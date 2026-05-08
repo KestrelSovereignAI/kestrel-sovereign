@@ -18,7 +18,7 @@
  *   4. Switch back to NORMAL — the purge fires.
  *   5. Audit log shows the purge entry.
  *
- * Run: demos/run.sh ephemeral-purge
+ * Run: kestrel demo run ephemeral-purge
  */
 const { test } = require('@playwright/test');
 const fs = require('fs');

@@ -20,8 +20,7 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 - `endpoints/` - FastAPI route handlers
 - `tests/` - Test suite (pytest)
 - `docker/` - Docker configurations (10 Dockerfile variants)
-- `scripts/` - Utility scripts
-- `scripts/cloudrun/` - Cloud Run build/deploy scripts
+- `scripts/` - Utility scripts (Cloud Run build/deploy is now the `kestrel deploy` CLI; see `docs/deployment/README.md`)
 
 ## Running Tests
 
@@ -102,10 +101,12 @@ are all signals.
 2. Provider implementations in `kestrel_sovereign/llm/`
 
 ### Deploying to Cloud Run
-1. One-time: `scripts/cloudrun/setup_secrets.sh` (creates GCP Secret Manager entries)
-2. Build: `scripts/cloudrun/build.sh` (builds + pushes to GCR)
-3. Deploy: `scripts/cloudrun/deploy_dev.sh` or `scripts/cloudrun/deploy_prod.sh`
-4. Or push a `v*` tag to trigger `.github/workflows/deploy.yml` automatically
+1. One-time: `uv run kestrel deploy secrets sync` (creates GCP Secret Manager entries from `.env`)
+2. Build: `uv run kestrel deploy build` (builds + pushes both images to GCR)
+3. Deploy: `uv run kestrel deploy dev` or `uv run kestrel deploy prod`
+4. Or push a `v*` tag to trigger `.github/workflows/deploy.yml` automatically (which calls the same Python entry points)
+
+Profiles, secrets, and env vars are configured in `deploy_config.toml`. See `docs/deployment/README.md` for the operator runbook.
 
 ---
 

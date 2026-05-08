@@ -135,12 +135,17 @@ class TestDeployManagerCoreUnit:
             assert "dev" in manager.profiles
             assert "prod" in manager.profiles
 
-            # Dev profile should scale to zero
+            # Dev profile is always-warm (min=1) to match the legacy
+            # ``scripts/cloudrun/deploy_dev.sh`` behavior — reconciled
+            # in epic #1050 sub-PR 1.4. Earlier example had dev=0
+            # (scale-to-zero), but the bash deploy_dev.sh always had
+            # min_instances=1, so the example file was the divergent
+            # one. The reconciliation chose bash parity.
             dev_profile = manager.profiles["dev"]
-            assert dev_profile.is_scale_to_zero is True
-            assert dev_profile.min_instances == 0
+            assert dev_profile.is_scale_to_zero is False
+            assert dev_profile.min_instances == 1
 
-            # Prod profile should be always-warm
+            # Prod profile is always-warm (matches deploy_prod.sh).
             prod_profile = manager.profiles["prod"]
             assert prod_profile.is_scale_to_zero is False
             assert prod_profile.min_instances == 1

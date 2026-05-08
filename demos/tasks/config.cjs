@@ -9,7 +9,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * activity log. Complements the spawn demo by showing the observability side
  * of asynchronous work.
  *
- * Run: demos/run.sh tasks
+ * Run: kestrel demo run tasks
  */
 module.exports = buildDemoConfig(
   [{ name: 'tasks-demo', testMatch: 'demo.cjs', timeout: 300000 }],

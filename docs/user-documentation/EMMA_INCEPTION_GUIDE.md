@@ -116,7 +116,7 @@ After creation, this directory will contain:
 export KESTREL_DATA_KEY="your-key-here"
 
 # Create Emma
-./scripts/sovereign-agent.sh create Emma ~/emma_data
+kestrel agent docker create Emma ~/emma_data
 ```
 
 ### Manual Docker Command
@@ -178,8 +178,8 @@ Should output: `Encrypted with: AES-256-GCM`
 unset KESTREL_DATA_KEY
 
 # Try to start Emma (should fail)
-./scripts/sovereign-agent.sh chat ~/emma_data
-# Expected: "Error: KESTREL_DATA_KEY is not set!"
+kestrel agent docker chat ~/emma_data
+# Expected: "error: KESTREL_DATA_KEY is not set!"
 
 # Restore key
 export KESTREL_DATA_KEY="your-key-here"
@@ -190,7 +190,7 @@ export KESTREL_DATA_KEY="your-key-here"
 ## Step 6: First Conversation
 
 ```bash
-./scripts/sovereign-agent.sh chat ~/emma_data
+kestrel agent docker chat ~/emma_data
 ```
 
 In the chat:
@@ -393,7 +393,7 @@ docker build --no-cache -f docker/Dockerfile.sovereign -t kestrel-sovereign .
 | File | Purpose |
 |------|---------|
 | `docker/Dockerfile.sovereign` | Docker container for isolated execution |
-| `scripts/sovereign-agent.sh` | CLI for create/chat/retire |
+| `kestrel agent docker {create,chat,retire}` | CLI for the Docker-isolated agent lifecycle (`kestrel_sovereign/cli_agent_docker.py`) |
 | `inception_service.py` | Agent creation logic |
 | `retirement_service.py` | Graceful retirement (test agents only) |
 | `security/key_storage.py` | AES-256-GCM key encryption |

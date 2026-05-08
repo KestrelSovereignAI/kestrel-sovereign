@@ -27,7 +27,7 @@ Closing shot. The surface is clean; the user can move on.
 ## Running the vignette
 
 ```bash
-demos/run.sh <feature-name>
+kestrel demo run <feature-name>
 ```
 
 Outputs land in `demos/<feature-name>/demo-output/`.

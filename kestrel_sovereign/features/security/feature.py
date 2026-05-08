@@ -132,7 +132,7 @@ class SecurityFeature(Feature):
     async def _register_all_tools(self):
         """Register all agent tools with default ASK permission.
 
-        Demo servers (KESTREL_DEMO_SERVER=1, set by demos/run.sh) get
+        Demo servers (KESTREL_DEMO_SERVER=1, set by ``kestrel demo run``) get
         ALLOW as the default instead — Playwright demos can't click
         through an interactive approval modal, and the demo agent runs
         in an isolated DB so the broader-grants are scoped correctly.

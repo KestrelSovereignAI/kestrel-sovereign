@@ -4,7 +4,7 @@
 [eye]
 name = "Kestrel Trash Vignette"
 screenshot_dir = "demos/trash/demo-output"
-test_cmd = "demos/run.sh trash"
+test_cmd = "kestrel demo run trash"
 
 [eye.model]
 provider = "anthropic"

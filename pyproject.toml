@@ -98,6 +98,10 @@ dependencies = [
     # Google Vertex AI (unified SDK for Gemini API and Vertex AI)
     "google-genai>=1.0.0",
     "google-cloud-logging>=3.5.0",
+    # GCP Secret Manager (used by ``kestrel deploy secrets sync`` to push
+    # local .env values into Secret Manager — port of
+    # scripts/cloudrun/setup_secrets.sh from epic #1050).
+    "google-cloud-secret-manager>=2.20.0",
     # Runtime utilities
     "psutil>=7.1.3",
     "numpy>=2.3.1",

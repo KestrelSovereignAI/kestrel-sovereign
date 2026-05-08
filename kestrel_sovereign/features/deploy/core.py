@@ -2,7 +2,15 @@
 Deploy Core Manager Operations.
 
 Contains the core DeployManagerCore class with config loading,
-profile management, provider registry, and health verification.
+profile management, provider registry, health verification, and
+the orchestration logic shared between the agent-tool surface
+(``DeployFeature``) and the operator CLI surface (``kestrel deploy``).
+
+The ``deploy_profile``/``teardown_profile``/``get_profile_logs``/
+``list_all_deployments``/``health_check_profile`` methods own the
+"talk to a provider, manage sessions, handle errors" workflow so
+both surfaces (`!deploy <action>` and `kestrel deploy <profile>`)
+delegate to the same code path.
 """
 
 import asyncio
@@ -10,6 +18,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.config import load_config
@@ -60,7 +69,14 @@ class DeployManagerCore:
         self.profiles = self._load_profiles(self.config.get("profiles", {}))
 
         # Provider registry (lazy-loaded)
-        self._providers: Dict[DeployProviderType, DeployProvider] = {}
+        # Cache key is ``(provider_type, gcp_project_id)`` so profiles
+        # with different ``gcp_project_id`` values each get their own
+        # CloudRunProvider — not a shared instance bound to whatever
+        # deploy ran first. Azure providers ignore the project_id
+        # component (always None for them).
+        self._providers: Dict[
+            tuple, DeployProvider
+        ] = {}
 
         # Multi-session tracking (agents may have dev+prod simultaneously)
         self._sessions: Dict[str, DeploymentSession] = {}
@@ -134,6 +150,70 @@ class DeployManagerCore:
 
         return profiles
 
+    def _validate_no_unresolved_placeholders(
+        self, profile_name: str, profile: DeploymentProfile
+    ) -> None:
+        """Raise DeployManagerError if any expanded value still
+        contains ``${VAR}`` (env var unset) OR if the original config
+        used ``${VAR}`` syntax and the expanded value is now empty
+        (env var set but blank). The bash predecessors used
+        ``${VAR:?...}`` which errored on EITHER condition; we mirror
+        that so missing/empty secrets like ``KESTREL_ALLOWED_EMAILS``
+        don't silently produce an OAuth-enabled service that locks
+        everyone out. Codex review on the final epic→main PR caught
+        the empty-string gap.
+        """
+        # Load the raw (pre-expansion) profile config so we can
+        # distinguish "this value was a ${VAR} substitution" from
+        # "this value was literally empty in the TOML".
+        raw_profile = (self.config.get("profiles", {}) or {}).get(profile_name, {}) or {}
+        raw_env = raw_profile.get("env_vars", {}) or {}
+        raw_secrets = raw_profile.get("secrets", {}) or {}
+
+        unresolved = []
+        empty_after_expansion = []
+
+        def _check(section: str, raw_dict, expanded_dict):
+            for key, expanded in (expanded_dict or {}).items():
+                if not isinstance(expanded, str):
+                    continue
+                if "${" in expanded:
+                    unresolved.append((section, key, expanded))
+                    continue
+                # Empty after expansion + raw used ${...} → bash's
+                # ``${VAR:?...}`` would have errored.
+                raw = raw_dict.get(key)
+                if (
+                    isinstance(raw, str)
+                    and "${" in raw
+                    and expanded == ""
+                ):
+                    empty_after_expansion.append((section, key, raw))
+
+        _check("env_vars", raw_env, profile.env_vars)
+        _check("secrets", raw_secrets, profile.secrets)
+
+        if unresolved or empty_after_expansion:
+            details_unresolved = "; ".join(
+                f"{section}.{key}={value!r}" for section, key, value in unresolved
+            )
+            details_empty = "; ".join(
+                f"{section}.{key}={raw!r} (env var set but empty)"
+                for section, key, raw in empty_after_expansion
+            )
+            details = "; ".join(d for d in (details_unresolved, details_empty) if d)
+            missing_vars = sorted({
+                m.group(1)
+                for _, _, value in (unresolved + empty_after_expansion)
+                for m in re.finditer(r'\$\{([^}]+)\}', value)
+            })
+            raise DeployManagerError(
+                f"profile '{profile_name}' has unresolved or empty ${{...}} "
+                f"placeholders (env vars: {', '.join(missing_vars)}). "
+                f"Export them with non-empty values before running "
+                f"`kestrel deploy {profile_name}`. Affected: {details}"
+            )
+
     @staticmethod
     def _expand_env_vars(env_dict: Dict[str, str]) -> Dict[str, str]:
         """
@@ -157,30 +237,47 @@ class DeployManagerCore:
                 expanded[key] = value
         return expanded
 
-    def _get_provider(self, provider_type: DeployProviderType) -> DeployProvider:
+    def _get_provider(
+        self,
+        provider_type: DeployProviderType,
+        *,
+        gcp_project_id: Optional[str] = None,
+    ) -> DeployProvider:
         """
         Get or create a deployment provider instance.
 
         Args:
-            provider_type: Type of provider to get
+            provider_type: Type of provider to get.
+            gcp_project_id: For ``CLOUD_RUN``, the GCP project the
+                provider should target. Falls back to
+                ``self.gcp_project_id`` when not given (legacy callers,
+                Azure providers — which ignore it). The cache is keyed
+                by ``(provider_type, gcp_project_id)`` so two profiles
+                that target different GCP projects each get their own
+                CloudRunProvider, not a single one bound to whichever
+                deploy ran first. Codex review on the final epic→main
+                PR caught the cache-shared-state bug.
 
         Returns:
             DeployProvider instance
         """
+        cache_key = (provider_type, gcp_project_id)
+
         # Check cache first
-        if provider_type in self._providers:
-            return self._providers[provider_type]
+        if cache_key in self._providers:
+            return self._providers[cache_key]
 
         # Create new provider
         if provider_type == DeployProviderType.CLOUD_RUN:
-            provider = CloudRunProvider(project_id=self.gcp_project_id)
+            project = gcp_project_id or self.gcp_project_id
+            provider = CloudRunProvider(project_id=project)
         elif provider_type == DeployProviderType.AZURE_CONTAINER_APPS:
             provider = AzureContainerProvider()
         else:
             raise DeployManagerError(f"Unknown provider type: {provider_type}")
 
         # Cache for reuse
-        self._providers[provider_type] = provider
+        self._providers[cache_key] = provider
         logger.debug(f"Created {provider_type.value} provider")
 
         return provider
@@ -304,3 +401,297 @@ class DeployManagerCore:
         """
         async with self._lock:
             return dict(self._sessions)
+
+    # ------------------------------------------------------------------
+    # Orchestration: shared by DeployFeature (`!deploy`) and the
+    # `kestrel deploy` CLI. These methods own provider dispatch, session
+    # bookkeeping, and DeployManagerError handling. Both surfaces wrap
+    # them with surface-specific guards (CLI prints to stderr, the
+    # feature returns structured ``error`` dicts).
+    # ------------------------------------------------------------------
+
+    def build_image_reference(self, profile_name: str, tag: str = "latest") -> str:
+        """
+        Build container image reference for a profile.
+
+        The image name is derived from the profile's ``deployment_mode``:
+
+        * ``deployment_mode = "agent"`` (default) → ``<image_name>``
+          (e.g. ``kestrel``) — built from ``docker/Dockerfile.cloudrun``.
+        * ``deployment_mode = "multi_agent"`` → ``<image_name>-multi_agent``
+          (e.g. ``kestrel-multi_agent``) — built from
+          ``docker/Dockerfile.multi_agent``.
+
+        These names match :data:`kestrel_sovereign.features.deploy.build.DEFAULT_TARGETS`
+        and ``.github/workflows/deploy.yml`` so ``kestrel deploy build`` and
+        ``kestrel deploy <profile>`` always reference the same registry refs.
+        The legacy bash ``deploy_dev.sh``/``deploy_multi_agent_dev.sh`` used
+        a hyphenated ``kestrel-multi-agent`` orphan that no build path ever
+        produced; epic #1050 sub-PR 1.4 reconciled on the underscore form.
+
+        Args:
+            profile_name: Profile to look up. Unknown profiles fall back
+                to the manager-level ``image_name`` so callers exercising
+                the manager outside a profile context (legacy tests) still
+                get a sensible ref.
+            tag: Image tag (default ``latest``).
+
+        Returns:
+            Full image reference (e.g. ``gcr.io/project/kestrel-multi_agent:v1.2.3``).
+        """
+        # Resolve the image name from the profile's deployment_mode. We
+        # don't raise on an unknown profile because some legacy callers
+        # build a manager from a stripped-down config; they'll get the
+        # global single-agent name, which is the historical default.
+        image_name = self.image_name
+        profile = self.profiles.get(profile_name)
+        if profile is not None and profile.is_multi_agent:
+            image_name = f"{self.image_name}-multi_agent"
+
+        # Profile-scoped ``gcp_project_id`` wins over the manager-level
+        # value — DeployManagerCore._load_profiles populates
+        # ``profile.gcp_project_id`` with ``data.get("gcp_project_id")
+        # or self.gcp_project_id``, so it's already the resolved
+        # effective project. Without this, a config that legitimately
+        # sets ``[profiles.prod].gcp_project_id`` would build
+        # ``gcr.io/<manager-project>/...`` instead of the profile's.
+        # Codex review on the final epic→main PR.
+        gcp_project = (
+            (profile.gcp_project_id if profile is not None else None)
+            or self.gcp_project_id
+        )
+
+        # For Cloud Run, use GCR
+        if gcp_project:
+            return f"gcr.io/{gcp_project}/{image_name}:{tag}"
+
+        # Fallback to generic reference
+        return f"{image_name}:{tag}"
+
+    async def deploy_profile(
+        self, profile_name: str, tag: str = "latest"
+    ) -> Dict[str, Any]:
+        """
+        Deploy an agent to the cloud platform configured by ``profile_name``.
+
+        Returns the same shape DeployFeature historically returned:
+            ``{"success": True, "action": "deploy", "session": {...}}``
+        on success, ``{"success": False, "error": "..."}`` on failure.
+        """
+        try:
+            profile = self.get_profile(profile_name)
+
+            # Validate that every ``${VAR}`` placeholder in the profile's
+            # env_vars / secrets actually resolved against runtime env.
+            # ``_expand_env_vars`` returns the literal ``${VAR}`` when a
+            # variable is unset — pushing that to Cloud Run silently
+            # produces broken config (e.g. an OAuth allowlist with the
+            # literal string ``${KESTREL_ALLOWED_EMAILS}``). The bash
+            # scripts errored on missing env via ``${VAR:?...}``;
+            # mirror that here. Codex review on PR #1064.
+            self._validate_no_unresolved_placeholders(profile_name, profile)
+
+            image = self.build_image_reference(profile_name, tag)
+
+            # Check if session already exists
+            existing_session = await self.get_session(profile.service_name)
+            if existing_session:
+                return {
+                    "success": False,
+                    "error": f"Service {profile.service_name} already deployed",
+                    "session": existing_session.to_dict(),
+                    "hint": f"Tear it down first (e.g. `kestrel deploy teardown {profile_name}`)",
+                }
+
+            # Create deployment session
+            session = DeploymentSession(
+                service_name=profile.service_name,
+                provider=profile.provider,
+                profile=profile,
+                status=DeployStatus.DEPLOYING,
+                started_at=datetime.now(timezone.utc),
+            )
+            await self.add_session(session)
+
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
+
+            logger.info(f"Deploying {image} to {profile.service_name}...")
+            session.status = DeployStatus.DEPLOYING
+
+            deploy_result = await provider.deploy(
+                image=image,
+                service_name=profile.service_name,
+                profile=profile,
+            )
+
+            session.status = DeployStatus.ACTIVE
+            session.service_url = deploy_result.get("service_url")
+            session.revision = deploy_result.get("revision")
+            session.last_updated = datetime.now(timezone.utc)
+
+            if session.service_url:
+                logger.info(f"Verifying health of {session.service_url}...")
+                healthy = await self._verify_health(session.service_url)
+                session.health_status = "healthy" if healthy else "unknown"
+
+            logger.info(f"Deployment complete: {session.service_url}")
+
+            return {
+                "success": True,
+                "action": "deploy",
+                "session": session.to_dict(),
+            }
+
+        except DeployManagerError as e:
+            # Best-effort session cleanup on failure so a retry can
+            # re-create one. We swallow the inner exception because the
+            # outer DeployManagerError is what the operator needs to see.
+            try:
+                profile = self.get_profile(profile_name)
+                await self.remove_session(profile.service_name)
+            except Exception:
+                pass
+
+            return {"success": False, "error": str(e)}
+
+    async def teardown_profile(self, profile_name: str) -> Dict[str, Any]:
+        """Delete a deployed service for ``profile_name``."""
+        try:
+            profile = self.get_profile(profile_name)
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
+
+            logger.info(f"Tearing down service {profile.service_name}...")
+            result = await provider.teardown(profile.service_name)
+
+            await self.remove_session(profile.service_name)
+
+            return {
+                "success": True,
+                "action": "teardown",
+                "service": profile.service_name,
+                "result": result,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_profile_logs(
+        self, profile_name: str, lines: int = 100
+    ) -> Dict[str, Any]:
+        """Fetch the last ``lines`` log lines from the deployed service."""
+        try:
+            profile = self.get_profile(profile_name)
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
+
+            logs = await provider.get_logs(profile.service_name, lines=lines)
+
+            return {
+                "success": True,
+                "action": "logs",
+                "service": profile.service_name,
+                "lines": lines,
+                "logs": logs,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
+
+    async def list_all_deployments(self) -> Dict[str, Any]:
+        """List every deployment across every provider configured in profiles.
+
+        Iterates the ``(provider, gcp_project_id)`` pairs from
+        ``self.profiles`` (deduped) rather than just ``provider_type``,
+        so configs with profile-scoped ``gcp_project_id`` overrides
+        list deployments from each project. Without this, the manager
+        would only ever talk to its own ``self.gcp_project_id``,
+        omitting deployments that live in profile-specific GCP projects.
+        Codex review on the final epic→main PR.
+        """
+        try:
+            all_deployments = []
+
+            # Collect unique (provider, project) pairs. Azure profiles
+            # don't have a project_id; encode that as None.
+            provider_targets = set()
+            for prof in self.profiles.values():
+                if prof.provider == DeployProviderType.CLOUD_RUN:
+                    provider_targets.add((prof.provider, prof.gcp_project_id))
+                else:
+                    provider_targets.add((prof.provider, None))
+
+            # Add the manager-level CloudRun fallback if not already
+            # covered (e.g. configs with no profile-level overrides
+            # still want to list against ``self.gcp_project_id``).
+            if any(p == DeployProviderType.CLOUD_RUN for p, _ in provider_targets):
+                provider_targets.add(
+                    (DeployProviderType.CLOUD_RUN, self.gcp_project_id)
+                )
+
+            for provider_type, project in provider_targets:
+                try:
+                    provider = self._get_provider(
+                        provider_type, gcp_project_id=project
+                    )
+                    deployments = await provider.list_deployments()
+                    all_deployments.extend(deployments)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to list {provider_type.value} deployments "
+                        f"(project={project}): {e}"
+                    )
+
+            return {
+                "success": True,
+                "action": "list",
+                "count": len(all_deployments),
+                "deployments": all_deployments,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}
+
+    async def health_check_profile(self, profile_name: str) -> Dict[str, Any]:
+        """Health-check the deployed service for ``profile_name``."""
+        try:
+            profile = self.get_profile(profile_name)
+
+            session = await self.get_session(profile.service_name)
+            if not session or not session.service_url:
+                # No tracked session — query the provider directly so
+                # `kestrel deploy health` works against services that
+                # were deployed in a previous process.
+                provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
+                status = await provider.get_status(profile.service_name)
+
+                if status.get("status") == "offline":
+                    return {
+                        "success": True,
+                        "action": "health",
+                        "service": profile.service_name,
+                        "status": "offline",
+                        "message": "Service not deployed",
+                    }
+
+                service_url = status.get("service_url")
+            else:
+                service_url = session.service_url
+
+            if not service_url:
+                return {
+                    "success": False,
+                    "error": "Service URL not available",
+                }
+
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
+            health_result = await provider.health_check(service_url)
+
+            return {
+                "success": True,
+                "action": "health",
+                "service": profile.service_name,
+                "url": service_url,
+                "health": health_result,
+            }
+
+        except DeployManagerError as e:
+            return {"success": False, "error": str(e)}

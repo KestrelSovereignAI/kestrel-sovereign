@@ -3,7 +3,7 @@
 [eye]
 name = "Kestrel Privacy Modes Vignette"
 screenshot_dir = "demos/privacy-modes/demo-output"
-test_cmd = "demos/run.sh privacy-modes"
+test_cmd = "kestrel demo run privacy-modes"
 
 [eye.model]
 provider = "anthropic"

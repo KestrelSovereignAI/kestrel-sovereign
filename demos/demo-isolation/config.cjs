@@ -8,7 +8,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Server-side rail (#766) that refuses destructive ops on live agents
  * unless the X-Kestrel-Allow-Destructive header is present.
  *
- * Run: demos/run.sh demo-isolation
+ * Run: kestrel demo run demo-isolation
  */
 module.exports = buildDemoConfig(
   [{ name: 'demo-isolation-demo', testMatch: 'demo.cjs', timeout: 180000 }],

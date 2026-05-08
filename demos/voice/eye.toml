@@ -4,7 +4,7 @@
 [eye]
 name = "Kestrel Voice Vignette"
 screenshot_dir = "demos/voice/demo-output"
-test_cmd = "demos/run.sh voice"
+test_cmd = "kestrel demo run voice"
 
 [eye.model]
 provider = "anthropic"

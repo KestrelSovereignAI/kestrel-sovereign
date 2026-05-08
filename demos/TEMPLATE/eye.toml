@@ -11,7 +11,7 @@
 [eye]
 name = "<Feature Name> Vignette"
 screenshot_dir = "demos/<feature-name>/demo-output"
-test_cmd = "demos/run.sh <feature-name>"
+test_cmd = "kestrel demo run <feature-name>"
 
 [eye.model]
 provider = "anthropic"

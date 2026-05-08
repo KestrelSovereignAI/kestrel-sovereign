@@ -48,46 +48,16 @@ class CloudRunProvider(DeployProvider):
         self._setup_auth()
 
     def _setup_auth(self):
-        """Setup GCP authentication from environment or project credentials."""
-        import tempfile
+        """Setup GCP authentication from environment or project credentials.
 
-        # Priority 1: Explicit GOOGLE_APPLICATION_CREDENTIALS env var
-        creds_file = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if creds_file and os.path.exists(creds_file):
-            logger.info(
-                f"Using credentials from GOOGLE_APPLICATION_CREDENTIALS: {creds_file}"
-            )
-            return
+        Delegates to :func:`kestrel_sovereign.features.deploy._gcp_auth.setup_gcp_auth`
+        so this provider and ``kestrel deploy secrets sync`` share one
+        credential discovery chain. The temp file path (if any) is
+        captured for cleanup via :meth:`cleanup` / ``__del__``.
+        """
+        from .._gcp_auth import setup_gcp_auth
 
-        # Priority 2: Inline JSON key from GCP_SERVICE_ACCOUNT_KEY
-        key_json = os.getenv("GCP_SERVICE_ACCOUNT_KEY")
-        if key_json:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".json", delete=False
-            ) as f:
-                f.write(key_json)
-                self._temp_cred_file = f.name
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = f.name
-                logger.info("Using service account key from GCP_SERVICE_ACCOUNT_KEY")
-            atexit.register(self._cleanup_temp_creds)
-            return
-
-        # Priority 3: Project-local service account file
-        project_creds = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-            "credentials",
-            "kestrel-agent-admin.json",
-        )
-        if os.path.exists(project_creds):
-            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = project_creds
-            logger.info(f"Using project service account: {project_creds}")
-            return
-
-        # Fallback: Application Default Credentials
-        logger.warning(
-            "No explicit credentials found. Using Application Default Credentials. "
-            "Set GOOGLE_APPLICATION_CREDENTIALS or place credentials/kestrel-agent-admin.json"
-        )
+        self._temp_cred_file = setup_gcp_auth()
 
     def _cleanup_temp_creds(self):
         """Remove temporary credentials file created from GCP_SERVICE_ACCOUNT_KEY."""
@@ -242,6 +212,14 @@ class CloudRunProvider(DeployProvider):
             logger.info(f"Waiting for Cloud Run operation to complete...")
             result = await asyncio.to_thread(operation.result, timeout=600)
 
+            # Allow unauthenticated invocations — matches the bash
+            # ``gcloud run deploy --allow-unauthenticated`` flag, which
+            # binds ``allUsers`` to ``roles/run.invoker``. Without this
+            # the freshly-created service returns 401 to public traffic
+            # and the app's OAuth flow / /health endpoint can't be
+            # reached. Codex review on PR #1064 caught the regression.
+            await self._allow_unauthenticated(client, service_path)
+
             # Get service URL
             service_url = result.uri
 
@@ -258,6 +236,60 @@ class CloudRunProvider(DeployProvider):
         except Exception as e:
             logger.error(f"Deployment failed: {e}", exc_info=True)
             raise DeployManagerError(f"Deployment failed: {e}") from e
+
+    async def _allow_unauthenticated(self, client, service_path: str) -> None:
+        """Bind ``allUsers`` to ``roles/run.invoker`` on the service.
+
+        Equivalent to ``gcloud run deploy --allow-unauthenticated``,
+        which the bash deploy_*.sh scripts always passed. Without this
+        binding Cloud Run rejects public traffic with 401, so the
+        application's OAuth flow and /health endpoint are unreachable
+        for new services or services recreated after teardown.
+
+        We fetch the current IAM policy, add the binding only if it's
+        not already present (idempotent), and set it back. Logs at
+        WARNING if the operation fails so the deploy itself doesn't
+        regress on transient IAM API errors — the operator can grant
+        the role manually as a backstop.
+        """
+        try:
+            from google.iam.v1 import iam_policy_pb2, policy_pb2
+
+            get_req = iam_policy_pb2.GetIamPolicyRequest(resource=service_path)
+            policy = await asyncio.to_thread(client.get_iam_policy, request=get_req)
+
+            already_set = any(
+                b.role == "roles/run.invoker" and "allUsers" in b.members
+                for b in policy.bindings
+            )
+            if already_set:
+                logger.debug("allUsers already has run.invoker; no IAM change needed")
+                return
+
+            policy.bindings.add(
+                role="roles/run.invoker",
+                members=["allUsers"],
+            )
+            set_req = iam_policy_pb2.SetIamPolicyRequest(
+                resource=service_path, policy=policy
+            )
+            await asyncio.to_thread(client.set_iam_policy, request=set_req)
+            logger.info(
+                f"Granted allUsers run.invoker on {service_path} "
+                f"(equivalent to --allow-unauthenticated)"
+            )
+        except ImportError as e:  # protobuf module missing
+            logger.warning(
+                "Could not import google.iam.v1 — skipping "
+                f"allUsers/run.invoker binding: {e}. The service may "
+                "require manual IAM granting before public traffic works."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to grant allUsers/run.invoker (the service is "
+                "deployed but may not accept public traffic until you "
+                f"run `gcloud run services add-iam-policy-binding`): {e}"
+            )
 
     async def get_status(self, service_name: str) -> Dict[str, Any]:
         """Get Cloud Run service status."""

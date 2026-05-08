@@ -7,11 +7,13 @@ history because a Playwright demo harness pointed at the live multi_agent
 server on ``localhost:8888`` and called destructive APIs against
 whichever agents the server had mounted.
 
-The convention layer fix is shipped (``demos/run.sh``, commit 88f4792 —
-the canonical demo entry point spins an isolated server on port 8900
-against ``agent_data/demo/`` and refuses port 8888). **But that's
-discipline, not enforcement.** A rogue script (or a curious developer
-running ``cd demos/foo && npx playwright test`` directly) still hits live.
+The convention layer fix is shipped (``kestrel demo run`` —
+:mod:`kestrel_sovereign.cli_demo`, the canonical demo entry point;
+spins an isolated server on port 8900 against ``agent_data/demo/`` and
+refuses port 8888; ported from the legacy ``demos/run.sh`` in epic
+#1050 tier 3). **But that's discipline, not enforcement.** A rogue
+script (or a curious developer running ``cd demos/foo && npx
+playwright test`` directly) still hits live.
 
 This module is the server-side prevention layer. Even if a destructive
 call reaches the live server, the rail here refuses it unless the

@@ -3,7 +3,7 @@
 [eye]
 name = "Kestrel EPHEMERAL Purge Vignette"
 screenshot_dir = "demos/ephemeral-purge/demo-output"
-test_cmd = "demos/run.sh ephemeral-purge"
+test_cmd = "kestrel demo run ephemeral-purge"
 
 [eye.model]
 provider = "anthropic"

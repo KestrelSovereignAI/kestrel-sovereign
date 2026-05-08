@@ -8,7 +8,7 @@ const { buildDemoConfig } = require('@kestrel/flight');
  * Tour the 5 privacy modes (EPHEMERAL → PUBLIC) — same agent, same chat,
  * different contracts.
  *
- * Run: demos/run.sh privacy-modes
+ * Run: kestrel demo run privacy-modes
  */
 module.exports = buildDemoConfig(
   [{ name: 'privacy-modes-demo', testMatch: 'demo.cjs', timeout: 240000 }],

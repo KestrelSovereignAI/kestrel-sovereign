@@ -4,7 +4,7 @@
 
 On **2026-04-24** a Playwright harness pointed at the live `localhost:8888`
 server and called destructive APIs against three agents.  Their conversation
-histories were wiped.  The convention layer (`demos/run.sh`) prevents this
+histories were wiped.  The convention layer (`kestrel demo run`) prevents this
 *by discipline* — but discipline is not enforcement.
 
 Issue **#766** is the server-side enforcement layer.  Every destructive
@@ -41,6 +41,6 @@ and why.
 ## Running the vignette
 
 ```bash
-demos/run.sh demo-isolation
+kestrel demo run demo-isolation
 kestrel-eye review --config demos/demo-isolation/eye.toml
 ```

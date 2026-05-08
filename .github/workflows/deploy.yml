@@ -9,6 +9,13 @@ name: Deploy to Cloud Run
 # where Release sign hit a flaky state-leak (responded_count=3 vs
 # 1 in test_fs_write_requires_real_approval) on its tag-time
 # re-run while the same code was already on PyPI.
+#
+# Build/deploy steps invoke ``uv run kestrel deploy {build,<profile>}``
+# (epic #1050 sub-PR 1.4 — bash-to-Python port). All flags, secrets,
+# and env vars live in deploy_config.toml; the workflow only carries
+# what GitHub itself owns: GCP credentials, the resolved tag, and the
+# KESTREL_ALLOWED_EMAILS secret consumed via ``${KESTREL_ALLOWED_EMAILS}``
+# expansion in the TOML.
 
 on:
   workflow_run:
@@ -31,7 +38,7 @@ on:
 env:
   PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
   REGION: us-central1
-  IMAGE_NAME: kestrel
+  PYTHON_VERSION: "3.13"
 
 jobs:
   build:
@@ -47,6 +54,14 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # Output the resolved ref so deploy-dev / deploy-prod check out the
+    # SAME revision that was built. Codex review on PR #1064 caught
+    # that without this, manual deploys with inputs.ref (and tag-push
+    # deploys when main has moved) would deploy the just-built image
+    # using deploy_config.toml + CLI from main, not the requested ref.
+    outputs:
+      resolved_ref: ${{ steps.resolved_ref.outputs.ref }}
+      tag: ${{ steps.tag.outputs.tag }}
 
     steps:
       # On workflow_run, github.ref points at main (the workflow file's
@@ -70,11 +85,30 @@ jobs:
         with:
           ref: ${{ steps.resolved_ref.outputs.ref }}
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --extra cloud
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      # ``setup-gcloud`` is still needed because ``kestrel deploy build``
+      # shells out to ``docker buildx``, and docker needs ``gcloud auth
+      # configure-docker`` to push to gcr.io. The ``auth`` action above
+      # writes credentials_json to a temp file and points
+      # GOOGLE_APPLICATION_CREDENTIALS at it; gcloud picks that up here.
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
@@ -92,28 +126,26 @@ jobs:
             echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           fi
 
-      - name: Build and push single-agent image
-        run: |
-          docker build \
-            -f docker/Dockerfile.cloudrun \
-            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }} \
-            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest \
-            .
-          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:${{ steps.tag.outputs.tag }}
-          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
+      # Set up Docker BuildKit + QEMU for multi-arch builds. ``kestrel
+      # deploy build`` defaults to ``linux/amd64,linux/arm64``; without
+      # these actions, GitHub-hosted runners can't build the arm64
+      # target. Codex review on the epic→main PR caught this.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3.6.1
 
-      - name: Build and push multi_agent (multi-agent) image
-        run: |
-          docker build \
-            -f docker/Dockerfile.multi_agent \
-            --secret id=github_token,env=GITHUB_TOKEN \
-            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:${{ steps.tag.outputs.tag }} \
-            -t gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:latest \
-            .
-          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:${{ steps.tag.outputs.tag }}
-          docker push gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:latest
+      # Single source of truth for image build: ``kestrel deploy build``
+      # walks DEFAULT_TARGETS (kestrel + kestrel-multi_agent), runs
+      # ``docker buildx build --push`` for each with the same multi-arch
+      # platform list the bash script used, and tags both ``:<tag>`` and
+      # ``:latest``. GITHUB_TOKEN is consumed via BuildKit secrets so
+      # Dockerfiles installing private deps work.
+      - name: Build and push Cloud Run images
         env:
+          GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
           GITHUB_TOKEN: ${{ secrets.GH_PAT }}
+        run: uv run kestrel deploy build --tag ${{ steps.tag.outputs.tag }}
 
   deploy-dev:
     runs-on: ubuntu-latest
@@ -123,42 +155,44 @@ jobs:
       id-token: write
 
     steps:
+      # Check out the same ref that was built (see ``build.outputs``).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.build.outputs.resolved_ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --extra cloud
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # ``kestrel deploy dev`` reads deploy_config.toml's [profiles.dev]
+      # for the full secret list / env vars / scaling — anything the
+      # legacy ``deploy_dev.sh`` set is encoded there. KESTREL_ALLOWED_EMAILS
+      # is interpolated via the ``${KESTREL_ALLOWED_EMAILS}`` placeholder
+      # in the TOML, expanded by DeployManagerCore._expand_env_vars from
+      # this step's environment.
       - name: Deploy to Cloud Run (dev)
-        uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
-        with:
-          service: kestrel-dev
-          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}-multi_agent:latest
-          region: ${{ env.REGION }}
-          flags: >-
-            --memory=2Gi
-            --cpu=2
-            --port=8080
-            --min-instances=0
-            --max-instances=10
-            --timeout=300
-            --concurrency=80
-            --allow-unauthenticated
-          secrets: |
-            OPENAI_API_KEY=kestrel-openai-key:latest
-            ANTHROPIC_API_KEY=kestrel-anthropic-key:latest
-            KESTREL_API_KEY=kestrel-api-key:latest
-            KESTREL_DATA_KEY=kestrel-data-key:latest
-            GOOGLE_CLIENT_ID=kestrel-google-client-id:latest
-            GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest
-            KESTREL_SESSION_SECRET=kestrel-session-secret:latest
-            GITHUB_TOKEN=github-read-kestrel:latest
-          env_vars: |
-            KESTREL_ENV=development
-            KESTREL_DB_BACKEND=sqlite
-            KESTREL_DB_PATH=/app/agent_data
-            KESTREL_AGENTS=Kestrel,kestrel-demo
-            KESTREL_REQUIRE_OAUTH=true
-            KESTREL_ALLOWED_EMAILS=${{ secrets.KESTREL_ALLOWED_EMAILS }}
+        env:
+          GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
+          KESTREL_ALLOWED_EMAILS: ${{ secrets.KESTREL_ALLOWED_EMAILS }}
+        run: uv run kestrel deploy dev
 
       - name: Show dev URL
         run: |
@@ -181,38 +215,38 @@ jobs:
     environment: production
 
     steps:
+      # Check out the same ref that was built (see ``build.outputs``).
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.build.outputs.resolved_ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --extra cloud
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
       - name: Deploy to Cloud Run (prod)
-        uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
-        with:
-          service: kestrel-prod
-          image: gcr.io/${{ env.PROJECT_ID }}/${{ env.IMAGE_NAME }}:latest
-          region: ${{ env.REGION }}
-          flags: >-
-            --memory=2Gi
-            --cpu=2
-            --port=8080
-            --min-instances=1
-            --max-instances=100
-            --timeout=300
-            --concurrency=80
-            --allow-unauthenticated
-          secrets: |
-            OPENAI_API_KEY=kestrel-openai-key:latest
-            KESTREL_API_KEY=kestrel-api-key:latest
-            KESTREL_DATA_KEY=kestrel-data-key:latest
-            GOOGLE_CLIENT_ID=kestrel-google-client-id:latest
-            GOOGLE_CLIENT_SECRET=kestrel-google-client-secret:latest
-            KESTREL_SESSION_SECRET=kestrel-session-secret:latest
-          env_vars: |
-            KESTREL_ENV=production
-            KESTREL_DB_BACKEND=sqlite
-            KESTREL_DB_PATH=/app/agent_data
-            KESTREL_ALLOWED_EMAILS=${{ secrets.KESTREL_ALLOWED_EMAILS }}
+        env:
+          GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
+          KESTREL_ALLOWED_EMAILS: ${{ secrets.KESTREL_ALLOWED_EMAILS }}
+        run: uv run kestrel deploy prod
 
       - name: Show prod URL
         run: |

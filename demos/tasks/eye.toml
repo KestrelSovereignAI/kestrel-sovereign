@@ -3,7 +3,7 @@
 [eye]
 name = "Kestrel Tasks & Activity Demo"
 screenshot_dir = "demos/tasks/demo-output"
-test_cmd = "demos/run.sh tasks"
+test_cmd = "kestrel demo run tasks"
 
 [eye.model]
 provider = "anthropic"
