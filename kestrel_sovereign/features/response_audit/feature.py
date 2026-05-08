@@ -117,17 +117,32 @@ class ResponseAuditFeature(Feature):
         they are not.
         """
         hook_registered = self._hook is not None and self._hook.enabled
+        audit_count = getattr(self._hook, "audit_count", 0) if self._hook else 0
+        last_risk_level = (
+            getattr(self._hook, "last_risk_level", None) if self._hook else None
+        )
         data = {
             "mode": self._mode,
             "strategy": self._strategy,
             "risk_threshold": self._risk_threshold,
             "hook_registered": hook_registered,
-            "audit_count": getattr(self._hook, "audit_count", 0) if self._hook else 0,
-            "last_risk_level": getattr(self._hook, "last_risk_level", None) if self._hook else None,
+            "audit_count": audit_count,
+            "last_risk_level": last_risk_level,
         }
+        # Render every scalar field in the confirmation. The
+        # command-handler envelope formatter only appends a JSON
+        # block of ``data`` when it carries a structural payload
+        # (list/nested-dict values), so scalar-only ``data`` is
+        # invisible in CLI output by design — anything the !audit
+        # user is supposed to see has to live in the confirmation.
         confirmation = (
-            f"Response audit: mode={self._mode}, strategy={self._strategy}, "
-            f"hook_registered={hook_registered}, audit_count={data['audit_count']}."
+            "Response Audit Status:\n"
+            f"  mode: {self._mode}\n"
+            f"  strategy: {self._strategy}\n"
+            f"  risk_threshold: {self._risk_threshold}\n"
+            f"  hook_registered: {hook_registered}\n"
+            f"  audit_count: {audit_count}\n"
+            f"  last_risk_level: {last_risk_level}"
         )
         if self._mode != "skip" and not hook_registered:
             return ToolResult.partial(
