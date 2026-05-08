@@ -65,8 +65,18 @@ _SHELL_EXIT_HINT = (
 # ---------------------------------------------------------------------------
 
 def _get_project_dir() -> Path:
-    """Get the project root directory (where server.py lives)."""
-    return Path(__file__).parent.parent.resolve()
+    """Get the project root directory.
+
+    Delegates to :func:`kestrel_sovereign.paths.project_dir`, which honours
+    ``KESTREL_HOME``, walks up from CWD looking for marker files
+    (``multi_agent.toml``, ``kestrel.toml``, ``.env``), and falls back to
+    ``~/.kestrel`` for pip-installed users with no project in CWD. Crucially,
+    this no longer returns ``site-packages/`` when the package is pip-installed
+    — that was silent data loss on ``pip install --upgrade``.
+    """
+    from kestrel_sovereign.paths import project_dir
+
+    return project_dir()
 
 
 def _format_uptime(pid: int) -> str:

@@ -19,8 +19,20 @@ from kestrel_sovereign.llm.service import _warn_no_llm_config_found
 
 @pytest.fixture
 def cwd(tmp_path, monkeypatch):
+    """Chdir into an empty tmp dir AND pin ``KESTREL_HOME`` to it.
+
+    Without ``KESTREL_HOME`` the project-dir resolver
+    (:func:`kestrel_sovereign.paths.project_dir`) walks up from CWD looking
+    for a ``kestrel.toml`` marker — which it finds in the dev repo above the
+    ``tmp_path`` pytest gives us. That makes ``load_section('llm')`` read the
+    dev config instead of returning empty, and the empty-[llm] warning the
+    tests in this file are checking for never fires."""
+    monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+    from kestrel_sovereign import paths
+    paths.reset_cache()
     monkeypatch.chdir(tmp_path)
-    return tmp_path
+    yield tmp_path
+    paths.reset_cache()
 
 
 def test_warn_includes_no_section_message(cwd, caplog):
@@ -91,6 +103,9 @@ def test_llmservice_init_emits_warning_when_config_section_empty(cwd, caplog):
 
 def test_llmservice_init_does_not_warn_when_config_present(tmp_path, monkeypatch, caplog):
     """Negative case: a populated [llm] section must NOT trigger the warning."""
+    monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+    from kestrel_sovereign import paths
+    paths.reset_cache()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "kestrel.toml").write_text(
         '[llm]\n'

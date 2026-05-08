@@ -55,9 +55,11 @@ def get_disabled_features() -> Set[str]:
 
     # Source 2: kestrel.toml [features].disabled
     try:
-        # Walk up from features/ to find project root (where kestrel.toml lives)
-        project_dir = Path(__file__).parent.parent.parent.resolve()
-        toml_path = project_dir / "kestrel.toml"
+        # Resolve via the central paths module so pip-installed users land
+        # on their KESTREL_HOME / ~/.kestrel project root instead of the
+        # package's site-packages parent.
+        from kestrel_sovereign.paths import project_dir as _resolve_project_dir
+        toml_path = _resolve_project_dir() / "kestrel.toml"
         if toml_path.exists():
             try:
                 import tomllib

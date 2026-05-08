@@ -1153,9 +1153,10 @@ class TalonCoordinatorFeature(Feature):
         if host_url:
             return host_url.rstrip("/")
 
+        from kestrel_sovereign.paths import project_dir
         for candidate in [
             Path.cwd() / "multi_agent.toml",
-            Path(__file__).resolve().parents[3] / "multi_agent.toml",
+            project_dir() / "multi_agent.toml",
         ]:
             if candidate.exists():
                 try:

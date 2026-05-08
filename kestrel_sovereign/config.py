@@ -26,6 +26,17 @@ _UNIFIED_CONFIG_MAPPING = {
     "council_config.toml": "council",
 }
 
+def _project_root_for_config() -> Path:
+    """Anchor for ``kestrel.toml`` lookups.
+
+    Imported lazily so this module stays cheap to import (``paths`` is
+    cheap, but the import dance keeps the cycle-risk surface small).
+    """
+    from kestrel_sovereign.paths import project_dir
+
+    return project_dir()
+
+
 def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]:
     """
     Loads a TOML configuration file from the project root.
@@ -46,8 +57,9 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
     Returns:
         A dictionary containing the configuration.
     """
+    project_root = _project_root_for_config()
     # Try unified config first
-    unified_path = Path("kestrel.toml")
+    unified_path = project_root / "kestrel.toml"
     if unified_path.exists() and file_name in _UNIFIED_CONFIG_MAPPING:
         try:
             with open(unified_path, 'r', encoding='utf-8') as f:
@@ -76,11 +88,11 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
             logger.warning(f"Error loading from unified config, falling back to individual file: {e}")
 
     # Fall back to individual config file (backward compatibility)
-    config_path = Path(file_name)
+    config_path = project_root / file_name
 
     # Create the config file from the example if it doesn't exist
     if not config_path.exists():
-        example_path = Path(f"{file_name}.example")
+        example_path = project_root / f"{file_name}.example"
         if example_path.exists():
             logger.info(f"'{file_name}' not found. Copying from '{example_path}'.")
             config_path.write_text(example_path.read_text(encoding='utf-8'), encoding='utf-8')
@@ -160,7 +172,7 @@ def load_section(section: str) -> Dict[str, Any]:
     search_paths = []
     if db_path:
         search_paths.append(Path(db_path) / "kestrel.toml")
-    search_paths.append(Path("kestrel.toml"))
+    search_paths.append(_project_root_for_config() / "kestrel.toml")
 
     for config_path in search_paths:
         if config_path.exists():

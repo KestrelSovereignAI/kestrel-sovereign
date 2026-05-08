@@ -52,10 +52,14 @@ def _discover_host_url() -> Optional[str]:
     if host_url:
         return host_url.rstrip("/")
 
-    # Try reading multi_agent.toml to get host port
+    # Try reading multi_agent.toml to get host port. Resolve via the
+    # paths module so pip-installed users land on their KESTREL_HOME /
+    # ~/.kestrel project root rather than the package's site-packages
+    # parent (which would never have a multi_agent.toml).
+    from kestrel_sovereign.paths import project_dir
     for candidate in [
         Path.cwd() / "multi_agent.toml",
-        Path(__file__).resolve().parents[3] / "multi_agent.toml",
+        project_dir() / "multi_agent.toml",
     ]:
         if candidate.exists():
             try:
