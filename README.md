@@ -77,11 +77,16 @@ uv run kestrel start MyAgent    # if you ran step 5
 
 If you're upgrading from a pre-2026-05 setup that used a standalone `llm_config.toml`, run `uv run kestrel migrate-llm-config` to fold it into `kestrel.toml [llm]`. The legacy file is no longer read.
 
-Your agent is now running. The default port is **8801** (the first free port at or above the configured base; `8888` is the fleet-wide convention but the wizard picks the next available slot — `kestrel start` prints the chosen port and PID).
+Your agent is now running. Two ports to know about, depending on which start form you used:
 
-> **Port conflict?** Each agent has its own config. Edit `agent_data/myagent/kestrel.toml` to change the port, or use `--port 8899` on the command line.
+| Command | Listens on | Why |
+|---|---|---|
+| `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every registered agent at `multi_agent.host.port` (default `8888`). |
+| `kestrel start <name>` | `http://localhost:8801` (the **agent**) | A single agent on its own port — the next free slot at or above `8801` (or whatever you set in `agent_data/<name>/kestrel.toml`). The CLI prints the chosen port + PID. |
 
-> **Test it:** Visit the printed URL (e.g. `http://localhost:8801`) in your browser to open the built-in **Sovereign Console** (web UI with Chat, Identity, Constitution, Memories, and more). The same host + `/health` returns a JSON readiness probe.
+> **Port conflict?** Each agent has its own config. Edit `agent_data/myagent/kestrel.toml` to change the per-agent port, or use `--port 8899` on the command line. Edit `multi_agent.toml` to change the host port.
+
+> **Test it:** Visit the printed URL in your browser (e.g. `http://localhost:8888` for the host, or `http://localhost:8801` for a single-agent start) to open the built-in **Sovereign Console**. Append `/health` to either for a JSON readiness probe.
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
@@ -167,7 +172,7 @@ uv run python main.py ./agent_data/myagent
 <a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
 
-Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the printed URL (typically `http://localhost:8801`) in any browser -- no additional software required.
+Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the printed URL — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or `http://localhost:8801` for a single-agent start — in any browser; no additional software required.
 
 The console provides 8 tabs:
 
@@ -500,7 +505,7 @@ The server exposes OpenAI-compatible endpoints for use with third-party clients:
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 
-For most users, the built-in **Sovereign Console** at the agent's URL (e.g. `http://localhost:8801`) is the easiest way to interact with your agent (see the [Web UI section](#web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
+For most users, the built-in **Sovereign Console** at the printed URL (`http://localhost:8888` for the multi-agent host, or the agent's own port for a single-agent start) is the easiest way to interact with your agent (see the [Web UI section](#web-ui-sovereign-console) above). If you prefer an external client, point any OpenAI-compatible tool (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) at your server's `/v1/chat/completions` endpoint. Use the model name from `/v1/models`.
 
 > **Auth:** every request to `/v1/...` requires the `X-API-Key` header (or `Authorization: Bearer <key>`). The key was written to `.env` as `KESTREL_API_KEY` by `kestrel setup` (or `--quickstart`). Most OpenAI-compatible clients let you set the key via their `OPENAI_API_KEY` env var or settings UI; point that at your `KESTREL_API_KEY` value.
 
