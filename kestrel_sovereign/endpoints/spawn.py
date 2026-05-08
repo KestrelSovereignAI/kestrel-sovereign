@@ -11,7 +11,10 @@ except ImportError:
     import sys
     from pathlib import Path
 
-    _pkg_src = Path(__file__).resolve().parents[1] / "kestrel-feature-spawn" / "src"
+    # Source-clone fallback: ``parents[2]`` lands at the repo root
+    # now that this module lives at ``kestrel_sovereign/endpoints/``.
+    # Codex review v3 on PR #1097 caught the off-by-one.
+    _pkg_src = Path(__file__).resolve().parents[2] / "kestrel-feature-spawn" / "src"
     if _pkg_src.exists() and str(_pkg_src) not in sys.path:
         sys.path.insert(0, str(_pkg_src))
 
