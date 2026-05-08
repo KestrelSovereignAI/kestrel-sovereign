@@ -136,15 +136,48 @@ No code changes required unless the vendor needs a new adapter class. Add a `[ve
 
 ### Adding a new adapter class
 
-1. Write the adapter as a subclass of `LLMAdapter` (see `kestrel_sovereign/llm/adapter.py`).
-2. Register it in `_ADAPTER_REGISTRY` in [provider_registry.py](../../kestrel_sovereign/llm/provider_registry.py).
+`LLMAdapter` lives in `kestrel-sovereign-sdk` (since SDK 0.5 / epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) Wave 1A). The base class, the response/marker types, and the conformance helpers are all importable from `kestrel_sdk.llm`.
+
+There are **two paths** depending on whether the adapter ships in this repo or as an external package.
+
+**In-tree adapter** (lives in `kestrel_sovereign/llm/`):
+
+1. Subclass [`kestrel_sdk.llm.LLMAdapter`](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk/blob/main/kestrel_sdk/llm/adapter.py) — the framework's `kestrel_sovereign/llm/adapter.py` is a thin subclass that adds image-handling helpers; in-tree adapters typically extend that.
+2. Register in `_ADAPTER_REGISTRY` in [provider_registry.py](../../kestrel_sovereign/llm/provider_registry.py).
 3. Implement `list_models()` to return models tagged with the correct vendor — or raise `NotImplementedError` and let the adapter share a canonical route's discovery via the per-vendor rule below.
+4. (Optional) Implement `get_streaming_response_with_tools` and emit `ToolCallStarted` markers per the timing rules in [llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md). Required if you want the constitutional honesty layer's bubble retraction to fire on this adapter — see [llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md).
+5. (Optional) Override the metadata methods (`substrate_type`, `deliberation_style`, `cost_per_million`, `is_subscription`, `supports_session_continuation`) so the council, costing, and substrate-routing surfaces work without adding `if vendor == "x"` branches in framework code.
+
+**External plugin** (separate `pip`-installable package): no edits to this repo. The plugin author publishes a package that depends on `kestrel-sovereign-sdk` only and registers under the `kestrel_sovereign.llm_providers` entry-point group. Framework discovers the adapter at startup. Full author guide in [llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md), including the conformance suite (`pytest` against `kestrel_sdk.testing` helpers).
 
 ### Per-vendor discovery rule
 
 Multiple routes can target the same vendor. Discovery runs **once per vendor**: we pick the first route whose adapter implements `list_models()`. Subscription adapters (`ClaudeMaxAdapter`, `CodexAdapter`) raise `NotImplementedError` — their routes share the api-route's catalog by virtue of being under the same vendor.
 
 This means `openai:plan` shows the same model list as `openai:api`, without alias tables.
+
+---
+
+## Streaming, tools, and the honesty layer
+
+The streaming response surface has three modes, all routed through `LLMService`:
+
+| Method | Yields | Used when |
+|---|---|---|
+| `get_streaming_response(...)` | `str` chunks | Plain streaming, no tools. |
+| `stream_with_messages(messages=...)` | `str` chunks | Post-tool synthesis (the orchestrator already injected the `tool` messages). |
+| `stream_with_tool_detection(messages=, tools=)` | `Union[str, ToolCallStarted, LLMResponse]` (tagged union) | Single-call streaming + tool detection. The default chat path. |
+
+The third one is the load-bearing path. Adapters yielding `ToolCallStarted` (since SDK 0.7) at the moment a tool call first appears in the provider stream — *before* arguments finish accumulating — drive the constitutional honesty layer:
+
+- The framework emits an in-band sentinel (`\x1eKESTREL:REVISE:<json>\x1e`) on `/api/agent/stream` so the chat client can retract the in-flight bubble.
+- A parallel SSE `revising` event fires on `/api/agent/notifications/sse` as a reliability backup.
+- The audit hook (when enabled) reads the marker boundary as the deterministic divider between pre-tool prose and post-tool synthesis, and the resulting `HookInput.pre_tool_prose` / `tool_calls` / `tool_results` (SDK 0.9 fields) feed `analyze_narration` to catch confident-lie patterns even when the audit LLM is unavailable.
+
+**End-to-end pipeline + guarantees:** see [llm/HONESTY_LAYER.md](llm/HONESTY_LAYER.md).
+**Adapter author's view + per-provider marker timing:** see [llm/PROVIDER_PLUGINS.md](llm/PROVIDER_PLUGINS.md).
+
+The mandate-restricted no-silent-fallback rule applies here: when the user pinned a route (`mandate_restricted = providers_to_use length == 1`), the streaming loop fails loudly with `LLMStreamingError` rather than falling through to a different vendor. Multi-route default chains still retry through the list, but the fallback happens in server logs — never by injecting a `[Route X unavailable, trying next...]` note into the stream where it would corrupt the agent's response.
 
 ---
 
