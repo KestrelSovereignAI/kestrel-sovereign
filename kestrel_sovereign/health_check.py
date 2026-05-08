@@ -91,15 +91,17 @@ def run_health_check():
         print(f'Ollama: ❌ Not responding at {ollama_url}')
 
     # Check config
-    kestrel_toml_exists = os.path.exists('kestrel.toml')
+    from kestrel_sovereign.paths import project_dir
+    kestrel_toml_path = project_dir() / "kestrel.toml"
+    kestrel_toml_exists = kestrel_toml_path.exists()
     if kestrel_toml_exists:
         llm_section = load_section("llm")
         if llm_section:
-            print('LLM Config: ✅ kestrel.toml [llm] populated')
+            print(f'LLM Config: ✅ {kestrel_toml_path} [llm] populated')
         else:
-            print('LLM Config: ⚠️  kestrel.toml found but [llm] section is empty')
+            print(f'LLM Config: ⚠️  {kestrel_toml_path} found but [llm] section is empty')
     else:
-        print('LLM Config: ❌ Missing kestrel.toml — run `kestrel setup` to create one')
+        print(f'LLM Config: ❌ Missing {kestrel_toml_path} — run `kestrel setup` to create one')
 
     print('\n🚀 Ready to start!')
 

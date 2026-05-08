@@ -20,8 +20,19 @@ logger = logging.getLogger(__name__)
 # Default config path (individual file for backward compat)
 DEFAULT_PROFILES_PATH = Path(__file__).parent.parent / "constitutional_profiles.toml"
 
-# Unified config path (preferred)
-UNIFIED_CONFIG_PATH = Path("kestrel.toml")
+# Unified config path (preferred). Resolved lazily via the paths module so
+# pip-installed users get their KESTREL_HOME / ~/.kestrel project root
+# instead of CWD (which may be wherever they launched the process from).
+def _unified_config_path() -> Path:
+    from kestrel_sovereign.paths import project_dir
+    return project_dir() / "kestrel.toml"
+
+
+# Backwards-compat alias for callers and tests that imported the old
+# module-level constant. ``_unified_config_path()`` is preferred — the
+# constant is frozen at import time and won't see late ``KESTREL_HOME``
+# changes.
+UNIFIED_CONFIG_PATH = _unified_config_path()
 
 
 @dataclass
@@ -101,9 +112,10 @@ class ConstitutionalProfileService:
         config_source = None
 
         # Try unified config first
-        if UNIFIED_CONFIG_PATH.exists():
+        unified_path = _unified_config_path()
+        if unified_path.exists():
             try:
-                with open(UNIFIED_CONFIG_PATH, "rb") as f:
+                with open(unified_path, "rb") as f:
                     unified_data = tomllib.load(f)
 
                 # Extract constitution section
@@ -127,7 +139,7 @@ class ConstitutionalProfileService:
                 config_source = str(self.config_path)
 
                 # Log deprecation warning if unified config exists
-                if UNIFIED_CONFIG_PATH.exists():
+                if _unified_config_path().exists():
                     logger.warning(
                         "DEPRECATION: Loading from 'constitutional_profiles.toml' directly. "
                         "Consider migrating to unified 'kestrel.toml' configuration. "

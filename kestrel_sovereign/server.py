@@ -34,10 +34,20 @@ from kestrel_sovereign.telemetry import setup_tracing
 # Resolution order:
 #   1. CWD/.env — the project the operator is running from. This is what the
 #      pre-move root-level server.py loaded by virtue of sitting next to .env.
-#   2. <package-dir>/.env — only useful for source clones where the package
-#      sits one level under the repo root and somebody dropped .env in there.
-# python-dotenv silently no-ops on missing files, so both calls are safe.
+#   2. <project_dir>/.env — the resolved project (KESTREL_HOME, marker walk-up,
+#      or ~/.kestrel for pip-installed users). Crucial for pip installs where
+#      CWD may be wherever the operator launched ``kestrel start`` from.
+#   3. <package-dir>/.env — legacy: source clones where someone dropped a .env
+#      next to the package source.
+# python-dotenv silently no-ops on missing files, so all three calls are safe.
 load_dotenv(Path.cwd() / ".env", override=False)
+try:
+    from kestrel_sovereign.paths import project_dir as _resolve_project_dir
+    load_dotenv(_resolve_project_dir() / ".env", override=False)
+except Exception:
+    # Resolver should never raise, but a .env load is best-effort: if
+    # this somehow blows up we want the server to keep booting.
+    pass
 load_dotenv(Path(__file__).parent / ".env", override=False)
 
 from kestrel_sovereign.logging_config import (

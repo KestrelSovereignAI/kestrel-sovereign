@@ -23,11 +23,21 @@ from .storage import CouncilStorage, get_storage
 
 logger = logging.getLogger(__name__)
 
-# Default config path (individual file for backward compat)
-CONFIG_PATH = Path("council_config.toml")
+def _resolve_council_config_path() -> Path:
+    from kestrel_sovereign.paths import project_dir
+    return project_dir() / "council_config.toml"
 
-# Unified config path (preferred)
-UNIFIED_CONFIG_PATH = Path("kestrel.toml")
+
+def _resolve_unified_config_path() -> Path:
+    from kestrel_sovereign.paths import project_dir
+    return project_dir() / "kestrel.toml"
+
+
+# Backwards-compat aliases. These are evaluated once at import time;
+# call the helpers above for late-binding behaviour (tests setting
+# ``KESTREL_HOME`` after import need the helpers).
+CONFIG_PATH = _resolve_council_config_path()
+UNIFIED_CONFIG_PATH = _resolve_unified_config_path()
 
 
 class CouncilFeature(Feature):
@@ -58,10 +68,13 @@ class CouncilFeature(Feature):
         config_source = None
         config_data = None
 
+        unified_path = _resolve_unified_config_path()
+        legacy_path = _resolve_council_config_path()
+
         # Try unified config first
-        if UNIFIED_CONFIG_PATH.exists():
+        if unified_path.exists():
             try:
-                with open(UNIFIED_CONFIG_PATH, "rb") as f:
+                with open(unified_path, "rb") as f:
                     unified_data = tomllib.load(f)
                 if "council" in unified_data:
                     config_data = unified_data.get("council", {})
@@ -71,15 +84,15 @@ class CouncilFeature(Feature):
                 logger.warning(f"Could not load council config from unified file: {e}")
 
         # Fall back to individual config file
-        if not config_data and CONFIG_PATH.exists():
+        if not config_data and legacy_path.exists():
             try:
-                with open(CONFIG_PATH, "rb") as f:
+                with open(legacy_path, "rb") as f:
                     data = tomllib.load(f)
                 config_data = data.get("council", {})
-                config_source = str(CONFIG_PATH)
+                config_source = str(legacy_path)
 
                 # Log deprecation warning if unified config exists
-                if UNIFIED_CONFIG_PATH.exists():
+                if unified_path.exists():
                     logger.warning(
                         "DEPRECATION: Loading from 'council_config.toml' directly. "
                         "Consider migrating to unified 'kestrel.toml' configuration. "
