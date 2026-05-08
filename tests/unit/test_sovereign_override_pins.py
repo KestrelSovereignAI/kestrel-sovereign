@@ -17,6 +17,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, Mock, AsyncMock
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.privacy import PrivacyMode
 from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
@@ -335,7 +336,8 @@ async def test_sovereign_delete_cleans_up_pins():
     # Pin the message
     feature = _make_feature(db)
     result = await feature.memory_pin(message_id=msg_id, reason="crucial moment")
-    assert result["pinned"] is True
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert result.data["pinned"] is True
     assert len(db.pins) == 1
 
     # Delete via privacy wrapper (sovereign action)
@@ -454,7 +456,8 @@ async def test_pins_cannot_resist_sovereign_deletion():
     # Pin it
     feature = _make_feature(db)
     pin_result = await feature.memory_pin(message_id=msg_id, reason="life event")
-    assert pin_result["pinned"] is True
+    assert pin_result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert pin_result.data["pinned"] is True
 
     # Verify both the message and pin exist
     assert msg_id in db.messages

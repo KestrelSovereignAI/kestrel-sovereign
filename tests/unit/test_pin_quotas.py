@@ -15,6 +15,8 @@ import pytest
 from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock
 
+from kestrel_sdk.tools.result import ToolResultStatus
+
 
 class FakeDB:
     """In-memory fake database for testing the memory agency feature.
@@ -270,15 +272,17 @@ async def test_pin_quota_enforced():
     # Pin up to the quota limit -- all should succeed
     for i in range(PIN_QUOTA_DEFAULT):
         result = await feature.memory_pin(message_id=msg_ids[i], reason=f"pin {i}")
-        assert result["pinned"] is True, f"Pin {i} should succeed"
+        assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL), (
+            f"Pin {i} should succeed (got {result.status})"
+        )
+        assert result.data["pinned"] is True
 
     # The 101st pin should be rejected
     result = await feature.memory_pin(
         message_id=msg_ids[PIN_QUOTA_DEFAULT], reason="one too many"
     )
-    assert result.get("pinned") is False
-    assert "error" in result
-    assert "quota" in result["error"].lower()
+    assert result.status is ToolResultStatus.ERROR
+    assert "quota" in result.error.lower()
 
 
 @pytest.mark.asyncio
@@ -292,13 +296,13 @@ async def test_pin_quota_configurable():
 
     for i in range(custom_quota):
         result = await feature.memory_pin(message_id=msg_ids[i])
-        assert result["pinned"] is True
+        assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+        assert result.data["pinned"] is True
 
     # The (custom_quota + 1)th pin should fail
     result = await feature.memory_pin(message_id=msg_ids[custom_quota])
-    assert result.get("pinned") is False
-    assert "error" in result
-    assert str(custom_quota) in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert str(custom_quota) in result.error
 
 
 @pytest.mark.asyncio
@@ -315,11 +319,12 @@ async def test_pin_quota_repin_does_not_double_count():
 
     # Re-pin the first one -- should succeed (idempotent, not a new pin)
     result = await feature.memory_pin(message_id=msg_ids[0], reason="re-pin")
-    assert result["pinned"] is True
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert result.data["pinned"] is True
 
     # A genuinely new pin should still be rejected
     result = await feature.memory_pin(message_id=msg_ids[2])
-    assert result.get("pinned") is False
+    assert result.status is ToolResultStatus.ERROR
 
 
 # --------------------------------------------------------------------------
@@ -341,9 +346,11 @@ async def test_pin_ratio_warning():
     # Pin the third -- this pushes ratio to 3/4 = 75%
     result = await feature.memory_pin(message_id=msg_ids[2])
 
-    assert result["pinned"] is True
-    assert "warning" in result
-    assert "ratio" in result["warning"].lower()
+    # Honesty: high pin ratio surfaces as PARTIAL with the over-pinning
+    # caveat in result.error (was result["warning"] pre-#1042 layer 4).
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["pinned"] is True
+    assert "ratio" in result.error.lower()
 
 
 @pytest.mark.asyncio
@@ -359,8 +366,10 @@ async def test_pin_ratio_no_warning_below_threshold():
     await feature.memory_pin(message_id=msg_ids[1])
     result = await feature.memory_pin(message_id=msg_ids[2])
 
-    assert result["pinned"] is True
-    assert "warning" not in result
+    # 3/10 = 30% ratio, below threshold → OK (no over-pinning caveat).
+    assert result.status is ToolResultStatus.OK
+    assert result.data["pinned"] is True
+    assert not result.error
 
 
 # --------------------------------------------------------------------------
@@ -383,7 +392,8 @@ async def test_admin_bulk_unpin_all():
 
     result = await feature.memory_admin_unpin_all()
 
-    assert result["unpinned"] == 5
+    assert result.status is ToolResultStatus.OK
+    assert result.data["unpinned"] == 5
 
     # All pins should now be released
     active_after = sum(1 for p in db.pins.values() if p["released_at"] is None)
@@ -402,7 +412,8 @@ async def test_admin_bulk_unpin_all_empty():
     feature = _make_feature(db, pin_quota=100)
 
     result = await feature.memory_admin_unpin_all()
-    assert result["unpinned"] == 0
+    assert result.status is ToolResultStatus.OK
+    assert result.data["unpinned"] == 0
 
 
 # --------------------------------------------------------------------------
@@ -429,8 +440,9 @@ async def test_admin_unpin_oldest():
     # Unpin the 2 oldest
     result = await feature.memory_admin_unpin_oldest(count=2)
 
-    assert result["unpinned"] == 2
-    assert result["requested"] == 2
+    assert result.status is ToolResultStatus.OK
+    assert result.data["unpinned"] == 2
+    assert result.data["requested"] == 2
 
     # The 2 oldest messages should be unpinned; the 3 newest should remain
     active_message_ids = {
@@ -468,8 +480,11 @@ async def test_admin_unpin_oldest_more_than_exist():
 
     result = await feature.memory_admin_unpin_oldest(count=10)
 
-    assert result["unpinned"] == 3
-    assert result["requested"] == 10
+    # Honesty: requested 10 but only 3 active → PARTIAL with shortfall caveat.
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["unpinned"] == 3
+    assert result.data["requested"] == 10
+    assert "10" in result.error or "3" in result.error
 
     active_after = sum(1 for p in db.pins.values() if p["released_at"] is None)
     assert active_after == 0
@@ -494,16 +509,17 @@ async def test_pin_stats_includes_quota_info():
 
     stats = await feature.memory_pin_stats()
 
-    assert stats["total_messages"] == 10
-    assert stats["pinned"] == 3
-    assert stats["quota"] == 50
-    assert stats["quota_remaining"] == 47
-    assert stats["pin_ratio"] == 0.3
+    # 30% ratio is below alert threshold → OK (no over-pinning caveat).
+    assert stats.status is ToolResultStatus.OK
+    assert stats.data["total_messages"] == 10
+    assert stats.data["pinned"] == 3
+    assert stats.data["quota"] == 50
+    assert stats.data["quota_remaining"] == 47
+    assert stats.data["pin_ratio"] == 0.3
     # Age fields should be present (non-None since we have pins)
-    assert stats["oldest_pin_age_seconds"] is not None
-    assert stats["average_pin_age_seconds"] is not None
-    # No alert at 30% ratio
-    assert "alert" not in stats
+    assert stats.data["oldest_pin_age_seconds"] is not None
+    assert stats.data["average_pin_age_seconds"] is not None
+    assert not stats.error
 
 
 @pytest.mark.asyncio
@@ -520,9 +536,10 @@ async def test_pin_stats_alert_when_ratio_exceeds_threshold():
 
     stats = await feature.memory_pin_stats()
 
-    assert stats["pin_ratio"] == 0.75
-    assert "alert" in stats
-    assert "threshold" in stats["alert"].lower()
+    # 75% ratio exceeds threshold → PARTIAL with alert in result.error.
+    assert stats.status is ToolResultStatus.PARTIAL
+    assert stats.data["pin_ratio"] == 0.75
+    assert "threshold" in stats.error.lower()
 
 
 @pytest.mark.asyncio
@@ -537,13 +554,14 @@ async def test_pin_stats_no_pins():
 
     stats = await feature.memory_pin_stats()
 
-    assert stats["pinned"] == 0
-    assert stats["quota"] == 100
-    assert stats["quota_remaining"] == 100
-    assert stats["pin_ratio"] == 0.0
-    assert stats["oldest_pin_age_seconds"] is None
-    assert stats["average_pin_age_seconds"] is None
-    assert "alert" not in stats
+    assert stats.status is ToolResultStatus.OK
+    assert stats.data["pinned"] == 0
+    assert stats.data["quota"] == 100
+    assert stats.data["quota_remaining"] == 100
+    assert stats.data["pin_ratio"] == 0.0
+    assert stats.data["oldest_pin_age_seconds"] is None
+    assert stats.data["average_pin_age_seconds"] is None
+    assert not stats.error
 
 
 @pytest.mark.asyncio
@@ -561,6 +579,8 @@ async def test_pin_stats_quota_remaining_floor_at_zero():
     feature.pin_quota = 5
 
     stats = await feature.memory_pin_stats()
-    assert stats["pinned"] == 10
-    assert stats["quota"] == 5
-    assert stats["quota_remaining"] == 0  # floor at zero, not negative
+    # 100% ratio → PARTIAL with over-pinning caveat.
+    assert stats.status is ToolResultStatus.PARTIAL
+    assert stats.data["pinned"] == 10
+    assert stats.data["quota"] == 5
+    assert stats.data["quota_remaining"] == 0  # floor at zero, not negative

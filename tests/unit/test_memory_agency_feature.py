@@ -230,15 +230,18 @@ async def test_initialize_uses_raw_storage_without_touching_wrapper_db():
 @pytest.mark.asyncio
 async def test_pin_memory_sets_decay_protected():
     """Pinning a message should set decay_protected=True in its metadata."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     msg_id = db.add_message("Remember this important event", {"importance": 0.8})
     feature = _make_feature(db)
 
     result = await feature.memory_pin(message_id=msg_id, reason="milestone")
 
-    assert result["pinned"] is True
-    assert result["message_id"] == msg_id
-    assert "Remember this" in result["preview"]
+    # 1 pin / 1 message = 100% ratio → PARTIAL with over-pinning caveat
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["pinned"] is True
+    assert result.data["message_id"] == msg_id
+    assert "Remember this" in result.data["preview"]
 
     # Verify metadata was updated
     stored_meta = json.loads(db.messages[msg_id]["metadata"])
@@ -248,6 +251,7 @@ async def test_pin_memory_sets_decay_protected():
 @pytest.mark.asyncio
 async def test_release_memory_clears_pin():
     """Releasing a pinned message should clear decay_protected and set released_at."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     msg_id = db.add_message("Temporary note", {"importance": 0.5})
     feature = _make_feature(db)
@@ -257,8 +261,9 @@ async def test_release_memory_clears_pin():
     # Release
     result = await feature.memory_release(message_id=msg_id)
 
-    assert result["released"] is True
-    assert result["message_id"] == msg_id
+    assert result.status is ToolResultStatus.OK
+    assert result.data["released"] is True
+    assert result.data["message_id"] == msg_id
 
     # Metadata should have decay_protected=False
     stored_meta = json.loads(db.messages[msg_id]["metadata"])
@@ -272,6 +277,7 @@ async def test_release_memory_clears_pin():
 @pytest.mark.asyncio
 async def test_list_pinned_returns_active_pins():
     """memory_pinned should return only non-released pins."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     msg1 = db.add_message("First memory")
     msg2 = db.add_message("Second memory")
@@ -287,8 +293,9 @@ async def test_list_pinned_returns_active_pins():
 
     result = await feature.memory_pinned()
 
-    assert result["count"] == 2
-    pinned_ids = {p["message_id"] for p in result["pins"]}
+    assert result.status is ToolResultStatus.OK
+    assert result.data["count"] == 2
+    pinned_ids = {p["message_id"] for p in result.data["pins"]}
     assert msg1 in pinned_ids
     assert msg3 in pinned_ids
     assert msg2 not in pinned_ids
@@ -297,6 +304,7 @@ async def test_list_pinned_returns_active_pins():
 @pytest.mark.asyncio
 async def test_pin_stats_returns_ratios():
     """memory_pin_stats should return correct counts and ratios."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     # Add 10 messages
     ids = [db.add_message(f"Message {i}") for i in range(10)]
@@ -312,10 +320,12 @@ async def test_pin_stats_returns_ratios():
 
     result = await feature.memory_pin_stats()
 
-    assert result["total_messages"] == 10
-    assert result["pinned"] == 2       # 3 pinned - 1 released = 2 active
-    assert result["released"] == 1
-    assert result["pin_ratio"] == 0.2  # 2 / 10
+    # 2/10 = 20% ratio, below threshold → OK
+    assert result.status is ToolResultStatus.OK
+    assert result.data["total_messages"] == 10
+    assert result.data["pinned"] == 2       # 3 pinned - 1 released = 2 active
+    assert result.data["released"] == 1
+    assert result.data["pin_ratio"] == 0.2  # 2 / 10
 
 
 @pytest.mark.asyncio
@@ -340,25 +350,27 @@ async def test_double_pin_is_idempotent():
 @pytest.mark.asyncio
 async def test_pin_nonexistent_message_returns_error():
     """Pinning a message that does not exist should return an error."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     feature = _make_feature(db)
 
     result = await feature.memory_pin(message_id=99999)
 
-    assert "error" in result
-    assert "99999" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "99999" in result.error
 
 
 @pytest.mark.asyncio
 async def test_release_nonexistent_message_returns_error():
     """Releasing a message that does not exist should return an error."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     feature = _make_feature(db)
 
     result = await feature.memory_release(message_id=99999)
 
-    assert "error" in result
-    assert "99999" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "99999" in result.error
 
 
 @pytest.mark.asyncio
@@ -423,6 +435,7 @@ async def test_pin_preserves_existing_metadata():
 @pytest.mark.asyncio
 async def test_save_fact_creates_kg_node():
     """save_fact should create a learned_fact node in the knowledge graph."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     graph = FakeGraphStore()
     feature = _make_feature(db, graph_store=graph)
@@ -431,13 +444,14 @@ async def test_save_fact_creates_kg_node():
         subject="user", predicate="favorite_number", value="445"
     )
 
-    assert result["saved"] is True
-    assert result["subject"] == "user"
-    assert result["predicate"] == "favorite_number"
-    assert result["value"] == "445"
+    assert result.status is ToolResultStatus.OK
+    assert result.data["saved"] is True
+    assert result.data["subject"] == "user"
+    assert result.data["predicate"] == "favorite_number"
+    assert result.data["value"] == "445"
 
     # Verify KG node was created
-    fact_id = result["node_id"]
+    fact_id = result.data["node_id"]
     assert fact_id in graph.nodes
     node = graph.nodes[fact_id]
     assert node.node_type == "learned_fact"
@@ -455,6 +469,7 @@ async def test_save_fact_creates_kg_node():
 @pytest.mark.asyncio
 async def test_save_fact_upserts_same_subject_predicate():
     """Saving the same subject+predicate should update the existing node."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     graph = FakeGraphStore()
     feature = _make_feature(db, graph_store=graph)
@@ -462,8 +477,9 @@ async def test_save_fact_upserts_same_subject_predicate():
     await feature.save_fact(subject="user", predicate="favorite_color", value="blue")
     result = await feature.save_fact(subject="user", predicate="favorite_color", value="green")
 
-    assert result["saved"] is True
-    assert result["value"] == "green"
+    assert result.status is ToolResultStatus.OK
+    assert result.data["saved"] is True
+    assert result.data["value"] == "green"
 
     # Should still be one node (upserted)
     fact_id = "fact:test-agent:user:favorite_color"
@@ -473,7 +489,8 @@ async def test_save_fact_upserts_same_subject_predicate():
 
 @pytest.mark.asyncio
 async def test_save_fact_clamps_confidence():
-    """Confidence should be clamped to [0.0, 1.0]."""
+    """Out-of-range confidence is clamped and surfaced as PARTIAL."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     graph = FakeGraphStore()
     feature = _make_feature(db, graph_store=graph)
@@ -481,21 +498,28 @@ async def test_save_fact_clamps_confidence():
     result = await feature.save_fact(
         subject="user", predicate="test", value="x", confidence=2.5
     )
-    assert result["confidence"] == 1.0
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["confidence"] == 1.0
+    assert result.data["confidence_requested"] == 2.5
+    assert result.data["confidence_clamped"] is True
+    assert "clamped" in result.error
 
     result = await feature.save_fact(
         subject="user", predicate="test2", value="y", confidence=-0.5
     )
-    assert result["confidence"] == 0.0
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["confidence"] == 0.0
+    assert result.data["confidence_clamped"] is True
 
 
 @pytest.mark.asyncio
 async def test_save_fact_without_graph_returns_error():
     """save_fact should return error if graph store is not available."""
+    from kestrel_sdk.tools.result import ToolResultStatus
     db = FakeDB()
     feature = _make_feature(db, graph_store=None)
 
     result = await feature.save_fact(subject="user", predicate="name", value="Alice")
 
-    assert "error" in result
-    assert "not available" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "not available" in result.error
