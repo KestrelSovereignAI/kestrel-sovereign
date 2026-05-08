@@ -405,13 +405,16 @@ class TestHeartbeatCheck:
     @pytest.mark.asyncio
     async def test_returns_all_checks(self, feature):
         """health_check returns results for all 5 checks."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.health_check()
-        assert "id" in result
-        assert "status" in result
-        assert "checks" in result
-        assert "created_at" in result
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert "id" in data
+        assert "status" in data
+        assert "checks" in data
+        assert "created_at" in data
 
-        check_names = {c["name"] for c in result["checks"]}
+        check_names = {c["name"] for c in data["checks"]}
         assert "database" in check_names
         assert "llm_service" in check_names
         assert "memory_system" in check_names
@@ -439,11 +442,14 @@ class TestHeartbeatCheck:
     @pytest.mark.asyncio
     async def test_healthy_when_all_pass(self, feature):
         """Status is 'healthy' when all checks pass."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.health_check()
+        assert result.status is ToolResultStatus.OK
+        data = result.data
         # With our mock agent that has db, llm, storage, the checks should mostly pass
-        assert result["status"] in ("healthy", "degraded")
+        assert data["status"] in ("healthy", "degraded")
         # overall_healthy should match
-        assert result["overall_healthy"] == (result["status"] == "healthy")
+        assert data["overall_healthy"] == (data["status"] == "healthy")
 
 
 class TestHeartbeatStatus:
@@ -461,14 +467,16 @@ class TestHeartbeatStatus:
 
     @pytest.mark.asyncio
     async def test_returns_uptime(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         result = await feature.health_history()
-        assert "uptime_seconds" in result
-        assert result["uptime_seconds"] >= 0
+        assert result.status is ToolResultStatus.OK
+        assert "uptime_seconds" in result.data
+        assert result.data["uptime_seconds"] >= 0
 
     @pytest.mark.asyncio
     async def test_returns_interval(self, feature):
         result = await feature.health_history()
-        assert result["interval_seconds"] == DEFAULT_INTERVAL_SECONDS
+        assert result.data["interval_seconds"] == DEFAULT_INTERVAL_SECONDS
 
     @pytest.mark.asyncio
     async def test_returns_history_from_db(self, feature):
@@ -479,9 +487,10 @@ class TestHeartbeatStatus:
         ])
 
         result = await feature.health_history(limit=10)
-        assert result["history_count"] == 2
-        assert result["history"][0]["id"] == "id-1"
-        assert result["history"][1]["id"] == "id-2"
+        data = result.data
+        assert data["history_count"] == 2
+        assert data["history"][0]["id"] == "id-1"
+        assert data["history"][1]["id"] == "id-2"
 
     @pytest.mark.asyncio
     async def test_trend_stable(self, feature):
@@ -491,7 +500,7 @@ class TestHeartbeatStatus:
             ("id-2", "healthy", '[]', 1, "2026-03-05T11:00:00"),
         ])
         result = await feature.health_history()
-        assert result["trend"] == "stable"
+        assert result.data["trend"] == "stable"
 
     @pytest.mark.asyncio
     async def test_trend_declining(self, feature):
@@ -501,7 +510,7 @@ class TestHeartbeatStatus:
             ("id-2", "healthy", '[]', 1, "2026-03-05T11:00:00"),
         ])
         result = await feature.health_history()
-        assert result["trend"] == "declining"
+        assert result.data["trend"] == "declining"
 
     @pytest.mark.asyncio
     async def test_trend_recovering(self, feature):
@@ -511,7 +520,7 @@ class TestHeartbeatStatus:
             ("id-2", "unhealthy", '[]', 0, "2026-03-05T11:00:00"),
         ])
         result = await feature.health_history()
-        assert result["trend"] == "recovering"
+        assert result.data["trend"] == "recovering"
 
     @pytest.mark.asyncio
     async def test_falls_back_to_memory_history(self, feature):
@@ -521,8 +530,9 @@ class TestHeartbeatStatus:
             {"id": "mem-1", "status": "healthy", "overall_healthy": True},
         ]
         result = await feature.health_history()
-        assert result["history_count"] == 1
-        assert result["history"][0]["id"] == "mem-1"
+        data = result.data
+        assert data["history_count"] == 1
+        assert data["history"][0]["id"] == "mem-1"
 
 
 class _FakeTask:
@@ -571,26 +581,39 @@ class TestHeartbeatInterval:
 
     @pytest.mark.asyncio
     async def test_changes_interval(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
             result = await feature.health_interval(seconds=120)
 
-        assert result["old_interval_seconds"] == DEFAULT_INTERVAL_SECONDS
-        assert result["new_interval_seconds"] == 120
+        assert result.status is ToolResultStatus.OK
+        assert result.data["old_interval_seconds"] == DEFAULT_INTERVAL_SECONDS
+        assert result.data["new_interval_seconds"] == 120
         assert feature._interval_seconds == 120
 
     @pytest.mark.asyncio
     async def test_clamps_minimum(self, feature):
+        """Round 1 honesty: requesting an out-of-range interval is
+        silently clamped — surface as PARTIAL with the actual applied
+        value so the LLM cannot claim "set to 1" when the runtime
+        accepted 10."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
             result = await feature.health_interval(seconds=1)
 
-        assert result["new_interval_seconds"] == 10
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["new_interval_seconds"] == 10
+        assert result.data["requested_seconds"] == 1
+        assert "outside" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_clamps_maximum(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         with patch("asyncio.create_task", return_value=_make_awaitable_task()):
             result = await feature.health_interval(seconds=9999)
 
-        assert result["new_interval_seconds"] == 3600
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["new_interval_seconds"] == 3600
+        assert result.data["requested_seconds"] == 9999
 
 
 # ============================================================================
@@ -676,13 +699,16 @@ class TestGracefulDegradation:
             await feat.initialize()
 
         result = await feat.health_check()
-        assert "id" in result
-        assert "checks" in result
+        from kestrel_sdk.tools.result import ToolResultStatus
+        assert result.status is ToolResultStatus.OK
+        data = result.data
+        assert "id" in data
+        assert "checks" in data
         # Database check should fail but others should still run
-        db_check = next(c for c in result["checks"] if c["name"] == "database")
+        db_check = next(c for c in data["checks"] if c["name"] == "database")
         assert db_check["status"] == "fail"
         # LLM check should pass
-        llm_check = next(c for c in result["checks"] if c["name"] == "llm_service")
+        llm_check = next(c for c in data["checks"] if c["name"] == "llm_service")
         assert llm_check["status"] == "pass"
 
         feat._running = False
@@ -702,7 +728,7 @@ class TestGracefulDegradation:
         await feat.health_check()
 
         result = await feat.health_history()
-        assert result["history_count"] == 1
+        assert result.data["history_count"] == 1
 
         feat._running = False
 
@@ -729,7 +755,7 @@ class TestGracefulDegradation:
 
         # Should not raise
         result = await feat.health_check()
-        assert "id" in result
+        assert "id" in result.data
         assert len(feat._in_memory_history) == 1
 
         feat._running = False
