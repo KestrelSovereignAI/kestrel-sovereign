@@ -487,8 +487,18 @@ async def notifications_sse(request: Request):
             yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
 
             ping_interval = SSE_PING_INTERVAL_SECONDS
-            poll_interval = 0.5  # Check for task notifications every 500ms
+            # Wave 5C: revising events are time-sensitive — the chat
+            # UI uses them to retract pre-tool prose BEFORE post-tool
+            # synthesis chunks land on the parallel /api/agent/stream
+            # channel. The previous polling interval of 500ms could
+            # cause SSE delivery to race the chat-stream chunks. We
+            # block on event_queue.get() with a short timeout instead
+            # so emit_event-sourced events deliver sub-frame; the
+            # timeout still drives the legacy task-notification poll
+            # and the keepalive ping. Codex P2 of #1084.
+            task_poll_interval = 0.5
             last_ping = time.monotonic()
+            last_task_poll = 0.0
 
             while True:
                 # Check if client disconnected
@@ -496,44 +506,51 @@ async def notifications_sse(request: Request):
                     logger.debug("SSE client disconnected")
                     break
 
-                # Drain any events from the agent event bus without blocking.
-                # These arrive as (event_type, payload) tuples and are forwarded
-                # as native SSE events so the browser's EventSource can route
-                # them via addEventListener(event_type, ...).
-                while True:
-                    try:
-                        event_type, data = event_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+                # Block waiting for an event, but bound the wait so
+                # task notifications + ping still fire on schedule.
+                try:
+                    event_type, data = await asyncio.wait_for(
+                        event_queue.get(), timeout=0.1,
+                    )
                     yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+                    # Drain any other events queued behind the first.
+                    while True:
+                        try:
+                            event_type, data = event_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        yield f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+                except asyncio.TimeoutError:
+                    pass
 
-                # Check for pending task-completion notifications
-                notifications = agent.get_pending_notifications()
-                for notification in notifications:
-                    # Determine notification type from emoji prefix
-                    if notification.startswith("✅"):
-                        notif_type = "completed"
-                    elif notification.startswith("❌"):
-                        notif_type = "failed"
-                    elif notification.startswith("⚠️"):
-                        notif_type = "canceled"
-                    else:
-                        notif_type = "info"
+                current_time = time.monotonic()
 
-                    event_data = json.dumps({
-                        "message": notification,
-                        "type": notif_type
-                    })
-                    yield f"event: task_notification\ndata: {event_data}\n\n"
+                # Task-completion notifications come from a polling
+                # source (agent.get_pending_notifications), not the
+                # event queue. Keep them on the slower interval.
+                if current_time - last_task_poll >= task_poll_interval:
+                    notifications = agent.get_pending_notifications()
+                    for notification in notifications:
+                        if notification.startswith("✅"):
+                            notif_type = "completed"
+                        elif notification.startswith("❌"):
+                            notif_type = "failed"
+                        elif notification.startswith("⚠️"):
+                            notif_type = "canceled"
+                        else:
+                            notif_type = "info"
+
+                        event_data = json.dumps({
+                            "message": notification,
+                            "type": notif_type,
+                        })
+                        yield f"event: task_notification\ndata: {event_data}\n\n"
+                    last_task_poll = current_time
 
                 # Send keepalive ping
-                current_time = time.monotonic()
                 if current_time - last_ping >= ping_interval:
                     yield f"event: ping\ndata: {json.dumps({'time': current_time})}\n\n"
                     last_ping = current_time
-
-                # Brief sleep before next poll
-                await asyncio.sleep(poll_interval)
 
         except asyncio.CancelledError:
             logger.debug("SSE connection cancelled")

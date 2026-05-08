@@ -1062,6 +1062,15 @@ nav {
 
 /* Provider filter UI now integrated into dropdown via SharedModelSelector */
 
+/* Wave 5C: revising placeholder shown when the server retracts
+   pre-tool prose via the `revising` SSE event. The next streaming
+   chunk replaces this with the post-tool synthesis. */
+.revising-placeholder {
+    color: var(--text-secondary);
+    opacity: 0.75;
+    font-style: italic;
+}
+
 /* Thinking Indicator */
 .thinking-indicator {
     display: flex;
