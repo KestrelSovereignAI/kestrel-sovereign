@@ -13,7 +13,7 @@ from kestrel_sovereign.config import TRUSTED_AGENTS_DIR
 from typing import Optional, Dict, List, Any, Union
 import re
 from pathlib import Path
-from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.extensions.app_extension import AppExtension
 from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.features import discover_features, get_feature_by_name
@@ -983,7 +983,7 @@ class KestrelAgent(
         self.storage.set_privacy_mode(mode)
         status_message = self.privacy_agent.set_mode(mode)
 
-        config = mode.to_config()
+        config = privacy_mode_to_config(mode)
         model_switched = self._apply_privacy_model_transition(config)
         voice_switched, biometric_warning = await self._apply_privacy_voice_transition(config)
 

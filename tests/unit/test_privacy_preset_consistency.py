@@ -4,7 +4,13 @@ from unittest.mock import MagicMock
 
 from kestrel_sovereign.command_handler import CommandHandler
 from kestrel_sovereign.features.privacy import PrivacyAgent
-from kestrel_sovereign.privacy import PRIVACY_PRESETS, PrivacyMode, get_privacy_preset
+from kestrel_sovereign.privacy import (
+    PRIVACY_PRESETS,
+    PrivacyMode,
+    get_privacy_preset,
+    privacy_config_to_mode,
+    privacy_mode_to_config,
+)
 
 
 def test_privacy_presets_match_canonical_flag_combinations():
@@ -31,8 +37,8 @@ def test_privacy_presets_match_canonical_flag_combinations():
 
 def test_privacy_mode_round_trips_to_named_presets():
     for mode in PrivacyMode:
-        config = mode.to_config()
-        assert PrivacyMode.from_config(config) == mode
+        config = privacy_mode_to_config(mode)
+        assert privacy_config_to_mode(config) == mode
         assert config == PRIVACY_PRESETS[mode.value]
 
 
