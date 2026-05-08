@@ -210,6 +210,8 @@ async def test_webhook_registration_and_audit_history_are_backend_neutral(db_bac
     feature = WebhookFeature(agent)
     await feature.initialize()
 
+    # Webhook tools migrated to ToolResult (#1061 wave 26).
+    from kestrel_sdk.tools.result import ToolResultStatus
     webhook_name = f"audit-{uuid4().hex}"
     registered = await feature.webhooks_register(
         name=webhook_name,
@@ -217,11 +219,11 @@ async def test_webhook_registration_and_audit_history_are_backend_neutral(db_bac
         event_type="sync",
         rate_limit=0,
     )
-    assert registered["success"] is True
+    assert registered.status is ToolResultStatus.OK
 
     listed = await feature.webhooks_list()
-    assert listed["count"] == 1
-    assert listed["webhooks"][0]["name"] == webhook_name
+    assert listed.data["count"] == 1
+    assert listed.data["webhooks"][0]["name"] == webhook_name
 
     await feature.log_webhook_event(
         webhook_name=webhook_name,
@@ -232,7 +234,7 @@ async def test_webhook_registration_and_audit_history_are_backend_neutral(db_bac
     )
 
     history = await feature.webhooks_history(limit=5)
-    assert history["count"] == 1
-    assert history["events"][0]["webhook_name"] == webhook_name
-    assert history["events"][0]["authenticated"] is True
-    assert history["events"][0]["payload_hash"] == "abc123"
+    assert history.data["count"] == 1
+    assert history.data["events"][0]["webhook_name"] == webhook_name
+    assert history.data["events"][0]["authenticated"] is True
+    assert history.data["events"][0]["payload_hash"] == "abc123"

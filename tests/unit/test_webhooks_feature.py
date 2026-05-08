@@ -616,9 +616,9 @@ class TestWebhookFeatureInitializeWithoutDB:
         feat = WebhookFeature(agent)
         await feat.initialize()
 
-        result = await feat.webhooks_list()
-        assert result["count"] == 0
-        assert result["webhooks"] == []
+        envelope = await feat.webhooks_list()
+        assert envelope.data["count"] == 0
+        assert envelope.data["webhooks"] == []
 
 
 class TestWebhookFeatureLoadPersisted:
@@ -667,16 +667,16 @@ class TestWebhooksList:
 
     @pytest.mark.asyncio
     async def test_list_empty(self, feature):
-        result = await feature.webhooks_list()
-        assert result["count"] == 0
-        assert result["webhooks"] == []
+        envelope = await feature.webhooks_list()
+        assert envelope.data["count"] == 0
+        assert envelope.data["webhooks"] == []
 
     @pytest.mark.asyncio
     async def test_list_after_register(self, feature):
         await feature.webhooks_register(name="test-hook", auth_type="none")
-        result = await feature.webhooks_list()
-        assert result["count"] == 1
-        assert result["webhooks"][0]["name"] == "test-hook"
+        envelope = await feature.webhooks_list()
+        assert envelope.data["count"] == 1
+        assert envelope.data["webhooks"][0]["name"] == "test-hook"
 
 
 class TestWebhooksRegister:
@@ -690,72 +690,81 @@ class TestWebhooksRegister:
 
     @pytest.mark.asyncio
     async def test_register_none_auth(self, feature):
-        result = await feature.webhooks_register(name="open-hook", auth_type="none")
-        assert result["success"] is True
-        assert result["name"] == "open-hook"
-        assert result["endpoint"] == "/webhooks/open-hook"
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(name="open-hook", auth_type="none")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["name"] == "open-hook"
+        assert envelope.data["endpoint"] == "/webhooks/open-hook"
 
     @pytest.mark.asyncio
     async def test_register_bearer_auth(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="secure-hook",
             auth_type="bearer_token",
             auth_config_json='{"token": "test-token"}',
         )
-        assert result["success"] is True
-        assert result["auth_type"] == "bearer_token"
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["auth_type"] == "bearer_token"
 
     @pytest.mark.asyncio
     async def test_register_hmac_auth(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="hmac-hook",
             auth_type="hmac_sha256",
             auth_config_json='{"secret": "my-secret"}',
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_register_ip_allowlist(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="ip-hook",
             auth_type="ip_allowlist",
             auth_config_json='{"allowed_ips": ["10.0.0.0/8"]}',
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_register_invalid_auth_type(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="bad-hook", auth_type="magic_auth"
         )
-        assert result["success"] is False
-        assert "Invalid auth_type" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "Invalid auth_type" in envelope.error
 
     @pytest.mark.asyncio
     async def test_register_invalid_auth_config_json(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="bad-json", auth_type="none", auth_config_json="not-json"
         )
-        assert result["success"] is False
-        assert "auth_config_json" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "auth_config_json" in envelope.error
 
     @pytest.mark.asyncio
     async def test_register_invalid_name(self, feature):
-        result = await feature.webhooks_register(name="bad name!", auth_type="none")
-        assert result["success"] is False
-        assert "alphanumeric" in result["error"]
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(name="bad name!", auth_type="none")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "alphanumeric" in envelope.error
 
     @pytest.mark.asyncio
     async def test_register_empty_name(self, feature):
-        result = await feature.webhooks_register(name="", auth_type="none")
-        assert result["success"] is False
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(name="", auth_type="none")
+        assert envelope.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_register_duplicate(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         await feature.webhooks_register(name="dup-hook", auth_type="none")
-        result = await feature.webhooks_register(name="dup-hook", auth_type="none")
-        assert result["success"] is False
-        assert "already registered" in result["error"]
+        envelope = await feature.webhooks_register(name="dup-hook", auth_type="none")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "already registered" in envelope.error
 
     @pytest.mark.asyncio
     async def test_register_persists_to_db(self, feature):
@@ -768,26 +777,29 @@ class TestWebhooksRegister:
 
     @pytest.mark.asyncio
     async def test_register_with_custom_rate_limit(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="rate-hook", auth_type="none", rate_limit=10
         )
-        assert result["success"] is True
-        assert result["rate_limit"] == 10
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["rate_limit"] == 10
 
     @pytest.mark.asyncio
     async def test_register_with_event_type(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="event-hook", auth_type="none", event_type="push"
         )
-        assert result["success"] is True
-        assert result["event_type"] == "push"
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["event_type"] == "push"
 
     @pytest.mark.asyncio
     async def test_register_hyphens_and_underscores_in_name(self, feature):
-        result = await feature.webhooks_register(
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
             name="my-webhook_v2", auth_type="none"
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
 
 
 class TestWebhooksRemove:
@@ -801,16 +813,18 @@ class TestWebhooksRemove:
 
     @pytest.mark.asyncio
     async def test_remove_existing(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         await feature.webhooks_register(name="to-remove", auth_type="none")
-        result = await feature.webhooks_remove(name="to-remove")
-        assert result["success"] is True
-        assert result["status"] == "removed"
+        envelope = await feature.webhooks_remove(name="to-remove")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["status"] == "removed"
 
     @pytest.mark.asyncio
     async def test_remove_not_found(self, feature):
-        result = await feature.webhooks_remove(name="nonexistent")
-        assert result["success"] is False
-        assert "not found" in result["error"]
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_remove(name="nonexistent")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not found" in envelope.error
 
     @pytest.mark.asyncio
     async def test_remove_deletes_from_db(self, feature):
@@ -835,9 +849,9 @@ class TestWebhooksHistory:
 
     @pytest.mark.asyncio
     async def test_history_empty(self, feature):
-        result = await feature.webhooks_history()
-        assert result["count"] == 0
-        assert result["events"] == []
+        envelope = await feature.webhooks_history()
+        assert envelope.data["count"] == 0
+        assert envelope.data["events"] == []
 
     @pytest.mark.asyncio
     async def test_history_from_db(self, feature):
@@ -845,10 +859,10 @@ class TestWebhooksHistory:
             ("ev-1", "hook-a", "1.1.1.1", 1, 200, "abc", "2026-03-05T10:00:00"),
             ("ev-2", "hook-b", "2.2.2.2", 0, 401, "def", "2026-03-05T09:00:00"),
         ])
-        result = await feature.webhooks_history()
-        assert result["count"] == 2
-        assert result["events"][0]["id"] == "ev-1"
-        assert result["events"][1]["authenticated"] is False
+        envelope = await feature.webhooks_history()
+        assert envelope.data["count"] == 2
+        assert envelope.data["events"][0]["id"] == "ev-1"
+        assert envelope.data["events"][1]["authenticated"] is False
 
     @pytest.mark.asyncio
     async def test_history_falls_back_to_memory(self, feature):
@@ -858,15 +872,39 @@ class TestWebhooksHistory:
         await feature.receiver.handle_webhook(
             "hook", headers={}, body=b"test", source_ip="3.3.3.3"
         )
-        result = await feature.webhooks_history()
-        assert result["count"] == 1
+        envelope = await feature.webhooks_history()
+        assert envelope.data["count"] == 1
 
     @pytest.mark.asyncio
     async def test_history_respects_limit(self, feature):
         feature._db.fetchall = AsyncMock(return_value=[])
-        result = await feature.webhooks_history(limit=5)
+        envelope = await feature.webhooks_history(limit=5)
         # Verify limit was passed (or at least used)
-        assert result["count"] == 0  # No data, just checking it doesn't crash
+        assert envelope.data["count"] == 0  # No data, just checking it doesn't crash
+
+    @pytest.mark.asyncio
+    async def test_history_partial_when_db_query_fails(self, feature):
+        """When the DB query raises, the envelope must say so — the
+        in-memory ring buffer fallback may be missing persisted events.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.fetchall = AsyncMock(side_effect=RuntimeError("disk i/o error"))
+        envelope = await feature.webhooks_history()
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "in-memory ring buffer" in envelope.error
+
+    @pytest.mark.asyncio
+    async def test_register_partial_when_persist_fails(self, feature):
+        """When the in-memory register succeeds but the DB INSERT
+        raises, the envelope must surface PARTIAL — the webhook
+        works now but won't survive a restart.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.execute = AsyncMock(side_effect=RuntimeError("table missing"))
+        envelope = await feature.webhooks_register(name="lost-on-restart", auth_type="none")
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "NOT survive" in envelope.error
+        assert envelope.data["persisted"] is False
 
 
 # ============================================================================
