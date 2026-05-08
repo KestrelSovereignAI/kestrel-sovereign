@@ -1,6 +1,6 @@
 # Kestrel Workflows Feature — Architecture Design
 
-> Draft v3.2. Pre-filing. Revised after three adversarial review rounds (v1→v2 flipped the engine; v2→v3 hardened conformance / idempotency / leases / attestation / budgets; v3→v3.1 closed round-3 inline fixes; v3.1→v3.2 adds Talon-aware constitutional injection §3.8). All changelogs in the appendix.
+> Draft v3.3. Pre-filing. Revised after four review rounds (v1→v2 flipped the engine; v2→v3 hardened conformance / idempotency / leases / attestation / budgets; v3→v3.1 closed round-3 inline fixes; v3.1→v3.2 added Talon-aware constitutional injection §3.8; v3.2→v3.3 closed codex round-4 internal-consistency P2s). All changelogs in the appendix.
 
 ## Executive Summary
 
@@ -390,7 +390,9 @@ CREATE TABLE workflow_stage_events (
     event_id          UUID PRIMARY KEY,
     run_id            UUID NOT NULL REFERENCES workflow_runs(run_id),
     stage             TEXT NOT NULL,
-    event_type        TEXT NOT NULL,  -- enter|action_complete|gate_pass|gate_fail|compensate_start|compensate_complete|retry|abort
+    event_type        TEXT NOT NULL,
+        -- enter|action_complete|action_complete_post_cancel|gate_pass|gate_fail
+        -- |compensate_start|compensate_complete|retry|abort|cancel_barrier_set
     idempotency_key   TEXT NOT NULL,  -- sha256(run_id||stage||attempt_input_hash)
     payload_json      JSONB NOT NULL,
     actor_did         TEXT NOT NULL,
@@ -427,7 +429,18 @@ CREATE INDEX ON workflow_signals (run_id, stage, signal_name) WHERE consumed_at 
 - A retention cron (built on `features/scheduler/`) honors `workflow_definitions.retention_days`, soft-deleting runs and events past their TTL.
 - Soft-delete pattern matches the existing project pattern (`project_soft_delete_shipped.md`, PRs #763–#767). A separate hard-delete cron purges soft-deleted rows after a grace window.
 
-**SQLite parity:** `JSONB` becomes `TEXT` on SQLite; GIN index is Postgres-only and the StorageAdapter detects backend at startup.
+**SQLite parity (full mapping):** the schema above is written in Postgres dialect for readability; the `StorageAdapter`'s migration emitter produces backend-specific DDL using the following substitutions on SQLite. Migrations that depend only on Postgres types fail loudly at SQLite startup with a missing-mapping error rather than silently truncating.
+
+| Postgres | SQLite | Notes |
+|---|---|---|
+| `UUID` | `TEXT` | Application stores canonical 36-char UUID strings; lexicographic ordering is fine for indexes. |
+| `TIMESTAMPTZ` | `TEXT` | ISO-8601 with explicit `Z` suffix; `datetime(... )` SQLite functions handle comparisons. |
+| `DEFAULT now()` | `DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))` | Same wall-clock semantics. |
+| `JSONB` | `TEXT` | JSON-validated at write time by the adapter; queries use `json_extract` on SQLite, `jsonb_path_query` on Postgres. |
+| `TEXT[]` (n/a — replaced by `current_stages_json`) | `TEXT` (JSON array) | Already encoded as JSON in v3 schema for portability. |
+| Partial indexes (`WHERE foo IS NULL`) | Same syntax | SQLite supports partial indexes since 3.8.0. |
+| GIN on JSONB | (none — Postgres-only) | StorageAdapter skips on SQLite; falls back to in-app filtering for payload introspection queries. |
+| `REFERENCES … ON DELETE` | Same | Both backends honor; SQLite needs `PRAGMA foreign_keys = ON` set at connection. |
 
 ---
 
@@ -439,7 +452,7 @@ CREATE INDEX ON workflow_signals (run_id, stage, signal_name) WHERE consumed_at 
 
 **Scope:** prove the conformance contract holds for `StorageAdapter` (SQLite + Postgres) and `DBOSAdapter`. Nothing else.
 
-- [ ] Conformance suite implements all `INV_1`..`INV_13` invariants as parameterized tests
+- [ ] Conformance suite implements all `INV_1`..`INV_15` invariants as parameterized tests (including `INV_14_result_fidelity` and `INV_15_visibility_after_commit`)
 - [ ] `StorageAdapter` (SQLite): suite passes
 - [ ] `StorageAdapter` (Postgres): suite passes
 - [ ] `DBOSAdapter`: suite passes — or, if it can't, document precisely which invariants DBOS cannot satisfy and why
@@ -482,7 +495,7 @@ CREATE INDEX ON workflow_signals (run_id, stage, signal_name) WHERE consumed_at 
 
 - [ ] `tests_pass`, `ci_green`, `lint_clean` (CI introspection via gh API)
 - [ ] `council_approve`, `consent_collect`, `signature_collected` (wrap existing features)
-- [ ] `script(language, src_hash, sandbox)` via the existing compute feature
+- [ ] `script(language, src_hash, signature, signing_did, sandbox)` via the existing compute feature, with the full §3.3 content-addressing rules: runner resolves only against its own `ScriptStore`, refuses auto-fetch, verifies signature, re-checks `compute.script_run` permission for `signing_did` at run-start
 - [ ] **`red_team_clear`** — full §3.4 hardening
   - [ ] Reviewer DID-distinctness enforcement
   - [ ] Model-family diversity check against attestation registry
@@ -610,6 +623,17 @@ Round-3 review verdict was FILE; the following residual findings became sub-issu
 - **L3 — `read_only=True` mechanism.** Trigger-based vs. write-counter shim; closed in Phase 1. Promote to sub-issue.
 - **C2 follow-up — Provider signed-response receipts.** Upgrade hosted-model attestation when major providers ship them. Sub-issue.
 - **Talon integration upgrade.** Replace Talon's module-scoped `_CONSTITUTION_CACHE` with a `WorkflowStageContext`-backed loader so Talon and the workflow runner share one constitution-injection path; backport hash-verified injection, priority-ordered truncation, recursive ref-resolution, and `constitution_echo_verified` to standalone Talon runs. Sub-issue.
+
+### v3.2 → v3.3 changelog (codex round 4 P2 internal-consistency fixes)
+
+Codex CLI review caught four self-contradictions; all fixed inline:
+
+- **§6 Phase 0 conformance suite:** updated from `INV_1..INV_13` to `INV_1..INV_15` so v3.1's added `INV_14_result_fidelity` and `INV_15_visibility_after_commit` ship tested.
+- **§6 Phase 2 script gate:** updated checklist from `script(language, src_hash, sandbox)` to the full `script(language, src_hash, signature, signing_did, sandbox)` with the §3.3 content-addressing rules spelled out, so the v3.1 hardening doesn't get lost in implementation.
+- **§5 SQLite parity:** expanded from a one-line `JSONB→TEXT` note to a full mapping table covering `UUID`, `TIMESTAMPTZ`, `DEFAULT now()`, partial indexes, GIN, foreign keys. StorageAdapter migration emitter fails loudly on missing mappings rather than silently truncating.
+- **§5 event-type enum:** added `action_complete_post_cancel` (referenced by §3.5 cancellation barrier) and `cancel_barrier_set` so the well-defined cancel/action_complete race can be represented in the audit trail.
+
+Codex verdict: P2-only round (no P0/P1, no architectural concerns). Per `feedback_codex_round_velocity.md`, this is convergence — round 4 found internal consistency bugs only, which is the highest-leverage final pass before filing.
 
 ### v3.1 → v3.2 changelog (Talon integration)
 
