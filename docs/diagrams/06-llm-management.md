@@ -1,6 +1,13 @@
 # 06 - LLM Management
 
-Multi-model fallback, BrainRouter, and GPU integration.
+Multi-model fallback, GPU integration, streaming with tools, and the constitutional honesty layer.
+
+> **Slide-deck doc — for the canonical architecture references see:**
+> - [LLM_SERVICE_ARCHITECTURE.md](../architecture/LLM_SERVICE_ARCHITECTURE.md) — vendor / route / model schema, mandate semantics, routing
+> - [llm/PROVIDER_PLUGINS.md](../architecture/llm/PROVIDER_PLUGINS.md) — adapter authoring (in-tree + external plugin paths)
+> - [llm/HONESTY_LAYER.md](../architecture/llm/HONESTY_LAYER.md) — streaming honesty enforcement, `ToolCallStarted`, in-band sentinel + SSE backup
+>
+> The slides below are a high-level visual overview. Where they reference older terminology (e.g. `BrainRouter` is now merged into `LLMService`; the adapter base lives in `kestrel-sovereign-sdk` since [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) Wave 1A), defer to the canonical docs.
 
 ---
 
@@ -84,31 +91,70 @@ graph TD
 
 ```mermaid
 graph TD
-    subgraph service["LLMService"]
-        LOAD[Load config]
-        INIT[Initialize adapters]
-        PRIO[Set priority order]
+    subgraph sdk["kestrel-sovereign-sdk (kestrel_sdk.llm)"]
+        BASE[LLMAdapter ABC]
+        TYPES["LLMResponse / ToolCall<br/>ToolCallStarted / ModelInfo"]
     end
-    
-    subgraph adapters["Adapters"]
+
+    subgraph service["LLMService (framework)"]
+        LOAD[Load kestrel.toml [llm]]
+        INIT[Initialize adapters]
+        PRIO[Resolve route_priority]
+        ROUTE[resolve_provider_routing]
+    end
+
+    subgraph adapters["Adapters (in-tree OR plugins)"]
         OAI_A[OpenAIAdapter]
         ANT_A[AnthropicAdapter]
-        GOOGLE_A[GoogleAdapter]
         OLLAMA_A[OllamaAdapter]
+        PLUGIN[…external plugins<br/>via entry-points]
     end
-    
-    subgraph interface["Common Interface"]
-        GEN[generate_response]
-        AVAIL[is_available]
+
+    subgraph contract["SDK Contract Methods"]
+        RESP[get_response]
         STREAM[get_streaming_response]
+        TOOLS["get_streaming_response_with_tools<br/>↪ yields ToolCallStarted markers"]
+        META[substrate_type / cost / etc.]
+        DISC[list_models]
     end
-    
-    service --> adapters --> interface
-    
+
+    sdk --> adapters
+    service --> adapters --> contract
+
+    style sdk fill:#512e5f,stroke:#af7ac5
     style service fill:#1a5276,stroke:#85c1e9
+    style TOOLS fill:#7d6608,stroke:#f4d03f
 ```
 
-**Unified interface.** All providers look the same to the agent.
+**SDK-defined contract.** External plugins ship as `pip install <pkg>` and register via the `kestrel_sovereign.llm_providers` entry-point group — no framework edits required. The streaming-with-tools method drives the constitutional honesty layer (see Slide 5b).
+
+---
+
+## Slide 5b: Honesty Layer — `ToolCallStarted` → revising
+
+```mermaid
+sequenceDiagram
+    participant LLM as LLM Stream
+    participant AGT as Agent (streaming.py)
+    participant CHAT as Chat UI (chat.js)
+    participant SSE as /notifications/sse
+    participant AUDIT as ResponseAuditHook
+
+    LLM->>AGT: text chunk: "Saving that now"
+    AGT->>CHAT: yield chunk → bubble shows text
+    LLM->>AGT: ToolCallStarted (marker)
+    AGT->>CHAT: in-band \x1eKESTREL:REVISE:…\x1e on chat stream
+    AGT->>SSE: emit revising event (backup)
+    CHAT->>CHAT: strip sentinel; clear bubble
+    LLM->>AGT: LLMResponse (tool_calls)
+    Note over AGT: execute tool → tool_results
+    AGT->>CHAT: post-tool synthesis chunks
+    AGT->>AUDIT: HookInput(pre_tool_prose, tool_calls, tool_results)
+    AUDIT->>AUDIT: analyze_narration (deterministic)
+    Note over AUDIT: violation? → DENY/MODIFY persisted text
+```
+
+**Closes the "Saved your favorite color is teal" failure mode** ([#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042)). In-band sentinel is ordering-correct; SSE is reliability backup; audit check is deterministic and runs even when the audit LLM is unavailable.
 
 ---
 
@@ -380,9 +426,9 @@ sequenceDiagram
     UI->>API: GET /api/models
     API-->>UI: All models
 
-    U->>UI: Select "claude-3-5-sonnet"
-    UI->>API: POST /api/model/select
-    API->>LLM: set_model("claude-3-5-sonnet")
+    U->>UI: Select a model
+    UI->>API: POST /api/model/set
+    API->>LLM: set_model_preference(model, vendor, route)
     LLM-->>API: OK
     API-->>UI: Model changed
 ```

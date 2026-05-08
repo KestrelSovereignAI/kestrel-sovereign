@@ -1,12 +1,20 @@
 # PRD: Multi-Model Foundational Support
 
-> **Historical PRD.** This document describes the original multi-model support
-> architecture as designed and built. The architecture has since evolved
-> (vendor/route/model schema in epic #688; unified `kestrel.toml [llm]` in
-> epic #938 / 2026-05). For the current canonical reference see
-> [`docs/architecture/LLM_SERVICE_ARCHITECTURE.md`](../LLM_SERVICE_ARCHITECTURE.md).
-> The Implementation Status section below is preserved as a record of the
-> initial build, not as guidance for new work.
+> **Historical PRD — preserved for context, do not follow as guidance.**
+> This describes the *original* multi-model support architecture from initial
+> build. Subsequent work has materially changed every layer:
+>
+> | Change | Tracker | Impact on this doc |
+> |---|---|---|
+> | Vendor / route / model schema | epic [#688](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/688) | The "single-string provider" model below is the antipattern that motivated the rewrite. The Mermaid diagram in §3 still shows the legacy `provider_priority` shape — kept as a record of what was replaced, not as a current reference. |
+> | Unified `kestrel.toml [llm]` | epic [#938](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/938) (2026-05) | `llm_config.toml` no longer exists; configuration moved into `[llm]` in `kestrel.toml`. Migration command: `kestrel migrate-llm-config`. |
+> | `LLMAdapter` promoted to SDK | epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) Wave 1A (2026-05) | The contract lives in `kestrel-sovereign-sdk` (`kestrel_sdk.llm`), not `kestrel_sovereign/llm/adapter.py`. External plugins ship without framework changes via the `kestrel_sovereign.llm_providers` entry-point group. |
+> | Streaming-with-tools + `ToolCallStarted` + honesty layer | epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) Waves 4A–5E (2026-05) | The original `generate_response(prompt: str) -> str` interface is one of three streaming modes now; the constitutional honesty layer rides on the `ToolCallStarted` marker. |
+>
+> **Canonical references (use these instead):**
+> - [LLM_SERVICE_ARCHITECTURE.md](../LLM_SERVICE_ARCHITECTURE.md) — current vendor / route / model architecture, mandate semantics, routing.
+> - [llm/PROVIDER_PLUGINS.md](../llm/PROVIDER_PLUGINS.md) — adapter authoring (in-tree + external plugin paths) and the SDK contract surface.
+> - [llm/HONESTY_LAYER.md](../llm/HONESTY_LAYER.md) — streaming honesty enforcement (in-band sentinel, SSE backup, narration check).
 
 ## 1. Vision
 
