@@ -15,6 +15,7 @@ import pytest_asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.scheduler.feature import SchedulerFeature
 from kestrel_sovereign.features.scheduler.runner import SchedulerRunner, ScheduledTask
 
@@ -114,8 +115,9 @@ class TestScheduleList:
     async def test_list_empty(self, feature):
         feature._db.fetchall = AsyncMock(return_value=[])
         result = await feature.schedule_list()
-        assert result["tasks"] == []
-        assert result["count"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["tasks"] == []
+        assert result.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_list_returns_tasks(self, feature):
@@ -124,16 +126,41 @@ class TestScheduleList:
             ("id-2", "audit_anchor", "0 */6 * * *", '{"force": true}', 0, "2026-03-05T06:00:00", "2026-03-05T12:00:00", "2026-03-04T00:00:00"),
         ])
         result = await feature.schedule_list()
-        assert result["count"] == 2
-        assert result["tasks"][0]["task_name"] == "wellness_check"
-        assert result["tasks"][1]["enabled"] is False
-        assert result["tasks"][1]["args"] == {"force": True}
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 2
+        assert result.data["tasks"][0]["task_name"] == "wellness_check"
+        assert result.data["tasks"][1]["enabled"] is False
+        assert result.data["tasks"][1]["args"] == {"force": True}
 
     @pytest.mark.asyncio
     async def test_list_no_db(self, feature_no_db):
         result = await feature_no_db.schedule_list()
-        assert result["success"] is False
-        assert "not available" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not available" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_list_handles_malformed_args_json_as_partial(self, feature):
+        """Regression: a single row with malformed args_json must not
+        abort the whole list. The migrated code surfaces the bad rows
+        as load_errors with a PARTIAL caveat (codex round 2 P2)."""
+        feature._db.fetchall = AsyncMock(return_value=[
+            ("id-1", "wellness_check", "@daily", "{}", 1, None, None, "2026-03-05T00:00:00"),
+            ("id-2", "broken", "@hourly", "not-json", 1, None, None, "2026-03-05T00:00:00"),
+            ("id-3", "list-args", "@daily", "[1,2,3]", 1, None, None, "2026-03-05T00:00:00"),
+        ])
+        result = await feature.schedule_list()
+
+        assert result.status is ToolResultStatus.PARTIAL
+        # All 3 tasks still listed (no row dropped).
+        assert result.data["count"] == 3
+        # The good one keeps its args; the bad ones get empty {}.
+        names_to_args = {t["task_name"]: t["args"] for t in result.data["tasks"]}
+        assert names_to_args["wellness_check"] == {}
+        assert names_to_args["broken"] == {}
+        assert names_to_args["list-args"] == {}
+        # load_errors carries both bad rows.
+        bad_ids = {e["task_id"] for e in result.data["load_errors"]}
+        assert bad_ids == {"id-2", "id-3"}
 
 
 # =========================================================================
@@ -149,11 +176,11 @@ class TestScheduleAdd:
             cron_expression="@daily",
             task_name="wellness_check",
         )
-        assert result["success"] is True
-        assert result["task_name"] == "wellness_check"
-        assert result["cron_expression"] == "@daily"
-        assert result["task_id"] is not None
-        assert result["next_run_at"] is not None
+        assert result.status is ToolResultStatus.OK
+        assert result.data["task_name"] == "wellness_check"
+        assert result.data["cron_expression"] == "@daily"
+        assert result.data["task_id"] is not None
+        assert result.data["next_run_at"] is not None
 
         # Verify DB insert was called
         feature._db.execute.assert_called()
@@ -165,7 +192,7 @@ class TestScheduleAdd:
             task_name="memory_consolidation",
             args_json='{"threshold": 100}',
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_add_invalid_cron(self, feature):
@@ -173,8 +200,8 @@ class TestScheduleAdd:
             cron_expression="bad cron",
             task_name="test_task",
         )
-        assert result["success"] is False
-        assert "invalid cron" in result["error"].lower() or "Invalid" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "invalid cron" in result.error.lower() or "Invalid" in result.error
 
     @pytest.mark.asyncio
     async def test_add_invalid_args_json(self, feature):
@@ -183,8 +210,8 @@ class TestScheduleAdd:
             task_name="test_task",
             args_json="not valid json",
         )
-        assert result["success"] is False
-        assert "args_json" in result["error"].lower() or "Invalid" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "args_json" in result.error.lower() or "Invalid" in result.error
 
     @pytest.mark.asyncio
     async def test_add_args_json_must_be_object(self, feature):
@@ -193,8 +220,8 @@ class TestScheduleAdd:
             task_name="test_task",
             args_json='[1, 2, 3]',
         )
-        assert result["success"] is False
-        assert "object" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "object" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_add_no_db(self, feature_no_db):
@@ -202,7 +229,7 @@ class TestScheduleAdd:
             cron_expression="@daily",
             task_name="test_task",
         )
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -216,20 +243,20 @@ class TestScheduleRemove:
     async def test_remove_existing(self, feature):
         feature._db.fetchone = AsyncMock(return_value=("task-id",))
         result = await feature.schedule_remove(task_id="task-id")
-        assert result["success"] is True
-        assert result["status"] == "removed"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "removed"
 
     @pytest.mark.asyncio
     async def test_remove_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_remove(task_id="nonexistent")
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_remove_no_db(self, feature_no_db):
         result = await feature_no_db.schedule_remove(task_id="any")
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -243,21 +270,21 @@ class TestSchedulePause:
     async def test_pause_active_task(self, feature):
         feature._db.fetchone = AsyncMock(return_value=("task-id", 1))
         result = await feature.schedule_pause(task_id="task-id")
-        assert result["success"] is True
-        assert result["status"] == "paused"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "paused"
 
     @pytest.mark.asyncio
     async def test_pause_already_paused(self, feature):
         feature._db.fetchone = AsyncMock(return_value=("task-id", 0))
         result = await feature.schedule_pause(task_id="task-id")
-        assert result["success"] is True
-        assert result["status"] == "already_paused"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "already_paused"
 
     @pytest.mark.asyncio
     async def test_pause_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_pause(task_id="nonexistent")
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -271,22 +298,22 @@ class TestScheduleResume:
     async def test_resume_paused_task(self, feature):
         feature._db.fetchone = AsyncMock(return_value=("task-id", 0, "@daily"))
         result = await feature.schedule_resume(task_id="task-id")
-        assert result["success"] is True
-        assert result["status"] == "resumed"
-        assert result["next_run_at"] is not None
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "resumed"
+        assert result.data["next_run_at"] is not None
 
     @pytest.mark.asyncio
     async def test_resume_already_running(self, feature):
         feature._db.fetchone = AsyncMock(return_value=("task-id", 1, "@daily"))
         result = await feature.schedule_resume(task_id="task-id")
-        assert result["success"] is True
-        assert result["status"] == "already_running"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "already_running"
 
     @pytest.mark.asyncio
     async def test_resume_not_found(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         result = await feature.schedule_resume(task_id="nonexistent")
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -300,8 +327,9 @@ class TestScheduleHistory:
     async def test_history_empty(self, feature):
         feature._db.fetchall = AsyncMock(return_value=[])
         result = await feature.schedule_history()
-        assert result["executions"] == []
-        assert result["count"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["executions"] == []
+        assert result.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_history_returns_records(self, feature):
@@ -310,11 +338,12 @@ class TestScheduleHistory:
             ("exec-2", "task-2", "failed", "Connection timeout", 5000, "2026-03-05T09:00:00", "audit_anchor", None),
         ])
         result = await feature.schedule_history()
-        assert result["count"] == 2
-        assert result["executions"][0]["status"] == "success"
-        assert result["executions"][0]["outcome_signal"] == 0.9
-        assert result["executions"][1]["task_name"] == "audit_anchor"
-        assert result["executions"][1]["outcome_signal"] is None
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 2
+        assert result.data["executions"][0]["status"] == "success"
+        assert result.data["executions"][0]["outcome_signal"] == 0.9
+        assert result.data["executions"][1]["task_name"] == "audit_anchor"
+        assert result.data["executions"][1]["outcome_signal"] is None
 
     @pytest.mark.asyncio
     async def test_history_respects_limit(self, feature):
@@ -693,11 +722,11 @@ class TestScheduleUpdate:
         result = await feature.schedule_update(
             task_id="task-id", cron_expression="@hourly"
         )
-        assert result["success"] is True
-        assert result["status"] == "updated"
-        assert result["old_cron"] == "@daily"
-        assert result["cron_expression"] == "@hourly"
-        assert result["next_run_at"] is not None
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "updated"
+        assert result.data["old_cron"] == "@daily"
+        assert result.data["cron_expression"] == "@hourly"
+        assert result.data["next_run_at"] is not None
 
     @pytest.mark.asyncio
     async def test_update_unchanged_is_noop(self, feature):
@@ -705,8 +734,8 @@ class TestScheduleUpdate:
         result = await feature.schedule_update(
             task_id="task-id", cron_expression="@hourly"
         )
-        assert result["success"] is True
-        assert result["status"] == "unchanged"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "unchanged"
         # Must not UPDATE when nothing changed
         feature._db.execute.assert_not_called()
 
@@ -715,8 +744,8 @@ class TestScheduleUpdate:
         result = await feature.schedule_update(
             task_id="task-id", cron_expression="not a cron"
         )
-        assert result["success"] is False
-        assert "invalid cron" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "invalid cron" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_update_not_found(self, feature):
@@ -724,8 +753,8 @@ class TestScheduleUpdate:
         result = await feature.schedule_update(
             task_id="missing", cron_expression="@daily"
         )
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_update_disabled_task_leaves_next_run_null(self, feature):
@@ -733,16 +762,16 @@ class TestScheduleUpdate:
         result = await feature.schedule_update(
             task_id="task-id", cron_expression="@hourly"
         )
-        assert result["success"] is True
+        assert result.status is ToolResultStatus.OK
         # Paused task must not compute a next_run
-        assert result["next_run_at"] is None
+        assert result.data["next_run_at"] is None
 
     @pytest.mark.asyncio
     async def test_update_no_db(self, feature_no_db):
         result = await feature_no_db.schedule_update(
             task_id="any", cron_expression="@daily"
         )
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -758,8 +787,8 @@ class TestRecordOutcome:
         result = await feature.schedule_record_outcome(
             execution_id="exec-id", signal=0.8
         )
-        assert result["success"] is True
-        assert result["signal"] == 0.8
+        assert result.status is ToolResultStatus.OK
+        assert result.data["signal"] == 0.8
 
     @pytest.mark.asyncio
     async def test_signal_clamped_upper(self, feature):
@@ -767,7 +796,11 @@ class TestRecordOutcome:
         result = await feature.schedule_record_outcome(
             execution_id="exec-id", signal=2.5
         )
-        assert result["signal"] == 1.0
+        # Honesty: out-of-range input was silently clamped → PARTIAL.
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["signal"] == 1.0
+        assert result.data["signal_clamped"] is True
+        assert "clamped" in result.error
 
     @pytest.mark.asyncio
     async def test_signal_clamped_lower(self, feature):
@@ -775,7 +808,9 @@ class TestRecordOutcome:
         result = await feature.schedule_record_outcome(
             execution_id="exec-id", signal=-0.5
         )
-        assert result["signal"] == 0.0
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["signal"] == 0.0
+        assert result.data["signal_clamped"] is True
 
     @pytest.mark.asyncio
     async def test_record_not_found(self, feature):
@@ -783,8 +818,8 @@ class TestRecordOutcome:
         result = await feature.schedule_record_outcome(
             execution_id="missing", signal=0.5
         )
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "not found" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_non_numeric_signal_returns_error_not_exception(self, feature):
@@ -792,15 +827,15 @@ class TestRecordOutcome:
         result = await feature.schedule_record_outcome(
             execution_id="exec-1", signal="high"
         )
-        assert result["success"] is False
-        assert "numeric" in result["error"].lower()
+        assert result.status is ToolResultStatus.ERROR
+        assert "numeric" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_none_signal_returns_error(self, feature):
         result = await feature.schedule_record_outcome(
             execution_id="exec-1", signal=None
         )
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -814,9 +849,10 @@ class TestScheduleEngagement:
     async def test_empty(self, feature):
         feature._db.fetchall = AsyncMock(return_value=[])
         result = await feature.schedule_engagement(days=7)
-        assert result["window_days"] == 7
-        assert result["tasks"] == []
-        assert result["count"] == 0
+        assert result.status is ToolResultStatus.OK
+        assert result.data["window_days"] == 7
+        assert result.data["tasks"] == []
+        assert result.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_aggregates(self, feature):
@@ -825,26 +861,27 @@ class TestScheduleEngagement:
             ("task-2", "reflect", "0 */4 * * *", 42, 0, None),
         ])
         result = await feature.schedule_engagement(days=7)
-        assert result["count"] == 2
-        assert result["tasks"][0]["mean_signal"] == 0.62
-        assert result["tasks"][0]["signals"] == 5
+        assert result.status is ToolResultStatus.OK
+        assert result.data["count"] == 2
+        assert result.data["tasks"][0]["mean_signal"] == 0.62
+        assert result.data["tasks"][0]["signals"] == 5
         # Second task has executions but zero signals — downstream isn't
         # reporting back. mean_signal must be None, not 0.
-        assert result["tasks"][1]["mean_signal"] is None
-        assert result["tasks"][1]["signals"] == 0
+        assert result.data["tasks"][1]["mean_signal"] is None
+        assert result.data["tasks"][1]["signals"] == 0
 
     @pytest.mark.asyncio
     async def test_rejects_zero_or_negative_days(self, feature):
         result = await feature.schedule_engagement(days=0)
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
         result = await feature.schedule_engagement(days=-1)
-        assert result["success"] is False
+        assert result.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_rejects_absurdly_large_days(self, feature):
         result = await feature.schedule_engagement(days=10_000)
-        assert result["success"] is False
-        assert "365" in result["error"]
+        assert result.status is ToolResultStatus.ERROR
+        assert "365" in result.error
 
 
 # =========================================================================
