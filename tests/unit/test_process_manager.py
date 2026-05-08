@@ -209,9 +209,11 @@ class TestStartAgent:
 
         assert ap.pid == 12345
         assert "claw" in pm.agents
-        # Verify command includes server:app
+        # Verify command includes the in-package ASGI module reference.
+        # `kestrel_sovereign.server:app` (not `server:app`) is what survives a
+        # pip install — the wheel doesn't ship a top-level server.py.
         cmd = mock_popen.call_args[0][0]
-        assert "server:app" in cmd
+        assert "kestrel_sovereign.server:app" in cmd
         assert "--port" in cmd
         assert "8801" in cmd
 

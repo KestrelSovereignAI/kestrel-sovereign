@@ -127,7 +127,7 @@ redis-cli -h redis -a "$REDIS_PASSWORD"
 ipython
 
 # Kestrel CLI
-python main.py agent_data/kestrel_prime.db
+python -m kestrel_sovereign.main agent_data/kestrel_prime.db
 
 # Run a script
 python your_script.py

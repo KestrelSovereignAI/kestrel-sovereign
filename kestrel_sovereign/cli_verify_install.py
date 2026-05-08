@@ -224,23 +224,27 @@ def _start_uvicorn(
     port: int,
     agent_dir: Path,
 ) -> "subprocess.Popen[bytes]":
-    """Spawn ``<venv>/bin/uvicorn server:app`` as a background process.
+    """Spawn ``<venv>/bin/uvicorn kestrel_sovereign.server:app`` as a background process.
 
     On POSIX we ``start_new_session=True`` so SIGTERM hits the whole
     group (uvicorn's worker children); on Windows we use
     ``CREATE_NEW_PROCESS_GROUP`` so we can later send
     ``CTRL_BREAK_EVENT``. Same idiom the multi_agent ProcessManager
     uses (kestrel_sovereign/multi_agent/process_manager.py).
+
+    The module reference is the in-package path because verify-install
+    is exercising a pip-installed wheel; the ``--app-dir`` shim that
+    used to make the root-level ``server:app`` resolvable is no longer
+    needed.
     """
     uvicorn = _venv_exec(venv_dir, "uvicorn")
     env = os.environ.copy()
     env["VIRTUAL_ENV"] = str(venv_dir)
     env["KESTREL_DB_PATH"] = str(agent_dir)
     cmd = [
-        str(uvicorn), "server:app",
+        str(uvicorn), "kestrel_sovereign.server:app",
         "--host", "127.0.0.1",
         "--port", str(port),
-        "--app-dir", str(repo),
     ]
     kwargs: dict = {"cwd": str(repo), "env": env}
     if _is_windows():

@@ -280,7 +280,7 @@ class SmartTestRunner:
                 tests.add("tests/integration/test_api_e2e.py")
             elif f == "kestrel_agent.py":
                 tests.add("tests/integration/")
-            elif f == "server.py":
+            elif f == "server.py" or f == "kestrel_sovereign/server.py":
                 tests.add("tests/integration/test_api_e2e.py")
 
         return [t for t in tests if t]

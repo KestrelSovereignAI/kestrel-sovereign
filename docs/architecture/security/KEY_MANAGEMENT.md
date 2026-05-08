@@ -225,7 +225,7 @@ cat ~/emma_data/emma.key.enc
 
 # Agent should fail without master key
 unset KESTREL_DATA_KEY
-uv run python main.py ~/emma_data/kestrel_prime.db
+uv run python -m kestrel_sovereign.main ~/emma_data/kestrel_prime.db
 # Should fail with: MasterKeyNotConfiguredError
 ```
 

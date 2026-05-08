@@ -36,7 +36,7 @@ module.exports = defineConfig({
 
   // Optionally start server before tests
   // webServer: {
-  //   command: 'python server.py',
+  //   command: 'python -m kestrel_sovereign.server',
   //   url: 'http://127.0.0.1:8888/health',
   //   reuseExistingServer: !process.env.CI,
   //   timeout: 120 * 1000,

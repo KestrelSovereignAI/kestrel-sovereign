@@ -56,7 +56,10 @@ def _discover_router_routes() -> list[str]:
 
 
 def _discover_app_routes() -> list[str]:
-    text = (PROJECT_ROOT / "server.py").read_text(encoding="utf-8")
+    # server.py was moved into the package so it ships in the wheel; the root-
+    # level server.py is now a tiny re-export shim with no decorators. Read
+    # the in-package file directly so this discovery still finds @app routes.
+    text = (PROJECT_ROOT / "kestrel_sovereign" / "server.py").read_text(encoding="utf-8")
     pattern = re.compile(r'@app\.(get|post|put|delete|patch|head)\("([^"]+)"')
     return sorted(f"{match.group(1).upper()} {match.group(2)}" for match in pattern.finditer(text))
 

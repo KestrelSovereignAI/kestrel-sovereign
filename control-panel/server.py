@@ -271,7 +271,7 @@ async def start_agent(agent_id: str):
     
     # Start from the isolated run directory
     process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", str(port)],
+        [sys.executable, "-m", "uvicorn", "kestrel_sovereign.server:app", "--host", "0.0.0.0", "--port", str(port)],
         cwd=str(run_dir),
         stdout=open(log_file, "w"),
         stderr=subprocess.STDOUT,
