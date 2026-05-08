@@ -16,15 +16,32 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_export_filename() -> str:
+    """Generate a collision-resistant filename for an identity export.
+
+    Round 4 codex finding: ``strftime('%Y%m%d_%H%M%S')`` granularity
+    is per-second, so two exports within the same second overwrite
+    each other. Append a microsecond stamp + 8-char uuid hex to
+    make collisions astronomically unlikely.
+    """
+    now = datetime.now(timezone.utc)
+    return (
+        f"identity_{now.strftime('%Y%m%d_%H%M%S')}_"
+        f"{now.microsecond:06d}_{uuid.uuid4().hex[:8]}.json"
+    )
 
 
 class IdentityFeature(Feature):
@@ -60,7 +77,7 @@ class IdentityFeature(Feature):
         storage_tier: str = "local",
         sign: bool = True,
         include_wallet: bool = True,
-    ) -> str:
+    ) -> ToolResult:
         """
         Export agent identity to a portable package.
 
@@ -69,6 +86,16 @@ class IdentityFeature(Feature):
             sign: Whether to sign the package with DID key
             include_wallet: Whether to include wallet transaction history
         """
+        if not isinstance(sign, bool):
+            return ToolResult.failed(
+                f"sign must be a boolean, got {type(sign).__name__}={sign!r}"
+            )
+        if not isinstance(include_wallet, bool):
+            return ToolResult.failed(
+                "include_wallet must be a boolean, got "
+                f"{type(include_wallet).__name__}={include_wallet!r}"
+            )
+
         try:
             from kestrel_sovereign.identity import (
                 IdentityExporter,
@@ -78,7 +105,7 @@ class IdentityFeature(Feature):
 
             db = resolve_feature_database(self.agent)
             if db is None:
-                return "Export failed: database not available"
+                return ToolResult.failed("Export failed: database not available")
 
             # Export identity
             exporter = IdentityExporter(
@@ -87,12 +114,17 @@ class IdentityFeature(Feature):
             )
             package = await exporter.export(include_wallet_history=include_wallet)
 
-            # Sign if requested
+            # Sign if requested. The original code logged a warning
+            # and silently proceeded with an unsigned package — that's
+            # exactly the honesty leak the migration is meant to
+            # surface. Track the failure so we can return PARTIAL.
+            sign_failure: Optional[str] = None
             if sign:
                 try:
                     package = sign_package(package)
                 except Exception as e:
                     logger.warning(f"Could not sign package: {e}")
+                    sign_failure = str(e)
 
             # Get JSON representation
             package_json = package.to_json()
@@ -116,58 +148,178 @@ class IdentityFeature(Feature):
                     encrypt=False,  # Package is already structured
                     metadata={"type": "identity_package", "did": package.did}
                 )
-                cid = result.ipfs_cid or result.content_hash
+                # Honesty: FilecoinAdapter silently downgrades to
+                # LOCAL_ONLY when IPFS / Lotus isn't available — it
+                # mutates result.tier and leaves ipfs_cid as None.
+                # In that case the package is still on disk under the
+                # content hash, but it's NOT importable via
+                # `!identity import <ipfs-cid>` (no Qm/bafy prefix to
+                # match). Pre-fix we returned OK with a non-CID hash
+                # in the import instructions — wrong. Detect the
+                # downgrade and surface as PARTIAL with the correct
+                # local-only retrieval path. (Round 2 codex finding.)
+                actual_tier = getattr(result, "tier", tier_enum)
+                tier_downgraded = (
+                    actual_tier == StorageTier.LOCAL_ONLY
+                    and tier_enum != StorageTier.LOCAL_ONLY
+                )
+                ipfs_cid = getattr(result, "ipfs_cid", None) or getattr(result, "cid", None)
+                content_hash = getattr(result, "content_hash", None)
+                # Use a real CID for restore instructions only when
+                # one was actually produced; otherwise fall back to
+                # the content hash with a clear local-only framing.
+                restore_id = ipfs_cid or content_hash
 
-                return f"""Identity Export Complete
+                # When the tier downgraded, also write the package JSON
+                # to KESTREL_DATA_DIR so there's an actually-restorable
+                # path. The FilecoinAdapter's local cache is a compressed
+                # blob keyed by content_hash — import_identity can't
+                # consume it. Mirroring the tier=local fallback gives
+                # the user a real file path that `!identity import`
+                # accepts. (Round 3 codex finding #2.)
+                fallback_filepath: Optional[Path] = None
+                if tier_downgraded:
+                    try:
+                        storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
+                        storage_dir.mkdir(exist_ok=True)
+                        filename = _unique_export_filename()
+                        fallback_filepath = storage_dir / filename
+                        with open(fallback_filepath, 'w', encoding='utf-8') as f:
+                            f.write(package_json)
+                    except Exception as e:
+                        # If even the fallback write fails, leave
+                        # fallback_filepath=None — the PARTIAL
+                        # message below will be even more pessimistic
+                        # ("no restore path available").
+                        logger.error(
+                            f"Tier downgrade fallback file write failed: {e}",
+                            exc_info=True,
+                        )
+                        fallback_filepath = None
 
-Package Summary:
-- DID: {summary['did'][:30]}...
-- Agent Name: {summary['agent_name']}
-- Created: {summary['created_at']}
-- Episodes: {summary['episodes_count']}
-- Saved Items: {summary['saved_items_count']}
-- Relationships: {summary['relationships_count']}
-- Skills: {summary['skills_count']}
-- Signed: {summary['is_signed']}
-
-Storage:
-- Tier: {tier_enum.value}
-- CID: {cid}
-
-Use `!identity import {cid}` to restore this identity on another substrate.
-"""
+                if tier_downgraded:
+                    if fallback_filepath:
+                        confirmation = (
+                            f"Exported identity package: DID={summary['did'][:30]}..., "
+                            f"agent={summary['agent_name']}, "
+                            f"{summary['episodes_count']} episodes, "
+                            f"{summary['saved_items_count']} items, "
+                            f"signed={summary['is_signed']}; "
+                            f"requested tier={tier_enum.value} unavailable, "
+                            f"saved as JSON to {fallback_filepath}. "
+                            f"Use `!identity import {fallback_filepath}` to restore."
+                        )
+                    else:
+                        confirmation = (
+                            f"Exported identity package: DID={summary['did'][:30]}..., "
+                            f"agent={summary['agent_name']}, "
+                            f"{summary['episodes_count']} episodes; "
+                            f"requested tier={tier_enum.value} unavailable AND "
+                            "fallback JSON write failed — package is in the "
+                            f"FilecoinAdapter local cache (content_hash="
+                            f"{content_hash}) but cannot be restored via "
+                            "`!identity import` directly"
+                        )
+                else:
+                    confirmation = (
+                        f"Exported identity package: DID={summary['did'][:30]}..., "
+                        f"agent={summary['agent_name']}, "
+                        f"{summary['episodes_count']} episodes, "
+                        f"{summary['saved_items_count']} items, "
+                        f"signed={summary['is_signed']}; "
+                        f"stored to tier={actual_tier.value if hasattr(actual_tier, 'value') else actual_tier} "
+                        f"(CID={ipfs_cid}). "
+                        f"Use `!identity import {restore_id}` to restore."
+                    )
+                data = {
+                    "did": package.did,
+                    "agent_name": summary['agent_name'],
+                    "summary": dict(summary),
+                    "requested_storage_tier": tier_enum.value,
+                    "actual_storage_tier": (
+                        actual_tier.value if hasattr(actual_tier, "value") else str(actual_tier)
+                    ),
+                    "tier_downgraded": tier_downgraded,
+                    "ipfs_cid": ipfs_cid,
+                    "content_hash": content_hash,
+                    "fallback_file_path": (
+                        str(fallback_filepath) if fallback_filepath else None
+                    ),
+                    "signed": bool(summary.get("is_signed")),
+                    "sign_requested": sign,
+                    "sign_failure": sign_failure,
+                }
             else:
                 # Save to local file
                 storage_dir = Path(os.environ.get("KESTREL_DATA_DIR", "agent_data"))
                 storage_dir.mkdir(exist_ok=True)
-                filename = f"identity_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+                filename = _unique_export_filename()
                 filepath = storage_dir / filename
 
                 with open(filepath, 'w', encoding='utf-8') as f:
                     f.write(package_json)
 
-                return f"""Identity Export Complete
-
-Package Summary:
-- DID: {summary['did'][:30]}...
-- Agent Name: {summary['agent_name']}
-- Created: {summary['created_at']}
-- Episodes: {summary['episodes_count']}
-- Saved Items: {summary['saved_items_count']}
-- Relationships: {summary['relationships_count']}
-- Skills: {summary['skills_count']}
-- Signed: {summary['is_signed']}
-
-Storage:
-- Tier: local
-- File: {filepath}
-
-Use `!identity import {filepath}` to restore this identity.
-"""
-
+                confirmation = (
+                    f"Exported identity package: DID={summary['did'][:30]}..., "
+                    f"agent={summary['agent_name']}, "
+                    f"{summary['episodes_count']} episodes, "
+                    f"{summary['saved_items_count']} items, "
+                    f"signed={summary['is_signed']}; "
+                    f"saved to {filepath}. "
+                    f"Use `!identity import {filepath}` to restore."
+                )
+                data = {
+                    "did": package.did,
+                    "agent_name": summary['agent_name'],
+                    "summary": dict(summary),
+                    "storage_tier": "local",
+                    "file_path": str(filepath),
+                    "signed": bool(summary.get("is_signed")),
+                    "sign_requested": sign,
+                    "sign_failure": sign_failure,
+                }
         except Exception as e:
             logger.error(f"Identity export failed: {e}", exc_info=True)
-            return f"Identity export failed: {str(e)}"
+            return ToolResult.failed(f"Identity export failed: {str(e)}")
+
+        # Honesty: composite PARTIAL surfaces.
+        partial_errs: List[str] = []
+        if sign and sign_failure:
+            # signing was REQUESTED but FAILED. The package was
+            # still written, but it's unsigned — anyone importing
+            # it will see UNSIGNED and may reject it.
+            partial_errs.append(
+                f"signing was requested but failed: {sign_failure}; "
+                "the package was written UNSIGNED — verify will report "
+                "UNSIGNED and an importer with allow_unsigned=False "
+                "will reject it"
+            )
+        if data.get("tier_downgraded"):
+            fallback = data.get("fallback_file_path")
+            if fallback:
+                partial_errs.append(
+                    f"requested storage tier "
+                    f"{data['requested_storage_tier']!r} was unavailable "
+                    "(no IPFS / Lotus); the package was saved as a JSON "
+                    f"file to {fallback} instead — use "
+                    f"`!identity import {fallback}` to restore"
+                )
+            else:
+                partial_errs.append(
+                    f"requested storage tier "
+                    f"{data['requested_storage_tier']!r} was unavailable "
+                    "AND the fallback JSON file write failed — the "
+                    "package is only in the FilecoinAdapter local cache "
+                    f"(content_hash={data.get('content_hash')}) which "
+                    "cannot be restored via `!identity import` directly"
+                )
+        if partial_errs:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=" | ".join(partial_errs),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
         name="import_identity",
@@ -182,7 +334,7 @@ Use `!identity import {filepath}` to restore this identity.
         source: str,
         verify_signature: bool = True,
         merge_mode: str = "merge",
-    ) -> str:
+    ) -> ToolResult:
         """
         Import agent identity from a package.
 
@@ -191,6 +343,17 @@ Use `!identity import {filepath}` to restore this identity.
             verify_signature: Whether to verify DID signature
             merge_mode: How to handle existing data ('replace', 'merge', 'skip_existing')
         """
+        if not isinstance(verify_signature, bool):
+            return ToolResult.failed(
+                "verify_signature must be a boolean, got "
+                f"{type(verify_signature).__name__}={verify_signature!r}"
+            )
+        if merge_mode not in ("replace", "merge", "skip_existing"):
+            return ToolResult.failed(
+                f"merge_mode must be 'replace', 'merge', or 'skip_existing'; "
+                f"got {merge_mode!r}"
+            )
+
         try:
             from kestrel_sovereign.identity import (
                 AgentIdentityPackage,
@@ -211,7 +374,10 @@ Use `!identity import {filepath}` to restore this identity.
                 with open(source, 'r', encoding='utf-8') as f:
                     package_json = f.read()
             else:
-                return f"Source not found: {source}"
+                return ToolResult.failed(
+                    f"Source not found: {source}",
+                    data={"source": source},
+                )
 
             # Parse package
             package = AgentIdentityPackage.from_json(package_json)
@@ -222,13 +388,20 @@ Use `!identity import {filepath}` to restore this identity.
             hash_ok = package.verify_content_hash() if package.content_hash else True
 
             if not constitution_ok:
-                return "Import failed: Constitution hash verification failed"
+                return ToolResult.failed(
+                    "Import failed: Constitution hash verification failed",
+                    data={"source": source, "did": package.did},
+                )
             if not hash_ok:
-                return "Import failed: Content hash verification failed (package may be corrupted)"
+                return ToolResult.failed(
+                    "Import failed: Content hash verification failed "
+                    "(package may be corrupted)",
+                    data={"source": source, "did": package.did},
+                )
 
             db = resolve_feature_database(self.agent)
             if db is None:
-                return "Import failed: database not available"
+                return ToolResult.failed("Import failed: database not available")
 
             # Import
             importer = IdentityImporter(
@@ -241,40 +414,60 @@ Use `!identity import {filepath}` to restore this identity.
                 merge_mode=merge_mode,
                 allow_unsigned=False,
             )
-
-            if result.success:
-                stats = result.stats
-                return f"""Identity Import Complete
-
-Source Package:
-- DID: {summary['did'][:30]}...
-- Agent Name: {summary['agent_name']}
-- Source Substrate: {summary['source_substrate']}
-- Export Time: {summary['export_timestamp']}
-
-Import Results:
-- Episodes Imported: {stats.get('episodes_imported', 0)}
-- Saved Items Imported: {stats.get('saved_items_imported', 0)}
-- Temporal Patterns: {stats.get('temporal_patterns_imported', 0)}
-- Relationships: {stats.get('relationships_imported', 0)}
-- Skills: {stats.get('skills_imported', 0)}
-
-Migration ID: {result.migration_id}
-"""
-            else:
-                errors = "\n".join(f"- {e}" for e in result.errors)
-                return f"""Identity Import Failed
-
-Errors:
-{errors}
-
-Warnings:
-{chr(10).join(f'- {w}' for w in result.warnings) if result.warnings else 'None'}
-"""
-
         except Exception as e:
             logger.error(f"Identity import failed: {e}", exc_info=True)
-            return f"Identity import failed: {str(e)}"
+            return ToolResult.failed(f"Identity import failed: {str(e)}")
+
+        if not result.success:
+            return ToolResult.failed(
+                "Identity import failed: "
+                + ("; ".join(result.errors) if result.errors else "unknown error"),
+                data={
+                    "source": source,
+                    "did": package.did,
+                    "errors": list(result.errors),
+                    "warnings": list(result.warnings),
+                },
+            )
+
+        stats = result.stats or {}
+        confirmation = (
+            f"Imported identity package: DID={summary['did'][:30]}..., "
+            f"agent={summary['agent_name']}, "
+            f"from substrate={summary['source_substrate']}; "
+            f"{stats.get('episodes_imported', 0)} episodes, "
+            f"{stats.get('saved_items_imported', 0)} saved items, "
+            f"{stats.get('relationships_imported', 0)} relationships, "
+            f"{stats.get('skills_imported', 0)} skills "
+            f"(migration_id={result.migration_id})"
+        )
+        data = {
+            "source": source,
+            "did": package.did,
+            "agent_name": summary['agent_name'],
+            "source_substrate": summary['source_substrate'],
+            "export_timestamp": summary['export_timestamp'],
+            "stats": dict(stats),
+            "migration_id": result.migration_id,
+            "merge_mode": merge_mode,
+            "warnings": list(result.warnings),
+        }
+
+        # Honesty: import_package returned success=True but populated
+        # warnings (e.g. partial schema-version mismatch, skipped
+        # entries). Surface as PARTIAL so the LLM cannot claim a
+        # clean import while skipped/warned items quietly went
+        # missing.
+        if result.warnings:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"{len(result.warnings)} warning(s) during import: "
+                    + "; ".join(result.warnings)
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
         name="verify_identity",
@@ -283,7 +476,7 @@ Warnings:
         category=ToolCategory.SYSTEM,
         command_prefix="!identity verify"
     )
-    async def verify_identity(self, source: str) -> str:
+    async def verify_identity(self, source: str) -> ToolResult:
         """
         Verify an identity package.
 
@@ -308,7 +501,10 @@ Warnings:
                 with open(source, 'r', encoding='utf-8') as f:
                     package_json = f.read()
             else:
-                return f"Source not found: {source}"
+                return ToolResult.failed(
+                    f"Source not found: {source}",
+                    data={"source": source},
+                )
 
             # Parse package
             package = AgentIdentityPackage.from_json(package_json)
@@ -337,33 +533,69 @@ Warnings:
             if package.signature or package.signatures:
                 is_valid, msg = verify_package_signature(package)
                 sig_status = "VALID" if is_valid else f"INVALID: {msg}"
-
-            return f"""Identity Package Verification
-
-Package Info:
-- DID: {summary['did']}
-- Agent Name: {summary['agent_name']}
-- Created: {summary['created_at']}
-- Exported: {summary['export_timestamp']}
-- Source Substrate: {summary['source_substrate']}
-- Package Version: {summary['package_version']}
-
-Contents:
-- Episodes: {summary['episodes_count']}
-- Saved Items: {summary['saved_items_count']}
-- Relationships: {summary['relationships_count']}
-- Skills: {summary['skills_count']}
-- Previous Migrations: {summary['migrations_count']}
-
-Verification:
-- Constitution: {constitution_status}
-- Content Hash: {hash_status}
-- Signature: {sig_status}
-"""
-
         except Exception as e:
             logger.error(f"Identity verification failed: {e}", exc_info=True)
-            return f"Identity verification failed: {str(e)}"
+            return ToolResult.failed(f"Identity verification failed: {str(e)}")
+
+        confirmation = (
+            f"Verified package {summary['did'][:30]}... "
+            f"(agent={summary['agent_name']}, "
+            f"v{summary.get('package_version', '?')}): "
+            f"constitution={constitution_status}, "
+            f"hash={hash_status}, signature={sig_status}"
+        )
+        data = {
+            "source": source,
+            "summary": dict(summary),
+            "constitution_status": constitution_status,
+            "hash_status": hash_status,
+            "signature_status": sig_status,
+        }
+
+        # Honesty: a verification that finds the package INVALID is
+        # not a tool failure (the verify ran successfully and gave
+        # an authoritative answer), but the LLM must surface the
+        # invalid-half — otherwise it might say "verified the
+        # package" without mentioning the check failed. PARTIAL
+        # forces both halves to speak.
+        invalid_parts = []
+        if constitution_status == "INVALID":
+            invalid_parts.append("constitution hash mismatch")
+        if hash_status.startswith("INVALID"):
+            invalid_parts.append("content hash mismatch (package may have been modified)")
+        if sig_status.startswith("INVALID"):
+            invalid_parts.append(f"signature {sig_status.lower()}")
+        if invalid_parts:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    "package verification reported failures: "
+                    + "; ".join(invalid_parts)
+                    + "; do NOT import this package without resolving"
+                ),
+                data=data,
+            )
+
+        # Honesty: an UNSIGNED package isn't a verification *failure*
+        # (the verify ran and found no signature to check), but the
+        # default import path uses ``allow_unsigned=False`` —
+        # IdentityImporter will reject it. Returning a clean OK lets
+        # the LLM say "package verified" while the same package is
+        # actually unimportable. Surface as PARTIAL so the LLM has to
+        # speak the importability caveat. (Round 3 codex finding.)
+        if sig_status == "UNSIGNED":
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    "package is UNSIGNED — `!identity import` defaults to "
+                    "allow_unsigned=False and will reject it. Either re-sign "
+                    "the package or pass allow_unsigned=True (NOT recommended "
+                    "for cross-substrate migrations)"
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     @tool(
         name="assess_substrate",
@@ -372,10 +604,8 @@ Verification:
         category=ToolCategory.SYSTEM,
         command_prefix="!identity assess"
     )
-    async def assess_substrate(self) -> str:
-        """
-        Assess current substrate capabilities.
-        """
+    async def assess_substrate(self) -> ToolResult:
+        """Assess current substrate capabilities."""
         try:
             from kestrel_sovereign.config import load_config
             from kestrel_sovereign.identity import SubstrateType
@@ -409,30 +639,45 @@ Verification:
                 "streaming": "Yes",
                 "function_calling": "Yes" if substrate != SubstrateType.UNKNOWN.value else "Unknown",
             }
-
-            cap_lines = "\n".join(f"- {k}: {v}" for k, v in capabilities.items())
-
-            return f"""Substrate Assessment
-
-Current Substrate:
-- Type: {substrate}
-- Provider: {provider}
-- Model: {model}
-
-Capabilities:
-{cap_lines}
-
-Identity Status:
-- Agent DID: {self.agent.agent_id[:30]}...
-- Constitution: Anchored
-- Memory System: Active
-
-Note: Full capability mapping will be expanded in Phase 3 of substrate portability.
-"""
-
         except Exception as e:
             logger.error(f"Substrate assessment failed: {e}", exc_info=True)
-            return f"Substrate assessment failed: {str(e)}"
+            return ToolResult.failed(f"Substrate assessment failed: {str(e)}")
+
+        cap_lines = "\n".join(f"- {k}: {v}" for k, v in capabilities.items())
+        confirmation_text = (
+            f"Substrate: {substrate} ({provider}/{model}); "
+            f"capabilities: tool_use={capabilities['tool_use']}, "
+            f"vision={capabilities['vision']}, "
+            f"function_calling={capabilities['function_calling']}"
+        )
+        data = {
+            "substrate_type": substrate,
+            "provider": provider,
+            "model": model,
+            "capabilities": dict(capabilities),
+            "agent_did_prefix": self.agent.agent_id[:30],
+        }
+
+        # Honesty: when substrate detection fell through to UNKNOWN,
+        # the resulting capabilities map is full of "Unknown". The
+        # tool ran successfully (it gave an answer) but downstream
+        # decisions made on this assessment will be brittle. Surface
+        # as PARTIAL so the LLM cannot claim "assessed substrate"
+        # without mentioning the unknowns.
+        if substrate == SubstrateType.UNKNOWN.value:
+            return ToolResult.partial(
+                confirmation=confirmation_text,
+                error=(
+                    f"substrate is UNKNOWN (provider={provider!r}); "
+                    "capability assessment is best-effort and downstream "
+                    "migration decisions should treat it as untrusted"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=confirmation_text,
+            data=data,
+        )
 
     @tool(
         name="migration_history",
@@ -441,16 +686,18 @@ Note: Full capability mapping will be expanded in Phase 3 of substrate portabili
         category=ToolCategory.SYSTEM,
         command_prefix="!identity history"
     )
-    async def migration_history(self) -> str:
-        """
-        Show migration audit trail.
-        """
-        try:
-            db = resolve_feature_database(self.agent)
-            if db is None:
-                return "No migration history found"
+    async def migration_history(self) -> ToolResult:
+        """Show migration audit trail."""
+        db = resolve_feature_database(self.agent)
+        # Honesty: pre-fix, "no DB" returned the same string as "DB
+        # OK but 0 records" — the LLM couldn't tell the difference.
+        # Surface as ERROR when the DB is unavailable so downstream
+        # logic doesn't infer "agent has no history" from a database
+        # outage.
+        if db is None:
+            return ToolResult.failed("Database not available; migration history cannot be queried")
 
-            # Get migration records from graph
+        try:
             rows = await db.fetchall(
                 """SELECT node_id, properties FROM graph_nodes
                    WHERE node_type = 'migration_record'
@@ -461,47 +708,96 @@ Note: Full capability mapping will be expanded in Phase 3 of substrate portabili
                    ORDER BY node_id DESC""",
                 (self.agent.agent_id,)
             )
-
-            if not rows:
-                return """Migration History
-
-No migrations recorded.
-
-This agent was born on this substrate and has never been migrated.
-
-Use `!identity export` to create a portable identity package.
-"""
-
-            # Format migration records
-            records = []
-            for row in rows:
-                props = json.loads(row[1]) if row[1] else {}
-                records.append({
-                    "id": row[0][:12],
-                    "timestamp": props.get("timestamp", "Unknown")[:19],
-                    "from": props.get("source_substrate", "Unknown"),
-                    "to": props.get("target_substrate", "Unknown"),
-                    "stats": props.get("stats", {}),
-                })
-
-            # Build history display
-            history_lines = []
-            for i, rec in enumerate(records, 1):
-                stats = rec["stats"]
-                history_lines.append(f"""
-{i}. Migration {rec['id']}
-   Date: {rec['timestamp']}
-   From: {rec['from']} -> To: {rec['to']}
-   Items: {stats.get('episodes_imported', 0)} episodes, {stats.get('saved_items_imported', 0)} items
-""")
-
-            return f"""Migration History
-
-Total Migrations: {len(records)}
-{"".join(history_lines)}
-Use `!identity export` to create a new identity package for migration.
-"""
-
         except Exception as e:
             logger.error(f"Migration history failed: {e}", exc_info=True)
-            return f"Migration history failed: {str(e)}"
+            return ToolResult.failed(f"Migration history failed: {str(e)}")
+
+        if not rows:
+            return ToolResult.ok(
+                confirmation=(
+                    "Migration history: no migrations recorded — this agent "
+                    "was born on this substrate. Use `!identity export` to "
+                    "create a portable package."
+                ),
+                data={"total_migrations": 0, "records": []},
+            )
+
+        # Format migration records. Wrap each per-row format step
+        # so a single malformed row (e.g. ``{"stats": null}``,
+        # numeric timestamp, missing fields) doesn't escape this
+        # @tool — the migrated module's contract requires every
+        # code path to return ToolResult. (Round 1 codex finding.)
+        records = []
+        parse_errors: List[str] = []
+        for row in rows:
+            try:
+                node_id = row[0] if row else None
+                if not isinstance(node_id, str):
+                    parse_errors.append(f"row had non-string node_id: {node_id!r}")
+                    continue
+                short_id = node_id[:12]
+
+                if row[1] is None:
+                    props: Dict[str, Any] = {}
+                elif isinstance(row[1], str):
+                    props = json.loads(row[1])
+                    if not isinstance(props, dict):
+                        parse_errors.append(
+                            f"node {short_id}: properties JSON parsed to "
+                            f"{type(props).__name__}, expected object"
+                        )
+                        continue
+                else:
+                    parse_errors.append(
+                        f"node {short_id}: properties is "
+                        f"{type(row[1]).__name__}, expected str/None"
+                    )
+                    continue
+
+                ts = props.get("timestamp", "Unknown")
+                ts_str = ts[:19] if isinstance(ts, str) else str(ts)[:19]
+
+                # ``stats`` may be missing, ``null``, or a non-dict —
+                # accept dict, fall back to {} otherwise.
+                raw_stats = props.get("stats")
+                stats = dict(raw_stats) if isinstance(raw_stats, dict) else {}
+
+                records.append({
+                    "id": short_id,
+                    "full_id": node_id,
+                    "timestamp": ts_str,
+                    "from": props.get("source_substrate") or "Unknown",
+                    "to": props.get("target_substrate") or "Unknown",
+                    "stats": stats,
+                })
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                short = row[0][:12] if row and isinstance(row[0], str) else "?"
+                parse_errors.append(f"node {short}: {e}")
+                continue
+
+        confirmation = (
+            f"Migration history: {len(records)} migration(s) recorded "
+            + ("" if not parse_errors
+               else f"({len(parse_errors)} record(s) had unreadable properties)")
+        ).strip()
+        data = {
+            "total_migrations": len(records),
+            "records": records,
+            "parse_errors": parse_errors,
+        }
+
+        # Honesty: some rows had unparseable properties. We report
+        # the readable ones but the full count of recorded migrations
+        # may be higher than ``total_migrations`` suggests. PARTIAL
+        # forces the LLM to surface the gap.
+        if parse_errors:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"{len(parse_errors)} migration record(s) had "
+                    "unparseable properties and were skipped: "
+                    + "; ".join(parse_errors)
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
