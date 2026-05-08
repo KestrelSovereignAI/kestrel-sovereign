@@ -86,8 +86,13 @@ class SovereigntyFeature(Feature):
         try:
             for feature in getattr(self.agent, 'features', {}).values():
                 if type(feature).__name__ == 'AuditAnchorFeature':
-                    status = await feature.anchor_status()
-                    audit_anchors = status.get("result", status)
+                    status_envelope = await feature.anchor_status()
+                    # anchor_status returns a ToolResult envelope
+                    # (#1061 wave 17); the legacy dict lives under .data.
+                    if hasattr(status_envelope, "data") and status_envelope.data is not None:
+                        audit_anchors = status_envelope.data
+                    else:
+                        audit_anchors = status_envelope
                     break
         except Exception:
             logger.debug("Failed to attach audit anchors to sovereignty receipt", exc_info=True)

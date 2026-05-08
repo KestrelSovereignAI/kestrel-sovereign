@@ -10,6 +10,7 @@ import pytest_asyncio
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.audit_anchor.hasher import AuditHasher
 
 
@@ -196,18 +197,18 @@ class TestAuditAnchorFeature:
     async def test_anchor_audit_no_entries(self, feature_no_entries):
         """Returns 'nothing to anchor' when no audit entries exist."""
         result = await feature_no_entries.anchor_audit()
-        assert result["status"] == "nothing_to_anchor"
+        assert result.data["status"] == "nothing_to_anchor"
 
     @pytest.mark.asyncio
     async def test_anchor_audit_creates_record(self, feature_with_entries):
         """Anchoring with entries stores a record in the database."""
         result = await feature_with_entries.anchor_audit()
 
-        assert result["status"] == "anchored"
-        assert result["entries_count"] == 3
-        assert len(result["anchor_hash"]) == 64  # SHA-256
-        assert result["storage_ref"] == "fakehash123"
-        assert result["anchor_id"] is not None
+        assert result.data["status"] == "anchored"
+        assert result.data["entries_count"] == 3
+        assert len(result.data["anchor_hash"]) == 64  # SHA-256
+        assert result.data["storage_ref"] == "fakehash123"
+        assert result.data["anchor_id"] is not None
 
         # Verify store_file was called with serialized entries
         feature_with_entries.agent.storage.store_file.assert_called_once()
@@ -235,15 +236,15 @@ class TestAuditAnchorFeature:
         )
         result = await feature_with_entries.anchor_audit()
 
-        assert result["status"] == "anchored"
-        assert result["storage_ref"] is None
-        assert result["entries_count"] == 3
+        assert result.data["status"] == "anchored"
+        assert result.data["storage_ref"] is None
+        assert result.data["entries_count"] == 3
 
     @pytest.mark.asyncio
     async def test_verify_audit_no_anchors(self, feature_no_entries):
         """Verify returns 'no_anchors' when none exist."""
         result = await feature_no_entries.verify_audit()
-        assert result["status"] == "no_anchors"
+        assert result.data["status"] == "no_anchors"
 
     @pytest.mark.asyncio
     async def test_verify_audit_passes(self, tmp_path):
@@ -285,10 +286,10 @@ class TestAuditAnchorFeature:
 
         result = await feature.verify_audit()
 
-        assert result["status"] == "verified"
-        assert result["total_anchors"] == 1
-        assert result["passed"] == 1
-        assert result["failed"] == 0
+        assert result.data["status"] == "verified"
+        assert result.data["total_anchors"] == 1
+        assert result.data["passed"] == 1
+        assert result.data["failed"] == 0
 
     @pytest.mark.asyncio
     async def test_verify_audit_detects_tampering(self, tmp_path):
@@ -315,10 +316,10 @@ class TestAuditAnchorFeature:
 
         result = await feature.verify_audit()
 
-        assert result["status"] == "integrity_failure"
-        assert result["failed"] == 1
-        assert result["details"][0]["status"] == "FAIL"
-        assert result["details"][0]["match"] is False
+        assert result.data["status"] == "integrity_failure"
+        assert result.data["failed"] == 1
+        assert result.data["details"][0]["status"] == "FAIL"
+        assert result.data["details"][0]["match"] is False
 
     @pytest.mark.asyncio
     async def test_anchor_status(self, feature_with_entries):
@@ -329,10 +330,10 @@ class TestAuditAnchorFeature:
 
         result = await feature_with_entries.anchor_status()
 
-        assert result["last_anchor_at"] is None
-        assert result["total_anchors"] == 0
-        assert result["entries_since_last"] == 3  # 3 entries exist, none anchored
-        assert result["auto_anchor_threshold"] == 50
+        assert result.data["last_anchor_at"] is None
+        assert result.data["total_anchors"] == 0
+        assert result.data["entries_since_last"] == 3  # 3 entries exist, none anchored
+        assert result.data["auto_anchor_threshold"] == 50
 
     @pytest.mark.asyncio
     async def test_anchor_status_with_existing_anchor(self, tmp_path):
@@ -357,10 +358,10 @@ class TestAuditAnchorFeature:
 
         result = await feature.anchor_status()
 
-        assert result["last_anchor_at"] == "2026-03-01T12:00:00"
-        assert result["total_anchors"] == 1
+        assert result.data["last_anchor_at"] == "2026-03-01T12:00:00"
+        assert result.data["total_anchors"] == 1
         # Only the second entry (12:05) is after the anchor at 12:00
-        assert result["entries_since_last"] == 1
+        assert result.data["entries_since_last"] == 1
 
     @pytest.mark.asyncio
     async def test_on_audit_complete_auto_anchors(self, tmp_path):
@@ -434,7 +435,7 @@ class TestAuditAnchorFeature:
         await feature.initialize()
 
         result = await feature.anchor_audit()
-        assert result["status"] == "nothing_to_anchor"
+        assert result.data["status"] == "nothing_to_anchor"
 
     @pytest.mark.asyncio
     async def test_feature_has_correct_tools(self, feature_no_entries):
