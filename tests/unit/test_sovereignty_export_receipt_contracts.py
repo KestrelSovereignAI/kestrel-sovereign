@@ -61,12 +61,20 @@ async def test_export_persists_receipt_with_import_and_audit_provenance():
         "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter",
         return_value=adapter,
     ):
-        result = await SovereigntyFeature(agent).export_sovereignty(
+        envelope = await SovereigntyFeature(agent).export_sovereignty(
             storage_tier="ipfs",
             encrypt=True,
         )
 
-    assert "CID: bafybackup" in result
+    assert "CID: bafybackup" in envelope.confirmation
+    assert envelope.data == {
+        "cid": "bafybackup",
+        "content_hash": "hash123",
+        "tier": "ipfs",
+        "encrypted": True,
+        "size_bytes": len(backup_blob),
+        "node_id": "hash123",
+    }
     assert len(stored_nodes) == 1
     receipt = stored_nodes[0]
     assert receipt.node_type == "sovereignty_receipt"
@@ -119,10 +127,12 @@ async def test_import_fails_closed_when_backup_key_material_is_missing_or_rotate
         "kestrel_sovereign.features.sovereignty.feature.FilecoinAdapter",
         return_value=adapter,
     ):
-        result = await SovereigntyFeature(agent).import_sovereignty("bafybackup")
+        envelope = await SovereigntyFeature(agent).import_sovereignty("bafybackup")
 
-    assert result.startswith("❌ Error during import:")
-    assert expected in result
+    from kestrel_sdk.tools.result import ToolResultStatus
+    assert envelope.status is ToolResultStatus.ERROR
+    assert envelope.error.startswith("❌ Error during import:")
+    assert expected in envelope.error
     adapter.retrieve_content.assert_called_once_with(
         "bafybackup",
         ipfs_cid="bafybackup",

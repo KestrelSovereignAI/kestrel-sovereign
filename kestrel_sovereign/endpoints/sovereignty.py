@@ -8,6 +8,7 @@ import re
 import time
 import os
 import logging
+from typing import Any, Dict
 
 from kestrel_sovereign.kestrel_config.constants import MAX_SOVEREIGNTY_PREVIEW_SIZE
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
@@ -198,8 +199,24 @@ async def trigger_sovereignty_export(request: Request):
         if not sovereignty:
             raise HTTPException(status_code=500, detail="Sovereignty feature not available.")
 
-        result = await sovereignty.export_sovereignty(storage_tier=tier, encrypt=encrypt)
-        return {"success": True, "message": result}
+        envelope = await sovereignty.export_sovereignty(storage_tier=tier, encrypt=encrypt)
+        # export_sovereignty returns a ToolResult since #1061 wave 22.
+        # Honesty: surface PARTIAL/ERROR distinctly so the HTTP caller
+        # can tell a "backup hashed but not actually published" path
+        # from a clean export, and bubble auth/wallet refusals as
+        # 4xx-shaped errors instead of 200 OK.
+        from kestrel_sdk.tools.result import ToolResultStatus
+        message = envelope.confirmation or envelope.error or ""
+        body: Dict[str, Any] = {
+            "success": envelope.status is not ToolResultStatus.ERROR,
+            "status": envelope.status.value,
+            "message": message,
+        }
+        if envelope.error:
+            body["error"] = envelope.error
+        if envelope.data is not None:
+            body["data"] = envelope.data
+        return body
     except HTTPException:
         raise
     except Exception as e:
