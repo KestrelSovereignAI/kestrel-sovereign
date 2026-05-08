@@ -52,11 +52,14 @@ uv sync  # Creates .venv and installs all dependencies
 ollama serve
 ollama pull llama3.2:3b
 
-# 3. Run the setup wizard. Interactive by default; pass --quickstart to
-#    accept defaults, autodetect Ollama, generate KESTREL_DATA_KEY +
-#    KESTREL_API_KEY, and pre-register a default agent named "Kestrel".
-uv run kestrel setup            # interactive
-uv run kestrel setup --quickstart  # non-interactive (CI / scripted installs)
+# 3. Run the setup wizard. Interactive by default; --quickstart accepts
+#    every default non-interactively (CI / scripted installs).
+#    Note: --quickstart configures Ollama as the LLM provider — it
+#    does NOT autodetect cloud API keys. If you're cloud-only, run
+#    the interactive wizard so it can ask which provider you want
+#    (or hand-edit `kestrel.toml`'s [llm] block after).
+uv run kestrel setup               # interactive (recommended for cloud-only)
+uv run kestrel setup --quickstart  # non-interactive; selects Ollama
 # Or hand-edit: cp kestrel.toml.example kestrel.toml
 
 # 4. Doctor check (verify readiness)
