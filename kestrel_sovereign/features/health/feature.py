@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from .checks import (
     check_context_budget,
@@ -152,15 +153,52 @@ class HealthFeature(Feature):
     # Tool commands (canonical !health* form)
     # =========================================================================
 
+    # ------------------------------------------------------------------
+    # Wrappers from the dict-returning internal helpers to ToolResult.
+    #
+    # The helpers (``_run_health``, ``_load_history``, ``_apply_interval``)
+    # keep dict returns because the public API methods (``run_once``,
+    # ``get_latest``) and HTTP endpoints (``/agent/health/*``) rely on
+    # that shape, and the background liveness loop reads ``result['status']``
+    # directly. Wrapping at the @tool boundary keeps the migration
+    # localized.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _wrap_health_result(result: Dict[str, Any]) -> ToolResult:
+        """Render a ``_run_health`` dict as a ToolResult.
+
+        Honesty: the check itself ran successfully even when the system
+        is degraded/unhealthy. We return ToolResult.ok with the status
+        explicit in the confirmation so the LLM cannot claim the
+        system is healthy without reading the status field. The
+        structured data carries the per-check breakdown.
+        """
+        status = result.get("status", "unknown")
+        checks = result.get("checks", []) or []
+        failed = [c for c in checks if c.get("status") == "fail"]
+        warned = [c for c in checks if c.get("status") == "warn"]
+
+        confirmation = (
+            f"Liveness probe ran: overall={status}, "
+            f"{len(checks)} check(s)"
+            + (f", {len(failed)} failed" if failed else "")
+            + (f", {len(warned)} warned" if warned else "")
+        )
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data=dict(result),
+        )
+
     @tool(
         name="health_check",
         description="Run a manual liveness check and show results",
         category=ToolCategory.SYSTEM,
         command_prefix="!health",
     )
-    async def health_check(self) -> Dict[str, Any]:
+    async def health_check(self) -> ToolResult:
         """Run all liveness checks and return the results."""
-        return await self._run_health()
+        return self._wrap_health_result(await self._run_health())
 
     @tool(
         name="health_history",
@@ -168,9 +206,31 @@ class HealthFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!health-history",
     )
-    async def health_history(self, limit: int = 10) -> Dict[str, Any]:
-        """Show the last N health results and uptime information."""
-        return await self._load_history(limit)
+    async def health_history(self, limit: int = 10) -> ToolResult:
+        """Show the last N health results and uptime information.
+
+        Args:
+            limit: Maximum entries to return (the request — actual count
+                returned may be lower if fewer entries exist).
+        """
+        try:
+            limit_val = int(limit)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"limit must be an integer, got {limit!r}"
+            )
+        if limit_val < 1:
+            return ToolResult.failed("limit must be >= 1")
+
+        data = await self._load_history(limit_val)
+        return ToolResult.ok(
+            confirmation=(
+                f"Health history: {data['history_count']} entry(ies), "
+                f"uptime={data['uptime_seconds']}s, trend={data['trend']}, "
+                f"interval={data['interval_seconds']}s"
+            ),
+            data=dict(data),
+        )
 
     @tool(
         name="health_interval",
@@ -178,9 +238,45 @@ class HealthFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!health-interval",
     )
-    async def health_interval(self, seconds: int = 60) -> Dict[str, Any]:
-        """Change the background liveness-check interval."""
-        return await self._apply_interval(seconds)
+    async def health_interval(self, seconds: int = 60) -> ToolResult:
+        """Change the background liveness-check interval.
+
+        Args:
+            seconds: Requested interval in seconds. Clamped to [10, 3600].
+        """
+        try:
+            seconds_val = int(seconds)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"seconds must be an integer, got {seconds!r}"
+            )
+
+        # _apply_interval silently clamps to [10, 3600]. Honesty: if
+        # the request was outside the range, surface as PARTIAL with
+        # the actual applied value so the LLM cannot claim "set to 5"
+        # when the runtime accepted 10.
+        clamped = seconds_val < 10 or seconds_val > 3600
+        data = await self._apply_interval(seconds_val)
+        if clamped:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Interval changed: {data['old_interval_seconds']}s "
+                    f"→ {data['new_interval_seconds']}s"
+                ),
+                error=(
+                    f"requested {seconds_val}s is outside the allowed "
+                    f"range [10, 3600]; clamped to "
+                    f"{data['new_interval_seconds']}s"
+                ),
+                data={**data, "requested_seconds": seconds_val},
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Interval changed: {data['old_interval_seconds']}s "
+                f"→ {data['new_interval_seconds']}s"
+            ),
+            data={**data, "requested_seconds": seconds_val},
+        )
 
     # =========================================================================
     # Legacy !heartbeat* aliases (deprecation-warn + forward)
@@ -192,9 +288,10 @@ class HealthFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!heartbeat",
     )
-    async def heartbeat_check_alias(self) -> Dict[str, Any]:
+    async def heartbeat_check_alias(self) -> ToolResult:
         self._warn_deprecated("!heartbeat", "!health")
-        return await self._run_health()
+        result = self._wrap_health_result(await self._run_health())
+        return self._tag_alias(result, "!heartbeat")
 
     @tool(
         name="heartbeat_status",
@@ -202,9 +299,10 @@ class HealthFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!heartbeat-status",
     )
-    async def heartbeat_status_alias(self, limit: int = 10) -> Dict[str, Any]:
+    async def heartbeat_status_alias(self, limit: int = 10) -> ToolResult:
         self._warn_deprecated("!heartbeat-status", "!health-history")
-        return await self._load_history(limit)
+        result = await self.health_history(limit=limit)
+        return self._tag_alias(result, "!heartbeat-status")
 
     @tool(
         name="heartbeat_interval",
@@ -212,9 +310,39 @@ class HealthFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!heartbeat-interval",
     )
-    async def heartbeat_interval_alias(self, seconds: int = 60) -> Dict[str, Any]:
+    async def heartbeat_interval_alias(self, seconds: int = 60) -> ToolResult:
         self._warn_deprecated("!heartbeat-interval", "!health-interval")
-        return await self._apply_interval(seconds)
+        result = await self.health_interval(seconds=seconds)
+        return self._tag_alias(result, "!heartbeat-interval")
+
+    @staticmethod
+    def _tag_alias(result: ToolResult, alias: str) -> ToolResult:
+        """Inject ``deprecated_alias`` into a forwarded ToolResult.
+
+        Preserve the alias marker across OK/PARTIAL/ERROR so the
+        LLM/audit payload can always tell that the deprecated alias
+        was used — including on input-validation errors raised by
+        the canonical tool. (Round 1 codex finding for #1082.)
+        """
+        merged_data = {**(result.data or {}), "deprecated_alias": alias}
+        status = result.status.value
+        if status == "ok":
+            return ToolResult.ok(
+                confirmation=result.confirmation,
+                data=merged_data,
+            )
+        if status == "partial":
+            return ToolResult.partial(
+                confirmation=result.confirmation,
+                error=result.error,
+                data=merged_data,
+            )
+        # ERROR: preserve the error string and surface the alias marker
+        # via data so traceability holds for the failure path too.
+        return ToolResult.failed(
+            result.error or "unknown error",
+            data=merged_data,
+        )
 
     def _warn_deprecated(self, old: str, new: str) -> None:
         logger.warning(
