@@ -143,8 +143,11 @@ class TestScriptLifecycle:
             purpose="Test"
         )
         
-        assert "created" in result.lower() or "✅" in result
-        assert "test_script" in result
+        # write_script now returns a ToolResult envelope (#1061 wave 13);
+        # the formatted body lives in confirmation.
+        body = result.confirmation
+        assert "created" in body.lower() or "✅" in body
+        assert "test_script" in body
     
     @pytest.mark.asyncio
     async def test_script_signed_after_write(self, compute_feature):
@@ -196,9 +199,11 @@ class TestScriptLifecycle:
         script.signature = "hmac:" + base64.b64encode(forged).decode()
         await compute_feature.script_store.update(script)
 
-        # run_script should reject before reaching the executor
+        # run_script should reject before reaching the executor.
+        # Migrated path: invalid signature -> ToolResult.failed; the
+        # rejection text lives in result.error.
         result = await compute_feature.run_script(script.id, executor="uv")
-        assert "invalid signature" in result.lower(), (
+        assert "invalid signature" in (result.error or "").lower(), (
             f"run_script must reject the legacy hmac: tag, got: {result!r}"
         )
 
@@ -229,7 +234,7 @@ class TestScriptLifecycle:
         await compute_feature.script_store.update(script)
 
         result = await compute_feature.run_script(script.id, executor="uv")
-        assert "invalid signature" in result.lower(), (
+        assert "invalid signature" in (result.error or "").lower(), (
             f"run_script must reject state=SIGNED with no signature, got: {result!r}"
         )
 
@@ -254,7 +259,7 @@ class TestScriptLifecycle:
         await compute_feature.script_store.update(script)
 
         result = await compute_feature.run_script(script.id, executor="uv")
-        assert "invalid signature" in result.lower(), (
+        assert "invalid signature" in (result.error or "").lower(), (
             f"run_script must reject state=SIGNED with empty signature, got: {result!r}"
         )
 
@@ -348,9 +353,12 @@ class TestApprovalIntegration:
         try:
             # Now run should work (auto-approved by mock)
             result = await compute_feature.run_script(script.id[:8], executor="uv")
-            
-            # Should either succeed or fail based on uv availability, but not be denied
-            assert "denied" not in result.lower() or "approved" in result.lower() or "completed" in result.lower() or "failed" in result.lower()
+
+            # Should either succeed or fail based on uv availability, but not be
+            # denied. result is a ToolResult — flatten confirmation+error to
+            # search the same content the legacy str return carried.
+            text = ((result.confirmation or "") + (result.error or "")).lower()
+            assert "denied" not in text or "approved" in text or "completed" in text or "failed" in text
         finally:
             security_feature.approval_queue.request_approval = original_request
 
@@ -402,7 +410,8 @@ class TestTrashIntegration:
     async def test_list_trash_works(self, compute_feature):
         """Test listing trash items works."""
         result = await compute_feature.list_trash()
-        assert "Trash" in result or "empty" in result.lower()
+        body = result.confirmation
+        assert "Trash" in body or "empty" in body.lower()
 
 
 if __name__ == "__main__":

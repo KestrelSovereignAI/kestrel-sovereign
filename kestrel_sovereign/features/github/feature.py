@@ -543,7 +543,15 @@ Use `list_source_components` to see the feature components that make up this age
             return self._str_to_tool_result(f"Could not access component '{component}': {e}")
         
         if not comp_files:
-            return self._str_to_tool_result(f"Component '{component}' not found or has no files")
+            # Codex round 1 P2 (#1108): the helper's prefix detector
+            # treats this body as OK by default, but a not-found
+            # component is an ERROR — return failed explicitly so
+            # downstream callers see status=ERROR rather than
+            # success=True with an apologetic body.
+            return ToolResult.failed(
+                f"Component '{component}' not found or has no files",
+                data={"component": component},
+            )
         
         lines = [f"# Component: {component}\n"]
         lines.append(f"**Path:** {component_path}")
