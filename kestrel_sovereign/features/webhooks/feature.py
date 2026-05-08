@@ -478,31 +478,60 @@ class WebhookFeature(Feature):
             name: The name of the webhook to remove
 
         Returns:
-            ToolResult.ok on a clean remove; PARTIAL when the receiver
-            forgot the webhook but the DB DELETE failed (a future
-            restart could resurrect it from webhook_config); ERROR
-            when the webhook is not registered.
+            ToolResult.ok on a clean remove (in-memory + persisted row).
+            PARTIAL when the receiver forgot it but the DB DELETE failed,
+            OR when the receiver had no record but a persisted-only row
+            was cleaned up (the latter can happen after a prior partial
+            failure or when a persisted webhook didn't load on startup —
+            retrying ``webhooks_remove`` must still scrub the row, so
+            we never short-circuit on the receiver miss alone).
+            ERROR only when neither the receiver nor the database
+            has any trace of the webhook.
         """
-        # Remove from receiver
-        removed = self.receiver.unregister_webhook(name)
+        # Remove from receiver (in-memory)
+        removed_from_memory = self.receiver.unregister_webhook(name)
 
-        if not removed:
-            return ToolResult.failed(error=f"Webhook '{name}' not found")
-
-        # Remove from database
+        # Always attempt the DB DELETE, even if the receiver didn't
+        # have it. A prior call could have left a stale row behind
+        # (transient DB error → PARTIAL), or a persisted webhook may
+        # have failed to load into the receiver on startup. If we
+        # short-circuit on the receiver miss, that row gets
+        # resurrected on the next restart — codex caught this on
+        # round 1.
+        deleted_persisted_row = False
         delete_failed = False
         if self._db:
             try:
-                await self._db.execute(
-                    "DELETE FROM webhook_config WHERE name = ? AND agent_id = ?",
+                # Probe first so we can tell "found-and-deleted" from
+                # "no-row-existed" without depending on cursor.rowcount,
+                # which is not uniformly exposed by the async DB
+                # adapter. Two queries instead of one is cheap; correctness
+                # is not.
+                existing = await self._db.fetchone(
+                    "SELECT id FROM webhook_config WHERE name = ? AND agent_id = ?",
                     (name, self._agent_id),
                 )
+                if existing is not None:
+                    await self._db.execute(
+                        "DELETE FROM webhook_config WHERE name = ? AND agent_id = ?",
+                        (name, self._agent_id),
+                    )
+                    deleted_persisted_row = True
             except Exception as exc:
                 logger.warning("WebhookFeature: failed to delete from DB: %s", exc)
                 delete_failed = True
 
-        data = {"name": name, "status": "removed", "deleted_from_db": (self._db is not None and not delete_failed)}
+        if not removed_from_memory and not deleted_persisted_row and not delete_failed:
+            return ToolResult.failed(error=f"Webhook '{name}' not found")
+
+        data = {
+            "name": name,
+            "status": "removed",
+            "removed_from_memory": removed_from_memory,
+            "deleted_from_db": deleted_persisted_row,
+        }
         confirmation = f"Webhook '{name}' removed."
+
         if delete_failed:
             return ToolResult.partial(
                 confirmation,
@@ -510,6 +539,19 @@ class WebhookFeature(Feature):
                     "the receiver forgot this webhook but the DB DELETE for "
                     "webhook_config failed — a restart could resurrect it "
                     "from the persisted row."
+                ),
+                data=data,
+            )
+        if not removed_from_memory and deleted_persisted_row:
+            # Persisted-only cleanup — the receiver never had this
+            # webhook in this process. Surface that so the LLM doesn't
+            # claim it was actively serving requests right before the
+            # remove.
+            return ToolResult.partial(
+                confirmation,
+                (
+                    f"webhook '{name}' was not loaded in the in-memory "
+                    "receiver; cleaned up a stale row from webhook_config."
                 ),
                 data=data,
             )

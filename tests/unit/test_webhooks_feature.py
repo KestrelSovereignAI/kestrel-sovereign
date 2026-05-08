@@ -830,12 +830,45 @@ class TestWebhooksRemove:
     async def test_remove_deletes_from_db(self, feature):
         await feature.webhooks_register(name="db-remove", auth_type="none")
         feature._db.execute.reset_mock()
+        feature._db.fetchone = AsyncMock(return_value=("any-id",))
         await feature.webhooks_remove(name="db-remove")
         delete_calls = [
             c for c in feature._db.execute.call_args_list
             if "DELETE FROM webhook_config" in str(c)
         ]
         assert len(delete_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_remove_cleans_persisted_only_row(self, feature):
+        """Receiver doesn't have the webhook (e.g. it failed to load on
+        startup, or a prior remove was PARTIAL because the DB was
+        temporarily down) but the persisted row still exists. The
+        retry must scrub that row, NOT short-circuit on the receiver
+        miss — otherwise the webhook resurrects on the next restart.
+        Codex round 1 of #1126 caught the regression.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        # Receiver is empty; DB still has the row.
+        feature._db.fetchone = AsyncMock(return_value=("orphan-id",))
+        envelope = await feature.webhooks_remove(name="orphan")
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert "stale row" in envelope.error
+        assert envelope.data["removed_from_memory"] is False
+        assert envelope.data["deleted_from_db"] is True
+        delete_calls = [
+            c for c in feature._db.execute.call_args_list
+            if "DELETE FROM webhook_config" in str(c)
+        ]
+        assert len(delete_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_remove_truly_not_found_returns_error(self, feature):
+        """Neither receiver nor DB has the webhook → ERROR."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.fetchone = AsyncMock(return_value=None)
+        envelope = await feature.webhooks_remove(name="ghost")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not found" in envelope.error
 
 
 class TestWebhooksHistory:
