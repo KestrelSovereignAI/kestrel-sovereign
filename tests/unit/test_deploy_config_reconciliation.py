@@ -296,6 +296,111 @@ def test_kestrel_allowed_emails_expansion(live_config, monkeypatch):
     )
 
 
+def test_build_image_reference_uses_profile_scoped_project(live_config):
+    """Codex review on the final epic→main PR: when a profile sets its
+    own ``gcp_project_id``, ``build_image_reference`` must use THAT
+    project, not the manager-level value. Otherwise a config with a
+    profile-scoped override silently builds the wrong image ref.
+
+    This synthetic config has manager=alpha, dev=alpha, prod=beta —
+    the prod image ref must point at beta.
+    """
+    config = {
+        "manager": {"gcp_project_id": "alpha-project", "image_name": "kestrel"},
+        "profiles": {
+            "dev": {
+                "provider": "cloudrun",
+                "service_name": "kestrel-dev",
+                "region": "us-central1",
+                "gcp_project_id": "alpha-project",
+            },
+            "prod": {
+                "provider": "cloudrun",
+                "service_name": "kestrel-prod",
+                "region": "us-central1",
+                "gcp_project_id": "beta-project",
+            },
+        },
+    }
+    manager = DeployManager(config=config)
+
+    assert (
+        manager.build_image_reference("dev", "v1")
+        == "gcr.io/alpha-project/kestrel:v1"
+    )
+    assert (
+        manager.build_image_reference("prod", "v1")
+        == "gcr.io/beta-project/kestrel:v1"
+    ), "prod profile's gcp_project_id must override the manager-level value"
+
+
+def test_get_provider_caches_per_profile_project(live_config):
+    """Two profiles targeting different GCP projects each get their
+    own CloudRunProvider — not a single one bound to whichever profile
+    constructed first. Codex review caught the cache-shared-state bug
+    on the final epic→main PR.
+    """
+    config = {
+        "manager": {"gcp_project_id": "alpha-project"},
+        "profiles": {
+            "dev": {
+                "provider": "cloudrun",
+                "service_name": "kestrel-dev",
+                "region": "us-central1",
+                "gcp_project_id": "alpha-project",
+            },
+            "prod": {
+                "provider": "cloudrun",
+                "service_name": "kestrel-prod",
+                "region": "us-central1",
+                "gcp_project_id": "beta-project",
+            },
+        },
+    }
+    manager = DeployManager(config=config)
+
+    # Patch CloudRunProvider so we don't try to import google-cloud-run.
+    constructed: list = []
+
+    class _StubProvider:
+        def __init__(self, project_id):
+            self.project_id = project_id
+            constructed.append(project_id)
+
+    from kestrel_sovereign.features.deploy import core as core_mod
+
+    real_cls = core_mod.CloudRunProvider
+    core_mod.CloudRunProvider = _StubProvider
+    try:
+        p_alpha = manager._get_provider(
+            DeployProviderType.CLOUD_RUN, gcp_project_id="alpha-project"
+        )
+        p_beta = manager._get_provider(
+            DeployProviderType.CLOUD_RUN, gcp_project_id="beta-project"
+        )
+    finally:
+        core_mod.CloudRunProvider = real_cls
+
+    # Two separate provider instances, one per project.
+    assert p_alpha is not p_beta
+    assert p_alpha.project_id == "alpha-project"
+    assert p_beta.project_id == "beta-project"
+    # Cache hit: re-asking for alpha returns the same instance.
+    p_alpha_again = manager._get_provider(
+        DeployProviderType.CLOUD_RUN, gcp_project_id="alpha-project"
+    )
+    # The cache holds the STUBBED instance from above, so we re-stub
+    # to assert hit behavior.
+    core_mod.CloudRunProvider = _StubProvider
+    try:
+        p_alpha_again2 = manager._get_provider(
+            DeployProviderType.CLOUD_RUN, gcp_project_id="alpha-project"
+        )
+    finally:
+        core_mod.CloudRunProvider = real_cls
+    assert p_alpha_again is p_alpha_again2
+
+
 @pytest.mark.asyncio
 async def test_deploy_profile_rejects_unresolved_placeholders(
     live_config, monkeypatch

@@ -69,7 +69,14 @@ class DeployManagerCore:
         self.profiles = self._load_profiles(self.config.get("profiles", {}))
 
         # Provider registry (lazy-loaded)
-        self._providers: Dict[DeployProviderType, DeployProvider] = {}
+        # Cache key is ``(provider_type, gcp_project_id)`` so profiles
+        # with different ``gcp_project_id`` values each get their own
+        # CloudRunProvider — not a shared instance bound to whatever
+        # deploy ran first. Azure providers ignore the project_id
+        # component (always None for them).
+        self._providers: Dict[
+            tuple, DeployProvider
+        ] = {}
 
         # Multi-session tracking (agents may have dev+prod simultaneously)
         self._sessions: Dict[str, DeploymentSession] = {}
@@ -200,30 +207,47 @@ class DeployManagerCore:
                 expanded[key] = value
         return expanded
 
-    def _get_provider(self, provider_type: DeployProviderType) -> DeployProvider:
+    def _get_provider(
+        self,
+        provider_type: DeployProviderType,
+        *,
+        gcp_project_id: Optional[str] = None,
+    ) -> DeployProvider:
         """
         Get or create a deployment provider instance.
 
         Args:
-            provider_type: Type of provider to get
+            provider_type: Type of provider to get.
+            gcp_project_id: For ``CLOUD_RUN``, the GCP project the
+                provider should target. Falls back to
+                ``self.gcp_project_id`` when not given (legacy callers,
+                Azure providers — which ignore it). The cache is keyed
+                by ``(provider_type, gcp_project_id)`` so two profiles
+                that target different GCP projects each get their own
+                CloudRunProvider, not a single one bound to whichever
+                deploy ran first. Codex review on the final epic→main
+                PR caught the cache-shared-state bug.
 
         Returns:
             DeployProvider instance
         """
+        cache_key = (provider_type, gcp_project_id)
+
         # Check cache first
-        if provider_type in self._providers:
-            return self._providers[provider_type]
+        if cache_key in self._providers:
+            return self._providers[cache_key]
 
         # Create new provider
         if provider_type == DeployProviderType.CLOUD_RUN:
-            provider = CloudRunProvider(project_id=self.gcp_project_id)
+            project = gcp_project_id or self.gcp_project_id
+            provider = CloudRunProvider(project_id=project)
         elif provider_type == DeployProviderType.AZURE_CONTAINER_APPS:
             provider = AzureContainerProvider()
         else:
             raise DeployManagerError(f"Unknown provider type: {provider_type}")
 
         # Cache for reuse
-        self._providers[provider_type] = provider
+        self._providers[cache_key] = provider
         logger.debug(f"Created {provider_type.value} provider")
 
         return provider
@@ -394,9 +418,22 @@ class DeployManagerCore:
         if profile is not None and profile.is_multi_agent:
             image_name = f"{self.image_name}-multi_agent"
 
+        # Profile-scoped ``gcp_project_id`` wins over the manager-level
+        # value — DeployManagerCore._load_profiles populates
+        # ``profile.gcp_project_id`` with ``data.get("gcp_project_id")
+        # or self.gcp_project_id``, so it's already the resolved
+        # effective project. Without this, a config that legitimately
+        # sets ``[profiles.prod].gcp_project_id`` would build
+        # ``gcr.io/<manager-project>/...`` instead of the profile's.
+        # Codex review on the final epic→main PR.
+        gcp_project = (
+            (profile.gcp_project_id if profile is not None else None)
+            or self.gcp_project_id
+        )
+
         # For Cloud Run, use GCR
-        if self.gcp_project_id:
-            return f"gcr.io/{self.gcp_project_id}/{image_name}:{tag}"
+        if gcp_project:
+            return f"gcr.io/{gcp_project}/{image_name}:{tag}"
 
         # Fallback to generic reference
         return f"{image_name}:{tag}"
@@ -446,7 +483,7 @@ class DeployManagerCore:
             )
             await self.add_session(session)
 
-            provider = self._get_provider(profile.provider)
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
 
             logger.info(f"Deploying {image} to {profile.service_name}...")
             session.status = DeployStatus.DEPLOYING
@@ -491,7 +528,7 @@ class DeployManagerCore:
         """Delete a deployed service for ``profile_name``."""
         try:
             profile = self.get_profile(profile_name)
-            provider = self._get_provider(profile.provider)
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
 
             logger.info(f"Tearing down service {profile.service_name}...")
             result = await provider.teardown(profile.service_name)
@@ -514,7 +551,7 @@ class DeployManagerCore:
         """Fetch the last ``lines`` log lines from the deployed service."""
         try:
             profile = self.get_profile(profile_name)
-            provider = self._get_provider(profile.provider)
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
 
             logs = await provider.get_logs(profile.service_name, lines=lines)
 
@@ -566,7 +603,7 @@ class DeployManagerCore:
                 # No tracked session — query the provider directly so
                 # `kestrel deploy health` works against services that
                 # were deployed in a previous process.
-                provider = self._get_provider(profile.provider)
+                provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
                 status = await provider.get_status(profile.service_name)
 
                 if status.get("status") == "offline":
@@ -588,7 +625,7 @@ class DeployManagerCore:
                     "error": "Service URL not available",
                 }
 
-            provider = self._get_provider(profile.provider)
+            provider = self._get_provider(profile.provider, gcp_project_id=profile.gcp_project_id)
             health_result = await provider.health_check(service_url)
 
             return {
