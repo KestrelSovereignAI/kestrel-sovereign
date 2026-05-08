@@ -524,6 +524,28 @@ class WebhookFeature(Feature):
         if not removed_from_memory and not deleted_persisted_row and not delete_failed:
             return ToolResult.failed(error=f"Webhook '{name}' not found")
 
+        # When nothing was actually removed (neither receiver nor DB
+        # row was touched) but the DB probe blew up, we DO NOT know
+        # whether the webhook exists. Reporting "removed" in that
+        # state would be a lie — it's possible a persisted row is
+        # still there, and the user thinks they cleaned it up.
+        # Codex round 2 of #1126 caught this.
+        if delete_failed and not removed_from_memory and not deleted_persisted_row:
+            return ToolResult.failed(
+                error=(
+                    f"Could not remove webhook '{name}': not loaded in the "
+                    "receiver and the DB lookup against webhook_config "
+                    "failed; the persisted row (if any) is still there. "
+                    "Retry once the database is reachable."
+                ),
+                data={
+                    "name": name,
+                    "removed_from_memory": False,
+                    "deleted_from_db": False,
+                    "db_lookup_failed": True,
+                },
+            )
+
         data = {
             "name": name,
             "status": "removed",
@@ -533,6 +555,9 @@ class WebhookFeature(Feature):
         confirmation = f"Webhook '{name}' removed."
 
         if delete_failed:
+            # Receiver removed it (since we got past the failed-only
+            # check above), but the DB DELETE didn't land — the row
+            # could resurrect on restart.
             return ToolResult.partial(
                 confirmation,
                 (

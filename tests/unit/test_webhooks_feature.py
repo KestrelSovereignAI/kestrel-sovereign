@@ -870,6 +870,24 @@ class TestWebhooksRemove:
         assert envelope.status is ToolResultStatus.ERROR
         assert "not found" in envelope.error
 
+    @pytest.mark.asyncio
+    async def test_remove_db_probe_fails_with_no_memory_hit(self, feature):
+        """Receiver doesn't have it AND the DB probe blew up — we
+        DO NOT know whether a persisted row exists, so reporting
+        'removed' would be a lie. Must return ERROR with a retry
+        hint, not PARTIAL with a fake confirmation. Codex round 2
+        of #1126 caught the regression.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
+        feature._db.fetchone = AsyncMock(side_effect=RuntimeError("connection refused"))
+        envelope = await feature.webhooks_remove(name="maybe-ghost")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "DB lookup against webhook_config failed" in envelope.error
+        assert "Retry" in envelope.error
+        assert envelope.data["removed_from_memory"] is False
+        assert envelope.data["deleted_from_db"] is False
+        assert envelope.data["db_lookup_failed"] is True
+
 
 class TestWebhooksHistory:
     @pytest_asyncio.fixture
