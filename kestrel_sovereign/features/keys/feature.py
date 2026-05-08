@@ -17,9 +17,10 @@ Security:
 import logging
 from typing import Any, Dict, Optional
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
-from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_DEFAULT
 from kestrel_sovereign.security.service_key_storage import (
     ServiceKeyStorage,
@@ -91,7 +92,7 @@ class KeyManagementFeature(Feature):
         provider: str,
         api_key: str,
         quota_limit: Optional[int] = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Add an API key for an external service.
 
@@ -102,24 +103,19 @@ class KeyManagementFeature(Feature):
             provider: Service provider (openrouter, openai, anthropic, lighthouse, github, runpod, vastai)
             api_key: The API key to store (will be encrypted)
             quota_limit: Optional usage limit
-
-        Returns:
-            Result with key_id if successful
         """
         if not self._storage:
-            return {
-                "success": False,
-                "error": "Key storage not available - check KESTREL_DATA_KEY and agent DID",
-            }
+            return ToolResult.failed(
+                "Key storage not available - check KESTREL_DATA_KEY and agent DID",
+            )
 
-        # Validate provider
         provider = provider.lower()
         if provider not in KNOWN_PROVIDERS:
             valid_providers = ", ".join(KNOWN_PROVIDERS.keys())
-            return {
-                "success": False,
-                "error": f"Unknown provider '{provider}'. Valid providers: {valid_providers}",
-            }
+            return ToolResult.failed(
+                f"Unknown provider '{provider}'. Valid providers: {valid_providers}",
+                data={"provider": provider},
+            )
 
         try:
             key_id = await self._storage.store_key(
@@ -127,20 +123,22 @@ class KeyManagementFeature(Feature):
                 api_key=api_key,
                 quota_limit=quota_limit,
             )
+        except Exception as e:
+            logger.error(f"Failed to add service key: {e}")
+            return ToolResult.failed(str(e))
 
-            provider_info = KNOWN_PROVIDERS[provider]
-            return {
+        provider_info = KNOWN_PROVIDERS[provider]
+        return ToolResult.ok(
+            confirmation=f"API key for {provider_info['name']} stored securely",
+            data={
                 "success": True,
                 "key_id": key_id,
                 "provider": provider,
                 "provider_name": provider_info["name"],
                 "quota_limit": quota_limit,
                 "message": f"API key for {provider_info['name']} stored securely.",
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to add service key: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="list_service_keys",
@@ -148,7 +146,7 @@ class KeyManagementFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!list-keys"
     )
-    async def list_service_keys(self) -> Dict[str, Any]:
+    async def list_service_keys(self) -> ToolResult:
         """
         List all configured service keys.
 
@@ -156,41 +154,38 @@ class KeyManagementFeature(Feature):
         - Provider name
         - Quota usage
         - Active status
-
-        Returns:
-            List of configured keys
         """
         if not self._storage:
-            return {
-                "success": False,
-                "error": "Key storage not available - check KESTREL_DATA_KEY and agent DID",
-            }
+            return ToolResult.failed(
+                "Key storage not available - check KESTREL_DATA_KEY and agent DID",
+            )
 
         try:
             keys = await self._storage.list_keys()
+        except Exception as e:
+            logger.error(f"Failed to list service keys: {e}")
+            return ToolResult.failed(str(e))
 
-            # Format for display
-            key_list = []
-            for key in keys:
-                provider_info = KNOWN_PROVIDERS.get(key.provider_id, {"name": key.provider_id})
-                key_list.append({
-                    "provider": key.provider_id,
-                    "provider_name": provider_info["name"],
-                    "quota_limit": key.quota_limit,
-                    "quota_used": key.quota_used,
-                    "is_active": key.is_active,
-                    "created_at": key.created_at.isoformat() if key.created_at else None,
-                })
+        key_list = []
+        for key in keys:
+            provider_info = KNOWN_PROVIDERS.get(key.provider_id, {"name": key.provider_id})
+            key_list.append({
+                "provider": key.provider_id,
+                "provider_name": provider_info["name"],
+                "quota_limit": key.quota_limit,
+                "quota_used": key.quota_used,
+                "is_active": key.is_active,
+                "created_at": key.created_at.isoformat() if key.created_at else None,
+            })
 
-            return {
+        return ToolResult.ok(
+            confirmation=f"Listed {len(key_list)} service key(s)",
+            data={
                 "success": True,
                 "keys": key_list,
                 "total": len(key_list),
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to list service keys: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="get_key_usage",
@@ -202,7 +197,7 @@ class KeyManagementFeature(Feature):
         self,
         provider: str,
         days: int = 30,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Get usage statistics for a service key.
 
@@ -211,15 +206,11 @@ class KeyManagementFeature(Feature):
         Args:
             provider: Service provider
             days: Number of days to look back (default: 30)
-
-        Returns:
-            Usage statistics
         """
         if not self._storage:
-            return {
-                "success": False,
-                "error": "Key storage not available - check KESTREL_DATA_KEY and agent DID",
-            }
+            return ToolResult.failed(
+                "Key storage not available - check KESTREL_DATA_KEY and agent DID",
+            )
 
         provider = provider.lower()
 
@@ -228,27 +219,35 @@ class KeyManagementFeature(Feature):
                 provider_id=provider,
                 days=days,
             )
+        except Exception as e:
+            logger.error(f"Failed to get key usage: {e}")
+            return ToolResult.failed(str(e))
 
-            # Aggregate by operation
-            by_operation = {}
-            total_units = 0
-            total_cost = 0.0
+        by_operation: Dict[str, Dict[str, Any]] = {}
+        total_units = 0
+        total_cost = 0.0
 
-            for record in usage_records:
-                op = record.operation
-                if op not in by_operation:
-                    by_operation[op] = {"count": 0, "units": 0, "cost": 0.0}
-                by_operation[op]["count"] += 1
-                by_operation[op]["units"] += record.units_consumed
-                if record.cost_estimate_usd:
-                    by_operation[op]["cost"] += record.cost_estimate_usd
+        for record in usage_records:
+            op = record.operation
+            if op not in by_operation:
+                by_operation[op] = {"count": 0, "units": 0, "cost": 0.0}
+            by_operation[op]["count"] += 1
+            by_operation[op]["units"] += record.units_consumed
+            if record.cost_estimate_usd:
+                by_operation[op]["cost"] += record.cost_estimate_usd
 
-                total_units += record.units_consumed
-                if record.cost_estimate_usd:
-                    total_cost += record.cost_estimate_usd
+            total_units += record.units_consumed
+            if record.cost_estimate_usd:
+                total_cost += record.cost_estimate_usd
 
-            provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
-            return {
+        provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
+        return ToolResult.ok(
+            confirmation=(
+                f"Usage for {provider_info['name']} over last {days} day(s): "
+                f"{len(usage_records)} ops, {total_units} units, "
+                f"${round(total_cost, 4)}"
+            ),
+            data={
                 "success": True,
                 "provider": provider,
                 "provider_name": provider_info["name"],
@@ -257,11 +256,8 @@ class KeyManagementFeature(Feature):
                 "total_units": total_units,
                 "estimated_cost_usd": round(total_cost, 4),
                 "by_operation": by_operation,
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to get key usage: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="remove_service_key",
@@ -272,7 +268,7 @@ class KeyManagementFeature(Feature):
     async def remove_service_key(
         self,
         provider: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Remove (deactivate) a service key.
 
@@ -280,32 +276,30 @@ class KeyManagementFeature(Feature):
 
         Args:
             provider: Service provider to remove key for
-
-        Returns:
-            Result of deactivation
         """
         if not self._storage:
-            return {
-                "success": False,
-                "error": "Key storage not available - check KESTREL_DATA_KEY and agent DID",
-            }
+            return ToolResult.failed(
+                "Key storage not available - check KESTREL_DATA_KEY and agent DID",
+            )
 
         provider = provider.lower()
 
         try:
             await self._storage.deactivate_key(provider_id=provider)
+        except Exception as e:
+            logger.error(f"Failed to remove service key: {e}")
+            return ToolResult.failed(str(e))
 
-            provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
-            return {
+        provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
+        return ToolResult.ok(
+            confirmation=f"API key for {provider_info['name']} has been deactivated",
+            data={
                 "success": True,
                 "provider": provider,
                 "provider_name": provider_info["name"],
                 "message": f"API key for {provider_info['name']} has been deactivated.",
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to remove service key: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="delete_service_key",
@@ -316,7 +310,7 @@ class KeyManagementFeature(Feature):
     async def delete_service_key(
         self,
         provider: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Permanently delete a service key.
 
@@ -324,32 +318,30 @@ class KeyManagementFeature(Feature):
 
         Args:
             provider: Service provider to delete key for
-
-        Returns:
-            Result of deletion
         """
         if not self._storage:
-            return {
-                "success": False,
-                "error": "Key storage not available - check KESTREL_DATA_KEY and agent DID",
-            }
+            return ToolResult.failed(
+                "Key storage not available - check KESTREL_DATA_KEY and agent DID",
+            )
 
         provider = provider.lower()
 
         try:
             await self._storage.delete_key(provider_id=provider)
+        except Exception as e:
+            logger.error(f"Failed to delete service key: {e}")
+            return ToolResult.failed(str(e))
 
-            provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
-            return {
+        provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
+        return ToolResult.ok(
+            confirmation=f"API key for {provider_info['name']} has been permanently deleted",
+            data={
                 "success": True,
                 "provider": provider,
                 "provider_name": provider_info["name"],
                 "message": f"API key for {provider_info['name']} has been permanently deleted.",
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to delete service key: {e}")
-            return {"success": False, "error": str(e)}
+            },
+        )
 
     @tool(
         name="rotate_service_key",
@@ -361,7 +353,7 @@ class KeyManagementFeature(Feature):
         self,
         provider: str,
         new_api_key: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Rotate an API key for a service.
 
@@ -371,15 +363,11 @@ class KeyManagementFeature(Feature):
         Args:
             provider: Service provider
             new_api_key: The new API key
-
-        Returns:
-            Result of key rotation
         """
         if not self._storage:
-            return {
-                "success": False,
-                "error": "Key storage not available - check KESTREL_DATA_KEY and agent DID",
-            }
+            return ToolResult.failed(
+                "Key storage not available - check KESTREL_DATA_KEY and agent DID",
+            )
 
         provider = provider.lower()
 
@@ -390,6 +378,13 @@ class KeyManagementFeature(Feature):
         elif hasattr(self.agent, 'features'):
             security = self.agent.features.get("security")
 
+        # Track whether the approval flow ran cleanly. If the queue is
+        # available but the approval request itself raised, the legacy
+        # path silently proceeded "without approval" and reported success.
+        # That hides a security-relevant bypass; surface it as PARTIAL so
+        # the agent must speak that the rotation took effect WITHOUT
+        # constitutional review.
+        approval_bypassed_reason: Optional[str] = None
         if security and hasattr(security, 'approval_queue'):
             try:
                 approved, approval_type = await security.approval_queue.request_approval(
@@ -400,12 +395,13 @@ class KeyManagementFeature(Feature):
                 )
 
                 if not approved:
-                    return {
-                        "success": False,
-                        "error": "Key rotation not approved by constitutional review",
-                    }
+                    return ToolResult.failed(
+                        "Key rotation not approved by constitutional review",
+                        data={"provider": provider},
+                    )
             except Exception as e:
                 logger.warning(f"Approval request failed: {e}, proceeding without approval")
+                approval_bypassed_reason = str(e)
 
         try:
             # Store new key (replaces old one due to UNIQUE constraint on agent_did + provider_id)
@@ -413,19 +409,36 @@ class KeyManagementFeature(Feature):
                 provider_id=provider,
                 api_key=new_api_key,
             )
-
-            provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
-            return {
-                "success": True,
-                "key_id": key_id,
-                "provider": provider,
-                "provider_name": provider_info["name"],
-                "message": f"API key for {provider_info['name']} has been rotated.",
-            }
-
         except Exception as e:
             logger.error(f"Failed to rotate service key: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        provider_info = KNOWN_PROVIDERS.get(provider, {"name": provider})
+        data = {
+            "success": True,
+            "key_id": key_id,
+            "provider": provider,
+            "provider_name": provider_info["name"],
+            "message": f"API key for {provider_info['name']} has been rotated.",
+        }
+
+        if approval_bypassed_reason is not None:
+            data["approval_bypassed_reason"] = approval_bypassed_reason
+            return ToolResult.partial(
+                confirmation=f"API key for {provider_info['name']} rotated",
+                error=(
+                    "constitutional approval queue raised "
+                    f"({approval_bypassed_reason!r}); rotation proceeded "
+                    "WITHOUT review. Investigate the approval pipeline "
+                    "before relying on rotation as a security control."
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(
+            confirmation=f"API key for {provider_info['name']} has been rotated",
+            data=data,
+        )
 
     @tool(
         name="list_providers",
@@ -433,14 +446,11 @@ class KeyManagementFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!providers"
     )
-    async def list_providers(self) -> Dict[str, Any]:
+    async def list_providers(self) -> ToolResult:
         """
         List all supported service providers.
 
         Shows provider info including sub-account support.
-
-        Returns:
-            List of supported providers
         """
         providers = []
         for provider_id, info in KNOWN_PROVIDERS.items():
@@ -450,11 +460,14 @@ class KeyManagementFeature(Feature):
                 "supports_sub_accounts": info.get("supports_sub_accounts", False),
             })
 
-        return {
-            "success": True,
-            "providers": providers,
-            "total": len(providers),
-        }
+        return ToolResult.ok(
+            confirmation=f"Listed {len(providers)} supported provider(s)",
+            data={
+                "success": True,
+                "providers": providers,
+                "total": len(providers),
+            },
+        )
 
     # =========================================================================
     # Internal API (for other features to use)
