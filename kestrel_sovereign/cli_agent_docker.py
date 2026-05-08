@@ -260,7 +260,7 @@ def _cmd_run(args) -> int:
     surface; this restores parity with the bash.
     """
     raw_dir: str = args.data_dir
-    command: List[str] = list(args.command or [])
+    command: List[str] = list(getattr(args, "container_command", None) or [])
     if not command:
         print(
             "error: `kestrel agent docker run` requires a command.\n"
@@ -418,9 +418,15 @@ def add_agent_docker_subcommand(
         "data_dir",
         help="Host directory containing the agent's data (``~`` is expanded).",
     )
+    # ``dest="container_command"`` to avoid colliding with the
+    # top-level subparser's ``dest="command"`` — argparse merges all
+    # positionals into the same Namespace, so a bare ``"command"``
+    # here would clobber the top-level dispatch field with a list and
+    # crash ``cli.main()`` (codex review v9 on PR #1079 caught it).
     run_p.add_argument(
-        "command",
+        "container_command",
         nargs=argparse.REMAINDER,
+        metavar="command",
         help="Command (and args) to run inside the container — e.g. "
              "``python -c 'print(\"hello\")'``.",
     )

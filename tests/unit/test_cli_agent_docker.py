@@ -361,6 +361,30 @@ def test_ensure_image_builds_when_missing(monkeypatch):
     assert "docker/Dockerfile.sovereign" in " ".join(calls[1])
 
 
+def test_kestrel_agent_docker_run_argparse_via_real_parser(tmp_path):
+    """Codex review v9 on PR #1079: the bare ``"command"`` positional
+    on the run subverb collided with the top-level subparser's
+    ``dest="command"``, so a real ``kestrel agent docker run ...``
+    invocation crashed before reaching ``cmd_agent``. The dest is now
+    ``container_command``; assert via the real parser.
+    """
+    import argparse
+    from kestrel_sovereign import cli_agent_docker
+
+    p = argparse.ArgumentParser(prog="kestrel")
+    sub = p.add_subparsers(dest="command")
+    cli_agent_docker.add_agent_docker_subcommand(sub)
+
+    args = p.parse_args([
+        "agent", "docker", "run", str(tmp_path), "python", "-c", "print(1)",
+    ])
+    # Top-level dispatch field must still be the string "agent",
+    # NOT the user's command list.
+    assert args.command == "agent"
+    # And the user's command list lands in ``container_command``.
+    assert args.container_command == ["python", "-c", "print(1)"]
+
+
 def test_kestrel_agent_docker_run_passes_command_through(tmp_path, monkeypatch):
     """Codex review v3 on PR #1071: the bash predecessor's
     ``sovereign-agent.sh run <data_dir> <command...>`` was a generic
@@ -386,7 +410,7 @@ def test_kestrel_agent_docker_run_passes_command_through(tmp_path, monkeypatch):
         agent_command="docker",
         agent_docker_command="run",
         data_dir=str(tmp_path),
-        command=["python", "-c", "print('hello')"],
+        container_command=["python", "-c", "print('hello')"],
     )
     rc = cli_agent_docker.cmd_agent(args)
     assert rc == 0
@@ -412,7 +436,7 @@ def test_kestrel_agent_docker_run_requires_command(tmp_path, monkeypatch, capsys
         agent_command="docker",
         agent_docker_command="run",
         data_dir=str(tmp_path),
-        command=[],
+        container_command=[],
     )
     rc = cli_agent_docker.cmd_agent(args)
     assert rc == 1
