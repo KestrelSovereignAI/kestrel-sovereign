@@ -99,14 +99,23 @@ class ObservabilityFeature(Feature):
         # Pre-migration the legacy dict let the LLM read just the
         # event counts and skip the recent_errors list.
         if recent_errors:
+            # Codex round 1: recent_errors is capped at limit=10. Don't
+            # claim "N error event(s)" when the real count could be
+            # higher — phrase as "showing N (possibly more)" when the
+            # cap was hit, or give the exact count otherwise.
+            shown = len(recent_errors)
+            if shown >= 10:
+                err_phrase = (
+                    f"at least {shown} error event(s) in the last hour "
+                    "(query capped at 10; real count may be higher)"
+                )
+            else:
+                err_phrase = f"{shown} error event(s) in the last hour"
             return ToolResult.partial(
                 confirmation=(
                     f"Observability: {total_events} hook event(s) in last 1h"
                 ),
-                error=(
-                    f"{len(recent_errors)} error event(s) in the last hour; "
-                    "see recent_errors in data for details"
-                ),
+                error=f"{err_phrase}; see recent_errors in data for details",
                 data=data,
             )
         return ToolResult.ok(
