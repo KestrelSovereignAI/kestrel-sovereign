@@ -5,6 +5,7 @@ Manages the first-time experience when a new agent comes online, guiding
 them through a discovery conversation to establish their personality.
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -268,6 +269,14 @@ And how do you like to work together - quick and direct, or more room to think t
         except Exception as e:
             logger.error(f"Failed to save user name: {e}")
 
+    #: Hard cap on the discovery LLM round-trip. Discovery sits inside the
+    #: agent's CONVERSATION lock — if the call hangs, *every* subsequent
+    #: request on this agent (HTTP, shell, A2A) blocks waiting for the lock.
+    #: A bounded timeout makes the failure mode "raise loudly after N seconds"
+    #: instead of "wedge the agent until restart". 60s is generous for a
+    #: chat completion; healthy local Ollama returns in <2s.
+    DISCOVERY_LLM_TIMEOUT_SECONDS = 60.0
+
     async def process_discovery_message(
         self, user_message: str
     ) -> Tuple[str, bool, bool]:
@@ -302,8 +311,15 @@ And how do you like to work together - quick and direct, or more room to think t
         # the caller can decide between retrying discovery or falling
         # through to the agent's normal LLM path. See
         # ``KestrelAgent._handle_bootstrap``.
-        response = await self.llm_service.generate_with_messages(
-            messages=messages,
+        #
+        # Bounded by ``DISCOVERY_LLM_TIMEOUT_SECONDS`` because this call
+        # holds the agent's CONVERSATION lock — an indefinite hang inside
+        # the adapter (older Ollama clients, mis-configured remote, etc.)
+        # would wedge every subsequent request on this agent until the
+        # process is restarted.
+        response = await asyncio.wait_for(
+            self.llm_service.generate_with_messages(messages=messages),
+            timeout=self.DISCOVERY_LLM_TIMEOUT_SECONDS,
         )
         assistant_message = response.content if hasattr(response, 'content') else str(response)
 

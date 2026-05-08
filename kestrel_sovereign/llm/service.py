@@ -1687,6 +1687,27 @@ No other text or formatting.
 
         # Fall back to standard providers (skip any disabled by auth failure).
         providers = self._available_providers()
+
+        # Lazy auto-resolution. Routes are seeded with ``model = "auto"`` in
+        # ``kestrel.toml`` and only get resolved to a real model id when the
+        # disk cache is populated (``_load_from_disk_cache`` runs at __init__)
+        # or when the model-picker UI calls ``discover_all_models`` explicitly.
+        # On a fresh ``--quickstart`` setup neither has happened yet, so the
+        # very first chat call would otherwise hit the adapter with the
+        # literal string ``"auto"`` — Ollama returns 404, which the SDK turns
+        # into either a fast error (recent ollama) or an indefinite hang
+        # (older client/server combos). Trigger discovery here, once, on
+        # demand. ``use_cache=True`` makes subsequent calls a cache hit.
+        if any(p.get("model") == "auto" for p in providers):
+            try:
+                await self.discover_all_models(use_cache=True)
+            except Exception as exc:
+                logger.warning(
+                    "Lazy model discovery failed in generate_with_messages "
+                    "(continuing with provider['model'] as-is): %s", exc,
+                )
+            providers = self._available_providers()
+
         if force_local_only:
             providers = [p for p in providers if p.get("is_local")]
             # Clear any cloud model override — use the local provider's own model

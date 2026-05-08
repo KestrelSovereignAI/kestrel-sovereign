@@ -38,12 +38,9 @@ class ConstitutionFeature(Feature):
                 if text and not text.startswith("Error:"):
                     self.full_text = text
                 else:
-                    # Fallback to file
-                    with open("docs/principles/KESTREL_CONSTITUTION.md", "r", encoding="utf-8") as f:
-                        self.full_text = f.read()
+                    self.full_text = self._read_canonical_constitution()
             else:
-                with open("docs/principles/KESTREL_CONSTITUTION.md", "r", encoding="utf-8") as f:
-                    self.full_text = f.read()
+                self.full_text = self._read_canonical_constitution()
 
             self._parse_articles()
             self._parse_books()
@@ -52,6 +49,37 @@ class ConstitutionFeature(Feature):
             logger.info("ConstitutionFeature initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize ConstitutionFeature: {e}")
+
+    @staticmethod
+    def _read_canonical_constitution() -> str:
+        """Read the canonical constitution markdown.
+
+        Tries the source-clone path (``docs/principles/KESTREL_CONSTITUTION.md``,
+        relative to CWD) first so source-clone development picks up edits
+        without rebuilding the wheel, then falls back to the package-bundled
+        copy at ``kestrel_sovereign/data/KESTREL_CONSTITUTION.md`` so
+        pip-installed users actually get a constitution rather than
+        ``FileNotFoundError`` at agent boot.
+        """
+        from pathlib import Path
+
+        from kestrel_sovereign.config import CONSTITUTION_PATH
+
+        candidates = [
+            Path("docs/principles/KESTREL_CONSTITUTION.md"),
+            Path(CONSTITUTION_PATH),
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate.read_text(encoding="utf-8")
+            except OSError:
+                continue
+
+        searched = ", ".join(str(c) for c in candidates)
+        raise FileNotFoundError(
+            f"KESTREL_CONSTITUTION.md not found at any of: {searched}"
+        )
 
     def _parse_articles(self):
         """Parse the constitution into articles (legacy + Article V which remains)."""
