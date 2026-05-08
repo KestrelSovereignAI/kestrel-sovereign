@@ -15,17 +15,21 @@ the MemoryRetriever boosts in scoring.
 
 Pin quotas prevent decay circumvention and database bloat by limiting
 the number of active pins per agent.
+
+@tool methods return ``kestrel_sdk.tools.result.ToolResult`` per the
+kestrel-sovereign #1042 narration-honesty contract (see #1061).
 """
 
 import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +115,21 @@ class MemoryAgencyFeature(Feature):
         pinned = await self._active_pin_count()
         return pinned / total
 
+    @staticmethod
+    def _parse_metadata(raw_metadata: Any) -> Dict[str, Any]:
+        """Defensively parse metadata from a conversation_history row."""
+        if not raw_metadata:
+            return {}
+        if isinstance(raw_metadata, dict):
+            return dict(raw_metadata)
+        if isinstance(raw_metadata, str):
+            try:
+                parsed = json.loads(raw_metadata)
+                return parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
     # ------------------------------------------------------------------
     # Tools
     # ------------------------------------------------------------------
@@ -124,107 +143,137 @@ class MemoryAgencyFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory-pin",
     )
-    async def memory_pin(self, message_id: int, reason: str = "") -> Dict[str, Any]:
+    async def memory_pin(self, message_id: int, reason: str = "") -> ToolResult:
         """
         Pin a conversation message to protect it from memory decay.
-
-        Sets ``decay_protected = True`` in the message metadata and records
-        the pin in the memory_pins table.  Enforces the per-agent pin quota
-        and emits a warning when the pin ratio exceeds the alert threshold.
 
         Args:
             message_id: The database ID of the message to pin
             reason: Optional reason for pinning this memory
         """
+        try:
+            message_id_val = int(message_id)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"message_id must be an integer, got {message_id!r}"
+            )
+
         db = self._db
 
-        # ----- Quota enforcement -----
-        # Check whether this message already has an active pin (idempotent
-        # re-pin should not count against the quota).
-        existing = await db.fetchone(
-            "SELECT id FROM memory_pins WHERE message_id = ? AND released_at IS NULL",
-            (message_id,),
-        )
-
-        if not existing:
+        # Quota enforcement (idempotent re-pin doesn't count).
+        try:
+            existing = await db.fetchone(
+                "SELECT id FROM memory_pins WHERE message_id = ? AND released_at IS NULL",
+                (message_id_val,),
+            )
             current_pins = await self._active_pin_count()
-            if current_pins >= self.pin_quota:
-                return {
-                    "error": (
-                        f"Pin quota reached ({self.pin_quota}). "
-                        "Release existing pins before pinning new memories."
-                    ),
-                    "pinned": False,
+        except Exception as e:
+            logger.error(f"memory_pin quota check failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        if not existing and current_pins >= self.pin_quota:
+            return ToolResult.failed(
+                f"Pin quota reached ({self.pin_quota}). "
+                "Release existing pins before pinning new memories.",
+                data={
                     "quota": self.pin_quota,
                     "current_pins": current_pins,
-                }
+                    "message_id": message_id_val,
+                },
+            )
 
-        # ----- Fetch the message -----
-        row = await db.fetchone(
-            "SELECT id, content, metadata FROM conversation_history WHERE id = ?",
-            (message_id,),
-        )
+        try:
+            row = await db.fetchone(
+                "SELECT id, content, metadata FROM conversation_history WHERE id = ?",
+                (message_id_val,),
+            )
+        except Exception as e:
+            logger.error(f"memory_pin fetch failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
         if not row:
-            return {"error": f"Message {message_id} not found"}
+            return ToolResult.failed(
+                f"Message {message_id_val} not found",
+                data={"message_id": message_id_val},
+            )
 
         msg_id, content, raw_metadata = row
-
-        # Parse metadata
-        metadata = {}
-        if raw_metadata:
-            try:
-                metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-            except (json.JSONDecodeError, TypeError):
-                metadata = {}
-
-        # Set decay_protected
+        metadata = self._parse_metadata(raw_metadata)
         metadata["decay_protected"] = True
 
-        # Write metadata back
-        await db.execute(
-            "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-            (json.dumps(metadata), msg_id),
-        )
-
-        # Record in memory_pins (idempotent -- skip if already active)
-        if not existing:
-            pin_id = uuid.uuid4().hex[:12]
+        try:
             await db.execute(
-                """INSERT INTO memory_pins (id, message_id, agent_id, pin_reason, pinned_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (
-                    pin_id,
-                    message_id,
-                    self.agent_id,
-                    reason,
-                    datetime.now(timezone.utc).isoformat(),
-                ),
+                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), msg_id),
             )
+
+            if not existing:
+                pin_id = uuid.uuid4().hex[:12]
+                await db.execute(
+                    """INSERT INTO memory_pins (id, message_id, agent_id, pin_reason, pinned_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        pin_id,
+                        message_id_val,
+                        self.agent_id,
+                        reason,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"memory_pin write failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         preview = (content[:80] + "...") if len(content) > 80 else content
-        result: Dict[str, Any] = {
+        data: Dict[str, Any] = {
             "pinned": True,
-            "message_id": message_id,
+            "message_id": message_id_val,
             "preview": preview,
             "reason": reason,
+            "idempotent_repin": bool(existing),
         }
 
-        # ----- Ratio alert -----
-        ratio = await self._pin_ratio()
+        # Ratio alert. Honesty: the pin DID succeed, but the ratio
+        # is now over the alert threshold — surface as PARTIAL so the
+        # LLM cannot claim "pinned successfully" without speaking the
+        # over-pinning caveat.
+        try:
+            ratio = await self._pin_ratio()
+        except Exception as e:
+            logger.warning(f"memory_pin ratio computation failed: {e}")
+            ratio = 0.0
+        data["pin_ratio"] = ratio
+
         if ratio > PIN_RATIO_ALERT_THRESHOLD:
-            result["warning"] = (
-                f"Pin ratio is {ratio:.1%} (threshold: "
-                f"{PIN_RATIO_ALERT_THRESHOLD:.0%}). "
-                "Consider releasing less important pins to avoid over-pinning."
-            )
             logger.warning(
                 "Agent %s pin ratio %.2f exceeds threshold %.2f",
                 self.agent_id[:30] if self.agent_id else "(none)",
                 ratio,
                 PIN_RATIO_ALERT_THRESHOLD,
             )
+            return ToolResult.partial(
+                confirmation=(
+                    f"Pinned message {message_id_val}"
+                    + (f" (re-pin)" if existing else "")
+                    + (f" — reason: {reason}" if reason else "")
+                ),
+                error=(
+                    f"pin ratio is {ratio:.1%} (alert threshold "
+                    f"{PIN_RATIO_ALERT_THRESHOLD:.0%}); the agent may be "
+                    "over-pinning. Consider releasing less important pins "
+                    "to avoid evading the decay system."
+                ),
+                data=data,
+            )
 
-        return result
+        return ToolResult.ok(
+            confirmation=(
+                f"Pinned message {message_id_val}"
+                + (f" (re-pin)" if existing else "")
+                + (f" — reason: {reason}" if reason else "")
+            ),
+            data=data,
+        )
 
     @tool(
         name="memory_release",
@@ -235,51 +284,81 @@ class MemoryAgencyFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory-release",
     )
-    async def memory_release(self, message_id: int) -> Dict[str, Any]:
+    async def memory_release(self, message_id: int) -> ToolResult:
         """
         Release a pinned memory, allowing it to decay normally again.
-
-        Clears ``decay_protected`` from the message metadata and marks
-        the pin record with a ``released_at`` timestamp.
 
         Args:
             message_id: The database ID of the message to release
         """
+        try:
+            message_id_val = int(message_id)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"message_id must be an integer, got {message_id!r}"
+            )
+
         db = self._db
 
-        # Fetch the message
-        row = await db.fetchone(
-            "SELECT id, metadata FROM conversation_history WHERE id = ?",
-            (message_id,),
-        )
+        try:
+            row = await db.fetchone(
+                "SELECT id, metadata FROM conversation_history WHERE id = ?",
+                (message_id_val,),
+            )
+        except Exception as e:
+            logger.error(f"memory_release fetch failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
         if not row:
-            return {"error": f"Message {message_id} not found"}
+            return ToolResult.failed(
+                f"Message {message_id_val} not found",
+                data={"message_id": message_id_val},
+            )
 
         msg_id, raw_metadata = row
-
-        # Parse and update metadata
-        metadata = {}
-        if raw_metadata:
-            try:
-                metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-            except (json.JSONDecodeError, TypeError):
-                metadata = {}
-
+        metadata = self._parse_metadata(raw_metadata)
+        was_pinned = bool(metadata.get("decay_protected"))
         metadata["decay_protected"] = False
 
-        await db.execute(
-            "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-            (json.dumps(metadata), msg_id),
-        )
+        # Honesty: if the message wasn't pinned, the release is a
+        # no-op. Tell the LLM that explicitly so it can't say
+        # "released the pin" when there was no pin to release.
+        try:
+            await db.execute(
+                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                (json.dumps(metadata), msg_id),
+            )
 
-        # Update memory_pins record
-        now = datetime.now(timezone.utc).isoformat()
-        await db.execute(
-            "UPDATE memory_pins SET released_at = ? WHERE message_id = ? AND released_at IS NULL",
-            (now, message_id),
-        )
+            now = datetime.now(timezone.utc).isoformat()
+            await db.execute(
+                "UPDATE memory_pins SET released_at = ? WHERE message_id = ? AND released_at IS NULL",
+                (now, message_id_val),
+            )
+        except Exception as e:
+            logger.error(f"memory_release write failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
-        return {"released": True, "message_id": message_id}
+        if not was_pinned:
+            return ToolResult.ok(
+                confirmation=(
+                    f"Message {message_id_val} was not pinned — no-op "
+                    "(decay_protected flag was already False)"
+                ),
+                data={
+                    "released": False,
+                    "was_pinned": False,
+                    "message_id": message_id_val,
+                },
+            )
+
+        return ToolResult.ok(
+            confirmation=f"Released pin on message {message_id_val}",
+            data={
+                "released": True,
+                "was_pinned": True,
+                "message_id": message_id_val,
+            },
+        )
 
     @tool(
         name="memory_pinned",
@@ -290,23 +369,22 @@ class MemoryAgencyFeature(Feature):
         category=ToolCategory.MEMORY,
         command_prefix="!memory-pinned",
     )
-    async def memory_pinned(self) -> Dict[str, Any]:
-        """
-        List all active (non-released) pinned memories.
-
-        Joins memory_pins with conversation_history to show message
-        content alongside pin metadata.
-        """
+    async def memory_pinned(self) -> ToolResult:
+        """List all active (non-released) pinned memories."""
         db = self._db
 
-        rows = await db.fetchall(
-            """SELECT mp.id, mp.message_id, mp.pin_reason, mp.pinned_at,
-                      ch.content
-               FROM memory_pins mp
-               JOIN conversation_history ch ON ch.id = mp.message_id
-               WHERE mp.released_at IS NULL
-               ORDER BY mp.pinned_at DESC""",
-        )
+        try:
+            rows = await db.fetchall(
+                """SELECT mp.id, mp.message_id, mp.pin_reason, mp.pinned_at,
+                          ch.content
+                   FROM memory_pins mp
+                   JOIN conversation_history ch ON ch.id = mp.message_id
+                   WHERE mp.released_at IS NULL
+                   ORDER BY mp.pinned_at DESC""",
+            )
+        except Exception as e:
+            logger.error(f"memory_pinned query failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         pins = []
         for row in rows:
@@ -320,7 +398,10 @@ class MemoryAgencyFeature(Feature):
                 "preview": preview,
             })
 
-        return {"pins": pins, "count": len(pins)}
+        return ToolResult.ok(
+            confirmation=f"Listed {len(pins)} active pin(s)",
+            data={"pins": pins, "count": len(pins)},
+        )
 
     # ------------------------------------------------------------------
     # Sovereign override -- pins CANNOT resist sovereign actions
@@ -408,12 +489,7 @@ class MemoryAgencyFeature(Feature):
             return
 
         raw_metadata = row[0]
-        metadata = {}
-        if raw_metadata:
-            try:
-                metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-            except (json.JSONDecodeError, TypeError):
-                metadata = {}
+        metadata = self._parse_metadata(raw_metadata)
 
         if metadata.get("decay_protected"):
             metadata["decay_protected"] = False
@@ -431,67 +507,59 @@ class MemoryAgencyFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!memory-pin-stats",
     )
-    async def memory_pin_stats(self) -> Dict[str, Any]:
-        """
-        Return statistics about memory pinning activity.
-
-        Counts total messages, active pins, and released pins, then
-        calculates the pin ratio.  Also includes quota information,
-        oldest/average pin age, and an alert when the ratio exceeds
-        the configured threshold.
-        """
+    async def memory_pin_stats(self) -> ToolResult:
+        """Return statistics about memory pinning activity."""
         db = self._db
 
-        total_messages = await db.fetchval(
-            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
-            (self.agent_id,),
-        ) or 0
+        try:
+            total_messages = await db.fetchval(
+                "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+                (self.agent_id,),
+            ) or 0
 
-        pinned_count = await db.fetchval(
-            "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NULL",
-        ) or 0
+            pinned_count = await db.fetchval(
+                "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NULL",
+            ) or 0
 
-        released_count = await db.fetchval(
-            "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NOT NULL",
-        ) or 0
+            released_count = await db.fetchval(
+                "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NOT NULL",
+            ) or 0
 
-        pin_ratio = round(pinned_count / total_messages, 4) if total_messages > 0 else 0.0
+            pin_ratio = round(pinned_count / total_messages, 4) if total_messages > 0 else 0.0
 
-        # ----- Pin age information -----
-        oldest_pin_at = await db.fetchval(
-            "SELECT MIN(pinned_at) FROM memory_pins WHERE released_at IS NULL",
-        )
-        newest_pin_at = await db.fetchval(
-            "SELECT MAX(pinned_at) FROM memory_pins WHERE released_at IS NULL",
-        )
+            oldest_pin_at = await db.fetchval(
+                "SELECT MIN(pinned_at) FROM memory_pins WHERE released_at IS NULL",
+            )
 
-        now = datetime.now(timezone.utc)
-        oldest_pin_age_seconds = None
-        average_pin_age_seconds = None
+            now = datetime.now(timezone.utc)
+            oldest_pin_age_seconds: Optional[int] = None
+            average_pin_age_seconds: Optional[int] = None
 
-        if oldest_pin_at:
-            try:
-                oldest_dt = datetime.fromisoformat(oldest_pin_at)
-                oldest_pin_age_seconds = round((now - oldest_dt).total_seconds())
-            except (ValueError, TypeError):
-                pass
-
-        # Compute average pin age from all active pins
-        all_pin_times = await db.fetchall(
-            "SELECT pinned_at FROM memory_pins WHERE released_at IS NULL",
-        )
-        if all_pin_times:
-            ages = []
-            for (pin_time,) in all_pin_times:
+            if oldest_pin_at:
                 try:
-                    dt = datetime.fromisoformat(pin_time)
-                    ages.append((now - dt).total_seconds())
+                    oldest_dt = datetime.fromisoformat(oldest_pin_at)
+                    oldest_pin_age_seconds = round((now - oldest_dt).total_seconds())
                 except (ValueError, TypeError):
-                    continue
-            if ages:
-                average_pin_age_seconds = round(sum(ages) / len(ages))
+                    pass
 
-        result: Dict[str, Any] = {
+            all_pin_times = await db.fetchall(
+                "SELECT pinned_at FROM memory_pins WHERE released_at IS NULL",
+            )
+            if all_pin_times:
+                ages = []
+                for (pin_time,) in all_pin_times:
+                    try:
+                        dt = datetime.fromisoformat(pin_time)
+                        ages.append((now - dt).total_seconds())
+                    except (ValueError, TypeError):
+                        continue
+                if ages:
+                    average_pin_age_seconds = round(sum(ages) / len(ages))
+        except Exception as e:
+            logger.error(f"memory_pin_stats failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        data: Dict[str, Any] = {
             "total_messages": total_messages,
             "pinned": pinned_count,
             "released": released_count,
@@ -502,14 +570,27 @@ class MemoryAgencyFeature(Feature):
             "average_pin_age_seconds": average_pin_age_seconds,
         }
 
-        if pin_ratio > PIN_RATIO_ALERT_THRESHOLD:
-            result["alert"] = (
-                f"Pin ratio {pin_ratio:.1%} exceeds alert threshold "
-                f"({PIN_RATIO_ALERT_THRESHOLD:.0%}). Consider releasing "
-                "less important pins to prevent over-pinning."
-            )
+        confirmation = (
+            f"Pin stats: {pinned_count} active, {released_count} released, "
+            f"ratio={pin_ratio:.1%}, quota_remaining={data['quota_remaining']}"
+        )
 
-        return result
+        # Honesty: stats themselves are observational (the tool ran),
+        # but a high pin ratio is a finding the LLM should surface
+        # rather than buried in data. PARTIAL with the alert framing.
+        if pin_ratio > PIN_RATIO_ALERT_THRESHOLD:
+            return ToolResult.partial(
+                confirmation=confirmation,
+                error=(
+                    f"pin ratio {pin_ratio:.1%} exceeds alert threshold "
+                    f"({PIN_RATIO_ALERT_THRESHOLD:.0%}); the agent is "
+                    "over-pinning relative to total memories. Consider "
+                    "releasing less important pins to prevent evading "
+                    "the decay system."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation=confirmation, data=data)
 
     # ------------------------------------------------------------------
     # Knowledge Graph -- learned facts
@@ -534,12 +615,9 @@ class MemoryAgencyFeature(Feature):
         predicate: str,
         value: str,
         confidence: float = 1.0,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Save a learned fact as a Knowledge Graph node.
-
-        Creates a ``learned_fact`` node linked to the agent via a
-        ``knows`` edge.  Facts are immediately visible in the KG panel.
 
         Args:
             subject: Who or what the fact is about (e.g. "user", "project")
@@ -549,16 +627,25 @@ class MemoryAgencyFeature(Feature):
         """
         from kestrel_sovereign.storage.async_graph_store import GraphNode
 
+        try:
+            confidence_val = float(confidence)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"confidence must be a number, got {confidence!r}"
+            )
+
         graph = getattr(self.storage, "graph", None)
         if graph is None:
-            return {"error": "Knowledge graph not available"}
+            return ToolResult.failed("Knowledge graph not available")
 
-        # Clamp confidence
-        confidence = max(0.0, min(1.0, confidence))
+        # Honesty: confidence is silently clamped to [0, 1]. Pre-fix
+        # this was hidden — the agent could pass 1.5 and the saved
+        # node would have 1.0 with no signal. Surface as PARTIAL when
+        # the input was actually clamped.
+        clamped_confidence = max(0.0, min(1.0, confidence_val))
+        was_clamped = clamped_confidence != confidence_val
 
-        # Generate a deterministic-ish node ID for upsert on same subject+predicate
         fact_id = f"fact:{self.agent_id}:{subject}:{predicate}"
-
         node = GraphNode(
             node_id=fact_id,
             node_type="learned_fact",
@@ -567,28 +654,55 @@ class MemoryAgencyFeature(Feature):
                 "subject": subject,
                 "predicate": predicate,
                 "value": value,
-                "confidence": confidence,
+                "confidence": clamped_confidence,
                 "source": "agent_tool",
                 "saved_at": datetime.now(timezone.utc).isoformat(),
             },
         )
 
-        await graph.add_node(node)
-        await graph.add_edge(self.agent_id, fact_id, "knows")
+        try:
+            await graph.add_node(node)
+            await graph.add_edge(self.agent_id, fact_id, "knows")
+        except Exception as e:
+            logger.error(f"save_fact write failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         logger.info(
             "Saved fact to KG: %s.%s = %s (confidence=%.2f)",
-            subject, predicate, value, confidence,
+            subject, predicate, value, clamped_confidence,
         )
 
-        return {
+        data = {
             "saved": True,
             "node_id": fact_id,
             "subject": subject,
             "predicate": predicate,
             "value": value,
-            "confidence": confidence,
+            "confidence": clamped_confidence,
+            "confidence_requested": confidence_val,
+            "confidence_clamped": was_clamped,
         }
+
+        if was_clamped:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Saved fact {subject}.{predicate}={value} "
+                    f"(confidence={clamped_confidence:.2f})"
+                ),
+                error=(
+                    f"requested confidence={confidence_val} was outside "
+                    f"[0.0, 1.0]; clamped to {clamped_confidence:.2f}"
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Saved fact {subject}.{predicate}={value} "
+                f"(confidence={clamped_confidence:.2f})"
+            ),
+            data=data,
+        )
 
     # ------------------------------------------------------------------
     # Admin / Sovereign tools
@@ -603,54 +717,80 @@ class MemoryAgencyFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!memory-admin-unpin-all",
     )
-    async def memory_admin_unpin_all(self) -> Dict[str, Any]:
-        """
-        Remove every active pin for the current agent.
-
-        Marks all active memory_pins records as released and clears
-        ``decay_protected`` on the corresponding messages.  This is an
-        administrative override intended for sovereign/admin use.
-        """
+    async def memory_admin_unpin_all(self) -> ToolResult:
+        """Remove every active pin for the current agent."""
         db = self._db
         now = datetime.now(timezone.utc).isoformat()
 
-        # Fetch all active pin message IDs before releasing
-        active_pins = await db.fetchall(
-            "SELECT message_id FROM memory_pins WHERE released_at IS NULL",
-        )
+        try:
+            active_pins = await db.fetchall(
+                "SELECT message_id FROM memory_pins WHERE released_at IS NULL",
+            )
+        except Exception as e:
+            logger.error(f"memory_admin_unpin_all query failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         if not active_pins:
-            return {"unpinned": 0, "message": "No active pins to remove."}
-
-        # Release all active pins
-        await db.execute(
-            "UPDATE memory_pins SET released_at = ? WHERE released_at IS NULL",
-            (now,),
-        )
-
-        # Clear decay_protected on all affected messages
-        for (message_id,) in active_pins:
-            row = await db.fetchone(
-                "SELECT id, metadata FROM conversation_history WHERE id = ?",
-                (message_id,),
+            return ToolResult.ok(
+                confirmation="No active pins to remove (no-op)",
+                data={"unpinned": 0},
             )
-            if row:
-                msg_id, raw_metadata = row
-                metadata = {}
-                if raw_metadata:
-                    try:
-                        metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-                    except (json.JSONDecodeError, TypeError):
-                        metadata = {}
-                metadata["decay_protected"] = False
-                await db.execute(
-                    "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                    (json.dumps(metadata), msg_id),
+
+        try:
+            await db.execute(
+                "UPDATE memory_pins SET released_at = ? WHERE released_at IS NULL",
+                (now,),
+            )
+        except Exception as e:
+            logger.error(f"memory_admin_unpin_all release failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
+
+        # Clear decay_protected on each affected message. If a row
+        # write fails, track it — release succeeded but the metadata
+        # is inconsistent for that message until repaired.
+        metadata_failures: List[Dict[str, Any]] = []
+        for (message_id,) in active_pins:
+            try:
+                row = await db.fetchone(
+                    "SELECT id, metadata FROM conversation_history WHERE id = ?",
+                    (message_id,),
                 )
+                if row:
+                    msg_id, raw_metadata = row
+                    metadata = self._parse_metadata(raw_metadata)
+                    metadata["decay_protected"] = False
+                    await db.execute(
+                        "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                        (json.dumps(metadata), msg_id),
+                    )
+            except Exception as e:
+                metadata_failures.append({"message_id": message_id, "error": str(e)})
 
         count = len(active_pins)
-        logger.info("Admin bulk-unpin: removed %d pins for agent %s", count, self.agent_id[:30] if self.agent_id else "(none)")
-        return {"unpinned": count}
+        logger.info(
+            "Admin bulk-unpin: removed %d pins for agent %s",
+            count,
+            self.agent_id[:30] if self.agent_id else "(none)",
+        )
+
+        if metadata_failures:
+            return ToolResult.partial(
+                confirmation=f"Released {count} pin(s) (memory_pins records updated)",
+                error=(
+                    f"{len(metadata_failures)} message(s) had metadata "
+                    "update failures — pin records are released but the "
+                    "decay_protected flag in conversation_history is stale "
+                    "for those rows. Manual reconciliation needed."
+                ),
+                data={
+                    "unpinned": count,
+                    "metadata_failures": metadata_failures,
+                },
+            )
+        return ToolResult.ok(
+            confirmation=f"Released {count} pin(s)",
+            data={"unpinned": count},
+        )
 
     @tool(
         name="memory_admin_unpin_oldest",
@@ -661,55 +801,62 @@ class MemoryAgencyFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!memory-admin-unpin-oldest",
     )
-    async def memory_admin_unpin_oldest(self, count: int) -> Dict[str, Any]:
+    async def memory_admin_unpin_oldest(self, count: int) -> ToolResult:
         """
         Remove the *count* oldest active pins for this agent.
-
-        Selects the oldest active pins by ``pinned_at``, marks them as
-        released, and clears ``decay_protected`` on the corresponding
-        messages.
 
         Args:
             count: Number of oldest pins to release
         """
+        try:
+            count_val = int(count)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"count must be an integer, got {count!r}"
+            )
+        if count_val < 1:
+            return ToolResult.failed("count must be >= 1")
+
         db = self._db
         now = datetime.now(timezone.utc).isoformat()
 
-        # Fetch the N oldest active pins
-        oldest_pins = await db.fetchall(
-            "SELECT id, message_id FROM memory_pins "
-            "WHERE released_at IS NULL ORDER BY pinned_at ASC LIMIT ?",
-            (count,),
-        )
+        try:
+            oldest_pins = await db.fetchall(
+                "SELECT id, message_id FROM memory_pins "
+                "WHERE released_at IS NULL ORDER BY pinned_at ASC LIMIT ?",
+                (count_val,),
+            )
+        except Exception as e:
+            logger.error(f"memory_admin_unpin_oldest query failed: {e}", exc_info=True)
+            return ToolResult.failed(str(e))
 
         if not oldest_pins:
-            return {"unpinned": 0, "message": "No active pins to remove."}
+            return ToolResult.ok(
+                confirmation="No active pins to remove (no-op)",
+                data={"unpinned": 0, "requested": count_val},
+            )
 
+        metadata_failures: List[Dict[str, Any]] = []
         for pin_id, message_id in oldest_pins:
-            # Release the pin
-            await db.execute(
-                "UPDATE memory_pins SET released_at = ? WHERE id = ?",
-                (now, pin_id),
-            )
-
-            # Clear decay_protected on the message
-            row = await db.fetchone(
-                "SELECT id, metadata FROM conversation_history WHERE id = ?",
-                (message_id,),
-            )
-            if row:
-                msg_id, raw_metadata = row
-                metadata = {}
-                if raw_metadata:
-                    try:
-                        metadata = json.loads(raw_metadata) if isinstance(raw_metadata, str) else raw_metadata
-                    except (json.JSONDecodeError, TypeError):
-                        metadata = {}
-                metadata["decay_protected"] = False
+            try:
                 await db.execute(
-                    "UPDATE conversation_history SET metadata = ? WHERE id = ?",
-                    (json.dumps(metadata), msg_id),
+                    "UPDATE memory_pins SET released_at = ? WHERE id = ?",
+                    (now, pin_id),
                 )
+                row = await db.fetchone(
+                    "SELECT id, metadata FROM conversation_history WHERE id = ?",
+                    (message_id,),
+                )
+                if row:
+                    msg_id, raw_metadata = row
+                    metadata = self._parse_metadata(raw_metadata)
+                    metadata["decay_protected"] = False
+                    await db.execute(
+                        "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                        (json.dumps(metadata), msg_id),
+                    )
+            except Exception as e:
+                metadata_failures.append({"message_id": message_id, "error": str(e)})
 
         released = len(oldest_pins)
         logger.info(
@@ -717,4 +864,37 @@ class MemoryAgencyFeature(Feature):
             released,
             self.agent_id[:30] if self.agent_id else "(none)",
         )
-        return {"unpinned": released, "requested": count}
+
+        data = {
+            "unpinned": released,
+            "requested": count_val,
+            "shortfall": max(0, count_val - released),
+        }
+
+        # Honesty: composite signals
+        partial_errs: List[str] = []
+        if released < count_val:
+            partial_errs.append(
+                f"requested {count_val} pin(s) released but only "
+                f"{released} were active; {count_val - released} fewer "
+                "than requested"
+            )
+        if metadata_failures:
+            data["metadata_failures"] = metadata_failures
+            partial_errs.append(
+                f"{len(metadata_failures)} message(s) had metadata "
+                "update failures — pin records released but "
+                "decay_protected flag is stale; manual reconciliation needed"
+            )
+
+        if partial_errs:
+            return ToolResult.partial(
+                confirmation=f"Released {released} oldest pin(s)",
+                error=" | ".join(partial_errs),
+                data=data,
+            )
+
+        return ToolResult.ok(
+            confirmation=f"Released {released} oldest pin(s)",
+            data=data,
+        )
