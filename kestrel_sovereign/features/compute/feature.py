@@ -13,9 +13,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.kestrel_config.constants import (
     APPROVAL_TIMEOUT_DEFAULT,
     SUBPROCESS_TIMEOUT_SHORT,
@@ -216,38 +217,35 @@ class ComputeFeature(Feature):
         content: str,
         purpose: str,
         requirements: str = "",
-    ) -> str:
+    ) -> ToolResult:
         """
         Write a new script to the staging area.
-        
+
         The script is NOT executed immediately. It will be:
         1. Stored in the script store
         2. Signed with the agent's DID
         3. Queued for security review
         4. Presented to user for approval
-        
+
         Args:
             name: Human-readable name for the script
             language: "bash" or "python"
             content: The script content
             purpose: Why this script is needed
             requirements: Python packages needed (comma-separated, python only)
-            
-        Returns:
-            Status message with script ID
         """
-        # Ensure async initialization is complete
         await self._ensure_initialized()
-        
+
         if language not in ("bash", "python"):
-            return f"Error: Unsupported language '{language}'. Use 'bash' or 'python'."
-        
-        # Parse requirements
+            return ToolResult.failed(
+                f"Error: Unsupported language '{language}'. Use 'bash' or 'python'.",
+                data={"name": name, "language": language},
+            )
+
         reqs = []
         if requirements and language == "python":
             reqs = [r.strip() for r in requirements.split(",") if r.strip()]
-        
-        # Create script record
+
         script = ComputeScript(
             id=str(uuid4()),
             name=name,
@@ -259,8 +257,7 @@ class ComputeFeature(Feature):
             created_at=datetime.now(),
             updated_at=datetime.now(),
         )
-        
-        # Store the script
+
         await self.script_store.save(script)
 
         # Sign with agent DID. Sign-or-fail: if keys are unavailable the
@@ -270,39 +267,81 @@ class ComputeFeature(Feature):
             await self.signer.sign_and_update(script)
         except ScriptSigningKeysUnavailable as e:
             logger.error(f"Cannot sign script {script.id[:8]}…: {e}")
-            return (
+            msg = (
                 f"❌ Script '{name}' saved as DRAFT but could not be signed.\n"
                 f"   ID: {script.id[:8]}\n"
                 f"   Reason: agent secp256k1 signing keys are not available. "
                 f"Cannot produce an unforgeable signature; refusing to mark "
                 f"as SIGNED."
             )
+            return ToolResult.failed(
+                msg,
+                data={
+                    "name": name,
+                    "script_id": script.id,
+                    "state": ScriptState.DRAFT.value,
+                    "signed": False,
+                },
+            )
         script.state = ScriptState.SIGNED
         await self.script_store.update(script)
-        
-        # Analyze for preview
-        result = self.analyzer.analyze(script)
-        
+
+        analysis = self.analyzer.analyze(script)
+
         response = (
             f"✅ Script '{name}' created (ID: {script.id[:8]})\n"
             f"   Language: {language}\n"
             f"   Status: SIGNED (awaiting security review)\n"
         )
-        
-        if result.has_critical:
-            response += f"   ⚠️  CRITICAL issues found - will be blocked\n"
-        elif result.has_rewritable:
-            response += f"   ℹ️  Destructive operations will be safely rewritten\n"
-        
-        if result.findings:
-            response += f"   Security findings: {len(result.findings)} (risk: {result.risk_score}/100)\n"
-        
+
+        if analysis.has_critical:
+            response += "   ⚠️  CRITICAL issues found - will be blocked\n"
+        elif analysis.has_rewritable:
+            response += "   ℹ️  Destructive operations will be safely rewritten\n"
+
+        if analysis.findings:
+            response += (
+                f"   Security findings: {len(analysis.findings)} "
+                f"(risk: {analysis.risk_score}/100)\n"
+            )
+
         if reqs:
             response += f"   Requirements: {', '.join(reqs)}\n"
-        
-        response += f"\n   Use `!compute-run {script.id[:8]}` to submit for execution."
-        
-        return response
+
+        response += (
+            f"\n   Use `!compute-run {script.id[:8]}` to submit for execution."
+        )
+
+        data = {
+            "name": name,
+            "script_id": script.id,
+            "language": language,
+            "state": ScriptState.SIGNED.value,
+            "signed": True,
+            "risk_score": analysis.risk_score,
+            "findings_count": len(analysis.findings),
+            "has_critical": analysis.has_critical,
+            "has_rewritable": analysis.has_rewritable,
+            "requirements": reqs,
+        }
+
+        # Honesty: a script with CRITICAL findings will be blocked at
+        # run_script time. The write succeeded but the practical effect
+        # is "this can never run as-written". PARTIAL forces the agent
+        # to speak that the script will be rejected on execution
+        # rather than just narrate "created successfully".
+        if analysis.has_critical:
+            return ToolResult.partial(
+                confirmation=response,
+                error=(
+                    f"script {script.id[:8]} contains CRITICAL findings; "
+                    "run_script will auto-reject it. The write/sign step "
+                    "succeeded but the script is not executable as written."
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(confirmation=response, data=data)
     
     @tool(
         name="run_script",
@@ -315,7 +354,7 @@ class ComputeFeature(Feature):
         script_id: str,
         executor: str = "uv",
         timeout: int = 300,
-    ) -> str:
+    ) -> ToolResult:
         """
         Submit a script for execution.
         
@@ -339,7 +378,10 @@ class ComputeFeature(Feature):
         # Find script
         script = await self.script_store.find_by_id_prefix(script_id)
         if not script:
-            return f"Error: Script not found with ID starting with '{script_id}'"
+            return ToolResult.failed(
+                f"Error: Script not found with ID starting with '{script_id}'",
+                data={"script_id": script_id},
+            )
 
         # Defense-in-depth: re-verify the signature here, independent of the
         # security-hook chain. Wave 0B (#914) — script.state alone is not
@@ -362,35 +404,49 @@ class ComputeFeature(Feature):
                     "possible tampering, legacy 'hmac:' tag, or missing signature."
                 )
                 await self.script_store.update(script)
-                return (
+                return ToolResult.failed(
                     f"Error: Script '{script.name}' has an invalid signature. "
-                    f"Re-create or re-sign with current ECDSA keys before retrying."
+                    f"Re-create or re-sign with current ECDSA keys before retrying.",
+                    data={"script_id": script.id, "state": script.state.value},
                 )
 
         # Check state
         if script.state == ScriptState.REJECTED:
-            return (
+            return ToolResult.failed(
                 f"Error: Script '{script.name}' was rejected.\n"
                 f"Reason: {script.review_notes}\n"
-                f"Please create a new script without the blocked patterns."
+                f"Please create a new script without the blocked patterns.",
+                data={"script_id": script.id, "state": script.state.value},
             )
-        
+
         if script.state not in (ScriptState.SIGNED, ScriptState.APPROVED, ScriptState.PENDING_REVIEW):
-            return f"Error: Script is in state '{script.state.value}', cannot execute"
-        
+            return ToolResult.failed(
+                f"Error: Script is in state '{script.state.value}', cannot execute",
+                data={"script_id": script.id, "state": script.state.value},
+            )
+
         # Check executor availability
         if executor not in self.executors or self.executors[executor] is None:
             available = [k for k, v in self.executors.items() if v is not None]
-            return f"Error: Executor '{executor}' not available. Available: {available}"
-        
+            return ToolResult.failed(
+                f"Error: Executor '{executor}' not available. Available: {available}",
+                data={"executor": executor, "available": available},
+            )
+
         # Check language support
         exec_obj = self.executors[executor]
         if not exec_obj.supports_language(script.language):
-            return f"Error: Executor '{executor}' does not support {script.language}"
-        
+            return ToolResult.failed(
+                f"Error: Executor '{executor}' does not support {script.language}",
+                data={"executor": executor, "language": script.language},
+            )
+
         # Validate timeout
         if timeout > self.policy.max_timeout_seconds:
-            return f"Error: Timeout {timeout}s exceeds maximum {self.policy.max_timeout_seconds}s"
+            return ToolResult.failed(
+                f"Error: Timeout {timeout}s exceeds maximum {self.policy.max_timeout_seconds}s",
+                data={"timeout": timeout, "max": self.policy.max_timeout_seconds},
+            )
         
         script.timeout_seconds = timeout
         
@@ -405,9 +461,15 @@ class ComputeFeature(Feature):
                 critical = next(f for f in result.findings if f.severity == "critical")
                 script.review_notes = f"Auto-rejected: {critical.description}"
                 await self.script_store.update(script)
-                return (
+                return ToolResult.failed(
                     f"⛔ Script blocked: {critical.description}\n"
-                    f"This pattern is not allowed for security reasons."
+                    f"This pattern is not allowed for security reasons.",
+                    data={
+                        "script_id": script.id,
+                        "state": ScriptState.REJECTED.value,
+                        "auto_rejected": True,
+                        "critical_finding": critical.description,
+                    },
                 )
         
         # Demo servers (KESTREL_DEMO_SERVER=1) skip the approval queue entirely:
@@ -447,7 +509,15 @@ class ComputeFeature(Feature):
                     script.state = ScriptState.REJECTED
                     script.review_notes = f"User denied execution (scope: {scope})"
                     await self.script_store.update(script)
-                    return f"❌ Script execution denied by user ({scope})"
+                    return ToolResult.failed(
+                        f"❌ Script execution denied by user ({scope})",
+                        data={
+                            "script_id": script.id,
+                            "state": ScriptState.REJECTED.value,
+                            "denied_by_user": True,
+                            "scope": scope,
+                        },
+                    )
                 
                 script.state = ScriptState.APPROVED
                 script.review_notes = f"User approved with scope: {scope}"
@@ -486,23 +556,55 @@ class ComputeFeature(Feature):
                 response += f"\n📤 Output:\n{record.stdout[:2000]}"
                 if len(record.stdout) > 2000:
                     response += "\n... [truncated]"
-            
+
             if record.stderr:
                 response += f"\n📥 Stderr:\n{record.stderr[:1000]}"
                 if len(record.stderr) > 1000:
                     response += "\n... [truncated]"
-            
-            return response
+
+            data = {
+                "script_id": script.id,
+                "state": script.state.value,
+                "exit_code": record.exit_code,
+                "duration_seconds": record.duration_seconds,
+                "executor": executor,
+                "succeeded": record.succeeded,
+                "stdout_truncated": (record.stdout[:2000] if record.stdout else ""),
+                "stderr_truncated": (record.stderr[:1000] if record.stderr else ""),
+            }
+
+            # Honesty: a non-zero exit is a real failure of the
+            # script, not the orchestration. The script ran but the
+            # command failed — agent must speak that the script's
+            # work didn't succeed rather than narrate "executed" off
+            # an exit_code != 0.
+            if not record.succeeded:
+                return ToolResult.partial(
+                    confirmation=response,
+                    error=(
+                        f"script {script.id[:8]} executed but exited with "
+                        f"code {record.exit_code} (executor={executor}); "
+                        "the work it was supposed to do did not succeed."
+                    ),
+                    data=data,
+                )
+            return ToolResult.ok(confirmation=response, data=data)
 
         except (OSError, ValueError, TypeError) as e:
             script.state = ScriptState.FAILED
             await self.script_store.update(script)
-            return f"❌ Execution failed: {str(e)}"
+            return ToolResult.failed(
+                f"❌ Execution failed: {str(e)}",
+                data={"script_id": script.id, "state": ScriptState.FAILED.value},
+            )
         except Exception as e:
             script.state = ScriptState.FAILED
             await self.script_store.update(script)
             logger.error(f"Unexpected execution failure: {e}", exc_info=True)
-            return f"❌ Execution failed: {str(e)}"
+            return ToolResult.failed(
+                f"❌ Execution failed: {str(e)}",
+                data={"script_id": script.id, "state": ScriptState.FAILED.value},
+            )
     
     async def _execute_script(
         self,
@@ -528,29 +630,32 @@ class ComputeFeature(Feature):
         self,
         state: str = "",
         limit: int = 20,
-    ) -> str:
+    ) -> ToolResult:
         """
         List scripts in the store.
-        
+
         Args:
             state: Filter by state (draft, signed, pending_review, approved, rejected, running, completed, failed)
             limit: Maximum number of results
-            
-        Returns:
-            Formatted list of scripts
         """
         if state:
             try:
                 script_state = ScriptState(state)
                 scripts = await self.script_store.list_by_state(script_state, limit)
             except ValueError:
-                return f"Error: Invalid state '{state}'. Valid states: {[s.value for s in ScriptState]}"
+                return ToolResult.failed(
+                    f"Error: Invalid state '{state}'. Valid states: {[s.value for s in ScriptState]}",
+                    data={"state": state},
+                )
         else:
             scripts = await self.script_store.list_recent(limit)
-        
+
         if not scripts:
-            return "No scripts found."
-        
+            return ToolResult.ok(
+                confirmation="No scripts found.",
+                data={"scripts": [], "count": 0},
+            )
+
         lines = ["📜 Scripts:\n"]
         for s in scripts:
             status_icon = {
@@ -564,13 +669,28 @@ class ComputeFeature(Feature):
                 ScriptState.COMPLETED: "✅",
                 ScriptState.FAILED: "❌",
             }.get(s.state, "❓")
-            
+
             lines.append(
                 f"  {status_icon} {s.id[:8]} | {s.name[:20]:<20} | {s.language:<6} | "
                 f"{s.state.value:<14} | risk:{s.risk_score:>3}"
             )
-        
-        return "\n".join(lines)
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": len(scripts),
+                "scripts": [
+                    {
+                        "id": s.id,
+                        "name": s.name,
+                        "language": s.language,
+                        "state": s.state.value,
+                        "risk_score": s.risk_score,
+                    }
+                    for s in scripts
+                ],
+            },
+        )
     
     @tool(
         name="show_script",
@@ -578,19 +698,19 @@ class ComputeFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-show",
     )
-    async def show_script(self, script_id: str) -> str:
+    async def show_script(self, script_id: str) -> ToolResult:
         """
         Show script details including content and security analysis.
-        
+
         Args:
             script_id: Script ID (full or prefix)
-            
-        Returns:
-            Detailed script information
         """
         script = await self.script_store.find_by_id_prefix(script_id)
         if not script:
-            return f"Error: Script not found with ID starting with '{script_id}'"
+            return ToolResult.failed(
+                f"Error: Script not found with ID starting with '{script_id}'",
+                data={"script_id": script_id},
+            )
         
         lines = [
             f"📜 Script: {script.name}",
@@ -627,8 +747,21 @@ class ComputeFeature(Feature):
             lines.append(f"   {i:3}| {line}")
         if len(content_lines) > 20:
             lines.append(f"   ... ({len(content_lines) - 20} more lines)")
-        
-        return "\n".join(lines)
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "script_id": script.id,
+                "name": script.name,
+                "language": script.language,
+                "state": script.state.value,
+                "risk_score": script.risk_score,
+                "purpose": script.purpose,
+                "requirements": script.requirements,
+                "review_notes": script.review_notes,
+                "findings_count": len(script.security_findings or []),
+            },
+        )
     
     @tool(
         name="execution_history",
@@ -640,28 +773,31 @@ class ComputeFeature(Feature):
         self,
         script_id: str = "",
         limit: int = 10,
-    ) -> str:
+    ) -> ToolResult:
         """
         Show execution history.
-        
+
         Args:
             script_id: Optional script ID to filter by
             limit: Maximum number of results
-            
-        Returns:
-            Execution history
         """
         if script_id:
             script = await self.script_store.find_by_id_prefix(script_id)
             if not script:
-                return f"Error: Script not found with ID starting with '{script_id}'"
+                return ToolResult.failed(
+                    f"Error: Script not found with ID starting with '{script_id}'",
+                    data={"script_id": script_id},
+                )
             executions = await self.script_store.get_executions_for_script(script.id, limit)
         else:
             executions = await self.script_store.list_recent_executions(limit)
-        
+
         if not executions:
-            return "No executions found."
-        
+            return ToolResult.ok(
+                confirmation="No executions found.",
+                data={"executions": [], "count": 0},
+            )
+
         lines = ["📊 Execution History:\n"]
         for e in executions:
             status = "✅" if e.succeeded else "❌"
@@ -670,8 +806,24 @@ class ComputeFeature(Feature):
                 f"  {status} {e.id[:8]} | script:{e.script_id[:8]} | "
                 f"exit:{e.exit_code} | {duration} | {e.executor}"
             )
-        
-        return "\n".join(lines)
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": len(executions),
+                "executions": [
+                    {
+                        "id": e.id,
+                        "script_id": e.script_id,
+                        "exit_code": e.exit_code,
+                        "duration_seconds": e.duration_seconds,
+                        "executor": e.executor,
+                        "succeeded": e.succeeded,
+                    }
+                    for e in executions
+                ],
+            },
+        )
     
     # =========================================================================
     # Trash Management Tools
@@ -683,27 +835,27 @@ class ComputeFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-trash",
     )
-    async def list_trash(self, days: int = 7) -> str:
+    async def list_trash(self, days: int = 7) -> ToolResult:
         """
         List recent trash items.
-        
+
         Args:
             days: Show items from last N days (default: 7)
-            
-        Returns:
-            List of trash items
         """
         items = self.trash_manager.list_items(days=days, limit=50)
-        
+
         if not items:
-            return f"🗑️ Trash is empty (last {days} days)"
-        
+            return ToolResult.ok(
+                confirmation=f"🗑️ Trash is empty (last {days} days)",
+                data={"items": [], "count": 0, "days": days},
+            )
+
         stats = self.trash_manager.get_stats()
-        
+
         lines = [
             f"🗑️ Trash ({stats['item_count']} items, {self.trash_manager.format_size(stats['total_size_bytes'])})\n"
         ]
-        
+
         for item in items[:20]:
             icon = "📁" if item.is_dir else "📄"
             age = (datetime.now() - item.deleted_at).days
@@ -712,11 +864,18 @@ class ComputeFeature(Feature):
                 f"  {icon} {item.name[:30]:<30} | {size:>10} | {age}d ago"
             )
             lines.append(f"      Path: {item.path}")
-        
+
         if len(items) > 20:
             lines.append(f"\n  ... and {len(items) - 20} more items")
-        
-        return "\n".join(lines)
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "count": len(items),
+                "days": days,
+                "stats": stats,
+            },
+        )
     
     @tool(
         name="restore_from_trash",
@@ -728,32 +887,45 @@ class ComputeFeature(Feature):
         self,
         trash_path: str,
         destination: str = "",
-    ) -> str:
+    ) -> ToolResult:
         """
         Restore a file from trash.
-        
+
         Args:
             trash_path: Path to the item in trash
             destination: Where to restore (default: current directory)
-            
-        Returns:
-            Status message
         """
         try:
             restored_path = self.trash_manager.restore(
                 Path(trash_path),
                 destination or None,
             )
-            return f"✅ Restored to: {restored_path}"
         except FileNotFoundError:
-            return f"Error: Trash item not found: {trash_path}"
+            return ToolResult.failed(
+                f"Error: Trash item not found: {trash_path}",
+                data={"trash_path": trash_path},
+            )
         except FileExistsError as e:
-            return f"Error: {e}"
+            return ToolResult.failed(
+                f"Error: {e}",
+                data={"trash_path": trash_path, "destination": destination},
+            )
         except (PermissionError, OSError) as e:
-            return f"Error restoring file: {e}"
+            return ToolResult.failed(
+                f"Error restoring file: {e}",
+                data={"trash_path": trash_path},
+            )
         except Exception as e:
             logger.error(f"Unexpected error restoring file: {e}", exc_info=True)
-            return f"Error restoring file: {e}"
+            return ToolResult.failed(
+                f"Error restoring file: {e}",
+                data={"trash_path": trash_path},
+            )
+
+        return ToolResult.ok(
+            confirmation=f"✅ Restored to: {restored_path}",
+            data={"trash_path": trash_path, "restored_path": str(restored_path)},
+        )
     
     @tool(
         name="empty_trash",
@@ -765,31 +937,54 @@ class ComputeFeature(Feature):
         self,
         older_than_days: int = 30,
         dry_run: bool = True,
-    ) -> str:
+    ) -> ToolResult:
         """
         Permanently delete old trash items.
-        
+
         This is the ONLY way to truly delete files, and it:
         1. Only deletes items older than specified days
         2. Requires explicit user approval
         3. Logs all deletions to audit trail
-        
+
         Args:
             older_than_days: Delete items older than this (default: 30)
             dry_run: If True, only count what would be deleted
-            
-        Returns:
-            Status message with count
         """
         if dry_run:
             count = self.trash_manager.empty(older_than_days=older_than_days, dry_run=True)
-            return (
+            body = (
                 f"🗑️ Dry run: Would delete {count} items older than {older_than_days} days.\n"
                 f"   Run with dry_run=false to actually delete."
             )
-        else:
-            count = self.trash_manager.empty(older_than_days=older_than_days, dry_run=False)
-            return f"🗑️ Permanently deleted {count} items older than {older_than_days} days."
+            # Honesty: dry-run mode (the default) didn't actually
+            # delete anything. PARTIAL forces the agent to speak the
+            # caveat — narrating "deleted N items" off a dry run
+            # would be a lie. Same pattern as model.cleanup_models
+            # (PR #1098) and strategic_memory.backlog_hygiene (#1104).
+            return ToolResult.partial(
+                confirmation=body,
+                error=(
+                    f"dry_run=True: {count} items were counted but NOT "
+                    "deleted. Re-run with dry_run=False to apply."
+                ),
+                data={
+                    "dry_run": True,
+                    "count": count,
+                    "older_than_days": older_than_days,
+                    "applied": False,
+                },
+            )
+
+        count = self.trash_manager.empty(older_than_days=older_than_days, dry_run=False)
+        return ToolResult.ok(
+            confirmation=f"🗑️ Permanently deleted {count} items older than {older_than_days} days.",
+            data={
+                "dry_run": False,
+                "count": count,
+                "older_than_days": older_than_days,
+                "applied": True,
+            },
+        )
     
     # =========================================================================
     # Introspection Tools
@@ -801,12 +996,9 @@ class ComputeFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!compute-caps",
     )
-    async def get_compute_capabilities(self) -> Dict[str, Any]:
+    async def get_compute_capabilities(self) -> ToolResult:
         """
         Returns current compute environment so agent can adapt behavior.
-        
-        Returns:
-            Dictionary with version, executors, permissions, policy, data_zones
         """
         executor_status = {}
         for name, executor in self.executors.items():
@@ -814,8 +1006,8 @@ class ComputeFeature(Feature):
                 executor_status[name] = False
             else:
                 executor_status[name] = executor.is_available
-        
-        return {
+
+        data = {
             "version": "1.0",
             "executors": executor_status,
             "policy": self.policy.to_dict() if self.policy else {},
@@ -825,23 +1017,28 @@ class ComputeFeature(Feature):
             },
             "supported_languages": ["bash", "python"],
         }
+        available = [name for name, ok in executor_status.items() if ok]
+        return ToolResult.ok(
+            confirmation=(
+                f"compute capabilities (v{data['version']}); "
+                f"available executors: {', '.join(available) if available else '(none)'}"
+            ),
+            data=data,
+        )
     
     @tool(
         name="get_compute_policy",
         description="Query the current security policy for compute",
         category=ToolCategory.SYSTEM,
     )
-    async def get_compute_policy(self) -> Dict[str, Any]:
+    async def get_compute_policy(self) -> ToolResult:
         """
         Returns security policy so agent can explain constraints to user.
-        
-        Returns:
-            Current policy configuration
         """
         if not self.policy:
-            return {"error": "Policy not initialized"}
-        
-        return {
+            return ToolResult.failed("Policy not initialized")
+
+        data = {
             "policy": self.policy.to_dict(),
             "explanation": {
                 "auto_approve_below_risk": (
@@ -860,3 +1057,11 @@ class ComputeFeature(Feature):
                 },
             },
         }
+        return ToolResult.ok(
+            confirmation=(
+                f"compute policy: auto_approve_below_risk="
+                f"{self.policy.auto_approve_below_risk}, "
+                f"max_timeout={self.policy.max_timeout_seconds}s"
+            ),
+            data=data,
+        )
