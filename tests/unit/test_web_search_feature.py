@@ -13,6 +13,7 @@ import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timezone
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.web_search.feature import WebSearchFeature
 from kestrel_sovereign.features.web_search.tool import WebSearchTool
 
@@ -243,8 +244,9 @@ class TestWebSearchFeature:
         """Search should return error when API key missing."""
         result = await feature_disabled.search("test query")
 
-        assert result["success"] is False
-        assert "disabled" in result["error"].lower()
+        # Migrated to ToolResult (#1061 wave 19): disabled = ERROR
+        assert result.status is ToolResultStatus.ERROR
+        assert "disabled" in result.error.lower()
 
     @pytest.mark.asyncio
     async def test_search_when_enabled(self, feature_enabled):
@@ -265,8 +267,8 @@ class TestWebSearchFeature:
 
             result = await feature_enabled.search("test query", max_results=3)
 
-        assert result["success"] is True
-        assert result["query"] == "test query"
+        assert result.status is ToolResultStatus.OK
+        assert result.data["query"] == "test query"
 
     def test_has_tool_decorator(self, mock_agent):
         """Verify the search method has the @tool decorator."""
@@ -331,12 +333,13 @@ class TestWebSearchIntegration:
 
                 result = await feature.search("What is Python?")
 
-            assert result["success"] is True
-            assert "Python" in result["answer"]
-            assert len(result["results"]) == 2
+            assert result.status is ToolResultStatus.OK
+            assert "Python" in result.data["answer"]
+            assert len(result.data["results"]) == 2
 
-            # Format for LLM
-            formatted = feature.tool.format_results_for_llm(result)
+            # Format for LLM (the underlying tool's helper still takes
+            # the legacy dict; .data carries it)
+            formatted = feature.tool.format_results_for_llm(result.data)
             assert "Python" in formatted
             assert "python.org" in formatted
 

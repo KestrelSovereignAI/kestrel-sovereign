@@ -16,10 +16,11 @@ methods, so the two surfaces never drift out of sync.
 import logging
 from typing import Any, Dict
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.deploy.manager import DeployManager
 from kestrel_sovereign.features.deploy.models import DeployManagerError
-from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,7 @@ class DeployFeature(Feature):
         action: str = "status",
         profile: str = "",
         tag: str = "latest",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Main entry point for agent deployment management.
 
@@ -95,37 +96,114 @@ class DeployFeature(Feature):
             !deploy health profile=dev
         """
         if getattr(self, "disabled", False):
-            return {
-                "action": action,
-                "error": "Deploy feature is disabled",
-                "reason": getattr(self, "disabled_reason", "No profiles configured"),
-            }
+            return ToolResult.failed(
+                "Deploy feature is disabled",
+                data={
+                    "action": action,
+                    "error": "Deploy feature is disabled",
+                    "reason": getattr(self, "disabled_reason", "No profiles configured"),
+                },
+            )
 
         action_normalized = (action or "status").lower()
 
+        # Internal helpers (_status, _deploy, etc.) still return
+        # legacy dicts with {"success": True/False, ...}. Wrap the
+        # outcome at the @tool boundary based on the success flag.
         if action_normalized in {"status"}:
-            return await self._status()
+            result_dict = await self._status()
+        elif action_normalized in {"deploy", "start"}:
+            result_dict = await self._deploy(profile_name=profile, image_tag=tag)
+        elif action_normalized in {"teardown", "stop", "delete"}:
+            result_dict = await self._teardown(profile_name=profile)
+        elif action_normalized in {"logs", "log"}:
+            result_dict = await self._logs(profile_name=profile)
+        elif action_normalized in {"list", "ls"}:
+            result_dict = await self._list_deployments()
+        elif action_normalized in {"health", "check"}:
+            result_dict = await self._health_check(profile_name=profile)
+        else:
+            return ToolResult.failed(
+                f"Unknown action: {action}",
+                data={
+                    "success": False,
+                    "error": f"Unknown action: {action}",
+                    "available_actions": [
+                        "status", "deploy", "teardown", "logs", "list", "health",
+                    ],
+                },
+            )
 
-        if action_normalized in {"deploy", "start"}:
-            return await self._deploy(profile_name=profile, image_tag=tag)
+        if isinstance(result_dict, dict) and result_dict.get("success") is False:
+            return ToolResult.failed(
+                result_dict.get("error") or f"deploy {action_normalized} failed",
+                data=result_dict,
+            )
 
-        if action_normalized in {"teardown", "stop", "delete"}:
-            return await self._teardown(profile_name=profile)
+        # Build a meaningful confirmation. The command renderer drops
+        # scalar-only ``data`` blocks, so the confirmation is the only
+        # surface the user sees for short outcomes (deploy status with
+        # no sessions, health check with "Service not deployed", etc).
+        # Pull the most informative legacy field per action — falling
+        # back to a generic string only when nothing better exists.
+        confirmation = self._format_deploy_confirmation(action_normalized, result_dict)
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data=result_dict if isinstance(result_dict, dict) else {"raw": result_dict},
+        )
 
-        if action_normalized in {"logs", "log"}:
-            return await self._logs(profile_name=profile)
-
-        if action_normalized in {"list", "ls"}:
-            return await self._list_deployments()
-
-        if action_normalized in {"health", "check"}:
-            return await self._health_check(profile_name=profile)
-
-        return {
-            "success": False,
-            "error": f"Unknown action: {action}",
-            "available_actions": ["status", "deploy", "teardown", "logs", "list", "health"],
-        }
+    @staticmethod
+    def _format_deploy_confirmation(action: str, payload: Any) -> str:
+        """Build a deploy-action confirmation string from the legacy
+        manager dict. Codex round 2 (#1117): generic "deploy X ok"
+        was hiding the actual outcome (e.g. "No active deployment
+        sessions") because the command renderer suppresses scalar
+        data; this puts the meaningful text in confirmation.
+        """
+        if not isinstance(payload, dict):
+            return f"deploy {action} ok"
+        # Prefer the manager's own message when present.
+        msg = payload.get("message")
+        if isinstance(msg, str) and msg:
+            return msg
+        # Health check returns the provider result under payload["health"]
+        # for deployed services, OR a top-level {"healthy": ...} for
+        # standalone results. Check both. Codex round 4: the nested
+        # case was being missed, so deployed-but-unhealthy was silently
+        # rendering "deploy health ok".
+        if action in {"health", "check"}:
+            health_block = payload.get("health")
+            if isinstance(health_block, dict):
+                if health_block.get("healthy") is True:
+                    return "Service is healthy"
+                if health_block.get("healthy") is False:
+                    reason = (
+                        health_block.get("reason")
+                        or health_block.get("error")
+                        or payload.get("reason")
+                        or "no detail"
+                    )
+                    return f"Service is unhealthy: {reason}"
+            healthy = payload.get("healthy")
+            if healthy is True:
+                return "Service is healthy"
+            if healthy is False:
+                return f"Service is unhealthy: {payload.get('reason') or 'no detail'}"
+        # Status with sessions but no message.
+        if action == "status" and "active_deployments" in payload:
+            n = payload.get("active_deployments", 0)
+            return f"{n} active deployment(s)"
+        # List of deployments. The manager returns
+        # {"count": N, "deployments": [...]} on this path; older
+        # surfaces also used "sessions". Read both.
+        if action in {"list", "ls"}:
+            if "count" in payload:
+                return f"Listed {payload['count']} deployment(s)"
+            if "deployments" in payload:
+                return f"Listed {len(payload.get('deployments') or [])} deployment(s)"
+            if "sessions" in payload:
+                return f"Listed {len(payload.get('sessions') or [])} deployment(s)"
+        return f"deploy {action} ok"
 
     async def _status(self) -> Dict[str, Any]:
         """Get status of all active deployment sessions."""

@@ -10,6 +10,7 @@ import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.deploy.core import DeployManagerCore
 from kestrel_sovereign.features.deploy.feature import DeployFeature
 from kestrel_sovereign.features.deploy.manager import DeployManager
@@ -338,8 +339,9 @@ class TestDeployFeature:
 
         result = await feature.deploy_agent(action="status")
 
-        assert result["error"] == "Deploy feature is disabled"
-        assert result["reason"] == "No profiles configured"
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["error"] == "Deploy feature is disabled"
+        assert result.data["reason"] == "No profiles configured"
 
     @pytest.mark.asyncio
     async def test_status_no_sessions(self, sample_config):
@@ -355,9 +357,9 @@ class TestDeployFeature:
 
             result = await feature.deploy_agent(action="status")
 
-            assert result["success"] is True
-            assert result["active_deployments"] == 0
-            assert "No active deployment sessions" in result["message"]
+            assert result.status is ToolResultStatus.OK
+            assert result.data["active_deployments"] == 0
+            assert "No active deployment sessions" in result.data["message"]
 
     @pytest.mark.asyncio
     async def test_deploy_without_profile(self, sample_config):
@@ -372,9 +374,9 @@ class TestDeployFeature:
 
             result = await feature.deploy_agent(action="deploy", profile="")
 
-            assert result["success"] is False
-            assert "Profile required" in result["error"]
-            assert "available_profiles" in result
+            assert result.status is ToolResultStatus.ERROR
+            assert "Profile required" in result.error
+            assert "available_profiles" in result.data
 
     @pytest.mark.asyncio
     async def test_unknown_action(self, sample_config):
@@ -389,9 +391,9 @@ class TestDeployFeature:
 
             result = await feature.deploy_agent(action="invalid")
 
-            assert result["success"] is False
-            assert "Unknown action" in result["error"]
-            assert "available_actions" in result
+            assert result.status is ToolResultStatus.ERROR
+            assert "Unknown action" in result.error
+            assert "available_actions" in result.data
 
     def test_build_image_reference(self, sample_config):
         """Test image reference building.

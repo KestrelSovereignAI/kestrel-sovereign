@@ -4,9 +4,11 @@ State of Mind Feature
 Provides the !state-of-mind command to inspect constitutional governance mode.
 """
 import logging
-from typing import Optional
-from kestrel_sovereign.features.base import Feature, tool
+from typing import Any, Optional
+
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature, tool
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +36,7 @@ class StateOfMindFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!state-of-mind"
     )
-    async def get_state_of_mind(self) -> str:
+    async def get_state_of_mind(self) -> ToolResult:
         """
         Retrieve the current state of mind for the agent.
 
@@ -51,20 +53,33 @@ class StateOfMindFeature(Feature):
         Returns:
             Formatted state of mind report
         """
-        try:
-            # Get state of mind from LLM service
-            if not hasattr(self.agent, 'llm_service'):
-                return "Error: LLM service not available"
+        if not hasattr(self.agent, 'llm_service'):
+            return ToolResult.failed("LLM service not available")
 
+        try:
             state = self.agent.llm_service.get_state_of_mind()
 
-            # Format using the profile service
             from kestrel_sovereign.llm.constitutional_profile import get_profile_service
             profile_service = get_profile_service()
             formatted = profile_service.format_state_of_mind(state)
-
-            return formatted
-
         except Exception as e:
             logger.error(f"Failed to get state of mind: {e}")
-            return f"Error retrieving state of mind: {str(e)}"
+            return ToolResult.failed(f"Error retrieving state of mind: {str(e)}")
+
+        # The LLM service may return a StateOfMind dataclass; ToolResult.data
+        # ends up in json.dumps via _serialize_tool_result, so coerce to a
+        # plain dict-or-string here. dataclasses.asdict handles the
+        # canonical case; fall back to vars() / str() when it isn't a
+        # dataclass instance.
+        import dataclasses
+        if dataclasses.is_dataclass(state) and not isinstance(state, type):
+            state_serialized: Any = dataclasses.asdict(state)
+        elif isinstance(state, dict):
+            state_serialized = state
+        else:
+            state_serialized = {"raw": str(state)}
+
+        return ToolResult.ok(
+            confirmation=formatted,
+            data={"state": state_serialized},
+        )
