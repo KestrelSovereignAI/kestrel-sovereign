@@ -396,18 +396,18 @@ class TestGitHubFeature:
         )
         await feature.cache.set(content)
 
-        # Call the method directly
+        # Call the method directly. Migrated to ToolResult (#1061 wave 14):
+        # body lives in confirmation, error in error.
         result = await feature.read_github_file(repo="self", path="test.py")
 
-        assert "cached content" in result
-    
+        assert "cached content" in (result.confirmation or "")
+
     @pytest.mark.asyncio
     async def test_get_definition_non_python(self, feature):
-        # Call the method directly
         result = await feature.get_code_definition(
-            repo="self", 
-            path="README.md", 
+            repo="self",
+            path="README.md",
             name="something"
         )
-        
-        assert "only supports Python" in result
+
+        assert "only supports Python" in (result.error or "")
