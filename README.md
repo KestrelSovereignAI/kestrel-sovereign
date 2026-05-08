@@ -85,11 +85,11 @@ Your agent is now running. Two ports to know about, depending on which start for
 | Command | Listens on | Why |
 |---|---|---|
 | `kestrel start` (no name) | `http://localhost:8888` (the multi-agent **host**) | Default in-process multi-agent mode; the host fronts every agent registered with `autostart = true` at `multi_agent.host.port` (default `8888`). Agents registered with `autostart = false` aren't loaded — start those by name. |
-| `kestrel start <name>` | `http://localhost:8801` (the **agent**) | A single agent on its own port — the next free slot at or above `8801` (assigned by `kestrel create` and recorded in `multi_agent.toml` under that agent's entry). The CLI prints the chosen port + PID. |
+| `kestrel start <name>` | the **agent's own port**, printed by the CLI on start | Each agent gets the next free slot at or above `8801` (the first auto-assigned agent lands there; subsequent agents go to `8802`, etc., or whatever `--port` you passed to `kestrel create`). The exact value lives in `multi_agent.toml` under that agent's entry, and `kestrel start` prints `host=127.0.0.1 port=NNNN pid=...`. |
 
 > **Port conflict?** Edit the agent's entry in `multi_agent.toml` to change its port, or recreate the agent with a chosen port (`kestrel create MyAgent --port 8899`). Edit `multi_agent.toml`'s `[host]` section to change the host port (default `8888`). `kestrel start` itself doesn't take a `--port` flag — runtime ports are read from `multi_agent.toml`.
 
-> **Test it:** Visit the printed URL in your browser (e.g. `http://localhost:8888` for the host, or `http://localhost:8801` for a single-agent start) to open the built-in **Sovereign Console**. Append `/health` to either for a JSON readiness probe.
+> **Test it:** Visit the URL the CLI printed on start (`http://localhost:8888` for the multi-agent host, or whatever per-agent port `kestrel start <name>` reported). The Sovereign Console is the default page; append `/health` for a JSON readiness probe.
 
 > **Windows users:** the CLI prints emoji. If you see `UnicodeEncodeError: 'charmap' codec can't encode character ...`, run `chcp 65001` once in your PowerShell session to switch the console to UTF-8. (As of v0.1.9 the CLI auto-reconfigures stdout, so a fresh install should not hit this.)
 
@@ -175,7 +175,7 @@ uv run python main.py ./agent_data/myagent
 <a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
 
-Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the printed URL — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or `http://localhost:8801` for a single-agent start — in any browser; no additional software required.
+Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required.
 
 The console provides 8 tabs:
 
