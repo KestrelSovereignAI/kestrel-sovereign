@@ -26,6 +26,22 @@ from .talon_handoff import dispatch_to_talon, pick_top_issue
 
 logger = logging.getLogger(__name__)
 
+
+# Prefixes that the github-backed sub-modules (backlog_hygiene,
+# session_log) return when prerequisites (scan_repos config or
+# GITHUB_TOKEN) are missing. They look like report bodies but are
+# actually skipped runs — the @tool wrappers must turn these into
+# ERROR envelopes so callers can't treat a no-op as a successful
+# scan/log/apply.
+_GITHUB_PREREQ_FAILURE_PREFIXES: tuple = (
+    "No scan_repos configured",
+    "No GITHUB_TOKEN found",
+)
+
+
+def _is_github_prereq_failure(body: str) -> bool:
+    return any(body.startswith(p) for p in _GITHUB_PREREQ_FAILURE_PREFIXES)
+
 # Try to import yaml; fall back to a simple parser if not available
 try:
     import yaml
@@ -446,6 +462,18 @@ class StrategicMemoryFeature(Feature):
             fix: Set to 'yes' to auto-fix issues where possible (add labels). Default 'no' (report only).
         """
         report = await run_backlog_hygiene(self._data, fix=fix)
+
+        # Prerequisite failures (missing scan_repos / missing
+        # GITHUB_TOKEN) come back as success-shaped strings from the
+        # helper. Surface them as ERROR — the scan never ran, no fixes
+        # could possibly have been applied, and a downstream caller
+        # checking status must see failure rather than "applied=True".
+        if _is_github_prereq_failure(report):
+            return ToolResult.failed(
+                report,
+                data={"fix": fix, "report": report, "applied": False},
+            )
+
         # Honesty: dry-run mode (anything but the runner's truthy
         # predicate) reports issues but does not change anything.
         # Surface as PARTIAL so the agent must speak that the report
@@ -483,6 +511,17 @@ class StrategicMemoryFeature(Feature):
             focus: Brief description of today's focus area.
         """
         log = await collect_session_log(self._data, session_id=session_id, focus=focus)
+
+        # Same shape as backlog_hygiene: prereq failures (no scan_repos
+        # / no GITHUB_TOKEN) come back as text. The session log was not
+        # collected; downstream callers branching on status must see
+        # ERROR rather than treating the warning as a real log.
+        if _is_github_prereq_failure(log):
+            return ToolResult.failed(
+                log,
+                data={"session_id": session_id, "focus": focus, "log": log},
+            )
+
         return ToolResult.ok(
             confirmation=log,
             data={"session_id": session_id, "focus": focus, "log": log},
