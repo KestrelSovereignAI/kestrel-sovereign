@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,89 @@ def test_keys_interactive_skips_api_key_when_declined(tmp_path):
     keys.run(ctx)
     env = read_env(tmp_path / ".env")
     assert "KESTREL_API_KEY" not in env
+
+
+def test_keys_propagates_generated_data_key_to_os_environ(tmp_path, monkeypatch):
+    """Quickstart's KESTREL_DATA_KEY must reach the live process before the
+    agent step runs inception.
+
+    Without this, ``inception_service.save_kestrel_identity`` reads
+    ``os.environ["KESTREL_DATA_KEY"]``, sees nothing, and silently writes a
+    plaintext PEM. The key is on disk in ``.env`` but no one in this
+    process has reloaded it.
+    """
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    env_file_value = read_env(tmp_path / ".env")["KESTREL_DATA_KEY"]
+    assert os.environ.get("KESTREL_DATA_KEY") == env_file_value
+    # API key (also generated in quickstart) should propagate too.
+    assert os.environ.get("KESTREL_API_KEY") == read_env(tmp_path / ".env")["KESTREL_API_KEY"]
+
+
+def test_quickstart_inception_writes_encrypted_pem_not_plaintext(tmp_path, monkeypatch):
+    """End-to-end check: after ``keys.run``, an inception-style key save
+    should land on the encrypted ``.key.enc`` path — not the plaintext
+    ``.pem`` fallback.
+
+    This is the regression guard for the bug where ``--quickstart`` wrote
+    a fresh ``KESTREL_DATA_KEY`` into ``.env`` but never told ``os.environ``,
+    so ``save_kestrel_identity`` saw an empty master key and silently fell
+    back to plaintext PEM."""
+    monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    # Now run an inception-style key save in the same process, mimicking
+    # what ``agent.run`` would do later in the wizard.
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from kestrel_sovereign.inception_service import save_kestrel_identity
+
+    private_key = ec.generate_private_key(ec.SECP256K1())
+    out_dir = tmp_path / "agent_data" / "Kestrel"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_kestrel_identity(
+        did_document={"id": "did:pkh:eip155:1:0xtest"},
+        keys={
+            "private_key_obj": private_key,
+            "public_key_hex": "00" * 64,
+            "address": "0xtest",
+        },
+        key_id="kestrel_0xtest",
+        output_dir=out_dir,
+    )
+
+    encrypted = list(out_dir.glob("*.key.enc"))
+    plaintext = list(out_dir.glob("*.pem"))
+    assert encrypted, f"expected encrypted .key.enc; found {[p.name for p in out_dir.iterdir()]}"
+    assert not plaintext, (
+        f"plaintext PEM written despite quickstart generating KESTREL_DATA_KEY: "
+        f"{[p.name for p in plaintext]}"
+    )
+
+
+def test_keys_does_not_clobber_preexisting_os_environ_value(tmp_path, monkeypatch):
+    """If the operator already has ``KESTREL_DATA_KEY`` exported in their
+    shell, the keys step should not overwrite it in ``os.environ`` even if
+    ``.env`` was empty. (Their shell value is what inception will use, and
+    overwriting silently would be surprising.)"""
+    user_supplied = "user-shell-key-do-not-touch"
+    monkeypatch.setenv("KESTREL_DATA_KEY", user_supplied)
+    monkeypatch.delenv("KESTREL_API_KEY", raising=False)
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    keys.run(ctx)
+
+    # The .env got a generated value (the keys step doesn't read os.environ
+    # to decide whether to generate — only ``read_env``), but os.environ
+    # keeps the user's pre-existing export.
+    assert os.environ["KESTREL_DATA_KEY"] == user_supplied
 
 
 def test_keys_idempotent_when_everything_set(tmp_path):
