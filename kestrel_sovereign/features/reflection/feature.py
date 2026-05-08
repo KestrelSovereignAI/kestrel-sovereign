@@ -17,12 +17,13 @@ import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import (
     resolve_feature_conversation_store,
     resolve_feature_database,
 )
-from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sovereign.kestrel_config.constants import (
     APPROVAL_TIMEOUT_DEFAULT,
     APPROVAL_TIMEOUT_SHORT,
@@ -70,6 +71,42 @@ class ReflectionFeature(Feature):
             "Self-reflection and improvement - analyze past interactions, "
             "identify patterns, generate insights, and propose behavioral changes"
         )
+
+    @staticmethod
+    def _to_tool_result(
+        legacy: Dict[str, Any],
+        *,
+        ok_confirmation: str,
+    ) -> ToolResult:
+        """Wrap a legacy success/error dict in a ToolResult envelope.
+
+        Honesty layer 4 (#1042) requires every @tool return to use the
+        ToolResult shape. The reflection tools delegate to handlers /
+        formatters that still produce rich dicts of the form
+        ``{"success": True/False, "error": ..., ...payload...}``. To
+        avoid rewriting every handler in this PR, this helper converts
+        at the @tool boundary:
+
+          - ``success: False`` (or an ``error`` key without success) →
+            ``ToolResult.failed(error)`` carrying the original dict
+            under ``data`` so downstream callers can still inspect it.
+          - otherwise → ``ToolResult.ok(confirmation, data=dict)``.
+
+        PARTIAL surfaces remain on the methods themselves where the
+        domain semantics warrant them (see ``propose_improvement`` for
+        rejected-but-stored proposals).
+        """
+        if not isinstance(legacy, dict):
+            return ToolResult.ok(
+                confirmation=ok_confirmation,
+                data={"raw": legacy},
+            )
+        if legacy.get("success") is False or (
+            "error" in legacy and "success" not in legacy
+        ):
+            err = legacy.get("error") or "tool reported failure without an error message"
+            return ToolResult.failed(err, data=legacy)
+        return ToolResult.ok(confirmation=ok_confirmation, data=legacy)
 
     async def initialize(self):
         """Initialize the reflection feature."""
@@ -289,7 +326,7 @@ class ReflectionFeature(Feature):
         self,
         scope: str = "all",
         depth: str = "normal",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Perform layered self-reflection.
 
@@ -332,7 +369,7 @@ class ReflectionFeature(Feature):
                     result.stopped_at_layer = ReflectionLayer.ARMS
                     result.completed_at = datetime.utcnow()
                     result.actions = self._prioritizer.prioritize(result.arms, None, None)
-                    return self._format_result(result)
+                    return self._reflect_to_tool_result(result)
 
             # Layer 2: Memory - Can I access what I know?
             logger.info("Reflection Layer 2: Memory (knowledge checks)")
@@ -351,7 +388,7 @@ class ReflectionFeature(Feature):
                     result.stopped_at_layer = ReflectionLayer.MEMORY
                     result.completed_at = datetime.utcnow()
                     result.actions = self._prioritizer.prioritize(result.arms, result.memory, None)
-                    return self._format_result(result)
+                    return self._reflect_to_tool_result(result)
 
             # Layer 3: Mind - Is my reasoning producing good outputs?
             logger.info(f"Reflection Layer 3: Mind (cognitive checks, depth={depth})")
@@ -372,14 +409,14 @@ class ReflectionFeature(Feature):
             # Persist session and insights
             await self._persist_reflection(result)
 
-            return self._format_result(result)
+            return self._reflect_to_tool_result(result)
 
         except Exception as e:
             logger.error(f"Reflection failed: {e}")
             result.error = str(e)
             result.completed_at = datetime.utcnow()
             await self._persist_reflection(result)
-            return self._format_result(result)
+            return self._reflect_to_tool_result(result)
 
     async def _persist_reflection(self, result: ReflectionResult) -> None:
         """Store reflection session and insights to the database."""
@@ -424,6 +461,62 @@ class ReflectionFeature(Feature):
         """Format ReflectionResult for API response."""
         return ReflectionResultFormatter.format_reflection_result(result)
 
+    def _reflect_to_tool_result(self, result: ReflectionResult) -> ToolResult:
+        """Convert a ReflectionResult into a ToolResult envelope.
+
+        Honesty surfaces:
+          - error path → ERROR
+          - stopped_at_layer is set (critical failure halted reflection
+            before all layers completed) → PARTIAL with the layer name
+            in the caveat so the agent must speak "reflection stopped
+            early at <layer>" instead of narrating a clean success.
+          - critical findings in completed layers → PARTIAL with the
+            count so the agent can't narrate "everything's fine" while
+            the action list contains CRITICAL items.
+        """
+        legacy = self._format_result(result)
+        summary = legacy.get("summary") or {}
+        critical = summary.get("critical_failures", 0) or 0
+
+        if result.error:
+            return ToolResult.failed(result.error, data=legacy)
+
+        if result.stopped_at_layer is not None:
+            layer_name = getattr(result.stopped_at_layer, "value", str(result.stopped_at_layer))
+            return ToolResult.partial(
+                confirmation=(
+                    f"Reflection ran but stopped early at layer {layer_name!s}"
+                ),
+                error=(
+                    f"a CRITICAL failure in the {layer_name!s} layer halted "
+                    "reflection before later layers ran; the action list is "
+                    "based on a partial picture. Address the critical failure "
+                    "first, then re-run."
+                ),
+                data=legacy,
+            )
+
+        if critical > 0:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Reflection completed (passed={summary.get('total_passed', 0)}, "
+                    f"failed={summary.get('total_failed', 0)})"
+                ),
+                error=(
+                    f"{critical} layer(s) reported CRITICAL findings; "
+                    "see action list for prioritized fixes"
+                ),
+                data=legacy,
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Reflection completed (layers={summary.get('layers_completed', 0)}, "
+                f"actions={summary.get('action_count', 0)})"
+            ),
+            data=legacy,
+        )
+
     @tool(
         name="get_insights",
         description="Get past insights from reflection sessions",
@@ -435,7 +528,7 @@ class ReflectionFeature(Feature):
         type_filter: str = None,
         min_confidence: float = 0.5,
         limit: int = 20,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Get past insights from reflection sessions.
 
@@ -443,12 +536,9 @@ class ReflectionFeature(Feature):
             type_filter: Filter by insight type ('pattern', 'improvement', 'success', 'failure', 'anomaly')
             min_confidence: Minimum confidence threshold (0.0 - 1.0)
             limit: Maximum number of insights to return
-
-        Returns:
-            List of insights matching the criteria
         """
         if not self._db_helper:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             insights = await self._db_helper.get_insights(
@@ -456,11 +546,16 @@ class ReflectionFeature(Feature):
                 min_confidence=min_confidence,
                 limit=limit,
             )
-            return ReflectionResultFormatter.format_insights_response(insights)
-
         except Exception as e:
             logger.error(f"Failed to get insights: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        legacy = ReflectionResultFormatter.format_insights_response(insights)
+        count = legacy.get("count", len(insights) if isinstance(insights, list) else 0)
+        return ToolResult.ok(
+            confirmation=f"Found {count} insight(s)",
+            data=legacy,
+        )
 
     @tool(
         name="propose_improvement",
@@ -474,7 +569,7 @@ class ReflectionFeature(Feature):
         description: str,
         change_type: str,
         proposed_change: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Propose a self-improvement.
 
@@ -485,21 +580,16 @@ class ReflectionFeature(Feature):
             description: Detailed description of why this improvement is needed
             change_type: Type of change ('prompt', 'behavior', 'tool_usage', 'response_style')
             proposed_change: The specific change to make
-
-        Returns:
-            Proposal details including approval status
         """
-        # Validate change type
         try:
             ct = ChangeType(change_type)
         except ValueError:
             valid = [c.value for c in ChangeType]
-            return {
-                "success": False,
-                "error": f"Invalid change_type. Valid options: {valid}",
-            }
+            return ToolResult.failed(
+                f"Invalid change_type. Valid options: {valid}",
+                data={"change_type": change_type},
+            )
 
-        # Create proposal
         proposal = ImprovementProposal(
             id=str(uuid.uuid4()),
             insight_id=None,  # Manual proposal
@@ -509,21 +599,18 @@ class ReflectionFeature(Feature):
             proposed_change=proposed_change,
         )
 
-        # Store proposal using database helper
         if self._db_helper:
             await self._db_helper.store_proposal(proposal)
 
-        # Request approval
         approved = await self._approval_handler.request_approval(proposal)
 
         if approved:
-            # Apply the improvement
             await self._approval_handler.apply_improvement(proposal)
             proposal.applied_at = datetime.utcnow()
             if self._db_helper:
                 await self._db_helper.update_proposal(proposal)
 
-        return {
+        data = {
             "success": True,
             "proposal_id": proposal.id,
             "requires_approval": proposal.requires_approval,
@@ -531,6 +618,32 @@ class ReflectionFeature(Feature):
             "rejection_reason": proposal.rejection_reason,
             "applied": proposal.is_applied,
         }
+
+        # Honesty: a proposal that was REJECTED by constitutional review
+        # is recorded but not applied. The legacy code returned
+        # ``"success": True`` for the *recording* — but from the agent's
+        # standpoint, the improvement did NOT take effect. Surface as
+        # PARTIAL so the LLM cannot narrate "self-improvement applied"
+        # for a proposal the constitution rejected.
+        if proposal.requires_approval and not proposal.approved:
+            return ToolResult.partial(
+                confirmation=(
+                    f"Proposal {proposal.id[:8]} stored (title={title!r})"
+                ),
+                error=(
+                    "constitutional review rejected the proposal; the "
+                    "change was not applied. Reason: "
+                    f"{proposal.rejection_reason or 'not provided'}"
+                ),
+                data=data,
+            )
+        return ToolResult.ok(
+            confirmation=(
+                f"Proposal {proposal.id[:8]}: "
+                + ("approved + applied" if proposal.is_applied else "stored")
+            ),
+            data=data,
+        )
 
     @tool(
         name="get_behavior_rules",
@@ -540,26 +653,28 @@ class ReflectionFeature(Feature):
     async def get_behavior_rules(
         self,
         active_only: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Get behavior rules that modify agent behavior.
 
         Args:
             active_only: Only return active rules (default: True)
-
-        Returns:
-            List of behavior rules
         """
         if not self._db_helper:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed("Database not available")
 
         try:
             rules = await self._db_helper.get_behavior_rules(active_only=active_only)
-            return ReflectionResultFormatter.format_behavior_rules_response(rules)
-
         except Exception as e:
             logger.error(f"Failed to get behavior rules: {e}")
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(str(e))
+
+        legacy = ReflectionResultFormatter.format_behavior_rules_response(rules)
+        count = legacy.get("count", len(rules) if isinstance(rules, list) else 0)
+        return ToolResult.ok(
+            confirmation=f"Found {count} behavior rule(s)",
+            data=legacy,
+        )
 
     # =========================================================================
     # GitHub Ticket Creation Tools
@@ -574,7 +689,7 @@ class ReflectionFeature(Feature):
     async def create_improvement_ticket(
         self,
         insight_id: str,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Create a GitHub issue from an actionable insight.
 
@@ -585,17 +700,22 @@ class ReflectionFeature(Feature):
 
         Args:
             insight_id: ID of the insight to create a ticket for
-
-        Returns:
-            Result including GitHub issue URL if created
         """
         if not self._ticket_handler:
-            return {
-                "success": False,
-                "error": "Ticket handler not available - check configuration",
-            }
+            return ToolResult.failed(
+                "Ticket handler not available - check configuration",
+            )
 
-        return await self._ticket_handler.create_improvement_ticket(insight_id)
+        legacy = await self._ticket_handler.create_improvement_ticket(insight_id)
+        url = (legacy or {}).get("issue_url") if isinstance(legacy, dict) else None
+        return self._to_tool_result(
+            legacy or {},
+            ok_confirmation=(
+                f"Created improvement ticket"
+                + (f" at {url}" if url else "")
+                + (f" (insight={insight_id})")
+            ),
+        )
 
     # =========================================================================
     # Self-Model Management Tools
@@ -607,7 +727,7 @@ class ReflectionFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!self-model"
     )
-    async def get_self_model(self) -> Dict[str, Any]:
+    async def get_self_model(self) -> ToolResult:
         """
         Get the agent's current self-model.
 
@@ -616,17 +736,17 @@ class ReflectionFeature(Feature):
         - Communication style preferences
         - Learned user preferences
         - Behavior patterns (successes and failures)
-
-        Returns:
-            Current self-model data
         """
         if not self._self_model_handler:
-            return {
-                "success": False,
-                "error": "Self-model handler not available - check configuration",
-            }
+            return ToolResult.failed(
+                "Self-model handler not available - check configuration",
+            )
 
-        return await self._self_model_handler.get_self_model()
+        legacy = await self._self_model_handler.get_self_model()
+        return self._to_tool_result(
+            legacy or {},
+            ok_confirmation="Retrieved self-model",
+        )
 
     @tool(
         name="update_self_model",
@@ -637,7 +757,7 @@ class ReflectionFeature(Feature):
     async def update_self_model(
         self,
         from_session_id: str = None,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Update the self-model based on recent insights.
 
@@ -648,17 +768,17 @@ class ReflectionFeature(Feature):
 
         Args:
             from_session_id: Optional session ID to get insights from (default: most recent)
-
-        Returns:
-            Update result including new model version
         """
         if not self._self_model_handler:
-            return {
-                "success": False,
-                "error": "Self-model handler not available - check configuration",
-            }
+            return ToolResult.failed(
+                "Self-model handler not available - check configuration",
+            )
 
-        return await self._self_model_handler.update_self_model(from_session_id)
+        legacy = await self._self_model_handler.update_self_model(from_session_id)
+        return self._to_tool_result(
+            legacy or {},
+            ok_confirmation="Self-model updated",
+        )
 
     # =========================================================================
     # Sleep Integration
@@ -668,10 +788,14 @@ class ReflectionFeature(Feature):
         """
         Called before memory consolidation during sleep.
 
-        Performs a shallow reflection on the current session.
+        Performs a shallow reflection on the current session. The
+        return shape is the legacy reflection-result dict (not a
+        ToolResult); sleep-cycle hooks predate the @tool envelope and
+        consume the formatted dict directly.
         """
         logger.info("Running pre-sleep reflection")
-        return await self.reflect(scope="session", depth="shallow")
+        envelope = await self.reflect(scope="session", depth="shallow")
+        return envelope.data if envelope.data is not None else {"success": False, "error": envelope.error or ""}
 
     async def on_post_consolidation(
         self,
@@ -680,13 +804,15 @@ class ReflectionFeature(Feature):
         """
         Called after memory consolidation during sleep.
 
-        Performs deeper reflection using consolidated episodes.
+        Performs deeper reflection using consolidated episodes. Returns
+        the legacy reflection-result dict (see on_pre_sleep note).
         """
         episodes_created = consolidation_result.get("episodes_created", 0)
 
         if episodes_created > 0:
             logger.info(f"Running post-consolidation reflection ({episodes_created} new episodes)")
-            return await self.reflect(scope="today", depth="normal")
+            envelope = await self.reflect(scope="today", depth="normal")
+            return envelope.data if envelope.data is not None else {"success": False, "error": envelope.error or ""}
 
         return {"success": True, "skipped": True, "reason": "No new episodes"}
 
@@ -705,7 +831,7 @@ class ReflectionFeature(Feature):
         iterations: int = 3,
         depth: str = "normal",
         create_tickets: bool = False,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Run intensive training cycle for rapid self-improvement.
 
@@ -713,14 +839,16 @@ class ReflectionFeature(Feature):
             iterations: Number of reflection cycles (default: 3)
             depth: Analysis depth ('quick', 'normal', 'deep')
             create_tickets: Whether to create GitHub issues for action items
-
-        Returns:
-            Training cycle results with health trend
         """
-        return await self._training_manager.run_training_cycle(
+        legacy = await self._training_manager.run_training_cycle(
             iterations=iterations,
             depth=depth,
             create_tickets=create_tickets,
+        )
+        ran = (legacy or {}).get("iterations_completed", iterations) if isinstance(legacy, dict) else iterations
+        return self._to_tool_result(
+            legacy or {},
+            ok_confirmation=f"Training cycle completed ({ran}/{iterations} iterations)",
         )
 
     # =========================================================================

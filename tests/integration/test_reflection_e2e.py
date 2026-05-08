@@ -17,6 +17,7 @@ import os
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.reflection import (
     ReflectionFeature,
     InteractionAnalyzer,
@@ -220,11 +221,13 @@ async def test_reflect_runs_layered_checks():
 
     result = await feature.reflect(scope="today", depth="normal")
 
-    assert result["success"] is True
-    assert "summary" in result
-    assert result["summary"]["layers_completed"] >= 1
-    # Should have layer results
-    assert "arms" in result or "memory" in result or "mind" in result
+    # reflect() now returns a ToolResult envelope (#1061 wave 9). OK
+    # or PARTIAL both indicate the reflection ran; only ERROR means it
+    # failed outright. The legacy dict shape lives under .data.
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert "summary" in result.data
+    assert result.data["summary"]["layers_completed"] >= 1
+    assert "arms" in result.data or "memory" in result.data or "mind" in result.data
 
 
 @pytest.mark.asyncio
@@ -242,9 +245,9 @@ async def test_reflect_returns_summary_stats():
 
     result = await feature.reflect(scope="today", depth="normal")
 
-    # Check summary structure
-    assert "summary" in result
-    summary = result["summary"]
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert "summary" in result.data
+    summary = result.data["summary"]
     assert "layers_completed" in summary
     assert "total_passed" in summary
     assert "total_failed" in summary
@@ -268,10 +271,9 @@ async def test_reflect_legacy_generates_insights():
 
     result = await feature.reflect(scope="today", depth="normal")
 
-    # reflect() returns a dict with reflection results
-    assert isinstance(result, dict)
-    assert "id" in result  # Reflection session ID
-    assert "arms" in result  # Layer results
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert "id" in result.data  # Reflection session ID
+    assert "arms" in result.data  # Layer results
 
 
 @pytest.mark.asyncio
@@ -289,9 +291,8 @@ async def test_reflect_legacy_stores_insights_in_db():
 
     result = await feature.reflect(scope="today", depth="normal")
 
-    # Check that reflection ran successfully
-    assert isinstance(result, dict)
-    assert "id" in result  # Reflection session ID
+    assert result.status in (ToolResultStatus.OK, ToolResultStatus.PARTIAL)
+    assert "id" in result.data  # Reflection session ID
 
 
 @pytest.mark.asyncio
@@ -304,8 +305,8 @@ async def test_get_insights_retrieves_from_db():
 
     result = await feature.get_insights(min_confidence=0.5, limit=10)
 
-    assert result["success"] is True
-    assert result["count"] >= 0
+    assert result.status is ToolResultStatus.OK
+    assert result.data["count"] >= 0
 
 
 @pytest.mark.asyncio
@@ -331,10 +332,13 @@ async def test_propose_improvement_requires_approval():
         proposed_change="Limit responses to 3 sentences when possible",
     )
 
-    assert result["success"] is True
-    assert result["requires_approval"] is True
-    assert result["approved"] is False
-    assert "rejection_reason" in result
+    # A rejected-but-stored proposal is now PARTIAL (the recording
+    # succeeded; the change did NOT take effect — agent must speak the
+    # rejection rather than narrate "self-improvement applied").
+    assert result.status is ToolResultStatus.PARTIAL
+    assert result.data["requires_approval"] is True
+    assert result.data["approved"] is False
+    assert "rejection_reason" in result.data
 
 
 @pytest.mark.asyncio
@@ -360,9 +364,9 @@ async def test_propose_improvement_applies_when_approved():
         proposed_change="Limit responses to 3 sentences when possible",
     )
 
-    assert result["success"] is True
-    assert result["approved"] is True
-    assert result["applied"] is True
+    assert result.status is ToolResultStatus.OK
+    assert result.data["approved"] is True
+    assert result.data["applied"] is True
 
     # Check that behavior rule was stored
     assert len(agent._db.rules) == 1
@@ -383,8 +387,8 @@ async def test_invalid_change_type_rejected():
         proposed_change="Test",
     )
 
-    assert result["success"] is False
-    assert "Invalid change_type" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "Invalid change_type" in result.error
 
 
 # ============================================================================
@@ -795,8 +799,8 @@ async def test_create_improvement_ticket_without_ticket_creator():
 
     result = await feature.create_improvement_ticket(insight_id="test-insight")
 
-    assert result["success"] is False
-    assert "Ticket" in result["error"] and "not available" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "Ticket" in result.error and "not available" in result.error
 
 
 @pytest.mark.asyncio
@@ -811,8 +815,8 @@ async def test_get_self_model_without_manager():
 
     result = await feature.get_self_model()
 
-    assert result["success"] is False
-    assert "Self-model" in result["error"] and "not available" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "Self-model" in result.error and "not available" in result.error
 
 
 @pytest.mark.asyncio
@@ -827,8 +831,8 @@ async def test_update_self_model_without_manager():
 
     result = await feature.update_self_model()
 
-    assert result["success"] is False
-    assert "Self-model" in result["error"] and "not available" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "Self-model" in result.error and "not available" in result.error
 
 
 @pytest.mark.asyncio
@@ -860,8 +864,8 @@ async def test_create_improvement_ticket_economic_gate():
 
     result = await feature.create_improvement_ticket(insight_id="test-insight")
 
-    assert result["success"] is False
-    assert "requires paid tier or revenue share" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "requires paid tier or revenue share" in result.error
 
 
 @pytest.mark.asyncio
@@ -892,8 +896,8 @@ async def test_update_self_model_economic_gate():
 
     result = await feature.update_self_model()
 
-    assert result["success"] is False
-    assert "require paid tier" in result["error"]
+    assert result.status is ToolResultStatus.ERROR
+    assert "require paid tier" in result.error
 
 
 if __name__ == "__main__":
