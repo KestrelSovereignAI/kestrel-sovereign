@@ -71,6 +71,7 @@ MIGRATED_FEATURE_MODULES: frozenset[str] = frozenset({
     "kestrel_sovereign.features.talon.coordinator",
     "kestrel_sovereign.features.peers.feature",
     "kestrel_sovereign.features.audit_anchor.feature",
+    "kestrel_sovereign.features.consent.feature",
 })
 
 
