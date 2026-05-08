@@ -836,6 +836,14 @@ class MemoryAgencyFeature(Feature):
                 data={"unpinned": 0, "requested": count_val},
             )
 
+        # Honesty: separate pin-release from metadata clear so a write
+        # failure on the memory_pins UPDATE doesn't get reported as a
+        # successful release. If the pin record can't be marked
+        # released_at, the pin is still active — it must NOT count
+        # toward `unpinned` or the caller will free quota that wasn't
+        # actually freed.
+        released_count = 0
+        release_failures: List[Dict[str, Any]] = []
         metadata_failures: List[Dict[str, Any]] = []
         for pin_id, message_id in oldest_pins:
             try:
@@ -843,6 +851,14 @@ class MemoryAgencyFeature(Feature):
                     "UPDATE memory_pins SET released_at = ? WHERE id = ?",
                     (now, pin_id),
                 )
+            except Exception as e:
+                release_failures.append(
+                    {"pin_id": pin_id, "message_id": message_id, "error": str(e)}
+                )
+                continue
+            released_count += 1
+
+            try:
                 row = await db.fetchone(
                     "SELECT id, metadata FROM conversation_history WHERE id = ?",
                     (message_id,),
@@ -858,7 +874,7 @@ class MemoryAgencyFeature(Feature):
             except Exception as e:
                 metadata_failures.append({"message_id": message_id, "error": str(e)})
 
-        released = len(oldest_pins)
+        released = released_count
         logger.info(
             "Admin unpin-oldest: removed %d oldest pins for agent %s",
             released,
@@ -871,13 +887,19 @@ class MemoryAgencyFeature(Feature):
             "shortfall": max(0, count_val - released),
         }
 
-        # Honesty: composite signals
         partial_errs: List[str] = []
         if released < count_val:
             partial_errs.append(
                 f"requested {count_val} pin(s) released but only "
                 f"{released} were active; {count_val - released} fewer "
                 "than requested"
+            )
+        if release_failures:
+            data["release_failures"] = release_failures
+            partial_errs.append(
+                f"{len(release_failures)} pin(s) could not be released "
+                "(memory_pins UPDATE failed); those pins are still "
+                "active and continue to occupy quota"
             )
         if metadata_failures:
             data["metadata_failures"] = metadata_failures
