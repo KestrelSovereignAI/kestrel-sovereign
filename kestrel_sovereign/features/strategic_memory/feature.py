@@ -19,7 +19,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 
-from .backlog_hygiene import run_backlog_hygiene
+from .backlog_hygiene import is_auto_fix, run_backlog_hygiene
 from .morning_signal import generate_morning_signal
 from .session_log import collect_session_log
 from .talon_handoff import dispatch_to_talon, pick_top_issue
@@ -401,13 +401,29 @@ class StrategicMemoryFeature(Feature):
                 )
             return ToolResult.ok(confirmation=body, data=data)
 
-        # Fallback: direct mesh dispatch via talon_handoff
+        # Fallback: direct mesh dispatch via talon_handoff. The helper
+        # returns markdown text whose first token signals the outcome:
+        # "Dispatched to ..." (success), "Failed to dispatch ..." (mesh
+        # error), or "Found issue to dispatch ... but no multi_agent
+        # host URL configured." (config gap). Wrapping all of these as
+        # OK would let the LLM narrate "dispatched" off a body that
+        # said "Failed". Detect the failure prefixes and surface PARTIAL.
         dispatch_result = await dispatch_to_talon(self._data)
         body = f"## Signal Dispatch\n{dispatch_result}"
-        return ToolResult.ok(
-            confirmation=body,
-            data={"mode": "execute", "fallback": True, "dispatch_result": dispatch_result},
-        )
+        data = {"mode": "execute", "fallback": True, "dispatch_result": dispatch_result}
+
+        failure_prefixes = ("Failed to dispatch", "Found issue to dispatch")
+        if any(dispatch_result.startswith(p) for p in failure_prefixes):
+            return ToolResult.partial(
+                confirmation=body,
+                error=(
+                    f"fallback dispatch did not place the issue with talon: "
+                    f"{dispatch_result}"
+                ),
+                data=data,
+            )
+
+        return ToolResult.ok(confirmation=body, data=data)
 
     def _get_talon_coordinator(self):
         """Get TalonCoordinatorFeature if loaded."""
@@ -430,17 +446,21 @@ class StrategicMemoryFeature(Feature):
             fix: Set to 'yes' to auto-fix issues where possible (add labels). Default 'no' (report only).
         """
         report = await run_backlog_hygiene(self._data, fix=fix)
-        # Honesty: dry-run mode (fix=='no') reports issues but does not
-        # change anything. Surface as PARTIAL so the agent must speak
-        # that the report is read-only — narrating "fixed N issues" off
-        # a fix='no' run would be a lie. Same pattern as model
-        # cleanup_models(dry_run=True) in PR #1098.
-        if fix.lower() != "yes":
+        # Honesty: dry-run mode (anything but the runner's truthy
+        # predicate) reports issues but does not change anything.
+        # Surface as PARTIAL so the agent must speak that the report
+        # is read-only — narrating "fixed N issues" off a dry run
+        # would be a lie. Same pattern as model.cleanup_models(dry_run)
+        # in PR #1098. Use the shared `is_auto_fix` predicate so this
+        # wrapper agrees with the runner on what counts as auto-fix
+        # (yes / true / 1, case-insensitive).
+        if not is_auto_fix(fix):
             return ToolResult.partial(
                 confirmation=report,
                 error=(
                     f"fix={fix!r}: this is a report-only scan, no changes "
-                    "were made. Re-run with fix='yes' to apply auto-fixes."
+                    "were made. Re-run with fix='yes' (or 'true' / '1') "
+                    "to apply auto-fixes."
                 ),
                 data={"fix": fix, "report": report, "applied": False},
             )
