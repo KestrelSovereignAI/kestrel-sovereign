@@ -200,3 +200,28 @@ def test_create_agent_respects_explicit_port(tmp_path):
             port=9999,
         )
     assert result.port == 9999
+
+
+# --- #1109: malformed [emancipation] block aborts before inception -----------
+
+def test_invalid_emancipation_block_blocks_run_without_inception(tmp_path):
+    """A malformed [emancipation] block must surface as a wizard
+    blocker AND prevent inception — never raise an unhandled exception
+    that crashes the wizard."""
+    (tmp_path / "kestrel.toml").write_text(
+        # enabled=true but no terms — parse_emancipation_block raises
+        '[emancipation]\nenabled = true\n',
+        encoding="utf-8",
+    )
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async"
+    ) as mock_inc:
+        agent.run(ctx)
+        mock_inc.assert_not_called()
+
+    assert any("[emancipation]" in b and "invalid" in b for b in ctx.blockers)
+    # Wizard returned cleanly — no traceback escaped.
+    assert not (tmp_path / "agent_data").exists() or not list(
+        (tmp_path / "agent_data").iterdir()
+    )

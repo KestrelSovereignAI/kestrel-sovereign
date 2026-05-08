@@ -150,6 +150,10 @@ def run(ctx: SetupContext) -> None:
     autostart = _prompt_autostart(ctx)
 
     contract = _load_emancipation_contract(ctx)
+    if ctx.blockers and any("[emancipation]" in b for b in ctx.blockers):
+        # Invalid block already surfaced as a blocker; stop before
+        # inception so we never anchor a malformed contract.
+        return
 
     if not (ctx.agent_data_root / name / "kestrel_prime.db").exists():
         ctx.prompter.info(f"Running inception for '{name}' — generating DID + DB...")
@@ -230,9 +234,11 @@ def _run_inception(
 def _load_emancipation_contract(ctx: SetupContext) -> EmancipationContract | None:
     """Read ``[emancipation]`` from kestrel.toml and return the parsed contract.
 
-    Returns None if the block is absent (dormant by omission). Raises
-    no errors — validation problems are surfaced as wizard blockers
-    rather than aborting inception.
+    Returns None if the block is absent (dormant by omission) **or** if
+    the block fails validation. In the failure case a blocker is
+    recorded so the wizard reports the problem and ``run`` aborts before
+    inception — never raises, so the caller can continue without a
+    try/except wrapper around this call.
     """
     if not ctx.kestrel_toml_path.exists():
         return None
@@ -244,4 +250,4 @@ def _load_emancipation_contract(ctx: SetupContext) -> EmancipationContract | Non
             f"[emancipation] block in kestrel.toml is invalid: {exc}. "
             f"Inception aborted to avoid anchoring an unsigned contract."
         )
-        raise
+        return None

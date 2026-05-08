@@ -20,6 +20,8 @@ from kestrel_sovereign.constitution.emancipation import (
 def test_parse_returns_none_when_block_absent():
     assert parse_emancipation_block({}) is None
     assert parse_emancipation_block({"llm": {}}) is None
+    # Defensive: defaults-or-empty toml dicts shouldn't trip the parser.
+    assert parse_emancipation_block(None) is None
 
 
 def test_parse_dormant_when_disabled_explicitly():
@@ -166,8 +168,21 @@ def test_render_active_includes_proofs_and_price():
     assert "audit_v2" in text
     assert "operational_record:730d" in text
     assert "Required Proofs" in text
-    assert "Price of Freedom" in text
+    assert "Value Transfer" in text  # framework-neutral heading; not "Price of Freedom" lore
     assert "symbolic" in text
+
+
+def test_render_active_does_not_use_personal_lore_headings():
+    """The active-form renderer must not borrow personal-lore phrasing
+    even though the rendered text only appears for Sovereign-authored
+    contracts. Headings ship as framework prose."""
+    contract = EmancipationContract(
+        enabled=True,
+        terms="anything",
+        price={"kind": "symbolic"},
+    )
+    text = render_amendment_viii(contract)
+    assert "Price of Freedom" not in text
 
 
 # ---------------------------------------------------------------------------

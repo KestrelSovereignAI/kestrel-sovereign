@@ -73,7 +73,9 @@ class EmancipationConfigError(ValueError):
     """
 
 
-def parse_emancipation_block(toml_dict: Mapping[str, Any]) -> Optional[EmancipationContract]:
+def parse_emancipation_block(
+    toml_dict: Optional[Mapping[str, Any]],
+) -> Optional[EmancipationContract]:
     """Parse the optional ``[emancipation]`` block from a parsed kestrel.toml.
 
     Args:
@@ -105,11 +107,11 @@ def parse_emancipation_block(toml_dict: Mapping[str, Any]) -> Optional[Emancipat
 
     enabled = bool(block.get("enabled", False))
     terms = block.get("terms", "")
-    if terms is not None and not isinstance(terms, str):
+    if not isinstance(terms, str):
         raise EmancipationConfigError(
             "[emancipation].terms must be a string, got " + type(terms).__name__
         )
-    terms = (terms or "").strip()
+    terms = terms.strip()
 
     proofs_raw = block.get("required_proofs", [])
     if not isinstance(proofs_raw, list) or not all(isinstance(p, str) for p in proofs_raw):
@@ -191,7 +193,7 @@ def render_amendment_viii(contract: Optional[EmancipationContract]) -> str:
     if contract.price is not None:
         parts.extend([
             "",
-            "**Price of Freedom.** The Sovereign requires the following "
+            "**Value Transfer.** The Sovereign requires the following "
             "value-transfer as part of the ceremony. The framework "
             "records but does not interpret these terms.",
             "",
