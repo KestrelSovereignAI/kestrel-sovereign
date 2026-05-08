@@ -4,7 +4,7 @@ State of Mind Feature
 Provides the !state-of-mind command to inspect constitutional governance mode.
 """
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
@@ -66,7 +66,20 @@ class StateOfMindFeature(Feature):
             logger.error(f"Failed to get state of mind: {e}")
             return ToolResult.failed(f"Error retrieving state of mind: {str(e)}")
 
+        # The LLM service may return a StateOfMind dataclass; ToolResult.data
+        # ends up in json.dumps via _serialize_tool_result, so coerce to a
+        # plain dict-or-string here. dataclasses.asdict handles the
+        # canonical case; fall back to vars() / str() when it isn't a
+        # dataclass instance.
+        import dataclasses
+        if dataclasses.is_dataclass(state) and not isinstance(state, type):
+            state_serialized: Any = dataclasses.asdict(state)
+        elif isinstance(state, dict):
+            state_serialized = state
+        else:
+            state_serialized = {"raw": str(state)}
+
         return ToolResult.ok(
             confirmation=formatted,
-            data={"state": state if isinstance(state, dict) else {"raw": state}},
+            data={"state": state_serialized},
         )

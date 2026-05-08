@@ -166,8 +166,24 @@ class DeployFeature(Feature):
         msg = payload.get("message")
         if isinstance(msg, str) and msg:
             return msg
-        # Health check often returns {"healthy": bool, ...} with no message.
+        # Health check returns the provider result under payload["health"]
+        # for deployed services, OR a top-level {"healthy": ...} for
+        # standalone results. Check both. Codex round 4: the nested
+        # case was being missed, so deployed-but-unhealthy was silently
+        # rendering "deploy health ok".
         if action in {"health", "check"}:
+            health_block = payload.get("health")
+            if isinstance(health_block, dict):
+                if health_block.get("healthy") is True:
+                    return "Service is healthy"
+                if health_block.get("healthy") is False:
+                    reason = (
+                        health_block.get("reason")
+                        or health_block.get("error")
+                        or payload.get("reason")
+                        or "no detail"
+                    )
+                    return f"Service is unhealthy: {reason}"
             healthy = payload.get("healthy")
             if healthy is True:
                 return "Service is healthy"
