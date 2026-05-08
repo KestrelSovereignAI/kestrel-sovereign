@@ -263,7 +263,12 @@ def _start_subprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) -
         # Host is NOT an agent — no DB path, no KESTREL_SERVE_UI
 
         log_file = _host_log_file(project_dir)
-        cmd = [sys.executable, "-m", "uvicorn", "host:app",
+        # Use the fully-qualified package path. Pre-move this said
+        # ``host:app``, which only resolved when CWD happened to contain
+        # ``host.py`` — i.e. only on source clones. Pip-installed users
+        # got ``ModuleNotFoundError: No module named 'host'`` on the
+        # legacy ``--subprocess`` path. Same fix shape as #1097.
+        cmd = [sys.executable, "-m", "uvicorn", "kestrel_sovereign.host:app",
                "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
 
         print(f"   Starting host on :{multi_agent.host.port}...", end="", flush=True)

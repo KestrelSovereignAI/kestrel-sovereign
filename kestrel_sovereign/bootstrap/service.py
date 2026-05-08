@@ -293,15 +293,19 @@ And how do you like to work together - quick and direct, or more room to think t
         for msg in history:
             messages.append(msg)
 
-        # Get LLM response
-        try:
-            response = await self.llm_service.generate_with_messages(
-                messages=messages,
-            )
-            assistant_message = response.content if hasattr(response, 'content') else str(response)
-        except Exception as e:
-            logger.error(f"LLM error during discovery: {e}")
-            assistant_message = "I'm having trouble thinking right now. Can you tell me a bit more about yourself?"
+        # Get LLM response. Pre-fix this swallowed any LLM error and
+        # returned a hardcoded "I'm having trouble thinking right now…"
+        # string. That landed verbatim in OpenAI-compat clients (Open
+        # WebUI hitting /v1/chat/completions) and was indistinguishable
+        # from a real model response, hiding the actual problem from
+        # both the user and ``_handle_bootstrap``. Now we propagate so
+        # the caller can decide between retrying discovery or falling
+        # through to the agent's normal LLM path. See
+        # ``KestrelAgent._handle_bootstrap``.
+        response = await self.llm_service.generate_with_messages(
+            messages=messages,
+        )
+        assistant_message = response.content if hasattr(response, 'content') else str(response)
 
         # Add assistant response to history
         history.append({"role": "assistant", "content": assistant_message})

@@ -272,11 +272,20 @@ class TestBootstrapErrorHandling:
     """Test error handling in bootstrap flow."""
 
     @pytest.mark.asyncio
-    async def test_llm_error_during_discovery(self, temp_dir, mock_db):
-        """Discovery should handle LLM errors gracefully."""
+    async def test_llm_error_during_discovery_propagates(self, temp_dir, mock_db):
+        """Discovery now PROPAGATES LLM errors instead of swallowing them.
+
+        Pre-fix the service caught the exception and returned a hardcoded
+        fallback string ("I'm having trouble thinking right now…") that
+        Open WebUI displayed verbatim through ``/v1/chat/completions``,
+        making transient LLM errors look like real model output. The
+        new contract: raise so ``KestrelAgent._handle_bootstrap`` can
+        decide between retry and falling through to the agent's normal
+        LLM path.
+        """
 
         class FailingLLM:
-            async def generate(self, messages, temperature=None):
+            async def generate_with_messages(self, messages, **kwargs):
                 raise Exception("LLM unavailable")
 
         agent_dir = temp_dir / "agent_data" / "error_test"
@@ -292,10 +301,8 @@ class TestBootstrapErrorHandling:
 
         await service.set_bootstrap_state(BootstrapState.DISCOVERY)
 
-        # Should return a fallback response, not crash
-        response, complete, avatar = await service.process_discovery_message("Test message")
-        assert response is not None
-        assert "trouble" in response.lower() or "more about yourself" in response.lower()
+        with pytest.raises(Exception, match="LLM unavailable"):
+            await service.process_discovery_message("Test message")
 
     @pytest.mark.asyncio
     async def test_missing_agent_data_path(self, mock_db):
