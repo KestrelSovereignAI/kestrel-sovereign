@@ -37,6 +37,13 @@ from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
 
+# Bounded batch size for retention sweep deletes — well under both
+# SQLite's SQLITE_MAX_VARIABLE_NUMBER (≥999, modern default 32766) and
+# Postgres' 65535 bind-parameter cap. 500 also keeps the per-batch
+# transaction small enough that a long-running sweep stays
+# preemptable.
+_PURGE_BATCH_SIZE = 500
+
 
 class WorkflowStore(UnifiedStoreBase):
     """Backend-agnostic persistence for workflow definitions, runs, and
@@ -367,9 +374,19 @@ class WorkflowStore(UnifiedStoreBase):
         if not expired:
             return 0
 
-        placeholders = ", ".join("?" * len(expired))
-        return await self._backend.execute(
-            f"DELETE FROM {self.RUNS_TABLE} "
-            f"WHERE run_id IN ({placeholders})",
-            tuple(expired),
-        )
+        # Codex round-3 P2: a single unbounded ``IN (?, ?, ...)`` delete
+        # would hit SQLite's SQLITE_MAX_VARIABLE_NUMBER (≥999, often
+        # 32766 on modern builds) or Postgres' 65535 bind-parameter
+        # cap once enough runs accumulate, leaving the entire expired
+        # history unpurged. Batch in chunks well under both limits so
+        # the sweep makes forward progress on any backend.
+        purged_total = 0
+        for batch_start in range(0, len(expired), _PURGE_BATCH_SIZE):
+            batch = expired[batch_start : batch_start + _PURGE_BATCH_SIZE]
+            placeholders = ", ".join("?" * len(batch))
+            purged_total += await self._backend.execute(
+                f"DELETE FROM {self.RUNS_TABLE} "
+                f"WHERE run_id IN ({placeholders})",
+                tuple(batch),
+            )
+        return purged_total

@@ -242,6 +242,38 @@ async def test_purge_expired_runs_respects_retention_days(store: WorkflowStore):
     assert surviving == ["run-12h", "run-fresh", "run-running"]
 
 
+async def test_purge_handles_batch_size_overflow(store: WorkflowStore):
+    """Codex round-3 P2: > _PURGE_BATCH_SIZE expired runs must still
+    purge in bounded batches; a single unbounded IN(?,?,...) would
+    hit SQLite/Postgres bind-parameter caps."""
+    from kestrel_sovereign.features.workflows.store import _PURGE_BATCH_SIZE
+
+    spec = _signed_spec(retention_days=1)
+    await store.insert_definition_for_test(spec)
+
+    long_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    # Insert just over one batch worth so we exercise both batches
+    # without making the test absurdly slow.
+    n = _PURGE_BATCH_SIZE + 5
+    for i in range(n):
+        await store.backend.execute(
+            f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, "
+            f"workflow_ver, params_json, status, started_by_did, "
+            f"finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                f"run-{i:04d}", "release", 1, "{}",
+                "completed", "did:web:k.example", long_ago,
+            ),
+        )
+
+    purged = await store.purge_expired_runs()
+    assert purged == n
+    remaining = await store.backend.fetch_all(
+        f"SELECT run_id FROM {store.RUNS_TABLE}"
+    )
+    assert remaining == []
+
+
 async def test_purge_cascades_stage_links(store: WorkflowStore):
     """Codex round-1 P2: ``ON DELETE CASCADE`` on the stage_links FK
     means purging an expired run also drops its stage history rows.
