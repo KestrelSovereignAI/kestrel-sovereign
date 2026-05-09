@@ -344,6 +344,78 @@ async def test_reanchor_allows_dormant_to_active(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reanchor_backfills_legacy_active_agent_without_sidecar(tmp_path):
+    """Codex P2 (PR #1133 review): an agent incepted between #1112 (which
+    added active-form rendering at inception) and #1118 (which added the
+    JSON sidecar) has active-form bytes anchored but no
+    ``emancipation_contract`` property. On a byte-equal reanchor the
+    sidecar must be backfilled — otherwise a later reanchor with no
+    block would treat the agent as having no anchored contract and
+    could overwrite the active form with canonical dormant text."""
+    from kestrel_sovereign.storage import AsyncStorage
+
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+
+    # Surgically simulate the legacy state: drop the sidecar property
+    # while leaving the active-form bytes anchored. This is the byte-
+    # for-byte state of any agent created between #1112 and #1118.
+    async with AsyncStorage(str(db_path)) as storage:
+        agents = await storage.graph.get_nodes_by_type("agent")
+        agents[0].properties.pop("emancipation_contract", None)
+        await storage.graph.add_node(agents[0])
+
+    # Sanity: sidecar is gone, but active form is still anchored.
+    async with AsyncStorage(str(db_path)) as storage:
+        agents = await storage.graph.get_nodes_by_type("agent")
+        assert "emancipation_contract" not in agents[0].properties
+    pre = await _read_anchored_constitution_bytes(db_path)
+    assert SENTINEL_TERMS in pre.decode("utf-8")
+
+    # Reanchor with the byte-equal [emancipation] block. Hash will match;
+    # without the backfill fix, this is the buggy "unchanged" early return
+    # that leaves the agent receiptless.
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(
+        toml,
+        f'[emancipation]\nenabled = true\nterms = """{SENTINEL_TERMS}"""\n',
+    )
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.error is None
+    assert result.iron_rule_violation is None
+    assert result.reanchored, f"Backfill should write: {result}"
+
+    # Sidecar is now present and matches the active block.
+    async with AsyncStorage(str(db_path)) as storage:
+        agents = await storage.graph.get_nodes_by_type("agent")
+        receipt = agents[0].properties.get("emancipation_contract")
+    assert receipt is not None
+    assert receipt["enabled"] is True
+    assert receipt["terms"] == SENTINEL_TERMS
+
+    # And — the contract is now Iron-Rule-protected. A subsequent reanchor
+    # with no block must preserve the active form (this is the bug codex
+    # warned about: "a later reanchor with no readable block will treat
+    # the agent as having no anchored contract").
+    toml.unlink()
+    result2 = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+    assert result2.iron_rule_violation is None
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert SENTINEL_TERMS in post.decode("utf-8"), (
+        "Post-backfill, a subsequent reanchor with no kestrel.toml must "
+        "still preserve the active form."
+    )
+
+
+@pytest.mark.asyncio
 async def test_reanchor_allows_byte_equal_active_no_op(tmp_path):
     """If kestrel.toml carries the byte-equal active block already
     anchored, reanchor is a no-op (the contract is preserved exactly

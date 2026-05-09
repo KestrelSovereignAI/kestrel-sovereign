@@ -222,7 +222,22 @@ async def reanchor_constitution(
 
     new_hash = hashlib.sha256(new_content).hexdigest()
 
-    if old_hash == new_hash:
+    # #1118 sidecar backfill: if the agent has active-form bytes anchored
+    # (e.g. it was incepted between #1112 — which added activation at
+    # inception — and #1118 — which added the JSON sidecar), the
+    # constitution hash will already match the active form but
+    # ``agent.properties.emancipation_contract`` will be missing. Without
+    # a backfill, a future reanchor with no [emancipation] block would
+    # treat the agent as having no anchored contract and could overwrite
+    # the active form with canonical dormant text. Force the write path
+    # in that specific case so the receipt lands.
+    needs_sidecar_backfill = (
+        anchored_contract is None
+        and candidate_contract is not None
+        and candidate_contract.enabled
+    )
+
+    if old_hash == new_hash and not needs_sidecar_backfill:
         return ReanchorResult(
             agent_name=agent_name,
             db_path=db_path,
