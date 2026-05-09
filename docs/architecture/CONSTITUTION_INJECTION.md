@@ -40,13 +40,61 @@ ALTER TABLE signal_log ADD COLUMN echo_canary_status TEXT; -- 'verified' | 'miss
 
 ### 2. Doctrine bundle hashing (not just constitution)
 
-The constitution has an anchored hash and the periodic audit catches filesystem tampering. **Bootstrap files (AGENTS.md, SOUL.md, TORTOISE_DOCTRINE.md, etc.) do not.** A hostile filesystem write to AGENTS.md changes operative doctrine without tripping safe mode. The only safety net is `BootstrapLoader.reload()`, which doesn't verify against any anchored hash.
+The constitution has an anchored hash and the periodic audit catches filesystem tampering. **Bootstrap files (AGENTS.md, SOUL.md, etc.) do not** — a hostile filesystem write to AGENTS.md changes operative doctrine without tripping safe mode. The only safety net is `BootstrapLoader.reload()`, which doesn't verify against any anchored hash.
 
-**Define:** `doctrine_bundle_hash = sha256(canonical_concat(AGENTS.md, TORTOISE_DOCTRINE.md, SOUL.md, <any other file in BootstrapLoader.load() ordered alphabetically>))`. Anchor it the same way the constitution_hash is anchored — on the agent's identity node.
+**Worse:** `docs/TORTOISE_DOCTRINE.md` is not in `BootstrapLoader.DEFAULT_BOOTSTRAP_FILES` (only AGENTS, SOUL, TOOLS, IDENTITY, USER, HEARTBEAT, BOOTSTRAP, MEMORY, CAPABILITIES, GOALS, STRATEGY) and lives outside the agent data directory the loader scans. Today's in-agent COGNITION turns therefore have NO Tortoise Doctrine in their system prompt at all — only the standalone-Talon path pulls it in via `context.py`'s abs-path-following loader. (Codex round 1 P2 catch.)
 
-**Verify:** at the start of every COGNITION dispatch, the dispatcher computes the live bundle hash from `BootstrapLoader.load()` and compares to the anchored value. Mismatch → `Status.DROPPED_VALIDATION` with `error="doctrine_bundle_drift"`. The agent does NOT enter safe mode (that's the constitution-tampering response); the dispatch is refused, the operator gets a `signal_log` entry with the drift recorded, and the next periodic audit will surface it broadly.
+#### The doctrine bundle definition (two tiers)
 
-This closes the gap where AGENTS.md tampering between periodic audits affects operative doctrine.
+The doctrine bundle is the ordered concatenation of:
+
+1. **Anchored doctrine — explicit absolute repo-relative paths**, evaluated against the worktree root the agent runs from:
+   - `docs/principles/KESTREL_CONSTITUTION.md` (already separately anchored as `constitution_hash`; included in the bundle for completeness)
+   - `docs/TORTOISE_DOCTRINE.md` (Tortoise Doctrine — this epic adds it to the in-agent system prompt; previously absent)
+   - `AGENTS.md` (repo root; previously loaded only by Talon)
+   - any other doctrine file the operator declares in `agent_node.properties["doctrine_anchored_paths"]` (extensibility hook)
+
+2. **BootstrapLoader files** — whatever `BootstrapLoader.load()` returns at injection time, in `BootstrapLoader.DEFAULT_BOOTSTRAP_FILES` order (deterministic). The loader's own scan rules apply (file existence, per-file budget, etc.).
+
+**Bundle hash:**
+```python
+def doctrine_bundle_hash(anchored_files: list[Path], bootstrap_files: OrderedDict[str, str]) -> str:
+    parts: list[bytes] = []
+    for path in anchored_files:  # ordered list, not a set
+        parts.append(f"--- BEGIN {path.name} (sha256=...) ---\n".encode())
+        parts.append(path.read_bytes())
+        parts.append(b"\n--- END ---\n")
+    for name, content in bootstrap_files.items():  # OrderedDict preserves insertion order
+        parts.append(f"--- BEGIN {name} ---\n".encode())
+        parts.append(content.encode("utf-8"))
+        parts.append(b"\n--- END ---\n")
+    return hashlib.sha256(b"".join(parts)).hexdigest()
+```
+
+The bundle hash is anchored on the agent's identity node, parallel to the constitution_hash:
+```python
+agent_node.properties["doctrine_bundle_hash"] = doctrine_bundle_hash(...)
+agent_node.properties["doctrine_bundle_files"] = [str(p) for p in anchored_files] + list(bootstrap_files.keys())
+agent_node.properties["doctrine_bundle_anchored_at"] = iso_timestamp
+```
+
+The list of files is itself part of what gets recorded so an auditor can see exactly which files contributed to the anchored hash at the time of anchoring. A `reanchor_doctrine_bundle(expected_hash, authorization)` ratification path (parallel to `reanchor_constitution`) is required for legitimate doctrine updates.
+
+**Verify:** at the start of every COGNITION dispatch, the dispatcher computes the live bundle hash and compares to the anchored value. Mismatch → `Status.DROPPED_VALIDATION` with `error="doctrine_bundle_drift"`. The agent does NOT enter safe mode (that's the constitution-tampering response); the dispatch is refused, the operator gets a `signal_log` entry with the drift recorded, and the next periodic audit will surface it broadly.
+
+This closes two gaps: (a) AGENTS.md / SOUL.md tampering between periodic audits, and (b) TORTOISE_DOCTRINE.md absence from the in-agent system prompt entirely.
+
+#### Inclusion in the system prompt
+
+`build_system_prompt` in `agent/context_builder.py` is extended to inject the anchored-doctrine files (priority 2 in §7) before the existing BootstrapLoader files (priority 4–6). Each anchored-doctrine file gets its own fenced section:
+
+```
+--- TORTOISE DOCTRINE ---
+<contents of docs/TORTOISE_DOCTRINE.md>
+--- END TORTOISE DOCTRINE ---
+```
+
+Section names are derived from the file's basename uppercased (matching the existing convention). Constitutional precedence ordering (§7) drops these in priority order if the assembled system prompt exceeds budget.
 
 ### 3. Echo-canary verification (defense-in-depth against silent injection bypass)
 
@@ -115,15 +163,15 @@ This is opt-in for v1 (don't break existing ARTIFACT flows) but tracked, so a fo
 
 **Add:** a clause-priority ordering with explicit drop-from-end behavior when the assembled system prompt exceeds a configured byte budget:
 
-| Priority | Section |
-|---|---|
-| 1 (highest) | Constitution (`--- GOVERNING CONSTITUTION ---`) |
-| 2 | TORTOISE_DOCTRINE.md (if present in bootstrap) |
-| 3 | AGENTS.md |
-| 4 | SOUL.md |
-| 5 | State-of-mind, prompt_adaptation preamble |
-| 6 (lowest) | Other bootstrap files alphabetically |
-| 7 | Style reminder |
+| Priority | Section | Source |
+|---|---|---|
+| 1 (highest) | Constitution (`--- GOVERNING CONSTITUTION ---`) | `_get_governing_constitution()` (anchored) |
+| 2 | Tortoise Doctrine (`--- TORTOISE DOCTRINE ---`) | anchored doctrine file at `docs/TORTOISE_DOCTRINE.md` |
+| 3 | AGENTS.md (`--- AGENTS ---`) | anchored doctrine file at repo-root `AGENTS.md` |
+| 4 | SOUL.md (`--- YOUR IDENTITY ---`) | BootstrapLoader |
+| 5 | State-of-mind, prompt_adaptation preamble | `StateOfMind` + `PromptAdaptation` |
+| 6 (lowest) | Other BootstrapLoader files alphabetically | BootstrapLoader (TOOLS, IDENTITY, USER, etc.) |
+| 7 | Style reminder | Hard-coded in `build_system_prompt` |
 
 If total exceeds budget, drop priority-N back to priority-1 entries until under budget. Record `injected_clauses[]` and `dropped_clauses[]` in `signal_log` for forensic audit. Per-source budget overrides allowed in `SourceRegistration.system_prompt_budget_bytes`.
 
