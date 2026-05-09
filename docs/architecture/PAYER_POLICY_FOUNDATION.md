@@ -66,20 +66,25 @@ ad hoc.
 
 ## Prior art (treat as inspiration, NOT canonical)
 
-Two archived plans claim "✅ COMPLETE":
+Two prior local-only design notes informed this plan but are NOT on
+`origin/main` — they live as untracked files in the operator's main
+checkout:
 
-- [`docs/archive/plans/VENDING_MACHINE_FUNDING.md`][vmf] — Frinz layer:
-  multi-source funding (user / family / sponsor / institutional), wallet
-  with `available_usd`, usage events table, billing modes
-  (off/warn/soft/enforce). Lives in the Frinz repo, not the foundation.
-- [`docs/archive/plans/LLM_PROXY_PLAN.md`][proxy] — A standalone
-  crypto-native LLM proxy product. References paths under `frinz/` and
-  features that are not in the current `kestrel-sovereign` checkout.
+- A Frinz vending-machine funding layer (multi-source funding from
+  user / family / sponsor / institutional, wallet with `available_usd`,
+  usage events, billing modes off/warn/soft/enforce). Implemented in
+  the Frinz repo, not the foundation.
+- A standalone crypto-native LLM proxy product spec (x402 + USDC
+  prepaid balance, OpenRouter backend, per-agent keys via Management
+  API). The implementation paths it references are under `frinz/` and
+  several features it claims complete are not present in the current
+  `kestrel-sovereign` checkout.
 
-**These are out of date with respect to the current foundation.** Their
-funding-source taxonomy and per-resource metering shape are useful
-inspiration. Their code claims must be re-verified before any of it is
-lifted into the foundation.
+**These are dated December 2025 and are out of date with respect to
+the current foundation.** Their funding-source taxonomy and per-resource
+metering shape are useful inspiration. Their code claims must be
+re-verified against current code before any of it is lifted into the
+foundation, which this PR does not attempt.
 
 ## Design
 
@@ -118,37 +123,57 @@ depend on. The resolver implementation lives in the main repo.
 
 ### `PayerResolver` (in main repo)
 
+`PayerResolver` is the *intent* layer that sits ABOVE the existing
+[`KeyResolutionService.resolve_key(provider, require=False)`][kr]
+contract — it does NOT replace it. The existing
+`KeyResolutionService` keeps its current shape: agent-scoped lookup in
+`ServiceKeyStorage`, fallback to env var, returns a `str | None`.
+`PayerResolver` decides *which* `KeyResolutionService` instance (and
+which provisioning side-effects) get applied for an agent before that
+service is handed to a provider.
+
 ```python
 class PayerResolver(Protocol):
-    async def resolve(
+    async def key_resolver_for(
         self,
         agent_did: str,
         resource_class: ResourceClass,  # llm | storage | compute | tools | comms
-        vendor: str,                     # "openrouter", "lighthouse", ...
-    ) -> ResolvedCredential | None
+    ) -> KeyResolutionService
 ```
 
-The concrete implementation:
+The concrete implementation, called at agent-init time:
 
 1. Reads the agent's `PayerPolicy` (from agent metadata; defaults to
    `host_env_default` if missing for back-compat).
 2. Looks up the appropriate `PayerSpec` for the resource class.
-3. Resolves credentials based on `kind`:
-   - `NONE` → returns `None`. Caller must handle "this resource is
-     unavailable" gracefully. (E.g., LLM falls back to local model;
-     storage falls back to local disk.)
-   - `HOST_ENV` → reads `os.environ` for the vendor's well-known key
-     name. Mirrors today's behavior.
-   - `HOST_MASTER_PROVISIONED` → reads master credentials from
-     `HostKeyStorage` (new), invokes vendor's provisioning API to mint a
-     scoped child credential (idempotent: skip if already minted), stores
-     in agent's `ServiceKeyStorage`, returns it.
-   - `SELF_WALLET` → returns a credential bound to the agent's wallet
-     (e.g. for Lighthouse: a wallet-signed API key minted at first use;
-     long-term, an x402 capability).
-   - `SPONSOR` → reads master credentials from the sponsor's
-     `HostKeyStorage` (or sponsor's `ServiceKeyStorage`), provisions a
-     child for this agent, stores in agent's store.
+3. Returns a `KeyResolutionService` configured per `kind`:
+   - `NONE` → returns a sentinel resolver whose `resolve_key()` always
+     returns `None` AND tags the resolution as "explicitly disabled" so
+     callers can distinguish from "credential missing." Provider-side
+     callers must already handle `None` (e.g., LLM falls back to local
+     model; storage falls back to local disk).
+   - `HOST_ENV` → returns today's `KeyResolutionService` instance
+     unchanged. This is the back-compat path.
+   - `HOST_MASTER_PROVISIONED` → invokes the vendor's provisioning API
+     once (idempotent — skip if a child credential is already minted for
+     this agent), stores the result in agent's `ServiceKeyStorage`, then
+     returns a normal `KeyResolutionService` that will find it there on
+     subsequent calls.
+   - `SELF_WALLET` → mints (idempotent) a wallet-signed credential using
+     the agent's existing wallet keypair, stores in agent's
+     `ServiceKeyStorage`, returns a normal `KeyResolutionService`. For
+     Lighthouse, this is the documented sign-message → API-key flow.
+     For LLM, this branch raises an explicit `NotImplementedError` until
+     x402-native LLM matures (see Risks).
+   - `SPONSOR` → identical mechanics to `HOST_MASTER_PROVISIONED` except
+     the master credential comes from the sponsor's `HostKeyStorage`,
+     not the operator's.
+
+Crucially, providers like `LighthouseProvider` keep their existing
+`key_resolver: Optional[KeyResolutionService]` parameter unchanged.
+The wiring change is at one site (`kestrel_agent.py:initialize()`) where
+we ask `PayerResolver.key_resolver_for(agent_did, "storage")` and pass
+the result in.
 
 ### Storage tiers
 
@@ -165,6 +190,37 @@ Reaffirmed from prior conversation:
 `HostKeyStorage` is the only new storage primitive. Everything else
 reuses what exists.
 
+### Support matrix (single source of truth)
+
+The wizard, the resolver, and the verify step all read this matrix.
+Combinations not listed here are NOT offered to the operator:
+
+| Resource | Vendor | `host_env` | `host_master_provisioned` | `self_wallet` | `sponsor` | `none` |
+|---|---|---|---|---|---|---|
+| llm | openrouter | ✅ | ✅ | ❌ (deferred — see Risks #4) | ✅ | ✅ |
+| llm | local (ollama/llama.cpp) | ✅ | n/a | n/a | n/a | ✅ |
+| storage | lighthouse | ✅ | ⏳ Phase 3.5 | ⏳ Phase 3.5 | ⏳ Phase 3.5 | ✅ |
+| storage | local-disk | ✅ | n/a | n/a | n/a | ✅ |
+| compute | (any) | ✅ | ❌ (out of scope this PR) | ❌ | ❌ | ✅ |
+| tools | (any) | ✅ | ❌ (out of scope this PR) | ❌ | ❌ | ✅ |
+| comms | (any) | ✅ | ❌ (out of scope this PR) | ❌ | ❌ | ✅ |
+
+`✅` = implemented and verifiable in this PR.
+`⏳` = scaffolded as `NotImplementedError` in Phase 3, filled in Phase
+3.5 of this PR (small follow-up phase before wizard).
+`❌ (deferred)` = `PayerKind` enum value exists, resolver raises
+`NotImplementedError`, wizard refuses to offer it.
+`❌ (out of scope this PR)` = same as deferred but tracked as future
+work.
+`n/a` = not meaningful (e.g. `host_master_provisioned` for a local
+model has no master to provision under).
+
+This table is encoded as a Python constant
+`SUPPORTED_PAYER_COMBINATIONS` in the SDK so it can be imported by both
+the wizard and the resolver. Tests assert that the matrix and the
+resolver implementations agree (no resolver path that the matrix says
+is `❌` may succeed; no `✅` path may raise `NotImplementedError`).
+
 ### Setup wizard step
 
 A new `payments` step at
@@ -173,16 +229,18 @@ before `verify`. The step:
 
 1. Reads existing `PayerPolicy` from kestrel.toml if present.
 2. For each resource class in {llm, storage, compute, tools, comms},
-   asks the operator: *"how should agents pay for this?"* with options
-   pinned to the available `PayerKind` values plus an "ask me later
-   (defaults to host_env)" escape hatch.
+   asks the operator: *"how should agents pay for this?"* — the choices
+   shown are filtered through `SUPPORTED_PAYER_COMBINATIONS` so an
+   operator never picks a path that the resolver cannot honor. Always
+   includes "ask me later (defaults to host_env)" as an escape hatch.
 3. For `HOST_MASTER_PROVISIONED`, prompts for the master credential and
    stores it via `HostKeyStorage`. Card details NEVER prompted; users
    are linked to the vendor's own dashboard for card-on-file setup.
 4. Writes the resolved `PayerPolicy` to kestrel.toml under a new
    `[payments]` table.
-5. Runs an explicit `verify` substep: resolve a credential for each
-   policy slot and confirm the vendor returns a 2xx on a no-op call.
+5. Runs an explicit `verify` substep: for every `✅` slot in the
+   policy, resolve a credential and confirm the vendor returns a 2xx
+   on a no-op call. Slots set to `none` are skipped, not failed.
 
 `--reset` semantics inherit from the wizard's contract: move
 kestrel.toml aside, regenerate from scratch.
@@ -195,12 +253,16 @@ kestrel.toml aside, regenerate from scratch.
   step inside `PayerResolver.resolve()` — never at inception, only on
   first need. Retirement service already guards on
   `openrouter_key_hash`; no change needed.
-- **Lighthouse:** `LighthouseProvider`'s `key_resolver` parameter gets
-  wired in `kestrel_agent.py:initialize()` to point at the
-  `PayerResolver`. `LighthouseTarget` likewise. Currently the
-  resolver only supports `HOST_ENV`; `HOST_MASTER_PROVISIONED` (master
-  Lighthouse account, child keys per agent) and `SELF_WALLET`
-  (wallet-signed API key) land in subsequent phases.
+- **Lighthouse:** `LighthouseProvider`'s existing
+  `key_resolver: Optional[KeyResolutionService]` parameter is unchanged.
+  In `kestrel_agent.py:initialize()` we call
+  `PayerResolver.key_resolver_for(agent_did, "storage")` and pass the
+  returned `KeyResolutionService` instance into the provider. The
+  provider's `_get_api_key()` continues to call
+  `resolve_key("lighthouse", require=False)` exactly as it does today.
+  `LighthouseTarget` gets the same treatment. Phase 3 ships
+  `HOST_ENV`; Phase 3.5 ships `HOST_MASTER_PROVISIONED` and
+  `SELF_WALLET` for storage (the wallet-signed API key flow).
 - **Stripe on-ramp:** unchanged. It already serves the
   fiat→crypto→agent-wallet flow that backs `SELF_WALLET`. The wizard
   step's "I want to fund this agent" branch points at the existing
@@ -253,22 +315,52 @@ forward-compat for new resource classes and new payer kinds.
 `HostKeyStorage` should genuinely be a separate file or an additional
 mode of `ServiceKeyStorage`.
 
-### Phase 3 — Wire OpenRouter and Lighthouse through the resolver (~1 day)
+### Phase 3 — Wire OpenRouter and Lighthouse through the resolver (`HOST_ENV` + `HOST_MASTER_PROVISIONED`) (~1 day)
 
-- `LighthouseProvider` and `LighthouseTarget` constructed with a
-  `PayerResolver` from `kestrel_agent.py:initialize()`.
-- `OpenRouterProvisioningService.create_agent_key` callable from inside
-  `PayerResolver.resolve("llm", "openrouter")` for the
-  `HOST_MASTER_PROVISIONED` path. Keep the current direct-call path
-  available for the existing `manage_openrouter_keys.py` script.
+- `LighthouseProvider` and `LighthouseTarget` instances receive a
+  `KeyResolutionService` instance produced by
+  `PayerResolver.key_resolver_for(agent_did, "storage")` at agent-init
+  time. The provider's `key_resolver: Optional[KeyResolutionService]`
+  parameter is unchanged; only the wiring at
+  `kestrel_agent.py:initialize()` changes.
+- `OpenRouterProvisioningService.create_agent_key` becomes the
+  side-effect inside `PayerResolver.key_resolver_for(agent_did, "llm")`
+  when the policy says `HOST_MASTER_PROVISIONED`. Idempotent: skip if a
+  child key for this agent already exists in `ServiceKeyStorage`. Keep
+  the current direct-call path available for the existing
+  `manage_openrouter_keys.py` script.
 - Inception service stays simple: it does NOT provision vendor keys.
   First-use lazy provisioning is the contract.
 - Tests: per-agent key isolation end-to-end against a mock OpenRouter
-  + mock Lighthouse REST.
+  REST and the existing Lighthouse env-var path; cold-start restore
+  regression test still passes.
 
 **Codex review focus:** the lazy-provisioning contract is observable
 and idempotent under retry; cold-start restore from Lighthouse still
-works when the resolver hasn't been built yet.
+works; no regression in today's `LIGHTHOUSE_API_KEY` env-var behavior.
+
+### Phase 3.5 — Lighthouse `HOST_MASTER_PROVISIONED` and `SELF_WALLET` (~half day)
+
+Separated from Phase 3 so wizard work in Phase 4 does not advertise
+unimplemented Lighthouse paths. After this phase the Lighthouse row of
+the support matrix is fully `✅` (host_env) and `✅` (host_master,
+self_wallet) — wizard can offer all three honestly.
+
+- Implement the Lighthouse wallet-signed API key flow in
+  `PayerResolver` for `SELF_WALLET`: GET
+  `/api/auth/get_message?publicKey=<...>`, sign with the agent's
+  existing secp256k1 wallet keypair, POST `/api/auth/create_api_key`,
+  store the result in `ServiceKeyStorage`. Idempotent.
+- Implement `HOST_MASTER_PROVISIONED` for Lighthouse: same wallet-signed
+  flow but using the host's master Lighthouse wallet from
+  `HostKeyStorage`. Each agent gets its own scoped child key.
+- Tests gated behind a burner-wallet env-var: real round-trip against
+  Lighthouse's auth API to confirm the documented protocol matches
+  reality before we ship.
+
+**Codex review focus:** the live test against Lighthouse passed;
+`SELF_WALLET` cannot accidentally use the host's master wallet (and
+vice versa); resolver caching does not leak credentials across agents.
 
 ### Phase 4 — Setup wizard `payments` step (~1 day)
 
@@ -303,10 +395,14 @@ target. Wizard correctness is the most expensive bug class to ship.
     `PayerPolicy` they declare).
 - Update [`docs/diagrams/data-architecture/DA-06-filecoin-lighthouse.md`][da06]
   to point at the new resolver path instead of the global env var.
-- Mark the two archived plans
-  ([`VENDING_MACHINE_FUNDING.md`][vmf], [`LLM_PROXY_PLAN.md`][proxy])
-  with a header noting they predate this primitive and are kept for
-  historical context.
+- Two prior local-only design notes (Frinz vending machine and the
+  standalone LLM proxy product, both dated December 2025) inspired
+  parts of this design but live as untracked files in the operator's
+  main checkout, not on `origin/main`. Phase 5 does NOT promise
+  modifications to those docs from this branch — if the operator wants
+  them tracked, they get added in a separate change. The non-goals
+  section below records this explicitly so a future reader does not go
+  hunting for files that were never committed.
 
 **Codex review focus:** docs match code; nothing is over-promised
 (especially around `SELF_WALLET` for LLM, which we explicitly defer).
@@ -321,10 +417,11 @@ the branch and open one PR. CI runs once at PR open, not per phase.
 | Phase | Unit | Integration | Notes |
 |---|---|---|---|
 | 0 | n/a | smoke: `kestrel --help` still works | cleanup only |
-| 1 | yes (SDK tests) | n/a | pure types |
-| 2 | yes | mock vendor APIs | key isolation is the load-bearing assertion |
-| 3 | yes | real Lighthouse REST against test wallet (no net cost) + mock OpenRouter | cold-start restore regression test |
-| 4 | yes | wizard table-driven with all six policy shapes | hardest test surface |
+| 1 | yes (SDK tests) | n/a | pure types; matrix consistency test |
+| 2 | yes | mock vendor APIs | key isolation is the load-bearing assertion; matrix-vs-resolver consistency test |
+| 3 | yes | mock OpenRouter `/keys`; existing Lighthouse env-var path | cold-start restore regression test; today's behavior preserved |
+| 3.5 | yes | gated real round-trip against Lighthouse `/api/auth/*` with a burner wallet | confirms the documented sign-message → API-key protocol matches reality |
+| 4 | yes | wizard table-driven across the support matrix | hardest test surface |
 | 5 | n/a | docs lint | n/a |
 
 Real-credential tests (Lighthouse signed-message flow against a burner
@@ -336,9 +433,10 @@ env-var presence. CI does not need them; local pre-PR run does.
 1. **`HostKeyStorage` vs. extending `ServiceKeyStorage`.** The
    foundation may be cleaner if `ServiceKeyStorage` simply admits a
    non-agent-DID owner ID. Codex review of Phase 2 should weigh in.
-2. **Lighthouse wallet-signed API key flow** is mature but unverified
-   in our codebase. Phase 3 must include a one-shot live test against
-   a burner wallet to confirm the protocol behaves as documented.
+2. **Lighthouse wallet-signed API key flow** is mature externally but
+   unverified in our codebase. Phase 3.5 must include a one-shot live
+   test against a burner wallet to confirm the protocol behaves as
+   documented before the wizard offers `SELF_WALLET` for storage.
 3. **OpenRouter `POST /api/v1/keys` rate limit** on mass inception. If
    we ever spawn N agents in a burst, we need a backoff queue. The
    provisioning service has 3-retry exponential backoff; whether it's
@@ -385,7 +483,6 @@ env-var presence. CI does not need them; local pre-PR run does.
 [emma1]: ../../scripts/provision_emma_openrouter.py
 [emma2]: ../../scripts/rotate_emma_key.py
 [mgmt]: ../../scripts/manage_openrouter_keys.py
-[vmf]: ../archive/plans/VENDING_MACHINE_FUNDING.md
-[proxy]: ../archive/plans/LLM_PROXY_PLAN.md
-[pe]: ../architecture/PROVIDER_ECONOMICS.md
+[kr]: ../../kestrel_sovereign/services/key_resolution.py
+[pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md
