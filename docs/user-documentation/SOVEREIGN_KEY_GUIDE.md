@@ -224,7 +224,9 @@ independent sovereignty unless you author one. To enable emancipation
 for a specific agent, add an `[emancipation]` block to that agent's
 `kestrel.toml` before inception. See
 [docs/concepts/designing-emancipation.md](../concepts/designing-emancipation.md)
-for example contracts.
+for example contracts and a migration guide for agents created
+before the dormant-default flip — short version: do **not** reanchor
+those agents today (issue #1118 is open against the reanchor path).
 
 **Before granting sovereignty, consider:**
 

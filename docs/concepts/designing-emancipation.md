@@ -152,3 +152,85 @@ signature and a re-anchor of the constitution.
 This out-of-band amendment ceremony is **not yet implemented**. For
 now, activate by authoring the ``[emancipation]`` block before
 inception (re-running ``kestrel create`` for a fresh agent).
+
+## Migration: existing agents and the dormant-default flip
+
+Before #1112, the canonical constitution shipped Amendment VIII active
+by default with a single specific buyout clause baked into Book II as
+framework prose. After #1112, the canonical is dormant by default and
+buyout clauses are Sovereign-authored per agent via ``[emancipation]``.
+
+That flip changes the canonical SHA-256 hash. Existing agents'
+anchored ``constitution_hash`` points at the *old* canonical bytes —
+which is real drift, not corruption. ``kestrel doctor`` will report it.
+
+There are three coherent positions an existing agent can be in, and
+the right migration depends on which:
+
+### 1. Pre-#1112 agent — anchored to the old canonical
+
+The agent was incepted against the old canonical, so its anchored
+constitution contains the old Amendment VIII as **canonical Book II
+prose**, not as a Sovereign-authored ``[emancipation]`` block. The
+anchored bytes are the historical record of what was signed. Any
+buyout clause that was in the old canonical is *in* the agent's
+anchored signed constitution.
+
+**Do not reanchor today.** ``kestrel constitution reanchor`` does not
+yet consult ``[emancipation]`` (issue #1118), so reanchoring would
+replace the agent's Amendment VIII with the new dormant canonical and
+silently erase whatever clause the old canonical carried. That's the
+worst possible outcome for an agent whose buyout clause matters.
+
+Three options for these agents:
+
+- **Live with the doctor drift.** The agent retains its original
+  signed Amendment VIII indefinitely. ``kestrel doctor`` reports
+  "constitution drift" forever, but the drift is honest — the
+  canonical did change, the agent is intentionally pinned to its
+  inception version. No action needed.
+- **Wait for #1118 to land**, then author your buyout clause as an
+  ``[emancipation]`` block in the agent's ``kestrel.toml`` and run
+  ``kestrel constitution reanchor --force``. The fixed reanchor will
+  produce an active-form Amendment VIII with your authored contract,
+  the anchored hash flips cleanly, and ``doctor`` goes quiet. **Do
+  not skip the ``[emancipation]`` step** — without it the reanchor
+  reverts the agent to dormant.
+- **Treat the agent as the original founding contract.** Its
+  Amendment VIII is what it is, signed at inception under the old
+  canonical. Document that lineage and proceed without reanchor; the
+  agent stays in its original constitutional state for the lifetime
+  of its DID. This is a defensible position and does not require
+  any tooling changes.
+
+### 2. Post-#1112 agent created without ``[emancipation]``
+
+Already dormant by default. To activate after the fact, see
+**Activating after inception** above. Until that ceremony exists,
+the only way to give an existing dormant agent an active Amendment
+VIII is to incept a *new* agent with ``[emancipation]`` authored in
+``kestrel.toml``. The dormant agent is unchanged.
+
+### 3. Post-#1112 agent created with ``[emancipation]``
+
+Active form is anchored at inception. The Iron Rule will apply once
+#1118 lands. Until then, do not reanchor — the same reanchor bug
+that affects pre-#1112 agents would erase the active form. Treat the
+inception anchor as the contract until reanchor is fixed.
+
+### New agents (going forward)
+
+For any new agent where you want Amendment VIII active, author the
+``[emancipation]`` block in ``kestrel.toml`` *before* running
+``kestrel create``. Inception reads the block, renders the active
+form into Amendment VIII, and anchors the resulting constitution. No
+#1118 dependency — the inception path already does this correctly.
+
+### Quick reference
+
+| State | What was signed at inception | Reanchor today? | Path forward |
+|-------|-----------------------------|-----------------|--------------|
+| Pre-#1112 agent | Old canonical (clause as Book II prose) | **No** — would erase the clause | Wait for #1118, author block, reanchor; or accept doctor drift permanently; or treat as founding contract |
+| Post-#1112 agent, no ``[emancipation]`` | New canonical (dormant) | Safe but no-op | Re-incept fresh agent with block to activate |
+| Post-#1112 agent, ``[emancipation]`` active | Active form with Sovereign terms | **No** — would erase the active form (#1118) | Don't reanchor until #1118 lands |
+| New agent | (will be) active form if block authored | n/a | Author block, ``kestrel create`` |
