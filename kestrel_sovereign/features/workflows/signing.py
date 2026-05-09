@@ -1,0 +1,345 @@
+"""Workflow definition + transition signing helpers (Phase 0 chunk C).
+
+Implements the small surface called out in design §6 Phase 0:
+
+> DID signing + verification helpers (reuse existing ``kestrel-talon``
+> IdentityPackage primitives)
+
+The ceremony-grade signing primitives in
+:mod:`kestrel_sovereign.identity.signing` are package-specific to
+``AgentIdentityPackage``. Workflow specs and stage-link transitions
+need a thinner, format-agnostic surface, so this module wires the
+existing :mod:`kestrel_sovereign.security.crypto_suite` and
+:class:`kestrel_sovereign.identity.runtime_identity.AgentIdentity`
+primitives directly.
+
+Phase 0 ships:
+
+- :func:`sign_workflow_spec` — populate ``spec.spec_hash`` and
+  ``author_sig`` (ECDSA secp256k1 over the canonical bytes; hybrid
+  signatures land in Phase 1 once the workflow runner needs the v2
+  array shape).
+- :func:`verify_workflow_spec` — recompute the hash, verify the
+  signature against an author public key bytes blob.
+- :func:`canonical_transition_payload` — the deterministic byte form
+  signed for each :class:`StageLink`.
+- :func:`sign_stage_transition` — produces the actor signature for a
+  stage transition.
+- :func:`verify_stage_transition` — verifies that signature.
+
+What this module deliberately does NOT do:
+
+- Hybrid (classical + PQ) signatures. Phase 0 tracks the legacy ECDSA
+  field that already exists on every agent. Hybrid wraps the same
+  byte payload and lives behind the existing ``sign_hybrid`` helper;
+  Phase 1 adds it once the workflow runner is exercising signatures
+  end-to-end.
+- DID-document resolution. The ``public_key_resolver`` parameter is a
+  pluggable callable so callers can resolve over ``did:web``,
+  ``did:pkh``, in-memory test fixtures, or :class:`AgentIdentity`'s
+  legacy keypair without this module owning that lookup.
+- Anchor-style hashing. Workflow definitions sign the canonical JSON
+  bytes directly; we do not Merkle-anchor or chain.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import replace
+from typing import Callable, Optional
+
+from kestrel_sovereign.features.workflows.models import (
+    StageLink,
+    WorkflowDefinitionError,
+    WorkflowSpec,
+)
+from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+from kestrel_sovereign.security.crypto_suite import (
+    ALG_ECDSA_SECP256K1_SHA256,
+    CryptoSuiteError,
+    get_suite,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# Pluggable resolver: caller maps a DID to the public-key bytes used by
+# :meth:`CryptoSuite.deserialize_public_key`. The legacy uncompressed
+# X9.62 form is the right shape for secp256k1; callers that source
+# their keys from W3C Multikey VMs use
+# ``serialize_public_key_for_multikey``'s inverse.
+PublicKeyResolver = Callable[[str], bytes]
+
+
+# ---------------------------------------------------------------------------
+# WorkflowSpec signing
+# ---------------------------------------------------------------------------
+
+
+def sign_workflow_spec(
+    spec: WorkflowSpec,
+    agent_identity: AgentIdentity,
+) -> WorkflowSpec:
+    """Sign ``spec`` with the agent's legacy ECDSA secp256k1 key.
+
+    The author DID is taken from :attr:`AgentIdentity.signing_did` —
+    that's the post-ceremony ``did:web`` identity for hybrid agents and
+    the legacy ``did:pkh`` for pre-ceremony agents. The legacy ECDSA
+    private key is used to produce the signature in either case
+    (hybrid signatures are a Phase 1 concern; this Phase 0 helper
+    reproduces the legacy field).
+
+    The signed bytes are the lowercase-hex SHA-256 of the canonical
+    payload. We sign the hex bytes (not the raw 32-byte digest) so the
+    signature is over a stable string that auditors can recompute and
+    log without normalization decisions.
+
+    Returns a new :class:`WorkflowSpec` (frozen dataclass) with
+    ``spec_hash`` and ``author_sig`` populated. ``author_did`` is
+    overwritten only when the input was empty — callers may pre-set
+    it for delegated signing scenarios where the spec author and the
+    runner-on-disk agent differ.
+    """
+    if not isinstance(spec, WorkflowSpec):
+        raise TypeError("sign_workflow_spec requires a WorkflowSpec instance")
+
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+
+    if agent_identity.legacy_keypair.private_key is None:
+        raise WorkflowDefinitionError(
+            "sign_workflow_spec: AgentIdentity has no legacy private key "
+            "(post-destruction state). Phase 1 will use the hybrid keypair "
+            "via sign_hybrid; until then this helper requires a legacy key."
+        )
+
+    signing_did = spec.author_did or agent_identity.signing_did
+
+    # The canonical payload INCLUDES ``author_did`` (it's part of what
+    # the author signs). Therefore set the author_did first, recompute
+    # the hash on the *to-be-signed* form, then sign that hash. If we
+    # signed before setting author_did, ``verify_workflow_spec`` would
+    # later recompute a hash that doesn't match the stored one and
+    # fail. Frozen-dataclass: use ``replace`` to materialize the
+    # pre-sign canonical form.
+    pre_sign = replace(
+        spec,
+        author_did=signing_did,
+        author_sig="",
+        spec_hash="",
+    )
+    spec_hash = pre_sign.compute_spec_hash()
+
+    try:
+        sig = suite.sign(
+            spec_hash.encode("utf-8"),
+            agent_identity.legacy_keypair.private_key,
+        )
+    except CryptoSuiteError as exc:
+        raise WorkflowDefinitionError(
+            f"sign_workflow_spec failed: {exc}"
+        ) from exc
+
+    return replace(
+        pre_sign,
+        spec_hash=spec_hash,
+        author_sig=sig.hex(),
+    )
+
+
+def verify_workflow_spec(
+    spec: WorkflowSpec,
+    public_key_resolver: PublicKeyResolver,
+) -> bool:
+    """Recompute the canonical hash and verify ``spec.author_sig``.
+
+    Returns ``True`` iff the signature verifies. Returns ``False`` (not
+    raises) on any of: missing author_did/author_sig/spec_hash, hash
+    mismatch, signature mismatch, malformed signature bytes,
+    unresolvable author DID. The verifier never throws on bad input —
+    callers integrate it into a runner-side gate where ``False`` means
+    refuse to run.
+
+    Hash mismatch and signature mismatch are deliberately
+    indistinguishable in the return value because either represents an
+    untrusted input; surfaces that need to log the cause use the side
+    channel of the canary log already established by #1137.
+    """
+    if not isinstance(spec, WorkflowSpec):
+        return False
+    if not spec.author_did or not spec.author_sig or not spec.spec_hash:
+        return False
+
+    expected_hash = spec.compute_spec_hash()
+    if expected_hash != spec.spec_hash:
+        return False
+
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+
+    try:
+        public_key_bytes = public_key_resolver(spec.author_did)
+        public_key = suite.deserialize_public_key(public_key_bytes)
+    except Exception as exc:  # noqa: BLE001 — resolver is caller-supplied
+        logger.debug(
+            "verify_workflow_spec: public-key resolution failed for %s: %s",
+            spec.author_did,
+            exc,
+        )
+        return False
+
+    try:
+        sig_bytes = bytes.fromhex(spec.author_sig)
+    except ValueError:
+        return False
+
+    try:
+        return suite.verify(spec_hash_to_bytes(spec.spec_hash), sig_bytes, public_key)
+    except CryptoSuiteError:
+        return False
+
+
+def spec_hash_to_bytes(spec_hash: str) -> bytes:
+    """Helper exposed for callers signing across the same hash form
+    (sign and verify must encode identically). Returns the lowercase-
+    hex string as UTF-8 bytes — NOT the raw 32-byte digest. See the
+    sign_workflow_spec docstring for the rationale.
+    """
+    return spec_hash.encode("utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Stage-transition signing
+# ---------------------------------------------------------------------------
+
+
+def canonical_transition_payload(
+    *,
+    run_id: str,
+    stage_name: str,
+    attempt_number: int,
+    signal_id: Optional[str],
+    gate_outcome: Optional[str],
+) -> bytes:
+    """Deterministic, dialect-portable byte form for a stage transition
+    signature (design §5 ``actor_sig`` definition).
+
+    Format: ``"workflow.stage_transition.v1\\n<run_id>\\n<stage_name>\\n
+    <attempt_number>\\n<signal_id>\\n<gate_outcome>"`` UTF-8 encoded.
+
+    The ``v1`` discriminator front-loads the format version so future
+    additions (extra fields, JSON canonicalization) can introduce
+    ``v2`` without colliding with v1 signatures. ``None`` values
+    serialize as the literal four-byte string ``"none"`` so a missing
+    ``signal_id`` (pre-dispatch) and a present ``signal_id`` named
+    "none" cannot collide — the latter is rejected at the dataclass
+    boundary (signal_id values come from signal_log.id which is a
+    UUID, not the literal string).
+    """
+    parts = (
+        "workflow.stage_transition.v1",
+        run_id,
+        stage_name,
+        str(attempt_number),
+        "none" if signal_id is None else signal_id,
+        "none" if gate_outcome is None else gate_outcome,
+    )
+    return "\n".join(parts).encode("utf-8")
+
+
+def sign_stage_transition(
+    *,
+    run_id: str,
+    stage_name: str,
+    attempt_number: int,
+    signal_id: Optional[str],
+    gate_outcome: Optional[str],
+    agent_identity: AgentIdentity,
+) -> str:
+    """Returns the lowercase-hex secp256k1 signature for a stage
+    transition. Caller writes this into ``StageLink.actor_sig``.
+
+    Mirrors :func:`sign_workflow_spec`: legacy ECDSA only in Phase 0;
+    hybrid signing follows once the runner is in place.
+    """
+    if agent_identity.legacy_keypair.private_key is None:
+        raise WorkflowDefinitionError(
+            "sign_stage_transition: AgentIdentity has no legacy private key"
+        )
+    payload = canonical_transition_payload(
+        run_id=run_id,
+        stage_name=stage_name,
+        attempt_number=attempt_number,
+        signal_id=signal_id,
+        gate_outcome=gate_outcome,
+    )
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    try:
+        sig = suite.sign(payload, agent_identity.legacy_keypair.private_key)
+    except CryptoSuiteError as exc:
+        raise WorkflowDefinitionError(
+            f"sign_stage_transition failed: {exc}"
+        ) from exc
+    return sig.hex()
+
+
+def verify_stage_transition(
+    link: StageLink,
+    public_key_resolver: PublicKeyResolver,
+) -> bool:
+    """Verify a stage transition's actor signature.
+
+    Returns False (not raises) on any failure mode — same posture as
+    :func:`verify_workflow_spec`. The runner-side gate treats False
+    as "refuse to advance the workflow" and logs a structured event;
+    a bad signature on a stage transition is auditor-grade evidence
+    of either tampering or a stale identity rotation that the
+    operator must explicitly resolve.
+    """
+    if not isinstance(link, StageLink):
+        return False
+    if not link.actor_did or not link.actor_sig:
+        return False
+
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+
+    try:
+        public_key_bytes = public_key_resolver(link.actor_did)
+        public_key = suite.deserialize_public_key(public_key_bytes)
+    except Exception as exc:  # noqa: BLE001 — resolver is caller-supplied
+        logger.debug(
+            "verify_stage_transition: public-key resolution failed for %s: %s",
+            link.actor_did,
+            exc,
+        )
+        return False
+
+    try:
+        sig_bytes = bytes.fromhex(link.actor_sig)
+    except ValueError:
+        return False
+
+    payload = canonical_transition_payload(
+        run_id=link.run_id,
+        stage_name=link.stage_name,
+        attempt_number=link.attempt_number,
+        signal_id=link.signal_id,
+        gate_outcome=(
+            link.gate_outcome.value
+            if link.gate_outcome is not None
+            else None
+        ),
+    )
+    try:
+        return suite.verify(payload, sig_bytes, public_key)
+    except CryptoSuiteError:
+        return False
+
+
+__all__ = [
+    "PublicKeyResolver",
+    "canonical_transition_payload",
+    "sign_stage_transition",
+    "sign_workflow_spec",
+    "spec_hash_to_bytes",
+    "verify_stage_transition",
+    "verify_workflow_spec",
+]
