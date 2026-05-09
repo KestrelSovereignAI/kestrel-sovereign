@@ -357,6 +357,15 @@ class Stage:
         # writeful ACTION stages slip past the noop_idempotent
         # eligibility check in __post_init__. Pass-through keeps the
         # type guard in __post_init__ load-bearing.
+        #
+        # ``forbidden_modules`` similarly passes through raw (no
+        # ``tuple(...)`` wrap) — round-3 codex P2: ``tuple("features")``
+        # is ``('f', 'e', ..., 's')``, an iterable of single-char
+        # strings that would silently pass __post_init__'s
+        # ``all(isinstance(m, str) ...)`` check while completely
+        # mangling the constitutional-boundary scope. Passing the raw
+        # value lets the ``isinstance(value, (list, tuple))`` guard in
+        # __post_init__ reject strings as the user intended.
         return cls(
             name=str(data["name"]),
             signal_source=str(data["signal_source"]),
@@ -364,7 +373,7 @@ class Stage:
             params=dict(data.get("params") or {}),
             gate=Gate.from_dict(gate_data),
             compensate=str(data.get("compensate", "noop_idempotent")),
-            forbidden_modules=tuple(data.get("forbidden_modules") or ()),
+            forbidden_modules=data.get("forbidden_modules") or (),
             irreversible=data.get("irreversible", False),
             non_deterministic=data.get("non_deterministic", False),
             read_only=data.get("read_only", False),
@@ -544,6 +553,12 @@ class Edge:
             raise WorkflowDefinitionError(
                 f"Edge.from_dict expected mapping, got {type(data).__name__}"
             )
+        # ``stages`` (parallel-edge fan-out list) passes through raw —
+        # ``tuple("a,b,c")`` would expand a string into single chars,
+        # each of which is itself a non-empty str, silently producing 5
+        # "stages" from one mistyped value. Same trap as Stage's
+        # forbidden_modules (round-3 codex P2). __post_init__ rejects
+        # non-list/non-tuple inputs.
         return cls(
             kind=data["kind"],
             from_stage=str(data["from_stage"]),
@@ -551,7 +566,7 @@ class Edge:
             condition=data.get("condition"),
             true_stage=data.get("true_stage"),
             false_stage=data.get("false_stage"),
-            stages=tuple(data.get("stages") or ()),
+            stages=data.get("stages") or (),
             join_strategy=data.get("join_strategy"),
             subworkflow_name=data.get("subworkflow_name"),
             subworkflow_version=data.get("subworkflow_version"),

@@ -195,6 +195,39 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_from_dict_rejects_string_for_forbidden_modules():
+    """Codex round 3 P2: ``tuple('features.security')`` expands a
+    string into single chars, each a non-empty str; the all-isinstance
+    check then passes and the constitutional-boundary scan would scope
+    to nothing meaningful. ``Stage.from_dict`` must pass the raw value
+    through so __post_init__'s isinstance(list/tuple) guard rejects it."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage.from_dict(
+            {
+                "name": "publish",
+                "signal_source": "ci.publish",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": True,
+                "forbidden_modules": "features.security",  # string, not list
+            }
+        )
+
+
+def test_edge_from_dict_rejects_string_for_parallel_stages():
+    """Same trap on ``Edge(kind=parallel)`` — ``tuple('abc')`` would
+    parse 'abc' as three single-char stages."""
+    with pytest.raises(WorkflowDefinitionError):
+        Edge.from_dict(
+            {
+                "kind": "parallel",
+                "from_stage": "fanout",
+                "stages": "ab",  # string, not list
+                "join_strategy": "all",
+            }
+        )
+
+
 def test_stage_from_dict_rejects_string_booleans():
     """Codex round 1 P2: ``bool("false")`` is True. ``Stage.from_dict``
     must NOT silently coerce strings to booleans, or a writeful ACTION

@@ -139,6 +139,9 @@ test = [
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
     "asgi-lifespan>=2.1.0",
+    # Same reason as the [dependency-groups].test mirror below: workflow
+    # schema parity tests need this to actually run instead of skip.
+    "jsonschema>=4.20",
 ]
 # ML/training dependencies (adds ~2GB+ for torch, diffusers, etc.)
 ml = [
