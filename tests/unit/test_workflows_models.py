@@ -38,6 +38,7 @@ from kestrel_sovereign.features.workflows.schema import (
     WORKFLOW_RUN_SCHEMA,
     WORKFLOW_SPEC_SCHEMA,
     WORKFLOW_STAGE_LINK_SCHEMA,
+    validate_spec_payload,
 )
 
 
@@ -1112,6 +1113,34 @@ def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_validate_spec_payload_catches_duplicate_stage_names():
+    """Round-4 P2: graph invariants (duplicate names, dangling edge
+    references) aren't expressible in pure draft-2020-12. The
+    ``validate_spec_payload`` helper layers them on top so schema-
+    valid payloads also construct successfully."""
+    spec = _minimal_spec().to_dict()
+    spec["stages"].append(spec["stages"][0])  # duplicate by deep equality
+    with pytest.raises(ValueError):
+        validate_spec_payload(spec)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_validate_spec_payload_catches_dangling_edge_reference():
+    spec = _minimal_spec().to_dict()
+    spec["edges"] = [
+        {"kind": "sequential", "from_stage": "lint", "to_stage": "ghost"}
+    ]
+    with pytest.raises(ValueError):
+        validate_spec_payload(spec)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_validate_spec_payload_passes_canonical_form():
+    spec = _minimal_spec().to_dict()
+    validate_spec_payload(spec)
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")

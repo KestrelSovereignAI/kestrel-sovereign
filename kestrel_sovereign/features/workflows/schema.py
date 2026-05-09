@@ -480,8 +480,79 @@ WORKFLOW_STAGE_LINK_SCHEMA: dict[str, Any] = {
 }
 
 
+def validate_spec_payload(payload: Any) -> None:
+    """Run draft-2020-12 schema validation AND the graph invariants
+    that JSON Schema alone can't express.
+
+    Codex round-4 P2: stage-name uniqueness and edge→stage references
+    are correlation rules across separate arrays — draft-2020-12 has
+    no native syntax for them. ``WORKFLOW_SPEC_SCHEMA`` checks
+    everything that's expressible declaratively; this helper layers
+    on the same graph-level checks ``WorkflowSpec.__post_init__``
+    enforces, so schema-valid payloads also construct successfully.
+
+    Callers SHOULD use this rather than ``jsonschema.validate(payload,
+    WORKFLOW_SPEC_SCHEMA)`` directly. Raises:
+
+    - ``jsonschema.ValidationError`` from the schema layer.
+    - ``ValueError`` from the graph layer (so callers can disambiguate).
+
+    Importing jsonschema lazily keeps the schema module importable in
+    environments that haven't installed it.
+    """
+    import jsonschema  # local import — see docstring
+
+    jsonschema.validate(instance=payload, schema=WORKFLOW_SPEC_SCHEMA)
+
+    if not isinstance(payload, dict):  # pragma: no cover — schema rejects
+        return
+
+    stages = payload.get("stages") or []
+    declared: set[str] = set()
+    for stage in stages:
+        name = stage.get("name") if isinstance(stage, dict) else None
+        if not isinstance(name, str):
+            continue
+        if name in declared:
+            raise ValueError(f"duplicate stage name: {name!r}")
+        declared.add(name)
+
+    edges = payload.get("edges") or []
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        from_stage = edge.get("from_stage")
+        if from_stage not in declared:
+            raise ValueError(
+                f"edge.from_stage {from_stage!r} not in declared stages"
+            )
+        kind = edge.get("kind")
+        if kind == "sequential":
+            target = edge.get("to_stage")
+            if target not in declared:
+                raise ValueError(
+                    f"edge.to_stage {target!r} not in declared stages"
+                )
+        elif kind == "branch":
+            for branch_field in ("true_stage", "false_stage"):
+                target = edge.get(branch_field)
+                if target not in declared:
+                    raise ValueError(
+                        f"edge.{branch_field} {target!r} not in declared stages"
+                    )
+        elif kind == "parallel":
+            missing = [s for s in (edge.get("stages") or []) if s not in declared]
+            if missing:
+                raise ValueError(
+                    f"edge.parallel.stages reference undeclared: {missing}"
+                )
+        # SUBWORKFLOW edges reference an external workflow name, not
+        # a stage in this spec, so no in-graph reference check applies.
+
+
 __all__ = [
     "WORKFLOW_RUN_SCHEMA",
     "WORKFLOW_SPEC_SCHEMA",
     "WORKFLOW_STAGE_LINK_SCHEMA",
+    "validate_spec_payload",
 ]
