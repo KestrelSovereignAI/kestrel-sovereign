@@ -497,6 +497,52 @@ def test_register_accepts_none_budget():
     assert reg.get("default_budget").system_prompt_budget_bytes is None
 
 
+def test_register_rejects_string_budget_with_clear_error():
+    """Codex round-1 (chunk 1F PR) P2: untyped config (TOML / env)
+    can hand us a string. The validator must surface a clean
+    RegistrationError, not a raw TypeError from the `<= 0` compare."""
+    reg = SourceRegistry()
+    with pytest.raises(
+        RegistrationError, match="must be a positive int.*str"
+    ):
+        reg.register(
+            _valid_cognition_reg(
+                "string_budget",
+                system_prompt_budget_bytes="8192",  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_register_rejects_float_budget():
+    """Floats slip past `<= 0` comparisons but violate the documented
+    positive-int contract."""
+    reg = SourceRegistry()
+    with pytest.raises(
+        RegistrationError, match="must be a positive int.*float"
+    ):
+        reg.register(
+            _valid_cognition_reg(
+                "float_budget",
+                system_prompt_budget_bytes=1.5,  # type: ignore[arg-type]
+            )
+        )
+
+
+def test_register_rejects_bool_budget():
+    """`True` is technically `int` in Python but obviously a misuse
+    here. Reject explicitly."""
+    reg = SourceRegistry()
+    with pytest.raises(
+        RegistrationError, match="must be a positive int.*bool"
+    ):
+        reg.register(
+            _valid_cognition_reg(
+                "bool_budget",
+                system_prompt_budget_bytes=True,  # type: ignore[arg-type]
+            )
+        )
+
+
 def test_claude_code_echo_warns_when_no_rationale_in_docstring():
     """claude_code + echo=True is unusual; if the handler's module
     docstring lacks rationale the operator gets a registration-time

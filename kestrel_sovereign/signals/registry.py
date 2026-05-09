@@ -209,13 +209,25 @@ class SourceRegistry:
             )
 
         # Budget sanity — None means use operator default; if set,
-        # must be positive.
-        if reg.system_prompt_budget_bytes is not None:
-            if reg.system_prompt_budget_bytes <= 0:
+        # must be a positive int. Type-check before the comparison
+        # because untyped config (TOML / env / JSON) can hand us a
+        # string `"8192"` or a float `1.5` that would otherwise either
+        # raise an opaque TypeError on `<= 0` (str case) or silently
+        # pass with the wrong type (float case). bool is rejected
+        # explicitly because `True` is technically an int but
+        # obviously a misuse here.
+        budget = reg.system_prompt_budget_bytes
+        if budget is not None:
+            if isinstance(budget, bool) or not isinstance(budget, int):
                 raise RegistrationError(
                     f"Source '{reg.name}': system_prompt_budget_bytes "
-                    f"must be > 0 when set, got "
-                    f"{reg.system_prompt_budget_bytes}."
+                    f"must be a positive int (or None), got "
+                    f"{type(budget).__name__} {budget!r}."
+                )
+            if budget <= 0:
+                raise RegistrationError(
+                    f"Source '{reg.name}': system_prompt_budget_bytes "
+                    f"must be > 0 when set, got {budget}."
                 )
 
         # Soft warning — claude_code sources opting INTO echo should
