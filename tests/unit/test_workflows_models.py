@@ -595,6 +595,61 @@ def test_stage_link_rejects_non_string_non_enum_gate_outcome():
         )
 
 
+def test_stage_from_dict_rejects_falsy_wrong_type_gate():
+    """Round 6 P2: ``data.get('gate') or default`` rewrote a wire
+    ``gate: []`` (list, not object) into the canonical default-gate
+    form, masking malformed wire payloads."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage.from_dict(
+            {
+                "name": "x",
+                "signal_source": "x",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": True,
+                "gate": [],  # list, not object
+            }
+        )
+
+
+def test_gate_constitutional_boundary_clean_requires_non_empty_forbidden():
+    """Round 6 P2: ``all([]) is True``; an explicit empty list silently
+    passed dataclass validation while the schema rejects via
+    ``minItems: 1``. A boundary-clean gate that scopes to nothing scans
+    nothing — worse than no gate."""
+    with pytest.raises(WorkflowDefinitionError):
+        Gate(
+            type="constitutional_boundary_clean",
+            params={"forbidden_modules": []},
+        )
+
+
+def test_trigger_manual_rejects_cron_expression():
+    """Round 6 P2: ``Trigger(kind=manual, cron_expression='...')`` was
+    accepted by the dataclass but rejected by the schema oneOf —
+    schema/model drift on signed wire forms."""
+    with pytest.raises(WorkflowDefinitionError):
+        Trigger(kind=TriggerKind.MANUAL, cron_expression="0 4 * * *")
+
+
+def test_trigger_cron_rejects_signal_source():
+    with pytest.raises(WorkflowDefinitionError):
+        Trigger(
+            kind=TriggerKind.CRON,
+            cron_expression="0 4 * * *",
+            signal_source="github.pr_opened",
+        )
+
+
+def test_trigger_signal_source_rejects_cron_expression():
+    with pytest.raises(WorkflowDefinitionError):
+        Trigger(
+            kind=TriggerKind.SIGNAL_SOURCE,
+            signal_source="github.pr_opened",
+            cron_expression="0 4 * * *",
+        )
+
+
 def test_gate_from_dict_rejects_int_type():
     """Mirror of WorkflowSpec/Stage round-4 hardening at the gate layer."""
     with pytest.raises(WorkflowDefinitionError):

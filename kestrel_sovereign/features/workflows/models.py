@@ -251,12 +251,20 @@ class Gate:
         # required-field mistakes that would otherwise corrupt storage.
         if self.type == "constitutional_boundary_clean":
             forbidden = self.params.get("forbidden_modules")
-            if not isinstance(forbidden, (list, tuple)) or not all(
-                isinstance(m, str) for m in forbidden
+            # Round 6 P2: ``all([]) is True`` so an explicit empty list
+            # silently passed the dataclass check while the JSON schema
+            # already enforces ``minItems: 1``. A boundary-clean gate
+            # whose forbidden_modules scopes to nothing scans nothing,
+            # which is worse than no gate (operators think the gate
+            # protects them). Mirror the schema's minItems-1 here.
+            if (
+                not isinstance(forbidden, (list, tuple))
+                or len(forbidden) < 1
+                or not all(isinstance(m, str) for m in forbidden)
             ):
                 raise WorkflowDefinitionError(
                     "gate constitutional_boundary_clean requires "
-                    "params.forbidden_modules: list[str]"
+                    "params.forbidden_modules: non-empty list[str]"
                 )
         if self.type == "red_team_clear":
             constraint = self.params.get("prompt_pack_constraint")
@@ -385,7 +393,14 @@ class Stage:
             raise WorkflowDefinitionError(
                 f"Stage.from_dict expected mapping, got {type(data).__name__}"
             )
-        gate_data = data.get("gate") or {"type": "signal_status_ok"}
+        # Round 6 P2: ``data.get('gate') or {default}`` rewrites a
+        # present-but-falsy malformed wire ``gate: []`` into the
+        # canonical default-gate form. ``Gate.from_dict`` should see
+        # the malformed value and reject it.
+        if "gate" in data:
+            gate_data = data["gate"]
+        else:
+            gate_data = {"type": "signal_status_ok"}
         # Boolean fields pass through verbatim. We deliberately do NOT
         # call ``bool(...)`` here because ``bool("false")`` is True —
         # which would silently flip read_only=False into True for any
@@ -656,14 +671,36 @@ class Trigger:
                 f"{type(self.kind).__name__}"
             )
 
+        # Round 6 P2: mirror the JSON schema's ``oneOf`` discriminator
+        # so per-kind unrelated fields are rejected at the dataclass
+        # boundary too. Without this, ``Trigger(kind=manual,
+        # cron_expression="...")`` constructs and serializes a payload
+        # that the schema's oneOf would reject — schema/model drift on
+        # signed wire forms.
         if self.kind == TriggerKind.CRON:
-            if not isinstance(self.cron_expression, str) or not self.cron_expression.strip():
+            if (
+                not isinstance(self.cron_expression, str)
+                or not self.cron_expression.strip()
+            ):
                 raise WorkflowDefinitionError(
                     "trigger.kind=cron requires non-empty cron_expression"
                 )
+            if self.signal_source is not None:
+                raise WorkflowDefinitionError(
+                    "trigger.kind=cron must not set signal_source"
+                )
         elif self.kind == TriggerKind.SIGNAL_SOURCE:
             _validate_name("trigger.signal_source", self.signal_source or "")
-        # MANUAL needs no extra fields.
+            if self.cron_expression is not None:
+                raise WorkflowDefinitionError(
+                    "trigger.kind=signal_source must not set cron_expression"
+                )
+        else:  # MANUAL
+            if self.cron_expression is not None or self.signal_source is not None:
+                raise WorkflowDefinitionError(
+                    "trigger.kind=manual must not set cron_expression "
+                    "or signal_source"
+                )
 
         if not isinstance(self.params, Mapping):
             raise WorkflowDefinitionError(
