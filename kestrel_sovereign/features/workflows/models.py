@@ -185,6 +185,21 @@ def _is_strict_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _thaw_value(value: Any) -> Any:
+    """Recursively convert frozen JSON-like containers back to plain
+    dict/list for JSON serialization. Round 16 codex P2: shallow
+    ``dict(mappingproxy)`` leaves nested ``MappingProxyType`` and
+    tuples in the output, which ``json.dumps`` rejects with
+    ``TypeError`` — breaking ``compute_spec_hash`` for any spec whose
+    params carry nested objects.
+    """
+    if isinstance(value, Mapping):
+        return {str(k): _thaw_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thaw_value(v) for v in value]
+    return value
+
+
 def _freeze_value(value: Any) -> Any:
     """Recursively freeze a JSON-like value so a frozen dataclass holding
     it cannot be mutated post-construction.
@@ -331,7 +346,7 @@ class Gate:
                 )
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type, "params": dict(self.params)}
+        return {"type": self.type, "params": _thaw_value(self.params)}
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Gate":
@@ -462,7 +477,7 @@ class Stage:
             "name": self.name,
             "signal_source": self.signal_source,
             "signal_mode": self.signal_mode.value,
-            "params": dict(self.params),
+            "params": _thaw_value(self.params),
             "gate": self.gate.to_dict(),
             "compensate": self.compensate,
             "forbidden_modules": list(self.forbidden_modules),
@@ -700,7 +715,7 @@ class Edge:
             out["subworkflow_name"] = self.subworkflow_name
             out["subworkflow_version"] = self.subworkflow_version
         if self.params:
-            out["params"] = dict(self.params)
+            out["params"] = _thaw_value(self.params)
         return out
 
     @classmethod
@@ -814,7 +829,7 @@ class Trigger:
         if self.signal_source is not None:
             out["signal_source"] = self.signal_source
         if self.params:
-            out["params"] = dict(self.params)
+            out["params"] = _thaw_value(self.params)
         return out
 
     @classmethod
@@ -973,7 +988,7 @@ class WorkflowSpec:
             "stages": [s.to_dict() for s in self.stages],
             "edges": [e.to_dict() for e in self.edges],
             "triggers": [t.to_dict() for t in self.triggers],
-            "params_schema": dict(self.params_schema),
+            "params_schema": _thaw_value(self.params_schema),
             "retention_days": self.retention_days,
             "author_did": self.author_did,
         }
@@ -1170,7 +1185,7 @@ class WorkflowRun:
             "run_id": self.run_id,
             "workflow_name": self.workflow_name,
             "workflow_ver": self.workflow_ver,
-            "params": dict(self.params),
+            "params": _thaw_value(self.params),
             "status": self.status.value,
             "current_stages": list(self.current_stages),
             "parent_run_id": self.parent_run_id,

@@ -838,6 +838,31 @@ def test_workflow_spec_params_schema_immutable():
         spec.params_schema["type"] = "array"  # type: ignore[index]
 
 
+def test_workflow_spec_compute_spec_hash_with_nested_params():
+    """Round 16 P2: shallow dict() left MappingProxyType in output,
+    breaking json.dumps in compute_spec_hash. Recursive _thaw_value
+    fixes it for nested params."""
+    spec = WorkflowSpec(
+        name="r",
+        version=1,
+        stages=[
+            Stage(
+                name="lint",
+                signal_source="x",
+                signal_mode=SignalMode.ACTION,
+                read_only=True,
+                params={"branch": {"name": "main", "tags": ["a", "b"]}},
+            )
+        ],
+    )
+    # Must not raise — exercises json.dumps over the canonical payload.
+    h = spec.compute_spec_hash()
+    assert len(h) == 64
+    # And to_dict's JSON form is a plain dict tree.
+    payload = spec.to_dict()
+    json.dumps(payload)
+
+
 def test_workflow_spec_post_construction_mutation_does_not_change_hash():
     """Constructing then attempting mutation must NOT change
     compute_spec_hash — the freeze prevents it from succeeding at all,
