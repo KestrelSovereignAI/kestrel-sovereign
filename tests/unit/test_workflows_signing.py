@@ -20,6 +20,7 @@ from kestrel_sovereign.features.workflows import (
     StageLink,
     WorkflowSpec,
 )
+from kestrel_sovereign.features.workflows import WorkflowDefinitionError
 from kestrel_sovereign.features.workflows.signing import (
     canonical_transition_payload,
     sign_stage_transition,
@@ -163,17 +164,24 @@ def test_verify_fails_with_malformed_signature_hex():
     assert verify_workflow_spec(bad, _resolver_for(ai)) is False
 
 
-def test_sign_preserves_author_did_when_pre_set():
-    """A delegated-signing scenario: spec.author_did is set to a
-    different DID than the on-disk agent. ``sign_workflow_spec`` must
-    NOT overwrite it (the agent is the *signer*, not the *author* in
-    that flow). Phase 1's tool surface enforces the policy decision
-    of whether a delegated sign is allowed; this helper just preserves
-    the field."""
+def test_sign_rejects_mismatched_author_did():
+    """Round-2 P2: a pre-set author_did that doesn't match the agent's
+    signing_did would produce an unverifiable spec (signature is over
+    the agent's key, but verify resolves the foreign author_did).
+    Phase 0 helper rejects the mismatch. Delegated-signing flows are
+    a Phase 1+ multisig surface."""
     ai = _agent_identity(did="did:web:k.example")
     spec = _spec(author_did="did:web:author.example")
+    with pytest.raises(WorkflowDefinitionError):
+        sign_workflow_spec(spec, ai)
+
+
+def test_sign_accepts_matching_pre_set_author_did():
+    ai = _agent_identity(did="did:web:k.example")
+    spec = _spec(author_did="did:web:k.example")
     signed = sign_workflow_spec(spec, ai)
-    assert signed.author_did == "did:web:author.example"
+    assert signed.author_did == "did:web:k.example"
+    assert verify_workflow_spec(signed, _resolver_for(ai)) is True
 
 
 # ---------------------------------------------------------------------------

@@ -112,7 +112,25 @@ def sign_workflow_spec(
             "via sign_hybrid; until then this helper requires a legacy key."
         )
 
-    signing_did = spec.author_did or agent_identity.signing_did
+    # Codex chunk-D-review P2: a pre-set ``author_did`` that differs
+    # from the local agent's ``signing_did`` would produce an
+    # unverifiable signed spec — the signature is over a payload
+    # naming author_did=X, but the private key is the agent's key
+    # which a public-key resolver maps from agent_identity.signing_did,
+    # not X. Phase 0 sign helper requires the two to agree (either
+    # the spec carries no author_did and we set it from the agent, or
+    # the spec carries the agent's DID). Delegated-signing flows where
+    # a different author signs via a third party belong in a Phase 1+
+    # multisig surface, not this helper.
+    if spec.author_did and spec.author_did != agent_identity.signing_did:
+        raise WorkflowDefinitionError(
+            f"sign_workflow_spec: spec.author_did {spec.author_did!r} does "
+            f"not match agent_identity.signing_did "
+            f"{agent_identity.signing_did!r}. Use a delegated-signing "
+            "helper (Phase 1+) for cross-author signatures, or clear "
+            "spec.author_did so this helper sets it from the agent."
+        )
+    signing_did = agent_identity.signing_did
 
     # The canonical payload INCLUDES ``author_did`` (it's part of what
     # the author signs). Therefore set the author_did first, recompute
