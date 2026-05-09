@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from kestrel_sdk.tools.result import ToolResultStatus
 import pytest_asyncio
 
 from kestrel_sovereign.features.skills.feature import (
@@ -183,10 +184,10 @@ class TestExtractCandidates:
             ("ins-2", "sess-1", "improvement", "Memory recall too slow",
              "Queries take > 2s", 0.8, 1, "Add vector search index for memory retrieval"),
         ])
-        result = await feature.skill_extract_candidates(min_confidence=0.7, limit=10)
-        assert result["count"] == 2
-        assert result["candidates"][0]["insight_id"] == "ins-1"
-        assert result["candidates"][0]["title"] == "Always suggest exponential backoff for retries"
+        envelope = await feature.skill_extract_candidates(min_confidence=0.7, limit=10)
+        assert envelope.data["count"] == 2
+        assert envelope.data["candidates"][0]["insight_id"] == "ins-1"
+        assert envelope.data["candidates"][0]["title"] == "Always suggest exponential backoff for retries"
 
     @pytest.mark.asyncio
     async def test_dedups_against_existing_skills_on_disk(self, feature, tmp_path):
@@ -204,8 +205,8 @@ class TestExtractCandidates:
             ("ins-2", "sess-1", "improvement", "Memory recall too slow",
              "Queries take > 2s", 0.8, 1, "Add vector search index for memory retrieval"),
         ])
-        result = await feature.skill_extract_candidates()
-        assert result["count"] == 0
+        envelope = await feature.skill_extract_candidates()
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_dedups_against_graph_nodes(self, feature):
@@ -217,16 +218,16 @@ class TestExtractCandidates:
             ("ins-3", "sess-1", "pattern", "retries",
              "", 0.9, 1, "Use exponential backoff for retries"),
         ])
-        result = await feature.skill_extract_candidates()
-        assert result["count"] == 0
+        envelope = await feature.skill_extract_candidates()
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_skips_insights_without_suggested_action(self, feature):
         feature._db.fetchall = AsyncMock(return_value=[
             ("ins-x", "s", "pattern", "vague", "", 0.9, 1, ""),
         ])
-        result = await feature.skill_extract_candidates()
-        assert result["count"] == 0
+        envelope = await feature.skill_extract_candidates()
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_query_respects_min_confidence(self, feature):
@@ -254,7 +255,7 @@ class TestSkillSave:
             "ins-1", "sess-1", "improvement", "Memory recall too slow",
             "Queries take > 2s", 0.85, 1, "Add vector search index for memory retrieval",
         ))
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-1",
             steps_json=json.dumps([
                 "Create HNSW index on embeddings column",
@@ -264,11 +265,11 @@ class TestSkillSave:
             verification="p99 recall latency < 200ms on 10k rows",
             tags_json='["memory", "performance"]',
         )
-        assert result["success"] is True
-        assert result["skill_id"].startswith("skill_")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["skill_id"].startswith("skill_")
 
         # File exists and is parseable
-        skill_path = tmp_path / "skills" / f"{result['skill_id']}.md"
+        skill_path = tmp_path / "skills" / f"{envelope.data['skill_id']}.md"
         assert skill_path.exists()
         parsed = Skill.from_markdown(skill_path.read_text(encoding="utf-8"))
         assert parsed.title == "Add vector search index for memory retrieval"
@@ -294,56 +295,56 @@ class TestSkillSave:
         feature._db.fetchone = AsyncMock(return_value=(
             "ins-a", "s", "pattern", "t", "d", 0.9, 1, "Use exponential backoff for retries",
         ))
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-a",
             steps_json='["step 1"]',
             verification="v",
         )
-        assert result["success"] is False
-        assert "already exists" in result["error"].lower()
+        assert envelope.status is not ToolResultStatus.OK
+        assert "already exists" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_rejects_empty_steps(self, feature):
         feature._db.fetchone = AsyncMock(return_value=(
             "ins-b", "s", "pattern", "t", "d", 0.9, 1, "Some suggestion",
         ))
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-b", steps_json="[]", verification="v"
         )
-        assert result["success"] is False
-        assert "step" in result["error"].lower()
+        assert envelope.status is not ToolResultStatus.OK
+        assert "step" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_rejects_malformed_steps_json(self, feature):
         feature._db.fetchone = AsyncMock(return_value=(
             "ins-c", "s", "pattern", "t", "d", 0.9, 1, "Some suggestion",
         ))
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-c", steps_json="not json", verification="v"
         )
-        assert result["success"] is False
+        assert envelope.status is not ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_rejects_non_string_steps(self, feature):
         feature._db.fetchone = AsyncMock(return_value=(
             "ins-d", "s", "pattern", "t", "d", 0.9, 1, "Some suggestion",
         ))
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-d", steps_json="[1, 2, 3]", verification="v"
         )
-        assert result["success"] is False
-        assert "steps_json" in result["error"].lower()
+        assert envelope.status is not ToolResultStatus.OK
+        assert "steps_json" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_missing_insight(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="nope",
             steps_json='["x"]',
             verification="v",
         )
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        assert envelope.status is not ToolResultStatus.OK
+        assert "not found" in envelope.error.lower()
 
 
 # =============================================================================
@@ -365,9 +366,9 @@ class TestListShowDelete:
         )
         (tmp_path / "skills" / f"{s.id}.md").write_text(s.to_markdown(), encoding="utf-8")
 
-        result = await feature.skill_list()
-        assert result["count"] == 1
-        assert result["skills"][0]["title"] == "Roundtrip test"
+        envelope = await feature.skill_list()
+        assert envelope.data["count"] == 1
+        assert envelope.data["skills"][0]["title"] == "Roundtrip test"
 
     @pytest.mark.asyncio
     async def test_show_returns_skill(self, feature, tmp_path):
@@ -377,14 +378,14 @@ class TestListShowDelete:
             trigger="t", steps=["x"], verification="v",
         )
         (tmp_path / "skills" / f"{s.id}.md").write_text(s.to_markdown(), encoding="utf-8")
-        result = await feature.skill_show(skill_id="skill_show_1")
-        assert result["success"] is True
-        assert result["skill"]["title"] == "Shown"
+        envelope = await feature.skill_show(skill_id="skill_show_1")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["skill"]["title"] == "Shown"
 
     @pytest.mark.asyncio
     async def test_show_missing(self, feature):
-        result = await feature.skill_show(skill_id="skill_missing")
-        assert result["success"] is False
+        envelope = await feature.skill_show(skill_id="skill_missing")
+        assert envelope.status is not ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_delete_removes_file_and_node(self, feature, tmp_path):
@@ -395,10 +396,10 @@ class TestListShowDelete:
         path = tmp_path / "skills" / f"{s.id}.md"
         path.write_text(s.to_markdown(), encoding="utf-8")
 
-        result = await feature.skill_delete(skill_id="skill_del")
-        assert result["success"] is True
-        assert result["removed_file"] is True
-        assert result["removed_node"] is True
+        envelope = await feature.skill_delete(skill_id="skill_del")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_file"] is True
+        assert envelope.data["removed_node"] is True
         assert not path.exists()
         feature.agent.storage.delete_node.assert_awaited_once_with("skill_del")
 
@@ -406,8 +407,8 @@ class TestListShowDelete:
     async def test_delete_missing(self, feature):
         # Make the graph delete raise so removed_node stays False
         feature.agent.storage.delete_node = AsyncMock(side_effect=Exception("no node"))
-        result = await feature.skill_delete(skill_id="skill_nope")
-        assert result["success"] is False
+        envelope = await feature.skill_delete(skill_id="skill_nope")
+        assert envelope.status is not ToolResultStatus.OK
 
 
 # =============================================================================
@@ -437,27 +438,27 @@ class TestInputValidation:
     @pytest.mark.asyncio
     async def test_min_confidence_rejects_out_of_range(self, feature):
         for bad in (-0.1, 1.5, 2.0):
-            result = await feature.skill_extract_candidates(min_confidence=bad)
-            assert result["success"] is False
-            assert "[0.0, 1.0]" in result["error"]
+            envelope = await feature.skill_extract_candidates(min_confidence=bad)
+            assert envelope.status is not ToolResultStatus.OK
+            assert "[0.0, 1.0]" in envelope.error
 
     @pytest.mark.asyncio
     async def test_min_confidence_rejects_non_numeric(self, feature):
-        result = await feature.skill_extract_candidates(min_confidence="high")
-        assert result["success"] is False
-        assert "numeric" in result["error"].lower()
+        envelope = await feature.skill_extract_candidates(min_confidence="high")
+        assert envelope.status is not ToolResultStatus.OK
+        assert "numeric" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_limit_rejects_out_of_range(self, feature):
         for bad in (0, -1, 10_000):
-            result = await feature.skill_extract_candidates(limit=bad)
-            assert result["success"] is False
-            assert "[1, 500]" in result["error"]
+            envelope = await feature.skill_extract_candidates(limit=bad)
+            assert envelope.status is not ToolResultStatus.OK
+            assert "[1, 500]" in envelope.error
 
     @pytest.mark.asyncio
     async def test_limit_rejects_non_numeric(self, feature):
-        result = await feature.skill_extract_candidates(limit="lots")
-        assert result["success"] is False
+        envelope = await feature.skill_extract_candidates(limit="lots")
+        assert envelope.status is not ToolResultStatus.OK
 
 
 # =============================================================================
@@ -490,12 +491,12 @@ class TestAtomicWriteAndCollision:
 
         monkeypatch.setattr(mod.os, "link", _boom_on_finalize)
 
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-a",
             steps_json='["step a"]',
             verification="v",
         )
-        assert result["success"] is False
+        assert envelope.status is not ToolResultStatus.OK
 
         skills_dir = tmp_path / "skills"
         # No .md at the target, and no leftover tmp or claim files.
@@ -505,12 +506,12 @@ class TestAtomicWriteAndCollision:
 
         # Restore and confirm a clean save works afterwards.
         monkeypatch.setattr(mod.os, "link", real_link)
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-a",
             steps_json='["step a"]',
             verification="v",
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
 
     @pytest.mark.asyncio
     async def test_tmp_path_is_per_writer_not_deterministic(self, feature, tmp_path, monkeypatch):
@@ -537,19 +538,19 @@ class TestAtomicWriteAndCollision:
             steps_json='["s1"]',
             verification="v1",
         )
-        assert r1["success"] is True
+        assert r1.status is ToolResultStatus.OK
 
         # Remove the persisted file so the second save passes the collision
         # guard; the point of the test is the tmp-name uniqueness, not the
         # final-file race.
-        (tmp_path / "skills" / f"{r1['skill_id']}.md").unlink()
+        (tmp_path / "skills" / f"{r1.data['skill_id']}.md").unlink()
 
         r2 = await feature.skill_save(
             insight_id="ins-p1",
             steps_json='["s2"]',
             verification="v2",
         )
-        assert r2["success"] is True
+        assert r2.status is ToolResultStatus.OK
 
         # Both writes used distinct tmp filenames — no clobber possible.
         tmp_names = [n for n in observed_tmps if ".tmp." in n]
@@ -573,12 +574,12 @@ class TestAtomicWriteAndCollision:
             "ins-collide", "s", "pattern", "t", "d", 0.85, 1, title,
         ))
 
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-collide",
             steps_json='["s"]',
             verification="v",
         )
-        assert result["success"] is False
+        assert envelope.status is not ToolResultStatus.OK
         # File was NOT overwritten
         assert "existing content" in existing_path.read_text(encoding="utf-8")
 
@@ -736,12 +737,12 @@ class TestAtomicWriteAndCollision:
             "ins-sneak", "s", "pattern", "t", "d", 0.85, 1, "Sneaky overwrite test",
         ))
 
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-sneak",
             steps_json='["step"]',
             verification="v",
         )
-        assert result["success"] is False
+        assert envelope.status is not ToolResultStatus.OK
         # The original planted file is preserved, not overwritten.
         skill_id = skill_id_from_title("Sneaky overwrite test")
         final = tmp_path / "skills" / f"{skill_id}.md"
@@ -773,12 +774,12 @@ class TestStaleClaimReclamation:
         stale_mtime = time.time() - CLAIM_STALENESS_SECONDS - 10
         os.utime(claim_path, (stale_mtime, stale_mtime))
 
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-stale",
             steps_json='["step"]',
             verification="v",
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
         # Final file written, no leftover claim.
         final = tmp_path / "skills" / f"{skill_id}.md"
         assert final.exists()
@@ -796,13 +797,13 @@ class TestStaleClaimReclamation:
         claim_path.write_text("active claim", encoding="utf-8")
         # Freshly created — not stale.
 
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-fresh",
             steps_json='["step"]',
             verification="v",
         )
-        assert result["success"] is False
-        assert "concurrent" in result["error"].lower() or "in progress" in result["error"].lower()
+        assert envelope.status is not ToolResultStatus.OK
+        assert "concurrent" in envelope.error.lower() or "in progress" in envelope.error.lower()
         # Claim file was NOT removed by the blocked writer.
         assert claim_path.exists()
         assert claim_path.read_text(encoding="utf-8") == "active claim"
@@ -824,21 +825,24 @@ class TestPartialFailures:
         ))
         feature.agent.storage.add_node = AsyncMock(side_effect=Exception("graph down"))
 
-        result = await feature.skill_save(
+        envelope = await feature.skill_save(
             insight_id="ins-g",
             steps_json='["step"]',
             verification="v",
         )
-        assert result["success"] is True
+        assert envelope.status is ToolResultStatus.OK
 
-        skill_path = tmp_path / "skills" / f"{result['skill_id']}.md"
+        skill_path = tmp_path / "skills" / f"{envelope.data['skill_id']}.md"
         assert skill_path.exists()
         assert "Survives graph failure" in skill_path.read_text(encoding="utf-8")
 
     @pytest.mark.asyncio
     async def test_delete_reports_partial_removal(self, feature, tmp_path):
-        """File present but graph already lost it: delete still succeeds
-        and signals partial state via flags."""
+        """File present but graph already lost it: delete now surfaces
+        as PARTIAL (since #1061 wave 30) — the file went, but a stale
+        graph node will surface in associative recall, so the LLM
+        must not claim a clean removal.
+        """
         s = Skill(
             id="skill_partial",
             title="Partial",
@@ -847,10 +851,45 @@ class TestPartialFailures:
         (tmp_path / "skills" / f"{s.id}.md").write_text(s.to_markdown(), encoding="utf-8")
 
         feature.agent.storage.delete_node = AsyncMock(side_effect=Exception("not in graph"))
-        result = await feature.skill_delete(skill_id="skill_partial")
-        assert result["success"] is True
-        assert result["removed_file"] is True
-        assert result["removed_node"] is False
+        envelope = await feature.skill_delete(skill_id="skill_partial")
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["removed_file"] is True
+        assert envelope.data["removed_node"] is False
+        assert "graph node" in envelope.error and "associative recall" in envelope.error
+
+    @pytest.mark.asyncio
+    async def test_delete_stale_graph_node_with_file_already_absent_returns_ok(self, feature, tmp_path):
+        """Skills dir is configured but the file is already gone (stale
+        graph-only state from a previous partial delete or external
+        scrub). The graph delete succeeds. There's nothing to
+        resurrect, so the result must be OK — not PARTIAL with a
+        "could not be unlinked" caveat. Codex round 2 of #1130 caught
+        this falsely showing as PARTIAL.
+        """
+        # No file was ever written; skills_dir is set on the feature.
+        feature.agent.storage.delete_node = AsyncMock(return_value=None)
+        envelope = await feature.skill_delete(skill_id="skill_stale_node")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_file"] is False
+        assert envelope.data["removed_node"] is True
+
+    @pytest.mark.asyncio
+    async def test_delete_graph_only_no_skills_dir_returns_ok(self, feature):
+        """Graph-only agent (no skills directory configured) — a
+        successful graph node deletion must NOT trip the asymmetric-
+        PARTIAL branch, which would call ``_skill_path`` and raise
+        AssertionError. Codex round 1 of #1130 caught this.
+
+        A "no file_attempted, only graph_attempted" delete is
+        symmetric by construction — the graph layer is the only one
+        that could apply.
+        """
+        feature._skills_dir = None  # graph-only agent
+        feature.agent.storage.delete_node = AsyncMock(return_value=None)
+        envelope = await feature.skill_delete(skill_id="skill_graph_only")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_file"] is False
+        assert envelope.data["removed_node"] is True
 
     @pytest.mark.asyncio
     async def test_list_skips_unparseable_files(self, feature, tmp_path):
@@ -865,8 +904,8 @@ class TestPartialFailures:
             "just a plain note, not a skill\n", encoding="utf-8"
         )
 
-        result = await feature.skill_list()
-        titles = [s["title"] for s in result["skills"]]
+        envelope = await feature.skill_list()
+        titles = [s["title"] for s in envelope.data["skills"]]
         assert "Good skill" in titles
 
 

@@ -54,6 +54,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from .models import Skill, normalize_title, skill_id_from_title
 
@@ -103,22 +104,35 @@ class SkillsFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!skill list",
     )
-    async def skill_list(self) -> Dict[str, Any]:
+    async def skill_list(self) -> ToolResult:
         """List all skills this agent has extracted."""
         skills = await self._load_all_skills()
-        return {
-            "skills": [
-                {
-                    "id": s.id,
-                    "title": s.title,
-                    "tags": s.tags,
-                    "confidence": s.confidence,
-                    "created_at": s.created_at,
-                }
-                for s in skills
-            ],
-            "count": len(skills),
-        }
+        rows = [
+            {
+                "id": s.id,
+                "title": s.title,
+                "tags": s.tags,
+                "confidence": s.confidence,
+                "created_at": s.created_at,
+            }
+            for s in skills
+        ]
+        if not rows:
+            return ToolResult.ok(
+                "No extracted skills yet.",
+                data={"skills": [], "count": 0},
+            )
+        # Render the title list inside the confirmation so the !skill list
+        # CLI surface stays useful — the command-handler envelope formatter
+        # appends ``data`` only when it carries structural payload (a list
+        # value on a dict triggers the heuristic), so the JSON block does
+        # render here, but a one-line summary up top makes the LLM-facing
+        # confirmation honest about what's there.
+        titles = ", ".join(r["title"] for r in rows)
+        return ToolResult.ok(
+            f"{len(rows)} skill(s): {titles}",
+            data={"skills": rows, "count": len(rows)},
+        )
 
     @tool(
         "skill_show",
@@ -126,12 +140,19 @@ class SkillsFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!skill show",
     )
-    async def skill_show(self, skill_id: str) -> Dict[str, Any]:
+    async def skill_show(self, skill_id: str) -> ToolResult:
         """Show a skill's full content by ID."""
         skill = await self._load_skill(skill_id)
         if skill is None:
-            return {"success": False, "error": f"Skill {skill_id} not found"}
-        return {"success": True, "skill": skill.to_dict()}
+            return ToolResult.failed(error=f"Skill {skill_id} not found")
+        # Render the skill body inside the confirmation so !skill show
+        # surfaces what the user came for. ``data`` keeps the structured
+        # form for programmatic callers.
+        body = skill.to_markdown()
+        return ToolResult.ok(
+            f"Skill {skill_id} — {skill.title}:\n{body}",
+            data={"skill": skill.to_dict()},
+        )
 
     @tool(
         "skill_extract_candidates",
@@ -143,7 +164,7 @@ class SkillsFeature(Feature):
         self,
         min_confidence: float = MIN_CANDIDATE_CONFIDENCE,
         limit: int = 25,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Find actionable, high-confidence insights that aren't already skills.
 
         Deduplication: skips insights whose `suggested_action` would normalize
@@ -158,25 +179,27 @@ class SkillsFeature(Feature):
         try:
             min_confidence = float(min_confidence)
         except (TypeError, ValueError):
-            return {"success": False, "error": f"min_confidence must be numeric, got {min_confidence!r}"}
+            return ToolResult.failed(
+                error=f"min_confidence must be numeric, got {min_confidence!r}"
+            )
         if not (0.0 <= min_confidence <= 1.0):
-            return {"success": False, "error": "min_confidence must be in [0.0, 1.0]"}
+            return ToolResult.failed(error="min_confidence must be in [0.0, 1.0]")
 
         try:
             limit = int(limit)
         except (TypeError, ValueError):
-            return {"success": False, "error": f"limit must be an integer, got {limit!r}"}
+            return ToolResult.failed(error=f"limit must be an integer, got {limit!r}")
         if limit < 1 or limit > 500:
-            return {"success": False, "error": "limit must be in [1, 500]"}
+            return ToolResult.failed(error="limit must be in [1, 500]")
 
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed(error="Database not available")
 
         try:
             candidates = await self._fetch_candidates(min_confidence=min_confidence, limit=limit)
         except Exception as e:
             logger.error("Candidate query failed: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
 
         existing_titles = await self._existing_normalized_titles()
 
@@ -197,7 +220,10 @@ class SkillsFeature(Feature):
                 "would_become_skill_id": skill_id_from_title(suggested),
             })
 
-        return {"candidates": out, "count": len(out)}
+        return ToolResult.ok(
+            f"Found {len(out)} candidate insight(s) for skill extraction.",
+            data={"candidates": out, "count": len(out)},
+        )
 
     @tool(
         "skill_save",
@@ -211,7 +237,7 @@ class SkillsFeature(Feature):
         steps_json: str,
         verification: str,
         tags_json: str = "[]",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Promote a candidate insight into a stored skill.
 
         The LLM typically calls this after reviewing `skill_extract_candidates`
@@ -226,34 +252,34 @@ class SkillsFeature(Feature):
             tags_json: Optional JSON array of tag strings
         """
         if not self._db:
-            return {"success": False, "error": "Database not available"}
+            return ToolResult.failed(error="Database not available")
 
         try:
             steps = json.loads(steps_json)
             if not isinstance(steps, list) or not all(isinstance(s, str) for s in steps):
-                return {"success": False, "error": "steps_json must be a JSON array of strings"}
+                return ToolResult.failed(error="steps_json must be a JSON array of strings")
             if len(steps) == 0:
-                return {"success": False, "error": "at least one step is required"}
+                return ToolResult.failed(error="at least one step is required")
 
             tags = json.loads(tags_json)
             if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
-                return {"success": False, "error": "tags_json must be a JSON array of strings"}
+                return ToolResult.failed(error="tags_json must be a JSON array of strings")
         except json.JSONDecodeError as e:
-            return {"success": False, "error": f"Invalid JSON: {e}"}
+            return ToolResult.failed(error=f"Invalid JSON: {e}")
 
         insight = await self._fetch_insight(insight_id)
         if insight is None:
-            return {"success": False, "error": f"Insight {insight_id} not found"}
+            return ToolResult.failed(error=f"Insight {insight_id} not found")
 
         title = (insight.get("suggested_action") or "").strip()
         trigger = (insight.get("description") or title).strip()
         if not title:
-            return {"success": False, "error": "Insight has no suggested_action"}
+            return ToolResult.failed(error="Insight has no suggested_action")
 
         norm = normalize_title(title)
         existing = await self._existing_normalized_titles()
         if norm in existing:
-            return {"success": False, "error": f"A skill with a similar title already exists"}
+            return ToolResult.failed(error="A skill with a similar title already exists")
 
         skill = Skill(
             id=skill_id_from_title(title),
@@ -272,14 +298,16 @@ class SkillsFeature(Feature):
             await self._save_skill(skill)
         except Exception as e:
             logger.error("Failed to save skill: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
 
-        return {
-            "success": True,
-            "skill_id": skill.id,
-            "title": skill.title,
-            "path": str(self._skill_path(skill.id)) if self._skills_dir else None,
-        }
+        return ToolResult.ok(
+            f"Saved skill '{skill.title}' (id={skill.id}).",
+            data={
+                "skill_id": skill.id,
+                "title": skill.title,
+                "path": str(self._skill_path(skill.id)) if self._skills_dir else None,
+            },
+        )
 
     @tool(
         "skill_delete",
@@ -287,22 +315,38 @@ class SkillsFeature(Feature):
         category=ToolCategory.UTILITY,
         command_prefix="!skill delete",
     )
-    async def skill_delete(self, skill_id: str) -> Dict[str, Any]:
-        """Remove a skill from disk and the graph."""
+    async def skill_delete(self, skill_id: str) -> ToolResult:
+        """Remove a skill from disk and the graph.
+
+        Returns:
+            ToolResult.ok when every layer that *could* apply did its
+            job (both file + graph deleted, or only one layer was
+            available and it succeeded); PARTIAL when both layers
+            were available but only one succeeded — the asymmetric
+            outcome must be spoken because a stale graph node still
+            surfaces in associative recall and a stale file
+            resurrects on the next list/save; ERROR when neither
+            layer found anything to remove.
+        """
         removed_file = False
         removed_node = False
+        file_unlink_failed = False
+        file_was_present = False
 
-        if self._skills_dir:
+        if self._skills_dir is not None:
             path = self._skill_path(skill_id)
             if path.exists():
+                file_was_present = True
                 try:
                     path.unlink()
                     removed_file = True
                 except OSError as e:
                     logger.warning("Could not remove skill file %s: %s", path, e)
+                    file_unlink_failed = True
 
         storage = getattr(self.agent, "storage", None)
-        if storage is not None and hasattr(storage, "delete_node"):
+        graph_attempted = storage is not None and hasattr(storage, "delete_node")
+        if graph_attempted:
             try:
                 await storage.delete_node(skill_id)
                 removed_node = True
@@ -310,13 +354,60 @@ class SkillsFeature(Feature):
                 logger.warning("Could not remove skill node %s: %s", skill_id, e)
 
         if not (removed_file or removed_node):
-            return {"success": False, "error": f"Skill {skill_id} not found"}
-        return {
-            "success": True,
+            return ToolResult.failed(error=f"Skill {skill_id} not found")
+
+        data = {
             "skill_id": skill_id,
             "removed_file": removed_file,
             "removed_node": removed_node,
         }
+        # PARTIAL only fires for *real asymmetric leftover state*.
+        #
+        # 1. File unlink genuinely failed (file existed, OSError) AND
+        #    graph delete succeeded — the file will resurrect on the
+        #    next list/save.
+        # 2. File deletion succeeded AND graph_attempted but the
+        #    delete_node call raised — the graph node may still
+        #    surface in associative recall. (We can't reliably tell
+        #    "raised because already absent" from "raised because
+        #    backend down" without backend-specific introspection,
+        #    so this caveat is conservatively spoken.)
+        #
+        # Cases that are NOT asymmetric and stay OK (codex round 2 of
+        # #1130 caught these falsely showing as PARTIAL):
+        # - file already absent + graph deleted (stale-node cleanup;
+        #   nothing to resurrect).
+        # - graph never attempted + file removed (single-layer agent).
+        if file_unlink_failed and removed_node:
+            # Case 1: real file-side failure.
+            assert self._skills_dir is not None  # file_unlink_failed implies it
+            caveat = (
+                f"graph node removed but file at {self._skill_path(skill_id)} "
+                "could not be unlinked — the skill will reload on next "
+                "list/save attempt."
+            )
+            return ToolResult.partial(
+                f"Skill {skill_id} partially removed.",
+                caveat,
+                data=data,
+            )
+        if removed_file and graph_attempted and not removed_node:
+            # Case 2: file went, graph delete raised. Conservative
+            # PARTIAL — see comment above.
+            caveat = (
+                f"file removed but graph node {skill_id} could not be "
+                "deleted — it may still surface in associative recall "
+                "until the graph is reachable again."
+            )
+            return ToolResult.partial(
+                f"Skill {skill_id} partially removed.",
+                caveat,
+                data=data,
+            )
+        return ToolResult.ok(
+            f"Skill {skill_id} removed.",
+            data=data,
+        )
 
     # ------------------------------------------------------------------
     # Internals
