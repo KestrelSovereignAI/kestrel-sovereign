@@ -292,16 +292,18 @@ kestrel.toml aside, regenerate from scratch.
   step inside `PayerResolver.resolve()` — never at inception, only on
   first need. Retirement service already guards on
   `openrouter_key_hash`; no change needed.
-- **Lighthouse:** `LighthouseProvider`'s existing
-  `key_resolver: Optional[KeyResolutionService]` parameter is
-  unchanged. Phase 3 includes one small refactor to
-  `LighthouseProvider.__init__` so the constructor's `api_key` and
-  `key_resolver` parameters are mutually exclusive in spirit: when a
-  resolver is supplied, the env-var fallback is NOT consulted at
-  construction time. This is what lets the agent-init layer honor a
-  `NONE` policy by passing `api_key=None` with the resolver, and to
-  honor the other kinds without accidental env-var bleed-through. The
-  provider's `_get_api_key()` continues to call
+- **Lighthouse:** Two changes. (1) Honoring `NONE`: if
+  `PayerResolver.resolve_for(agent_did, "storage")` returns
+  `enabled=False`, the agent-init layer skips constructing
+  `LighthouseProvider` and `LighthouseTarget` entirely. Storage features
+  that consume them already handle their absence (today's missing
+  `LIGHTHOUSE_API_KEY` exercises the same code path). (2) When the
+  resolver IS in charge (any kind other than `NONE`), the provider is
+  constructed with `api_key=None` plus the resolver from
+  `ResolvedResource`; a tiny refactor to `LighthouseProvider.__init__`
+  ensures that `api_key=None` paired with a non-None resolver does NOT
+  silently fall back to `os.environ["LIGHTHOUSE_API_KEY"]` at
+  construction time. The provider's `_get_api_key()` continues to call
   `resolve_key("lighthouse", require=False)` exactly as it does today.
   `LighthouseTarget` gets the same treatment. Phase 3 ships
   `HOST_ENV`; Phase 3.5 ships `HOST_MASTER_PROVISIONED` and
@@ -360,27 +362,40 @@ mode of `ServiceKeyStorage`.
 
 ### Phase 3 — Wire OpenRouter and Lighthouse through the resolver (`HOST_ENV` + `HOST_MASTER_PROVISIONED`) (~1 day)
 
-- `LighthouseProvider` and `LighthouseTarget` instances receive a
-  `KeyResolutionService` instance produced by
-  `PayerResolver.key_resolver_for(agent_did, "storage")` at agent-init
-  time. The provider's `key_resolver: Optional[KeyResolutionService]`
-  parameter is unchanged; only the wiring at
-  `kestrel_agent.py:initialize()` changes.
+- At agent-init time in `kestrel_agent.py:initialize()`, call
+  `PayerResolver.resolve_for(agent_did, "storage")` and
+  `PayerResolver.resolve_for(agent_did, "llm")`. For each
+  `ResolvedResource`:
+  - `enabled=False` → DO NOT construct the provider (Lighthouse provider
+    / Lighthouse target / LLM client) at all. Storage features that
+    depend on it must already tolerate `None` (today's `LIGHTHOUSE_API_KEY`
+    not being set is functionally the same condition).
+  - `enabled=True` → construct the provider with `api_key=None` and the
+    `key_resolver` from `ResolvedResource`. The provider's existing
+    `key_resolver` parameter is unchanged.
+- Small refactor to `LighthouseProvider.__init__`: when both `api_key`
+  and `key_resolver` are `None`, fall back to `os.environ` (today's
+  behavior); otherwise use whichever was supplied verbatim. No silent
+  env-var bleed-through when the resolver is in charge.
 - `OpenRouterProvisioningService.create_agent_key` becomes the
-  side-effect inside `PayerResolver.key_resolver_for(agent_did, "llm")`
-  when the policy says `HOST_MASTER_PROVISIONED`. Idempotent: skip if a
+  side-effect inside `PayerResolver.resolve_for(agent_did, "llm")` when
+  the policy spec is `HOST_MASTER_PROVISIONED`. Idempotent: skip if a
   child key for this agent already exists in `ServiceKeyStorage`. Keep
   the current direct-call path available for the existing
   `manage_openrouter_keys.py` script.
 - Inception service stays simple: it does NOT provision vendor keys.
   First-use lazy provisioning is the contract.
-- Tests: per-agent key isolation end-to-end against a mock OpenRouter
-  REST and the existing Lighthouse env-var path; cold-start restore
-  regression test still passes.
+- Tests:
+  - per-agent OpenRouter key isolation against a mock REST.
+  - existing Lighthouse env-var path still works (back-compat).
+  - cold-start restore regression test still passes.
+  - `storage = none` actually disables Lighthouse on a host that has
+    `LIGHTHOUSE_API_KEY` set (regression for the round-2 finding).
 
 **Codex review focus:** the lazy-provisioning contract is observable
 and idempotent under retry; cold-start restore from Lighthouse still
-works; no regression in today's `LIGHTHOUSE_API_KEY` env-var behavior.
+works; no regression in today's `LIGHTHOUSE_API_KEY` env-var behavior;
+`NONE` policy actually disables.
 
 ### Phase 3.5 — Lighthouse `HOST_MASTER_PROVISIONED` and `SELF_WALLET` (~half day)
 
