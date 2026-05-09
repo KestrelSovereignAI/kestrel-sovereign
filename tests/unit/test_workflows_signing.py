@@ -220,6 +220,52 @@ def test_canonical_transition_distinguishes_none_from_string():
     assert none_form != str_form
 
 
+def test_canonical_transition_no_sentinel_collision():
+    """Codex chunk-C round-1 P2: the prior 'none' literal collided with
+    a persisted ``signal_id='none'``. JSON serialization makes
+    ``null`` (None) and ``"none"`` (string) byte-distinct."""
+    none_payload = canonical_transition_payload(
+        run_id="r-1",
+        stage_name="lint",
+        attempt_number=1,
+        signal_id=None,
+        gate_outcome=None,
+    )
+    string_none_payload = canonical_transition_payload(
+        run_id="r-1",
+        stage_name="lint",
+        attempt_number=1,
+        signal_id="none",
+        gate_outcome="none",
+    )
+    assert none_payload != string_none_payload
+
+
+def test_verify_stage_transition_does_not_accept_sentinel_replay():
+    """End-to-end: a signature produced for ``signal_id=None`` must NOT
+    verify against a StageLink whose ``signal_id='none'``."""
+    ai = _agent_identity()
+    sig_none = sign_stage_transition(
+        run_id="r-1",
+        stage_name="lint",
+        attempt_number=1,
+        signal_id=None,
+        gate_outcome=None,
+        agent_identity=ai,
+    )
+    link = StageLink(
+        link_id="l-1",
+        run_id="r-1",
+        stage_name="lint",
+        attempt_number=1,
+        idempotency_key="0" * 64,
+        actor_did=ai.signing_did,
+        actor_sig=sig_none,
+        signal_id="none",  # literal string — MUST NOT match the None sig
+    )
+    assert verify_stage_transition(link, _resolver_for(ai)) is False
+
+
 def test_sign_then_verify_stage_transition():
     ai = _agent_identity()
     sig_hex = sign_stage_transition(

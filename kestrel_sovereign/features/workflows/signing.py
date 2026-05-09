@@ -219,30 +219,36 @@ def canonical_transition_payload(
     signal_id: Optional[str],
     gate_outcome: Optional[str],
 ) -> bytes:
-    """Deterministic, dialect-portable byte form for a stage transition
-    signature (design §5 ``actor_sig`` definition).
+    """Deterministic byte form for a stage transition signature (design
+    §5 ``actor_sig`` definition).
 
-    Format: ``"workflow.stage_transition.v1\\n<run_id>\\n<stage_name>\\n
-    <attempt_number>\\n<signal_id>\\n<gate_outcome>"`` UTF-8 encoded.
+    Format: a JSON object with sorted keys, no whitespace, ``ensure_ascii``
+    off, prefixed with the ``workflow.stage_transition.v1`` discriminator
+    line. JSON's distinction between ``null`` and the string ``"null"``
+    means a pre-dispatch ``signal_id=None`` cannot produce the same
+    bytes as any persisted string value — closing the round-1 codex
+    P2 sentinel-collision gap (the prior format used the literal
+    string ``"none"`` which collided with a persisted ``signal_id="none"``).
 
     The ``v1`` discriminator front-loads the format version so future
-    additions (extra fields, JSON canonicalization) can introduce
-    ``v2`` without colliding with v1 signatures. ``None`` values
-    serialize as the literal four-byte string ``"none"`` so a missing
-    ``signal_id`` (pre-dispatch) and a present ``signal_id`` named
-    "none" cannot collide — the latter is rejected at the dataclass
-    boundary (signal_id values come from signal_log.id which is a
-    UUID, not the literal string).
+    additions (extra fields) can ship ``v2`` without colliding with
+    v1 signatures.
     """
-    parts = (
-        "workflow.stage_transition.v1",
-        run_id,
-        stage_name,
-        str(attempt_number),
-        "none" if signal_id is None else signal_id,
-        "none" if gate_outcome is None else gate_outcome,
+    import json as _json
+
+    body = _json.dumps(
+        {
+            "run_id": run_id,
+            "stage_name": stage_name,
+            "attempt_number": attempt_number,
+            "signal_id": signal_id,
+            "gate_outcome": gate_outcome,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
     )
-    return "\n".join(parts).encode("utf-8")
+    return f"workflow.stage_transition.v1\n{body}".encode("utf-8")
 
 
 def sign_stage_transition(
