@@ -422,7 +422,7 @@ core = false
 [legal]
 package = "kestrel-feature-legal"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-legal.git"
-features = ["IncorporateTool"]
+features = ["LegalFeature"]
 description = "Wyoming DAO LLC formation — articles of organization, operating agreements, incorporation documents"
 tags = ["legal", "incorporation", "wyoming", "dao"]
 icon = "scale"

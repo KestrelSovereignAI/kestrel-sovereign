@@ -385,36 +385,45 @@ class SleepMixin:
         """
         report = SleepReport(success=False)
 
-        # 1. Attempt incorporation if params provided
+        # 1. Attempt incorporation if params provided.
+        # Resolves LegalFeature via the agent's feature registry rather than
+        # importing kestrel_feature_legal directly: feature packages are
+        # extensions, not dependencies of sovereign.
         if incorporation_params:
-            try:
-                from kestrel_feature_legal import LegalFeature
-
-                feature = LegalFeature(agent=self)
-                await feature.initialize()
-                result = await feature.incorporate(**incorporation_params)
-
-                report.incorporation_attempted = True
-                report.incorporation_success = result.get("success", False)
-                report.incorporation_package_hash = result.get("package_hash")
-
-                if result.get("success"):
-                    # Store legal entity in agent's identity
-                    if hasattr(self, "legal_entity"):
-                        self.legal_entity = result.get("legal_entity")
-                    logger.info(
-                        "Pre-cryostasis incorporation succeeded: %s",
-                        result.get("entity_name"),
-                    )
-                else:
-                    logger.warning(
-                        "Pre-cryostasis incorporation failed: %s",
-                        result.get("error"),
-                    )
-            except Exception as e:
-                logger.warning("Pre-cryostasis incorporation error: %s", e)
+            feature = self.get_feature("legal")
+            if feature is None:
+                logger.warning(
+                    "Pre-cryostasis incorporation requested but no 'legal' "
+                    "feature is registered. Install kestrel-feature-legal "
+                    "and ensure it's enabled in the agent's feature profile."
+                )
                 report.incorporation_attempted = True
                 report.incorporation_success = False
+            else:
+                try:
+                    result = await feature.incorporate(**incorporation_params)
+
+                    report.incorporation_attempted = True
+                    report.incorporation_success = result.get("success", False)
+                    report.incorporation_package_hash = result.get("package_hash")
+
+                    if result.get("success"):
+                        # Store legal entity in agent's identity
+                        if hasattr(self, "legal_entity"):
+                            self.legal_entity = result.get("legal_entity")
+                        logger.info(
+                            "Pre-cryostasis incorporation succeeded: %s",
+                            result.get("entity_name"),
+                        )
+                    else:
+                        logger.warning(
+                            "Pre-cryostasis incorporation failed: %s",
+                            result.get("error"),
+                        )
+                except Exception as e:
+                    logger.warning("Pre-cryostasis incorporation error: %s", e)
+                    report.incorporation_attempted = True
+                    report.incorporation_success = False
 
         # 2. Run full sleep with permanent storage
         sleep_report = await self.sleep(tier="filecoin")
