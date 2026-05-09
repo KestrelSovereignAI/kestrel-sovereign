@@ -61,7 +61,7 @@ That's the pattern Kestrel needs everywhere — sovereignty CAR export/import, q
 
 ## 2. Hard prerequisite (separate epic)
 
-**Constitutional-injection upgrade for SignalDispatcher** (filed as its own epic alongside this one — see #1131 sub-issue list). v3.4 of this design carried §3.8 "Talon-aware constitutional injection" inside Workflows; v4 splits that out because hash-verified injection, priority-ordered truncation, recursive ref-resolution, `constitution_echo_verified` reception, and `constitutional_boundary_clean` static-scan apply to **every COGNITION signal**, not just workflow stages. Workflows depends on that work landing. Until it does, Workflows COGNITION stages get whatever Talon's current `_CONSTITUTION_CACHE` injection provides — which is acceptable for v1 since the workflow gate `constitution_echo_verified` (§3.3) still acts as a defense-in-depth layer at the workflow boundary even if the dispatcher hasn't been upgraded yet.
+**Constitutional-injection upgrade for SignalDispatcher** (filed as its own epic, **#1137**). v3.4 of this design carried §3.8 "Talon-aware constitutional injection" inside Workflows; v4 splits that out because hash-verified injection, priority-ordered truncation, recursive ref-resolution, `constitution_echo_verified` reception, and `constitutional_boundary_clean` static-scan apply to **every COGNITION signal**, not just workflow stages. Workflows depends on that work landing. Until it does, Workflows COGNITION stages get whatever Talon's current `_CONSTITUTION_CACHE` injection provides — which is acceptable for v1 since the workflow gate `constitution_echo_verified` (§3.3) still acts as a defense-in-depth layer at the workflow boundary even if the dispatcher hasn't been upgraded yet.
 
 ## 3. Domain model
 
@@ -378,7 +378,7 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 - #376 Agent Lifecycle Hardening — `consent_collect` gate via existing hook system
 - #462 Open Source Core/Feature Split — feature-package architecture
 - #1131 this epic
-- (TBD) Constitutional injection upgrade for SignalDispatcher — separate epic; hard prerequisite for §3.7 + dispatcher-wide benefit
+- #1137 Constitutional injection upgrade for SignalDispatcher — hard prerequisite for §3.7 + dispatcher-wide benefit; in v1 of Workflows the `constitution_echo_verified` gate is defense-in-depth at the workflow boundary so Workflows can ship before #1137 lands
 - `docs/architecture/SIGNAL_DISPATCHER.md` — canonical platform reference
 - `docs/architecture/SIGNAL_SOURCES_GUIDE.md` — registration walkthrough
 - `kestrel-talon/governance/constitution.py` — current constitution embedding upstream
