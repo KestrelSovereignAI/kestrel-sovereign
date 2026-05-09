@@ -66,6 +66,19 @@ class WorkflowStore(UnifiedStoreBase):
     def __init__(self, backend: DatabaseBackend):
         super().__init__(backend)
 
+    def _bool_default(self, value: bool) -> str:
+        """Dialect-portable DDL boolean default.
+
+        Codex round-2 P2: Postgres' ``BOOLEAN DEFAULT 0`` is a syntax
+        error; SQLite stores booleans as INTEGER and uses ``0``/``1``.
+        The base ``UnifiedStoreBase`` exposes value-side helpers
+        (``to_bool_param``) but not a DDL-side helper, so we keep the
+        literal mapping local here.
+        """
+        if self.is_postgres:
+            return "TRUE" if value else "FALSE"
+        return "1" if value else "0"
+
     async def initialize(self) -> None:
         await self._create_definitions_table()
         await self._create_runs_table()
@@ -137,7 +150,7 @@ class WorkflowStore(UnifiedStoreBase):
                 cancel_barrier_at         {ts_type},
                 started_by_did            TEXT NOT NULL,
                 scheduler_task_id         TEXT,
-                signature_post_revocation {bool_type} NOT NULL DEFAULT 0,
+                signature_post_revocation {bool_type} NOT NULL DEFAULT {self._bool_default(False)},
                 started_at                {ts_type} NOT NULL {ts_default},
                 finished_at               {ts_type},
                 deleted_at                {ts_type},
@@ -193,7 +206,7 @@ class WorkflowStore(UnifiedStoreBase):
                 gate_outcome      TEXT,
                 gate_reason       TEXT,
                 compensate_state  TEXT,
-                post_cancel       {bool_type} NOT NULL DEFAULT 0,
+                post_cancel       {bool_type} NOT NULL DEFAULT {self._bool_default(False)},
                 actor_did         TEXT NOT NULL,
                 actor_sig         TEXT NOT NULL,
                 occurred_at       {ts_type} NOT NULL {ts_default},
