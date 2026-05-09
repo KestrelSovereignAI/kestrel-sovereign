@@ -199,12 +199,19 @@ class TestDelegatedStorageNotImplemented:
             comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
         )
         resolver = FoundationPayerResolver(policy)
-        with pytest.raises(NotImplementedError) as excinfo:
+        # The SDK SUPPORT_MATRIX marks (STORAGE, lighthouse, <delegated>)
+        # as NOT_IMPLEMENTED, so the matrix-validation gate at the top of
+        # resolve_for raises UnsupportedCombinationError before ever
+        # reaching the kind dispatch. This keeps matrix and resolver
+        # behavior aligned; codex round 3 of Phase 3a flagged the
+        # earlier inconsistency where matrix said READY but resolver
+        # raised NotImplementedError.
+        with pytest.raises(UnsupportedCombinationError) as excinfo:
             await resolver.resolve_for(
                 "did:test:agent-a", ResourceClass.STORAGE
             )
-        assert kind.name in str(excinfo.value)
-        assert "storage" in str(excinfo.value).lower()
+        assert excinfo.value.kind is kind
+        assert excinfo.value.resource_class is ResourceClass.STORAGE
 
 
 class TestSelfWalletDeferred:

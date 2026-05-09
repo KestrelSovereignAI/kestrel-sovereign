@@ -116,41 +116,23 @@ class FoundationPayerResolver:
         # env-var fallback. Always safe; no side effects required.
         #
         # HOST_MASTER_PROVISIONED / USER_MASTER_PROVISIONED / SPONSOR:
-        # share the same agent-side surface but require provisioning
-        # side-effects (mint a per-agent child credential against the
-        # designated master) to be SAFE to enable.
-        # - For LLM, the back-compat path is the deprecated
-        #   `openrouter_key_hash` agent metadata field: when present,
-        #   the agent-init layer calls use_agent_key against the
-        #   already-stored child key. Phase 3c switches to
-        #   resolver-driven minting when the field is absent.
-        # - For STORAGE (Lighthouse) and everything else, there is no
-        #   analogous "child credential already provisioned" path.
-        #   Returning enabled here would let LighthouseProvider fall
-        #   through to LIGHTHOUSE_API_KEY env var — i.e., the
-        #   operator's master key billed as the agent's storage. That
-        #   is exactly the policy violation these payer kinds exist to
-        #   prevent. Raise NotImplementedError until Phase 3.5 ships
-        #   the wallet-signed Lighthouse key flow.
+        # share the same agent-side surface in Phase 3a — an enabled
+        # ResolvedResource backed by ServiceKeyStorage with env-var
+        # fallback. The agent-init layer detects pre-existing per-agent
+        # credentials via the deprecated `openrouter_key_hash` metadata
+        # field and calls use_agent_key. Phase 3c switches to
+        # resolver-driven minting for LLM when that field is absent.
+        # For STORAGE these kinds are marked NOT_IMPLEMENTED in the SDK
+        # support matrix until Phase 3.5 ships the Lighthouse wallet-
+        # signed key flow — the matrix check above already raises
+        # UnsupportedCombinationError for them, so we don't need a
+        # second gate here.
         delegated_master_kinds = {
             PayerKind.HOST_MASTER_PROVISIONED,
             PayerKind.USER_MASTER_PROVISIONED,
             PayerKind.SPONSOR,
         }
-        if spec.kind in delegated_master_kinds and resource_class is not ResourceClass.LLM:
-            raise NotImplementedError(
-                f"PayerKind.{spec.kind.name} resolution for "
-                f"({resource_class.value}, vendor={spec.vendor!r}) is not "
-                "yet implemented. Phase 3.5 of the PayerPolicy plan adds "
-                "Lighthouse wallet-signed key minting; until then, "
-                "delegated-master kinds are LLM-only. See "
-                "docs/architecture/PAYER_POLICY_FOUNDATION.md."
-            )
-
-        if spec.kind is PayerKind.HOST_ENV or (
-            spec.kind in delegated_master_kinds
-            and resource_class is ResourceClass.LLM
-        ):
+        if spec.kind is PayerKind.HOST_ENV or spec.kind in delegated_master_kinds:
             logger.debug(
                 f"PayerPolicy.{resource_class.value}: HOST_ENV for agent "
                 f"{agent_did[:30]}..."
