@@ -195,6 +195,22 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_from_dict_requires_compensate():
+    """Round 8 P2: signed-spec integrity. Defaulting ``compensate`` in
+    from_dict lets a wire form omit it and re-hash to a canonical
+    signed form. Schema requires it; from_dict must too."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage.from_dict(
+            {
+                "name": "x",
+                "signal_source": "x",
+                "signal_mode": "action",
+                "read_only": True,
+                # compensate omitted
+            }
+        )
+
+
 def test_stage_from_dict_rejects_string_for_forbidden_modules():
     """Codex round 3 P2: ``tuple('features.security')`` expands a
     string into single chars, each a non-empty str; the all-isinstance

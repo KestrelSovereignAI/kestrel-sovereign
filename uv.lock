@@ -2259,6 +2259,7 @@ full = [
     { name = "elevenlabs" },
     { name = "faster-whisper" },
     { name = "google-cloud-run" },
+    { name = "jsonschema" },
     { name = "kestrel-sovereign-sdk", extra = ["metrics"] },
     { name = "langchain" },
     { name = "langchain-community" },
@@ -2320,6 +2321,7 @@ search = [
 ]
 test = [
     { name = "asgi-lifespan" },
+    { name = "jsonschema" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
@@ -2398,6 +2400,7 @@ requires-dist = [
     { name = "idna", specifier = "==3.11" },
     { name = "iniconfig", specifier = "==2.1.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
+    { name = "jsonschema", marker = "extra == 'test'", specifier = ">=4.20" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["delivery"], marker = "extra == 'all-features'" },

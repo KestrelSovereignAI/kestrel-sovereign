@@ -436,13 +436,29 @@ class Stage:
         # would compute the same digest as the actually-signed
         # canonical bytes, letting a malformed wire form claim a valid
         # signature.
+        # Round 8 P2: ``compensate`` is REQUIRED at the wire boundary
+        # (schema enforces it). Defaulting it to ``noop_idempotent`` in
+        # from_dict would let a malformed wire form ``{name, source, mode}``
+        # construct a Stage that hashes identically to a canonical
+        # ``{..., compensate: "noop_idempotent"}`` form — letting the
+        # malformed wire claim a valid signature. Pass through using
+        # the strict-key access ``data["compensate"]`` so KeyError is
+        # surfaced (caller wraps in WorkflowDefinitionError below for
+        # non-Mapping inputs; missing required keys are similar).
+        if "compensate" not in data:
+            raise WorkflowDefinitionError(
+                "stage.compensate is required at the wire boundary "
+                "(schema requires it; defaulting in from_dict would let "
+                "a malformed wire form re-hash to a canonical signed "
+                "form)"
+            )
         return cls(
             name=data["name"],
             signal_source=data["signal_source"],
             signal_mode=data["signal_mode"],
             params=_present_or(data, "params", {}),
             gate=Gate.from_dict(gate_data),
-            compensate=data.get("compensate", "noop_idempotent"),
+            compensate=data["compensate"],
             forbidden_modules=_present_or(data, "forbidden_modules", ()),
             irreversible=data.get("irreversible", False),
             non_deterministic=data.get("non_deterministic", False),
