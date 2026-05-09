@@ -47,10 +47,18 @@ def _gate_schema() -> dict[str, Any]:
 
 
 def _stage_schema() -> dict[str, Any]:
+    # ``compensate`` is REQUIRED at the wire-format boundary even though
+    # ``Stage`` itself has a Python-side default of ``noop_idempotent``.
+    # Codex round 1 P2 catch: if the schema let it default, a client
+    # could submit a writeful ACTION stage (no ``read_only=True``,
+    # default ``compensate=noop_idempotent``) which validates against
+    # the schema but the dataclass rejects in __post_init__. Forcing
+    # the field at the wire boundary keeps schema parity with the
+    # dataclass — what validates here also constructs in Python.
     return {
         "type": "object",
         "additionalProperties": False,
-        "required": ["name", "signal_source", "signal_mode"],
+        "required": ["name", "signal_source", "signal_mode", "compensate"],
         "properties": {
             "name": {"type": "string", "pattern": _NAME_PATTERN},
             "signal_source": {"type": "string", "pattern": _NAME_PATTERN},

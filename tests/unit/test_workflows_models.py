@@ -195,6 +195,23 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_from_dict_rejects_string_booleans():
+    """Codex round 1 P2: ``bool("false")`` is True. ``Stage.from_dict``
+    must NOT silently coerce strings to booleans, or a writeful ACTION
+    stage with ``read_only="false"`` would slip past the
+    noop_idempotent eligibility check."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage.from_dict(
+            {
+                "name": "publish",
+                "signal_source": "ci.publish",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": "false",  # the bug — string, not bool
+            }
+        )
+
+
 def test_stage_round_trip():
     stage = _action_stage(
         gate=Gate(
@@ -495,6 +512,24 @@ def test_workflow_stage_link_to_dict_validates_against_schema():
     jsonschema.validate(
         instance=link.to_dict(), schema=WORKFLOW_STAGE_LINK_SCHEMA
     )
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_compensate_so_dataclass_can_construct():
+    """Codex round 1 P2: schema MUST require ``compensate`` at the wire
+    boundary. Otherwise a writeful ACTION stage (omitting compensate,
+    omitting read_only) validates against the schema but fails the
+    dataclass eligibility check — split-brain wire contract."""
+    spec = _minimal_spec().to_dict()
+    minimal_stage = {
+        "name": "publish",
+        "signal_source": "ci.publish",
+        "signal_mode": "action",
+        # compensate omitted — schema must reject this
+    }
+    spec["stages"].append(minimal_stage)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")

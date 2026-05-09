@@ -350,6 +350,13 @@ class Stage:
                 f"Stage.from_dict expected mapping, got {type(data).__name__}"
             )
         gate_data = data.get("gate") or {"type": "signal_status_ok"}
+        # Boolean fields pass through verbatim. We deliberately do NOT
+        # call ``bool(...)`` here because ``bool("false")`` is True —
+        # which would silently flip read_only=False into True for any
+        # client that emitted strings instead of JSON booleans, letting
+        # writeful ACTION stages slip past the noop_idempotent
+        # eligibility check in __post_init__. Pass-through keeps the
+        # type guard in __post_init__ load-bearing.
         return cls(
             name=str(data["name"]),
             signal_source=str(data["signal_source"]),
@@ -358,9 +365,9 @@ class Stage:
             gate=Gate.from_dict(gate_data),
             compensate=str(data.get("compensate", "noop_idempotent")),
             forbidden_modules=tuple(data.get("forbidden_modules") or ()),
-            irreversible=bool(data.get("irreversible", False)),
-            non_deterministic=bool(data.get("non_deterministic", False)),
-            read_only=bool(data.get("read_only", False)),
+            irreversible=data.get("irreversible", False),
+            non_deterministic=data.get("non_deterministic", False),
+            read_only=data.get("read_only", False),
         )
 
 
