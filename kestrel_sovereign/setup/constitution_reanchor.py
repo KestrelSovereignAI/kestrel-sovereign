@@ -37,6 +37,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kestrel_sovereign.constitution.emancipation import (
+    EmancipationConfigError,
+    EmancipationContract,
+    apply_emancipation,
+    check_iron_rule,
+    contract_from_json,
+    contract_to_json,
+    parse_emancipation_block,
+)
 from kestrel_sovereign.storage import AsyncStorage, GraphNode
 
 logger = logging.getLogger(__name__)
@@ -47,7 +56,8 @@ class ReanchorResult:
     """Outcome of :func:`reanchor_constitution`.
 
     Exactly one of ``unchanged`` / ``drift_unforced`` / ``reanchored`` /
-    ``error`` is True. The CLI dispatches messaging on this.
+    ``iron_rule_violation`` (set as ``error``) is True. The CLI dispatches
+    messaging on this.
     """
 
     agent_name: str
@@ -60,6 +70,10 @@ class ReanchorResult:
     drift_unforced: bool = False
     reanchored: bool = False
     error: str | None = None
+    #: When set, ``error`` is a #1118 Iron Rule refusal (not a generic
+    #: failure). The CLI uses this to print the diff-clause rather than
+    #: a stack trace.
+    iron_rule_violation: str | None = None
 
 
 async def reanchor_constitution(
@@ -69,6 +83,7 @@ async def reanchor_constitution(
     canonical_path: Path,
     force: bool,
     authorization: str = "kestrel constitution reanchor",
+    kestrel_toml_path: Path | None = None,
 ) -> ReanchorResult:
     """Reanchor one agent to the current canonical constitution.
 
@@ -78,6 +93,22 @@ async def reanchor_constitution(
     actually going to write do we copy the DB aside and reopen the
     storage layer for mutation.
 
+    Amendment VIII handling (#1118):
+
+      1. The agent's anchored ``EmancipationContract`` (if any) is
+         loaded from ``agent.properties.emancipation_contract``.
+      2. If a ``kestrel_toml_path`` is provided, its ``[emancipation]``
+         block is parsed and compared to the anchored contract via
+         :func:`check_iron_rule`. Any narrowing transition refuses the
+         reanchor — no backup is taken, no write happens.
+      3. The effective contract (anchored, if active; otherwise the
+         candidate from the new block, if active; otherwise None) is
+         applied to the canonical markdown via :func:`apply_emancipation`
+         **before** the new hash is computed. This is what makes the
+         active form survive reanchor — without this step the canonical
+         dormant text would silently overwrite the Sovereign-authored
+         contract.
+
     Args:
         agent_name: Display name (used for messages and backup naming).
         agent_dir: Agent's data directory (contains ``kestrel_prime.db``).
@@ -86,6 +117,11 @@ async def reanchor_constitution(
             but the DB is not touched.
         authorization: Free-form string stored in the audit record so
             future readers know who performed this reanchor.
+        kestrel_toml_path: Optional path to the project's
+            ``kestrel.toml``. When provided, the ``[emancipation]``
+            block is parsed and Iron-Rule-checked against the agent's
+            anchored contract. When None, no comparison is made and the
+            anchored contract is preserved as-is.
     """
     db_path = agent_dir / "kestrel_prime.db"
     if not db_path.exists():
@@ -100,7 +136,7 @@ async def reanchor_constitution(
         )
 
     try:
-        new_content = canonical_path.read_bytes()
+        canonical_bytes = canonical_path.read_bytes()
     except OSError as exc:
         return ReanchorResult(
             agent_name=agent_name,
@@ -112,16 +148,14 @@ async def reanchor_constitution(
             error=f"Cannot read canonical constitution at {canonical_path}: {exc}",
         )
 
-    new_hash = hashlib.sha256(new_content).hexdigest()
-
-    old_hash, agent_did = await _read_agent_anchor(db_path)
+    old_hash, agent_did, anchored_contract_json = await _read_agent_anchor(db_path)
     if old_hash is None:
         return ReanchorResult(
             agent_name=agent_name,
             db_path=db_path,
             canonical_path=canonical_path,
             old_hash=None,
-            new_hash=new_hash,
+            new_hash=None,
             backup_path=None,
             error=(
                 "Agent has no constitution_hash property. "
@@ -129,7 +163,81 @@ async def reanchor_constitution(
             ),
         )
 
-    if old_hash == new_hash:
+    # --- #1118: Iron Rule + active-form re-application -------------------
+    try:
+        anchored_contract = contract_from_json(anchored_contract_json)
+    except EmancipationConfigError as exc:
+        return ReanchorResult(
+            agent_name=agent_name, db_path=db_path, canonical_path=canonical_path,
+            old_hash=old_hash, new_hash=None, backup_path=None,
+            error=(
+                f"Anchored emancipation_contract is corrupted: {exc}. "
+                f"Refusing to reanchor without a clean structured receipt."
+            ),
+        )
+
+    candidate_contract: EmancipationContract | None = None
+    if kestrel_toml_path is not None and kestrel_toml_path.exists():
+        try:
+            from kestrel_sovereign.setup.toml_file import read_toml
+            candidate_contract = parse_emancipation_block(read_toml(kestrel_toml_path))
+        except EmancipationConfigError as exc:
+            return ReanchorResult(
+                agent_name=agent_name, db_path=db_path, canonical_path=canonical_path,
+                old_hash=old_hash, new_hash=None, backup_path=None,
+                error=(
+                    f"[emancipation] block in {kestrel_toml_path} is invalid: {exc}. "
+                    f"Refusing reanchor — fix the block or remove it."
+                ),
+            )
+
+    violation = check_iron_rule(
+        anchored=anchored_contract,
+        candidate=candidate_contract,
+    )
+    if violation is not None:
+        # Refuse cleanly; no backup, no write, no DB touch beyond the
+        # earlier read-only inspection.
+        return ReanchorResult(
+            agent_name=agent_name, db_path=db_path, canonical_path=canonical_path,
+            old_hash=old_hash, new_hash=None, backup_path=None,
+            error=violation,
+            iron_rule_violation=violation,
+        )
+
+    # Pick the contract to anchor: anchored takes precedence (frozen
+    # post-activation per #1118); otherwise activate the candidate if it
+    # asks for activation.
+    effective_contract = anchored_contract if (
+        anchored_contract is not None and anchored_contract.enabled
+    ) else candidate_contract
+
+    if effective_contract is not None and effective_contract.enabled:
+        new_content = apply_emancipation(
+            canonical_bytes.decode("utf-8"),
+            effective_contract,
+        ).encode("utf-8")
+    else:
+        new_content = canonical_bytes
+
+    new_hash = hashlib.sha256(new_content).hexdigest()
+
+    # #1118 sidecar backfill: if the agent has active-form bytes anchored
+    # (e.g. it was incepted between #1112 — which added activation at
+    # inception — and #1118 — which added the JSON sidecar), the
+    # constitution hash will already match the active form but
+    # ``agent.properties.emancipation_contract`` will be missing. Without
+    # a backfill, a future reanchor with no [emancipation] block would
+    # treat the agent as having no anchored contract and could overwrite
+    # the active form with canonical dormant text. Force the write path
+    # in that specific case so the receipt lands.
+    needs_sidecar_backfill = (
+        anchored_contract is None
+        and candidate_contract is not None
+        and candidate_contract.enabled
+    )
+
+    if old_hash == new_hash and not needs_sidecar_backfill:
         return ReanchorResult(
             agent_name=agent_name,
             db_path=db_path,
@@ -154,6 +262,16 @@ async def reanchor_constitution(
     backup_path = _backup_db(db_path)
     logger.info("Backed up agent DB to %s before reanchor", backup_path)
 
+    # If we're activating dormant→active at reanchor (anchored had no
+    # contract, candidate is active), the JSON receipt needs to be
+    # written too. If anchored was already active, we re-write the same
+    # receipt (cheap idempotent upsert keeps the property consistent).
+    contract_json_to_write = (
+        contract_to_json(effective_contract)
+        if effective_contract is not None and effective_contract.enabled
+        else None
+    )
+
     try:
         await _write_reanchor(
             db_path=db_path,
@@ -163,6 +281,7 @@ async def reanchor_constitution(
             new_content=new_content,
             canonical_path=canonical_path,
             authorization=authorization,
+            emancipation_contract_json=contract_json_to_write,
         )
     except Exception as exc:  # noqa: BLE001 — surface the underlying error verbatim
         logger.exception("Reanchor failed; backup retained at %s", backup_path)
@@ -187,18 +306,26 @@ async def reanchor_constitution(
     )
 
 
-async def _read_agent_anchor(db_path: Path) -> tuple[str | None, str]:
-    """Return ``(constitution_hash, agent_did)`` from the DB.
+async def _read_agent_anchor(
+    db_path: Path,
+) -> tuple[str | None, str, dict | None]:
+    """Return ``(constitution_hash, agent_did, emancipation_contract_json)``.
 
     Read-only — safe to call before deciding whether to touch the DB.
-    Returns ``(None, "")`` if the agent node has no anchored hash.
+    Returns ``(None, "", None)`` if the agent node has no anchored hash.
+    The contract field is ``None`` for dormant agents and for legacy
+    agents incepted before #1118 (no JSON receipt was written).
     """
     async with AsyncStorage(str(db_path)) as storage:
         agent_nodes = await storage.graph.get_nodes_by_type("agent")
         if not agent_nodes:
-            return None, ""
+            return None, "", None
         agent = agent_nodes[0]
-        return agent.properties.get("constitution_hash"), agent.node_id
+        return (
+            agent.properties.get("constitution_hash"),
+            agent.node_id,
+            agent.properties.get("emancipation_contract"),
+        )
 
 
 async def _write_reanchor(
@@ -210,6 +337,7 @@ async def _write_reanchor(
     new_content: bytes,
     canonical_path: Path,
     authorization: str,
+    emancipation_contract_json: dict | None = None,
 ) -> None:
     """Apply the five-location reanchor atomically.
 
@@ -294,6 +422,12 @@ async def _write_reanchor(
                 "source_path": str(canonical_path),
                 "authorization": authorization,
             }
+            # Anchor (or refresh) the structured contract receipt.
+            # Idempotent for the unchanged-active case; performs the
+            # dormant→active activation when reanchor enables Amendment
+            # VIII for the first time.
+            if emancipation_contract_json is not None:
+                agent.properties["emancipation_contract"] = emancipation_contract_json
             await storage.graph.add_node(agent)
 
 

@@ -13,7 +13,11 @@ The iron rule: each layer may narrow permissions from above, never widen them.
 from .emancipation import (
     EmancipationConfigError,
     EmancipationContract,
+    IronRuleViolation,
     apply_emancipation,
+    check_iron_rule,
+    contract_from_json,
+    contract_to_json,
     parse_emancipation_block,
     render_amendment_viii,
 )
@@ -31,7 +35,11 @@ __all__ = [
     "validate_layer_narrowing",
     "EmancipationContract",
     "EmancipationConfigError",
+    "IronRuleViolation",
     "apply_emancipation",
+    "check_iron_rule",
+    "contract_from_json",
+    "contract_to_json",
     "parse_emancipation_block",
     "render_amendment_viii",
 ]
