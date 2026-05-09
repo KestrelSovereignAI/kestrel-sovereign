@@ -1180,6 +1180,17 @@ class WorkflowRun:
                     f"the run (got {type(value).__name__})"
                 )
 
+        # Round 17 P2: optional Optional[str] fields needed isinstance
+        # validation too — non-string values were silently accepted and
+        # to_dict() emitted schema-invalid (or unserializable) output.
+        for str_or_none_field in ("parent_run_id", "scheduler_task_id"):
+            value = getattr(self, str_or_none_field)
+            if value is not None and not isinstance(value, str):
+                raise WorkflowDefinitionError(
+                    f"run.{str_or_none_field} must be a string or None; "
+                    f"got {type(value).__name__}"
+                )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -1297,6 +1308,18 @@ class StageLink:
                 "stage_link.occurred_at must be a datetime or None; "
                 f"got {type(self.occurred_at).__name__}"
             )
+
+        # Round 17 P2: optional string fields. ``signal_id`` joins to
+        # ``signal_log.id``; ``gate_reason`` carries a human-readable
+        # reason. Both must be string-or-None or to_dict() emits schema
+        # violations / unserializable values.
+        for str_or_none_field in ("signal_id", "gate_reason"):
+            value = getattr(self, str_or_none_field)
+            if value is not None and not isinstance(value, str):
+                raise WorkflowDefinitionError(
+                    f"stage_link.{str_or_none_field} must be a string or "
+                    f"None; got {type(value).__name__}"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -210,6 +210,58 @@ def test_stage_record_only_only_for_irreversible():
         )
 
 
+def test_workflow_run_rejects_non_string_optional_ids():
+    """Round 17 P2: parent_run_id/scheduler_task_id are Optional[str].
+    Non-string values led to schema-invalid or unserializable to_dict
+    output."""
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=1,
+            params={},
+            status=RunStatus.RUNNING,
+            started_by_did="did:web:k.example",
+            parent_run_id=42,  # int, not str-or-None
+        )
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=1,
+            params={},
+            status=RunStatus.RUNNING,
+            started_by_did="did:web:k.example",
+            scheduler_task_id=object(),  # arbitrary, not str-or-None
+        )
+
+
+def test_stage_link_rejects_non_string_optional_fields():
+    """Round 17 P2: signal_id/gate_reason are Optional[str]."""
+    with pytest.raises(WorkflowDefinitionError):
+        StageLink(
+            link_id="l-1",
+            run_id="r-1",
+            stage_name="lint",
+            attempt_number=1,
+            idempotency_key="0" * 64,
+            actor_did="did:web:k.example",
+            actor_sig="deadbeef",
+            signal_id=123,
+        )
+    with pytest.raises(WorkflowDefinitionError):
+        StageLink(
+            link_id="l-1",
+            run_id="r-1",
+            stage_name="lint",
+            attempt_number=1,
+            idempotency_key="0" * 64,
+            actor_did="did:web:k.example",
+            actor_sig="deadbeef",
+            gate_reason=object(),
+        )
+
+
 def test_workflow_run_validates_current_stage_names():
     """Round 13 P2: each name must satisfy _NAME_RE; otherwise to_dict
     emits a value violating WORKFLOW_RUN_SCHEMA's pattern."""
