@@ -45,6 +45,14 @@ env:
   # subsequent steps; the actual value is written at runtime via
   # ``echo UVRUN=... >> "$GITHUB_ENV"``.
   UVRUN: ""
+  # Python 3.11+ flag that blocks Python from prepending the cwd / script
+  # dir to ``sys.path``. Without this, ``python -m kestrel_sovereign.cli``
+  # run from the checkout root would resolve ``kestrel_sovereign`` against
+  # the source tree even on the wheel matrix — so a packaging regression
+  # in the wheel could silently slip through. Editable installs (used by
+  # the sync matrix) still resolve via ``site-packages`` ``.pth`` entries,
+  # which are unaffected by this flag — both paths keep working.
+  PYTHONSAFEPATH: "1"
 
 # The wizard creates an agent named "Kestrel" by default in quickstart
 # mode (kestrel_sovereign/setup/steps/agent.py::_prompt_name). Centralise
