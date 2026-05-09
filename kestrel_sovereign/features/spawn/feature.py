@@ -45,6 +45,16 @@ class SpawnFeature(Feature):
         self._child_results: dict[str, Any] = {}  # child_name -> latest result
         self._child_tasks: dict[str, asyncio.Task] = {}  # child_name -> running task
 
+    def get_router(self):
+        """Return the Spawn panel router for dynamic mounting.
+
+        The router exposes ``/api/spawn/children`` to the Console UI.
+        Lives at ``kestrel_sovereign/endpoints/spawn.py`` (inlined
+        from the archived ``kestrel-feature-spawn`` package).
+        """
+        from kestrel_sovereign.endpoints.spawn import router
+        return router
+
     async def post_all_features_loaded(self, agent):
         """Pre-explore spawn tools so they are immediately available to the orchestrator."""
         if hasattr(agent, '_register_explored_feature_tools'):
