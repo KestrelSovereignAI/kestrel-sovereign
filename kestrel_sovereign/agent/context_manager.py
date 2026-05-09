@@ -220,6 +220,7 @@ class ContextManager:
                 constitution=constitution,
                 include_briefing=include_briefing,
                 system_prompt_addendum=system_prompt_addendum,
+                system_prompt_budget_bytes=system_prompt_budget_bytes,
             )
 
         # Use provided history or fetch from storage
@@ -250,13 +251,26 @@ class ContextManager:
         # for the cache path; the tracking variant intentionally has
         # different bytes (different fence convention) so it's only
         # used when the source explicitly opts in via budget.
+        #
+        # Codex round-12 P2: the addendum (canary directive) must
+        # count toward the budget. Reserve its bytes BEFORE the
+        # assembler truncates so the final assembled prompt
+        # (assembler output + joiner + addendum) fits within the cap.
         if system_prompt_budget_bytes is not None:
+            reserved = 0
+            if system_prompt_addendum:
+                reserved = (
+                    len(system_prompt_addendum.encode("utf-8")) + 2
+                )  # 2 bytes for the "\n\n" joiner
+            effective_budget = max(
+                1, system_prompt_budget_bytes - reserved
+            )
             tracking_result = self.context_builder.build_system_prompt_with_tracking(
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=state_of_mind,
-                budget_bytes=system_prompt_budget_bytes,
+                budget_bytes=effective_budget,
             )
             system_prompt = tracking_result.prompt
             if system_prompt_addendum:
@@ -421,6 +435,7 @@ class ContextManager:
         constitution: str,
         include_briefing: bool,
         system_prompt_addendum: Optional[str] = None,
+        system_prompt_budget_bytes: Optional[int] = None,
     ) -> ContextResult:
         """
         Build minimal context for EPHEMERAL privacy mode.
@@ -438,13 +453,39 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"Failed to get constitutional state of mind: {e}")
 
-        system_prompt = self.context_builder.build_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind,
-            system_prompt_addendum=system_prompt_addendum,
-        )
+        # Codex round-12 P2: ephemeral mode must honor the
+        # system_prompt_budget_bytes too. Reserve the addendum bytes
+        # the same way the non-ephemeral path does so the assembled
+        # prompt (assembler + joiner + addendum) fits the cap.
+        if system_prompt_budget_bytes is not None:
+            reserved = 0
+            if system_prompt_addendum:
+                reserved = (
+                    len(system_prompt_addendum.encode("utf-8")) + 2
+                )
+            effective_budget = max(
+                1, system_prompt_budget_bytes - reserved
+            )
+            tracking_result = self.context_builder.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                budget_bytes=effective_budget,
+            )
+            system_prompt = tracking_result.prompt
+            if system_prompt_addendum:
+                system_prompt = (
+                    f"{system_prompt}\n\n{system_prompt_addendum}"
+                )
+        else:
+            system_prompt = self.context_builder.build_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                system_prompt_addendum=system_prompt_addendum,
+            )
 
         # Add ephemeral mode notice
         system_prompt = (

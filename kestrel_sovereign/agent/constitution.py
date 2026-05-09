@@ -113,23 +113,39 @@ class ConstitutionMixin:
         the enum and the string form).
         """
         from kestrel_sovereign.signals.constitution_canary import (
+            CODEX_CANARY_FIELD,
+            LOCAL_CANARY_FIELD,
             CanaryStatus,
             verify_in_json_response,
             verify_in_structured_response,
         )
 
+        # Map format → field name. Codex uses `constitution_canary`,
+        # local uses `_canary` — codex round-12 P2 caught that the
+        # JSON-string fallback was using the wrong default for codex
+        # responses returned as raw text.
         if prompt_template_format == "codex":
+            field = CODEX_CANARY_FIELD
             if isinstance(response, dict):
-                return verify_in_structured_response(response, canary)
+                return verify_in_structured_response(
+                    response, canary, field=field
+                )
             if isinstance(response, str):
-                return verify_in_json_response(response, canary)
+                return verify_in_json_response(
+                    response, canary, field=field
+                )
             return CanaryStatus.MISSING
 
         if prompt_template_format == "local":
+            field = LOCAL_CANARY_FIELD
             if isinstance(response, str):
-                return verify_in_json_response(response, canary)
+                return verify_in_json_response(
+                    response, canary, field=field
+                )
             if isinstance(response, dict):
-                return verify_in_structured_response(response, canary)
+                return verify_in_structured_response(
+                    response, canary, field=field
+                )
             return CanaryStatus.MISSING
 
         # claude_code / bare → no Phase-1 default verifier.

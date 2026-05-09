@@ -956,6 +956,38 @@ async def test_constitution_mixin_get_constitution_hash_reads_node():
 
 
 @pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_codex_raw_string_uses_codex_field():
+    """Codex round-12 P2: when the codex reviewer returns raw JSON
+    text (not a parsed dict), the verifier must look for
+    `constitution_canary`, not the local-format default `_canary`."""
+    import json as _json
+
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CODEX_CANARY_FIELD,
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    raw = _json.dumps({CODEX_CANARY_FIELD: canary})
+    result = _Agent().verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="codex",
+        signal_id="sig_x",
+        response=raw,
+    )
+    assert result is CanaryStatus.VERIFIED
+
+
+@pytest.mark.asyncio
 async def test_constitution_mixin_verify_echo_codex_format():
     """Default verifier on `ConstitutionMixin` parses codex format
     structured-response dicts. Returns VERIFIED when the canary
