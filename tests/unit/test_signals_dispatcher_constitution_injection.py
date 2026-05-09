@@ -893,6 +893,259 @@ async def test_constitution_mixin_get_constitution_hash_reads_node():
 
 
 @pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_codex_format():
+    """Default verifier on `ConstitutionMixin` parses codex format
+    structured-response dicts. Returns VERIFIED when the canary
+    matches the structured field; MISSING otherwise."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CODEX_CANARY_FIELD,
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+
+    agent = _Agent()
+    # Matching dict response → VERIFIED.
+    result = agent.verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="codex",
+        signal_id="sig_x",
+        response={CODEX_CANARY_FIELD: canary, "verdict": "OK"},
+    )
+    assert result is CanaryStatus.VERIFIED
+
+    # Non-matching → MISSING.
+    result = agent.verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="codex",
+        signal_id="sig_x",
+        response={CODEX_CANARY_FIELD: "f" * 16},
+    )
+    assert result is CanaryStatus.MISSING
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_local_format_extracts_json():
+    """For local format the verifier accepts raw text and extracts
+    the first balanced JSON block (model output discipline varies)."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        LOCAL_CANARY_FIELD,
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    text = (
+        "```json\n"
+        f'{{"{LOCAL_CANARY_FIELD}": "{canary}"}}\n'
+        "```"
+    )
+    result = _Agent().verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="local",
+        signal_id="sig_x",
+        response=text,
+    )
+    assert result is CanaryStatus.VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_claude_code_returns_missing():
+    """Phase 1 default returns MISSING for claude_code format —
+    Phase 2 wires the phantom-tool receipt channel."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    result = _Agent().verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="claude_code",
+        signal_id="sig_x",
+        response="some assistant text containing " + canary,
+    )
+    assert result is CanaryStatus.MISSING
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_passes_response_to_verifier_when_supported(
+    tmp_path, template_path
+):
+    """Codex round-9 P2 #1: the dispatcher must give the verifier the
+    LLM response so it can parse the format-specific receipt without
+    relying on the agent storing per-signal state."""
+    from kestrel_sovereign.signals.constitution_canary import (
+        CODEX_CANARY_FIELD,
+    )
+
+    captured_response = {"box": None}
+
+    class _ResponseChecking(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            self.process_input_calls.append(prompt)
+            self.process_input_kwargs = list(
+                getattr(self, "process_input_kwargs", [])
+            )
+            self.process_input_kwargs.append(kwargs)
+            # Pretend the codex reviewer returned a structured dict
+            # containing the canary the dispatcher just injected.
+            addendum = kwargs.get("system_prompt_addendum") or ""
+            # Extract the canary from the addendum text (16 lowercase hex).
+            import re
+
+            m = re.search(r"[0-9a-f]{16}", addendum)
+            return {CODEX_CANARY_FIELD: m.group(0) if m else "missing"}
+
+        def verify_constitution_echo(self, *, canary, prompt_template_format, signal_id, response=None):
+            # Use the dispatcher-supplied response; assert we got one.
+            captured_response["box"] = response
+            from kestrel_sovereign.signals.constitution_canary import (
+                CanaryStatus,
+                verify_in_structured_response,
+            )
+            return verify_in_structured_response(response, canary)
+
+    agent = _ResponseChecking(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="response_check_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("response_check_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.OK
+    assert captured_response["box"] is not None
+    assert isinstance(captured_response["box"], dict)
+    assert CODEX_CANARY_FIELD in captured_response["box"]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_passes_budget_to_agent_when_accepted(
+    tmp_path, template_path
+):
+    """Codex round-9 P2 #2: registered system_prompt_budget_bytes
+    propagates to the agent's process_input call when the agent
+    accepts the kwarg, so the agent's build_context can route to the
+    budget-aware tracking assembler."""
+    captured = {"budget_kw": None}
+
+    class _BudgetAwareAgent(_AuditingAgent):
+        async def process_input(
+            self, prompt: str,
+            *,
+            system_prompt_addendum=None,
+            system_prompt_budget_bytes=None,
+        ):
+            captured["budget_kw"] = system_prompt_budget_bytes
+            return "ok"
+
+    agent = _BudgetAwareAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="budget_aware_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+            system_prompt_budget_bytes=4096,
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("budget_aware_cog"))
+    await _drain(env)
+    assert captured["budget_kw"] == 4096
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_does_not_retry_on_internal_typeerror(
+    tmp_path, template_path
+):
+    """Codex round-9 P2 #3: a TypeError raised INSIDE process_input
+    (e.g. from a tool call or LLM error) must NOT trigger a silent
+    retry without the addendum — that would duplicate side effects.
+    Verify the dispatcher surfaces the TypeError as a normal failure."""
+
+    class _RaisingAgent(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            self.process_input_calls.append(prompt)
+            raise TypeError("internal LLM error")
+
+    agent = _RaisingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="internal_typeerror_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("internal_typeerror_cog")
+    )
+    await _drain(env)
+
+    # Single call (no silent retry), failure surfaced.
+    assert len(agent.process_input_calls) == 1
+    assert result.status == Status.FAILED
+    assert "internal LLM error" in (result.error or "")
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_constitution_mixin_compute_live_returns_none_default():
     """Phase 1: default implementation returns None. Phase 2 wires
     project_root + bootstrap loader to produce a real hash."""

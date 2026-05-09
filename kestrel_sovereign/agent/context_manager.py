@@ -183,6 +183,7 @@ class ContextManager:
         conversation_history: Optional[List[Dict]] = None,
         reflection_guidance: Optional[List[str]] = None,
         system_prompt_addendum: Optional[str] = None,
+        system_prompt_budget_bytes: Optional[int] = None,
     ) -> ContextResult:
         """
         Build complete context for an LLM request.
@@ -241,14 +242,33 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"Failed to get constitutional state of mind: {e}")
 
-        # 1. Build system prompt
-        system_prompt = self.context_builder.build_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind,
-            system_prompt_addendum=system_prompt_addendum,
-        )
+        # 1. Build system prompt. When the caller sets
+        # `system_prompt_budget_bytes` (a per-source registration knob
+        # threaded through by the SignalDispatcher), route to the
+        # priority-aware tracking assembler so the budget actually
+        # takes effect. The legacy build_system_prompt is byte-stable
+        # for the cache path; the tracking variant intentionally has
+        # different bytes (different fence convention) so it's only
+        # used when the source explicitly opts in via budget.
+        if system_prompt_budget_bytes is not None:
+            tracking_result = self.context_builder.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                budget_bytes=system_prompt_budget_bytes,
+            )
+            system_prompt = tracking_result.prompt
+            if system_prompt_addendum:
+                system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
+        else:
+            system_prompt = self.context_builder.build_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                system_prompt_addendum=system_prompt_addendum,
+            )
         system_tokens = self.counter.count(system_prompt)
         budget.use("system", system_tokens)
 

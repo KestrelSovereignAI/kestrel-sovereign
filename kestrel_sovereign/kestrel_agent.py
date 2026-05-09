@@ -1435,7 +1435,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None, system_prompt_budget_bytes: int = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -1522,6 +1522,7 @@ Expected Duration: {expected_duration}
                 return await self._process_input_traced_locked(
                     user_input, model_override, session_id, _otel_span, include_memories,
                     system_prompt_addendum=system_prompt_addendum,
+                    system_prompt_budget_bytes=system_prompt_budget_bytes,
                 )
 
     async def _process_input_traced_locked(
@@ -1533,6 +1534,7 @@ Expected Duration: {expected_duration}
         include_memories: bool = True,
         *,
         system_prompt_addendum: Optional[str] = None,
+        system_prompt_budget_bytes: Optional[int] = None,
     ) -> str:
         """Inner process_input logic wrapped in an OTEL span.
 
@@ -1616,6 +1618,7 @@ Expected Duration: {expected_duration}
             conversation_history=history,
             reflection_guidance=reflection_guidance,
             system_prompt_addendum=system_prompt_addendum,
+            system_prompt_budget_bytes=system_prompt_budget_bytes,
         )
 
         self._session_briefed = True

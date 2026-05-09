@@ -82,6 +82,59 @@ class ConstitutionMixin:
         """
         return None
 
+    def verify_constitution_echo(
+        self,
+        *,
+        canary: str,
+        prompt_template_format: str,
+        signal_id: str,
+        response,
+    ):
+        """Default echo verifier — scans the dispatch response for the
+        canary using the format-specific primitives.
+
+        Format → channel:
+        - `codex`: `response` is a dict with `constitution_canary`
+          field (codex CLI structured output). When the dispatcher's
+          `process_input` returns the JSON-decoded structured response,
+          we use `verify_in_structured_response`. If `response` is a
+          raw string (the in-agent claude_code path), fall through to
+          JSON extraction.
+        - `local`: `response` is the raw model text; parse JSON and
+          look for `_canary` field via `verify_in_json_response`.
+        - `claude_code`: returns MISSING. Phase 2 wires the phantom
+          tool registration so the receipt is captured via the
+          tool-call channel; Phase 1 sources opting into echo on this
+          format must implement their own verifier.
+        - `bare`: returns MISSING — caller-responsibility, the default
+          can't know how to parse.
+
+        Returns a `CanaryStatus` value (the dispatcher accepts both
+        the enum and the string form).
+        """
+        from kestrel_sovereign.signals.constitution_canary import (
+            CanaryStatus,
+            verify_in_json_response,
+            verify_in_structured_response,
+        )
+
+        if prompt_template_format == "codex":
+            if isinstance(response, dict):
+                return verify_in_structured_response(response, canary)
+            if isinstance(response, str):
+                return verify_in_json_response(response, canary)
+            return CanaryStatus.MISSING
+
+        if prompt_template_format == "local":
+            if isinstance(response, str):
+                return verify_in_json_response(response, canary)
+            if isinstance(response, dict):
+                return verify_in_structured_response(response, canary)
+            return CanaryStatus.MISSING
+
+        # claude_code / bare → no Phase-1 default verifier.
+        return CanaryStatus.MISSING
+
     def _init_constitution_audit_tracking(self):
         """Initialize constitution audit tracking. Called by KestrelAgent.__init__."""
         self._interaction_count = 0

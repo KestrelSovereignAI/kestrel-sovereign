@@ -76,6 +76,7 @@ enforces this for the whole repo.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import secrets
 import time
@@ -147,6 +148,25 @@ class _ConstitutionAudit:
     # post-dispatch with a fresh nonce would race the model against
     # a moving target.
     canary: Optional[str] = None
+
+
+def _agent_accepts_kwarg(callable_: Any, name: str) -> bool:
+    """Return True iff `callable_` declares `name` as a parameter or
+    accepts arbitrary kwargs (`**kwargs`). Used to feature-detect
+    optional process_input kwargs without try/except TypeError, which
+    would also swallow runtime errors raised inside the call.
+    """
+    try:
+        sig = inspect.signature(callable_)
+    except (TypeError, ValueError):
+        # Builtins or C-extension callables: assume permissive.
+        return True
+    for param in sig.parameters.values():
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if param.name == name:
+            return True
+    return False
 
 
 def _audit_to_log_kwargs(audit: Optional[_ConstitutionAudit]) -> dict:
@@ -826,28 +846,42 @@ class SignalDispatcher:
         token = None
         if set_chain is not None:
             token = set_chain(signal.causation_chain)
+        # Codex round-9 P2 #3: don't catch TypeError around
+        # process_input — that would also catch errors raised inside
+        # the LLM/tool path and retry, duplicating side effects.
+        # Inspect the signature once up-front so we know whether the
+        # kwargs are accepted; if not, log and skip silently. The
+        # post-dispatch verifier will mark MISSING because the
+        # addendum was never delivered, which is the correct failure
+        # mode for that configuration.
+        accepts_addendum = _agent_accepts_kwarg(
+            self._agent.process_input, "system_prompt_addendum"
+        )
+        accepts_budget = _agent_accepts_kwarg(
+            self._agent.process_input, "system_prompt_budget_bytes"
+        )
+        if addendum is not None and not accepts_addendum:
+            logger.warning(
+                "agent.process_input does not accept "
+                "system_prompt_addendum; constitutional canary "
+                "directive was NOT delivered for signal %s. Upgrade "
+                "the agent to plumb the kwarg through "
+                "context_manager.build_context.",
+                signal.id,
+            )
+
+        budget = registration.system_prompt_budget_bytes
+        process_input_kwargs: dict[str, Any] = {}
+        if addendum is not None and accepts_addendum:
+            process_input_kwargs["system_prompt_addendum"] = addendum
+        if budget is not None and accepts_budget:
+            process_input_kwargs["system_prompt_budget_bytes"] = budget
+
         try:
-            # Pass the addendum via kwarg when it's set. Agents that
-            # don't accept the kwarg yet (older external KestrelAgent
-            # forks) get the legacy positional call — full injection
-            # then degrades to "directive not delivered" → MISSING in
-            # post-dispatch verification, which is the safe failure
-            # mode for an operator who needs to upgrade their agent.
-            if addendum is not None:
-                try:
-                    result = await self._agent.process_input(
-                        prompt, system_prompt_addendum=addendum
-                    )
-                except TypeError:
-                    logger.warning(
-                        "agent.process_input does not accept "
-                        "system_prompt_addendum; constitutional canary "
-                        "directive was NOT delivered for signal %s. "
-                        "Upgrade the agent to plumb the kwarg "
-                        "through context_manager.build_context.",
-                        signal.id,
-                    )
-                    result = await self._agent.process_input(prompt)
+            if process_input_kwargs:
+                result = await self._agent.process_input(
+                    prompt, **process_input_kwargs
+                )
             else:
                 result = await self._agent.process_input(prompt)
         finally:
@@ -864,7 +898,9 @@ class SignalDispatcher:
         # round-3 P2 fix: NOT_REQUIRED returned by a verifier when
         # echo IS required is a contract violation, not a pass.
         if registration.require_constitution_echo:
-            await self._verify_canary_post_dispatch(signal, registration, audit)
+            await self._verify_canary_post_dispatch(
+                signal, registration, audit, response=result
+            )
             if audit.echo_canary_status is CanaryStatus.VERIFIED:
                 record_echo_verified(signal.source)
             else:
@@ -987,6 +1023,8 @@ class SignalDispatcher:
         signal: Signal,
         registration: SourceRegistration,
         audit: _ConstitutionAudit,
+        *,
+        response: Any,
     ) -> None:
         """Post-dispatch hook to verify the format-specific receipt.
 
@@ -1021,11 +1059,17 @@ class SignalDispatcher:
             return
 
         try:
-            value = verifier(
-                canary=audit.canary,
-                prompt_template_format=registration.prompt_template_format,
-                signal_id=signal.id,
-            )
+            verifier_kwargs = {
+                "canary": audit.canary,
+                "prompt_template_format": registration.prompt_template_format,
+                "signal_id": signal.id,
+            }
+            # Pass the response only if the verifier accepts it. The
+            # default ConstitutionMixin verifier needs it to scan
+            # codex/local format reviewer responses for the canary.
+            if _agent_accepts_kwarg(verifier, "response"):
+                verifier_kwargs["response"] = response
+            value = verifier(**verifier_kwargs)
             if asyncio.iscoroutine(value):
                 value = await value
         except Exception:
