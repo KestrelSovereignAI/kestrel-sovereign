@@ -78,6 +78,71 @@ async def test_get_spawn_children_falls_back_to_app_state_manager(monkeypatch):
     assert manager.get_children.call_count >= 1
 
 
+@pytest.mark.asyncio
+async def test_spawn_history_filtered_by_parent_did(monkeypatch):
+    """In multi-agent mode the lifecycle's ``_tracked`` and
+    ``_results`` are shared across all loaded parents. The spawn
+    history endpoint must filter by ``agent.agent_id`` so opening
+    A's panel never shows B's children. Codex round 4 of #1149
+    caught this leak.
+    """
+    # Lifecycle holds active spawns from BOTH parent A and parent B.
+    tracked_a = SimpleNamespace(
+        child_name="child-of-a",
+        child_did="did:child:a",
+        parent_did="did:parent:A",
+        started_at="2026-05-09T10:00:00Z",
+        result=None,
+    )
+    tracked_b = SimpleNamespace(
+        child_name="child-of-b",
+        child_did="did:child:b",
+        parent_did="did:parent:B",
+        started_at="2026-05-09T11:00:00Z",
+        result=None,
+    )
+
+    # And one terminated result from each.
+    from kestrel_sovereign.spawn.lifecycle import SpawnResult, SpawnStatus
+    from decimal import Decimal
+    result_a = SpawnResult(
+        child_name="finished-a",
+        child_did="did:child:a-old",
+        status=SpawnStatus.COMPLETED,
+        started_at="2026-05-09T09:00:00Z",
+        parent_did="did:parent:A",
+        budget_consumed=Decimal("0"),
+    )
+    result_b = SpawnResult(
+        child_name="finished-b",
+        child_did="did:child:b-old",
+        status=SpawnStatus.COMPLETED,
+        started_at="2026-05-09T08:00:00Z",
+        parent_did="did:parent:B",
+        budget_consumed=Decimal("0"),
+    )
+
+    lifecycle = SimpleNamespace(
+        _tracked={"child-of-a": tracked_a, "child-of-b": tracked_b},
+        _results={"finished-a": result_a, "finished-b": result_b},
+    )
+    manager = MagicMock()
+    manager._lifecycle = lifecycle
+    manager.get_children.return_value = []
+
+    # Request comes from agent A.
+    agent_a = SimpleNamespace(agent_id="did:parent:A", _agent_manager=None)
+    request = _make_request(agent_manager=manager)
+    monkeypatch.setattr(spawn_endpoints, "get_agent", lambda r: agent_a)
+
+    result = await spawn_endpoints.get_spawn_children(request)
+    history_names = {h["child_name"] for h in result["history"]}
+    # Only A's children appear; B's are filtered out.
+    assert history_names == {"child-of-a", "finished-a"}, (
+        f"Expected only parent A's history, got {history_names}"
+    )
+
+
 def test_get_agent_manager_helper_prefers_agent_then_app_state():
     """Direct unit test of the helper — agent.attached wins over app.state."""
     agent_mgr = MagicMock(name="agent-attached")

@@ -164,13 +164,29 @@ def _build_delegation_chain(manager, parent_did: str, parent_name: str) -> dict:
 
 
 def _build_spawn_history(agent, manager, request: Request | None = None) -> list:
-    """Build a log of spawn/terminate events."""
+    """Build a log of spawn/terminate events for THIS agent only.
+
+    In multi-agent mode the lifecycle is attached to the shared
+    ``app.state.agent_manager``, so its ``_tracked`` and
+    ``_results`` dicts contain children spawned by every loaded
+    parent. We filter both by ``parent_did == agent.agent_id`` so
+    one agent's panel never leaks another agent's history (#1149
+    round 4 caught this).
+    """
     history = []
+    parent_did = agent.agent_id
 
     lifecycle = _get_lifecycle(agent, request=request)
     if lifecycle is not None:
-        # Completed/terminated results
+        # Completed/terminated results — filter by parent_did.
+        # SpawnResult.parent_did was added in #1149 round 4. Old
+        # serialized records may lack it (defaulted to ""); when
+        # that's the case we fall through to the active-tracked
+        # cross-reference below.
         for name, result in lifecycle._results.items():
+            result_parent = getattr(result, "parent_did", "") or ""
+            if result_parent and result_parent != parent_did:
+                continue
             history.append({
                 "event": "terminated",
                 "child_name": result.child_name,
@@ -181,8 +197,11 @@ def _build_spawn_history(agent, manager, request: Request | None = None) -> list
                 "ended_at": result.ended_at,
             })
 
-        # Currently tracked (active spawns)
+        # Currently tracked (active spawns) — _TrackedChild always
+        # has parent_did, so filtering is unconditional.
         for name, tracked in lifecycle._tracked.items():
+            if tracked.parent_did != parent_did:
+                continue
             history.append({
                 "event": "spawned",
                 "child_name": tracked.child_name,
