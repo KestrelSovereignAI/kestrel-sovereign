@@ -162,6 +162,17 @@ _IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 _MISSING: Any = object()
 
 
+def _is_strict_positive_int(value: Any) -> bool:
+    """``isinstance(x, int)`` returns True for booleans (bool subclasses
+    int in Python). Round-7 codex P2: that let ``version=True`` pass as
+    a positive workflow version, then ``to_dict()`` emitted a JSON
+    boolean where the schema wants an integer — a schema/model drift
+    that lets a malformed wire form construct and re-hash. Use this
+    helper everywhere a numeric field must be an actual integer.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def _present_or(data: Mapping[str, Any], key: str, default: Any) -> Any:
     """Return ``data[key]`` if present, else ``default``.
 
@@ -531,13 +542,10 @@ class Edge:
             )
         else:  # SUBWORKFLOW
             _validate_name("edge.subworkflow_name", self.subworkflow_name or "")
-            if (
-                not isinstance(self.subworkflow_version, int)
-                or self.subworkflow_version < 1
-            ):
+            if not _is_strict_positive_int(self.subworkflow_version):
                 raise WorkflowDefinitionError(
                     "edge.kind=subworkflow requires subworkflow_version: "
-                    "positive int"
+                    "positive int (booleans are not accepted)"
                 )
             self._reject_unrelated_fields(
                 {
@@ -767,9 +775,10 @@ class WorkflowSpec:
 
     def __post_init__(self) -> None:
         _validate_name("workflow.name", self.name)
-        if not isinstance(self.version, int) or self.version < 1:
+        if not _is_strict_positive_int(self.version):
             raise WorkflowDefinitionError(
-                "workflow.version must be a positive int"
+                "workflow.version must be a positive int "
+                "(booleans are not accepted)"
             )
 
         if not isinstance(self.stages, (list, tuple)) or len(self.stages) < 1:
@@ -837,12 +846,12 @@ class WorkflowSpec:
             )
         object.__setattr__(self, "params_schema", dict(self.params_schema))
 
-        if self.retention_days is not None and (
-            not isinstance(self.retention_days, int) or self.retention_days < 1
+        if self.retention_days is not None and not _is_strict_positive_int(
+            self.retention_days
         ):
             raise WorkflowDefinitionError(
                 "workflow.retention_days must be None (retain forever) or a "
-                "positive int"
+                "positive int (booleans are not accepted)"
             )
 
         for str_field in ("author_did", "author_sig", "spec_hash"):
@@ -909,17 +918,26 @@ class WorkflowSpec:
                 f"{type(data).__name__}"
             )
         if "triggers" in data:
-            # Present-but-falsy ``triggers: 0`` would slip through the
-            # default-to-manual branch under ``data.get(...) or default``.
-            # Round 5 P2: pass the explicit value through; only treat
-            # missing key + empty list as the default.
+            # Round 7 P2: an explicit ``"triggers": null`` is rejected
+            # by the JSON schema, but previously this branch silently
+            # rewrote it to the manual default — letting a schema-
+            # invalid signed wire form construct the same canonical
+            # payload as a real manual-trigger spec. Reject the explicit
+            # null and let only an empty array (and missing key) fall
+            # back to the default.
             triggers_data = data["triggers"]
-            if triggers_data is None or (
-                isinstance(triggers_data, (list, tuple)) and not triggers_data
-            ):
-                triggers: Sequence[Trigger] = (Trigger(kind=TriggerKind.MANUAL),)
-            elif isinstance(triggers_data, (list, tuple)):
-                triggers = tuple(Trigger.from_dict(t) for t in triggers_data)
+            if triggers_data is None:
+                raise WorkflowDefinitionError(
+                    "workflow.triggers cannot be explicitly null; omit the "
+                    "key or pass [] for the manual-default trigger"
+                )
+            if isinstance(triggers_data, (list, tuple)):
+                if triggers_data:
+                    triggers: Sequence[Trigger] = tuple(
+                        Trigger.from_dict(t) for t in triggers_data
+                    )
+                else:
+                    triggers = (Trigger(kind=TriggerKind.MANUAL),)
             else:
                 raise WorkflowDefinitionError(
                     "workflow.triggers must be a list of Trigger dicts"
@@ -983,9 +1001,10 @@ class WorkflowRun:
         if not isinstance(self.run_id, str) or not self.run_id:
             raise WorkflowDefinitionError("run.run_id must be a non-empty string")
         _validate_name("run.workflow_name", self.workflow_name)
-        if not isinstance(self.workflow_ver, int) or self.workflow_ver < 1:
+        if not _is_strict_positive_int(self.workflow_ver):
             raise WorkflowDefinitionError(
-                "run.workflow_ver must be a positive int"
+                "run.workflow_ver must be a positive int "
+                "(booleans are not accepted)"
             )
 
         if isinstance(self.status, str):
@@ -1100,9 +1119,10 @@ class StageLink:
                 f"{self.idempotency_key!r}"
             )
         _validate_name("stage_link.stage_name", self.stage_name)
-        if not isinstance(self.attempt_number, int) or self.attempt_number < 1:
+        if not _is_strict_positive_int(self.attempt_number):
             raise WorkflowDefinitionError(
-                "stage_link.attempt_number must be a positive int (1-indexed)"
+                "stage_link.attempt_number must be a positive int (1-indexed; "
+                "booleans are not accepted)"
             )
 
         if self.gate_outcome is not None:

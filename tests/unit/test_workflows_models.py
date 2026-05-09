@@ -650,6 +650,68 @@ def test_trigger_signal_source_rejects_cron_expression():
         )
 
 
+def test_workflow_spec_rejects_bool_for_version():
+    """Round 7 P2: bool is subclass of int. ``isinstance(True, int)`` is
+    True, so ``version=True`` slipped through and ``to_dict()`` emitted
+    a JSON boolean where the schema requires integer."""
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowSpec(
+            name="r",
+            version=True,
+            stages=[_action_stage(name="lint")],
+        )
+
+
+def test_workflow_spec_rejects_bool_for_retention_days():
+    with pytest.raises(WorkflowDefinitionError):
+        _minimal_spec(retention_days=True)
+
+
+def test_workflow_run_rejects_bool_for_workflow_ver():
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=True,
+            params={},
+            status=RunStatus.RUNNING,
+            started_by_did="did:web:k.example",
+        )
+
+
+def test_stage_link_rejects_bool_for_attempt_number():
+    with pytest.raises(WorkflowDefinitionError):
+        StageLink(
+            link_id="l-1",
+            run_id="r-1",
+            stage_name="lint",
+            attempt_number=True,
+            idempotency_key="0" * 64,
+            actor_did="did:web:k.example",
+            actor_sig="deadbeef",
+        )
+
+
+def test_edge_subworkflow_rejects_bool_for_version():
+    with pytest.raises(WorkflowDefinitionError):
+        Edge(
+            kind=EdgeKind.SUBWORKFLOW,
+            from_stage="a",
+            subworkflow_name="child",
+            subworkflow_version=True,
+        )
+
+
+def test_workflow_spec_from_dict_rejects_explicit_null_triggers():
+    """Round 7 P2: an explicit ``triggers: null`` was silently rewritten
+    to the manual-default trigger, letting a schema-invalid wire form
+    construct the same canonical payload as a real manual-trigger spec."""
+    spec = _minimal_spec().to_dict()
+    spec["triggers"] = None
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowSpec.from_dict(spec)
+
+
 def test_gate_from_dict_rejects_int_type():
     """Mirror of WorkflowSpec/Stage round-4 hardening at the gate layer."""
     with pytest.raises(WorkflowDefinitionError):
