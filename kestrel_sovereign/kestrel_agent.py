@@ -737,8 +737,15 @@ class KestrelAgent(
                             api_url=sovereign_url, agent_id=agent_id, state_dir=state_dir,
                         ))
 
-                    # Delegated: Lighthouse (API key)
-                    if os.environ.get("LIGHTHOUSE_API_KEY"):
+                    # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
+                    # if the resolver came back with no LighthouseProvider
+                    # (NONE policy, or no resolver-supplied key, or env var
+                    # unset), DO NOT add the sync target. Otherwise the
+                    # policy would gate live storage but leave snapshot
+                    # uploads going to Lighthouse anyway.
+                    if self.lighthouse_provider is not None and os.environ.get(
+                        "LIGHTHOUSE_API_KEY"
+                    ):
                         self._sync_service.add_target(LighthouseTarget(
                             api_key=os.environ["LIGHTHOUSE_API_KEY"],
                             agent_id=agent_id, state_dir=state_dir,
@@ -870,7 +877,7 @@ class KestrelAgent(
             #                 per support matrix; x402-native LLM is not
             #                 a today-shippable contract).
             try:
-                from kestrel_sdk.payer_policy import PayerKind, ResourceClass
+                from kestrel_sdk.payer_policy import ResourceClass
                 from kestrel_sovereign.services.payer_resolver import (
                     FoundationPayerResolver,
                     load_policy_from_toml,
@@ -884,7 +891,6 @@ class KestrelAgent(
                 _llm_resolved = await _llm_resolver.resolve_for(
                     self.did, ResourceClass.LLM
                 )
-                _llm_kind = _llm_policy.llm.kind
                 if not _llm_resolved.enabled:
                     # NONE: Phase 3b's _check_policy guard reads this flag.
                     self.llm_service.disabled = True
@@ -892,16 +898,16 @@ class KestrelAgent(
                         f"PayerPolicy.llm = NONE for agent {self.did[:30]}...; "
                         f"LLMService.disabled = True"
                     )
-                elif _llm_kind in (
-                    PayerKind.HOST_MASTER_PROVISIONED,
-                    PayerKind.SPONSOR,
-                    PayerKind.USER_MASTER_PROVISIONED,
-                ):
-                    # Activate the agent's own provisioned key. Today's
-                    # detection still keys off the deprecated
-                    # openrouter_key_hash field for back-compat with manual
-                    # provisioning; Phase 3c switches to resolver-driven
-                    # minting when the field is absent.
+                else:
+                    # Any enabled kind. If the agent has a previously-
+                    # provisioned key (via the deprecated openrouter_key_hash
+                    # metadata field, or via Phase 3c resolver-driven minting),
+                    # swap the LLMService to use it. Without this branch,
+                    # agents that manually provisioned via
+                    # scripts/provision_agent_openrouter.py would silently
+                    # fall back to the shared host key on no-payments
+                    # deployments (host_env_default). Same logic applies to
+                    # any *_MASTER_PROVISIONED policy.
                     openrouter_key_hash = agent_node.properties.get(
                         "openrouter_key_hash"
                     )
@@ -926,7 +932,6 @@ class KestrelAgent(
                                 f"Could not activate agent OpenRouter key: {e}",
                                 exc_info=True,
                             )
-                # HOST_ENV: nothing to swap; today's behavior preserved.
             except NotImplementedError:
                 # SELF_WALLET / phase-deferred kinds. Re-raise so the
                 # operator sees a clear failure rather than a half-init

@@ -112,9 +112,22 @@ class FoundationPayerResolver:
             )
             return ResolvedResource.disabled()
 
-        # HOST_ENV: today's behavior — agent's ServiceKeyStorage with
-        # env-var fallback. No side effects required at this point.
-        if spec.kind is PayerKind.HOST_ENV:
+        # HOST_ENV / HOST_MASTER_PROVISIONED / USER_MASTER_PROVISIONED /
+        # SPONSOR all share the same agent-side surface in Phase 3a:
+        # an enabled ResolvedResource backed by the agent's ServiceKeyStorage
+        # with env-var fallback. The DIFFERENCE between them is provisioning
+        # side-effects (which credential gets minted into the storage), and
+        # those run in Phase 3c (HOST_MASTER) and 3.5 (Lighthouse SELF_WALLET).
+        # For now, the agent-init layer detects pre-existing per-agent
+        # credentials via the deprecated `openrouter_key_hash` metadata
+        # field and calls use_agent_key. Phase 3c switches to resolver-driven
+        # minting when that field is absent.
+        if spec.kind in (
+            PayerKind.HOST_ENV,
+            PayerKind.HOST_MASTER_PROVISIONED,
+            PayerKind.USER_MASTER_PROVISIONED,
+            PayerKind.SPONSOR,
+        ):
             logger.debug(
                 f"PayerPolicy.{resource_class.value}: HOST_ENV for agent "
                 f"{agent_did[:30]}..."

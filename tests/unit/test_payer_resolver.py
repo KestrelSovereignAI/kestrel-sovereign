@@ -124,10 +124,15 @@ class TestUnsupportedCombinations:
         assert excinfo.value.vendor == "bogus-vendor-xyz"
 
 
-class TestDeferredKindsRaiseNotImplemented:
-    """Phase 2 ships HOST_ENV + NONE only. The other kinds are wired in
-    Phase 3 / 3.5; until then they must raise a clear error rather than
-    silently degrading or returning a wrong-shape resource.
+class TestEnabledKindsReturnResolver:
+    """Phase 3a expanded the set of kinds that return an enabled
+    ResolvedResource: HOST_ENV plus all three delegated-master kinds
+    (HOST_MASTER_PROVISIONED, USER_MASTER_PROVISIONED, SPONSOR). They
+    share the same agent-side surface; the difference is provisioning
+    side-effects (Phase 3c for HOST_MASTER, 3.5 for SELF_WALLET). Until
+    the side-effects land, the agent-init layer detects pre-existing
+    per-agent credentials via the deprecated openrouter_key_hash
+    metadata field and calls use_agent_key uniformly.
     """
 
     @pytest.mark.asyncio
@@ -139,10 +144,9 @@ class TestDeferredKindsRaiseNotImplemented:
             PayerKind.SPONSOR,
         ],
     )
-    async def test_deferred_kind_raises_not_implemented(
+    async def test_enabled_kind_returns_resolver(
         self, kind: PayerKind
     ) -> None:
-        # Each kind needs a master_did when applicable.
         spec_kwargs = {"vendor": "openrouter", "kind": kind}
         if kind in (PayerKind.USER_MASTER_PROVISIONED, PayerKind.SPONSOR):
             spec_kwargs["master_did"] = "did:test:master"
@@ -154,10 +158,37 @@ class TestDeferredKindsRaiseNotImplemented:
             comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
         )
         resolver = FoundationPayerResolver(policy)
-        with pytest.raises(NotImplementedError) as excinfo:
+        result = await resolver.resolve_for(
+            "did:test:agent-a", ResourceClass.LLM
+        )
+        assert result.enabled is True
+        assert result.key_resolver is not None
+
+
+class TestSelfWalletDeferred:
+    """SELF_WALLET for LLM is explicitly deferred per the support matrix.
+    The resolver raises NotImplementedError there. SELF_WALLET for
+    storage (lighthouse) lands in Phase 3.5.
+    """
+
+    @pytest.mark.asyncio
+    async def test_self_wallet_for_llm_deferred(self) -> None:
+        # The matrix marks (LLM, openrouter, SELF_WALLET) as
+        # NOT_IMPLEMENTED, so resolve_for raises
+        # UnsupportedCombinationError BEFORE reaching the
+        # NotImplementedError for the kind. Both are valid surfaces;
+        # both indicate "this combination is not offered."
+        policy = PayerPolicy(
+            llm=PayerSpec(vendor="openrouter", kind=PayerKind.SELF_WALLET),
+            storage=PayerSpec(vendor="lighthouse", kind=PayerKind.HOST_ENV),
+            compute=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            tools=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+        )
+        resolver = FoundationPayerResolver(policy)
+        from kestrel_sdk.payer_policy import UnsupportedCombinationError
+        with pytest.raises((NotImplementedError, UnsupportedCombinationError)):
             await resolver.resolve_for("did:test:agent-a", ResourceClass.LLM)
-        # Error message names the kind so debugging is easy.
-        assert kind.name in str(excinfo.value)
 
 
 class TestArgValidation:
