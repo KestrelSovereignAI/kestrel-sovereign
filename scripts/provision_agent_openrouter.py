@@ -114,7 +114,10 @@ async def provision_agent_key(
                 properties = json.loads(agent_properties_json) if agent_properties_json else {}
                 if not properties.get("openrouter_key_hash"):
                     legacy_row = await db.fetchone(
-                        "SELECT value FROM agent_metadata WHERE key = 'openrouter_key_hash' LIMIT 1"
+                        "SELECT value FROM agent_metadata "
+                        "WHERE agent_id = ? AND key = 'openrouter_key_hash' "
+                        "LIMIT 1",
+                        (agent_did,),
                     )
                     legacy_hash = legacy_row[0] if legacy_row else None
                     if legacy_hash:
