@@ -426,18 +426,6 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
     return [(pkg, sorted(classes)) for pkg, classes in sorted(by_package.items())]
 
 
-def _module_for_package(package: str) -> str:
-    """Convert a distribution name (``kestrel-feature-legal``) to its
-    importable module name (``kestrel_feature_legal``).
-
-    Holds for every Kestrel feature package today. If a package ever
-    ships with a non-default importable name it must register under a
-    different module convention; the caller can override by adding a
-    package→module mapping if/when that day arrives.
-    """
-    return package.replace("-", "_")
-
-
 # ---------------------------------------------------------------------------
 # Test 3 — Feature package install (each `core = false` package)
 # ---------------------------------------------------------------------------
@@ -477,21 +465,36 @@ def _test_3_feature_package(work_dir: Path) -> List[VerifyResult]:
                 sub_name, False, f"pip install of {package} failed",
             ))
             continue
-        module = _module_for_package(package)
-        imports = "\n".join(f"from {module} import {cls}" for cls in feature_classes)
+        # Resolve via the entry-point group — package authors are only
+        # required to declare the class under
+        # ``kestrel_sovereign.features``, not to re-export it from
+        # ``__init__.py``. Hitting ``ep.load()`` exercises the
+        # declared `module.path:ClassName` and proves the class is
+        # actually importable along the documented contract.
         ok = _python_check(
             venv_dir,
-            f"{imports}\nprint('{package} OK')\n",
+            (
+                "import importlib.metadata as md\n"
+                "group = md.entry_points(group='kestrel_sovereign.features')\n"
+                "by_name = {ep.name: ep for ep in group}\n"
+                f"for cls_name in {sorted(feature_classes)!r}:\n"
+                "    assert cls_name in by_name, "
+                "f'entry point {cls_name!r} not registered'\n"
+                "    obj = by_name[cls_name].load()\n"
+                "    assert obj.__name__ == cls_name, "
+                "f'entry point loaded {obj.__name__!r}, expected {cls_name!r}'\n"
+                f"print('{package} OK')\n"
+            ),
         )
         if not ok:
             results.append(VerifyResult(
                 sub_name, False,
-                f"import {feature_classes} from {module} failed",
+                f"entry-point load of {feature_classes} failed",
             ))
             continue
         results.append(VerifyResult(
             sub_name, True,
-            f"imported {', '.join(feature_classes)} from {module}",
+            f"entry-points loaded: {', '.join(feature_classes)}",
         ))
     return results
 
@@ -536,26 +539,31 @@ def _test_4_sdk_feature_dev(work_dir: Path) -> List[VerifyResult]:
                 sub_name, False, f"--no-deps install of {package} failed",
             ))
             continue
-        module = _module_for_package(package)
-        imports = "\n".join(f"from {module} import {cls}" for cls in feature_classes)
-        asserts = "\n".join(
-            f"assert issubclass({cls}, Feature), "
-            f"'{cls} must be a kestrel_sdk Feature subclass'"
-            for cls in feature_classes
-        )
+        # Resolve through the entry-point group: load each declared
+        # Feature class via the registered `module.path:ClassName` and
+        # assert it subclasses the SDK's Feature base. Avoids the
+        # assumption that packages re-export their Feature classes
+        # from the package root.
         ok = _python_check(
             venv_dir,
             (
+                "import importlib.metadata as md\n"
                 "from kestrel_sdk.features.base import Feature\n"
-                f"{imports}\n"
-                f"{asserts}\n"
+                "group = md.entry_points(group='kestrel_sovereign.features')\n"
+                "by_name = {ep.name: ep for ep in group}\n"
+                f"for cls_name in {sorted(feature_classes)!r}:\n"
+                "    assert cls_name in by_name, "
+                "f'entry point {cls_name!r} not registered'\n"
+                "    obj = by_name[cls_name].load()\n"
+                "    assert issubclass(obj, Feature), "
+                "f'{cls_name!r} must be a kestrel_sdk Feature subclass'\n"
                 f"print('{package} dev mode OK')\n"
             ),
         )
         if not ok:
             results.append(VerifyResult(
                 sub_name, False,
-                f"one or more {feature_classes} are not kestrel_sdk Feature subclasses",
+                f"one or more of {feature_classes} are not kestrel_sdk Feature subclasses",
             ))
             continue
         results.append(VerifyResult(
@@ -592,28 +600,39 @@ def _test_5_full_stack(work_dir: Path) -> List[VerifyResult]:
             return [VerifyResult(name, False, f"pip install of {package} failed")]
 
     expected_classes: List[str] = sorted({c for _, classes in extracted for c in classes})
-    import_lines: List[str] = []
-    for package, classes in extracted:
-        module = _module_for_package(package)
-        for cls in classes:
-            import_lines.append(f"from {module} import {cls}")
     expected_repr = repr(tuple(expected_classes))
 
+    # Imports: load every expected Feature class via its entry point
+    # rather than `from <module> import <Class>` — package authors
+    # aren't required to re-export from `__init__.py`. ``ep.load()``
+    # exercises the declared `module.path:ClassName` so the import
+    # path the SDK contract guarantees is the one tested.
     ok_imports = _python_check(
         venv_dir,
         (
+            "import importlib.metadata as md\n"
             "from kestrel_sovereign.features.base import Feature\n"
-            + "\n".join(import_lines)
-            + "\nprint('Full stack OK')\n"
+            "group = md.entry_points(group='kestrel_sovereign.features')\n"
+            "by_name = {ep.name: ep for ep in group}\n"
+            f"for cls_name in {expected_repr}:\n"
+            "    assert cls_name in by_name, "
+            "f'entry point {cls_name!r} not registered'\n"
+            "    by_name[cls_name].load()\n"
+            "print('Full stack OK')\n"
         ),
     )
     results.append(VerifyResult(
         f"{name} (imports)",
         ok_imports,
-        "all packages importable" if ok_imports
-        else "one or more imports failed",
+        "all packages importable via entry-point resolution" if ok_imports
+        else "one or more entry-point loads failed",
     ))
 
+    # Discovery: enumerate the entry-point group and assert every
+    # expected class name is registered. Catches the case where the
+    # package was installed but the entry point itself was malformed
+    # / missing — `ok_imports` above already covered actual load
+    # failures, this asserts the group surface specifically.
     ok_eps = _python_check(
         venv_dir,
         (
