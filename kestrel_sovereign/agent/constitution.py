@@ -11,6 +11,77 @@ class ConstitutionMixin:
 
     AUDIT_INTERVAL = int(os.environ.get("KESTREL_AUDIT_INTERVAL", "100"))
 
+    # ------------------------------------------------------------------
+    # SignalDispatcher constitutional-injection hooks (#1137 chunk 1G)
+    #
+    # The dispatcher consults these via `getattr(agent, ...)` for
+    # COGNITION sources with `constitution_injection="full"`. They
+    # populate signal_log's per-dispatch audit row and gate
+    # doctrine-bundle drift detection.
+    #
+    # The constitution-hash hook is trivially shippable in Phase 1
+    # because the value already lives on the identity node. The
+    # doctrine-bundle hooks return None by default; agents that want
+    # drift detection override `compute_live_doctrine_bundle_hash` to
+    # invoke `kestrel_sovereign.agent.doctrine_bundle.compute_doctrine_bundle_hash`
+    # with their project_root + bootstrap files. Phase 2 of the epic
+    # wires this on KestrelAgent globally.
+    # ------------------------------------------------------------------
+
+    async def get_constitution_hash(self):
+        """Return the agent's anchored constitution hash, or None.
+
+        Reads `agent_node.properties["constitution_hash"]`. Returns
+        None if the agent has no identity node yet (pre-anchor) or
+        the property hasn't been set.
+        """
+        try:
+            agent_node = await self.storage.get_node(self.agent_id)
+        except Exception:
+            logging.exception(
+                "get_constitution_hash: agent_node lookup failed; "
+                "returning None so dispatcher records NULL"
+            )
+            return None
+        if agent_node is None:
+            return None
+        return agent_node.properties.get("constitution_hash")
+
+    async def get_anchored_doctrine_bundle_hash(self):
+        """Return the anchored doctrine_bundle_hash from agent_node, or None.
+
+        Default implementation reads
+        `agent_node.properties["doctrine_bundle_hash"]`. Returns None
+        when no bundle has been anchored — the dispatcher then records
+        the live hash without claiming drift.
+        """
+        try:
+            agent_node = await self.storage.get_node(self.agent_id)
+        except Exception:
+            logging.exception(
+                "get_anchored_doctrine_bundle_hash: agent_node lookup failed"
+            )
+            return None
+        if agent_node is None:
+            return None
+        return agent_node.properties.get("doctrine_bundle_hash")
+
+    async def compute_live_doctrine_bundle_hash(self):
+        """Compute the live (filesystem-current) doctrine_bundle_hash, or None.
+
+        Default returns None — Phase 1 ships the hook contract but
+        does NOT auto-resolve `project_root` because that requires
+        operator wiring (the agent doesn't intrinsically know its
+        repo root). When None is returned, drift detection is skipped
+        but the audit row still records NULL for the live hash.
+
+        Phase 2 (#1137 phase 2 of the epic) overrides this on
+        KestrelAgent to use `doctrine_bundle.compute_doctrine_bundle_hash`
+        with the agent's resolved `project_root` + the bootstrap
+        loader's `load()` cache.
+        """
+        return None
+
     def _init_constitution_audit_tracking(self):
         """Initialize constitution audit tracking. Called by KestrelAgent.__init__."""
         self._interaction_count = 0

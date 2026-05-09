@@ -650,7 +650,31 @@ class SignalDispatcher:
                 audit=audit,
             )
 
-        prompt = self._render_prompt(signal, registration)
+        # Resolve the constitution body for full-injection sources so
+        # the source's prompt_template can inline it via the
+        # `{constitution}` placeholder. The source author owns
+        # placement (codex/local reviewer prompts vary widely);
+        # templates that don't reference {constitution} are unaffected.
+        constitution_text: Optional[str] = None
+        if registration.constitution_injection == "full":
+            getter = getattr(self._agent, "_get_governing_constitution", None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    if asyncio.iscoroutine(value):
+                        value = await value
+                    if isinstance(value, str):
+                        constitution_text = value
+                except Exception:
+                    logger.exception(
+                        "_get_governing_constitution raised for signal %s; "
+                        "rendering without inline constitution",
+                        signal.id,
+                    )
+
+        prompt = self._render_prompt(
+            signal, registration, constitution_text=constitution_text
+        )
 
         # Step A.5: derive canary + inject the format-appropriate
         # instruction into the rendered prompt BEFORE the LLM call.
@@ -885,13 +909,25 @@ class SignalDispatcher:
             audit.echo_canary_status = CanaryStatus.MISSING
 
     def _render_prompt(
-        self, signal: Signal, registration: SourceRegistration
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        *,
+        constitution_text: Optional[str] = None,
     ) -> str:
         # Minimal template render for v1: read the file and substitute
         # known placeholders. Fenced UNTRUSTED payload is the source's
         # responsibility via the prompt template content (the design says
         # "templates live under prompts/signals/" with explicit fences).
         # A richer template engine (jinja, etc.) is a follow-up.
+        #
+        # `{constitution}` is exposed for source-author use in
+        # codex/local templates (kestrel-sovereign#1137 chunk 1G).
+        # When the dispatcher resolves the constitution at audit
+        # time, the source's template can choose where in the
+        # rendered prompt to inline it. Templates that don't include
+        # `{constitution}` get the same behavior as before — the
+        # placeholder is supplied (default empty string) but ignored.
         template_path = registration.prompt_template
         assert template_path is not None
         template = template_path.read_text(encoding="utf-8")
@@ -902,6 +938,7 @@ class SignalDispatcher:
             payload=signal.payload,
             urgency=signal.urgency.value,
             arrived_at=signal.arrived_at.isoformat(),
+            constitution=constitution_text or "",
         )
 
     # ------------------------------------------------------------------

@@ -696,6 +696,136 @@ async def test_audit_preserved_when_process_input_raises(
 
 
 @pytest.mark.asyncio
+async def test_full_injection_inlines_constitution_into_template(
+    tmp_path,
+):
+    """Codex round-4 P2 mitigation: the dispatcher exposes
+    `{constitution}` as a render variable for full-injection sources.
+    Source authors writing codex/local templates can include it where
+    they want; the canary then proves the model honored a prompt that
+    actually carried the constitution. Phase 2 will move to
+    system-prompt injection for claude_code; Phase 1 ships the
+    user-prompt-level path."""
+
+    class _GovernedAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "ARTICLE I — sovereignty over data"
+
+    template_path = tmp_path / "tpl_with_const.md"
+    template_path.write_text(
+        "Reviewer prompt:\n\n{constitution}\n\nDispatch payload: {payload}",
+        encoding="utf-8",
+    )
+
+    agent = _GovernedAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="codex_full_inject",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("codex_full_inject"))
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    # Constitution body is inline in the rendered prompt (the canary
+    # then verifies the model honored a constitution-bearing prompt,
+    # not an empty directive).
+    assert "ARTICLE I — sovereignty over data" in rendered
+    # Canary directive still appended.
+    assert "constitution_canary" in rendered
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_render_omits_constitution_when_injection_is_none(tmp_path):
+    """For `constitution_injection="none"` the dispatcher does NOT
+    fetch the constitution. Templates referencing `{constitution}`
+    get an empty string, matching legacy behavior."""
+
+    class _GovernedAgent(_AuditingAgent):
+        constitution_calls = 0
+
+        async def _get_governing_constitution(self) -> str:
+            type(self).constitution_calls += 1
+            return "should not appear"
+
+    template_path = tmp_path / "tpl.md"
+    template_path.write_text(
+        "X{constitution}Y", encoding="utf-8"
+    )
+
+    agent = _GovernedAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="legacy_cog_render",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("legacy_cog_render"))
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    assert rendered == "XY"  # placeholder substituted with empty
+    assert _GovernedAgent.constitution_calls == 0
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_get_constitution_hash_reads_node():
+    """The default ConstitutionMixin hook returns
+    agent_node.properties['constitution_hash'] — the trivial wiring
+    that lets real agents stop silently null-stamping signal_log."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    class _Agent(ConstitutionMixin):
+        def __init__(self, hash_value):
+            self.agent_id = "agent-x"
+            node = MagicMock()
+            node.properties = {"constitution_hash": hash_value}
+            self.storage = MagicMock()
+            self.storage.get_node = AsyncMock(return_value=node)
+
+    agent = _Agent("con_real_anchored")
+    assert await agent.get_constitution_hash() == "con_real_anchored"
+
+    # Missing node → None (no crash)
+    class _NoNodeAgent(ConstitutionMixin):
+        def __init__(self):
+            self.agent_id = "missing"
+            self.storage = MagicMock()
+            self.storage.get_node = AsyncMock(return_value=None)
+
+    assert await _NoNodeAgent().get_constitution_hash() is None
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_compute_live_returns_none_default():
+    """Phase 1: default implementation returns None. Phase 2 wires
+    project_root + bootstrap loader to produce a real hash."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    assert await _Agent().compute_live_doctrine_bundle_hash() is None
+
+
+@pytest.mark.asyncio
 async def test_action_signals_bypass_constitutional_audit(tmp_path):
     agent = _AuditingAgent(
         constitution_hash="should_not_be_used",

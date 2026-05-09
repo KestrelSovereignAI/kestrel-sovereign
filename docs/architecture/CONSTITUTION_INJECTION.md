@@ -244,17 +244,23 @@ The registry validator enforces:
 
 ### Phase 1 — Core primitive
 
-- [ ] Doctrine bundle hashing + anchoring on agent_node.properties
-- [ ] Per-dispatch verification (storage_hash vs bundle_hash live)
-- [ ] `signal_log` ALTERs (+ idx_constitution_hash)
-- [ ] `build_system_prompt` extended with priority-ordered truncation + clause tracking
-- [ ] Canary derivation + injection + echo-verification primitive
-- [ ] New result-status reasons (per §3 status semantics — `DROPPED_VALIDATION` for pre-dispatch refusals, `FAILED` for failures during/after dispatch):
+- [x] Doctrine bundle hashing + anchoring on agent_node.properties (chunk 1B)
+- [x] Per-dispatch verification (storage_hash vs bundle_hash live) (chunk 1G)
+- [x] `signal_log` ALTERs (+ idx_constitution_hash) (chunk 1C)
+- [x] `build_system_prompt` extended with priority-ordered truncation + clause tracking (chunk 1E — opt-in via `build_system_prompt_with_tracking`)
+- [x] Canary derivation + injection + echo-verification primitive (chunks 1F + 1G)
+- [x] New result-status reasons (per §3 status semantics):
   - `Status.DROPPED_VALIDATION` with `error="doctrine_bundle_drift"` (caught BEFORE the dispatch runs; bundle-hash mismatch at start of dispatch)
   - `Status.FAILED` with `error="constitution_not_received"` (dispatch executed, response was checked, canary missing)
-- [ ] `SourceRegistration` field additions; registry validator updates
-- [ ] Multi-format wrappers (`claude_code`, `codex`, `local`, `bare`) — stateless formatters over the same content
-- [ ] OTel spans + Prometheus counters: `constitution_echo_verified_total`, `constitution_echo_missing_total`, `doctrine_bundle_drift_total`
+- [x] `SourceRegistration` field additions; registry validator updates (chunks 1A SDK + 1D sovereign)
+- [x] Multi-format wrappers (`claude_code`, `codex`, `local`, `bare`) — stateless formatters over the same content (chunk 1F instruction builder; chunk 1E assembler)
+- [ ] OTel spans + Prometheus counters: `constitution_echo_verified_total`, `constitution_echo_missing_total`, `doctrine_bundle_drift_total` (chunk 1H, pending)
+
+**Phase 1 boundary the chunk 1G integration draws explicitly:**
+
+- For `prompt_template_format in {"codex","local"}`: source authors include `{constitution}` in their prompt_template to inline the constitution body where the reviewer expects it. The dispatcher exposes the placeholder; the source owns placement. The canary then proves the model honored the rendered prompt (which includes the constitution).
+- For `prompt_template_format == "claude_code"`: full system-prompt injection of the doctrine bundle + phantom-tool registration require deeper agent integration. Phase 1 ships the contract (registration + audit + canary primitives). Phase 2 (epic Phase 2) wires the in-agent path so claude_code COGNITION turns get the doctrine bundle in their system prompt and a per-turn ephemeral receipt tool.
+- `KestrelAgent.compute_live_doctrine_bundle_hash` returns None by default (Phase 1 limitation — `project_root` resolution is operator wiring). Phase 2 overrides this to invoke `doctrine_bundle.compute_doctrine_bundle_hash` with a resolved `project_root` + bootstrap loader cache; until then drift detection only fires when an operator implements the override.
 
 ### Phase 2 — Migration of existing COGNITION sources
 
