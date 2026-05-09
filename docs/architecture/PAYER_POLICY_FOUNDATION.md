@@ -390,18 +390,36 @@ in charge.
 
 #### LLM path (per-agent service, per-agent key swap)
 
-**Required invariant: one `LLMService` instance per agent.** This is
-already the de facto contract today —
+**Required invariant: one `LLMService` instance per agent.** Production
+code already follows this de facto today —
 [`multi_agent/agent_manager.py:90-91`][agm] explicitly constructs a
-fresh `LLMService` for each agent ("Each agent gets its own LLMService
-(mutable model state)"), and [`kestrel_agent.py:292`][ka292] enforces
-it at the constructor level. The plan REQUIRES this invariant because
-`LLMService.use_agent_key` mutates `self.providers` in-place; if the
-service were process-scoped, the last agent loaded would silently steal
-the OpenRouter client of every other agent. Phase 3 adds an explicit
-test asserting that two `KestrelAgent` instances loaded in the same
-process do NOT share an `LLMService` instance, so this invariant cannot
-silently regress.
+fresh `LLMService` per agent ("Each agent gets its own LLMService
+(mutable model state)"). However, this invariant is currently NOT
+enforced: [`kestrel_agent.py:292`][ka292] accepts any injected
+`llm_service`, and at least one test
+([`tests/integration/test_constitution_adversarial.py:232-247`][adv-test])
+shares a single instance across two `KestrelAgent` constructions. The
+plan REQUIRES this invariant because `LLMService.use_agent_key` mutates
+`self.providers` in-place; without enforcement, the last agent loaded
+would silently steal the OpenRouter client of every other agent
+sharing the instance.
+
+Phase 2 promotes the invariant from convention to enforcement:
+
+1. Add `LLMService.attach_to_agent(agent_did: str)` which records the
+   owning agent on first call and raises `LLMServiceAlreadyAttachedError`
+   on any subsequent attach with a different DID. The method is
+   idempotent for the same DID.
+2. Modify `KestrelAgent.__init__` to call `attach_to_agent(self.did)`
+   immediately after assigning `self.llm_service`. Construction fails
+   loudly if a second agent tries to claim the same instance.
+3. Migrate `test_constitution_adversarial.py:232-247` to construct
+   distinct `LLMService` instances per agent. The test was inadvertently
+   testing a non-invariant; fixing it is part of this PR.
+
+Phase 3 then adds a regression test asserting that two `KestrelAgent`
+instances in the same process get distinct `LLMService` instances and
+that any attempt to share raises at agent construction.
 
 `LLMService.__init__` and `ProviderRegistry` are NOT modified. Per-agent
 customization continues to happen after agent load via the existing
@@ -436,16 +454,30 @@ match (llm.enabled, policy.llm.kind, policy.llm.vendor):
 ```
 
 `LLMService.disabled` is a new instance attribute (default `False`).
-Phase 3 adds a guard at the top of each generation entry point
-(`generate`, `generate_with_messages`, `get_response`, plus the
-streaming variants) that raises a structured `PolicyDeniedError` when
-`self.disabled` is `True`. Callers (chat endpoints, reflection loops)
-treat this the same way they treat "no key configured" today. The flag
-is in-memory per instance; persistence is unnecessary because the
-policy in kestrel.toml is the source of truth and is re-read at each
-agent init. Tests assert that flipping `disabled = True` actually
-blocks every documented generation method; no entry point is allowed
-to bypass it.
+Phase 3 adds a single private guard `_check_policy()` that raises
+`PolicyDeniedError` when `self.disabled` is `True`, and inserts a call
+to it at the top of EVERY public method on `LLMService` that hits a
+provider client. Today's exhaustive list (verified by grep against
+[`kestrel_sovereign/llm/service.py`][llm-svc]):
+
+- `get_audit_response`
+- `get_response`
+- `get_response_with_model`
+- `generate`
+- `generate_with_messages`
+- any streaming variants present in the codebase at implementation
+  time (Phase 3 must enumerate these by inspection, not from this
+  list, since streaming has been actively refactored)
+
+Tests in Phase 3 walk the `LLMService` class via reflection at runtime,
+collect every `async def` method whose name matches one of the
+generation patterns, and assert each one calls `_check_policy()` at
+least once on the disabled path. This catches future entry points that
+forget the guard. Callers (chat endpoints, reflection loops) treat the
+`PolicyDeniedError` the same way they treat "no key configured" today.
+The flag is in-memory per instance; persistence is unnecessary because
+the policy in kestrel.toml is the source of truth and is re-read at
+each agent init.
 
 The `OpenRouterProvisioningService.create_agent_key` side-effect runs
 inside `PayerResolver.resolve_for(agent_did, "llm")` when the spec is
@@ -630,5 +662,7 @@ env-var presence. CI does not need them; local pre-PR run does.
 [use-agent-key-call]: ../../kestrel_sovereign/kestrel_agent.py
 [agm]: ../../kestrel_sovereign/multi_agent/agent_manager.py
 [ka292]: ../../kestrel_sovereign/kestrel_agent.py
+[adv-test]: ../../tests/integration/test_constitution_adversarial.py
+[llm-svc]: ../../kestrel_sovereign/llm/service.py
 [pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md
