@@ -388,45 +388,64 @@ behavior, kept for non-policy callers); otherwise use whichever was
 supplied verbatim. No silent env-var bleed-through when the resolver is
 in charge.
 
-#### LLM path (shared service, per-agent key swap)
+#### LLM path (per-agent service, per-agent key swap)
 
-`LLMService` is constructed once at process startup with shared
-provider clients (today's behavior, unchanged — `LLMService.__init__`
-and `ProviderRegistry` are NOT modified). Per-agent customization
-happens after agent load via the existing
+**Required invariant: one `LLMService` instance per agent.** This is
+already the de facto contract today —
+[`multi_agent/agent_manager.py:90-91`][agm] explicitly constructs a
+fresh `LLMService` for each agent ("Each agent gets its own LLMService
+(mutable model state)"), and [`kestrel_agent.py:292`][ka292] enforces
+it at the constructor level. The plan REQUIRES this invariant because
+`LLMService.use_agent_key` mutates `self.providers` in-place; if the
+service were process-scoped, the last agent loaded would silently steal
+the OpenRouter client of every other agent. Phase 3 adds an explicit
+test asserting that two `KestrelAgent` instances loaded in the same
+process do NOT share an `LLMService` instance, so this invariant cannot
+silently regress.
+
+`LLMService.__init__` and `ProviderRegistry` are NOT modified. Per-agent
+customization continues to happen after agent load via the existing
 [`LLMService.use_agent_key(agent_did, db, provider)`][use_agent_key]
 mechanism. The current direct call at
 [`kestrel_agent.py:806-820`][use-agent-key-call] (which keys off the
-deprecated `openrouter_key_hash` agent metadata field) is replaced
-with a policy-aware version:
+deprecated `openrouter_key_hash` agent metadata field) is replaced with
+a policy-aware version. Because the agent's `LLMService` instance is
+already its own, no `agent_did` parameter is needed for the disable
+path — the flag lives on the instance:
 
 ```python
 llm = await payer_resolver.resolve_for(agent_did, "llm")
 match (llm.enabled, policy.llm.kind, policy.llm.vendor):
     case (False, _, _):
-        # NONE: agent has no LLM; LLMService refuses calls for this agent
-        llm_service.disable_for_agent(agent_did)
+        # NONE: this agent's LLMService refuses every generation call.
+        self.llm_service.disabled = True
     case (True, "host_env", _):
-        # Shared key path; nothing to swap
+        # Shared-host key path; nothing to swap. Policy chose this vendor
+        # but is paying via the host's env-var-configured key.
         pass
     case (True, "host_master_provisioned", vendor):
         # Resolver already minted the child key in agent's ServiceKeyStorage.
-        # Swap shared client for agent-specific one for this vendor's routes.
-        await llm_service.use_agent_key(agent_did, db, provider=vendor)
+        # Swap this agent's LLMService client for the agent-specific key on
+        # every route belonging to this vendor.
+        await self.llm_service.use_agent_key(agent_did, db, provider=vendor)
     case (True, "sponsor", vendor):
         # Same as host_master but the resolver used sponsor's HostKeyStorage.
-        await llm_service.use_agent_key(agent_did, db, provider=vendor)
+        await self.llm_service.use_agent_key(agent_did, db, provider=vendor)
     case (True, "self_wallet", _):
         raise NotImplementedError("self_wallet for llm deferred")
 ```
 
-`LLMService.disable_for_agent(agent_did)` is a small new method: it
-flags the agent as forbidden for this LLMService instance. Subsequent
-calls keyed to that agent return a structured "policy denied" error
-that callers (chat endpoints, reflection loops) treat as "no LLM
-available" — same surface as today's "no key configured" condition.
-The flag lives in-memory on the LLMService; it does not persist to the
-agent's DB (the policy itself is the source of truth).
+`LLMService.disabled` is a new instance attribute (default `False`).
+Phase 3 adds a guard at the top of each generation entry point
+(`generate`, `generate_with_messages`, `get_response`, plus the
+streaming variants) that raises a structured `PolicyDeniedError` when
+`self.disabled` is `True`. Callers (chat endpoints, reflection loops)
+treat this the same way they treat "no key configured" today. The flag
+is in-memory per instance; persistence is unnecessary because the
+policy in kestrel.toml is the source of truth and is re-read at each
+agent init. Tests assert that flipping `disabled = True` actually
+blocks every documented generation method; no entry point is allowed
+to bypass it.
 
 The `OpenRouterProvisioningService.create_agent_key` side-effect runs
 inside `PayerResolver.resolve_for(agent_did, "llm")` when the spec is
@@ -449,9 +468,11 @@ service directly, unchanged.
   - cold-start restore regression test still passes.
   - `storage = none` actually disables Lighthouse on a host that has
     `LIGHTHOUSE_API_KEY` set (regression for the round-2 finding).
-  - `llm = none` causes LLMService calls for that agent to return the
-    "policy denied" surface, not silently fall through to the shared
-    key.
+  - `llm = none` causes every LLM generation entry point on the
+    agent's LLMService instance to raise `PolicyDeniedError`, not
+    silently fall through to the shared key.
+  - Two `KestrelAgent` instances in the same process get distinct
+    `LLMService` instances (asserts the per-agent invariant).
 
 **Codex review focus:** the storage and LLM wiring contracts are
 clearly distinct and neither bleeds into the other; the lazy-
@@ -607,5 +628,7 @@ env-var presence. CI does not need them; local pre-PR run does.
 [kr]: ../../kestrel_sovereign/services/key_resolution.py
 [use_agent_key]: ../../kestrel_sovereign/llm/service.py
 [use-agent-key-call]: ../../kestrel_sovereign/kestrel_agent.py
+[agm]: ../../kestrel_sovereign/multi_agent/agent_manager.py
+[ka292]: ../../kestrel_sovereign/kestrel_agent.py
 [pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md
