@@ -898,11 +898,40 @@ class SignalDispatcher:
             )
 
         budget = registration.system_prompt_budget_bytes
+        accepts_anchored = _agent_accepts_kwarg(
+            self._agent.process_input, "anchored_doctrine"
+        )
+        # Resolve anchored doctrine for full-injection sources so the
+        # agent's system-prompt assembler can deliver doctrine content
+        # (TORTOISE_DOCTRINE.md, AGENTS.md). Codex round-16 P2 fix —
+        # without this, the audit recorded the bundle hash but the
+        # model never received the doctrine.
+        anchored_doctrine = None
+        if (
+            registration.constitution_injection == "full"
+            and accepts_anchored
+        ):
+            getter = getattr(self._agent, "get_anchored_doctrine_files", None)
+            if callable(getter):
+                try:
+                    value = getter()
+                    if asyncio.iscoroutine(value):
+                        value = await value
+                    if value:
+                        anchored_doctrine = value
+                except Exception:
+                    logger.exception(
+                        "agent.get_anchored_doctrine_files raised for "
+                        "signal %s; proceeding without anchored doctrine",
+                        signal.id,
+                    )
         process_input_kwargs: dict[str, Any] = {}
         if addendum is not None and accepts_addendum:
             process_input_kwargs["system_prompt_addendum"] = addendum
         if budget is not None and accepts_budget:
             process_input_kwargs["system_prompt_budget_bytes"] = budget
+        if anchored_doctrine is not None:
+            process_input_kwargs["anchored_doctrine"] = anchored_doctrine
 
         try:
             if process_input_kwargs:

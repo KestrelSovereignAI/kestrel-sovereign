@@ -228,6 +228,7 @@ class ContextManager:
         reflection_guidance: Optional[List[str]] = None,
         system_prompt_addendum: Optional[str] = None,
         system_prompt_budget_bytes: Optional[int] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
     ) -> ContextResult:
         """
         Build complete context for an LLM request.
@@ -265,6 +266,7 @@ class ContextManager:
                 include_briefing=include_briefing,
                 system_prompt_addendum=system_prompt_addendum,
                 system_prompt_budget_bytes=system_prompt_budget_bytes,
+                anchored_doctrine=anchored_doctrine,
             )
 
         # Use provided history or fetch from storage
@@ -317,6 +319,7 @@ class ContextManager:
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=state_of_mind,
                 budget_bytes=effective_budget,
+                anchored_doctrine=anchored_doctrine,
             )
             system_prompt = tracking_result.prompt
             # Surface tracking back to the caller so the dispatcher
@@ -541,6 +544,7 @@ class ContextManager:
         include_briefing: bool,
         system_prompt_addendum: Optional[str] = None,
         system_prompt_budget_bytes: Optional[int] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
     ) -> ContextResult:
         """
         Build minimal context for EPHEMERAL privacy mode.
@@ -589,6 +593,7 @@ class ContextManager:
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=state_of_mind,
                 budget_bytes=effective_budget,
+                anchored_doctrine=anchored_doctrine,
             )
             system_prompt = ephemeral_tracking.prompt
             injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)

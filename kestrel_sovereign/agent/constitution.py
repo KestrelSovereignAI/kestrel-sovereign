@@ -2,7 +2,9 @@
 import logging
 import hashlib
 import os
-from typing import Tuple
+from collections import OrderedDict
+from pathlib import Path
+from typing import Optional, Tuple
 from datetime import datetime, timezone
 
 
@@ -69,17 +71,146 @@ class ConstitutionMixin:
     async def compute_live_doctrine_bundle_hash(self):
         """Compute the live (filesystem-current) doctrine_bundle_hash, or None.
 
-        Default returns None — Phase 1 ships the hook contract but
-        does NOT auto-resolve `project_root` because that requires
-        operator wiring (the agent doesn't intrinsically know its
-        repo root). When None is returned, drift detection is skipped
-        but the audit row still records NULL for the live hash.
+        Resolution strategy (codex round-16 P2 fix — was previously
+        a Phase 2 stub):
+        1. `KESTREL_PROJECT_ROOT` env var (operator override).
+        2. Walk up from this module's `__file__` looking for `.git`
+           or `pyproject.toml` (development checkouts).
+        3. Return None if neither is available — drift detection
+           skipped but no exception raised.
 
-        Phase 2 (#1137 phase 2 of the epic) overrides this on
-        KestrelAgent to use `doctrine_bundle.compute_doctrine_bundle_hash`
-        with the agent's resolved `project_root` + the bootstrap
-        loader's `load()` cache.
+        With a project_root resolved, hashes the doctrine bundle:
+        anchored doctrine paths (DEFAULT_ANCHORED_PATHS plus any
+        operator-declared additions on `agent_node.properties[
+        "doctrine_anchored_paths"]`) + bootstrap files from
+        `self.context_builder._bootstrap_files` if available.
         """
+        from kestrel_sovereign.agent.doctrine_bundle import (
+            compute_doctrine_bundle_hash,
+            resolve_anchored_paths,
+            PROP_BUNDLE_ANCHORED_PATHS,
+        )
+
+        project_root = await self._resolve_project_root_for_doctrine()
+        if project_root is None:
+            return None
+
+        extra_paths = []
+        try:
+            agent_node = await self.storage.get_node(self.agent_id)
+            if agent_node is not None:
+                extra_paths = (
+                    agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
+                )
+        except Exception:
+            logging.exception(
+                "compute_live_doctrine_bundle_hash: agent_node lookup failed; "
+                "computing bundle without operator-extra paths"
+            )
+
+        anchored_paths = resolve_anchored_paths(
+            project_root=project_root, extra_paths=extra_paths
+        )
+
+        # Bootstrap files come from the context_builder when present.
+        bootstrap_files: "OrderedDict[str, str]" = OrderedDict()
+        cb = getattr(self, "context_builder", None)
+        if cb is not None:
+            try:
+                bootstrap_files = OrderedDict(cb._bootstrap_files)
+            except Exception:
+                logging.exception(
+                    "compute_live_doctrine_bundle_hash: bootstrap loader read failed"
+                )
+                bootstrap_files = OrderedDict()
+
+        try:
+            snapshot = compute_doctrine_bundle_hash(
+                anchored_files=anchored_paths,
+                bootstrap_files=bootstrap_files,
+            )
+            return snapshot.hash
+        except Exception:
+            logging.exception(
+                "compute_live_doctrine_bundle_hash: hash computation failed"
+            )
+            return None
+
+    async def get_anchored_doctrine_files(self):
+        """Return an `OrderedDict[name, content]` of anchored doctrine
+        files for full-injection dispatches, or None if no project_root
+        is resolvable.
+
+        The dispatcher passes this dict to
+        `ContextManager.build_context(anchored_doctrine=...)` so the
+        budget-aware assembler injects TORTOISE_DOCTRINE.md / AGENTS.md
+        into the system prompt (codex round-16 P2 fix). Without this
+        wiring, full injection would record the doctrine bundle hash
+        for audit but the model would never see the doctrine content.
+        """
+        from kestrel_sovereign.agent.doctrine_bundle import (
+            PROP_BUNDLE_ANCHORED_PATHS,
+            resolve_anchored_paths,
+        )
+
+        project_root = await self._resolve_project_root_for_doctrine()
+        if project_root is None:
+            return None
+
+        extra_paths = []
+        try:
+            agent_node = await self.storage.get_node(self.agent_id)
+            if agent_node is not None:
+                extra_paths = (
+                    agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
+                )
+        except Exception:
+            logging.exception(
+                "get_anchored_doctrine_files: agent_node lookup failed"
+            )
+
+        anchored_paths = resolve_anchored_paths(
+            project_root=project_root, extra_paths=extra_paths
+        )
+
+        files: "OrderedDict[str, str]" = OrderedDict()
+        for path in anchored_paths:
+            try:
+                files[path.name] = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                # Match doctrine_bundle behavior — missing anchored
+                # files are skipped, not an error.
+                continue
+            except OSError as e:
+                logging.warning(
+                    "get_anchored_doctrine_files: cannot read %s: %s",
+                    path,
+                    e,
+                )
+                continue
+        return files
+
+    async def _resolve_project_root_for_doctrine(self) -> Optional[Path]:
+        """Best-effort project_root resolution for doctrine bundling.
+
+        Operator override via `KESTREL_PROJECT_ROOT` wins; otherwise
+        walk up from this module's `__file__` looking for `.git` or
+        `pyproject.toml`. Returns None when neither is available
+        (e.g. installed-package deployments without a checkout) —
+        the default `compute_live_doctrine_bundle_hash` then
+        gracefully reports None and drift detection is skipped.
+        """
+        env_root = os.environ.get("KESTREL_PROJECT_ROOT")
+        if env_root:
+            p = Path(env_root)
+            if p.exists():
+                return p
+
+        # Walk up from this file looking for repo markers.
+        candidate = Path(__file__).resolve()
+        for parent in candidate.parents:
+            if (parent / ".git").exists() or (parent / "pyproject.toml").exists():
+                return parent
         return None
 
     def verify_constitution_echo(

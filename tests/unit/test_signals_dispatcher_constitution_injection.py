@@ -1302,15 +1302,68 @@ async def test_dispatch_clears_stale_tracking_before_processing(
 
 
 @pytest.mark.asyncio
-async def test_constitution_mixin_compute_live_returns_none_default():
-    """Phase 1: default implementation returns None. Phase 2 wires
-    project_root + bootstrap loader to produce a real hash."""
+async def test_constitution_mixin_compute_live_returns_none_when_no_project_root(
+    monkeypatch,
+):
+    """When neither `KESTREL_PROJECT_ROOT` env var nor a `.git`/
+    `pyproject.toml` ancestor is reachable, the default returns
+    None — drift detection skipped without crashing."""
     from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", "/nonexistent/missing/path")
 
     class _Agent(ConstitutionMixin):
         pass
 
-    assert await _Agent().compute_live_doctrine_bundle_hash() is None
+    # Patch the walk-up resolver to return None too, simulating a
+    # deployment without repo markers.
+    agent = _Agent()
+    agent._resolve_project_root_for_doctrine = (
+        lambda: __import__("asyncio").sleep(0, result=None)
+    )
+    # Simpler: monkey-patch directly via async wrapper.
+    async def _none():
+        return None
+
+    agent._resolve_project_root_for_doctrine = _none
+
+    assert await agent.compute_live_doctrine_bundle_hash() is None
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_compute_live_returns_hash_when_project_root_exists(
+    tmp_path, monkeypatch,
+):
+    """When KESTREL_PROJECT_ROOT points at a directory containing
+    the doctrine files, the default computes a real bundle hash so
+    drift detection actually fires for production agents (codex
+    round-16 P2 fix). Also verifies storage-lookup failures are
+    swallowed gracefully (the stub has no storage attribute)."""
+    import logging as _logging
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import DEFAULT_ANCHORED_PATHS
+
+    # Create dummy doctrine files under tmp_path.
+    for rel in DEFAULT_ANCHORED_PATHS:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"contents of {rel}", encoding="utf-8")
+
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test-agent"
+
+    agent = _Agent()
+    # Suppress the expected agent_node error log.
+    _logging.disable(_logging.CRITICAL)
+    try:
+        h = await agent.compute_live_doctrine_bundle_hash()
+    finally:
+        _logging.disable(_logging.NOTSET)
+    assert isinstance(h, str)
+    assert len(h) == 64  # sha256 hex
+    assert all(c in "0123456789abcdef" for c in h)
 
 
 @pytest.mark.asyncio
