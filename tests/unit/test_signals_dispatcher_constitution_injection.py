@@ -612,6 +612,90 @@ async def test_minimal_agent_echo_required_fails(tmp_path, template_path):
 
 
 @pytest.mark.asyncio
+async def test_echo_required_treats_not_required_as_failure(
+    tmp_path, template_path
+):
+    """Codex round-3 P2: when echo IS required, a verifier that
+    returns NOT_REQUIRED is a contract violation, not a pass. The
+    dispatch must fail with `constitution_not_received`."""
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.NOT_REQUIRED,  # bogus answer
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="echo_bogus_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("echo_bogus_cog"))
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    assert result.error == "constitution_not_received"
+    rows = await env.backend.fetch_all(
+        "SELECT echo_canary_status FROM signal_log"
+    )
+    # Stamp reflects what the verifier said — auditor sees the
+    # protocol violation rather than a stomp to MISSING.
+    assert rows == [("not_required",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_preserved_when_process_input_raises(
+    tmp_path, template_path
+):
+    """Codex round-3 P2: if process_input raises after the audit was
+    built, the audit fields (constitution_hash, doctrine_bundle_hash)
+    must still land in signal_log so the per-dispatch forensic trail
+    survives LLM/API failures."""
+
+    class _RaisingAgent(_AuditingAgent):
+        async def process_input(self, prompt: str):
+            self.process_input_calls.append(prompt)
+            raise RuntimeError("openai 503")
+
+    agent = _RaisingAgent(
+        constitution_hash="con_traceable",
+        anchored_bundle_hash="bundle_anchored",
+        live_bundle_hash="bundle_anchored",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="will_raise_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("will_raise_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    # Outer message includes the raising cause.
+    assert "openai 503" in (result.error or "")
+
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, "
+        "echo_canary_status FROM signal_log"
+    )
+    # Audit preserved even though process_input failed.
+    assert rows == [("con_traceable", "bundle_anchored", "not_required")]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_action_signals_bypass_constitutional_audit(tmp_path):
     agent = _AuditingAgent(
         constitution_hash="should_not_be_used",

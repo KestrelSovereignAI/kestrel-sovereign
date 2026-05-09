@@ -607,6 +607,39 @@ class SignalDispatcher:
         # injected; refusing the dispatch is safer than dispatching
         # under tampered doctrine).
         audit = await self._build_constitution_audit(signal, registration)
+        try:
+            return await self._run_cognition_with_audit(
+                signal, registration, start, audit
+            )
+        except Exception as e:
+            # Codex round-3 P2: if process_input raises, the audit
+            # would otherwise be lost when the outer try/except in
+            # `_route_under_locks` calls `_fail` without it. Catch
+            # here so the per-dispatch forensic trail (constitution
+            # hash, bundle hash, MISSING canary stamp) lands in
+            # signal_log even for LLM/API failure cases.
+            logger.exception(
+                "COGNITION dispatch raised for signal %s "
+                "(source=%s) — preserving audit on _fail",
+                signal.id,
+                signal.source,
+            )
+            return self._fail(
+                signal,
+                start,
+                Status.FAILED,
+                error=f"{type(e).__name__}: {e}",
+                registration=registration,
+                audit=audit,
+            )
+
+    async def _run_cognition_with_audit(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        start: float,
+        audit: "_ConstitutionAudit",
+    ) -> SignalResult:
         if audit.drift_error is not None:
             return self._fail(
                 signal,
@@ -666,12 +699,14 @@ class SignalDispatcher:
         # opted in to `require_constitution_echo=True` the dispatcher
         # asks the agent for the format-specific receipt — checking
         # against the SAME canary that was injected pre-dispatch
-        # (audit.canary, derived in Step A.5). MISSING outcome flips
-        # the dispatch to FAILED with `error="constitution_not_received"`
-        # per design §3.
+        # (audit.canary, derived in Step A.5). Anything other than
+        # VERIFIED flips the dispatch to FAILED with
+        # `error="constitution_not_received"` per design §3 — codex
+        # round-3 P2 fix: NOT_REQUIRED returned by a verifier when
+        # echo IS required is a contract violation, not a pass.
         if registration.require_constitution_echo:
             await self._verify_canary_post_dispatch(signal, registration, audit)
-            if audit.echo_canary_status is CanaryStatus.MISSING:
+            if audit.echo_canary_status is not CanaryStatus.VERIFIED:
                 return self._fail(
                     signal,
                     start,
