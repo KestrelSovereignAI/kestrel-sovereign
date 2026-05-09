@@ -1,0 +1,315 @@
+"""JSON Schema for the workflow domain model.
+
+The schema is the wire-format contract for ``workflow_define(spec)`` and
+the runtime ``params_schema`` validator. It mirrors :mod:`models` exactly
+— a drift between the two is a bug; the round-trip test in
+``tests/unit/features/workflows/test_models.py`` enforces parity.
+
+We use draft-2020-12 because that's what every other Kestrel surface
+uses (signal source registrations, hooks, identity packages). No
+``$schema`` URI is hard-coded into the *value* of WorkflowSpec — it's
+only declared at the top level of the SCHEMA itself. Validators (Phase
+1's ``WorkflowDefinitionValidator``) pin to draft-2020-12 explicitly.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from kestrel_sdk.signals import SignalMode
+
+from kestrel_sovereign.features.workflows.models import (
+    BUILT_IN_GATE_TYPES,
+    EdgeKind,
+    GateOutcome,
+    RunStatus,
+    TriggerKind,
+)
+
+
+# Hash form for spec_hash / actor_sig payloads (lower-hex sha256, 64 chars).
+_HASH_PATTERN = r"^[0-9a-f]{64}$"
+
+# Lenient identifier pattern matching ``models._NAME_RE``.
+_NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$"
+
+
+def _gate_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["type"],
+        "properties": {
+            "type": {"type": "string", "enum": sorted(BUILT_IN_GATE_TYPES)},
+            "params": {"type": "object"},
+        },
+    }
+
+
+def _stage_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "signal_source", "signal_mode"],
+        "properties": {
+            "name": {"type": "string", "pattern": _NAME_PATTERN},
+            "signal_source": {"type": "string", "pattern": _NAME_PATTERN},
+            "signal_mode": {
+                "type": "string",
+                "enum": [m.value for m in SignalMode],
+            },
+            "params": {"type": "object"},
+            "gate": _gate_schema(),
+            "compensate": {"type": "string", "minLength": 1},
+            "forbidden_modules": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "irreversible": {"type": "boolean"},
+            "non_deterministic": {"type": "boolean"},
+            "read_only": {"type": "boolean"},
+        },
+    }
+
+
+def _edge_schema() -> dict[str, Any]:
+    """Edges use ``oneOf`` so only the relevant fields are populated per
+    kind — mirrors ``Edge._reject_unrelated_fields``."""
+
+    base = {
+        "from_stage": {"type": "string", "pattern": _NAME_PATTERN},
+        "params": {"type": "object"},
+    }
+    return {
+        "type": "object",
+        "oneOf": [
+            {
+                "additionalProperties": False,
+                "required": ["kind", "from_stage", "to_stage"],
+                "properties": {
+                    **base,
+                    "kind": {"const": EdgeKind.SEQUENTIAL.value},
+                    "to_stage": {"type": "string", "pattern": _NAME_PATTERN},
+                },
+            },
+            {
+                "additionalProperties": False,
+                "required": [
+                    "kind",
+                    "from_stage",
+                    "condition",
+                    "true_stage",
+                    "false_stage",
+                ],
+                "properties": {
+                    **base,
+                    "kind": {"const": EdgeKind.BRANCH.value},
+                    "condition": {"type": "string", "minLength": 1},
+                    "true_stage": {
+                        "type": "string",
+                        "pattern": _NAME_PATTERN,
+                    },
+                    "false_stage": {
+                        "type": "string",
+                        "pattern": _NAME_PATTERN,
+                    },
+                },
+            },
+            {
+                "additionalProperties": False,
+                "required": [
+                    "kind",
+                    "from_stage",
+                    "stages",
+                    "join_strategy",
+                ],
+                "properties": {
+                    **base,
+                    "kind": {"const": EdgeKind.PARALLEL.value},
+                    "stages": {
+                        "type": "array",
+                        "minItems": 2,
+                        "items": {
+                            "type": "string",
+                            "pattern": _NAME_PATTERN,
+                        },
+                    },
+                    "join_strategy": {
+                        "type": "string",
+                        "enum": ["all", "any", "first_success"],
+                    },
+                },
+            },
+            {
+                "additionalProperties": False,
+                "required": [
+                    "kind",
+                    "from_stage",
+                    "subworkflow_name",
+                    "subworkflow_version",
+                ],
+                "properties": {
+                    **base,
+                    "kind": {"const": EdgeKind.SUBWORKFLOW.value},
+                    "subworkflow_name": {
+                        "type": "string",
+                        "pattern": _NAME_PATTERN,
+                    },
+                    "subworkflow_version": {
+                        "type": "integer",
+                        "minimum": 1,
+                    },
+                },
+            },
+        ],
+    }
+
+
+def _trigger_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "oneOf": [
+            {
+                "additionalProperties": False,
+                "required": ["kind"],
+                "properties": {
+                    "kind": {"const": TriggerKind.MANUAL.value},
+                    "params": {"type": "object"},
+                },
+            },
+            {
+                "additionalProperties": False,
+                "required": ["kind", "cron_expression"],
+                "properties": {
+                    "kind": {"const": TriggerKind.CRON.value},
+                    "cron_expression": {"type": "string", "minLength": 1},
+                    "params": {"type": "object"},
+                },
+            },
+            {
+                "additionalProperties": False,
+                "required": ["kind", "signal_source"],
+                "properties": {
+                    "kind": {"const": TriggerKind.SIGNAL_SOURCE.value},
+                    "signal_source": {
+                        "type": "string",
+                        "pattern": _NAME_PATTERN,
+                    },
+                    "params": {"type": "object"},
+                },
+            },
+        ],
+    }
+
+
+WORKFLOW_SPEC_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "WorkflowSpec",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["name", "version", "stages"],
+    "properties": {
+        "name": {"type": "string", "pattern": _NAME_PATTERN},
+        "version": {"type": "integer", "minimum": 1},
+        "stages": {
+            "type": "array",
+            "minItems": 1,
+            "items": _stage_schema(),
+        },
+        "edges": {"type": "array", "items": _edge_schema()},
+        "triggers": {"type": "array", "items": _trigger_schema()},
+        "params_schema": {"type": "object"},
+        "retention_days": {
+            "anyOf": [{"type": "integer", "minimum": 1}, {"type": "null"}],
+        },
+        "author_did": {"type": "string"},
+        "author_sig": {"type": "string"},
+        "spec_hash": {"type": "string"},
+    },
+}
+
+
+WORKFLOW_RUN_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "WorkflowRun",
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["run_id", "workflow_name", "workflow_ver", "params", "status"],
+    "properties": {
+        "run_id": {"type": "string", "minLength": 1},
+        "workflow_name": {"type": "string", "pattern": _NAME_PATTERN},
+        "workflow_ver": {"type": "integer", "minimum": 1},
+        "params": {"type": "object"},
+        "status": {"type": "string", "enum": [s.value for s in RunStatus]},
+        "current_stages": {
+            "type": "array",
+            "items": {"type": "string", "pattern": _NAME_PATTERN},
+        },
+        "parent_run_id": {"type": ["string", "null"]},
+        "cancel_barrier_at": {"type": ["string", "null"]},
+        "started_by_did": {"type": "string"},
+        "scheduler_task_id": {"type": ["string", "null"]},
+        "signature_post_revocation": {"type": "boolean"},
+        "started_at": {"type": ["string", "null"]},
+        "finished_at": {"type": ["string", "null"]},
+        "deleted_at": {"type": ["string", "null"]},
+    },
+}
+
+
+WORKFLOW_STAGE_LINK_SCHEMA: dict[str, Any] = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "WorkflowStageLink",
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "link_id",
+        "run_id",
+        "stage_name",
+        "attempt_number",
+        "idempotency_key",
+        "actor_did",
+        "actor_sig",
+    ],
+    "properties": {
+        "link_id": {"type": "string", "minLength": 1},
+        "run_id": {"type": "string", "minLength": 1},
+        "stage_name": {"type": "string", "pattern": _NAME_PATTERN},
+        "attempt_number": {"type": "integer", "minimum": 1},
+        "signal_id": {"type": ["string", "null"]},
+        "idempotency_key": {"type": "string", "pattern": _HASH_PATTERN},
+        "gate_outcome": {
+            "anyOf": [
+                {"type": "string", "enum": [o.value for o in GateOutcome]},
+                {"type": "null"},
+            ],
+        },
+        "gate_reason": {"type": ["string", "null"]},
+        "compensate_state": {
+            "anyOf": [
+                {
+                    "type": "string",
+                    "enum": [
+                        "not_required",
+                        "pending",
+                        "complete",
+                        "record_only",
+                        "failed",
+                    ],
+                },
+                {"type": "null"},
+            ],
+        },
+        "post_cancel": {"type": "boolean"},
+        "actor_did": {"type": "string"},
+        "actor_sig": {"type": "string"},
+        "occurred_at": {"type": ["string", "null"]},
+    },
+}
+
+
+__all__ = [
+    "WORKFLOW_RUN_SCHEMA",
+    "WORKFLOW_SPEC_SCHEMA",
+    "WORKFLOW_STAGE_LINK_SCHEMA",
+]
