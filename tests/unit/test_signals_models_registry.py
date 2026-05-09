@@ -422,6 +422,41 @@ def test_register_accepts_local_format_with_echo():
     assert reg.get("local_review").prompt_template_format == "local"
 
 
+def test_register_rejects_codex_format_without_full_injection():
+    """Codex round-2 P2 (chunk 1G PR): reviewer formats also require
+    `constitution_injection='full'`. Without it, the dispatcher's
+    audit short-circuits, no constitution_hash is resolved, and every
+    dispatch would fail with `constitution_not_received` — a config
+    mismatch the validator must catch."""
+    reg = SourceRegistry()
+    with pytest.raises(
+        RegistrationError, match="requires constitution_injection='full'"
+    ):
+        reg.register(
+            _valid_cognition_reg(
+                "codex_no_full",
+                prompt_template_format="codex",
+                require_constitution_echo=True,
+                constitution_injection="none",
+            )
+        )
+
+
+def test_register_rejects_local_format_without_full_injection():
+    reg = SourceRegistry()
+    with pytest.raises(
+        RegistrationError, match="requires constitution_injection='full'"
+    ):
+        reg.register(
+            _valid_cognition_reg(
+                "local_no_full",
+                prompt_template_format="local",
+                require_constitution_echo=True,
+                constitution_injection="none",
+            )
+        )
+
+
 def test_register_accepts_claude_code_default():
     """Legacy in-agent path: claude_code + echo=False is the default
     and must continue to register without warnings or errors."""
@@ -672,6 +707,7 @@ def test_codex_format_does_not_warn_when_documented():
                 "codex_review_2",
                 prompt_template_format="codex",
                 require_constitution_echo=True,
+                constitution_injection="full",
             )
         )
     echo_warnings = [

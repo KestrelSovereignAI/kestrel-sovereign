@@ -208,6 +208,25 @@ class SourceRegistry:
                 "opting out is contradictory."
             )
 
+        # Hard error — reviewer formats with echo MUST also commit to
+        # full constitutional injection (codex round-2 P2 finding).
+        # Without `constitution_injection="full"` the dispatcher's
+        # audit builder short-circuits, no constitution_hash is
+        # resolved, no canary is derived, and every dispatch fails
+        # with `constitution_not_received` — a configuration
+        # mismatch the validator should catch.
+        if (
+            fmt in _ECHO_REQUIRED_FORMATS
+            and reg.constitution_injection != "full"
+        ):
+            raise RegistrationError(
+                f"Source '{reg.name}': prompt_template_format='{fmt}' "
+                "with require_constitution_echo=True requires "
+                "constitution_injection='full'. The reviewer formats "
+                "exist to verify a constitution that was injected; "
+                f"got constitution_injection='{reg.constitution_injection}'."
+            )
+
         # Budget sanity — None means use operator default; if set,
         # must be a positive int. Type-check before the comparison
         # because untyped config (TOML / env / JSON) can hand us a
