@@ -300,6 +300,58 @@ async def test_context_manager_ephemeral_honors_budget(tmp_path):
     assert addendum in result.system_prompt
 
 
+@pytest.mark.asyncio
+async def test_injection_tracking_is_per_async_task_isolated():
+    """Codex round-14 P2: injection tracking must be per-async-task,
+    not stored on a shared agent attribute that concurrent dispatches
+    could overwrite. Two parallel build_context calls must each see
+    their own tracking back via `get_current_injection_tracking`."""
+    import asyncio
+    from collections import OrderedDict
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sovereign.agent.context_manager import (
+        ContextManager,
+        get_current_injection_tracking,
+    )
+
+    async def _run_one(name: str, addendum: str):
+        cb = _stub_builder({"SOUL.md": f"soul {name}", f"{name}.md": "x" * 50})
+        cb.get_session_briefing = lambda: ""
+        cm = ContextManager(storage=MagicMock(), context_builder=cb)
+        cm.conversation_manager = MagicMock()
+        cm.conversation_manager.get_conversation_history = AsyncMock(
+            return_value=[]
+        )
+        cm.llm_service = None
+
+        await cm.build_context(
+            query="q",
+            constitution="C",
+            include_briefing=False,
+            privacy_mode="NORMAL",
+            conversation_history=[],
+            system_prompt_addendum=addendum,
+            system_prompt_budget_bytes=400,
+        )
+        # The current task's ContextVar must reflect THIS task's
+        # tracking, not the other concurrent task's.
+        injected, _dropped = get_current_injection_tracking()
+        return name, injected
+
+    results = await asyncio.gather(
+        _run_one("alpha", "addendum-A" * 10),
+        _run_one("beta", "addendum-B" * 10),
+    )
+    name_to_injected = {n: inj for n, inj in results}
+    # Each task saw its OWN bootstrap file (alpha.md vs beta.md) in
+    # its tracking — no cross-contamination.
+    assert "alpha.md" in (name_to_injected["alpha"] or [])
+    assert "beta.md" in (name_to_injected["beta"] or [])
+    assert "alpha.md" not in (name_to_injected["beta"] or [])
+    assert "beta.md" not in (name_to_injected["alpha"] or [])
+
+
 def test_system_prompt_addendum_empty_or_none_is_noop():
     """Empty string falsy → treated like None, preserves byte stability."""
     cb = _stub_builder({"SOUL.md": "soul"})

@@ -17,9 +17,10 @@ Refactored to serve as an orchestration layer that delegates to specialized mana
 import json
 import logging
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 from .context_builder import ContextBuilder
 from .token_counter import TokenCounter, get_token_counter
@@ -35,6 +36,30 @@ if TYPE_CHECKING:
     from kestrel_sovereign.llm.service import LLMService
 
 logger = logging.getLogger(__name__)
+
+
+# Per-async-task tracking of constitutional-injection clauses for the
+# current build_context call. The dispatcher reads this AFTER
+# process_input returns so it can land in signal_log.injected_clauses_json
+# / dropped_clauses_json. Using a ContextVar (not a shared agent
+# attribute) so concurrent COGNITION dispatches don't race — each
+# dispatch's task sees its OWN value (codex round-14 P2 catch).
+_INJECTION_TRACKING_VAR: ContextVar[
+    Optional[Tuple[Optional[List[str]], Optional[List[str]]]]
+] = ContextVar("kestrel_constitution_injection_tracking", default=None)
+
+
+def get_current_injection_tracking() -> Optional[
+    Tuple[Optional[List[str]], Optional[List[str]]]
+]:
+    """Return the (injected, dropped) clause tuple for the CURRENT
+    async task's most recent build_context invocation, or None.
+
+    Used by `SignalDispatcher` after `agent.process_input` returns to
+    populate signal_log audit fields. Per-task isolation via ContextVar
+    means concurrent dispatches do not see each other's tracking.
+    """
+    return _INJECTION_TRACKING_VAR.get()
 
 
 @dataclass
@@ -432,6 +457,14 @@ class ContextManager:
             f"{memory_count} memories, {rag_chunks} docs)"
         )
 
+        # Codex round-14 P2: publish per-task tracking via ContextVar
+        # so concurrent COGNITION dispatches don't race on a shared
+        # agent attribute. Dispatcher reads via
+        # `get_current_injection_tracking()` after process_input.
+        _INJECTION_TRACKING_VAR.set(
+            (injected_clauses_for_audit, dropped_clauses_for_audit)
+        )
+
         return ContextResult(
             system_prompt=system_prompt,
             messages=formatted_history,
@@ -529,6 +562,11 @@ class ContextManager:
         )
 
         tokens = self.counter.count(system_prompt)
+
+        # Same per-task tracking publish as the non-ephemeral path.
+        _INJECTION_TRACKING_VAR.set(
+            (injected_clauses_for_audit, dropped_clauses_for_audit)
+        )
 
         return ContextResult(
             system_prompt=system_prompt,

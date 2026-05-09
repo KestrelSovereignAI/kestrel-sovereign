@@ -905,15 +905,17 @@ class SignalDispatcher:
             if clear_chain is not None:
                 clear_chain(token)
 
-        # Codex round-13 P2: surface the agent's actual
-        # injected/dropped clause tracking from
-        # `build_system_prompt_with_tracking` into the signal_log
-        # audit. Without this, budgeted dispatches would record
-        # only the dispatcher's own KESTREL_CONSTITUTION marker and
-        # miss any clauses the assembler dropped due to budget.
-        injection_tracking = getattr(
-            self._agent, "_last_injection_tracking", None
+        # Codex round-13/14 P2: surface the agent's actual
+        # injected/dropped clause tracking from the budget-aware
+        # assembler into the signal_log audit. The tracking is
+        # published per-async-task via a ContextVar in
+        # `kestrel_sovereign.agent.context_manager`, so concurrent
+        # COGNITION dispatches don't race on a shared attribute.
+        from kestrel_sovereign.agent.context_manager import (
+            get_current_injection_tracking,
         )
+
+        injection_tracking = get_current_injection_tracking()
         if injection_tracking is not None:
             tracked_injected, tracked_dropped = injection_tracking
             if tracked_injected is not None:

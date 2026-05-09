@@ -1626,14 +1626,11 @@ Expected Duration: {expected_duration}
         # Log budget usage for monitoring and store for API access
         self._last_context_warnings = context_result.warnings or []
         self._last_context_summary = context_result.budget_summary
-        # Surface constitutional-injection tracking so the
-        # SignalDispatcher can populate signal_log.injected_clauses_json
-        # / dropped_clauses_json (#1137 chunk 1G). Only set when the
-        # tracking assembler ran (system_prompt_budget_bytes provided).
-        self._last_injection_tracking = (
-            context_result.injected_clauses,
-            context_result.dropped_clauses,
-        )
+        # Constitutional-injection tracking is published by
+        # ContextManager.build_context via a ContextVar so concurrent
+        # dispatches don't race; the SignalDispatcher reads via
+        # `get_current_injection_tracking()` rather than a shared
+        # agent attribute (codex round-14 P2 catch).
         if context_result.warnings:
             for warning in context_result.warnings:
                 logging.warning(f"Context warning: {warning}")
