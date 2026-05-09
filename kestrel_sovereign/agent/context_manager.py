@@ -302,17 +302,32 @@ class ContextManager:
         # count toward the budget. Reserve its bytes BEFORE the
         # assembler truncates so the final assembled prompt
         # (assembler output + joiner + addendum) fits within the cap.
+        # Codex round-17 P2: route to the tracking assembler when
+        # EITHER a budget is set OR anchored doctrine is supplied
+        # (the legacy build_system_prompt has no anchored_doctrine
+        # parameter). Otherwise full-injection sources without a
+        # budget would silently fall back to the legacy path that
+        # ignores doctrine.
         injected_clauses_for_audit: Optional[List[str]] = None
         dropped_clauses_for_audit: Optional[List[str]] = None
-        if system_prompt_budget_bytes is not None:
-            reserved = 0
-            if system_prompt_addendum:
-                reserved = (
-                    len(system_prompt_addendum.encode("utf-8")) + 2
-                )  # 2 bytes for the "\n\n" joiner
-            effective_budget = max(
-                1, system_prompt_budget_bytes - reserved
-            )
+        if system_prompt_budget_bytes is not None or anchored_doctrine:
+            # Effective budget: when caller set a budget, reserve
+            # addendum bytes from it (codex round-12); when no
+            # budget is set but anchored_doctrine triggered this
+            # path (codex round-17), pass None to the assembler so
+            # it doesn't truncate.
+            effective_budget: Optional[int]
+            if system_prompt_budget_bytes is None:
+                effective_budget = None
+            else:
+                reserved = 0
+                if system_prompt_addendum:
+                    reserved = (
+                        len(system_prompt_addendum.encode("utf-8")) + 2
+                    )  # 2 bytes for the "\n\n" joiner
+                effective_budget = max(
+                    1, system_prompt_budget_bytes - reserved
+                )
             tracking_result = self.context_builder.build_system_prompt_with_tracking(
                 constitution=constitution,
                 include_briefing=include_briefing,
@@ -576,17 +591,21 @@ class ContextManager:
         ephemeral_tracking = None
         injected_clauses_for_audit: Optional[List[str]] = None
         dropped_clauses_for_audit: Optional[List[str]] = None
-        if system_prompt_budget_bytes is not None:
+        if system_prompt_budget_bytes is not None or anchored_doctrine:
             # Reserve addendum + ephemeral notice + their joiners.
-            reserved = 0
-            if system_prompt_addendum:
-                reserved += (
-                    len(system_prompt_addendum.encode("utf-8")) + 2
+            effective_budget: Optional[int]
+            if system_prompt_budget_bytes is None:
+                effective_budget = None
+            else:
+                reserved = 0
+                if system_prompt_addendum:
+                    reserved += (
+                        len(system_prompt_addendum.encode("utf-8")) + 2
+                    )
+                reserved += len(ephemeral_notice.encode("utf-8")) + 2
+                effective_budget = max(
+                    1, system_prompt_budget_bytes - reserved
                 )
-            reserved += len(ephemeral_notice.encode("utf-8")) + 2
-            effective_budget = max(
-                1, system_prompt_budget_bytes - reserved
-            )
             ephemeral_tracking = self.context_builder.build_system_prompt_with_tracking(
                 constitution=constitution,
                 include_briefing=include_briefing,

@@ -301,6 +301,51 @@ async def test_context_manager_ephemeral_honors_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_anchored_doctrine_routes_through_tracking_assembler_without_budget():
+    """Codex round-17 P2: when anchored_doctrine is supplied but
+    system_prompt_budget_bytes is NOT, the legacy
+    build_system_prompt path can't accept anchored_doctrine and
+    would silently drop it. Routing must go through the tracking
+    assembler whenever anchored_doctrine is present."""
+    from collections import OrderedDict
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sovereign.agent.context_manager import ContextManager
+
+    cb = _stub_builder({"SOUL.md": "soul"})
+    cb.get_session_briefing = lambda: ""
+
+    cm = ContextManager(storage=MagicMock(), context_builder=cb)
+    cm.conversation_manager = MagicMock()
+    cm.conversation_manager.get_conversation_history = AsyncMock(
+        return_value=[]
+    )
+    cm.llm_service = None
+
+    result = await cm.build_context(
+        query="q",
+        constitution="C",
+        include_briefing=False,
+        privacy_mode="NORMAL",
+        conversation_history=[],
+        anchored_doctrine=OrderedDict(
+            [
+                ("TORTOISE_DOCTRINE.md", "TORTOISE BODY"),
+                ("AGENTS.md", "AGENTS BODY"),
+            ]
+        ),
+        # NOTE: no budget set
+    )
+    # Doctrine bodies appear in the rendered system prompt.
+    assert "TORTOISE BODY" in result.system_prompt
+    assert "AGENTS BODY" in result.system_prompt
+    # Tracking ran (the assembler path produces the lists).
+    assert result.injected_clauses is not None
+    assert "TORTOISE_DOCTRINE.md" in result.injected_clauses
+    assert "AGENTS.md" in result.injected_clauses
+
+
+@pytest.mark.asyncio
 async def test_reflection_guidance_skipped_when_over_budget():
     """Codex round-15 P2: reflection guidance is appended after the
     budget-aware assembler runs. If adding it would push the prompt
