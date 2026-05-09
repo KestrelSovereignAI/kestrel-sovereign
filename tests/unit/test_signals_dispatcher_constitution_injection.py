@@ -1302,6 +1302,89 @@ async def test_dispatch_clears_stale_tracking_before_processing(
 
 
 @pytest.mark.asyncio
+async def test_constitution_mixin_skips_constitution_in_anchored_doctrine(
+    tmp_path, monkeypatch,
+):
+    """Codex round-18 P2: the system prompt path independently
+    delivers the constitution via `_get_governing_constitution`. The
+    anchored-doctrine injection map must NOT include
+    KESTREL_CONSTITUTION.md or the constitution would appear twice.
+    Bundle-hash semantics still include it (drift completeness)."""
+    import logging as _logging
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import DEFAULT_ANCHORED_PATHS
+
+    for rel in DEFAULT_ANCHORED_PATHS:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"contents of {rel}", encoding="utf-8")
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test"
+
+    _logging.disable(_logging.CRITICAL)
+    try:
+        files = await _Agent().get_anchored_doctrine_files()
+    finally:
+        _logging.disable(_logging.NOTSET)
+
+    assert files is not None
+    # Constitution excluded.
+    assert "KESTREL_CONSTITUTION.md" not in files
+    # Other doctrine still present.
+    assert "TORTOISE_DOCTRINE.md" in files
+    assert "AGENTS.md" in files
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_auto_anchors_doctrine_bundle_on_first_dispatch(
+    tmp_path, template_path
+):
+    """Codex round-18 P1: agents upgraded to Phase 1 with no
+    pre-existing doctrine_bundle_hash should have it auto-anchored
+    on the first full-injection dispatch. The dispatcher calls
+    `ensure_doctrine_bundle_anchored` before the audit, so first-run
+    dispatches establish the anchor; subsequent runs detect drift."""
+
+    class _AnchorTrackingAgent(_AuditingAgent):
+        ensure_calls = 0
+
+        async def ensure_doctrine_bundle_anchored(self):
+            type(self).ensure_calls += 1
+            # First call: simulate writing the anchor.
+            self._anchored = self._live  # match → no drift
+            return self._anchored
+
+    agent = _AnchorTrackingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash=None,  # not anchored yet
+        live_bundle_hash="bundle_to_anchor",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="auto_anchor_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("auto_anchor_cog"))
+    await _drain(env)
+
+    assert result.status == Status.OK
+    assert _AnchorTrackingAgent.ensure_calls == 1
+    rows = await env.backend.fetch_all(
+        "SELECT doctrine_bundle_hash FROM signal_log"
+    )
+    # Live hash matches anchored after auto-anchor; recorded value
+    # is the live (post-anchor) hash.
+    assert rows == [("bundle_to_anchor",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_constitution_mixin_compute_live_returns_none_when_no_project_root(
     monkeypatch,
 ):

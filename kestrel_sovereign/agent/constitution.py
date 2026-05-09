@@ -49,6 +49,93 @@ class ConstitutionMixin:
             return None
         return agent_node.properties.get("constitution_hash")
 
+    async def ensure_doctrine_bundle_anchored(self):
+        """Auto-anchor the doctrine bundle if no anchor exists yet.
+
+        Codex round-18 P1 fix: without this, agents upgraded to
+        Phase 1 would have `agent_node.properties['doctrine_bundle_hash']`
+        unset, the dispatcher's drift check would skip (anchored=None),
+        and edits to AGENTS.md / TORTOISE_DOCTRINE.md would be
+        accepted indefinitely — defeating the per-dispatch drift
+        protection.
+
+        Behavior:
+        - If already anchored, return the existing hash.
+        - Otherwise compute the live bundle hash and write it to
+          agent_node.properties as the anchor, returning the hash.
+        - Returns None if project_root is unresolvable (no checkout
+          context) — drift detection then stays skipped, but the
+          dispatch still runs.
+        """
+        try:
+            agent_node = await self.storage.get_node(self.agent_id)
+        except Exception:
+            logging.exception(
+                "ensure_doctrine_bundle_anchored: agent_node lookup failed"
+            )
+            return None
+        if agent_node is None:
+            return None
+
+        from kestrel_sovereign.agent.doctrine_bundle import (
+            PROP_BUNDLE_ANCHORED_AT,
+            PROP_BUNDLE_FILES,
+            PROP_BUNDLE_HASH,
+        )
+
+        existing = agent_node.properties.get(PROP_BUNDLE_HASH)
+        if existing:
+            return existing
+
+        live_hash = await self.compute_live_doctrine_bundle_hash()
+        if not live_hash:
+            return None
+
+        agent_node.properties[PROP_BUNDLE_HASH] = live_hash
+        agent_node.properties[PROP_BUNDLE_ANCHORED_AT] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        # Recompute the contributing files list so an auditor knows
+        # which files went into the anchored hash.
+        try:
+            from kestrel_sovereign.agent.doctrine_bundle import (
+                compute_doctrine_bundle_hash,
+                resolve_anchored_paths,
+            )
+
+            project_root = await self._resolve_project_root_for_doctrine()
+            if project_root is not None:
+                paths = resolve_anchored_paths(project_root=project_root)
+                cb = getattr(self, "context_builder", None)
+                bootstrap = OrderedDict()
+                if cb is not None:
+                    try:
+                        bootstrap = OrderedDict(cb._bootstrap_files)
+                    except Exception:
+                        bootstrap = OrderedDict()
+                snapshot = compute_doctrine_bundle_hash(
+                    anchored_files=paths, bootstrap_files=bootstrap
+                )
+                agent_node.properties[PROP_BUNDLE_FILES] = list(snapshot.files)
+        except Exception:
+            logging.exception(
+                "ensure_doctrine_bundle_anchored: file-list snapshot failed; "
+                "anchoring hash without file list"
+            )
+
+        try:
+            await self.storage.add_node(agent_node)
+        except Exception:
+            logging.exception(
+                "ensure_doctrine_bundle_anchored: agent_node persist failed"
+            )
+            # Even if persist fails, the in-memory hash is set so this
+            # dispatch can proceed; the next call will retry.
+        logging.info(
+            f"Auto-anchored doctrine bundle: hash={live_hash[:16]}..."
+        )
+        return live_hash
+
     async def get_anchored_doctrine_bundle_hash(self):
         """Return the anchored doctrine_bundle_hash from agent_node, or None.
 
@@ -173,8 +260,23 @@ class ConstitutionMixin:
             project_root=project_root, extra_paths=extra_paths
         )
 
+        # Codex round-18 P2: skip the constitution itself when
+        # building the anchored-doctrine injection map. The agent's
+        # system-prompt path independently includes the constitution
+        # via `_get_governing_constitution()`, so emitting it here
+        # too would put it in the prompt twice (once as
+        # `--- GOVERNING CONSTITUTION ---`, once as
+        # `--- KESTREL CONSTITUTION ---`), wasting budget and
+        # potentially evicting lower-priority doctrine under the cap.
+        # The bundle HASH still includes the constitution file (for
+        # drift-detection completeness via `compute_doctrine_bundle_hash`);
+        # only the prompt-injection set excludes it.
+        skip_names = {"KESTREL_CONSTITUTION.md"}
+
         files: "OrderedDict[str, str]" = OrderedDict()
         for path in anchored_paths:
+            if path.name in skip_names:
+                continue
             try:
                 files[path.name] = path.read_text(encoding="utf-8")
             except FileNotFoundError:

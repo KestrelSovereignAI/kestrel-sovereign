@@ -1003,6 +1003,31 @@ class SignalDispatcher:
             cognition_result=result,
         )
 
+    async def _ensure_doctrine_bundle_anchored(self) -> None:
+        """Codex round-18 P1: ensure the doctrine bundle is anchored
+        on the agent_node BEFORE the first drift check. Without this,
+        agents upgraded to Phase 1 would have no anchored hash and
+        every dispatch would skip drift detection, accepting any
+        edits to AGENTS.md / TORTOISE_DOCTRINE.md silently.
+
+        Calls the optional `agent.ensure_doctrine_bundle_anchored()`
+        hook (idempotent — returns the existing anchor if set,
+        otherwise writes a new one). Failures are logged but
+        non-fatal; the dispatch proceeds with whatever state the
+        agent ended up in."""
+        ensure = getattr(self._agent, "ensure_doctrine_bundle_anchored", None)
+        if not callable(ensure):
+            return
+        try:
+            value = ensure()
+            if asyncio.iscoroutine(value):
+                await value
+        except Exception:
+            logger.exception(
+                "agent.ensure_doctrine_bundle_anchored raised; "
+                "drift detection may be skipped for this dispatch"
+            )
+
     async def _build_constitution_audit(
         self, signal: Signal, registration: SourceRegistration
     ) -> _ConstitutionAudit:
@@ -1021,6 +1046,12 @@ class SignalDispatcher:
 
         if registration.constitution_injection != "full":
             return audit
+
+        # Codex round-18 P1: ensure the bundle is anchored before
+        # we read anchored vs live hashes — first-time dispatch on
+        # a fresh agent establishes the anchor; subsequent dispatches
+        # detect drift normally.
+        await self._ensure_doctrine_bundle_anchored()
 
         get_const = getattr(self._agent, "get_constitution_hash", None)
         if callable(get_const):
