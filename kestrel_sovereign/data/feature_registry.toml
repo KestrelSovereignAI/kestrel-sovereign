@@ -286,7 +286,7 @@ list_channels = { description = "List configured channels", category = "communic
 
 [spawn]
 package = "kestrel-sovereign"
-git = ""
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SpawnFeature"]
 description = "Child agent spawning, delegation, and lifecycle management"
 tags = ["agents", "spawn", "delegation"]
@@ -457,7 +457,7 @@ core = true
 
 [bridge]
 package = "kestrel-sovereign"
-git = ""
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["BridgeFeature"]
 description = "Cross-protocol bridge for external system integration"
 tags = ["integration", "bridge", "interop"]
