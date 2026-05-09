@@ -753,11 +753,16 @@ async def test_full_injection_records_kestrel_constitution_clause(
     await _drain(env)
 
     rendered = agent.process_input_calls[0]
-    # User prompt is clean — no constitution duplication, no canary leak.
-    assert "ARTICLE I — sovereignty over data" not in rendered
-    assert "constitution_canary" not in rendered
+    # codex format: dispatcher INLINES the constitution into the
+    # prompt body because external reviewers don't have a separate
+    # system-prompt assembly path (codex round-11 P1 fix).
+    assert "ARTICLE I — sovereignty over data" in rendered
+    assert "GOVERNING CONSTITUTION" in rendered
 
     # Canary directive arrives via system_prompt_addendum kwarg.
+    # (For codex/local, the agent might also need it inlined into
+    # the body — but stock agents that route claude_code through
+    # in-agent ignore the addendum harmlessly.)
     addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
     assert addendum is not None
     assert "constitution_canary" in addendum
@@ -816,6 +821,58 @@ async def test_full_injection_drops_validation_when_no_constitution_body(
 
 
 @pytest.mark.asyncio
+async def test_claude_code_format_does_not_inline_constitution(
+    tmp_path, template_path
+):
+    """Codex round-11 P1 boundary: for `claude_code` format the
+    constitution arrives via the agent's system-prompt path, not via
+    the dispatcher's prompt body. The dispatcher MUST NOT inline the
+    constitution for in-agent dispatches — that would duplicate it
+    AND pollute conversation history."""
+
+    class _GovernedAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "ARTICLE I — sovereignty over data"
+
+    agent = _GovernedAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    # claude_code format with full injection but no echo (claude_code
+    # echo requires Phase 2 phantom-tool wiring; default off).
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="in_agent_full",
+            constitution_injection="full",
+            require_constitution_echo=False,
+            prompt_template_format="claude_code",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("in_agent_full"))
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    # Constitution is NOT in the user prompt for claude_code.
+    assert "ARTICLE I — sovereignty over data" not in rendered
+    assert "GOVERNING CONSTITUTION" not in rendered
+
+    # But the audit still records that the constitution was operative
+    # (it lives in the agent's system prompt path).
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json, constitution_hash FROM signal_log"
+    )
+    import json as _json
+
+    assert _json.loads(rows[0][0]) == ["KESTREL_CONSTITUTION"]
+    assert rows[0][1] == "con_abc"
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_render_constitution_placeholder_always_empty(tmp_path):
     """`_render_prompt` accepts the legacy `{constitution}`
     placeholder for backward compat with templates from an earlier
@@ -854,11 +911,17 @@ async def test_render_constitution_placeholder_always_empty(tmp_path):
     await _drain(env)
 
     rendered = agent.process_input_calls[0]
-    # Placeholder substituted with empty.
+    # Placeholder substituted with empty (the body block itself is
+    # `[BODY][/BODY]` after substitution).
     assert "[BODY][/BODY]" in rendered
-    # Constitution did NOT leak into the user prompt — it lives in
-    # the agent's system prompt path.
-    assert "DO NOT APPEAR IN USER PROMPT" not in rendered
+    # For codex format, the dispatcher does inline the constitution
+    # via the prepend — separate from the legacy `{constitution}`
+    # placeholder which always renders empty.
+    assert "DO NOT APPEAR IN USER PROMPT" in rendered  # via prepend
+    # And the prepend appears BEFORE the body block.
+    assert rendered.index("GOVERNING CONSTITUTION") < rendered.index(
+        "[BODY]"
+    )
     await env.backend.close()
 
 

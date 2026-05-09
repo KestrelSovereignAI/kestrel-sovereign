@@ -793,21 +793,38 @@ class SignalDispatcher:
 
         prompt = self._render_prompt(signal, registration)
 
-        # The agent's existing build_system_prompt path already places
-        # the constitution body in the system prompt (cached, stable).
-        # The dispatcher does NOT duplicate it into the user prompt —
-        # that would pollute conversation history AND break the
-        # cache-stable system-prompt prefix. The constitution_text we
-        # resolved above is used for two things only:
-        #   1. Refusing dispatch when the agent can't produce one.
-        #   2. (Future) inclusion in injected_clauses tracking.
+        # Constitution delivery is format-conditional:
         #
-        # injected_clauses still lists KESTREL_CONSTITUTION because
-        # the agent's system-prompt path WILL include it for this
-        # dispatch — we're recording that the constitution was
-        # operative, not that the dispatcher itself prepended it.
+        # - `claude_code` (in-agent): the agent's `build_system_prompt`
+        #   already places the constitution in the system prompt every
+        #   turn (cached, stable). The dispatcher does NOT duplicate
+        #   it into the user prompt — that would pollute conversation
+        #   history AND break the cache-stable prefix.
+        #
+        # - `codex` / `local` (external reviewer): the dispatch goes
+        #   to a non-in-agent reviewer that does NOT have the agent's
+        #   system-prompt assembly path. The "prompt" IS the entire
+        #   message to that reviewer. The dispatcher MUST inline the
+        #   constitution into the prompt, otherwise the canary will
+        #   verify but the model never received the constitution body
+        #   (codex round-11 P1 finding).
+        #
+        # - `bare`: caller-responsibility. Operator constructs whatever
+        #   prompt shape they need; dispatcher provides the canary
+        #   primitive but does not inject anything.
         if constitution_text is not None:
             audit.injected_clauses = ["KESTREL_CONSTITUTION"]
+            fmt = registration.prompt_template_format
+            if fmt in ("codex", "local"):
+                prompt = (
+                    "--- GOVERNING CONSTITUTION ---\n"
+                    f"{constitution_text}\n"
+                    "--- END CONSTITUTION ---\n\n"
+                    f"{prompt}"
+                )
+            # For claude_code, no inline prepend — the constitution
+            # arrives via the agent's system-prompt path. For bare,
+            # caller-responsibility.
 
         # Derive canary + build the format-appropriate instruction
         # BEFORE the LLM call. Pass it as `system_prompt_addendum` to
