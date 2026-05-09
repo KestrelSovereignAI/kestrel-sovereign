@@ -1119,7 +1119,16 @@ def cmd_setup(args) -> int:
     else:
         flow = Flow.INTERACTIVE
 
-    ctx = build_context(project_dir, flow=flow, reset=args.reset)
+    is_test_instance = bool(args.test) or os.environ.get(
+        "KESTREL_TEST_INSTANCE", ""
+    ).lower() in ("1", "true", "yes")
+
+    ctx = build_context(
+        project_dir,
+        flow=flow,
+        reset=args.reset,
+        is_test_instance=is_test_instance,
+    )
     return run_wizard(ctx, only_step=args.step)
 
 
@@ -1827,6 +1836,14 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument(
         "--reset", action="store_true",
         help="Move existing .env and kestrel.toml aside before regenerating",
+    )
+    setup_p.add_argument(
+        "--test", action="store_true",
+        help="Mark the inceptioned agent as a test instance "
+             "(is_test_instance=True on the agent's properties node, "
+             "auto-generated test_cycle_id). Honoured automatically when "
+             "KESTREL_TEST_INSTANCE=1 is set in the environment — useful for "
+             "CI runners that want every agent they incept tagged as a test.",
     )
 
     # kestrel migrate-llm-config

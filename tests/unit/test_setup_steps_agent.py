@@ -202,6 +202,96 @@ def test_create_agent_respects_explicit_port(tmp_path):
     assert result.port == 9999
 
 
+# --- --test plumbing: wizard surfaces is_test_instance to inception ----------
+
+def test_create_agent_propagates_is_test_instance_to_inception(tmp_path):
+    """``is_test_instance=True`` reaches ``create_kestrel_identity_async``.
+
+    Catches the bug where the wizard accepted ``--test`` but the keyword
+    argument never made it past ``setup/steps/agent.py::_run_inception``.
+    """
+    captured: dict = {}
+
+    async def _capturing_inception(**kwargs):
+        captured.update(kwargs)
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "kestrel_prime.db").write_bytes(b"")
+        return _FakeCreds(did="did:test", db_path=str(out / "kestrel_prime.db"))
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+        side_effect=_capturing_inception,
+    ):
+        agent.create_agent(
+            name="CIAgent",
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+            is_test_instance=True,
+        )
+
+    assert captured.get("is_test_instance") is True
+
+
+def test_create_agent_default_is_not_test_instance(tmp_path):
+    """Without an explicit ``is_test_instance``, the flag is False.
+
+    Locks in the default. A regression here would silently mark every
+    user's first ``kestrel setup`` agent as a test instance.
+    """
+    captured: dict = {}
+
+    async def _capturing_inception(**kwargs):
+        captured.update(kwargs)
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "kestrel_prime.db").write_bytes(b"")
+        return _FakeCreds(did="did:test", db_path=str(out / "kestrel_prime.db"))
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+        side_effect=_capturing_inception,
+    ):
+        agent.create_agent(
+            name="ProdAgent",
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+        )
+
+    assert captured.get("is_test_instance") is False
+
+
+def test_wizard_run_propagates_ctx_is_test_instance(tmp_path):
+    """``SetupContext.is_test_instance`` reaches inception via ``run()``.
+
+    Verifies the full wizard chain: a context flagged as a test instance
+    surfaces the flag through ``agent.run()`` → ``create_agent()`` →
+    ``_run_inception()`` → ``create_kestrel_identity_async``.
+    """
+    captured: dict = {}
+
+    async def _capturing_inception(**kwargs):
+        captured.update(kwargs)
+        out = Path(kwargs["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "kestrel_prime.db").write_bytes(b"")
+        return _FakeCreds(did="did:test", db_path=str(out / "kestrel_prime.db"))
+
+    ctx = _make_ctx(tmp_path, Flow.QUICKSTART)
+    ctx.is_test_instance = True
+
+    with patch(
+        "kestrel_sovereign.inception_service.create_kestrel_identity_async",
+        side_effect=_capturing_inception,
+    ):
+        agent.run(ctx)
+
+    assert captured.get("is_test_instance") is True
+    assert any("test instance" in change for change in ctx.changes), (
+        f"expected the changes list to mention test instance; got {ctx.changes}"
+    )
+
+
 # --- #1109: malformed [emancipation] block aborts before inception -----------
 
 def test_invalid_emancipation_block_blocks_run_without_inception(tmp_path):

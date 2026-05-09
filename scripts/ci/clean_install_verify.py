@@ -8,7 +8,9 @@ state the wizard produces. The workflow YAML calls them as:
     uv run python scripts/ci/clean_install_verify.py constitution --agent-name Kestrel
     uv run python scripts/ci/clean_install_verify.py memory --agent-name Kestrel
     uv run python scripts/ci/clean_install_verify.py start-and-health --agent-name Kestrel
+    uv run python scripts/ci/clean_install_verify.py host-and-chat-503
     uv run python scripts/ci/clean_install_verify.py did-persists --agent-name Kestrel
+    uv run python scripts/ci/clean_install_verify.py test-instance --agent-name Kestrel
 
 Pure stdlib. No shell idioms. No package import (kestrel_sovereign would
 pull heavy deps; we're just reading SQLite + TOML + dotenv). Designed
@@ -20,6 +22,7 @@ Exit code 0 = pass. Non-zero = fail; the message on stderr says why.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import sqlite3
 import subprocess
@@ -263,6 +266,150 @@ def cmd_start_and_health(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Subcommand: host-and-chat-503
+#
+# Boots the multi-agent host (``kestrel start`` with no agent name) and
+# probes the OpenAI-compat ``/v1/chat/completions`` endpoint at the host
+# level — i.e. without the ``/api/agents/<name>/`` prefix. In multi-agent
+# mode the host can't pick a target agent without that prefix and must
+# fail honestly with HTTP 503. Pre-#1110 the same call returned a
+# misleading 500 with "Internal error in chat completions", which read
+# like a server bug to clients (Open WebUI in particular) when it was
+# actually a routing problem. This subcommand locks that contract in CI.
+#
+# No LLM is involved: the route bails at ``get_agent(request)`` long
+# before any provider is consulted, so the assertion runs on every CI
+# matrix without an Ollama install.
+# ---------------------------------------------------------------------------
+
+def _host_port() -> int | None:
+    multi_agent = _read_toml(Path("multi_agent.toml"))
+    return ((multi_agent.get("host") or {}).get("port"))
+
+
+def _post_chat_completions(port: int, api_key: str, timeout_s: int = 5):
+    """POST a minimal chat-completions body. Returns (status, body) or (None, error_str)."""
+    payload = json.dumps(
+        {"model": "x", "messages": [{"role": "user", "content": "ping"}]}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://localhost:{port}/v1/chat/completions",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        # 5xx and 4xx come back here — that's exactly what we want to inspect.
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        return exc.code, body
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as exc:
+        return None, str(exc)
+
+
+def cmd_host_and_chat_503(args: argparse.Namespace) -> int:
+    """Start multi-agent host, assert top-level /v1/chat/completions → 503."""
+    port = _host_port()
+    if not port:
+        return _fail("multi_agent.toml missing [host].port")
+
+    # The chat-completions route is auth-gated (the security middleware
+    # 401s ahead of the route handler), so without the API key we'd
+    # exercise the auth path instead of the routing path. Read the key
+    # the wizard wrote into .env.
+    api_key = _read_dotenv(Path(".env")).get("KESTREL_API_KEY", "")
+    if not api_key:
+        return _fail(".env missing KESTREL_API_KEY (wizard should have generated it)")
+    print(f"Host port from multi_agent.toml: {port}")
+
+    start = _kestrel("start")  # no agent name → multi-agent host
+    sys.stdout.write(start.stdout)
+    sys.stderr.write(start.stderr)
+    if start.returncode != 0:
+        return _fail(f"kestrel start (host mode) exited {start.returncode}")
+
+    try:
+        if not _poll_health(port, timeout_s=30):
+            return _fail(
+                f"Host did not respond on http://localhost:{port}/health "
+                f"within 30 seconds"
+            )
+
+        status, body = _post_chat_completions(port, api_key=api_key)
+        if status != 503:
+            return _fail(
+                f"Top-level /v1/chat/completions returned status={status} "
+                f"(expected 503). Body: {body[:200]!r}"
+            )
+        # The honest-fail contract: the body should mention agent
+        # initialisation, not "Internal error in chat completions" (the
+        # pre-#1110 misleading wording).
+        if "Internal error in chat completions" in body:
+            return _fail(
+                "Top-level /v1/chat/completions returned 503 but with the "
+                "pre-#1110 misleading body. Body: " + body[:200]
+            )
+    finally:
+        stop = _kestrel("stop")
+        sys.stdout.write(stop.stdout)
+        sys.stderr.write(stop.stderr)
+
+    return _ok(
+        f"Top-level /v1/chat/completions on host:{port} returned 503 with "
+        f"a routing-not-server-error body"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Subcommand: test-instance (agent's properties node carries the test flag)
+#
+# When the wizard is run with ``--test`` (or ``KESTREL_TEST_INSTANCE=1``),
+# inception writes ``is_test_instance: True`` and a generated
+# ``test_cycle_id`` onto the agent's properties JSON in graph_nodes.
+# This subcommand reads that JSON and asserts the marker is present, so
+# CI can prove every agent it incepts is identifiable as a test agent
+# in any downstream telemetry that consumes the graph.
+# ---------------------------------------------------------------------------
+
+def cmd_test_instance(args: argparse.Namespace) -> int:
+    """Verify the agent's properties node is tagged ``is_test_instance``."""
+    db_path = _agent_db(args.agent_name)
+    if not db_path.exists():
+        return _fail(f"Agent database not found at {db_path}")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        row = conn.execute(
+            "SELECT properties FROM graph_nodes "
+            "WHERE node_type='agent' LIMIT 1"
+        ).fetchone()
+    if not row or not row[0]:
+        return _fail("No agent node properties in graph_nodes")
+
+    try:
+        props = json.loads(row[0])
+    except json.JSONDecodeError as exc:
+        return _fail(f"agent properties is not valid JSON: {exc}")
+
+    if not props.get("is_test_instance"):
+        return _fail(
+            f"agent properties missing is_test_instance=True "
+            f"(properties keys: {sorted(props.keys())})"
+        )
+    cycle_id = props.get("test_cycle_id")
+    return _ok(
+        f"Agent tagged as test instance — test_cycle_id={cycle_id or '(unset)'}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: did-persists (DB still has DID after stop/start cycle)
 # ---------------------------------------------------------------------------
 
@@ -294,12 +441,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("wizard-artifacts", help="Verify wizard wrote .env, kestrel.toml, multi_agent.toml")
 
+    # host-and-chat-503 doesn't need --agent-name (it queries the host port).
+    sub.add_parser(
+        "host-and-chat-503",
+        help="Start the multi-agent host and verify top-level /v1/chat/completions → 503",
+    )
+
     for name, help_text in (
         ("identity", "Verify Identity Pillar — DID in graph_nodes"),
         ("constitution", "Verify Constitution Pillar — anchored + RAG-indexed"),
         ("memory", "Verify Memory Pillar — required tables present"),
         ("start-and-health", "Start agent, probe /health, stop agent"),
         ("did-persists", "Verify DID survives after the stop/start cycle"),
+        ("test-instance", "Verify agent is tagged is_test_instance=True"),
     ):
         sp = sub.add_parser(name, help=help_text)
         sp.add_argument(
@@ -316,7 +470,9 @@ _HANDLERS = {
     "constitution": cmd_constitution,
     "memory": cmd_memory,
     "start-and-health": cmd_start_and_health,
+    "host-and-chat-503": cmd_host_and_chat_503,
     "did-persists": cmd_did_persists,
+    "test-instance": cmd_test_instance,
 }
 
 

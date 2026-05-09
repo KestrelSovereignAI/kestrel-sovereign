@@ -41,6 +41,7 @@ class SetupContext:
     flow: Flow
     prompter: Prompter
     reset: bool = False
+    is_test_instance: bool = False
     changes: list[str] = field(default_factory=list)
     blockers: list[str] = field(default_factory=list)
 

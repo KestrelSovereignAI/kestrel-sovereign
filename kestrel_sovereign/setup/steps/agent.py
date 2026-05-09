@@ -58,6 +58,7 @@ def create_agent(
     autostart: bool = True,
     port: int | None = None,
     emancipation_contract: EmancipationContract | None = None,
+    is_test_instance: bool = False,
 ) -> CreateAgentResult:
     """Idempotent agent creation: incept if needed, then register in multi_agent.
 
@@ -65,6 +66,12 @@ def create_agent(
     the agent's ``kestrel_prime.db`` already exists, inception is skipped
     and the existing agent is just (re-)registered with the requested
     port/autostart.
+
+    ``is_test_instance`` propagates to
+    :func:`kestrel_sovereign.inception_service.create_kestrel_identity_async`
+    so the new agent is tagged with ``is_test_instance=True`` and an
+    auto-generated ``test_cycle_id`` on its properties node. Ignored when
+    the agent already exists (no re-inception).
     """
     multi_agent_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
     multi_agent = MultiAgentConfig.load(multi_agent_path)
@@ -83,7 +90,12 @@ def create_agent(
     already_existed = db_path.exists()
     if not already_existed:
         agent_dir.mkdir(parents=True, exist_ok=True)
-        creds = _run_inception(agent_dir, name, emancipation_contract)
+        creds = _run_inception(
+            agent_dir,
+            name,
+            emancipation_contract,
+            is_test_instance=is_test_instance,
+        )
         did = creds.agent_did
 
     multi_agent.agents[name] = LocalAgentConfig(
@@ -156,7 +168,10 @@ def run(ctx: SetupContext) -> None:
         return
 
     if not (ctx.agent_data_root / name / "kestrel_prime.db").exists():
-        ctx.prompter.info(f"Running inception for '{name}' — generating DID + DB...")
+        suffix = " (test instance)" if ctx.is_test_instance else ""
+        ctx.prompter.info(
+            f"Running inception for '{name}'{suffix} — generating DID + DB..."
+        )
     try:
         result = create_agent(
             name=name,
@@ -164,6 +179,7 @@ def run(ctx: SetupContext) -> None:
             agent_data_root=ctx.agent_data_root,
             autostart=autostart,
             emancipation_contract=contract,
+            is_test_instance=ctx.is_test_instance,
         )
     except Exception as exc:  # noqa: BLE001 — surface inception failures verbatim
         ctx.block(f"Inception failed for '{name}': {exc}")
@@ -172,7 +188,8 @@ def run(ctx: SetupContext) -> None:
     if result.already_existed:
         ctx.record(f"Agent '{name}' already existed; multi_agent row refreshed")
     else:
-        ctx.record(f"Created agent '{name}' with DID {result.did}")
+        test_suffix = " [test instance]" if ctx.is_test_instance else ""
+        ctx.record(f"Created agent '{name}' with DID {result.did}{test_suffix}")
     ctx.record(
         f"Registered '{name}' in multi_agent.toml on port {result.port} "
         f"({'autostart' if result.autostart else 'manual'})"
@@ -217,6 +234,8 @@ def _run_inception(
     agent_dir: Path,
     name: str,
     emancipation_contract: EmancipationContract | None,
+    *,
+    is_test_instance: bool = False,
 ):
     """Call into inception_service. Imported lazily — heavy module."""
     from kestrel_sovereign.inception_service import create_kestrel_identity_async
@@ -227,6 +246,7 @@ def _run_inception(
             output_dir=str(agent_dir),
             agent_name=name,
             emancipation_contract=emancipation_contract,
+            is_test_instance=is_test_instance,
         )
     )
 

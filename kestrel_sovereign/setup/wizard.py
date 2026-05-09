@@ -102,6 +102,7 @@ def build_context(
     *,
     flow: Flow,
     reset: bool,
+    is_test_instance: bool = False,
 ) -> SetupContext:
     """Construct a SetupContext with the right prompter for the env."""
     from kestrel_sovereign.setup.prompts import (
@@ -118,4 +119,5 @@ def build_context(
         flow=flow,
         prompter=prompter,
         reset=reset,
+        is_test_instance=is_test_instance,
     )
