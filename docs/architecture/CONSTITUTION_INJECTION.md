@@ -218,13 +218,20 @@ class SourceRegistration:
     # ... existing fields ...
 
     # NEW: constitution injection
-    require_constitution_echo: bool = True   # COGNITION default; ACTION/ARTIFACT N/A
+    # Defaults are backwards-compatible: existing claude_code sources keep
+    # working without echo; codex/local reviewers opt in by setting True
+    # (and the registry validator enforces require_constitution_echo=True
+    # as a precondition for prompt_template_format in {"codex", "local"}).
+    require_constitution_echo: bool = False
     prompt_template_format: Literal["claude_code", "codex", "local", "bare"] = "claude_code"
-    constitution_injection: Literal["full", "partial", "none"] = "none"
+    constitution_injection: Literal["full", "none"] = "none"
     system_prompt_budget_bytes: Optional[int] = None  # None = global default
 ```
 
-`require_constitution_echo=False` MUST include a documented justification in the source's module-level docstring; the registry validator surfaces a warning at registration time.
+The registry validator enforces:
+- For `prompt_template_format in {"codex", "local"}`: `require_constitution_echo` MUST be `True`. (These reviewer formats exist precisely to verify; having them opt out makes no sense.)
+- For `prompt_template_format == "claude_code"`: `require_constitution_echo` MAY be `False` (the legacy default; relies on §1 + §2 verification only) OR `True` (opt in to phantom-tool receipt for that source).
+- `require_constitution_echo=True` on `claude_code` requires the source's module-level docstring to document why the extra receipt is desirable for that source — surfaced as a warning at registration if missing.
 
 ## Phase plan
 
@@ -242,7 +249,9 @@ class SourceRegistration:
 - [ ] `signal_log` ALTERs (+ idx_constitution_hash)
 - [ ] `build_system_prompt` extended with priority-ordered truncation + clause tracking
 - [ ] Canary derivation + injection + echo-verification primitive
-- [ ] `Status.DROPPED_VALIDATION` reasons: `doctrine_bundle_drift`, `constitution_not_received`
+- [ ] New result-status reasons (per §3 status semantics — `DROPPED_VALIDATION` for pre-dispatch refusals, `FAILED` for failures during/after dispatch):
+  - `Status.DROPPED_VALIDATION` with `error="doctrine_bundle_drift"` (caught BEFORE the dispatch runs; bundle-hash mismatch at start of dispatch)
+  - `Status.FAILED` with `error="constitution_not_received"` (dispatch executed, response was checked, canary missing)
 - [ ] `SourceRegistration` field additions; registry validator updates
 - [ ] Multi-format wrappers (`claude_code`, `codex`, `local`, `bare`) — stateless formatters over the same content
 - [ ] OTel spans + Prometheus counters: `constitution_echo_verified_total`, `constitution_echo_missing_total`, `doctrine_bundle_drift_total`
