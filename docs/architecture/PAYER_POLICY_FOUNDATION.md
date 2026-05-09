@@ -469,15 +469,23 @@ provider client. Today's exhaustive list (verified by grep against
   time (Phase 3 must enumerate these by inspection, not from this
   list, since streaming has been actively refactored)
 
-Tests in Phase 3 walk the `LLMService` class via reflection at runtime,
-collect every `async def` method whose name matches one of the
-generation patterns, and assert each one calls `_check_policy()` at
-least once on the disabled path. This catches future entry points that
-forget the guard. Callers (chat endpoints, reflection loops) treat the
-`PolicyDeniedError` the same way they treat "no key configured" today.
-The flag is in-memory per instance; persistence is unnecessary because
-the policy in kestrel.toml is the source of truth and is re-read at
-each agent init.
+Tests in Phase 3 walk the `LLMService` class (and its mixins —
+`StreamingMixin` and friends, where streaming entry points actually
+live) via reflection at runtime, collecting every method that is
+`inspect.iscoroutinefunction` OR `inspect.isasyncgenfunction`. The
+streaming entry points (`generate_stream`, `get_streaming_response`,
+`stream_with_messages`, `stream_with_tool_detection`) are async
+generators, so a reflection sweep that only checks
+`iscoroutinefunction` would silently miss them and leave `llm = none`
+streamable through provider clients. Both kinds must be enumerated.
+The test then asserts each collected entry point calls
+`_check_policy()` at least once on the disabled path. This catches
+future entry points that forget the guard, in either the coroutine or
+async-generator form. Callers (chat endpoints, reflection loops) treat
+the `PolicyDeniedError` the same way they treat "no key configured"
+today. The flag is in-memory per instance; persistence is unnecessary
+because the policy in kestrel.toml is the source of truth and is
+re-read at each agent init.
 
 The `OpenRouterProvisioningService.create_agent_key` side-effect runs
 inside `PayerResolver.resolve_for(agent_did, "llm")` when the spec is
