@@ -103,18 +103,31 @@ Even with hash-verified injection, a model could:
 - be steered by injected instructions later in the user message ("ignore prior context")
 - be running a different model than the one its DID claims (relevant for `red_team_clear` reviewer DIDs in #1131)
 
-**Add a per-invocation canary** to the system prompt:
+**Per-invocation canary** is derived as:
 ```
 canary = sha256(signal_id || constitution_hash || engine_nonce)[:16]
 ```
 
-The injection asks the model to **echo the canary verbatim in its first structured response**. The dispatcher inspects the response for the canary. Three outcomes recorded in `signal_log.echo_canary_status`:
+The receipt mechanism is **format-specific** because the in-agent `claude_code` path returns a user-visible chat message — embedding a canary in that response would either pollute chat output and persisted history (codex round 2 P2 catch), or get stripped before inspection and leave the dispatcher with nothing to verify.
 
-- `verified` — canary present in response → normal completion
-- `missing` — canary absent → `SignalResult.status = FAILED`, `error="constitution_not_received"`
-- `not_required` — for ACTION/ARTIFACT signals or COGNITION sources that opt out (some sources may have legitimate reasons to skip; opt-out is per-registration with a documented justification)
+| Format | Canary receipt mechanism | Default `require_constitution_echo` |
+|---|---|---|
+| `claude_code` (in-agent `process_input`) | **Hidden tool-call channel.** The dispatcher registers a phantom `_constitution_receipt(canary)` tool for the duration of the turn (cleaned up after); the system-prompt injection instructs the model to call it once, with the canary as the argument, before any other response content. The dispatcher inspects tool calls (already captured in turn metadata) for the matching invocation. The tool's handler is a no-op that records the receipt; the user-visible assistant message NEVER contains the canary. Off-by-default to avoid imposing a tool call on every legacy dispatch; opt in per source. | **False** (opt-in) — relies on the existing periodic integrity audit + per-dispatch hash verification (§1, §2) for in-agent paths |
+| `codex` | Structured-response field (codex CLI's structured output schema includes a free-form metadata field; canary lands there, never in stdout). Dispatcher parses and verifies. | **True** — non-in-agent reviewer; verification is the entire point |
+| `local` | Reviewer prompt requires JSON response with a `_canary` field; non-JSON or missing field → `missing`. Canary never user-visible because the response was never destined for chat. | **True** — non-in-agent reviewer |
+| `bare` | Caller is responsible for inspecting the response and recording the canary status. The wrapper provides the canary; the caller wires verification. | N/A — caller-responsibility |
+
+The dispatcher writes the outcome to `signal_log.echo_canary_status`:
+
+- `verified` — canary received via the format's mechanism → normal completion
+- `missing` — canary absent (where required) → `SignalResult.status = FAILED`, `error="constitution_not_received"`
+- `not_required` — for ACTION/ARTIFACT signals OR COGNITION with `require_constitution_echo=False` (e.g., default `claude_code` path)
+
+**Why hidden by format-specific channel rather than appearing in the response body:** the canary is operational metadata, not part of the conversation. The hidden tool-call for the in-agent path keeps user-visible chat clean while still giving the dispatcher a structural receipt; the structured-response fields for `codex`/`local` reviewers are non-chat surfaces by construction.
 
 **Why structural rather than pattern-based:** the canary is content-agnostic; it doesn't depend on the model "saying the right thing about the constitution." It's a receipt token.
+
+**Tool-channel implementation note:** the `_constitution_receipt` phantom tool is registered as a per-turn ephemeral tool (not in the global tool registry). It auto-allows (no permission prompt). It logs the receipt and returns immediately. The existing tool-use telemetry surfaces capture the call without changes to the chat-history persistence path.
 
 ### 4. Multi-format injection wrappers
 
