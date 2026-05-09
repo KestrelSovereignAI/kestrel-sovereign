@@ -149,6 +149,9 @@ assert {s.value for s in GateOutcome} == _GATE_OUTCOMES
 
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
+# Lowercase hex sha256 digest, 64 chars; mirrors signing-side helpers and the
+# JSON Schema `_HASH_PATTERN`.
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class WorkflowDefinitionError(ValueError):
@@ -203,6 +206,10 @@ class Gate:
     params: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.type, str):
+            raise WorkflowDefinitionError(
+                f"gate.type must be str, got {type(self.type).__name__}"
+            )
         if self.type not in BUILT_IN_GATE_TYPES:
             valid = ", ".join(sorted(BUILT_IN_GATE_TYPES))
             raise WorkflowDefinitionError(
@@ -244,11 +251,20 @@ class Gate:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Gate":
+        # Round 4 P2 (signed-spec integrity): pass raw values through so
+        # type-coercion can't normalize a malformed wire form into a
+        # canonical one. ``str(non_str)`` would silently accept a wire
+        # ``type: 42`` (int) as ``"42"`` — the dataclass would then
+        # reject it for the unrelated reason of "not in built-in gate
+        # types," but with a different malformed value (e.g. integer
+        # number that happens to stringify to a known type) the
+        # signature/hash verification path would round-trip a value that
+        # was never in the signed canonical form.
         if not isinstance(data, Mapping):
             raise WorkflowDefinitionError(
                 f"Gate.from_dict expected mapping, got {type(data).__name__}"
             )
-        return cls(type=str(data["type"]), params=dict(data.get("params") or {}))
+        return cls(type=data["type"], params=data.get("params") or {})
 
 
 # ---------------------------------------------------------------------------
@@ -366,13 +382,21 @@ class Stage:
         # mangling the constitutional-boundary scope. Passing the raw
         # value lets the ``isinstance(value, (list, tuple))`` guard in
         # __post_init__ reject strings as the user intended.
+        #
+        # Round 4 P2 (signed-spec integrity): every other field also
+        # passes raw — no ``str(...)``/``dict(...)`` coercion. A wire
+        # value of the wrong type would otherwise be normalized into
+        # the canonical form silently, and ``WorkflowSpec.compute_spec_hash``
+        # would compute the same digest as the actually-signed
+        # canonical bytes, letting a malformed wire form claim a valid
+        # signature.
         return cls(
-            name=str(data["name"]),
-            signal_source=str(data["signal_source"]),
+            name=data["name"],
+            signal_source=data["signal_source"],
             signal_mode=data["signal_mode"],
-            params=dict(data.get("params") or {}),
+            params=data.get("params") or {},
             gate=Gate.from_dict(gate_data),
-            compensate=str(data.get("compensate", "noop_idempotent")),
+            compensate=data.get("compensate", "noop_idempotent"),
             forbidden_modules=data.get("forbidden_modules") or (),
             irreversible=data.get("irreversible", False),
             non_deterministic=data.get("non_deterministic", False),
@@ -559,9 +583,14 @@ class Edge:
         # "stages" from one mistyped value. Same trap as Stage's
         # forbidden_modules (round-3 codex P2). __post_init__ rejects
         # non-list/non-tuple inputs.
+        #
+        # Round 4 P2 (signed-spec integrity): pass everything raw so
+        # a malformed wire value can't be normalized into the canonical
+        # signed form. ``__post_init__`` enforces the closed vocabulary
+        # and per-kind required fields.
         return cls(
             kind=data["kind"],
-            from_stage=str(data["from_stage"]),
+            from_stage=data["from_stage"],
             to_stage=data.get("to_stage"),
             condition=data.get("condition"),
             true_stage=data.get("true_stage"),
@@ -570,7 +599,7 @@ class Edge:
             join_strategy=data.get("join_strategy"),
             subworkflow_name=data.get("subworkflow_name"),
             subworkflow_version=data.get("subworkflow_version"),
-            params=dict(data.get("params") or {}),
+            params=data.get("params") or {},
         )
 
 
@@ -625,6 +654,9 @@ class Trigger:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "Trigger":
+        # Round 4 P2 (signed-spec integrity): raw pass-through; let
+        # __post_init__ enforce types so coercion can't normalize a
+        # malformed wire form.
         if not isinstance(data, Mapping):
             raise WorkflowDefinitionError(
                 f"Trigger.from_dict expected mapping, got "
@@ -634,7 +666,7 @@ class Trigger:
             kind=data["kind"],
             cron_expression=data.get("cron_expression"),
             signal_source=data.get("signal_source"),
-            params=dict(data.get("params") or {}),
+            params=data.get("params") or {},
         )
 
 
@@ -796,25 +828,44 @@ class WorkflowSpec:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "WorkflowSpec":
+        # Round 4 P2 (signed-spec integrity): WorkflowSpec is a DID-
+        # signed artifact. ``from_dict`` MUST NOT normalize wire types —
+        # an attacker who emits ``"version": "1"`` (string) instead of
+        # the signed canonical ``"version": 1`` (int) would otherwise
+        # produce a WorkflowSpec whose ``compute_spec_hash`` matches the
+        # signed hash, letting the malformed wire form claim a valid
+        # signature. Raw pass-through plus ``__post_init__`` isinstance
+        # checks reject the wrong type at the boundary, before any
+        # signature verification reads the spec.
         if not isinstance(data, Mapping):
             raise WorkflowDefinitionError(
                 f"WorkflowSpec.from_dict expected mapping, got "
                 f"{type(data).__name__}"
             )
+        triggers_data = data.get("triggers")
+        triggers: Sequence[Trigger]
+        if triggers_data is None:
+            triggers = (Trigger(kind=TriggerKind.MANUAL),)
+        else:
+            triggers = tuple(Trigger.from_dict(t) for t in triggers_data)
+            if not triggers:
+                triggers = (Trigger(kind=TriggerKind.MANUAL),)
+        # author_did / author_sig / spec_hash are stored as strings on
+        # the dataclass; ``__post_init__`` rejects non-string values.
+        # ``data.get(... or "")`` would coerce missing into ""; we use
+        # an explicit-default form so a present-but-non-string value
+        # propagates and is rejected.
         return cls(
-            name=str(data["name"]),
-            version=int(data["version"]),
+            name=data["name"],
+            version=data["version"],
             stages=tuple(Stage.from_dict(s) for s in data.get("stages") or ()),
             edges=tuple(Edge.from_dict(e) for e in data.get("edges") or ()),
-            triggers=tuple(
-                Trigger.from_dict(t) for t in data.get("triggers") or ()
-            )
-            or (Trigger(kind=TriggerKind.MANUAL),),
-            params_schema=dict(data.get("params_schema") or {}),
+            triggers=triggers,
+            params_schema=data.get("params_schema") or {},
             retention_days=data.get("retention_days"),
-            author_did=str(data.get("author_did") or ""),
-            author_sig=str(data.get("author_sig") or ""),
-            spec_hash=str(data.get("spec_hash") or ""),
+            author_did=data.get("author_did", ""),
+            author_sig=data.get("author_sig", ""),
+            spec_hash=data.get("spec_hash", ""),
         )
 
 
@@ -931,12 +982,28 @@ class StageLink:
     occurred_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
-        for str_field in ("link_id", "run_id", "idempotency_key", "actor_did", "actor_sig"):
+        for str_field in ("link_id", "run_id", "actor_did", "actor_sig"):
             value = getattr(self, str_field)
             if not isinstance(value, str) or not value:
                 raise WorkflowDefinitionError(
                     f"stage_link.{str_field} must be a non-empty string"
                 )
+        # Round 4 P2: idempotency_key is the dedupe/attempt invariant
+        # the runner relies on (design §3.5: ``sha256(run_id||stage||
+        # sha256(canonical_input||attempt||nonce))``). Any non-hex value
+        # passing the dataclass would corrupt that invariant — runner
+        # callers (Phase 1) read the field and would log mismatches as
+        # if it were a digest. Enforce the shape at the dataclass
+        # boundary so direct constructors get the same guarantee the
+        # JSON schema gives wire callers.
+        if not isinstance(self.idempotency_key, str) or not _IDEMPOTENCY_KEY_RE.match(
+            self.idempotency_key
+        ):
+            raise WorkflowDefinitionError(
+                "stage_link.idempotency_key must be a lowercase hex sha256 "
+                "digest (64 chars matching ^[0-9a-f]{64}$); got "
+                f"{self.idempotency_key!r}"
+            )
         _validate_name("stage_link.stage_name", self.stage_name)
         if not isinstance(self.attempt_number, int) or self.attempt_number < 1:
             raise WorkflowDefinitionError(

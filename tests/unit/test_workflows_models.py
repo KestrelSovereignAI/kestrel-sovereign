@@ -491,6 +491,44 @@ def test_stage_link_rejects_bad_compensate_state():
         )
 
 
+def test_stage_link_rejects_malformed_idempotency_key():
+    """Codex round 4 P2: dedupe invariant requires hex sha256 digest."""
+    for bad in ("retry", "abcd", "x" * 64, "0" * 63, "0" * 65, 12345):
+        with pytest.raises(WorkflowDefinitionError):
+            StageLink(
+                link_id="l-1",
+                run_id="r-1",
+                stage_name="lint",
+                attempt_number=1,
+                idempotency_key=bad,
+                actor_did="did:web:k.example",
+                actor_sig="deadbeef",
+            )
+
+
+def test_workflow_spec_from_dict_rejects_string_version():
+    """Codex round 4 P2 (signed-spec integrity): a wire ``version: "1"``
+    must NOT be silently coerced to int 1, or its compute_spec_hash
+    would match a signature whose canonical signed form was the int."""
+    spec = _minimal_spec().to_dict()
+    spec["version"] = "1"  # string, not int
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowSpec.from_dict(spec)
+
+
+def test_workflow_spec_from_dict_rejects_int_name():
+    spec = _minimal_spec().to_dict()
+    spec["name"] = 42
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowSpec.from_dict(spec)
+
+
+def test_gate_from_dict_rejects_int_type():
+    """Mirror of WorkflowSpec/Stage round-4 hardening at the gate layer."""
+    with pytest.raises(WorkflowDefinitionError):
+        Gate.from_dict({"type": 42})
+
+
 def test_stage_link_attempt_number_one_indexed():
     with pytest.raises(WorkflowDefinitionError):
         StageLink(
