@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 import pytest
+from kestrel_sdk.tools.result import ToolResultStatus
 import pytest_asyncio
 
 from kestrel_sovereign.features.computer_use import ComputerUseFeature
@@ -206,9 +207,9 @@ async def test_privacy_gate_refuses_when_flag_off(workspace: Path, security_feat
         grants={"filesystem_read", "shell_execution_sandboxed", "shell_execution_host"},
         security_feature=security_feature,
     )
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("privacy")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("privacy")
 
     audit = _read_audit(workspace / "audit.jsonl")
     assert audit and audit[-1]["outcome"] == "denied"
@@ -229,9 +230,9 @@ async def test_constitution_gate_refuses_without_grant(workspace: Path, security
         grants={"shell_execution_sandboxed", "shell_execution_host"},
         security_feature=security_feature,
     )
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("constitution")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("constitution")
     audit = _read_audit(workspace / "audit.jsonl")
     assert audit[-1]["allowed_by"] == ["privacy", "denied:constitution"]
     assert audit[-1]["outcome"] == "denied"
@@ -249,9 +250,9 @@ async def test_local_backend_refuses_without_host_grant(workspace: Path, securit
     )
     # The backend refuses to construct → feature lands with backend=None
     assert feature._backend is None
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("readiness:")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("readiness:")
 
 
 # =============================================================================
@@ -275,9 +276,9 @@ async def test_fs_write_requires_real_approval(workspace: Path, security_feature
     target = workspace / "new.txt"
 
     async with _ApprovalResponder(security_feature, decision=True, scope="once") as responder:
-        result = await feature.fs_write(path=str(target), content="payload")
+        envelope = await feature.fs_write(path=str(target), content="payload")
 
-    assert result["success"] is True, result
+    assert envelope.status is ToolResultStatus.OK, result
     assert target.read_text() == "payload"
     assert responder.responded_count == 1
 
@@ -306,10 +307,10 @@ async def test_fs_write_denied_when_user_refuses(workspace: Path, security_featu
     target = workspace / "rejected.txt"
 
     async with _ApprovalResponder(security_feature, decision=False, scope="once"):
-        result = await feature.fs_write(path=str(target), content="should not land")
+        envelope = await feature.fs_write(path=str(target), content="should not land")
 
-    assert result["success"] is False
-    assert result["error"].startswith("approval")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("approval")
     assert not target.exists()
 
 
@@ -333,9 +334,9 @@ async def test_fs_read_inside_allow_list_auto_approves(
         security_feature=security_feature,
     )
     # No approval responder running — auto-approve must be enough.
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is True
-    assert result["content"] == "hello world"
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["content"] == "hello world"
     assert security_feature.approval_queue.pending_count == 0
 
 
@@ -356,10 +357,10 @@ async def test_deny_path_short_circuits_before_approval(
     # Even with an "approve everything" responder running, a deny-list
     # match must hard-reject before reaching the queue.
     async with _ApprovalResponder(security_feature, decision=True) as responder:
-        result = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
+        envelope = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
 
-    assert result["success"] is False
-    assert result["error"].startswith("policy:deny")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("policy:deny")
     assert responder.responded_count == 0
 
 
@@ -379,11 +380,11 @@ async def test_shell_allowed_binary_runs_with_approval(
         security_feature=security_feature,
     )
     async with _ApprovalResponder(security_feature, decision=True):
-        result = await feature.shell(command="echo integration-ok", timeout=5)
+        envelope = await feature.shell(command="echo integration-ok", timeout=5)
 
-    assert result["success"] is True
-    assert result["returncode"] == 0
-    assert "integration-ok" in result["stdout"]
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["returncode"] == 0
+    assert "integration-ok" in envelope.data["stdout"]
 
 
 @pytest.mark.asyncio
@@ -397,10 +398,10 @@ async def test_shell_denied_binary_hard_rejects(
         security_feature=security_feature,
     )
     async with _ApprovalResponder(security_feature, decision=True) as responder:
-        result = await feature.shell(command="rm -rf /tmp/whatever", timeout=5)
+        envelope = await feature.shell(command="rm -rf /tmp/whatever", timeout=5)
 
-    assert result["success"] is False
-    assert result["error"].startswith("policy:deny")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("policy:deny")
     assert responder.responded_count == 0
 
 
@@ -461,12 +462,12 @@ async def test_symlink_resolves_to_realpath_for_human_approver(
                     continue
 
     async with _CapturingResponder(security_feature, decision=False):
-        result = await feature.fs_read(
+        envelope = await feature.fs_read(
             path=str(workspace / "trap_link" / "secret_in_outside.txt")
         )
 
-    assert result["success"] is False
-    assert result["error"].startswith("approval")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("approval")
     # The human approver was shown the resolved realpath, not the symlink path.
     real_target = os.path.realpath(secret)
     assert captured_args.get("path") == real_target
@@ -556,13 +557,13 @@ async def test_constitution_parser_picks_up_grants_from_disk(
 
     # Read should succeed (filesystem_read granted on disk)
     result_read = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result_read["success"] is True
+    assert result_read.status is ToolResultStatus.OK
 
     # Write should fail at constitution gate (filesystem_write NOT granted)
     async with _ApprovalResponder(security_feature, decision=True):
         result_write = await feature.fs_write(path=str(workspace / "blocked.txt"), content="x")
-    assert result_write["success"] is False
-    assert result_write["error"].startswith("constitution")
+    assert result_write.status is ToolResultStatus.ERROR
+    assert result_write.error.startswith("constitution")
     assert not (workspace / "blocked.txt").exists()
 
 
@@ -593,10 +594,10 @@ async def test_read_outside_allow_list_goes_through_approval_and_succeeds(
     )
 
     async with _ApprovalResponder(security_feature, decision=True) as responder:
-        result = await feature.fs_read(path=str(target))
+        envelope = await feature.fs_read(path=str(target))
 
-    assert result["success"] is True, result
-    assert result["content"] == "worth a look"
+    assert envelope.status is ToolResultStatus.OK, result
+    assert envelope.data["content"] == "worth a look"
     assert responder.responded_count == 1, "must reach the approval queue"
 
     audit = _read_audit(workspace / "audit.jsonl")
@@ -626,10 +627,10 @@ async def test_read_outside_allow_list_denied_when_user_refuses(
     )
 
     async with _ApprovalResponder(security_feature, decision=False):
-        result = await feature.fs_read(path=str(target))
+        envelope = await feature.fs_read(path=str(target))
 
-    assert result["success"] is False
-    assert result["error"].startswith("approval")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("approval")
 
 
 # =============================================================================
@@ -655,9 +656,9 @@ async def test_constitution_denial_does_not_leak_path_or_policy_info(
     # Pass a path with `..` traversal — under the wrong gate order, this would
     # surface as path_safety:traversal. Under the correct order, the agent
     # only learns it has no constitutional grant.
-    result = await feature.fs_read(path="../../../etc/passwd")
-    assert result["success"] is False
-    assert result["error"].startswith("constitution"), result["error"]
+    envelope = await feature.fs_read(path="../../../etc/passwd")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("constitution"), envelope.error
 
     audit = _read_audit(workspace / "audit.jsonl")
     last = audit[-1]
@@ -683,9 +684,9 @@ async def test_audit_records_path_safety_traversal_refusal(
         },
         security_feature=security_feature,
     )
-    result = await feature.fs_read(path="../../etc/passwd")
-    assert result["success"] is False
-    assert result["error"].startswith("path_safety")
+    envelope = await feature.fs_read(path="../../etc/passwd")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("path_safety")
 
     audit = _read_audit(workspace / "audit.jsonl")
     last = audit[-1]
@@ -712,10 +713,10 @@ async def test_audit_records_policy_deny_refusal(
     )
     # Even with a permissive responder, the deny-list must short-circuit.
     async with _ApprovalResponder(security_feature, decision=True) as responder:
-        result = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
+        envelope = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
 
-    assert result["success"] is False
-    assert result["error"].startswith("policy:deny")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("policy:deny")
     assert responder.responded_count == 0
 
     audit = _read_audit(workspace / "audit.jsonl")
@@ -750,9 +751,9 @@ async def test_audit_records_disabled_feature_call(
     feature._cfg = cfg
     await feature.initialize()
 
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("readiness:")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("readiness:")
 
     audit = _read_audit(workspace / "audit.jsonl")
     assert audit
@@ -786,11 +787,11 @@ async def test_fs_edit_replaces_single_occurrence(
     )
 
     async with _ApprovalResponder(security_feature, decision=True):
-        result = await feature.fs_edit(
+        envelope = await feature.fs_edit(
             path=str(target), old_text="beta", new_text="BETA", occurrence=1
         )
 
-    assert result["success"] is True, result
+    assert envelope.status is ToolResultStatus.OK, result
     # Only the FIRST occurrence is replaced.
     assert target.read_text() == "alpha BETA gamma beta"
 
@@ -815,11 +816,11 @@ async def test_fs_edit_can_target_nth_occurrence(
     )
 
     async with _ApprovalResponder(security_feature, decision=True):
-        result = await feature.fs_edit(
+        envelope = await feature.fs_edit(
             path=str(target), old_text="x", new_text="Y", occurrence=2
         )
 
-    assert result["success"] is True
+    assert envelope.status is ToolResultStatus.OK
     assert target.read_text() == "x Y x"
 
 
@@ -842,11 +843,11 @@ async def test_fs_edit_rejects_when_old_text_missing(
         security_feature=security_feature,
     )
 
-    result = await feature.fs_edit(
+    envelope = await feature.fs_edit(
         path=str(target), old_text="not present", new_text="X"
     )
-    assert result["success"] is False
-    assert "not found" in result["error"]
+    assert envelope.status is not ToolResultStatus.OK
+    assert "not found" in envelope.error
     assert target.read_text() == "hello world"  # unchanged
 
 
@@ -870,12 +871,12 @@ async def test_fs_edit_denied_when_user_refuses(
     )
 
     async with _ApprovalResponder(security_feature, decision=False):
-        result = await feature.fs_edit(
+        envelope = await feature.fs_edit(
             path=str(target), old_text="original", new_text="HIJACKED"
         )
 
-    assert result["success"] is False
-    assert result["error"].startswith("approval")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("approval")
     assert target.read_text() == "original"
 
 
@@ -925,9 +926,9 @@ audit_log_path = "{audit_path}"
     await feature.initialize()
 
     assert feature._backend is not None, "loader must have found enabled toml"
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is True
-    assert result["content"] == "hello world"
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["content"] == "hello world"
 
     # Audit landed at the configured path
     assert audit_path.exists()
@@ -998,12 +999,12 @@ async def test_fs_edit_does_not_read_file_when_privacy_blocks(
 
     monkeypatch.setattr(Path, "read_bytes", _tracking_read_bytes)
 
-    result = await feature.fs_edit(
+    envelope = await feature.fs_edit(
         path=str(target), old_text="beta", new_text="BETA"
     )
 
-    assert result["success"] is False
-    assert result["error"].startswith("privacy")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("privacy")
     assert _SentinelTracker.reads == 0, (
         "fs_edit must not read the target file when privacy refuses; "
         f"saw {_SentinelTracker.reads} reads"
@@ -1048,12 +1049,12 @@ async def test_fs_edit_does_not_read_file_when_constitution_blocks(
     # Try a substring-search probe: under the leaky implementation, the
     # error would tell us whether old_text exists in the file. Under the
     # fixed implementation, we get a constitution error and learn nothing.
-    result = await feature.fs_edit(
+    envelope = await feature.fs_edit(
         path=str(target), old_text="hunter2", new_text="REDACTED"
     )
 
-    assert result["success"] is False
-    assert result["error"].startswith("constitution")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("constitution")
     assert _SentinelTracker.reads == 0
 
 
@@ -1081,11 +1082,11 @@ async def test_fs_edit_substring_oracle_is_closed(
     )
 
     # Both refusals must look identical to the caller — no oracle.
-    assert res_present["success"] is False
-    assert res_missing["success"] is False
-    assert res_present["error"].startswith("constitution")
-    assert res_missing["error"].startswith("constitution")
-    assert res_present["error"] == res_missing["error"]
+    assert res_present.status is ToolResultStatus.ERROR
+    assert res_missing.status is ToolResultStatus.ERROR
+    assert res_present.error.startswith("constitution")
+    assert res_missing.error.startswith("constitution")
+    assert res_present.error == res_missing.error
 
 
 @pytest.mark.asyncio
@@ -1109,11 +1110,11 @@ async def test_fs_edit_audits_input_validation_failures(
         security_feature=security_feature,
     )
 
-    result = await feature.fs_edit(
+    envelope = await feature.fs_edit(
         path=str(target), old_text="x", new_text="y"
     )
-    assert result["success"] is False
-    assert "encoding" in result["error"]
+    assert envelope.status is not ToolResultStatus.OK
+    assert "encoding" in envelope.error
 
     audit = _read_audit(workspace / "audit.jsonl")
     last = audit[-1]
@@ -1147,11 +1148,11 @@ async def test_fs_edit_invalid_occurrence_audited(
         security_feature=security_feature,
     )
 
-    result = await feature.fs_edit(
+    envelope = await feature.fs_edit(
         path=str(target), old_text="hello", new_text="hi", occurrence=0
     )
-    assert result["success"] is False
-    assert "occurrence" in result["error"]
+    assert envelope.status is not ToolResultStatus.OK
+    assert "occurrence" in envelope.error
 
     audit = _read_audit(workspace / "audit.jsonl")
     last = audit[-1]
@@ -1180,11 +1181,11 @@ async def test_fs_edit_missing_text_audited(
         security_feature=security_feature,
     )
 
-    result = await feature.fs_edit(
+    envelope = await feature.fs_edit(
         path=str(target), old_text="not present", new_text="x"
     )
-    assert result["success"] is False
-    assert "not found" in result["error"]
+    assert envelope.status is not ToolResultStatus.OK
+    assert "not found" in envelope.error
 
     audit = _read_audit(workspace / "audit.jsonl")
     last = audit[-1]
@@ -1224,10 +1225,10 @@ async def test_fs_write_does_not_read_file_when_privacy_blocks(
 
     monkeypatch.setattr(Path, "read_bytes", _tracking_read_bytes)
 
-    result = await feature.fs_write(path=str(target), content="new content")
+    envelope = await feature.fs_write(path=str(target), content="new content")
 
-    assert result["success"] is False
-    assert result["error"].startswith("privacy")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("privacy")
     assert _SentinelTracker.reads == 0
 
 
@@ -1273,11 +1274,11 @@ async def test_fs_edit_diff_preview_present_in_approval_payload(
                     continue
 
     async with _CapturingResponder(security_feature, decision=True):
-        result = await feature.fs_edit(
+        envelope = await feature.fs_edit(
             path=str(target), old_text="ORIGINAL", new_text="REPLACED"
         )
 
-    assert result["success"] is True
+    assert envelope.status is ToolResultStatus.OK
     diff = captured.get("diff_preview", "")
     assert "ORIGINAL" in diff
     assert "REPLACED" in diff
