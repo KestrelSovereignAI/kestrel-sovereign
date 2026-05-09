@@ -42,7 +42,10 @@ dependencies = [
     # (require_constitution_echo / prompt_template_format /
     # constitution_injection / system_prompt_budget_bytes) that chunks 1D,
     # 1F, and 1G consume. Defaults are backwards-compatible.
-    "kestrel-sovereign-sdk>=0.11,<1",
+    #
+    # 0.12 floor: required by `from kestrel_sdk.payer_policy import ...`
+    # introduced by the PayerPolicy foundation work.
+    "kestrel-sovereign-sdk>=0.12,<1",
     # Core web framework
     "fastapi==0.128.1",
     "uvicorn==0.35.0",

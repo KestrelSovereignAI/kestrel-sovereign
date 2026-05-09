@@ -25,6 +25,18 @@ class MockLLMService:
         self.default_response = default_response
         self._responses: List[str] = []
         self._call_history: List[Dict[str, Any]] = []
+        # Mirrors LLMService's per-agent claim contract introduced in
+        # the PayerPolicy work. Real LLMService raises on duplicate
+        # attach; the mock just records (or no-ops) so tests that wrap
+        # this fake in a KestrelAgent work without modification.
+        self._owner_agent_did: Any = None
+
+    def attach_to_agent(self, agent_did: str) -> None:
+        """No-op claim. Tests that need to assert on this can read
+        ``_owner_agent_did`` directly."""
+        if not agent_did:
+            raise ValueError("agent_did is required for attach_to_agent")
+        self._owner_agent_did = agent_did
 
     def queue_response(self, response: str) -> None:
         """Queue a response to be returned by the next get_response call."""

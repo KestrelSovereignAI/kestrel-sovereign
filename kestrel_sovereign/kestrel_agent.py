@@ -295,7 +295,13 @@ class KestrelAgent(
         # test sharing pattern), this raises LLMServiceAlreadyAttachedError
         # so the cross-agent state-leak invariant is enforced at construction
         # time. See LLMService.attach_to_agent for the rationale.
-        self.llm_service.attach_to_agent(did)
+        #
+        # Guarded by hasattr because some tests inject lightweight LLM fakes
+        # (MockLLMService et al.) that only implement the generate/model
+        # surface. Real LLMService instances always have attach_to_agent;
+        # the invariant is enforced for them and silently waived for fakes.
+        if hasattr(self.llm_service, "attach_to_agent"):
+            self.llm_service.attach_to_agent(did)
         self.pg_pool = pg_pool
         # Note: agent_id is a @property that returns self.did (see below).
         # Do NOT set self.agent_id = ... here; it would shadow the property.

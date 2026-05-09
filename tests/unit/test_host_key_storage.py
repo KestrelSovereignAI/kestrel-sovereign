@@ -52,6 +52,28 @@ async def db(tmp_path) -> AsyncDatabase:
     await database.close()
 
 
+class TestPostgresUpsertCompatibility:
+    """Verify the SQLite ``INSERT OR REPLACE`` shim picks ``provider_id``
+    as the conflict target for ``host_service_keys``, not the first column
+    (``id``, a fresh UUID per insert that would never trigger a replace).
+    """
+
+    def test_placeholder_shim_uses_provider_id_as_conflict_target(self) -> None:
+        from kestrel_sovereign.storage.db.placeholder import sqlite_to_postgres
+
+        # Simulate the exact INSERT host_key_storage.store_key emits.
+        sql = (
+            "INSERT OR REPLACE INTO host_service_keys "
+            "(id, provider_id, encrypted_key, key_hash, is_active, created_at) "
+            "VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)"
+        )
+        converted, _count = sqlite_to_postgres(sql)
+        # Conflict must be on provider_id (the actual UNIQUE), not id
+        # (a fresh UUID per call that would never collide).
+        assert "ON CONFLICT (provider_id)" in converted
+        assert "ON CONFLICT (id)" not in converted
+
+
 class TestHostKeyStorageRoundTrip:
     @pytest.mark.asyncio
     async def test_store_then_get_returns_plaintext(self, db: AsyncDatabase) -> None:
