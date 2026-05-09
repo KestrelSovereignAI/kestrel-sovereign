@@ -1043,6 +1043,42 @@ def test_schema_accepts_did_bearing_signal_source():
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_record_only_only_for_irreversible():
+    """Round 14 P2: schema mirror of Stage's bidirectional invariant.
+    A reversible stage with compensate=compensate_record_only must be
+    rejected at the wire boundary."""
+    spec = _minimal_spec().to_dict()
+    spec["stages"].append(
+        {
+            "name": "ship",
+            "signal_source": "ci.publish",
+            "signal_mode": "action",
+            "compensate": "compensate_record_only",
+            "irreversible": False,
+        }
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_stage_link_rejects_empty_actor_fields():
+    """Round 14 P2: identity fields must be non-empty at the wire too."""
+    link = {
+        "link_id": "l-1",
+        "run_id": "r-1",
+        "stage_name": "lint",
+        "attempt_number": 1,
+        "idempotency_key": "0" * 64,
+        "actor_did": "",
+        "actor_sig": "deadbeef",
+        "post_cancel": False,
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=link, schema=WORKFLOW_STAGE_LINK_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
 def test_schema_irreversible_stage_requires_record_only_compensate():
     spec = _minimal_spec().to_dict()
     spec["stages"].append(

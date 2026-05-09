@@ -203,6 +203,21 @@ def _stage_schema() -> dict[str, Any]:
                     "required": ["compensate"],
                 },
             },
+            # Codex round 14 P2: the converse — compensate_record_only
+            # is reserved for irreversible stages. Mirror Stage's
+            # bidirectional irreversible↔record_only invariant.
+            {
+                "if": {
+                    "properties": {
+                        "compensate": {"const": "compensate_record_only"},
+                    },
+                    "required": ["compensate"],
+                },
+                "then": {
+                    "properties": {"irreversible": {"const": True}},
+                    "required": ["irreversible"],
+                },
+            },
         ],
     }
 
@@ -444,8 +459,11 @@ WORKFLOW_STAGE_LINK_SCHEMA: dict[str, Any] = {
             ],
         },
         "post_cancel": {"type": "boolean"},
-        "actor_did": {"type": "string"},
-        "actor_sig": {"type": "string"},
+        # Codex round 14 P2: dataclass requires non-empty actor identity.
+        # An unsigned/identity-less transition would pass schema before
+        # failing later or persisting in a schema-only path.
+        "actor_did": {"type": "string", "minLength": 1},
+        "actor_sig": {"type": "string", "minLength": 1},
         "occurred_at": {"type": ["string", "null"]},
     },
 }
