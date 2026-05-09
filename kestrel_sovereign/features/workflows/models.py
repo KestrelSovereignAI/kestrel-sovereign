@@ -34,6 +34,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping, Optional, Sequence
 
 from kestrel_sdk.signals import SignalMode
@@ -184,6 +185,27 @@ def _is_strict_positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 1
 
 
+def _freeze_value(value: Any) -> Any:
+    """Recursively freeze a JSON-like value so a frozen dataclass holding
+    it cannot be mutated post-construction.
+
+    Round 15 codex P2: a signed ``WorkflowSpec`` with
+    ``Stage.params={'n': 1}`` could be mutated via
+    ``spec.stages[0].params['n'] = 2`` after signature verification,
+    leaving ``spec_hash`` stale and the runner dispatching against a
+    payload that no longer matches what the author signed. ``MappingProxyType``
+    wraps dicts as read-only views; lists become tuples; primitives
+    pass through unchanged.
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(k): _freeze_value(v) for k, v in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(v) for v in value)
+    return value
+
+
 def _present_or(data: Mapping[str, Any], key: str, default: Any) -> Any:
     """Return ``data[key]`` if present, else ``default``.
 
@@ -277,7 +299,7 @@ class Gate:
         # Frozen mapping for hashability of Gate (subclassed dicts would
         # leak mutability into the dataclass). dict() is fine — JSON
         # round-trip materializes a plain dict on the way back.
-        object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "params", _freeze_value(self.params))
 
         # Light per-type schema validation; the heavy structural rules
         # (e.g. red_team_clear's reviewer pool size) belong in Phase 2's
@@ -359,7 +381,7 @@ class Stage:
                 f"stage.params must be a mapping, got "
                 f"{type(self.params).__name__}"
             )
-        object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "params", _freeze_value(self.params))
 
         if not isinstance(self.gate, Gate):
             raise WorkflowDefinitionError(
@@ -629,7 +651,7 @@ class Edge:
                 "edge.params must be a mapping (SUBWORKFLOW uses it as the "
                 "sub-call payload; other kinds keep it empty)"
             )
-        object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "params", _freeze_value(self.params))
 
     def _reject_unrelated_fields(self, allowed: set[str]) -> None:
         """Frozen-dataclass guard: every kind populates only its own
@@ -783,7 +805,7 @@ class Trigger:
             raise WorkflowDefinitionError(
                 "trigger.params must be a mapping"
             )
-        object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "params", _freeze_value(self.params))
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {"kind": self.kind.value}
@@ -922,7 +944,7 @@ class WorkflowSpec:
             raise WorkflowDefinitionError(
                 "workflow.params_schema must be a mapping (JSON Schema fragment)"
             )
-        object.__setattr__(self, "params_schema", dict(self.params_schema))
+        object.__setattr__(self, "params_schema", _freeze_value(self.params_schema))
 
         if self.retention_days is not None and not _is_strict_positive_int(
             self.retention_days
@@ -1104,7 +1126,7 @@ class WorkflowRun:
 
         if not isinstance(self.params, Mapping):
             raise WorkflowDefinitionError("run.params must be a mapping")
-        object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "params", _freeze_value(self.params))
 
         if not isinstance(self.current_stages, (list, tuple)) or not all(
             isinstance(s, str) for s in self.current_stages

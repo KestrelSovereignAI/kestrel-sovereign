@@ -819,6 +819,37 @@ def test_edge_subworkflow_rejects_bool_for_version():
         )
 
 
+def test_stage_params_are_immutable():
+    """Round 15 P2: Stage holds a frozen view of params so post-sign
+    mutation can't drift the live payload from the signed canonical
+    hash."""
+    stage = _action_stage(params={"branch": "main", "tags": ["a", "b"]})
+    with pytest.raises(TypeError):
+        stage.params["branch"] = "stolen"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        stage.params["new"] = 1  # type: ignore[index]
+    # Nested list became tuple
+    assert isinstance(stage.params["tags"], tuple)
+
+
+def test_workflow_spec_params_schema_immutable():
+    spec = _minimal_spec(params_schema={"type": "object", "required": ["x"]})
+    with pytest.raises(TypeError):
+        spec.params_schema["type"] = "array"  # type: ignore[index]
+
+
+def test_workflow_spec_post_construction_mutation_does_not_change_hash():
+    """Constructing then attempting mutation must NOT change
+    compute_spec_hash — the freeze prevents it from succeeding at all,
+    but the hash test pins the broader invariant."""
+    spec = _minimal_spec(params_schema={"x": 1})
+    h1 = spec.compute_spec_hash()
+    with pytest.raises(TypeError):
+        spec.params_schema["x"] = 2  # type: ignore[index]
+    h2 = spec.compute_spec_hash()
+    assert h1 == h2
+
+
 def test_workflow_spec_empty_triggers_round_trip_stable():
     """Round 12 P2: an empty triggers list constructs a spec whose
     hash matches a from_dict-loaded spec of the same wire form.
