@@ -116,22 +116,42 @@ class FoundationPayerResolver:
         # env-var fallback. Always safe; no side effects required.
         #
         # HOST_MASTER_PROVISIONED / USER_MASTER_PROVISIONED / SPONSOR:
-        # share the same agent-side surface in Phase 3a — an enabled
-        # ResolvedResource backed by ServiceKeyStorage with env-var
-        # fallback. The agent-init layer detects pre-existing per-agent
-        # credentials via the deprecated `openrouter_key_hash` metadata
-        # field and calls use_agent_key. Phase 3c switches to
-        # resolver-driven minting for LLM when that field is absent.
-        # For STORAGE these kinds are marked NOT_IMPLEMENTED in the SDK
-        # support matrix until Phase 3.5 ships the Lighthouse wallet-
-        # signed key flow — the matrix check above already raises
-        # UnsupportedCombinationError for them, so we don't need a
-        # second gate here.
+        # share the same agent-side surface in Phase 3a for LLM only.
+        # The agent-init layer detects pre-existing per-agent credentials
+        # via the deprecated `openrouter_key_hash` metadata field and
+        # calls use_agent_key. Phase 3c switches to resolver-driven
+        # minting for LLM when that field is absent.
+        #
+        # For STORAGE / COMPUTE / TOOLS / COMMS, delegated-master kinds
+        # are NOT yet wired (no analogous "child credential already
+        # provisioned" path; minting requires Phase 3.5+). The SDK
+        # SUPPORT_MATRIX marks those triples as NOT_IMPLEMENTED so the
+        # matrix-validation gate above raises
+        # UnsupportedCombinationError before reaching this code. We
+        # ALSO keep an explicit defense-in-depth check here so a stale
+        # or accidentally-regressed SDK matrix cannot silently fall
+        # through to LIGHTHOUSE_API_KEY env var (which would bill the
+        # operator's master key as the agent's storage — exact policy
+        # violation these kinds exist to prevent).
         delegated_master_kinds = {
             PayerKind.HOST_MASTER_PROVISIONED,
             PayerKind.USER_MASTER_PROVISIONED,
             PayerKind.SPONSOR,
         }
+        if (
+            spec.kind in delegated_master_kinds
+            and resource_class is not ResourceClass.LLM
+        ):
+            raise NotImplementedError(
+                f"PayerKind.{spec.kind.name} resolution for "
+                f"({resource_class.value}, vendor={spec.vendor!r}) is not "
+                "yet implemented (delegated-master kinds for non-LLM "
+                "resources land in Phase 3.5+). The SDK support matrix "
+                "should already mark this combination NOT_IMPLEMENTED — "
+                "if you're reaching this gate, the matrix is stale or "
+                "the SDK pin is too loose."
+            )
+
         if spec.kind is PayerKind.HOST_ENV or spec.kind in delegated_master_kinds:
             logger.debug(
                 f"PayerPolicy.{resource_class.value}: HOST_ENV for agent "
