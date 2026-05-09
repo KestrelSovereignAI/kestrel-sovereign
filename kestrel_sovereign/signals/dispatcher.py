@@ -695,6 +695,27 @@ class SignalDispatcher:
                     audit=audit,
                 )
 
+            # Codex round-6 P2 #1: `_get_governing_constitution()` may
+            # have lazily anchored on first call (writing
+            # constitution_hash to agent_node). The audit recorded
+            # whatever was there at audit-build time; refresh it now
+            # so the canary derivation below uses the post-anchor
+            # value, not the pre-anchor None.
+            get_const = getattr(self._agent, "get_constitution_hash", None)
+            if callable(get_const) and not audit.constitution_hash:
+                try:
+                    refreshed = get_const()
+                    if asyncio.iscoroutine(refreshed):
+                        refreshed = await refreshed
+                    if isinstance(refreshed, str) and refreshed:
+                        audit.constitution_hash = refreshed
+                except Exception:
+                    logger.exception(
+                        "Post-anchor constitution_hash refresh raised for "
+                        "signal %s; canary derivation may use stale value",
+                        signal.id,
+                    )
+
         prompt = self._render_prompt(signal, registration)
         if constitution_text is not None:
             # Prepend a single canonical fenced block. Templates may
@@ -738,6 +759,30 @@ class SignalDispatcher:
             )
             if instruction is not None:
                 prompt = f"{prompt}\n\n{instruction}"
+
+        # Codex round-6 P2 #2: enforce the registered budget. Phase 1
+        # cannot truncate the constitution (security property) or the
+        # canary directive (verification gate), so the only honest
+        # response to over-budget is to refuse with
+        # DROPPED_VALIDATION. Operators see the cap was insufficient
+        # and either resize the template or raise the budget — silent
+        # over-budget dispatches would leak audit signal.
+        budget = registration.system_prompt_budget_bytes
+        if budget is not None and len(prompt.encode("utf-8")) > budget:
+            audit.dropped_clauses = ["TEMPLATE_BODY"]
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=(
+                    f"prompt exceeds system_prompt_budget_bytes ({budget}); "
+                    "constitution + canary directive cannot be truncated. "
+                    "Reduce the source's prompt_template body or raise the "
+                    "registration budget."
+                ),
+                registration=registration,
+                audit=audit,
+            )
 
         # Set the in-flight turn's causation chain (already extended
         # with this hop's frame in step 2 of the pipeline) so outbound

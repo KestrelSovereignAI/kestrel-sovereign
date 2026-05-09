@@ -887,6 +887,145 @@ async def test_constitution_mixin_compute_live_returns_none_default():
 
 
 @pytest.mark.asyncio
+async def test_constitution_hash_refreshed_after_lazy_anchoring(tmp_path):
+    """Codex round-6 P2: `_get_governing_constitution()` can lazily
+    anchor on first call (writing constitution_hash). Without a
+    post-getter refresh, the first echo-required dispatch would see
+    `audit.constitution_hash=None` (recorded pre-getter), skip canary
+    derivation, and falsely fail. Pin the refresh."""
+
+    class _LazyAnchorAgent(_AuditingAgent):
+        def __init__(self):
+            super().__init__(
+                # Pre-anchor: get_constitution_hash returns None.
+                constitution_hash=None,
+                anchored_bundle_hash="bundle",
+                live_bundle_hash="bundle",
+                echo_status=CanaryStatus.VERIFIED,
+            )
+            self.anchored_value: Optional[str] = None
+
+        async def _get_governing_constitution(self) -> str:
+            # Simulate lazy anchoring: first call writes to the
+            # backing store; subsequent get_constitution_hash sees it.
+            self.anchored_value = "con_lazy_anchored"
+            self._const = self.anchored_value
+            return "ARTICLE I — sovereignty over data"
+
+    template_path = tmp_path / "tpl.md"
+    template_path.write_text("payload={payload}", encoding="utf-8")
+
+    agent = _LazyAnchorAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="lazy_anchor_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("lazy_anchor_cog")
+    )
+    await _drain(env)
+
+    # First-time dispatch under lazy anchoring SUCCEEDS — canary was
+    # derived from the post-anchor hash, the model saw it, the
+    # verifier confirmed.
+    assert result.status == Status.OK
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, echo_canary_status FROM signal_log"
+    )
+    assert rows == [("con_lazy_anchored", "verified")]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_refused_when_prompt_exceeds_budget(tmp_path):
+    """Codex round-6 P2 #2: registered `system_prompt_budget_bytes`
+    must take effect. Constitution + canary directive cannot be
+    truncated (security/verification properties), so an over-budget
+    prompt → DROPPED_VALIDATION with `dropped_clauses=["TEMPLATE_BODY"]`
+    so an operator sees the cap was hit."""
+    template_path = tmp_path / "big_tpl.md"
+    template_path.write_text("X" * 5000, encoding="utf-8")
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="oversized_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+            system_prompt_budget_bytes=1024,  # template alone exceeds
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("oversized_cog"))
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "exceeds system_prompt_budget_bytes" in (result.error or "")
+    # process_input never ran.
+    assert agent.process_input_calls == []
+    rows = await env.backend.fetch_all(
+        "SELECT dropped_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    assert _json.loads(rows[0][0]) == ["TEMPLATE_BODY"]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_succeeds_when_prompt_fits_budget(tmp_path):
+    """Counterpart: when the assembled prompt fits the budget, the
+    dispatch runs normally. Pin the under-budget pass."""
+    template_path = tmp_path / "small_tpl.md"
+    template_path.write_text("payload={payload}", encoding="utf-8")
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="under_budget_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+            system_prompt_budget_bytes=8192,
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("under_budget_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.OK
+    assert len(agent.process_input_calls) == 1
+    assert (
+        len(agent.process_input_calls[0].encode("utf-8")) <= 8192
+    )
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_action_signals_bypass_constitutional_audit(tmp_path):
     agent = _AuditingAgent(
         constitution_hash="should_not_be_used",
