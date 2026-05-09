@@ -860,40 +860,23 @@ class SignalDispatcher:
             if instruction is not None:
                 addendum = instruction
 
-        # Set the in-flight turn's causation chain (already extended
-        # with this hop's frame in step 2 of the pipeline) so outbound
-        # A2A tasks created during the turn carry the lineage forward
-        # (#905 review P1). The chain lives in a ContextVar so
-        # concurrent COGNITION dispatches stay isolated — agent-level
-        # mutable state would race here (#906 review P1: dispatcher
-        # set/clear runs OUTSIDE the CONVERSATION lock that
-        # process_input acquires inside its body).
-        set_chain = getattr(self._agent, "_set_current_chain", None)
-        clear_chain = getattr(self._agent, "_clear_current_chain", None)
-        token = None
-        if set_chain is not None:
-            token = set_chain(signal.causation_chain)
         # Codex round-9 P2 #3: don't catch TypeError around
         # process_input — that would also catch errors raised inside
         # the LLM/tool path and retry, duplicating side effects.
         # Inspect the signature once up-front so we know whether the
-        # kwargs are accepted; if not, log and skip silently. The
-        # post-dispatch verifier will mark MISSING because the
-        # addendum was never delivered, which is the correct failure
-        # mode for that configuration.
+        # kwargs are accepted; if not, log and skip silently.
         accepts_addendum = _agent_accepts_kwarg(
             self._agent.process_input, "system_prompt_addendum"
         )
         accepts_budget = _agent_accepts_kwarg(
             self._agent.process_input, "system_prompt_budget_bytes"
         )
+        # Codex round-19 P2 + round-20 P2: refuse pre-execution when
+        # the canary directive can't reach the model. CRITICAL: this
+        # check runs BEFORE `_set_current_chain` so failing here does
+        # NOT leak the in-flight causation chain ContextVar (which
+        # would corrupt subsequent task lineage).
         if addendum is not None and not accepts_addendum:
-            # Codex round-19 P2: refuse the dispatch BEFORE running
-            # the turn when we know in advance the canary directive
-            # cannot reach the model. Running the turn anyway would
-            # incur side effects (tool calls, persistence) only to
-            # fail verification afterward — a verification gate
-            # should gate ahead of the work, not after.
             return self._fail(
                 signal,
                 start,
@@ -908,6 +891,20 @@ class SignalDispatcher:
                 registration=registration,
                 audit=audit,
             )
+
+        # Set the in-flight turn's causation chain (already extended
+        # with this hop's frame in step 2 of the pipeline) so outbound
+        # A2A tasks created during the turn carry the lineage forward
+        # (#905 review P1). The chain lives in a ContextVar so
+        # concurrent COGNITION dispatches stay isolated — agent-level
+        # mutable state would race here (#906 review P1: dispatcher
+        # set/clear runs OUTSIDE the CONVERSATION lock that
+        # process_input acquires inside its body).
+        set_chain = getattr(self._agent, "_set_current_chain", None)
+        clear_chain = getattr(self._agent, "_clear_current_chain", None)
+        token = None
+        if set_chain is not None:
+            token = set_chain(signal.causation_chain)
 
         budget = registration.system_prompt_budget_bytes
         accepts_anchored = _agent_accepts_kwarg(
