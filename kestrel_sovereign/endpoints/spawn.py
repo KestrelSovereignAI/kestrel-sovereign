@@ -22,24 +22,42 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/spawn", tags=["spawn"])
 
 
-def _get_lifecycle(agent) -> Any:
-    """Get the SpawnedAgentLifecycle from the agent manager, if available."""
+def _get_lifecycle(agent, request: Request | None = None) -> Any:
+    """Get the SpawnedAgentLifecycle from the agent manager, if available.
+
+    Falls back to ``request.app.state.agent_manager`` for the same
+    multi-agent reason called out in ``_get_agent_manager``.
+    """
     manager = getattr(agent, '_agent_manager', None) or getattr(agent, 'agent_manager', None)
+    if manager is None and request is not None:
+        manager = getattr(request.app.state, 'agent_manager', None)
     if manager is None:
         return None
     return getattr(manager, '_lifecycle', None)
 
 
-def _get_agent_manager(agent) -> Any:
-    """Get AgentManager from agent."""
-    return getattr(agent, '_agent_manager', None) or getattr(agent, 'agent_manager', None)
+def _get_agent_manager(agent, request: Request | None = None) -> Any:
+    """Get AgentManager — first from the agent, then from app.state.
+
+    In multi-agent mode the shared AgentManager lives on
+    ``request.app.state.agent_manager`` and is NOT attached to each
+    loaded agent (``AgentManager.load_agent()`` doesn't backref).
+    Without the request fallback the panel reports an empty spawn
+    state for routed-agent calls like ``/api/agents/{name}/api/spawn/children``
+    even when the app-level manager has children. Codex round 3 of
+    #1149 caught this; the bug existed in the archived package too.
+    """
+    manager = getattr(agent, '_agent_manager', None) or getattr(agent, 'agent_manager', None)
+    if manager is None and request is not None:
+        manager = getattr(request.app.state, 'agent_manager', None)
+    return manager
 
 
 @router.get("/children")
 async def get_spawn_children(request: Request):
     """List all spawned children with status, budget, TTL, and delegation chain."""
     agent = get_agent(request)
-    manager = _get_agent_manager(agent)
+    manager = _get_agent_manager(agent, request=request)
 
     if manager is None:
         return {"children": [], "count": 0, "delegation_chain": {}, "history": []}
@@ -77,7 +95,7 @@ async def get_spawn_children(request: Request):
                 pass
 
         # Try to get budget info from lifecycle tracker
-        lifecycle = _get_lifecycle(agent)
+        lifecycle = _get_lifecycle(agent, request=request)
         if lifecycle is not None:
             tracked = lifecycle._tracked.get(child_name)
             if tracked and tracked.result:
@@ -99,7 +117,7 @@ async def get_spawn_children(request: Request):
     delegation_chain = _build_delegation_chain(manager, parent_did, agent.agent_id)
 
     # Build spawn history from lifecycle results
-    history = _build_spawn_history(agent, manager)
+    history = _build_spawn_history(agent, manager, request=request)
 
     return {
         "children": children,
@@ -145,11 +163,11 @@ def _build_delegation_chain(manager, parent_did: str, parent_name: str) -> dict:
     }
 
 
-def _build_spawn_history(agent, manager) -> list:
+def _build_spawn_history(agent, manager, request: Request | None = None) -> list:
     """Build a log of spawn/terminate events."""
     history = []
 
-    lifecycle = _get_lifecycle(agent)
+    lifecycle = _get_lifecycle(agent, request=request)
     if lifecycle is not None:
         # Completed/terminated results
         for name, result in lifecycle._results.items():
