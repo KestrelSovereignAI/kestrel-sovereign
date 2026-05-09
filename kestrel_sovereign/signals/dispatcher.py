@@ -826,14 +826,59 @@ class SignalDispatcher:
             audit.injected_clauses = ["KESTREL_CONSTITUTION"]
             fmt = registration.prompt_template_format
             if fmt in ("codex", "local"):
+                # External reviewer paths: the entire prompt IS the
+                # message. Inline the constitution AND any anchored
+                # doctrine so the reviewer actually sees the doctrine
+                # the canary will verify (codex round-23 P2 fix —
+                # without this, drift-checking the bundle hash claims
+                # coverage the reviewer never received).
+                from kestrel_sovereign.agent.system_prompt_assembler import (
+                    section_name_for_anchored_file,
+                )
+
+                doctrine_blocks: List[str] = []
+                getter = getattr(
+                    self._agent, "get_anchored_doctrine_files", None
+                )
+                if callable(getter):
+                    try:
+                        files = getter()
+                        if asyncio.iscoroutine(files):
+                            files = await files
+                        if files:
+                            for fname, body in files.items():
+                                label = section_name_for_anchored_file(fname)
+                                doctrine_blocks.append(
+                                    f"--- {label} ---\n{body}\n--- END {label} ---"
+                                )
+                                if audit.injected_clauses is None:
+                                    audit.injected_clauses = ["KESTREL_CONSTITUTION"]
+                                if fname not in audit.injected_clauses:
+                                    audit.injected_clauses.append(fname)
+                    except Exception:
+                        logger.exception(
+                            "Inline-format doctrine resolution failed for "
+                            "signal %s; reviewer will see only the "
+                            "constitution body",
+                            signal.id,
+                        )
+
+                doctrine_section = (
+                    "\n\n".join(doctrine_blocks) + "\n\n"
+                    if doctrine_blocks
+                    else ""
+                )
                 prompt = (
                     "--- GOVERNING CONSTITUTION ---\n"
                     f"{constitution_text}\n"
                     "--- END CONSTITUTION ---\n\n"
+                    f"{doctrine_section}"
                     f"{prompt}"
                 )
             # For claude_code, no inline prepend — the constitution
-            # arrives via the agent's system-prompt path. For bare,
+            # and doctrine arrive via the agent's system-prompt path
+            # (build_system_prompt_with_tracking handles
+            # anchored_doctrine when budget is set). For bare,
             # caller-responsibility.
 
         # Derive canary + build the format-appropriate instruction

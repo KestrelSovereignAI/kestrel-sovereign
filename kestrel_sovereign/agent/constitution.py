@@ -281,9 +281,25 @@ class ConstitutionMixin:
         # only the prompt-injection set excludes it.
         skip_names = {"KESTREL_CONSTITUTION.md"}
 
+        # Codex round-23 P2: keys are basenames so the assembler's
+        # section labels match. Operators who declare two anchored
+        # paths with the same basename get a logged warning and only
+        # the FIRST occurrence wins (predictable, reproducible). The
+        # alternative — silently overwriting — was the codex finding.
         files: "OrderedDict[str, str]" = OrderedDict()
         for path in anchored_paths:
             if path.name in skip_names:
+                continue
+            if path.name in files:
+                logging.warning(
+                    "get_anchored_doctrine_files: duplicate basename %s "
+                    "(another path with the same filename already "
+                    "registered); skipping %s. Rename or restructure "
+                    "the conflicting doctrine path to avoid silent "
+                    "doctrine omission.",
+                    path.name,
+                    path,
+                )
                 continue
             try:
                 files[path.name] = path.read_text(encoding="utf-8")

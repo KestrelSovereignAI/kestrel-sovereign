@@ -1342,6 +1342,121 @@ async def test_dispatch_clears_stale_tracking_before_processing(
 
 
 @pytest.mark.asyncio
+async def test_codex_format_inlines_doctrine_in_prompt(
+    tmp_path, template_path
+):
+    """Codex round-23 P2: codex/local reviewer prompts have no
+    separate system-prompt path. The dispatcher must inline BOTH the
+    constitution AND anchored doctrine so the reviewer actually sees
+    what the canary will verify. Otherwise drift-checking the bundle
+    hash claims coverage the reviewer never received."""
+    from collections import OrderedDict
+
+    class _DoctrineProvidingAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "ARTICLE I — sovereignty"
+
+        async def get_anchored_doctrine_files(self):
+            return OrderedDict(
+                [
+                    ("TORTOISE_DOCTRINE.md", "TORTOISE BODY"),
+                    ("AGENTS.md", "AGENTS BODY"),
+                ]
+            )
+
+    agent = _DoctrineProvidingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="codex_with_doctrine",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("codex_with_doctrine"))
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    assert "ARTICLE I — sovereignty" in rendered
+    assert "TORTOISE BODY" in rendered
+    assert "AGENTS BODY" in rendered
+    # Audit lists all clauses present in the prompt.
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    clauses = _json.loads(rows[0][0])
+    assert "KESTREL_CONSTITUTION" in clauses
+    assert "TORTOISE_DOCTRINE.md" in clauses
+    assert "AGENTS.md" in clauses
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_get_anchored_files_skips_duplicate_basenames(
+    tmp_path, monkeypatch,
+):
+    """Codex round-23 P2: when operator declares two paths with the
+    same basename, the OrderedDict-by-basename approach would
+    overwrite. Detect duplicates and skip with a logged warning so
+    the assembled prompt is deterministic and the operator sees the
+    conflict."""
+    import logging as _logging
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import (
+        DEFAULT_ANCHORED_PATHS,
+        PROP_BUNDLE_ANCHORED_PATHS,
+    )
+    from unittest.mock import AsyncMock, MagicMock
+
+    # Default doctrine files at one location.
+    for rel in DEFAULT_ANCHORED_PATHS:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"original {rel}", encoding="utf-8")
+    # An operator-declared path with the SAME BASENAME as AGENTS.md.
+    duplicate_dir = tmp_path / "duplicate"
+    duplicate_dir.mkdir()
+    (duplicate_dir / "AGENTS.md").write_text(
+        "DUPLICATE AGENTS", encoding="utf-8"
+    )
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test"
+
+        def __init__(self):
+            self.storage = MagicMock()
+            node = MagicMock()
+            node.properties = {
+                PROP_BUNDLE_ANCHORED_PATHS: ["duplicate/AGENTS.md"],
+            }
+            self.storage.get_node = AsyncMock(return_value=node)
+
+    _logging.disable(_logging.CRITICAL)
+    try:
+        files = await _Agent().get_anchored_doctrine_files()
+    finally:
+        _logging.disable(_logging.NOTSET)
+
+    assert files is not None
+    # Default AGENTS.md wins (first occurrence); duplicate skipped.
+    assert "AGENTS.md" in files
+    assert files["AGENTS.md"].startswith("original ")
+    # The basename "AGENTS.md" appears exactly once.
+    assert sum(1 for k in files if k == "AGENTS.md") == 1
+
+
+@pytest.mark.asyncio
 async def test_constitution_mixin_skips_constitution_in_anchored_doctrine(
     tmp_path, monkeypatch,
 ):
