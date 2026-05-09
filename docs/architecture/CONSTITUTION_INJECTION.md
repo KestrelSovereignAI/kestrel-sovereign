@@ -292,7 +292,7 @@ The registry validator enforces:
 2. **Canary length.** 16 hex chars (sha256 prefix) vs full 64. Lean: 16 is enough collision resistance for per-invocation use; less prompt budget impact. Confirm.
 3. **Doctrine bundle file list — ordered alphabetically or in `BootstrapLoader` insertion order?** The hash needs to be deterministic; alphabetical is safer. `BootstrapLoader` insertion order is documented but not enforced byte-stably.
 4. **Per-dispatch verification — do we read storage on every COGNITION dispatch or cache for the turn lifecycle?** The turn lifecycle holds `CONVERSATION` for the duration; reading storage once at turn start is sufficient and avoids hot-path I/O. Lean: turn-lifecycle scope, with a flag the dispatcher exposes for tests that need stricter behavior.
-5. **`SourceRegistration.constitution_injection="partial"` — what does it mean structurally?** Partial = constitution injected but bundle not; or vice-versa; or sampled. Lean: drop partial; keep it binary (`full`/`none`) until we have a real use case for partial.
+5. **(resolved in v1.3 — `partial` was dropped from the `constitution_injection` literal in favor of binary `full`/`none`. Re-introduce only when a concrete use case appears.)**
 
 ## Risks
 
@@ -300,7 +300,7 @@ The registry validator enforces:
 |---|---|
 | Per-dispatch verification adds latency to every COGNITION dispatch | Turn-lifecycle scope (Q4); hash-and-compare is microseconds vs storage retrieval (already happens) |
 | Echo-canary breaks legitimate sources whose models won't structured-respond | Per-source `require_constitution_echo=False` opt-out with documented justification; warning at registration time |
-| `SourceRegistration` field additions break existing source registrations | Defaults are backwards-compatible (`require_constitution_echo=True` matches current implicit "constitution is in system prompt"; `constitution_injection="none"` matches current ARTIFACT reality where most have nothing) |
+| `SourceRegistration` field additions break existing source registrations | Defaults are backwards-compatible: `require_constitution_echo=False` is the legacy `claude_code` default (no phantom-tool requirement on existing in-agent sources); `constitution_injection="none"` matches current ARTIFACT reality where most sources inject nothing; `prompt_template_format="claude_code"` matches the existing in-agent path. New `codex`/`local` reviewer sources are opt-in and the registry validator enforces `require_constitution_echo=True` for them. |
 | Bundle hash includes a file that hot-changes for legitimate reasons (e.g., SOUL.md edits) | Re-anchor flow analogous to `reanchor_constitution(expected_hash)` for the bundle, or treat SOUL.md re-anchor as part of the same protocol |
 | Talon-parity refactor leaves Talon temporarily broken | Phase 3 lands as a single PR with the shared primitive + Talon migration in one commit; tests prove parity before merge |
 
