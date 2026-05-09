@@ -905,6 +905,29 @@ class SignalDispatcher:
             if clear_chain is not None:
                 clear_chain(token)
 
+        # Codex round-13 P2: surface the agent's actual
+        # injected/dropped clause tracking from
+        # `build_system_prompt_with_tracking` into the signal_log
+        # audit. Without this, budgeted dispatches would record
+        # only the dispatcher's own KESTREL_CONSTITUTION marker and
+        # miss any clauses the assembler dropped due to budget.
+        injection_tracking = getattr(
+            self._agent, "_last_injection_tracking", None
+        )
+        if injection_tracking is not None:
+            tracked_injected, tracked_dropped = injection_tracking
+            if tracked_injected is not None:
+                # Merge: dispatcher's KESTREL_CONSTITUTION marker
+                # plus the assembler's own clause list. Use a
+                # de-duplicated, order-preserving merge.
+                merged = list(audit.injected_clauses or [])
+                for clause in tracked_injected:
+                    if clause not in merged:
+                        merged.append(clause)
+                audit.injected_clauses = merged
+            if tracked_dropped:
+                audit.dropped_clauses = list(tracked_dropped)
+
         # Step B: post-dispatch echo verification. If the source
         # opted in to `require_constitution_echo=True` the dispatcher
         # asks the agent for the format-specific receipt — checking

@@ -54,6 +54,14 @@ class ContextResult:
     # OpenAI prefix cache, Anthropic cache_control) can actually hit.
     # Callers prepend this to the current user message content.
     dynamic_user_context: str = ""
+    # Constitutional-injection tracking — populated only when the
+    # caller supplies `system_prompt_budget_bytes` and the
+    # priority-aware tracking assembler runs (kestrel-sovereign#1137).
+    # The dispatcher reads these via `self._agent._last_injection_tracking`
+    # after `process_input` returns and threads them into
+    # `signal_log.injected_clauses_json` / `dropped_clauses_json`.
+    injected_clauses: Optional[List[str]] = None
+    dropped_clauses: Optional[List[str]] = None
 
 
 class ContextManager:
@@ -256,6 +264,8 @@ class ContextManager:
         # count toward the budget. Reserve its bytes BEFORE the
         # assembler truncates so the final assembled prompt
         # (assembler output + joiner + addendum) fits within the cap.
+        injected_clauses_for_audit: Optional[List[str]] = None
+        dropped_clauses_for_audit: Optional[List[str]] = None
         if system_prompt_budget_bytes is not None:
             reserved = 0
             if system_prompt_addendum:
@@ -273,6 +283,11 @@ class ContextManager:
                 budget_bytes=effective_budget,
             )
             system_prompt = tracking_result.prompt
+            # Surface tracking back to the caller so the dispatcher
+            # can populate signal_log.injected_clauses_json /
+            # dropped_clauses_json (codex round-13 P2 fix).
+            injected_clauses_for_audit = list(tracking_result.injected_clauses)
+            dropped_clauses_for_audit = list(tracking_result.dropped_clauses)
             if system_prompt_addendum:
                 system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
         else:
@@ -427,6 +442,8 @@ class ContextManager:
             rag_chunks=rag_chunks,
             warnings=warnings,
             dynamic_user_context=dynamic_user_context,
+            injected_clauses=injected_clauses_for_audit,
+            dropped_clauses=dropped_clauses_for_audit,
         )
 
     async def _build_ephemeral_context(
@@ -453,27 +470,41 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"Failed to get constitutional state of mind: {e}")
 
-        # Codex round-12 P2: ephemeral mode must honor the
-        # system_prompt_budget_bytes too. Reserve the addendum bytes
-        # the same way the non-ephemeral path does so the assembled
-        # prompt (assembler + joiner + addendum) fits the cap.
+        # The EPHEMERAL MODE notice is fixed text appended after the
+        # budget-aware assembly. Codex round-13 P2 caught that we
+        # must reserve its bytes too, otherwise the notice can push
+        # the final prompt over the configured budget.
+        ephemeral_notice = (
+            "--- EPHEMERAL MODE ACTIVE ---\n"
+            "This conversation is not being recorded. "
+            "No history or memories are available.\n"
+            "--- END NOTICE ---"
+        )
+
+        ephemeral_tracking = None
+        injected_clauses_for_audit: Optional[List[str]] = None
+        dropped_clauses_for_audit: Optional[List[str]] = None
         if system_prompt_budget_bytes is not None:
+            # Reserve addendum + ephemeral notice + their joiners.
             reserved = 0
             if system_prompt_addendum:
-                reserved = (
+                reserved += (
                     len(system_prompt_addendum.encode("utf-8")) + 2
                 )
+            reserved += len(ephemeral_notice.encode("utf-8")) + 2
             effective_budget = max(
                 1, system_prompt_budget_bytes - reserved
             )
-            tracking_result = self.context_builder.build_system_prompt_with_tracking(
+            ephemeral_tracking = self.context_builder.build_system_prompt_with_tracking(
                 constitution=constitution,
                 include_briefing=include_briefing,
                 prompt_adaptation=prompt_adaptation,
                 state_of_mind=state_of_mind,
                 budget_bytes=effective_budget,
             )
-            system_prompt = tracking_result.prompt
+            system_prompt = ephemeral_tracking.prompt
+            injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)
+            dropped_clauses_for_audit = list(ephemeral_tracking.dropped_clauses)
             if system_prompt_addendum:
                 system_prompt = (
                     f"{system_prompt}\n\n{system_prompt_addendum}"
@@ -487,7 +518,8 @@ class ContextManager:
                 system_prompt_addendum=system_prompt_addendum,
             )
 
-        # Add ephemeral mode notice
+        # Append the ephemeral notice (already accounted for in the
+        # reserved budget above when budget_bytes was set).
         system_prompt = (
             f"{system_prompt}\n\n"
             "--- EPHEMERAL MODE ACTIVE ---\n"
@@ -504,6 +536,8 @@ class ContextManager:
             total_tokens=tokens,
             budget_summary={"mode": "ephemeral"},
             warnings=["EPHEMERAL mode: no history available"],
+            injected_clauses=injected_clauses_for_audit,
+            dropped_clauses=dropped_clauses_for_audit,
         )
 
     # Delegate to ConversationManager
