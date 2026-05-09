@@ -19,13 +19,19 @@ def _make_voice_feature(voice_config=None):
 
     vf = MagicMock()
     vf._voice_config = voice_config or VoiceConfig()
-    vf.list_voices = AsyncMock(return_value={
-        "voices": [
-            {"voice_id": "nova", "name": "Nova", "provider": "openai", "language": "en", "gender": "feminine", "preview_url": ""},
-            {"voice_id": "echo", "name": "Echo", "provider": "openai", "language": "en", "gender": "masculine", "preview_url": ""},
-        ],
-        "count": 2,
-    })
+    # list_voices returns ToolResult since #1061 wave 27. The endpoint
+    # unwraps envelope.data; the mock returns the envelope directly.
+    from kestrel_sdk.tools.result import ToolResult
+    vf.list_voices = AsyncMock(return_value=ToolResult.ok(
+        "2 voice(s) available.",
+        data={
+            "voices": [
+                {"voice_id": "nova", "name": "Nova", "provider": "openai", "language": "en", "gender": "feminine", "preview_url": ""},
+                {"voice_id": "echo", "name": "Echo", "provider": "openai", "language": "en", "gender": "masculine", "preview_url": ""},
+            ],
+            "count": 2,
+        },
+    ))
 
     # TTS provider mock
     tts = AsyncMock()

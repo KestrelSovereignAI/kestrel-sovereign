@@ -421,24 +421,29 @@ class TestAudioStoragePolicy:
     @pytest.mark.asyncio
     async def test_ephemeral_speak_no_storage_call(self):
         """In ephemeral mode, speak should NOT call storage.store_file."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         f = _make_feature("ephemeral", local_tts=True, cloud_tts=False)
         f._voice_config.tts_voice_id = "en_US-lessac-medium"
         f._voice_config.tts_provider = "piper"
-        result = await f.speak(text="Hello")
-        assert result["success"] is True
-        assert result["content_hash"] == ""
-        assert result["storage_policy"] == "none"
+        envelope = await f.speak(text="Hello")
+        # Ephemeral is OK with empty content_hash because the policy
+        # ('none') doesn't expect persistence — this is the only
+        # storage_policy that returns OK with no hash.
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["content_hash"] == ""
+        assert envelope.data["storage_policy"] == "none"
         f.agent.storage.store_file.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_isolated_speak_stores_with_temp_policy(self):
         """In isolated mode, speak stores with temp policy metadata."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         f = _make_feature("isolated", local_tts=True, cloud_tts=False)
         f._voice_config.tts_voice_id = "en_US-lessac-medium"
         f._voice_config.tts_provider = "piper"
-        result = await f.speak(text="Hello")
-        assert result["success"] is True
-        assert result["storage_policy"] == "temp"
+        envelope = await f.speak(text="Hello")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["storage_policy"] == "temp"
         f.agent.storage.store_file.assert_awaited_once()
         call_kwargs = f.agent.storage.store_file.call_args
         metadata = call_kwargs[1].get("metadata") if call_kwargs[1] else call_kwargs[0][2]
@@ -447,12 +452,13 @@ class TestAudioStoragePolicy:
     @pytest.mark.asyncio
     async def test_anonymous_speak_scrubs_metadata(self):
         """In anonymous mode, speak stores but omits voice_id/provider from metadata."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         f = _make_feature("anonymous", local_tts=True, cloud_tts=True)
         f._voice_config.tts_voice_id = "en_US-lessac-medium"
         f._voice_config.tts_provider = "piper"
-        result = await f.speak(text="Hello")
-        assert result["success"] is True
-        assert result["storage_policy"] == "scrubbed"
+        envelope = await f.speak(text="Hello")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["storage_policy"] == "scrubbed"
         f.agent.storage.store_file.assert_awaited_once()
         call_args = f.agent.storage.store_file.call_args
         metadata = call_args[1].get("metadata") if call_args[1] else call_args[0][2]
@@ -463,12 +469,13 @@ class TestAudioStoragePolicy:
     @pytest.mark.asyncio
     async def test_normal_speak_stores_full_metadata(self):
         """In normal mode, speak stores with full metadata."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         f = _make_feature("normal", local_tts=True, cloud_tts=True)
         f._voice_config.tts_voice_id = "en_US-lessac-medium"
         f._voice_config.tts_provider = "piper"
-        result = await f.speak(text="Hello")
-        assert result["success"] is True
-        assert result["storage_policy"] == "full"
+        envelope = await f.speak(text="Hello")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["storage_policy"] == "full"
         f.agent.storage.store_file.assert_awaited_once()
         call_args = f.agent.storage.store_file.call_args
         metadata = call_args[1].get("metadata") if call_args[1] else call_args[0][2]
@@ -547,22 +554,22 @@ class TestListVoicesPrivacy:
     @pytest.mark.asyncio
     async def test_ephemeral_filters_cloud_voices(self):
         f = _make_feature("ephemeral", local_tts=True, cloud_tts=True)
-        result = await f.list_voices()
-        providers = {v["provider"] for v in result["voices"]}
+        envelope = await f.list_voices()
+        providers = {v["provider"] for v in envelope.data["voices"]}
         assert "openai" not in providers
         assert "piper" in providers
 
     @pytest.mark.asyncio
     async def test_normal_shows_all_voices(self):
         f = _make_feature("normal", local_tts=True, cloud_tts=True)
-        result = await f.list_voices()
-        providers = {v["provider"] for v in result["voices"]}
+        envelope = await f.list_voices()
+        providers = {v["provider"] for v in envelope.data["voices"]}
         assert "openai" in providers
         assert "piper" in providers
 
     @pytest.mark.asyncio
     async def test_isolated_filters_cloud_voices(self):
         f = _make_feature("isolated", local_tts=True, cloud_tts=True)
-        result = await f.list_voices()
-        providers = {v["provider"] for v in result["voices"]}
+        envelope = await f.list_voices()
+        providers = {v["provider"] for v in envelope.data["voices"]}
         assert "openai" not in providers

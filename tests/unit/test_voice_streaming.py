@@ -141,7 +141,12 @@ def _make_voice_feature(voice_config=None):
 
     vf = MagicMock()
     vf._voice_config = voice_config or VoiceConfig()
-    vf.list_voices = AsyncMock(return_value={"voices": [], "count": 0})
+    # list_voices returns ToolResult since #1061 wave 27.
+    from kestrel_sdk.tools.result import ToolResult
+    vf.list_voices = AsyncMock(return_value=ToolResult.ok(
+        "0 voice(s) available.",
+        data={"voices": [], "count": 0},
+    ))
 
     # TTS provider mock
     tts = AsyncMock()

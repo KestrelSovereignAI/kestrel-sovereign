@@ -442,8 +442,9 @@ class TestSetVoicePersonalitySync:
             tts_providers={"fake": tts},
         )
 
-        result = await feature.set_voice("nova", "fake")
-        assert result["success"] is True
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.set_voice("nova", "fake")
+        assert envelope.status is ToolResultStatus.OK
 
         # Check personality was synced
         p = feature.agent.identity.personality

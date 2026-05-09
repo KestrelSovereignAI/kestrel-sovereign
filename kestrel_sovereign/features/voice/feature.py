@@ -16,6 +16,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.identity.identity_package import PersonalityFingerprint
 from kestrel_sovereign.privacy import PrivacyConfig, get_privacy_preset
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.voice.base import VoiceConfig, VoiceInfo, TTSProvider, STTProvider, match_voice, split_sentences
 from kestrel_sovereign.voice.provider_registry import VoiceProviderRegistry
 from kestrel_sovereign.voice.routing import (
@@ -597,7 +598,7 @@ class VoiceFeature(Feature):
     # ------------------------------------------------------------------
 
     @tool("list_voices", "List available TTS voices, optionally filtered by provider", ToolCategory.SYSTEM)
-    async def list_voices(self, provider: str = "") -> dict:
+    async def list_voices(self, provider: str = "") -> ToolResult:
         """List available voices.
 
         Args:
@@ -607,10 +608,18 @@ class VoiceFeature(Feature):
                 their voice catalogs typically overlap with sibling TTS
                 providers and we don't want duplicates in the unfiltered
                 view).
+
+        Returns:
+            ToolResult.ok with the voice list. PARTIAL when one or
+            more provider catalogs failed to enumerate (the legacy
+            code silently swallowed those, so an empty/short list
+            looked indistinguishable from "this provider has no
+            voices") — the caveat names which providers were lost.
         """
         registry = await self._ensure_registry()
         cloud_ok = self._cloud_allowed()
         voices: list[dict] = []
+        failed_providers: list[str] = []
 
         tts_names = registry.list_tts_providers()
         if provider:
@@ -628,6 +637,7 @@ class VoiceFeature(Feature):
                     voices.append(asdict(v) if isinstance(v, VoiceInfo) else v)
             except Exception as exc:
                 logger.warning("Failed to list voices from %s: %s", name, exc)
+                failed_providers.append(name)
 
         # Conversation providers own their own VoiceInfo per the ABC, so we
         # just pass through without sibling-catalog scans or fabrication.
@@ -650,16 +660,35 @@ class VoiceFeature(Feature):
                     "Failed to list voices from conversation provider %s: %s",
                     name, exc,
                 )
+                failed_providers.append(name)
 
-        return {"voices": voices, "count": len(voices)}
+        data = {"voices": voices, "count": len(voices)}
+        scope = f" from provider '{provider}'" if provider else ""
+        confirmation = f"{len(voices)} voice(s) available{scope}."
+        if failed_providers:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    f"{len(failed_providers)} provider(s) failed to enumerate: "
+                    + ", ".join(failed_providers)
+                    + " — voices from those providers are missing from the list."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool("set_voice", "Set the agent's TTS voice for spoken responses", ToolCategory.SYSTEM)
-    async def set_voice(self, voice_id: str, provider: str = "") -> dict:
+    async def set_voice(self, voice_id: str, provider: str = "") -> ToolResult:
         """Set the agent's voice.
 
         Args:
             voice_id: The voice identifier (e.g., "nova", "en_US-lessac-medium")
             provider: Provider name. If empty, auto-detect from voice_id.
+
+        Returns:
+            ToolResult.ok on a clean set; ERROR when the voice is not
+            found in any provider, or when the resolved provider is a
+            cloud service blocked by the current privacy mode.
         """
         registry = await self._ensure_registry()
 
@@ -679,15 +708,19 @@ class VoiceFeature(Feature):
                     continue
 
         if not resolved_provider:
-            return {"success": False, "error": f"Could not find voice '{voice_id}' in any provider."}
+            return ToolResult.failed(
+                error=f"Could not find voice '{voice_id}' in any provider."
+            )
 
         # Validate provider is accessible under current privacy mode
         tts = registry.get_tts(resolved_provider)
         if tts and not self._cloud_allowed() and not tts.is_local:
-            return {
-                "success": False,
-                "error": f"Provider '{resolved_provider}' is a cloud service blocked by current privacy mode.",
-            }
+            return ToolResult.failed(
+                error=(
+                    f"Provider '{resolved_provider}' is a cloud service "
+                    "blocked by current privacy mode."
+                )
+            )
 
         self._voice_config.tts_provider = resolved_provider
         self._voice_config.tts_voice_id = voice_id
@@ -708,22 +741,30 @@ class VoiceFeature(Feature):
             except Exception:
                 pass
 
-        return {
-            "success": True,
-            "voice_id": voice_id,
-            "provider": resolved_provider,
-        }
+        return ToolResult.ok(
+            f"Voice set to '{voice_id}' (provider={resolved_provider}).",
+            data={"voice_id": voice_id, "provider": resolved_provider},
+        )
 
     @tool("speak", "Synthesize speech from text using the agent's configured voice", ToolCategory.SYSTEM)
-    async def speak(self, text: str) -> dict:
+    async def speak(self, text: str) -> ToolResult:
         """Synthesize speech from text.
 
         Args:
             text: The text to speak aloud
+
+        Returns:
+            ToolResult.ok when synthesis succeeded and (if applicable)
+            audio was persisted; PARTIAL when synthesis succeeded but
+            persistence was expected and failed (the caller asked for
+            non-ephemeral storage but no ``content_hash`` came back —
+            the audio exists in memory only, retrieval after this turn
+            will not find it); ERROR when no voices are available on
+            any TTS provider.
         """
         tts, voice_id = await self._resolve_voice()
         if not voice_id:
-            return {"success": False, "error": "No voices available on any TTS provider."}
+            return ToolResult.failed(error="No voices available on any TTS provider.")
 
         audio_bytes = await tts.synthesize(
             text=text,
@@ -791,8 +832,7 @@ class VoiceFeature(Feature):
             else:
                 logger.warning("No storage available; audio bytes not persisted.")
 
-        return {
-            "success": True,
+        data = {
             "content_hash": content_hash,
             "format": self._voice_config.output_format,
             "voice_id": voice_id,
@@ -801,22 +841,51 @@ class VoiceFeature(Feature):
             "audio_size": len(audio_bytes),
             "storage_policy": storage_policy,
         }
+        confirmation = (
+            f"Synthesized {len(audio_bytes)} bytes of audio "
+            f"(voice={voice_id}, provider={tts.name}, "
+            f"format={self._voice_config.output_format}, policy={storage_policy})."
+        )
+
+        # Honesty: a non-ephemeral policy means the caller expects the
+        # audio to be retrievable later via content_hash. If the policy
+        # was anything other than "none" but storage couldn't produce a
+        # hash, the LLM must say so — otherwise downstream tools that
+        # try to !recall this audio will silently 404.
+        if storage_policy != "none" and not content_hash:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    f"audio synthesized but not persisted (storage_policy="
+                    f"'{storage_policy}' expected a content_hash but none "
+                    "was returned — typically the agent has no storage "
+                    "backend); subsequent retrieval by hash will fail."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool("transcribe", "Transcribe audio to text", ToolCategory.SYSTEM)
-    async def transcribe(self, audio_content_hash: str) -> dict:
+    async def transcribe(self, audio_content_hash: str) -> ToolResult:
         """Transcribe audio file to text.
 
         Args:
             audio_content_hash: Content hash of audio file (retrievable via /api/files/{hash})
+
+        Returns:
+            ToolResult.ok with the transcript; ERROR when storage is
+            not available, when the audio file is not found, or when
+            the underlying STT provider raises (the legacy code let
+            STT exceptions bubble — kept that behavior).
         """
         # Retrieve audio from storage
         storage = getattr(self.agent, "storage", None)
         if not storage or not hasattr(storage, "retrieve_file"):
-            return {"success": False, "error": "Storage not available for audio retrieval."}
+            return ToolResult.failed(error="Storage not available for audio retrieval.")
 
         audio_bytes = await storage.retrieve_file(audio_content_hash)
         if audio_bytes is None:
-            return {"success": False, "error": f"Audio file not found: {audio_content_hash}"}
+            return ToolResult.failed(error=f"Audio file not found: {audio_content_hash}")
 
         # Determine audio format from metadata
         audio_format = "opus"
@@ -832,9 +901,11 @@ class VoiceFeature(Feature):
             audio_format=audio_format,
         )
 
-        return {
-            "success": True,
-            "text": transcript,
-            "provider": stt.name,
-            "audio_content_hash": audio_content_hash,
-        }
+        return ToolResult.ok(
+            f"Transcribed {len(audio_bytes)} bytes via {stt.name}: {len(transcript)} chars.",
+            data={
+                "text": transcript,
+                "provider": stt.name,
+                "audio_content_hash": audio_content_hash,
+            },
+        )

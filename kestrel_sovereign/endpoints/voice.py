@@ -84,7 +84,14 @@ async def list_voices(request: Request, provider: str = "") -> dict:
         )
 
     try:
-        return await vf.list_voices(provider=provider)
+        # list_voices returns a ToolResult since #1061 wave 27.
+        # The legacy dict (voices/count) lives under .data; PARTIAL
+        # surfaces the list of providers that failed to enumerate.
+        envelope = await vf.list_voices(provider=provider)
+        body = dict(envelope.data or {})
+        if envelope.error:
+            body["warning"] = envelope.error
+        return body
     except Exception as e:
         logger.error("Error listing voices: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Error listing voices.")
