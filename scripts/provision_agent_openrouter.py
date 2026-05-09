@@ -104,6 +104,39 @@ async def provision_agent_key(
                     print(f"  - Active: {key.is_active}")
                     print(f"  - Quota: {key.quota_used}/{key.quota_limit or 'unlimited'}")
                     print(f"  - Created: {key.created_at}")
+
+            # Backfill graph_nodes.properties.openrouter_key_hash if it's
+            # missing. Agents provisioned by the original (buggy) script wrote
+            # the hash only to agent_metadata; runtime startup and retirement
+            # both read from graph_nodes.properties, so without this backfill
+            # they remain on the shared key path and retirement skips revocation.
+            if agent_node_id is not None:
+                properties = json.loads(agent_properties_json) if agent_properties_json else {}
+                if not properties.get("openrouter_key_hash"):
+                    legacy_row = await db.fetchone(
+                        "SELECT value FROM agent_metadata WHERE key = 'openrouter_key_hash' LIMIT 1"
+                    )
+                    legacy_hash = legacy_row[0] if legacy_row else None
+                    if legacy_hash:
+                        properties["openrouter_key_hash"] = legacy_hash
+                        await db.execute(
+                            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+                            (json.dumps(properties), agent_node_id),
+                        )
+                        print(
+                            f"\nBackfilled graph_nodes.properties.openrouter_key_hash "
+                            f"from legacy agent_metadata (hash {legacy_hash[:16]}...)."
+                        )
+                    else:
+                        print(
+                            "\nWARNING: graph_nodes.properties.openrouter_key_hash is missing "
+                            "and no legacy agent_metadata fallback was found. Runtime startup "
+                            "will not activate the stored agent key. To recover, either delete "
+                            "the encrypted entry from ServiceKeyStorage and re-run this script, "
+                            "or fetch the hash from OpenRouter and write it to graph_nodes "
+                            "manually.",
+                            file=sys.stderr,
+                        )
             return 0
 
         print(f"\nProvisioning OpenRouter key (label={agent_label}, limit=${limit_usd:.2f}, reset={limit_reset})...")
