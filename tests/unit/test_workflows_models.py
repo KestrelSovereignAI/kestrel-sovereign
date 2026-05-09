@@ -523,6 +523,78 @@ def test_workflow_spec_from_dict_rejects_int_name():
         WorkflowSpec.from_dict(spec)
 
 
+def test_workflow_spec_from_dict_rejects_falsy_wrong_type_params_schema():
+    """Codex round 5 P2: ``data.get('params_schema') or {}`` rewrote a
+    present-but-falsy ``params_schema: []`` into the canonical empty
+    dict, masking malformed wire forms. ``_present_or`` keeps the value
+    so __post_init__'s isinstance(Mapping) guard rejects it."""
+    spec = _minimal_spec().to_dict()
+    spec["params_schema"] = []  # list, not object
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowSpec.from_dict(spec)
+
+
+def test_stage_from_dict_rejects_falsy_wrong_type_params():
+    with pytest.raises(WorkflowDefinitionError):
+        Stage.from_dict(
+            {
+                "name": "x",
+                "signal_source": "x",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": True,
+                "params": [],  # list, not object
+            }
+        )
+
+
+def test_stage_from_dict_rejects_empty_string_for_forbidden_modules():
+    with pytest.raises(WorkflowDefinitionError):
+        Stage.from_dict(
+            {
+                "name": "x",
+                "signal_source": "x",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": True,
+                "forbidden_modules": "",  # falsy non-list
+            }
+        )
+
+
+def test_trigger_rejects_non_string_non_enum_kind():
+    """Round 5 P2: a JSON number for ``kind`` would fall through silently
+    and crash later in ``to_dict()`` at ``.value``."""
+    with pytest.raises(WorkflowDefinitionError):
+        Trigger(kind=42)
+
+
+def test_workflow_run_rejects_non_string_non_enum_status():
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=1,
+            params={},
+            status=42,
+            started_by_did="did:web:k.example",
+        )
+
+
+def test_stage_link_rejects_non_string_non_enum_gate_outcome():
+    with pytest.raises(WorkflowDefinitionError):
+        StageLink(
+            link_id="l-1",
+            run_id="r-1",
+            stage_name="lint",
+            attempt_number=1,
+            idempotency_key="0" * 64,
+            actor_did="did:web:k.example",
+            actor_sig="deadbeef",
+            gate_outcome=42,
+        )
+
+
 def test_gate_from_dict_rejects_int_type():
     """Mirror of WorkflowSpec/Stage round-4 hardening at the gate layer."""
     with pytest.raises(WorkflowDefinitionError):

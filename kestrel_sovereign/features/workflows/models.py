@@ -153,6 +153,26 @@ _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
 # JSON Schema `_HASH_PATTERN`.
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# Sentinel for ``data.get(key, _MISSING)`` so a present-but-falsy value
+# (e.g. ``params: []``, ``forbidden_modules: ""``) propagates to
+# __post_init__ instead of being rewritten into the canonical empty
+# default by ``... or {}``. Round-5 codex P2: signed-spec integrity
+# requires that wrong-type wire values get rejected at the boundary,
+# not silently normalized into the canonical signed form.
+_MISSING: Any = object()
+
+
+def _present_or(data: Mapping[str, Any], key: str, default: Any) -> Any:
+    """Return ``data[key]`` if present, else ``default``.
+
+    Unlike ``data.get(key) or default``, this does NOT rewrite a
+    present-but-falsy value into ``default`` — that distinction matters
+    for signed wire forms where a malformed ``params: []`` is a
+    different bytestream from a missing ``params`` and must be rejected
+    rather than coerced into the canonical missing-key form.
+    """
+    return data[key] if key in data else default
+
 
 class WorkflowDefinitionError(ValueError):
     """Raised when a dataclass constructor receives input that violates
@@ -264,7 +284,7 @@ class Gate:
             raise WorkflowDefinitionError(
                 f"Gate.from_dict expected mapping, got {type(data).__name__}"
             )
-        return cls(type=data["type"], params=data.get("params") or {})
+        return cls(type=data["type"], params=_present_or(data, "params", {}))
 
 
 # ---------------------------------------------------------------------------
@@ -394,10 +414,10 @@ class Stage:
             name=data["name"],
             signal_source=data["signal_source"],
             signal_mode=data["signal_mode"],
-            params=data.get("params") or {},
+            params=_present_or(data, "params", {}),
             gate=Gate.from_dict(gate_data),
             compensate=data.get("compensate", "noop_idempotent"),
-            forbidden_modules=data.get("forbidden_modules") or (),
+            forbidden_modules=_present_or(data, "forbidden_modules", ()),
             irreversible=data.get("irreversible", False),
             non_deterministic=data.get("non_deterministic", False),
             read_only=data.get("read_only", False),
@@ -595,11 +615,11 @@ class Edge:
             condition=data.get("condition"),
             true_stage=data.get("true_stage"),
             false_stage=data.get("false_stage"),
-            stages=data.get("stages") or (),
+            stages=_present_or(data, "stages", ()),
             join_strategy=data.get("join_strategy"),
             subworkflow_name=data.get("subworkflow_name"),
             subworkflow_version=data.get("subworkflow_version"),
-            params=data.get("params") or {},
+            params=_present_or(data, "params", {}),
         )
 
 
@@ -626,6 +646,15 @@ class Trigger:
                 raise WorkflowDefinitionError(
                     f"trigger.kind {self.kind!r} not in vocabulary ({valid})"
                 ) from exc
+        elif not isinstance(self.kind, TriggerKind):
+            # Round 5 P2: a JSON number or other non-string fell through
+            # silently before — leaving ``self.kind`` set to a value
+            # without a ``.value`` attribute, which then crashed in
+            # ``to_dict()`` / ``canonical_payload()``. Reject up-front.
+            raise WorkflowDefinitionError(
+                f"trigger.kind must be TriggerKind or str, got "
+                f"{type(self.kind).__name__}"
+            )
 
         if self.kind == TriggerKind.CRON:
             if not isinstance(self.cron_expression, str) or not self.cron_expression.strip():
@@ -666,7 +695,7 @@ class Trigger:
             kind=data["kind"],
             cron_expression=data.get("cron_expression"),
             signal_source=data.get("signal_source"),
-            params=data.get("params") or {},
+            params=_present_or(data, "params", {}),
         )
 
 
@@ -842,26 +871,46 @@ class WorkflowSpec:
                 f"WorkflowSpec.from_dict expected mapping, got "
                 f"{type(data).__name__}"
             )
-        triggers_data = data.get("triggers")
-        triggers: Sequence[Trigger]
-        if triggers_data is None:
-            triggers = (Trigger(kind=TriggerKind.MANUAL),)
+        if "triggers" in data:
+            # Present-but-falsy ``triggers: 0`` would slip through the
+            # default-to-manual branch under ``data.get(...) or default``.
+            # Round 5 P2: pass the explicit value through; only treat
+            # missing key + empty list as the default.
+            triggers_data = data["triggers"]
+            if triggers_data is None or (
+                isinstance(triggers_data, (list, tuple)) and not triggers_data
+            ):
+                triggers: Sequence[Trigger] = (Trigger(kind=TriggerKind.MANUAL),)
+            elif isinstance(triggers_data, (list, tuple)):
+                triggers = tuple(Trigger.from_dict(t) for t in triggers_data)
+            else:
+                raise WorkflowDefinitionError(
+                    "workflow.triggers must be a list of Trigger dicts"
+                )
         else:
-            triggers = tuple(Trigger.from_dict(t) for t in triggers_data)
-            if not triggers:
-                triggers = (Trigger(kind=TriggerKind.MANUAL),)
+            triggers = (Trigger(kind=TriggerKind.MANUAL),)
         # author_did / author_sig / spec_hash are stored as strings on
         # the dataclass; ``__post_init__`` rejects non-string values.
         # ``data.get(... or "")`` would coerce missing into ""; we use
         # an explicit-default form so a present-but-non-string value
         # propagates and is rejected.
+        stages_raw = _present_or(data, "stages", ())
+        edges_raw = _present_or(data, "edges", ())
+        if not isinstance(stages_raw, (list, tuple)):
+            raise WorkflowDefinitionError(
+                "workflow.stages must be a list of Stage dicts"
+            )
+        if not isinstance(edges_raw, (list, tuple)):
+            raise WorkflowDefinitionError(
+                "workflow.edges must be a list of Edge dicts"
+            )
         return cls(
             name=data["name"],
             version=data["version"],
-            stages=tuple(Stage.from_dict(s) for s in data.get("stages") or ()),
-            edges=tuple(Edge.from_dict(e) for e in data.get("edges") or ()),
+            stages=tuple(Stage.from_dict(s) for s in stages_raw),
+            edges=tuple(Edge.from_dict(e) for e in edges_raw),
             triggers=triggers,
-            params_schema=data.get("params_schema") or {},
+            params_schema=_present_or(data, "params_schema", {}),
             retention_days=data.get("retention_days"),
             author_did=data.get("author_did", ""),
             author_sig=data.get("author_sig", ""),
@@ -909,6 +958,15 @@ class WorkflowRun:
                 raise WorkflowDefinitionError(
                     f"run.status {self.status!r} not in vocabulary"
                 ) from exc
+        elif not isinstance(self.status, RunStatus):
+            # Round 5 P2: non-string non-enum (e.g. int 42) silently
+            # propagated and crashed later in ``to_dict()`` when
+            # accessing ``.value``. Closed-vocabulary guarantee must
+            # hold at the dataclass boundary.
+            raise WorkflowDefinitionError(
+                f"run.status must be RunStatus or str, got "
+                f"{type(self.status).__name__}"
+            )
 
         if not isinstance(self.params, Mapping):
             raise WorkflowDefinitionError("run.params must be a mapping")
@@ -1010,13 +1068,23 @@ class StageLink:
                 "stage_link.attempt_number must be a positive int (1-indexed)"
             )
 
-        if self.gate_outcome is not None and isinstance(self.gate_outcome, str):
-            try:
-                object.__setattr__(self, "gate_outcome", GateOutcome(self.gate_outcome))
-            except ValueError as exc:
+        if self.gate_outcome is not None:
+            if isinstance(self.gate_outcome, str):
+                try:
+                    object.__setattr__(
+                        self, "gate_outcome", GateOutcome(self.gate_outcome)
+                    )
+                except ValueError as exc:
+                    raise WorkflowDefinitionError(
+                        f"stage_link.gate_outcome {self.gate_outcome!r} invalid"
+                    ) from exc
+            elif not isinstance(self.gate_outcome, GateOutcome):
+                # Round 5 P2: non-string non-enum was silently accepted,
+                # crashing later in ``to_dict()`` at ``.value``.
                 raise WorkflowDefinitionError(
-                    f"stage_link.gate_outcome {self.gate_outcome!r} invalid"
-                ) from exc
+                    f"stage_link.gate_outcome must be GateOutcome or str, "
+                    f"got {type(self.gate_outcome).__name__}"
+                )
 
         if self.compensate_state is not None and self.compensate_state not in _COMPENSATE_STATES:
             valid = ", ".join(sorted(_COMPENSATE_STATES))
