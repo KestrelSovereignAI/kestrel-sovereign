@@ -108,6 +108,52 @@ def _gate_schema() -> dict[str, Any]:
                     },
                 },
             },
+            # Codex round 6 P2 (chunk B): script gate is the sandboxed
+            # custom predicate; all five identity/integrity fields are
+            # security-load-bearing per design §3.3.
+            {
+                "if": {
+                    "properties": {"type": {"const": "script"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": [
+                                "language",
+                                "src_hash",
+                                "signature",
+                                "signing_did",
+                                "sandbox",
+                            ],
+                            "properties": {
+                                "language": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                                "src_hash": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                                "signature": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                                "signing_did": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                                "sandbox": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
         ],
     }
 

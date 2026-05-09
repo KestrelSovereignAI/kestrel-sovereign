@@ -344,6 +344,24 @@ class Gate:
                     "gate red_team_clear requires "
                     "params.prompt_pack_constraint (PEP 440 spec) per §3.4"
                 )
+        if self.type == "script":
+            # Codex round 6 P2 (chunk B): the ``script`` gate is the
+            # sandboxed replacement for arbitrary callables (design
+            # §3.3 — ``script(language, src_hash, signature,
+            # signing_did, sandbox)``). All five fields are
+            # security-load-bearing: without them the runner can't
+            # locate, hash-verify, signature-verify, or sandbox the
+            # custom predicate. Reject definitions that omit any.
+            for required in (
+                "language", "src_hash", "signature", "signing_did", "sandbox",
+            ):
+                value = self.params.get(required)
+                if not isinstance(value, str) or not value.strip():
+                    raise WorkflowDefinitionError(
+                        f"gate script requires non-empty params.{required} "
+                        "(language, src_hash, signature, signing_did, sandbox) "
+                        "per design §3.3"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         return {"type": self.type, "params": _thaw_value(self.params)}

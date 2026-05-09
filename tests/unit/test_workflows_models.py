@@ -125,6 +125,24 @@ def test_gate_red_team_clear_requires_prompt_pack_constraint():
     )
 
 
+def test_gate_script_requires_all_security_fields():
+    """Round-6 P2 (chunk B): script gate is the sandboxed custom
+    predicate; all five fields (language, src_hash, signature,
+    signing_did, sandbox) are security-load-bearing per design §3.3."""
+    full_params = {
+        "language": "python",
+        "src_hash": "sha256:abcd",
+        "signature": "deadbeef",
+        "signing_did": "did:web:k.example",
+        "sandbox": "compute:firecracker",
+    }
+    Gate(type="script", params=full_params)  # full set OK
+    for missing in full_params:
+        partial = {k: v for k, v in full_params.items() if k != missing}
+        with pytest.raises(WorkflowDefinitionError):
+            Gate(type="script", params=partial)
+
+
 def test_gate_round_trip_dict():
     gate = Gate(type="red_team_clear", params={"prompt_pack_constraint": ">=1,<2"})
     assert Gate.from_dict(gate.to_dict()) == gate
@@ -1110,6 +1128,23 @@ def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
     spec["stages"][0]["gate"] = {
         "type": "constitutional_boundary_clean",
         "params": {},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_all_script_gate_fields():
+    """Round-6 P2 (chunk B): schema mirror — wire form must reject a
+    script gate missing any of language/src_hash/signature/signing_did/sandbox."""
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {
+        "type": "script",
+        "params": {
+            "language": "python",
+            "src_hash": "sha256:abcd",
+            # signature, signing_did, sandbox missing
+        },
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
