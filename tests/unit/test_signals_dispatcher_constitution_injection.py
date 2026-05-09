@@ -1241,6 +1241,49 @@ async def test_dispatcher_does_not_retry_on_internal_typeerror(
 
 
 @pytest.mark.asyncio
+async def test_echo_required_refuses_when_agent_rejects_addendum_kwarg(
+    tmp_path, template_path
+):
+    """Codex round-19 P2: when echo is required but the agent's
+    process_input doesn't accept system_prompt_addendum, the
+    dispatcher must refuse BEFORE calling process_input (not run
+    the turn and then fail verification afterward). Side effects
+    from the turn must not occur for unverifiable dispatches."""
+
+    class _NoAddendumAgent(_AuditingAgent):
+        async def process_input(self, prompt: str):  # NO **kwargs
+            self.process_input_calls.append(prompt)
+            return "should not run"
+
+    agent = _NoAddendumAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="cant_receive_canary",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("cant_receive_canary")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "system_prompt_addendum" in (result.error or "")
+    # process_input was NEVER called — turn refused pre-execution.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_dispatch_clears_stale_tracking_before_processing(
     tmp_path, template_path
 ):

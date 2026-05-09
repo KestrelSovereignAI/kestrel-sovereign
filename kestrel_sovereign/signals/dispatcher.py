@@ -888,13 +888,25 @@ class SignalDispatcher:
             self._agent.process_input, "system_prompt_budget_bytes"
         )
         if addendum is not None and not accepts_addendum:
-            logger.warning(
-                "agent.process_input does not accept "
-                "system_prompt_addendum; constitutional canary "
-                "directive was NOT delivered for signal %s. Upgrade "
-                "the agent to plumb the kwarg through "
-                "context_manager.build_context.",
-                signal.id,
+            # Codex round-19 P2: refuse the dispatch BEFORE running
+            # the turn when we know in advance the canary directive
+            # cannot reach the model. Running the turn anyway would
+            # incur side effects (tool calls, persistence) only to
+            # fail verification afterward — a verification gate
+            # should gate ahead of the work, not after.
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=(
+                    "require_constitution_echo=True but "
+                    "agent.process_input does not accept "
+                    "system_prompt_addendum kwarg; canary directive "
+                    "cannot be delivered. Upgrade the agent to plumb "
+                    "the kwarg through context_manager.build_context."
+                ),
+                registration=registration,
+                audit=audit,
             )
 
         budget = registration.system_prompt_budget_bytes
