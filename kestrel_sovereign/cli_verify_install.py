@@ -50,7 +50,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -379,96 +379,215 @@ def _test_2_core_sovereign(work_dir: Path) -> List[VerifyResult]:
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — Feature package install (wallet)
+# Extracted-feature discovery (used by Tests 3/4/5)
 # ---------------------------------------------------------------------------
 
-def _test_3_feature_package(work_dir: Path) -> VerifyResult:
-    """``pip install $REPO`` + ``pip install kestrel-feature-wallet``
-    (from PyPI) + ``import WalletFeature``.
+def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
+    """Return (package_name, [Feature class names]) for every Feature
+    package registered as truly extracted (``core = false``) in the
+    feature registry.
 
-    Post-OSS-split (epic #462), feature packages are published
-    independently; the wallet lives at
-    https://github.com/KestrelSovereignAI/kestrel-feature-wallet and is
-    on PyPI as ``kestrel-feature-wallet``. The bash predecessor pointed
-    at ``$REPO/kestrel_feature_wallet`` which no longer exists.
+    Tests 3/4/5 must not hardcode specific feature package names —
+    those would couple sovereign to specific extensions, which the
+    open-core split (epic #462) explicitly forbids. Driving off the
+    registry means new extracted features are auto-verified the moment
+    they're registered with ``core = false``, and a feature that's
+    claimed extracted but can't be ``pip install``ed surfaces as a
+    real verification failure.
+
+    Multiple registry entries can point at the same package (e.g.
+    ``[reflection]`` and ``[council]`` both ship inside
+    ``kestrel-feature-intelligence``). Dedupe by package name and
+    union the Feature class lists.
+
+    **Filtered to ``kestrel-feature-*`` packages only.** The registry
+    also lists provider plugins (``kestrel-voice-elevenlabs``,
+    ``kestrel-voice-deepgram``, ``kestrel-voice-openai``) under
+    ``core = false``, but those register under a different entry-point
+    group (``kestrel_sovereign.voice_providers``) and implement
+    provider interfaces, not ``kestrel_sdk.features.base.Feature``.
+    Running Tests 4 and 5 against them would fail spuriously
+    (Feature-subclass and ``kestrel_sovereign.features`` entry-point
+    assertions both miss). The naming convention is the discriminator
+    here; if a future Feature package adopts a non-default name it
+    must register under the conventional prefix to be picked up.
     """
-    name = "Test 3: Feature package"
+    from kestrel_sovereign.feature_registry import get_registry
+
+    by_package: Dict[str, Set[str]] = {}
+    for info in get_registry().values():
+        if info.core:
+            continue
+        if not info.package or info.package == "kestrel-sovereign":
+            continue
+        if not info.package.startswith("kestrel-feature-"):
+            continue
+        by_package.setdefault(info.package, set()).update(info.features)
+    return [(pkg, sorted(classes)) for pkg, classes in sorted(by_package.items())]
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — Feature package install (each `core = false` package)
+# ---------------------------------------------------------------------------
+
+def _test_3_feature_package(work_dir: Path) -> List[VerifyResult]:
+    """For every package registered as ``core = false`` in
+    ``feature_registry.toml``: ``pip install $REPO`` +
+    ``pip install <package>`` (from PyPI) + verify each declared
+    Feature class imports.
+
+    Post-OSS-split (epic #462), feature packages publish independently.
+    Sovereign no longer ships any one of them inline, so the verifier
+    can't single out a particular one — it iterates whatever the
+    registry currently claims is extracted.
+    """
+    base_name = "Test 3: Feature package"
+    extracted = _extracted_feature_packages()
+    if not extracted:
+        return [VerifyResult(
+            base_name, True,
+            "no extracted feature packages registered (core = false)",
+        )]
+
     repo = _repo_root()
-    venv_dir = work_dir / "test3" / ".venv"
-    if not _make_venv(venv_dir):
-        return VerifyResult(name, False, "uv venv creation failed")
-    if not _pip_install(venv_dir, str(repo)):
-        return VerifyResult(name, False, "pip install of sovereign failed")
-    if not _pip_install(venv_dir, "kestrel-feature-wallet"):
-        return VerifyResult(name, False, "pip install of kestrel-feature-wallet failed")
-    ok = _python_check(
-        venv_dir,
-        "from kestrel_feature_wallet import WalletFeature; print('Wallet OK')",
-    )
-    if not ok:
-        return VerifyResult(name, False, "import WalletFeature failed")
-    return VerifyResult(name, True, "import WalletFeature")
+    results: List[VerifyResult] = []
+    for idx, (package, feature_classes) in enumerate(extracted):
+        sub_name = f"{base_name} ({package})"
+        venv_dir = work_dir / f"test3-{idx}" / ".venv"
+        if not _make_venv(venv_dir):
+            results.append(VerifyResult(sub_name, False, "uv venv creation failed"))
+            continue
+        if not _pip_install(venv_dir, str(repo)):
+            results.append(VerifyResult(sub_name, False, "pip install of sovereign failed"))
+            continue
+        if not _pip_install(venv_dir, package):
+            results.append(VerifyResult(
+                sub_name, False, f"pip install of {package} failed",
+            ))
+            continue
+        # Resolve via the entry-point group — package authors are only
+        # required to declare the class under
+        # ``kestrel_sovereign.features``, not to re-export it from
+        # ``__init__.py``. Hitting ``ep.load()`` exercises the
+        # declared `module.path:ClassName` and proves the class is
+        # actually importable along the documented contract.
+        ok = _python_check(
+            venv_dir,
+            (
+                "import importlib.metadata as md\n"
+                "group = md.entry_points(group='kestrel_sovereign.features')\n"
+                "by_name = {ep.name: ep for ep in group}\n"
+                f"for cls_name in {sorted(feature_classes)!r}:\n"
+                "    assert cls_name in by_name, "
+                "f'entry point {cls_name!r} not registered'\n"
+                "    obj = by_name[cls_name].load()\n"
+                "    assert obj.__name__ == cls_name, "
+                "f'entry point loaded {obj.__name__!r}, expected {cls_name!r}'\n"
+                f"print('{package} OK')\n"
+            ),
+        )
+        if not ok:
+            results.append(VerifyResult(
+                sub_name, False,
+                f"entry-point load of {feature_classes} failed",
+            ))
+            continue
+        results.append(VerifyResult(
+            sub_name, True,
+            f"entry-points loaded: {', '.join(feature_classes)}",
+        ))
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — SDK + feature dev mode (--no-deps -e wallet)
+# Test 4 — SDK + feature dev mode (--no-deps per extracted package)
 # ---------------------------------------------------------------------------
 
-def _test_4_sdk_feature_dev(work_dir: Path) -> VerifyResult:
-    """``pip install kestrel-sovereign-sdk`` + ``pip install --no-deps
-    kestrel-feature-wallet`` + assert ``WalletFeature`` is a
+def _test_4_sdk_feature_dev(work_dir: Path) -> List[VerifyResult]:
+    """For every ``core = false`` package: ``pip install
+    kestrel-sovereign-sdk`` + ``pip install --no-deps <package>`` +
+    assert each declared Feature class is a
     ``kestrel_sdk.features.base.Feature`` subclass.
 
     Proves that a feature package author can develop against the SDK
     alone, without pulling in the full sovereign tree. ``--no-deps``
     keeps the install minimal — if the SDK interface is sufficient for
-    the wallet to import, the dev-mode contract holds.
-
-    Both packages come from PyPI (post-OSS-split). The bash predecessor
-    used local repo paths that no longer exist.
+    the package to import, the dev-mode contract holds.
     """
-    name = "Test 4: SDK + feature dev mode"
-    venv_dir = work_dir / "test4" / ".venv"
-    if not _make_venv(venv_dir):
-        return VerifyResult(name, False, "uv venv creation failed")
-    if not _pip_install(venv_dir, "kestrel-sovereign-sdk"):
-        return VerifyResult(name, False, "pip install of kestrel-sovereign-sdk failed")
-    if not _pip_install(
-        venv_dir,
-        "--no-deps",
-        "kestrel-feature-wallet",
-    ):
-        return VerifyResult(name, False, "no-deps wallet install failed")
-    ok = _python_check(
-        venv_dir,
-        (
-            "from kestrel_sdk.features.base import Feature\n"
-            "from kestrel_feature_wallet.wallet_feature import WalletFeature\n"
-            "assert issubclass(WalletFeature, Feature), "
-            "'WalletFeature must be a Feature subclass'\n"
-            "print('Dev mode OK')\n"
-        ),
-    )
-    if not ok:
-        return VerifyResult(
-            name, False,
-            "WalletFeature is not a kestrel_sdk Feature subclass",
+    base_name = "Test 4: SDK + feature dev mode"
+    extracted = _extracted_feature_packages()
+    if not extracted:
+        return [VerifyResult(
+            base_name, True,
+            "no extracted feature packages registered (core = false)",
+        )]
+
+    results: List[VerifyResult] = []
+    for idx, (package, feature_classes) in enumerate(extracted):
+        sub_name = f"{base_name} ({package})"
+        venv_dir = work_dir / f"test4-{idx}" / ".venv"
+        if not _make_venv(venv_dir):
+            results.append(VerifyResult(sub_name, False, "uv venv creation failed"))
+            continue
+        if not _pip_install(venv_dir, "kestrel-sovereign-sdk"):
+            results.append(VerifyResult(
+                sub_name, False, "pip install of kestrel-sovereign-sdk failed",
+            ))
+            continue
+        if not _pip_install(venv_dir, "--no-deps", package):
+            results.append(VerifyResult(
+                sub_name, False, f"--no-deps install of {package} failed",
+            ))
+            continue
+        # Resolve through the entry-point group: load each declared
+        # Feature class via the registered `module.path:ClassName` and
+        # assert it subclasses the SDK's Feature base. Avoids the
+        # assumption that packages re-export their Feature classes
+        # from the package root.
+        ok = _python_check(
+            venv_dir,
+            (
+                "import importlib.metadata as md\n"
+                "from kestrel_sdk.features.base import Feature\n"
+                "group = md.entry_points(group='kestrel_sovereign.features')\n"
+                "by_name = {ep.name: ep for ep in group}\n"
+                f"for cls_name in {sorted(feature_classes)!r}:\n"
+                "    assert cls_name in by_name, "
+                "f'entry point {cls_name!r} not registered'\n"
+                "    obj = by_name[cls_name].load()\n"
+                "    assert issubclass(obj, Feature), "
+                "f'{cls_name!r} must be a kestrel_sdk Feature subclass'\n"
+                f"print('{package} dev mode OK')\n"
+            ),
         )
-    return VerifyResult(
-        name, True,
-        "WalletFeature is a kestrel_sdk.features.base.Feature subclass",
-    )
+        if not ok:
+            results.append(VerifyResult(
+                sub_name, False,
+                f"one or more of {feature_classes} are not kestrel_sdk Feature subclasses",
+            ))
+            continue
+        results.append(VerifyResult(
+            sub_name, True,
+            f"{', '.join(feature_classes)} are kestrel_sdk.features.base.Feature subclasses",
+        ))
+    return results
 
 
 # ---------------------------------------------------------------------------
-# Test 5 — Full stack
+# Test 5 — Full stack (install $REPO + every extracted package)
 # ---------------------------------------------------------------------------
 
 def _test_5_full_stack(work_dir: Path) -> List[VerifyResult]:
-    """``pip install $REPO + wallet + intelligence`` then assert all
-    imports work AND that entry-point discovery finds every feature.
+    """``pip install $REPO`` + every ``core = false`` package, then
+    assert each declared Feature class imports AND that
+    ``kestrel_sovereign.features`` entry-point discovery finds every
+    Feature class.
     """
     name = "Test 5: Full stack"
+    extracted = _extracted_feature_packages()
+    if not extracted:
+        return [VerifyResult(name, True, "no extracted feature packages registered")]
+
     repo = _repo_root()
     venv_dir = work_dir / "test5" / ".venv"
     results: List[VerifyResult] = []
@@ -476,28 +595,44 @@ def _test_5_full_stack(work_dir: Path) -> List[VerifyResult]:
         return [VerifyResult(name, False, "uv venv creation failed")]
     if not _pip_install(venv_dir, str(repo)):
         return [VerifyResult(name, False, "pip install of sovereign failed")]
-    if not _pip_install(venv_dir, "kestrel-feature-wallet"):
-        return [VerifyResult(name, False, "pip install of kestrel-feature-wallet failed")]
-    if not _pip_install(venv_dir, "kestrel-feature-intelligence"):
-        return [VerifyResult(name, False, "pip install of kestrel-feature-intelligence failed")]
+    for package, _classes in extracted:
+        if not _pip_install(venv_dir, package):
+            return [VerifyResult(name, False, f"pip install of {package} failed")]
 
+    expected_classes: List[str] = sorted({c for _, classes in extracted for c in classes})
+    expected_repr = repr(tuple(expected_classes))
+
+    # Imports: load every expected Feature class via its entry point
+    # rather than `from <module> import <Class>` — package authors
+    # aren't required to re-export from `__init__.py`. ``ep.load()``
+    # exercises the declared `module.path:ClassName` so the import
+    # path the SDK contract guarantees is the one tested.
     ok_imports = _python_check(
         venv_dir,
         (
+            "import importlib.metadata as md\n"
             "from kestrel_sovereign.features.base import Feature\n"
-            "from kestrel_feature_wallet import WalletFeature\n"
-            "from kestrel_feature_intelligence import "
-            "ReflectionFeature, CouncilFeature\n"
+            "group = md.entry_points(group='kestrel_sovereign.features')\n"
+            "by_name = {ep.name: ep for ep in group}\n"
+            f"for cls_name in {expected_repr}:\n"
+            "    assert cls_name in by_name, "
+            "f'entry point {cls_name!r} not registered'\n"
+            "    by_name[cls_name].load()\n"
             "print('Full stack OK')\n"
         ),
     )
     results.append(VerifyResult(
         f"{name} (imports)",
         ok_imports,
-        "all packages importable" if ok_imports
-        else "one or more imports failed",
+        "all packages importable via entry-point resolution" if ok_imports
+        else "one or more entry-point loads failed",
     ))
 
+    # Discovery: enumerate the entry-point group and assert every
+    # expected class name is registered. Catches the case where the
+    # package was installed but the entry point itself was malformed
+    # / missing — `ok_imports` above already covered actual load
+    # failures, this asserts the group surface specifically.
     ok_eps = _python_check(
         venv_dir,
         (
@@ -505,7 +640,7 @@ def _test_5_full_stack(work_dir: Path) -> List[VerifyResult]:
             "eps = importlib.metadata.entry_points()\n"
             "group = eps.select(group='kestrel_sovereign.features')\n"
             "names = {ep.name for ep in group}\n"
-            "for needed in ('WalletFeature', 'ReflectionFeature', 'CouncilFeature'):\n"
+            f"for needed in {expected_repr}:\n"
             "    assert needed in names, f'{needed} not in {names}'\n"
             "print(f'Entry points discovered: {sorted(names)}')\n"
         ),
