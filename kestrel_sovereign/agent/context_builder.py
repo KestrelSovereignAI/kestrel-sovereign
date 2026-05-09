@@ -485,7 +485,8 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         include_briefing: bool = True,
         additional_context: Optional[str] = None,
         prompt_adaptation: Optional['PromptAdaptation'] = None,
-        state_of_mind: Optional['StateOfMind'] = None
+        state_of_mind: Optional['StateOfMind'] = None,
+        system_prompt_addendum: Optional[str] = None,
     ) -> str:
         """
         Build the complete system prompt for the LLM.
@@ -501,6 +502,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             additional_context: Any additional context to include
             prompt_adaptation: Optional constitutional prompt adaptation (preamble, emphasis)
             state_of_mind: Optional StateOfMind with governance mode and conflicts
+            system_prompt_addendum: Per-turn addendum appended at the end
+                of the system prompt. Used by the SignalDispatcher
+                (kestrel-sovereign#1137) to inject the constitutional
+                echo-canary directive for `require_constitution_echo=True`
+                COGNITION dispatches. Default None preserves byte-stable
+                output for legacy callers (the Anthropic prompt cache is
+                position-indexed; legacy callers must keep the same
+                bytes — see project_anthropic_cache_markers.md).
 
         Returns:
             Complete system prompt string
@@ -564,6 +573,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             parts.append("\n--- ADDITIONAL CONTEXT ---")
             parts.append(additional_context)
             parts.append("--- END CONTEXT ---")
+
+        # Per-turn addendum (e.g. constitutional echo-canary directive
+        # from the SignalDispatcher). Appended last so the cache-stable
+        # prefix above is unchanged when no addendum is supplied —
+        # legacy callers passing system_prompt_addendum=None get
+        # byte-identical output to the previous version of this method.
+        if system_prompt_addendum:
+            parts.append(system_prompt_addendum)
 
         return "\n\n".join(parts)
 

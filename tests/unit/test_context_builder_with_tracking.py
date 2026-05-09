@@ -188,3 +188,44 @@ def test_legacy_build_system_prompt_remains_byte_stable():
     assert "--- END CONSTITUTION ---" in out1  # asymmetric legacy fence
     assert "--- YOUR IDENTITY ---" in out1
     assert "--- END IDENTITY ---" in out1
+
+
+def test_system_prompt_addendum_appended_when_provided():
+    """Chunk 1G: dispatcher injects per-turn directives (canary
+    instruction) via `system_prompt_addendum`. Default None preserves
+    byte-stable output for the cached path."""
+    cb = _stub_builder({"SOUL.md": "soul"})
+    cb.get_session_briefing = lambda: "briefing"
+
+    legacy = cb.build_system_prompt(constitution="C")
+    with_addendum = cb.build_system_prompt(
+        constitution="C",
+        system_prompt_addendum=(
+            "--- CONSTITUTION RECEIPT ---\n"
+            "constitution_canary: 0123456789abcdef\n"
+            "--- END ---"
+        ),
+    )
+
+    # Legacy output is unchanged.
+    assert legacy == cb.build_system_prompt(constitution="C")
+    # With addendum, the directive appears at the END (so the
+    # cache-stable prefix above remains identical).
+    assert with_addendum.startswith(legacy + "\n\n")
+    assert with_addendum.endswith("--- END ---")
+    assert "0123456789abcdef" in with_addendum
+
+
+def test_system_prompt_addendum_empty_or_none_is_noop():
+    """Empty string falsy → treated like None, preserves byte stability."""
+    cb = _stub_builder({"SOUL.md": "soul"})
+    cb.get_session_briefing = lambda: "briefing"
+
+    legacy = cb.build_system_prompt(constitution="C")
+    out_none = cb.build_system_prompt(
+        constitution="C", system_prompt_addendum=None
+    )
+    out_empty = cb.build_system_prompt(
+        constitution="C", system_prompt_addendum=""
+    )
+    assert legacy == out_none == out_empty

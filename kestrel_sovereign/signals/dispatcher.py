@@ -772,64 +772,34 @@ class SignalDispatcher:
                     )
 
         prompt = self._render_prompt(signal, registration)
+
+        # The agent's existing build_system_prompt path already places
+        # the constitution body in the system prompt (cached, stable).
+        # The dispatcher does NOT duplicate it into the user prompt —
+        # that would pollute conversation history AND break the
+        # cache-stable system-prompt prefix. The constitution_text we
+        # resolved above is used for two things only:
+        #   1. Refusing dispatch when the agent can't produce one.
+        #   2. (Future) inclusion in injected_clauses tracking.
+        #
+        # injected_clauses still lists KESTREL_CONSTITUTION because
+        # the agent's system-prompt path WILL include it for this
+        # dispatch — we're recording that the constitution was
+        # operative, not that the dispatcher itself prepended it.
         if constitution_text is not None:
-            # PHASE 1 LIMITATION (codex round-8 P2): the dispatcher
-            # passes `prompt` to `agent.process_input`, which is the
-            # user-turn channel. For real `KestrelAgent` instances
-            # this means the prepended constitution + canary
-            # directive land in conversation history and are
-            # exposed as user content — NOT the design's intended
-            # system-prompt-with-hidden-receipt path. The Phase 1
-            # contract is still useful in three contexts:
-            #   1. External reviewer sources (codex/local) where the
-            #      "user prompt" is a one-shot call without
-            #      persistence (operator routes process_input to a
-            #      non-history handler for these).
-            #   2. Test harnesses with stubbed process_input.
-            #   3. Audit/forensic recording (hashes + clauses still
-            #      land in signal_log regardless of injection
-            #      semantics).
-            # Phase 2 (epic Phase 2) wires real system-prompt
-            # injection + phantom-tool registration. Until then,
-            # operators using `constitution_injection="full"` on a
-            # claude_code in-agent source will see the constitution
-            # in their conversation history and should disable echo
-            # for that path until Phase 2 ships.
-            logger.warning(
-                "Phase-1 constitutional injection: source '%s' has "
-                "constitution_injection='full' and the dispatcher is "
-                "prepending the constitution to the rendered prompt. "
-                "If this signal routes through KestrelAgent.process_input "
-                "the constitution will appear in conversation history. "
-                "Phase 2 of #1137 wires system-prompt injection; until "
-                "then, full injection is intended for external "
-                "reviewer paths (codex/local) only.",
-                registration.name,
-            )
-            prompt = (
-                "--- GOVERNING CONSTITUTION ---\n"
-                f"{constitution_text}\n"
-                "--- END CONSTITUTION ---\n\n"
-                f"{prompt}"
-            )
-            # Codex round-5 P2 fix: record the injected clause in the
-            # signal_log audit so a constitution-bearing dispatch is
-            # distinguishable from legacy paths. Phase 2 will add
-            # anchored doctrine clauses (TORTOISE_DOCTRINE.md, etc.)
-            # via the system-prompt assembler.
             audit.injected_clauses = ["KESTREL_CONSTITUTION"]
 
-        # Step A.5: derive canary + inject the format-appropriate
-        # instruction into the rendered prompt BEFORE the LLM call.
-        # Codex P1 (chunk 1G round 1): if we derived after, the model
-        # would never see the directive and verification would always
-        # MISS for legitimate dispatches. Phase 1 only injects into
-        # the user-prompt body the dispatcher controls; system-prompt
-        # injection (and phantom-tool registration for claude_code)
-        # require deeper agent integration and ship in Phase 2 of the
-        # epic. For codex/local formats, the entire prompt IS a single
-        # user message to the reviewer model, so user-prompt injection
-        # is the natural channel.
+        # Derive canary + build the format-appropriate instruction
+        # BEFORE the LLM call. Pass it as `system_prompt_addendum` to
+        # process_input so it lands in the system prompt (where
+        # operational directives belong) rather than the user prompt
+        # (where they would persist into conversation history). Cache:
+        # the addendum changes per dispatch (canary is fresh), so
+        # echo-required dispatches don't benefit from prompt-prefix
+        # cache hits — that's expected; verification is the priority.
+        # Cache stability for the COMMON path (no echo) is unchanged
+        # because no addendum is supplied.
+        addendum: Optional[str] = None
         if registration.require_constitution_echo and audit.constitution_hash:
             canary = derive_canary(
                 signal_id=signal.id,
@@ -841,31 +811,7 @@ class SignalDispatcher:
                 canary, registration.prompt_template_format
             )
             if instruction is not None:
-                prompt = f"{prompt}\n\n{instruction}"
-
-        # Codex round-6 P2 #2: enforce the registered budget. Phase 1
-        # cannot truncate the constitution (security property) or the
-        # canary directive (verification gate), so the only honest
-        # response to over-budget is to refuse with
-        # DROPPED_VALIDATION. Operators see the cap was insufficient
-        # and either resize the template or raise the budget — silent
-        # over-budget dispatches would leak audit signal.
-        budget = registration.system_prompt_budget_bytes
-        if budget is not None and len(prompt.encode("utf-8")) > budget:
-            audit.dropped_clauses = ["TEMPLATE_BODY"]
-            return self._fail(
-                signal,
-                start,
-                Status.DROPPED_VALIDATION,
-                error=(
-                    f"prompt exceeds system_prompt_budget_bytes ({budget}); "
-                    "constitution + canary directive cannot be truncated. "
-                    "Reduce the source's prompt_template body or raise the "
-                    "registration budget."
-                ),
-                registration=registration,
-                audit=audit,
-            )
+                addendum = instruction
 
         # Set the in-flight turn's causation chain (already extended
         # with this hop's frame in step 2 of the pipeline) so outbound
@@ -881,7 +827,29 @@ class SignalDispatcher:
         if set_chain is not None:
             token = set_chain(signal.causation_chain)
         try:
-            result = await self._agent.process_input(prompt)
+            # Pass the addendum via kwarg when it's set. Agents that
+            # don't accept the kwarg yet (older external KestrelAgent
+            # forks) get the legacy positional call — full injection
+            # then degrades to "directive not delivered" → MISSING in
+            # post-dispatch verification, which is the safe failure
+            # mode for an operator who needs to upgrade their agent.
+            if addendum is not None:
+                try:
+                    result = await self._agent.process_input(
+                        prompt, system_prompt_addendum=addendum
+                    )
+                except TypeError:
+                    logger.warning(
+                        "agent.process_input does not accept "
+                        "system_prompt_addendum; constitutional canary "
+                        "directive was NOT delivered for signal %s. "
+                        "Upgrade the agent to plumb the kwarg "
+                        "through context_manager.build_context.",
+                        signal.id,
+                    )
+                    result = await self._agent.process_input(prompt)
+            else:
+                result = await self._agent.process_input(prompt)
         finally:
             if clear_chain is not None:
                 clear_chain(token)

@@ -1435,7 +1435,7 @@ Expected Duration: {expected_duration}
         # State is COMPLETE or unknown - proceed to normal processing
         return None
 
-    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None) -> str:
+    async def process_input(self, user_input: str, model_override: str = None, session_id: str = None, include_memories: bool = True, caller=None, system_prompt_addendum: str = None) -> str:
         """
         Processes user input by consulting the constitution, retrieving context,
         and generating a response using tool calling for features.
@@ -1448,6 +1448,13 @@ Expected Duration: {expected_duration}
                               Set to False for multi-tenant sessions (e.g., SMS) to prevent
                               data leaking between users who share the same agent instance.
             caller: Optional CallerContext with auth identity and role.
+            system_prompt_addendum: Per-turn directive appended at the end
+                                    of the system prompt. Used by the SignalDispatcher
+                                    (#1137) to inject the constitutional echo-canary
+                                    directive for require_constitution_echo=True
+                                    COGNITION dispatches without touching the
+                                    cache-stable system-prompt prefix or polluting
+                                    persisted user-turn content.
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
@@ -1513,7 +1520,8 @@ Expected Duration: {expected_duration}
             }) as _otel_span:
                 # Lifecycle is already entered; call the locked body directly.
                 return await self._process_input_traced_locked(
-                    user_input, model_override, session_id, _otel_span, include_memories
+                    user_input, model_override, session_id, _otel_span, include_memories,
+                    system_prompt_addendum=system_prompt_addendum,
                 )
 
     async def _process_input_traced_locked(
@@ -1523,6 +1531,8 @@ Expected Duration: {expected_duration}
         session_id: str,
         _otel_span,
         include_memories: bool = True,
+        *,
+        system_prompt_addendum: Optional[str] = None,
     ) -> str:
         """Inner process_input logic wrapped in an OTEL span.
 
@@ -1605,6 +1615,7 @@ Expected Duration: {expected_duration}
             privacy_mode=self._privacy_mode.value,
             conversation_history=history,
             reflection_guidance=reflection_guidance,
+            system_prompt_addendum=system_prompt_addendum,
         )
 
         self._session_briefed = True

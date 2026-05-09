@@ -182,6 +182,7 @@ class ContextManager:
         emotional_context: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict]] = None,
         reflection_guidance: Optional[List[str]] = None,
+        system_prompt_addendum: Optional[str] = None,
     ) -> ContextResult:
         """
         Build complete context for an LLM request.
@@ -216,7 +217,8 @@ class ContextManager:
             return await self._build_ephemeral_context(
                 query=query,
                 constitution=constitution,
-                include_briefing=include_briefing
+                include_briefing=include_briefing,
+                system_prompt_addendum=system_prompt_addendum,
             )
 
         # Use provided history or fetch from storage
@@ -244,7 +246,8 @@ class ContextManager:
             constitution=constitution,
             include_briefing=include_briefing,
             prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=system_prompt_addendum,
         )
         system_tokens = self.counter.count(system_prompt)
         budget.use("system", system_tokens)
@@ -396,7 +399,8 @@ class ContextManager:
         self,
         query: str,
         constitution: str,
-        include_briefing: bool
+        include_briefing: bool,
+        system_prompt_addendum: Optional[str] = None,
     ) -> ContextResult:
         """
         Build minimal context for EPHEMERAL privacy mode.
@@ -418,7 +422,8 @@ class ContextManager:
             constitution=constitution,
             include_briefing=include_briefing,
             prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=system_prompt_addendum,
         )
 
         # Add ephemeral mode notice

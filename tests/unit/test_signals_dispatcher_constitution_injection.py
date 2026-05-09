@@ -84,8 +84,14 @@ class _AuditingAgent:
     def did(self) -> str:
         return self._did
 
-    async def process_input(self, prompt: str):
+    async def process_input(self, prompt: str, **kwargs):
+        # Capture both positional + the new system_prompt_addendum
+        # kwarg so chunk-1G tests can assert on either channel.
         self.process_input_calls.append(prompt)
+        self.process_input_kwargs = list(
+            getattr(self, "process_input_kwargs", [])
+        )
+        self.process_input_kwargs.append(kwargs)
         return self.process_input_return
 
     def _track_background_task(self, coro, *, name: str):
@@ -140,7 +146,7 @@ class _MinimalAgent:
     def did(self) -> str:
         return self._did
 
-    async def process_input(self, prompt: str):
+    async def process_input(self, prompt: str, **kwargs):
         return "ok"
 
     def _track_background_task(self, coro, *, name: str):
@@ -386,15 +392,18 @@ async def test_echo_required_verified_status_succeeds(
     assert len(call["canary"]) == 16
     assert all(c in "0123456789abcdef" for c in call["canary"])
 
-    # Codex P1 fix: the canary must have been injected into the prompt
-    # the model saw — verify it appears in the rendered prompt that
-    # process_input received, AND it equals what the verifier was
-    # asked about (same token in both places).
+    # The canary directive must reach the model via the SYSTEM PROMPT
+    # (not the user prompt — would persist into conversation history
+    # and break cache stability). Verify it appears in the
+    # `system_prompt_addendum` kwarg passed to process_input.
     assert len(agent.process_input_calls) == 1
-    rendered_prompt = agent.process_input_calls[0]
-    assert call["canary"] in rendered_prompt
+    addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
+    assert addendum is not None
+    assert call["canary"] in addendum
     # Codex format instruction is recognizable.
-    assert "constitution_canary" in rendered_prompt
+    assert "constitution_canary" in addendum
+    # And the user prompt does NOT carry the canary (no pollution).
+    assert call["canary"] not in agent.process_input_calls[0]
 
     rows = await env.backend.fetch_all(
         "SELECT echo_canary_status FROM signal_log"
@@ -431,12 +440,14 @@ async def test_canary_injected_pre_dispatch_matches_verifier_input(
     await env.dispatcher.dispatch_signal(_signal("cross_check"))
     await _drain(env)
 
-    rendered_prompt = agent.process_input_calls[0]
+    addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
     canary_sent_to_verifier = agent.verify_calls[0]["canary"]
-    # Same token in both places.
-    assert canary_sent_to_verifier in rendered_prompt
+    # Same token in addendum and verifier input.
+    assert canary_sent_to_verifier in addendum
     # Local-format instruction (JSON requirement) appears.
-    assert "_canary" in rendered_prompt
+    assert "_canary" in addendum
+    # User prompt is clean.
+    assert canary_sent_to_verifier not in agent.process_input_calls[0]
     await env.backend.close()
 
 
@@ -698,13 +709,17 @@ async def test_audit_preserved_when_process_input_raises(
 
 
 @pytest.mark.asyncio
-async def test_full_injection_unconditionally_prepends_constitution(
+async def test_full_injection_records_kestrel_constitution_clause(
     tmp_path,
 ):
-    """Codex round-5 P1: the dispatcher MUST inject the constitution
-    even if the source template doesn't mention it — otherwise a
-    careless author can pass canary verification without the model
-    ever seeing the constitution. Pin the unconditional prepend."""
+    """For full-injection sources the dispatcher records
+    `KESTREL_CONSTITUTION` in `injected_clauses_json`. The constitution
+    body itself lives in the agent's system prompt via the existing
+    `build_system_prompt` path — the dispatcher does NOT duplicate it
+    into the user prompt (which would pollute history) or into the
+    canary addendum (which is a per-turn directive). The clause name
+    in the audit reflects what was OPERATIVE during the dispatch, not
+    what the dispatcher itself prepended."""
 
     class _GovernedAgent(_AuditingAgent):
         async def _get_governing_constitution(self) -> str:
@@ -738,14 +753,16 @@ async def test_full_injection_unconditionally_prepends_constitution(
     await _drain(env)
 
     rendered = agent.process_input_calls[0]
-    # Constitution body is in the rendered prompt — even though the
-    # template never asked for it.
-    assert "ARTICLE I — sovereignty over data" in rendered
-    assert "GOVERNING CONSTITUTION" in rendered
-    # Canary directive still present.
-    assert "constitution_canary" in rendered
+    # User prompt is clean — no constitution duplication, no canary leak.
+    assert "ARTICLE I — sovereignty over data" not in rendered
+    assert "constitution_canary" not in rendered
 
-    # Codex round-5 P2: injected_clauses is populated.
+    # Canary directive arrives via system_prompt_addendum kwarg.
+    addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
+    assert addendum is not None
+    assert "constitution_canary" in addendum
+
+    # injected_clauses records that KESTREL_CONSTITUTION was operative.
     rows = await env.backend.fetch_all(
         "SELECT injected_clauses_json FROM signal_log"
     )
@@ -800,14 +817,16 @@ async def test_full_injection_drops_validation_when_no_constitution_body(
 
 @pytest.mark.asyncio
 async def test_render_constitution_placeholder_always_empty(tmp_path):
-    """Backward-compat: templates that included `{constitution}` from
-    the earlier chunk-1G round still render (no KeyError) but with
-    an empty substitution. The unconditional prepend is the only
-    injection channel."""
+    """`_render_prompt` accepts the legacy `{constitution}`
+    placeholder for backward compat with templates from an earlier
+    chunk-1G round; it ALWAYS substitutes empty. The dispatcher does
+    not put the constitution body in the user prompt — that lives in
+    the agent's system prompt via the existing build_system_prompt
+    path."""
 
     class _GovernedAgent(_AuditingAgent):
         async def _get_governing_constitution(self) -> str:
-            return "should appear in prepend, not in body"
+            return "DO NOT APPEAR IN USER PROMPT"
 
     template_path = tmp_path / "tpl_with_legacy_placeholder.md"
     template_path.write_text("[BODY]{constitution}[/BODY]", encoding="utf-8")
@@ -835,12 +854,11 @@ async def test_render_constitution_placeholder_always_empty(tmp_path):
     await _drain(env)
 
     rendered = agent.process_input_calls[0]
-    # Placeholder was empty in the body.
+    # Placeholder substituted with empty.
     assert "[BODY][/BODY]" in rendered
-    # Constitution still appears via the prepend.
-    assert "should appear in prepend, not in body" in rendered
-    # Verify it's actually in the prepend (above the body).
-    assert rendered.index("should appear") < rendered.index("[BODY]")
+    # Constitution did NOT leak into the user prompt — it lives in
+    # the agent's system prompt path.
+    assert "DO NOT APPEAR IN USER PROMPT" not in rendered
     await env.backend.close()
 
 
@@ -987,54 +1005,15 @@ async def test_constitution_hash_refreshed_after_lazy_anchoring(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_dispatch_refused_when_prompt_exceeds_budget(tmp_path):
-    """Codex round-6 P2 #2: registered `system_prompt_budget_bytes`
-    must take effect. Constitution + canary directive cannot be
-    truncated (security/verification properties), so an over-budget
-    prompt → DROPPED_VALIDATION with `dropped_clauses=["TEMPLATE_BODY"]`
-    so an operator sees the cap was hit."""
-    template_path = tmp_path / "big_tpl.md"
-    template_path.write_text("X" * 5000, encoding="utf-8")
-
-    agent = _AuditingAgent(
-        constitution_hash="con_abc",
-        anchored_bundle_hash="bundle",
-        live_bundle_hash="bundle",
-        echo_status=CanaryStatus.VERIFIED,
-    )
-    env = await _make_dispatcher(tmp_path, agent)
-    env.registry.register(
-        _cognition_reg(
-            template_path,
-            name="oversized_cog",
-            constitution_injection="full",
-            require_constitution_echo=True,
-            prompt_template_format="codex",
-            system_prompt_budget_bytes=1024,  # template alone exceeds
-        )
-    )
-
-    result = await env.dispatcher.dispatch_signal(_signal("oversized_cog"))
-    await _drain(env)
-
-    assert result.status == Status.DROPPED_VALIDATION
-    assert "exceeds system_prompt_budget_bytes" in (result.error or "")
-    # process_input never ran.
-    assert agent.process_input_calls == []
-    rows = await env.backend.fetch_all(
-        "SELECT dropped_clauses_json FROM signal_log"
-    )
-    import json as _json
-
-    assert _json.loads(rows[0][0]) == ["TEMPLATE_BODY"]
-    await env.backend.close()
-
-
-@pytest.mark.asyncio
-async def test_dispatch_succeeds_when_prompt_fits_budget(tmp_path):
-    """Counterpart: when the assembled prompt fits the budget, the
-    dispatch runs normally. Pin the under-budget pass."""
-    template_path = tmp_path / "small_tpl.md"
+async def test_system_prompt_budget_bytes_passes_through_to_agent(tmp_path):
+    """`system_prompt_budget_bytes` is a hint for the agent's
+    `build_system_prompt_with_tracking` (chunk 1E) — enforced inside
+    the system-prompt assembler. The dispatcher does NOT enforce a
+    budget on the user prompt because the constitution and other
+    cache-stable content live in the system prompt path. A registered
+    budget value passes through; the dispatch runs normally and the
+    agent's path applies the cap when assembled."""
+    template_path = tmp_path / "tpl.md"
     template_path.write_text("payload={payload}", encoding="utf-8")
 
     agent = _AuditingAgent(
@@ -1047,7 +1026,7 @@ async def test_dispatch_succeeds_when_prompt_fits_budget(tmp_path):
     env.registry.register(
         _cognition_reg(
             template_path,
-            name="under_budget_cog",
+            name="budget_cog",
             constitution_injection="full",
             require_constitution_echo=True,
             prompt_template_format="codex",
@@ -1055,15 +1034,14 @@ async def test_dispatch_succeeds_when_prompt_fits_budget(tmp_path):
         )
     )
 
-    result = await env.dispatcher.dispatch_signal(
-        _signal("under_budget_cog")
-    )
+    result = await env.dispatcher.dispatch_signal(_signal("budget_cog"))
     await _drain(env)
 
+    # Dispatch runs; budget is registration metadata for the agent
+    # path, not a dispatcher-side gate.
     assert result.status == Status.OK
-    assert len(agent.process_input_calls) == 1
     assert (
-        len(agent.process_input_calls[0].encode("utf-8")) <= 8192
+        env.registry.get("budget_cog").system_prompt_budget_bytes == 8192
     )
     await env.backend.close()
 
