@@ -8,25 +8,29 @@
 ## Plan stack (single source of truth)
 
 This work has grown into a stack of dependent PRs across two repos.
-The stack as it stands today, top-down:
+**Merge order matters** — Frinz Prereq-B must merge BEFORE foundation
+Prereq-A, otherwise Frinz breaks between the two merges (Frinz currently
+imports from `kestrel_sovereign.security.platform_key_storage` etc., and
+those modules vanish at Prereq-A merge).
 
 ```
                        ┌──────────────────────────────────────────┐
                        │ MAIN PR (kestrel-sovereign):             │
                        │   Payer Policy Phases 0, 2, 3, 3.5, 4, 5 │
                        └────────────────────┬─────────────────────┘
-                                            │ depends on
+                                            │ rebases off
                        ┌────────────────────┴─────────────────────┐
-                       │ PREREQ-B PR (frinz):                     │
-                       │   Adopt relocated security modules       │
-                       │   (PlatformKeyStorage, UserKeyStorage,   │
-                       │   LayeredKeyResolver) from foundation    │
+                       │ PREREQ-A PR (kestrel-sovereign):         │ #1156
+                       │   Remove relocated modules from          │
+                       │   foundation; rewire endpoints/models.py │
+                       │   to try-import from frinz.* at runtime  │
                        └────────────────────┬─────────────────────┘
-                                            │ depends on
+                                            │ requires merged
                        ┌────────────────────┴─────────────────────┐
-                       │ PREREQ-A PR (kestrel-sovereign):         │
-                       │   Untangle Frinz product code from       │
-                       │   foundation security/ and services/     │
+                       │ PREREQ-B PR (frinz):                     │ frinz#156
+                       │   Add modules at frinz/security/*; update│
+                       │   Frinz import paths; bump foundation pin│
+                       │   MERGES FIRST (no breakage window)      │
                        └──────────────────────────────────────────┘
 
                        ┌──────────────────────────────────────────┐
@@ -432,49 +436,72 @@ exercised.
 **Codex review focus:** schema completeness, serialization stability,
 forward-compat for new resource classes and new payer kinds.
 
-### Prereq-A — Untangle Frinz product code from foundation (~1 day, NEW PR)
+### Prereq-B — Frinz adopts relocated modules (~half day, NEW PR in frinz, frinz#156, MERGES FIRST)
 
-Discovered post-Phase-1 by survey (see "Plan stack" above). This phase
-ships in its own PR in `kestrel-sovereign`, BEFORE Phase 2 resumes.
-
-- Move out of `kestrel_sovereign/`:
-  - `security/platform_key_storage.py` → Frinz repo (`frinz/security/`)
-  - `security/user_key_storage.py` → Frinz repo (`frinz/security/`)
-  - `services/layered_key_resolver.py` → Frinz repo (`frinz/services/`)
-  - Their unit tests (e.g. [`tests/unit/test_layered_key_resolver.py`][lkr-test]).
-- The foundation `kestrel_sovereign/services/key_resolution.py`
-  (`KeyResolutionService`) stays — it's the genuinely-foundation
-  resolver and is `AsyncDatabase`-based.
-- Foundation CORE_SCHEMA's leaner `user_service_keys` shell stays for
-  now (it does not match Frinz's richer schema, but Frinz's migration
-  layer will continue to apply the rich schema on top of foundation
-  in Frinz deployments).
-- Foundation `agent_service_keys` and the rest are unchanged.
-- This PR REMOVES code, does not add features. Frinz starts breaking
-  on `from kestrel_sovereign.security.* import ...` after merge —
-  that's expected and is what Prereq-B fixes.
-
-**Codex review focus:** every removal is matched by a re-introduction
-in Prereq-B; nothing in foundation tests or production paths still
-imports the moved modules; the foundation README / KEY_MANAGEMENT.md
-docs that referenced them are updated to point at Frinz.
-
-### Prereq-B — Frinz adopts relocated modules (~half day, NEW PR in frinz)
-
-- New `frinz/security/platform_key_storage.py`,
-  `frinz/security/user_key_storage.py`,
-  `frinz/services/layered_key_resolver.py` — verbatim relocation of
-  the modules removed in Prereq-A.
-- `frinz/endpoints/admin_keys.py` and `frinz/endpoints/keys.py`
-  update their import paths.
+- Add to Frinz repo (verbatim copies, then de-Frinz nothing — they're
+  Frinz-shaped already):
+  - `frinz/security/platform_key_storage.py`
+  - `frinz/security/user_key_storage.py`
+  - `frinz/services/layered_key_resolver.py`
+- Move accompanying test [`tests/unit/test_layered_key_resolver.py`][lkr-test]
+  from foundation to Frinz.
+- Update Frinz consumers' import paths:
+  - `frinz/endpoints/admin_keys.py`
+  - `frinz/endpoints/keys.py`
+  - any other Frinz code that imports the modules
 - Frinz `migrations/020_key_layers.sql` is unchanged; the schema
-  source-of-truth stays in Frinz.
-- Frinz tests run against the relocated modules.
-- Bumps the foundation pin to a commit that has Prereq-A merged.
+  source-of-truth always lived in Frinz.
+- Bump the foundation pin only AFTER Prereq-A merges (separate small
+  follow-up bump, or delay merging Prereq-B until both can land
+  together — operationally either works).
+
+**Why this order:** if Prereq-A merged first, Frinz's existing
+`from kestrel_sovereign.security.platform_key_storage import ...`
+would error on missing module. Prereq-B first means Frinz already has
+its own copy and uses it; foundation's still-present copies are unused
+once Frinz finishes the import-path update.
 
 **Codex review focus:** every Frinz consumer of the relocated modules
 finds them at the new path; no stale imports of
-`kestrel_sovereign.security.platform_key_storage` remain.
+`kestrel_sovereign.security.platform_key_storage` remain in Frinz;
+Frinz tests pass against the relocated modules.
+
+### Prereq-A — Untangle Frinz product code from foundation (~1 day, NEW PR, kestrel-sovereign#1156, MERGES SECOND)
+
+Ships AFTER Prereq-B is merged.
+
+- Remove from `kestrel_sovereign/`:
+  - `security/platform_key_storage.py`
+  - `security/user_key_storage.py`
+  - `services/layered_key_resolver.py`
+  - `tests/unit/test_layered_key_resolver.py`
+- Rewire `kestrel_sovereign/endpoints/models.py` for the
+  `/api/keys/sources/{provider}`, `/api/keys/user/*`, and
+  `/api/keys/platform` endpoints (originally importing from
+  `kestrel_sovereign.security.*`):
+  - Wrap the imports in `try: from frinz.security.* import ...`
+    blocks with `except ImportError: return <empty/503 shape>`.
+  - This preserves the URL surface in foundation, returns the same
+    empty/503 today's standalone code returns when there's no PG pool,
+    and lets Frinz deployments find the implementations at runtime if
+    Frinz is installed alongside foundation.
+- Update [`docs/architecture/security/CRYPTO_INVENTORY.md`][crypto-inv]
+  references to point at the new `frinz/` paths.
+- The foundation `kestrel_sovereign/services/key_resolution.py`
+  (`KeyResolutionService`) stays — it IS a foundation resolver
+  (`AsyncDatabase`-based, no Frinz vocabulary).
+- Foundation CORE_SCHEMA's leaner `user_service_keys` shell stays for
+  now (it does not match Frinz's richer schema, but Frinz's migration
+  layer continues to apply its rich schema on top in Frinz deployments).
+- Foundation `agent_service_keys`, `service_providers`, etc. unchanged.
+
+**Codex review focus:** the conditional-import pattern actually
+degrades cleanly when Frinz is not installed (foundation-only
+deployment shows empty/503 the way it does today, no `ImportError`
+visible to clients); foundation tests still pass; nothing in
+foundation production paths still references the removed modules
+unconditionally; the long-term plugin/registry pattern is documented
+as a follow-up but not implemented here.
 
 ### Phase 2 — `HostKeyStorage` + `PayerResolver` (~1 day; resumes after prereqs)
 
