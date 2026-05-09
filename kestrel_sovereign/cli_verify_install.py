@@ -383,9 +383,9 @@ def _test_2_core_sovereign(work_dir: Path) -> List[VerifyResult]:
 # ---------------------------------------------------------------------------
 
 def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
-    """Return (package_name, [Feature class names]) for every package
-    registered as truly extracted (``core = false``) in the feature
-    registry.
+    """Return (package_name, [Feature class names]) for every Feature
+    package registered as truly extracted (``core = false``) in the
+    feature registry.
 
     Tests 3/4/5 must not hardcode specific feature package names —
     those would couple sovereign to specific extensions, which the
@@ -399,6 +399,18 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
     ``[reflection]`` and ``[council]`` both ship inside
     ``kestrel-feature-intelligence``). Dedupe by package name and
     union the Feature class lists.
+
+    **Filtered to ``kestrel-feature-*`` packages only.** The registry
+    also lists provider plugins (``kestrel-voice-elevenlabs``,
+    ``kestrel-voice-deepgram``, ``kestrel-voice-openai``) under
+    ``core = false``, but those register under a different entry-point
+    group (``kestrel_sovereign.voice_providers``) and implement
+    provider interfaces, not ``kestrel_sdk.features.base.Feature``.
+    Running Tests 4 and 5 against them would fail spuriously
+    (Feature-subclass and ``kestrel_sovereign.features`` entry-point
+    assertions both miss). The naming convention is the discriminator
+    here; if a future Feature package adopts a non-default name it
+    must register under the conventional prefix to be picked up.
     """
     from kestrel_sovereign.feature_registry import get_registry
 
@@ -407,6 +419,8 @@ def _extracted_feature_packages() -> List[Tuple[str, List[str]]]:
         if info.core:
             continue
         if not info.package or info.package == "kestrel-sovereign":
+            continue
+        if not info.package.startswith("kestrel-feature-"):
             continue
         by_package.setdefault(info.package, set()).update(info.features)
     return [(pkg, sorted(classes)) for pkg, classes in sorted(by_package.items())]
