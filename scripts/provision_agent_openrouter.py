@@ -23,6 +23,7 @@ agent row, or agent_metadata key=agent_did fallback).
 
 import argparse
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -68,12 +69,19 @@ async def provision_agent_key(
 
     try:
         agent_did = None
+        agent_node_id = None
+        agent_properties_json = None
 
+        # Prefer graph_nodes since that's the canonical location runtime
+        # and retirement service read from. Fall back to agent_metadata for
+        # exotic states.
         result = await db.fetchone(
-            "SELECT node_id FROM graph_nodes WHERE node_type = 'agent' LIMIT 1"
+            "SELECT node_id, properties FROM graph_nodes WHERE node_type = 'agent' LIMIT 1"
         )
         if result:
             agent_did = result[0]
+            agent_node_id = result[0]
+            agent_properties_json = result[1]
         else:
             result = await db.fetchone(
                 "SELECT value FROM agent_metadata WHERE key = 'agent_did' LIMIT 1"
@@ -120,14 +128,32 @@ async def provision_agent_key(
             )
             print(f"  - Internal key ID: {key_id}")
 
-            await db.execute(
-                """
-                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-                VALUES (?, 'openrouter_key_hash', ?, CURRENT_TIMESTAMP)
-                """,
-                (agent_did, key_info.key_hash),
-            )
-            print("  - openrouter_key_hash updated")
+            # Update graph_nodes.properties — this is where kestrel_agent.py
+            # and retirement_service.py read openrouter_key_hash. Writing
+            # only to agent_metadata (as the original Emma script did)
+            # left this hash invisible to the runtime; keys provisioned
+            # that way silently fell through to the shared key path.
+            if agent_node_id is not None:
+                properties = json.loads(agent_properties_json) if agent_properties_json else {}
+                properties["openrouter_key_hash"] = key_info.key_hash
+                await db.execute(
+                    "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+                    (json.dumps(properties), agent_node_id),
+                )
+                print("  - graph_nodes.properties.openrouter_key_hash updated")
+            else:
+                # Agent_metadata fallback path. retirement_service merges
+                # agent_metadata into the agent_info dict, so writing here
+                # at least covers retirement; runtime startup that reads
+                # from graph_nodes.properties will not see it.
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                    VALUES (?, 'openrouter_key_hash', ?, CURRENT_TIMESTAMP)
+                    """,
+                    (agent_did, key_info.key_hash),
+                )
+                print("  - agent_metadata.openrouter_key_hash updated (fallback)")
 
             retrieved_key = await key_storage.get_key(provider_id="openrouter")
             if retrieved_key == key_info.key:
