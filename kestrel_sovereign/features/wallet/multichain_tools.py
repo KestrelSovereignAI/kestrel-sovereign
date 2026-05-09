@@ -17,6 +17,7 @@ from pathlib import Path
 
 from kestrel_sovereign.features.base import tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ class MultichainToolsMixin:
         to_address: str,
         amount: str,
         network: str = "ethereum_sepolia"
-    ) -> str:
+    ) -> ToolResult:
         """
         Send native tokens on an EVM-compatible chain.
 
@@ -54,7 +55,7 @@ class MultichainToolsMixin:
             Transaction result with hash or error
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         try:
             from .transaction_manager import TransactionManager
@@ -65,17 +66,19 @@ class MultichainToolsMixin:
             try:
                 amount_decimal = Decimal(amount)
             except (ValueError, InvalidOperation):
-                return f"❌ Invalid amount: {amount}"
+                return ToolResult.failed(error=f"❌ Invalid amount: {amount}")
 
             if amount_decimal <= 0:
-                return "❌ Amount must be positive"
+                return ToolResult.failed(error="❌ Amount must be positive")
 
             # Parse network
             try:
                 chain = ChainNetwork(network)
             except ValueError:
                 networks = [n.value for n in ChainNetwork]
-                return f"❌ Invalid network: {network}\nAvailable: {', '.join(networks)}"
+                return ToolResult.failed(
+                    error=f"❌ Invalid network: {network}\nAvailable: {', '.join(networks)}"
+                )
 
             # Get storage directory
             db_path = self.wallet.db_path
@@ -84,7 +87,9 @@ class MultichainToolsMixin:
             # Load private key
             key_manager = FilecoinKeyManager(storage_dir=storage_dir)
             if not key_manager.has_address(self.wallet.agent_id):
-                return "❌ No wallet key found. Run `!wallet-generate-address` first."
+                return ToolResult.failed(
+                    error="❌ No wallet key found. Run `!wallet-generate-address` first."
+                )
 
             # Load private key from secure storage
             key_id = key_manager._get_key_id(self.wallet.agent_id)
@@ -110,29 +115,43 @@ class MultichainToolsMixin:
 
             if result.success:
                 explorer_url = result.get_explorer_url() or result.tx_hash
-                return f"""✅ **Transaction Sent**
+                native_token = tx_manager.get_adapter(chain).config.native_token
+                return ToolResult.ok(
+                    f"""✅ **Transaction Sent**
 
 **Network:** {chain.display_name}
 **To:** `{to_address}`
-**Amount:** {amount_decimal} {tx_manager.get_adapter(chain).config.native_token}
+**Amount:** {amount_decimal} {native_token}
 **TX Hash:** `{result.tx_hash}`
 
-**View:** {explorer_url}"""
+**View:** {explorer_url}""",
+                    data={
+                        "network": chain.value,
+                        "to_address": to_address,
+                        "amount": str(amount_decimal),
+                        "token": native_token,
+                        "tx_hash": result.tx_hash,
+                        "explorer_url": explorer_url,
+                    },
+                )
             else:
-                return f"❌ Transaction failed: {result.error}"
+                return ToolResult.failed(
+                    error=f"❌ Transaction failed: {result.error}",
+                    data={"network": chain.value, "to_address": to_address},
+                )
 
         except ValueError as e:
             logger.error(f"wallet_send failed (validation error): {e}", exc_info=True)
-            return f"❌ Transaction failed: {e}"
+            return ToolResult.failed(error=f"❌ Transaction failed: {e}")
         except (ConnectionError, TimeoutError) as e:
             logger.error(f"wallet_send failed (network error): {e}", exc_info=True)
-            return f"❌ Transaction failed: {e}"
+            return ToolResult.failed(error=f"❌ Transaction failed: {e}")
         except (ImportError, OSError) as e:
             logger.error(f"wallet_send failed (system error): {e}", exc_info=True)
-            return f"❌ Transaction failed: {e}"
+            return ToolResult.failed(error=f"❌ Transaction failed: {e}")
         except Exception as e:
             logger.error(f"wallet_send failed: {e}", exc_info=True)
-            return f"❌ Transaction failed: {e}"
+            return ToolResult.failed(error=f"❌ Transaction failed: {e}")
 
     @tool(
         name="wallet_send_token",
@@ -146,7 +165,7 @@ class MultichainToolsMixin:
         amount: str,
         token_symbol: str = "USDC",
         network: str = "ethereum_sepolia"
-    ) -> str:
+    ) -> ToolResult:
         """
         Send ERC-20 tokens on an EVM-compatible chain.
 
@@ -162,7 +181,7 @@ class MultichainToolsMixin:
             Transaction result with hash or error
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         try:
             from .transaction_manager import TransactionManager
@@ -173,26 +192,32 @@ class MultichainToolsMixin:
             try:
                 amount_decimal = Decimal(amount)
             except (ValueError, InvalidOperation):
-                return f"❌ Invalid amount: {amount}"
+                return ToolResult.failed(error=f"❌ Invalid amount: {amount}")
 
             if amount_decimal <= 0:
-                return "❌ Amount must be positive"
+                return ToolResult.failed(error="❌ Amount must be positive")
 
             # Parse network
             try:
                 chain = ChainNetwork(network)
             except ValueError:
                 networks = [n.value for n in ChainNetwork]
-                return f"❌ Invalid network: {network}\nAvailable: {', '.join(networks)}"
+                return ToolResult.failed(
+                    error=f"❌ Invalid network: {network}\nAvailable: {', '.join(networks)}"
+                )
 
             # Check token exists on network
             token = TokenRegistry.get_token(token_symbol, chain)
             if not token:
                 available = TokenRegistry.list_tokens(chain)
                 if available:
-                    return f"❌ Token {token_symbol} not available on {chain.display_name}\nAvailable: {', '.join(t.symbol for t in available)}"
+                    return ToolResult.failed(
+                        error=f"❌ Token {token_symbol} not available on {chain.display_name}\nAvailable: {', '.join(t.symbol for t in available)}"
+                    )
                 else:
-                    return f"❌ No tokens registered for {chain.display_name}"
+                    return ToolResult.failed(
+                        error=f"❌ No tokens registered for {chain.display_name}"
+                    )
 
             # Get storage directory
             db_path = self.wallet.db_path
@@ -201,7 +226,9 @@ class MultichainToolsMixin:
             # Load private key
             key_manager = FilecoinKeyManager(storage_dir=storage_dir)
             if not key_manager.has_address(self.wallet.agent_id):
-                return "❌ No wallet key found. Run `!wallet-generate-address` first."
+                return ToolResult.failed(
+                    error="❌ No wallet key found. Run `!wallet-generate-address` first."
+                )
 
             key_id = key_manager._get_key_id(self.wallet.agent_id)
             private_key = key_manager._secure_storage.load_private_key(key_id)
@@ -227,7 +254,8 @@ class MultichainToolsMixin:
 
             if result.success:
                 explorer_url = result.get_explorer_url() or result.tx_hash
-                return f"""✅ **Token Transfer Sent**
+                return ToolResult.ok(
+                    f"""✅ **Token Transfer Sent**
 
 **Network:** {chain.display_name}
 **Token:** {token.symbol} ({token.name})
@@ -235,22 +263,38 @@ class MultichainToolsMixin:
 **Amount:** {amount_decimal} {token.symbol}
 **TX Hash:** `{result.tx_hash}`
 
-**View:** {explorer_url}"""
+**View:** {explorer_url}""",
+                    data={
+                        "network": chain.value,
+                        "token": token.symbol,
+                        "to_address": to_address,
+                        "amount": str(amount_decimal),
+                        "tx_hash": result.tx_hash,
+                        "explorer_url": explorer_url,
+                    },
+                )
             else:
-                return f"❌ Token transfer failed: {result.error}"
+                return ToolResult.failed(
+                    error=f"❌ Token transfer failed: {result.error}",
+                    data={
+                        "network": chain.value,
+                        "token": token.symbol,
+                        "to_address": to_address,
+                    },
+                )
 
         except ValueError as e:
             logger.error(f"wallet_send_token failed (validation error): {e}", exc_info=True)
-            return f"❌ Token transfer failed: {e}"
+            return ToolResult.failed(error=f"❌ Token transfer failed: {e}")
         except (ConnectionError, TimeoutError) as e:
             logger.error(f"wallet_send_token failed (network error): {e}", exc_info=True)
-            return f"❌ Token transfer failed: {e}"
+            return ToolResult.failed(error=f"❌ Token transfer failed: {e}")
         except (ImportError, OSError) as e:
             logger.error(f"wallet_send_token failed (system error): {e}", exc_info=True)
-            return f"❌ Token transfer failed: {e}"
+            return ToolResult.failed(error=f"❌ Token transfer failed: {e}")
         except Exception as e:
             logger.error(f"wallet_send_token failed: {e}", exc_info=True)
-            return f"❌ Token transfer failed: {e}"
+            return ToolResult.failed(error=f"❌ Token transfer failed: {e}")
 
     @tool(
         name="wallet_networks",
@@ -258,14 +302,17 @@ class MultichainToolsMixin:
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-networks"
     )
-    async def wallet_networks(self) -> str:
+    async def wallet_networks(self) -> ToolResult:
         """
         List all available blockchain networks for transactions.
 
         Shows testnets, mainnets, and available tokens on each.
 
         Returns:
-            Formatted network list
+            ToolResult.ok with the network list. PARTIAL when
+            mainnet transactions are blocked (the LLM should speak
+            that — the catalog shows mainnets but tx attempts will
+            be refused).
         """
         from .chain_adapters import ChainNetwork, NetworkConfig, TokenRegistry
 
@@ -274,6 +321,7 @@ class MultichainToolsMixin:
         lines = ["🌐 **Available Networks**", ""]
 
         # Testnets first
+        testnet_data = []
         lines.append("**Testnets (Safe for Testing):**")
         for network in ChainNetwork:
             if network.is_testnet:
@@ -281,12 +329,18 @@ class MultichainToolsMixin:
                 tokens = TokenRegistry.list_tokens(network)
                 token_str = f" | Tokens: {', '.join(t.symbol for t in tokens)}" if tokens else ""
                 faucet_str = f"\n   Faucet: {config.faucet_url}" if config.faucet_url else ""
-
+                testnet_data.append({
+                    "network": network.value,
+                    "native_token": config.native_token,
+                    "tokens": [t.symbol for t in tokens],
+                    "faucet_url": config.faucet_url,
+                })
                 lines.append(f"• **{network.value}** - {config.native_token}{token_str}{faucet_str}")
 
         lines.append("")
 
         # Mainnets
+        mainnet_data = []
         lines.append("**Mainnets (Real Value):**")
         if mainnet_allowed:
             for network in ChainNetwork:
@@ -294,6 +348,11 @@ class MultichainToolsMixin:
                     config = NetworkConfig.get_config(network)
                     tokens = TokenRegistry.list_tokens(network)
                     token_str = f" | Tokens: {', '.join(t.symbol for t in tokens)}" if tokens else ""
+                    mainnet_data.append({
+                        "network": network.value,
+                        "native_token": config.native_token,
+                        "tokens": [t.symbol for t in tokens],
+                    })
                     lines.append(f"• **{network.value}** - {config.native_token}{token_str}")
         else:
             lines.append("⚠️ Mainnet transactions are **BLOCKED**")
@@ -304,7 +363,23 @@ class MultichainToolsMixin:
         lines.append("`!wallet-send <to> <amount> <network>`")
         lines.append("`!wallet-send-token <to> <amount> <token> <network>`")
 
-        return "\n".join(lines)
+        confirmation = "\n".join(lines)
+        data = {
+            "testnets": testnet_data,
+            "mainnets": mainnet_data,
+            "mainnet_allowed": mainnet_allowed,
+        }
+        if not mainnet_allowed:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "mainnet transactions are blocked by default — wallet_send / "
+                    "wallet_send_token attempts on mainnet networks will be "
+                    "refused until KESTREL_ALLOW_MAINNET=true is set."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool(
         name="wallet_tx_history",
@@ -312,7 +387,7 @@ class MultichainToolsMixin:
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-tx-history"
     )
-    async def wallet_tx_history(self, limit: int = 10) -> str:
+    async def wallet_tx_history(self, limit: int = 10) -> ToolResult:
         """
         View recent blockchain transaction history.
 
@@ -325,7 +400,7 @@ class MultichainToolsMixin:
             Formatted transaction history
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         try:
             from .transaction_manager import TransactionManager
@@ -345,7 +420,10 @@ class MultichainToolsMixin:
             await tx_manager.close()
 
             if not history:
-                return "📜 No blockchain transactions yet\n\nUse `!wallet-send` or `!wallet-send-token` to make transactions."
+                return ToolResult.ok(
+                    "📜 No blockchain transactions yet\n\nUse `!wallet-send` or `!wallet-send-token` to make transactions.",
+                    data={"history": [], "count": 0},
+                )
 
             lines = [f"📜 **Blockchain Transaction History** (last {len(history)})", ""]
 
@@ -355,10 +433,23 @@ class MultichainToolsMixin:
                 lines.append(f"📊 **Daily Limit:** ${tx_manager.daily_limit_usd}")
                 lines.append("")
 
+            history_data = []
             for tx in history:
                 status_emoji = "✅" if tx.status == "success" else "❌" if tx.status == "failed" else "⏳"
                 tx_type = "Token" if tx.tx_type == "erc20" else "Native"
                 token = f" ({tx.token_symbol})" if tx.token_symbol else ""
+
+                history_data.append({
+                    "status": tx.status,
+                    "tx_type": tx.tx_type,
+                    "token_symbol": tx.token_symbol,
+                    "network": tx.network,
+                    "to_address": tx.to_address,
+                    "amount": str(tx.amount),
+                    "tx_hash": tx.tx_hash,
+                    "timestamp": tx.timestamp.isoformat() if tx.timestamp else None,
+                    "error": tx.error,
+                })
 
                 lines.append(f"{status_emoji} **{tx_type}{token}** on {tx.network}")
                 lines.append(f"   To: `{tx.to_address[:10]}...{tx.to_address[-8:]}`")
@@ -370,14 +461,22 @@ class MultichainToolsMixin:
                     lines.append(f"   Error: {tx.error}")
                 lines.append("")
 
-            return "\n".join(lines)
+            return ToolResult.ok(
+                "\n".join(lines),
+                data={
+                    "history": history_data,
+                    "count": len(history),
+                    "spending_today_usd": float(spending.total_spent_usd),
+                    "daily_limit_usd": float(tx_manager.daily_limit_usd),
+                },
+            )
 
         except (ImportError, OSError) as e:
             logger.error(f"wallet_tx_history failed (system error): {e}", exc_info=True)
-            return f"❌ Failed to get transaction history: {e}"
+            return ToolResult.failed(error=f"❌ Failed to get transaction history: {e}")
         except (KeyError, ValueError, AttributeError) as e:
             logger.error(f"wallet_tx_history failed (data error): {e}", exc_info=True)
-            return f"❌ Failed to get transaction history: {e}"
+            return ToolResult.failed(error=f"❌ Failed to get transaction history: {e}")
         except Exception as e:
             logger.error(f"wallet_tx_history failed: {e}", exc_info=True)
-            return f"❌ Failed to get transaction history: {e}"
+            return ToolResult.failed(error=f"❌ Failed to get transaction history: {e}")

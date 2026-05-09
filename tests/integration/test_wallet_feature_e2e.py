@@ -24,6 +24,22 @@ import pytest
 from kestrel_sovereign.features.wallet.wallet_feature import WalletFeature
 from kestrel_sovereign.features.wallet.feature import WalletAgent, Currency
 
+def _wallet_render(envelope) -> str:
+    """Flatten a ToolResult into a string for legacy `in` substring tests.
+
+    Wallet tool returns historically were strings; the migrated envelopes
+    keep the same human-facing copy in ``confirmation`` (OK/PARTIAL) or
+    ``error`` (ERROR). This helper concatenates both so existing
+    ``"some text" in result`` assertions translate cleanly to
+    ``"some text" in _wallet_render(envelope)``.
+    """
+    parts = []
+    if envelope.confirmation:
+        parts.append(envelope.confirmation)
+    if envelope.error:
+        parts.append(envelope.error)
+    return "\n".join(parts)
+
 
 # =============================================================================
 # Fixtures
@@ -127,30 +143,30 @@ class TestWalletBalanceTool:
     @pytest.mark.asyncio
     async def test_balance_all_currencies(self, wallet_feature: WalletFeature):
         """!wallet-balance should show all currency balances."""
-        result = await wallet_feature.wallet_balance("all")
+        envelope = await wallet_feature.wallet_balance("all")
 
-        assert "Wallet Balances" in result
-        assert "FIL" in result
-        assert "90" in result  # Main balance
-        assert "10" in result  # Audit balance
-        assert "Total USD Value" in result
+        assert "Wallet Balances" in _wallet_render(envelope)
+        assert "FIL" in _wallet_render(envelope)
+        assert "90" in _wallet_render(envelope)  # Main balance
+        assert "10" in _wallet_render(envelope)  # Audit balance
+        assert "Total USD Value" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_balance_specific_currency(self, wallet_feature: WalletFeature):
         """!wallet-balance FIL should show only FIL balance."""
-        result = await wallet_feature.wallet_balance("FIL")
+        envelope = await wallet_feature.wallet_balance("FIL")
 
-        assert "FIL Balance" in result
-        assert "Main: 90" in result
-        assert "Audit: 10" in result
+        assert "FIL Balance" in _wallet_render(envelope)
+        assert "Main: 90" in _wallet_render(envelope)
+        assert "Audit: 10" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_balance_invalid_currency(self, wallet_feature: WalletFeature):
         """Invalid currency should return error message."""
-        result = await wallet_feature.wallet_balance("INVALID")
+        envelope = await wallet_feature.wallet_balance("INVALID")
 
-        assert "Unknown currency" in result
-        assert "FIL, USDC, USDT" in result
+        assert "Unknown currency" in _wallet_render(envelope)
+        assert "FIL, USDC, USDT" in _wallet_render(envelope)
 
 
 # =============================================================================
@@ -163,11 +179,11 @@ class TestWalletTransferTool:
     @pytest.mark.asyncio
     async def test_transfer_success(self, wallet_feature: WalletFeature):
         """Valid transfer should succeed and update balance."""
-        result = await wallet_feature.wallet_transfer("10.5", "FIL", "test memo")
+        envelope = await wallet_feature.wallet_transfer("10.5", "FIL", "test memo")
 
-        assert "Transfer Successful" in result
-        assert "10.5 FIL" in result
-        assert "test memo" in result
+        assert "Transfer Successful" in _wallet_render(envelope)
+        assert "10.5 FIL" in _wallet_render(envelope)
+        assert "test memo" in _wallet_render(envelope)
 
         # Verify balance updated
         balance = wallet_feature.wallet.get_balance(Currency.FIL, "main")
@@ -176,24 +192,24 @@ class TestWalletTransferTool:
     @pytest.mark.asyncio
     async def test_transfer_insufficient_funds(self, wallet_feature: WalletFeature):
         """Transfer should fail if insufficient funds."""
-        result = await wallet_feature.wallet_transfer("1000.0", "FIL", "too much")
+        envelope = await wallet_feature.wallet_transfer("1000.0", "FIL", "too much")
 
-        assert "Insufficient funds" in result
-        assert "Have 90" in result
+        assert "Insufficient funds" in _wallet_render(envelope)
+        assert "Have 90" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_transfer_invalid_amount(self, wallet_feature: WalletFeature):
         """Invalid amount should return error."""
-        result = await wallet_feature.wallet_transfer("not-a-number", "FIL")
+        envelope = await wallet_feature.wallet_transfer("not-a-number", "FIL")
 
-        assert "Invalid amount" in result
+        assert "Invalid amount" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_transfer_negative_amount(self, wallet_feature: WalletFeature):
         """Negative amount should return error."""
-        result = await wallet_feature.wallet_transfer("-10", "FIL")
+        envelope = await wallet_feature.wallet_transfer("-10", "FIL")
 
-        assert "must be positive" in result
+        assert "must be positive" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_transfer_records_history(self, wallet_feature: WalletFeature):
@@ -218,11 +234,11 @@ class TestWalletDepositTool:
     @pytest.mark.asyncio
     async def test_deposit_splits_90_10(self, wallet_feature: WalletFeature):
         """Deposit should split 90% to main, 10% to audit."""
-        result = await wallet_feature.wallet_deposit("100.0", "FIL", "test deposit")
+        envelope = await wallet_feature.wallet_deposit("100.0", "FIL", "test deposit")
 
-        assert "Deposit Recorded" in result
-        assert "Main (90%)" in result  # Main portion
-        assert "Audit (10%)" in result  # Audit portion
+        assert "Deposit Recorded" in _wallet_render(envelope)
+        assert "Main (90%)" in _wallet_render(envelope)  # Main portion
+        assert "Audit (10%)" in _wallet_render(envelope)  # Audit portion
 
         # Verify balances updated (original 90/10 + new 90/10)
         main = wallet_feature.wallet.get_balance(Currency.FIL, "main")
@@ -234,10 +250,10 @@ class TestWalletDepositTool:
     @pytest.mark.asyncio
     async def test_deposit_usdc(self, wallet_feature: WalletFeature):
         """Deposit should work for USDC."""
-        result = await wallet_feature.wallet_deposit("50.0", "USDC", "usdc deposit")
+        envelope = await wallet_feature.wallet_deposit("50.0", "USDC", "usdc deposit")
 
-        assert "Deposit Recorded" in result
-        assert "USDC" in result
+        assert "Deposit Recorded" in _wallet_render(envelope)
+        assert "USDC" in _wallet_render(envelope)
 
         main = wallet_feature.wallet.get_balance(Currency.USDC, "main")
         assert main == Decimal("45.0"), f"Expected 45.0 USDC, got {main}"
@@ -253,9 +269,9 @@ class TestWalletHistoryTool:
     @pytest.mark.asyncio
     async def test_history_empty(self, wallet_feature: WalletFeature):
         """Empty history should show appropriate message."""
-        result = await wallet_feature.wallet_history(10)
+        envelope = await wallet_feature.wallet_history(10)
 
-        assert "No transactions" in result
+        assert "No transactions" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_history_shows_transactions(self, wallet_feature: WalletFeature):
@@ -264,11 +280,11 @@ class TestWalletHistoryTool:
         await wallet_feature.wallet_transfer("5.0", "FIL", "tx1")
         await wallet_feature.wallet_transfer("3.0", "FIL", "tx2")
 
-        result = await wallet_feature.wallet_history(10)
+        envelope = await wallet_feature.wallet_history(10)
 
-        assert "Transaction History" in result
-        assert "tx1" in result
-        assert "tx2" in result
+        assert "Transaction History" in _wallet_render(envelope)
+        assert "tx1" in _wallet_render(envelope)
+        assert "tx2" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_history_respects_limit(self, wallet_feature: WalletFeature):
@@ -277,10 +293,10 @@ class TestWalletHistoryTool:
         for i in range(5):
             await wallet_feature.wallet_transfer("1.0", "FIL", f"tx{i}")
 
-        result = await wallet_feature.wallet_history(2)
+        envelope = await wallet_feature.wallet_history(2)
 
         # Should only show 2 transactions
-        assert "last 2" in result
+        assert "last 2" in _wallet_render(envelope)
 
 
 # =============================================================================
@@ -293,21 +309,21 @@ class TestWalletStatusTool:
     @pytest.mark.asyncio
     async def test_status_shows_complete_info(self, wallet_feature: WalletFeature):
         """Status should show comprehensive wallet information."""
-        result = await wallet_feature.wallet_status()
+        envelope = await wallet_feature.wallet_status()
 
-        assert "Wallet Status" in result
-        assert "Agent ID" in result
-        assert "Total USD Value" in result
-        assert "Cryostasis" in result
-        assert "Balances" in result
-        assert "Exchange Rates" in result
+        assert "Wallet Status" in _wallet_render(envelope)
+        assert "Agent ID" in _wallet_render(envelope)
+        assert "Total USD Value" in _wallet_render(envelope)
+        assert "Cryostasis" in _wallet_render(envelope)
+        assert "Balances" in _wallet_render(envelope)
+        assert "Exchange Rates" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_status_shows_healthy_cryostasis(self, wallet_feature: WalletFeature):
         """Status should show healthy when above threshold."""
-        result = await wallet_feature.wallet_status()
+        envelope = await wallet_feature.wallet_status()
 
-        assert "Healthy" in result or "CRYOSTASIS WARNING" not in result
+        assert "Healthy" in _wallet_render(envelope) or "CRYOSTASIS WARNING" not in _wallet_render(envelope)
 
 
 # =============================================================================
@@ -320,29 +336,29 @@ class TestWalletExchangeRatesTool:
     @pytest.mark.asyncio
     async def test_view_all_rates(self, wallet_feature: WalletFeature):
         """Should display all exchange rates."""
-        result = await wallet_feature.wallet_exchange_rates()
+        envelope = await wallet_feature.wallet_exchange_rates()
 
-        assert "Exchange Rates" in result
-        assert "FIL" in result
-        assert "USDC" in result
-        assert "USDT" in result
+        assert "Exchange Rates" in _wallet_render(envelope)
+        assert "FIL" in _wallet_render(envelope)
+        assert "USDC" in _wallet_render(envelope)
+        assert "USDT" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_view_single_rate(self, wallet_feature: WalletFeature):
         """Should display rate for specific currency."""
-        result = await wallet_feature.wallet_exchange_rates("FIL")
+        envelope = await wallet_feature.wallet_exchange_rates("FIL")
 
-        assert "FIL" in result
-        assert "$" in result
+        assert "FIL" in _wallet_render(envelope)
+        assert "$" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_update_rate(self, wallet_feature: WalletFeature):
         """Should update exchange rate."""
-        result = await wallet_feature.wallet_exchange_rates("FIL", "10.0")
+        envelope = await wallet_feature.wallet_exchange_rates("FIL", "10.0")
 
-        assert "Exchange Rate Updated" in result
-        assert "FIL" in result
-        assert "10.0" in result
+        assert "Exchange Rate Updated" in _wallet_render(envelope)
+        assert "FIL" in _wallet_render(envelope)
+        assert "10.0" in _wallet_render(envelope)
 
         # Verify rate was updated
         new_rate = wallet_feature.wallet._exchange_rates[Currency.FIL]
@@ -363,10 +379,10 @@ class TestMultiCurrency:
         await wallet_feature.wallet_deposit("100.0", "USDC")
 
         # Transfer USDC
-        result = await wallet_feature.wallet_transfer("10.0", "USDC", "usdc transfer")
+        envelope = await wallet_feature.wallet_transfer("10.0", "USDC", "usdc transfer")
 
-        assert "Transfer Successful" in result
-        assert "USDC" in result
+        assert "Transfer Successful" in _wallet_render(envelope)
+        assert "USDC" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_total_usd_value(self, wallet_feature: WalletFeature):
@@ -394,9 +410,9 @@ class TestCryostasis:
         # Set a very high threshold
         wallet_feature.wallet.set_cryostasis_threshold(Decimal("10000.0"))
 
-        result = await wallet_feature.wallet_status()
+        envelope = await wallet_feature.wallet_status()
 
-        assert "CRYOSTASIS WARNING" in result
+        assert "CRYOSTASIS WARNING" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_runway_estimate(self, wallet_feature: WalletFeature):
@@ -422,22 +438,22 @@ class TestEdgeCases:
         feature = WalletFeature(mock_agent)
         # Don't call initialize()
 
-        result = await feature.wallet_balance()
-        assert "Wallet not initialized" in result
+        envelope = await feature.wallet_balance()
+        assert "Wallet not initialized" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_zero_transfer(self, wallet_feature: WalletFeature):
         """Zero transfer should fail."""
-        result = await wallet_feature.wallet_transfer("0", "FIL")
+        envelope = await wallet_feature.wallet_transfer("0", "FIL")
 
-        assert "must be positive" in result
+        assert "must be positive" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_very_small_amounts(self, wallet_feature: WalletFeature):
         """Should handle very small amounts correctly."""
-        result = await wallet_feature.wallet_transfer("0.000001", "FIL", "tiny")
+        envelope = await wallet_feature.wallet_transfer("0.000001", "FIL", "tiny")
 
-        assert "Transfer Successful" in result
+        assert "Transfer Successful" in _wallet_render(envelope)
 
 
 # =============================================================================
