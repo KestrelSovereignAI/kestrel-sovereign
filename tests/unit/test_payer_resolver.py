@@ -165,6 +165,48 @@ class TestEnabledKindsReturnResolver:
         assert result.key_resolver is not None
 
 
+class TestDelegatedStorageNotImplemented:
+    """Delegated-master kinds (HOST_MASTER_PROVISIONED, USER_MASTER_PROVISIONED,
+    SPONSOR) are LLM-only in Phase 3a. For storage they raise
+    NotImplementedError until Phase 3.5 ships the Lighthouse wallet-signed
+    key minting flow.
+
+    This is the regression guard for codex Phase 3a round 2: returning
+    enabled for delegated storage kinds would let LighthouseProvider
+    fall through to LIGHTHOUSE_API_KEY env var, billing the operator's
+    master key as the agent's storage — the exact policy violation
+    these kinds exist to prevent.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "kind",
+        [
+            PayerKind.HOST_MASTER_PROVISIONED,
+            PayerKind.USER_MASTER_PROVISIONED,
+            PayerKind.SPONSOR,
+        ],
+    )
+    async def test_delegated_storage_raises(self, kind: PayerKind) -> None:
+        spec_kwargs = {"vendor": "lighthouse", "kind": kind}
+        if kind in (PayerKind.USER_MASTER_PROVISIONED, PayerKind.SPONSOR):
+            spec_kwargs["master_did"] = "did:test:master"
+        policy = PayerPolicy(
+            llm=PayerSpec(vendor="openrouter", kind=PayerKind.HOST_ENV),
+            storage=PayerSpec(**spec_kwargs),
+            compute=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            tools=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+        )
+        resolver = FoundationPayerResolver(policy)
+        with pytest.raises(NotImplementedError) as excinfo:
+            await resolver.resolve_for(
+                "did:test:agent-a", ResourceClass.STORAGE
+            )
+        assert kind.name in str(excinfo.value)
+        assert "storage" in str(excinfo.value).lower()
+
+
 class TestSelfWalletDeferred:
     """SELF_WALLET for LLM is explicitly deferred per the support matrix.
     The resolver raises NotImplementedError there. SELF_WALLET for
