@@ -93,6 +93,11 @@ class _AuditingAgent:
         self.background_tasks.append(task)
         return task
 
+    # Default stub constitution for full-injection tests. Subclasses
+    # in the no-constitution test override this to return "" or None.
+    async def _get_governing_constitution(self) -> str:
+        return "ARTICLE STUB — test constitution"
+
     # Optional constitutional-injection hooks.
     def get_constitution_hash(self) -> Optional[str]:
         return self._const
@@ -551,12 +556,14 @@ async def test_echo_required_no_constitution_hash_records_missing(
 
 
 @pytest.mark.asyncio
-async def test_minimal_agent_full_injection_records_nulls(
+async def test_minimal_agent_full_injection_refused(
     tmp_path, template_path
 ):
-    """Agent without get_constitution_hash / bundle hooks: the
-    dispatcher records NULLs and runs the dispatch. No drift is
-    detected because both sides are None."""
+    """Agent without `_get_governing_constitution` cannot satisfy
+    `constitution_injection="full"` — the dispatcher must refuse
+    rather than run the dispatch with NULLs (which would be a silent
+    Phase-1 failure of the security property). Codex round-5 P1
+    drives this stricter behavior."""
     agent = _MinimalAgent()
     env = await _make_dispatcher(tmp_path, agent)
     env.registry.register(
@@ -570,39 +577,34 @@ async def test_minimal_agent_full_injection_records_nulls(
     result = await env.dispatcher.dispatch_signal(_signal("min_cog"))
     await _drain(env)
 
-    assert result.status == Status.OK
-    rows = await env.backend.fetch_all(
-        "SELECT constitution_hash, doctrine_bundle_hash, "
-        "echo_canary_status FROM signal_log"
-    )
-    assert rows == [(None, None, "not_required")]
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
     await env.backend.close()
 
 
 @pytest.mark.asyncio
-async def test_minimal_agent_echo_required_fails(tmp_path, template_path):
-    """Agent without verify_constitution_echo + echo required: the
-    dispatcher cannot verify and stamps MISSING → FAILED."""
+async def test_minimal_agent_echo_required_refused(tmp_path, template_path):
+    """Minimal agent (no `_get_governing_constitution`) + full
+    injection + echo required: the dispatcher refuses earlier than
+    the verifier is reached — DROPPED_VALIDATION at the constitution
+    resolution step."""
     agent = _MinimalAgent()
     env = await _make_dispatcher(tmp_path, agent)
-    # Need to bypass the docstring-rationale warning by setting it
-    # explicitly via the registration, not opt out — that's the path
-    # operators take when they really mean it.
     env.registry.register(
         _cognition_reg(
             template_path,
             name="min_echo_cog",
             constitution_injection="full",
             require_constitution_echo=True,
-            prompt_template_format="codex",  # codex requires echo
+            prompt_template_format="codex",
         )
     )
 
     result = await env.dispatcher.dispatch_signal(_signal("min_echo_cog"))
     await _drain(env)
 
-    assert result.status == Status.FAILED
-    assert result.error == "constitution_not_received"
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
     await env.backend.close()
 
 
@@ -696,25 +698,21 @@ async def test_audit_preserved_when_process_input_raises(
 
 
 @pytest.mark.asyncio
-async def test_full_injection_inlines_constitution_into_template(
+async def test_full_injection_unconditionally_prepends_constitution(
     tmp_path,
 ):
-    """Codex round-4 P2 mitigation: the dispatcher exposes
-    `{constitution}` as a render variable for full-injection sources.
-    Source authors writing codex/local templates can include it where
-    they want; the canary then proves the model honored a prompt that
-    actually carried the constitution. Phase 2 will move to
-    system-prompt injection for claude_code; Phase 1 ships the
-    user-prompt-level path."""
+    """Codex round-5 P1: the dispatcher MUST inject the constitution
+    even if the source template doesn't mention it — otherwise a
+    careless author can pass canary verification without the model
+    ever seeing the constitution. Pin the unconditional prepend."""
 
     class _GovernedAgent(_AuditingAgent):
         async def _get_governing_constitution(self) -> str:
             return "ARTICLE I — sovereignty over data"
 
-    template_path = tmp_path / "tpl_with_const.md"
+    template_path = tmp_path / "tpl_no_placeholder.md"
     template_path.write_text(
-        "Reviewer prompt:\n\n{constitution}\n\nDispatch payload: {payload}",
-        encoding="utf-8",
+        "Reviewer task: payload={payload}", encoding="utf-8"
     )
 
     agent = _GovernedAgent(
@@ -727,59 +725,122 @@ async def test_full_injection_inlines_constitution_into_template(
     env.registry.register(
         _cognition_reg(
             template_path,
-            name="codex_full_inject",
+            name="codex_no_placeholder",
             constitution_injection="full",
             require_constitution_echo=True,
             prompt_template_format="codex",
         )
     )
 
-    await env.dispatcher.dispatch_signal(_signal("codex_full_inject"))
+    await env.dispatcher.dispatch_signal(
+        _signal("codex_no_placeholder")
+    )
     await _drain(env)
 
     rendered = agent.process_input_calls[0]
-    # Constitution body is inline in the rendered prompt (the canary
-    # then verifies the model honored a constitution-bearing prompt,
-    # not an empty directive).
+    # Constitution body is in the rendered prompt — even though the
+    # template never asked for it.
     assert "ARTICLE I — sovereignty over data" in rendered
-    # Canary directive still appended.
+    assert "GOVERNING CONSTITUTION" in rendered
+    # Canary directive still present.
     assert "constitution_canary" in rendered
+
+    # Codex round-5 P2: injected_clauses is populated.
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    assert _json.loads(rows[0][0]) == ["KESTREL_CONSTITUTION"]
     await env.backend.close()
 
 
 @pytest.mark.asyncio
-async def test_render_omits_constitution_when_injection_is_none(tmp_path):
-    """For `constitution_injection="none"` the dispatcher does NOT
-    fetch the constitution. Templates referencing `{constitution}`
-    get an empty string, matching legacy behavior."""
+async def test_full_injection_drops_validation_when_no_constitution_body(
+    tmp_path, template_path
+):
+    """If `_get_governing_constitution` returns empty/None for a
+    full-injection source, the dispatcher must REFUSE the dispatch —
+    logging VERIFIED while the model saw no constitution would be a
+    silent security failure."""
 
-    class _GovernedAgent(_AuditingAgent):
-        constitution_calls = 0
-
+    class _NoConstitutionAgent(_AuditingAgent):
         async def _get_governing_constitution(self) -> str:
-            type(self).constitution_calls += 1
-            return "should not appear"
+            return ""  # nothing to inject
 
-    template_path = tmp_path / "tpl.md"
-    template_path.write_text(
-        "X{constitution}Y", encoding="utf-8"
+    agent = _NoConstitutionAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
     )
-
-    agent = _GovernedAgent()
     env = await _make_dispatcher(tmp_path, agent)
     env.registry.register(
         _cognition_reg(
             template_path,
-            name="legacy_cog_render",
+            name="empty_const_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
         )
     )
 
-    await env.dispatcher.dispatch_signal(_signal("legacy_cog_render"))
+    result = await env.dispatcher.dispatch_signal(
+        _signal("empty_const_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
+    # process_input was NEVER called — no chance to verify a canary
+    # against a non-existent constitution.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_render_constitution_placeholder_always_empty(tmp_path):
+    """Backward-compat: templates that included `{constitution}` from
+    the earlier chunk-1G round still render (no KeyError) but with
+    an empty substitution. The unconditional prepend is the only
+    injection channel."""
+
+    class _GovernedAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "should appear in prepend, not in body"
+
+    template_path = tmp_path / "tpl_with_legacy_placeholder.md"
+    template_path.write_text("[BODY]{constitution}[/BODY]", encoding="utf-8")
+
+    agent = _GovernedAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="legacy_placeholder_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(
+        _signal("legacy_placeholder_cog")
+    )
     await _drain(env)
 
     rendered = agent.process_input_calls[0]
-    assert rendered == "XY"  # placeholder substituted with empty
-    assert _GovernedAgent.constitution_calls == 0
+    # Placeholder was empty in the body.
+    assert "[BODY][/BODY]" in rendered
+    # Constitution still appears via the prepend.
+    assert "should appear in prepend, not in body" in rendered
+    # Verify it's actually in the prepend (above the body).
+    assert rendered.index("should appear") < rendered.index("[BODY]")
     await env.backend.close()
 
 

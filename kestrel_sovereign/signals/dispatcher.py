@@ -650,11 +650,17 @@ class SignalDispatcher:
                 audit=audit,
             )
 
-        # Resolve the constitution body for full-injection sources so
-        # the source's prompt_template can inline it via the
-        # `{constitution}` placeholder. The source author owns
-        # placement (codex/local reviewer prompts vary widely);
-        # templates that don't reference {constitution} are unaffected.
+        # Resolve the constitution body for full-injection sources.
+        # Codex round-5 P1 fix: the dispatcher UNCONDITIONALLY
+        # prepends a fenced constitution block to the rendered
+        # prompt for `constitution_injection="full"`. A previous
+        # round exposed the constitution via a `{constitution}`
+        # template placeholder, but that made injection
+        # template-author-dependent — a source whose template
+        # forgot the placeholder would still pass canary verification
+        # without the model ever seeing the constitution. Unconditional
+        # prepend is auditable, deterministic, and impossible to
+        # bypass via template error.
         constitution_text: Optional[str] = None
         if registration.constitution_injection == "full":
             getter = getattr(self._agent, "_get_governing_constitution", None)
@@ -668,13 +674,46 @@ class SignalDispatcher:
                 except Exception:
                     logger.exception(
                         "_get_governing_constitution raised for signal %s; "
-                        "rendering without inline constitution",
+                        "the dispatch will refuse to proceed without the "
+                        "constitution body for a full-injection source",
                         signal.id,
                     )
+            if not constitution_text:
+                # Refuse the dispatch — full injection without an
+                # injectable constitution would log VERIFIED while
+                # the model saw no constitution; that defeats the
+                # entire point of `require_constitution_echo`.
+                return self._fail(
+                    signal,
+                    start,
+                    Status.DROPPED_VALIDATION,
+                    error=(
+                        "constitution_injection='full' requested but "
+                        "agent could not produce a constitution body"
+                    ),
+                    registration=registration,
+                    audit=audit,
+                )
 
-        prompt = self._render_prompt(
-            signal, registration, constitution_text=constitution_text
-        )
+        prompt = self._render_prompt(signal, registration)
+        if constitution_text is not None:
+            # Prepend a single canonical fenced block. Templates may
+            # also include the deprecated `{constitution}` placeholder
+            # (now substituted with empty string in `_render_prompt`)
+            # without changing this prepend — the security guarantee
+            # holds regardless of template content.
+            prompt = (
+                "--- GOVERNING CONSTITUTION ---\n"
+                f"{constitution_text}\n"
+                "--- END CONSTITUTION ---\n\n"
+                f"{prompt}"
+            )
+            # Codex round-5 P2 fix: record the injected clause in the
+            # signal_log audit so a constitution-bearing dispatch is
+            # distinguishable from legacy paths. Phase 2 will add
+            # anchored doctrine clauses (TORTOISE_DOCTRINE.md, etc.)
+            # via the system-prompt assembler.
+            audit.injected_clauses = ["KESTREL_CONSTITUTION"]
 
         # Step A.5: derive canary + inject the format-appropriate
         # instruction into the rendered prompt BEFORE the LLM call.
@@ -912,8 +951,6 @@ class SignalDispatcher:
         self,
         signal: Signal,
         registration: SourceRegistration,
-        *,
-        constitution_text: Optional[str] = None,
     ) -> str:
         # Minimal template render for v1: read the file and substitute
         # known placeholders. Fenced UNTRUSTED payload is the source's
@@ -921,13 +958,13 @@ class SignalDispatcher:
         # "templates live under prompts/signals/" with explicit fences).
         # A richer template engine (jinja, etc.) is a follow-up.
         #
-        # `{constitution}` is exposed for source-author use in
-        # codex/local templates (kestrel-sovereign#1137 chunk 1G).
-        # When the dispatcher resolves the constitution at audit
-        # time, the source's template can choose where in the
-        # rendered prompt to inline it. Templates that don't include
-        # `{constitution}` get the same behavior as before — the
-        # placeholder is supplied (default empty string) but ignored.
+        # `{constitution}` is accepted as a placeholder for backward
+        # compatibility with templates from an earlier chunk-1G round
+        # but is ALWAYS substituted with an empty string. Constitution
+        # injection happens via the dispatcher's unconditional prepend
+        # for `constitution_injection="full"` sources (see
+        # `_run_cognition_with_audit`). This avoids the
+        # template-forgot-the-placeholder bypass codex round-5 caught.
         template_path = registration.prompt_template
         assert template_path is not None
         template = template_path.read_text(encoding="utf-8")
@@ -938,7 +975,7 @@ class SignalDispatcher:
             payload=signal.payload,
             urgency=signal.urgency.value,
             arrived_at=signal.arrived_at.isoformat(),
-            constitution=constitution_text or "",
+            constitution="",
         )
 
     # ------------------------------------------------------------------
