@@ -195,6 +195,36 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_record_only_only_for_irreversible():
+    """Round 13 P2: compensate_record_only is reserved for irreversible
+    stages — a reversible stage that declares it would get a record-
+    only rollback for a side effect that should have a real compensation
+    source."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage(
+            name="x",
+            signal_source="x",
+            signal_mode=SignalMode.ACTION,
+            irreversible=False,
+            compensate="compensate_record_only",
+        )
+
+
+def test_workflow_run_validates_current_stage_names():
+    """Round 13 P2: each name must satisfy _NAME_RE; otherwise to_dict
+    emits a value violating WORKFLOW_RUN_SCHEMA's pattern."""
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=1,
+            params={},
+            status=RunStatus.RUNNING,
+            current_stages=("bad name",),  # whitespace forbidden
+            started_by_did="did:web:k.example",
+        )
+
+
 def test_stage_signal_source_accepts_did_bearing_names():
     """Round 10 P2: design's ``agent.<did>`` pattern embeds DIDs
     containing ``:``. _NAME_RE rejected these; signal_source uses the

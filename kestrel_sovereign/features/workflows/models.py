@@ -419,6 +419,21 @@ class Stage:
                 "compensate=\"compensate_record_only\" per design §3.5; "
                 f"got compensate={self.compensate!r}"
             )
+        # Round 13 P2: ``compensate_record_only`` is reserved FOR
+        # irreversible stages. A reversible stage that declares it gets
+        # a record-only rollback for a side effect the design says
+        # MUST have a real compensation source. Reject the converse so
+        # the irreversible↔record_only invariant is bidirectional.
+        if (
+            self.compensate == "compensate_record_only"
+            and not self.irreversible
+        ):
+            raise WorkflowDefinitionError(
+                f"stage {self.name!r}: compensate=\"compensate_record_only\" "
+                "is reserved for stages where irreversible=True (design "
+                "§3.5). Reversible stages must declare a real compensate "
+                "(a registered SourceRegistration that runs the rollback)."
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1097,6 +1112,11 @@ class WorkflowRun:
             raise WorkflowDefinitionError(
                 "run.current_stages must be a list[str] of stage names"
             )
+        # Round 13 P2: each name must satisfy the same identifier
+        # invariant as a Stage.name; otherwise to_dict() emits values
+        # that violate WORKFLOW_RUN_SCHEMA's pattern.
+        for name in self.current_stages:
+            _validate_name("run.current_stages[]", name)
         object.__setattr__(self, "current_stages", tuple(self.current_stages))
 
         if not isinstance(self.started_by_did, str):
