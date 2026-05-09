@@ -107,6 +107,22 @@ class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
 
 
+class LLMServiceAlreadyAttachedError(LLMServiceError):
+    """Raised when a second agent tries to claim an LLMService that is
+    already attached to a different agent.
+
+    The PayerPolicy work in #1156's follow-up requires that each
+    `KestrelAgent` instance holds its own `LLMService` instance —
+    `LLMService.use_agent_key()` mutates `self.providers` in place, so a
+    shared instance would silently leak the last-loaded agent's
+    OpenRouter client to every other agent. Production code already
+    constructs one service per agent (see
+    `kestrel_sovereign/multi_agent/agent_manager.py:90-91`), but the
+    invariant is now enforced at construction time so it cannot
+    silently regress.
+    """
+
+
 class ModelNotAvailableForRoute(LLMError):
     """Raised by _try_single_provider when the target model isn't in the
     route's vendor catalog.
@@ -219,6 +235,13 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._storage_cache = None
         self._storage_cache_timestamp = None
         self._storage_cache_ttl = STORAGE_CACHE_TTL_SECONDS
+
+        # Per-agent claim. None until `attach_to_agent(agent_did)` is called;
+        # set thereafter. Subsequent `attach_to_agent` calls with the SAME
+        # DID are idempotent; calls with a DIFFERENT DID raise
+        # LLMServiceAlreadyAttachedError. See `attach_to_agent` for the
+        # invariant rationale.
+        self._owner_agent_did: Optional[str] = None
 
         # Database for model usage tracking (uses abstract data layer)
         self._init_usage_tracking(database_url)
@@ -786,6 +809,45 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         except ProviderInitializationError as e:
             logger.error(f"Failed to initialize providers: {e}")
             return []
+
+    def attach_to_agent(self, agent_did: str) -> None:
+        """Claim this LLMService instance for a specific agent.
+
+        Required invariant for the PayerPolicy work: each KestrelAgent
+        gets its own LLMService instance because `use_agent_key()`
+        mutates `self.providers` in place. Sharing a service across
+        agents would let the last-loaded agent silently steal every
+        other agent's OpenRouter client.
+
+        Production code already constructs one service per agent. This
+        method enforces that contract at construction time so the
+        invariant cannot silently regress (e.g. by a future test or a
+        well-meaning refactor that reuses an instance).
+
+        Args:
+            agent_did: The agent's DID. Must be non-empty.
+
+        Raises:
+            ValueError: If agent_did is empty.
+            LLMServiceAlreadyAttachedError: If this service is already
+                attached to a different agent.
+
+        Idempotent for repeated attach with the same DID, so a code path
+        that re-enters agent init (re-anchor flows, test reset, etc.)
+        does not double-fail.
+        """
+        if not agent_did:
+            raise ValueError("agent_did is required for attach_to_agent")
+        if self._owner_agent_did is None:
+            self._owner_agent_did = agent_did
+            return
+        if self._owner_agent_did == agent_did:
+            return
+        raise LLMServiceAlreadyAttachedError(
+            f"LLMService is already attached to agent {self._owner_agent_did[:30]}...; "
+            f"cannot re-attach to {agent_did[:30]}.... Construct a fresh LLMService "
+            "per agent (each agent's OpenRouter client mutation must be isolated)."
+        )
 
     async def use_agent_key(
         self,

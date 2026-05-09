@@ -290,6 +290,12 @@ class KestrelAgent(
         self.storage = None
 
         self.llm_service = llm_service or LLMService()
+        # Claim this LLMService for this agent. If an externally-provided
+        # llm_service was already claimed by another agent (the adversarial-
+        # test sharing pattern), this raises LLMServiceAlreadyAttachedError
+        # so the cross-agent state-leak invariant is enforced at construction
+        # time. See LLMService.attach_to_agent for the rationale.
+        self.llm_service.attach_to_agent(did)
         self.pg_pool = pg_pool
         # Note: agent_id is a @property that returns self.did (see below).
         # Do NOT set self.agent_id = ... here; it would shadow the property.
