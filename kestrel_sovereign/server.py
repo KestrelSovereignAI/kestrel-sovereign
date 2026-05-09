@@ -977,7 +977,22 @@ def get_stripe_webhook_handler():
     global _stripe_webhook_handler
     if _stripe_webhook_handler is None:
         try:
-            from kestrel_feature_wallet.onramp import StripeOnRamp, StripeWebhookHandler
+            # Use the in-core wallet onramp module. The previous
+            # `kestrel_feature_wallet.onramp` static import violated
+            # the open-core rule (sovereign must not depend on
+            # feature packages — features are extensions, not
+            # dependencies) and was a phantom dependency in practice:
+            # kestrel-feature-wallet isn't on PyPI yet, and the
+            # in-core kestrel_sovereign/features/wallet/onramp/ is
+            # what actually runs. When wallet completes extraction
+            # this should migrate to resolving the registered
+            # WalletFeature via the agent feature registry so
+            # sovereign's server doesn't reach into the package's
+            # internals.
+            from kestrel_sovereign.features.wallet.onramp import (
+                StripeOnRamp,
+                StripeWebhookHandler,
+            )
             onramp = StripeOnRamp()
             _stripe_webhook_handler = StripeWebhookHandler(onramp)
             _stripe_webhook_handler.on_deposit_complete = _on_stripe_deposit_complete
