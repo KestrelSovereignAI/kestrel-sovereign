@@ -243,6 +243,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # invariant rationale.
         self._owner_agent_did: Optional[str] = None
 
+        # PayerPolicy NONE flag. Set to True by the agent-init layer when
+        # the agent's policy slot for LLM is `PayerKind.NONE`. Phase 3b
+        # adds the `_check_policy()` guard on every generation entry point
+        # that raises PolicyDeniedError when this is True. Phase 3a only
+        # plumbs the flag; generation calls still go through (consistent
+        # with HOST_ENV behavior) until 3b lands the guard.
+        self.disabled: bool = False
+
         # Database for model usage tracking (uses abstract data layer)
         self._init_usage_tracking(database_url)
 

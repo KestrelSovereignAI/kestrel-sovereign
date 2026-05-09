@@ -75,13 +75,24 @@ class LighthouseProvider(StorageProvider, CryostasisCapable, MultiCurrencyPaymen
         Initialize Lighthouse provider.
 
         Args:
-            api_key: Lighthouse API key (or from LIGHTHOUSE_API_KEY env var)
+            api_key: Lighthouse API key. When both ``api_key`` and
+                ``key_resolver`` are None, ``LIGHTHOUSE_API_KEY`` is read
+                from the environment as a fallback (today's standalone
+                behavior). When ``key_resolver`` is supplied, the env-var
+                fallback is NOT consulted at construction time — the
+                resolver is the single source of truth, so a PayerPolicy
+                slot of ``NONE`` actually means NONE even on a host where
+                ``LIGHTHOUSE_API_KEY`` happens to be set.
             cache_dir: Local cache directory for performance
             default_tier: Default storage tier (CLOUD_HOT or CLOUD_COLD)
             key_resolver: Optional KeyResolutionService for dynamic key resolution
         """
         self._key_resolver = key_resolver
-        self.api_key = api_key or os.environ.get("LIGHTHOUSE_API_KEY")
+        # Env-var fallback only when no resolver is in charge (otherwise the
+        # resolver would be silently overridden at construction time).
+        if api_key is None and key_resolver is None:
+            api_key = os.environ.get("LIGHTHOUSE_API_KEY")
+        self.api_key = api_key
         self._default_tier = default_tier
 
         # Initialize cache directory
