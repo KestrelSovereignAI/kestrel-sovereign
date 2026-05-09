@@ -297,6 +297,7 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 - [ ] Idempotency-key enforcement at `workflow_stage_links` insert
 - [ ] Cancellation barrier handling + reverse-order compensation runner
 - [ ] `WorkflowHarness` test fixture (deterministic clock; cassette-replay layer for non-deterministic actor types — `agent`, `talon_fleet`, `human`, `council`, `red_team_clear` reviewers; stages without `actor_replay_safe=True` fail closed in harness mode)
+  - **Glossary — cassette:** the standard VCR.py / vcrpy test-fixture pattern. The first run records every reviewer/agent LLM call (request + response) into a fixture file; every subsequent run replays the recorded responses without hitting the network. Lets `red_team_clear` (and any other non-deterministic gate) run in CI deterministically without burning per-run LLM budget. See sub-issues #1138 (cassette redaction & encryption) and #1142 (CI bootstrap for first-run recording) for the security and bootstrap implications.
 - [ ] Definition revocation handler (§3.6)
 - [ ] OTel spans rolling up under workflow run; Prometheus counters for stage gate_pass/gate_fail/compensate_complete/compensate_failed (signal_log already provides per-signal observability; we add only workflow-level rollups)
 
