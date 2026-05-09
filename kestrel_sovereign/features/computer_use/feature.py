@@ -496,12 +496,23 @@ class ComputerUseFeature(Feature):
                 outcome="ok",
                 duration_ms=duration_ms,
             )
+            content_str = data.decode("utf-8", errors="replace")
+            # Render the file contents inside the confirmation so the
+            # !fs-read CLI surface still shows what the user came for —
+            # the command-handler envelope formatter suppresses scalar
+            # ``data`` (no list/nested-dict values triggers the
+            # structural-payload heuristic), so anything the user is
+            # expected to see has to live in ``confirmation``.
+            confirmation = (
+                f"Read {len(data)} bytes from {resolved}:\n"
+                + (content_str if content_str else "(empty file)")
+            )
             return ToolResult.ok(
-                f"Read {len(data)} bytes from {resolved}.",
+                confirmation,
                 data={
                     "path": str(resolved),
                     "bytes": len(data),
-                    "content": data.decode("utf-8", errors="replace"),
+                    "content": content_str,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -820,9 +831,23 @@ class ComputerUseFeature(Feature):
                 "duration_ms": result.duration_ms,
                 "timed_out": result.timed_out,
             }
+            # Render stdout/stderr inside the confirmation so the
+            # !shell CLI surface keeps showing the command output —
+            # the command-handler envelope formatter suppresses
+            # scalar-only ``data`` (the structural-payload heuristic
+            # only fires on list/nested-dict values), so the user-
+            # visible payload has to live in ``confirmation``.
+            stdout_block = (
+                f"\nstdout:\n{result.stdout}" if result.stdout else ""
+            )
+            stderr_block = (
+                f"\nstderr:\n{result.stderr}" if result.stderr else ""
+            )
             if result.returncode == 0:
                 return ToolResult.ok(
-                    f"Command ran successfully (rc=0, {result.duration_ms}ms).",
+                    f"Command ran successfully (rc=0, {result.duration_ms}ms)."
+                    + stdout_block
+                    + stderr_block,
                     data=data,
                 )
             # Non-zero exit: PARTIAL — the shell ran (so audit / follow-up
@@ -835,7 +860,9 @@ class ComputerUseFeature(Feature):
                 + (f"; stderr tail: {stderr_tail}" if stderr_tail else "")
             )
             return ToolResult.partial(
-                f"Command ran but failed (rc={result.returncode}, {result.duration_ms}ms).",
+                f"Command ran but failed (rc={result.returncode}, {result.duration_ms}ms)."
+                + stdout_block
+                + stderr_block,
                 caveat,
                 data=data,
             )
