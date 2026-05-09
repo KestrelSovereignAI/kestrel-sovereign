@@ -256,6 +256,8 @@ The registry validator enforces:
 - [x] Multi-format wrappers (`claude_code`, `codex`, `local`, `bare`) — stateless formatters over the same content (chunk 1F instruction builder; chunk 1E assembler)
 - [ ] OTel spans + Prometheus counters: `constitution_echo_verified_total`, `constitution_echo_missing_total`, `doctrine_bundle_drift_total` (chunk 1H, pending)
 
+**Phase 2 follow-up tracked at [#1150](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1150)** — codex rounds 8 and 9 both flagged the same Phase 2 gaps; that issue holds the punch list (system-prompt injection, real `verify_constitution_echo`, phantom-tool registration, in-tree source migration).
+
 **Phase 1 boundary the chunk 1G integration draws explicitly:**
 
 - For `prompt_template_format in {"codex","local"}`: source authors include `{constitution}` in their prompt_template to inline the constitution body where the reviewer expects it. The dispatcher exposes the placeholder; the source owns placement. The canary then proves the model honored the rendered prompt (which includes the constitution).
