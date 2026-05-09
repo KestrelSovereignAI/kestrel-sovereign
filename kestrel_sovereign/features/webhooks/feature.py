@@ -25,6 +25,7 @@ from typing import Any, Dict, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 from .models import WebhookAuthType, WebhookConfig
 from .receiver import WebhookReceiver
@@ -197,13 +198,17 @@ class WebhookFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!webhooks list",
     )
-    async def webhooks_list(self) -> Dict[str, Any]:
+    async def webhooks_list(self) -> ToolResult:
         """List all registered webhooks for this agent.
 
         Returns:
-            Dict with a list of webhooks and count.
+            ToolResult.ok with a list of webhooks + count. PARTIAL
+            when the receiver is empty but the DB query failed — the
+            empty list there could otherwise hide persisted webhooks
+            that just weren't readable.
         """
         webhooks = self.receiver.list_webhooks()
+        db_failed = False
 
         # Supplement with DB data if available and receiver is empty
         if not webhooks and self._db:
@@ -230,8 +235,27 @@ class WebhookFeature(Feature):
                     })
             except Exception as exc:
                 logger.warning("WebhookFeature: DB query failed: %s", exc)
+                db_failed = True
 
-        return {"webhooks": webhooks, "count": len(webhooks)}
+        data = {"webhooks": webhooks, "count": len(webhooks)}
+        confirmation = (
+            "No webhooks registered."
+            if not webhooks
+            else f"{len(webhooks)} webhook(s) registered: "
+            + ", ".join(w.get("name", "?") for w in webhooks)
+            + "."
+        )
+        if db_failed:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "DB query for webhook_config failed; the receiver list "
+                    "is empty and persisted webhooks could not be loaded — "
+                    "an empty result here does NOT mean none are configured."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool(
         "webhooks_history",
@@ -239,17 +263,22 @@ class WebhookFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!webhooks history",
     )
-    async def webhooks_history(self, limit: int = 20) -> Dict[str, Any]:
+    async def webhooks_history(self, limit: int = 20) -> ToolResult:
         """Show recent webhook events.
 
         Args:
             limit: Maximum number of events to return (default: 20)
 
         Returns:
-            Dict with a list of events and count.
+            ToolResult.ok with the event list. PARTIAL when the DB
+            query failed (history could be missing persisted events
+            and we fell back to the in-memory ring buffer) or when no
+            DB is attached at all (events are NOT being persisted, so
+            an empty list does not mean "no inbound webhooks").
         """
         # Try database first
         events: list = []
+        db_failed = False
         if self._db:
             try:
                 rows = await self._db.fetchall(
@@ -275,12 +304,34 @@ class WebhookFeature(Feature):
                     })
             except Exception as exc:
                 logger.warning("WebhookFeature: history query failed: %s", exc)
+                db_failed = True
 
         # Fallback to in-memory log
         if not events:
             events = self.receiver.get_recent_events(limit)
 
-        return {"events": events, "count": len(events)}
+        data = {"events": events, "count": len(events)}
+        confirmation = f"Returned {len(events)} webhook event(s)."
+        if db_failed:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "DB query for webhook_log failed; results are from the "
+                    "in-memory ring buffer only and may be missing persisted "
+                    "audit events."
+                ),
+                data=data,
+            )
+        if not self._db:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "no database is attached — webhook events are not being "
+                    "persisted; this list is the in-memory ring buffer only."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool(
         "webhooks_register",
@@ -295,7 +346,7 @@ class WebhookFeature(Feature):
         event_type: str = "",
         auth_config_json: str = "{}",
         rate_limit: int = 60,
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Register a new webhook endpoint.
 
         Args:
@@ -306,32 +357,34 @@ class WebhookFeature(Feature):
             rate_limit: Maximum requests per minute (default: 60, 0 = unlimited)
 
         Returns:
-            Dict with registration status and webhook details.
+            ToolResult.ok on a clean register; PARTIAL when the
+            in-memory register succeeded but the DB persistence row
+            failed (the webhook will work right now but won't survive
+            a restart); ERROR for any validation or duplicate-name
+            failure.
         """
         # Validate auth_type
         try:
             auth_type_enum = WebhookAuthType(auth_type)
         except ValueError:
             valid = [t.value for t in WebhookAuthType]
-            return {
-                "success": False,
-                "error": f"Invalid auth_type '{auth_type}'. Must be one of: {valid}",
-            }
+            return ToolResult.failed(
+                error=f"Invalid auth_type '{auth_type}'. Must be one of: {valid}"
+            )
 
         # Parse auth config
         try:
             auth_config = json.loads(auth_config_json)
             if not isinstance(auth_config, dict):
-                return {"success": False, "error": "auth_config_json must be a JSON object"}
+                return ToolResult.failed(error="auth_config_json must be a JSON object")
         except json.JSONDecodeError as exc:
-            return {"success": False, "error": f"Invalid auth_config_json: {exc}"}
+            return ToolResult.failed(error=f"Invalid auth_config_json: {exc}")
 
         # Validate name
         if not name or not name.replace("-", "").replace("_", "").isalnum():
-            return {
-                "success": False,
-                "error": "Webhook name must be alphanumeric (hyphens and underscores allowed)",
-            }
+            return ToolResult.failed(
+                error="Webhook name must be alphanumeric (hyphens and underscores allowed)"
+            )
 
         # Build config
         webhook_id = str(uuid.uuid4())
@@ -353,9 +406,10 @@ class WebhookFeature(Feature):
         try:
             self.receiver.register_webhook(config)
         except ValueError as exc:
-            return {"success": False, "error": str(exc)}
+            return ToolResult.failed(error=str(exc))
 
         # Persist to database
+        persist_failed = False
         if self._db:
             try:
                 await self._db.execute(
@@ -378,14 +432,14 @@ class WebhookFeature(Feature):
                 )
             except Exception as exc:
                 logger.warning("WebhookFeature: failed to persist webhook config: %s", exc)
+                persist_failed = True
 
         logger.info(
             "Registered webhook: %s (auth=%s, rate_limit=%d/min)",
             name, auth_type, rate_limit,
         )
 
-        return {
-            "success": True,
+        data = {
             "webhook_id": webhook_id,
             "name": name,
             "auth_type": auth_type,
@@ -393,7 +447,23 @@ class WebhookFeature(Feature):
             "rate_limit": max(0, rate_limit),
             "endpoint": f"/webhooks/{name}",
             "created_at": now,
+            "persisted": (self._db is not None and not persist_failed),
         }
+        confirmation = (
+            f"Registered webhook '{name}' (auth={auth_type}, "
+            f"rate_limit={max(0, rate_limit)}/min, endpoint=/webhooks/{name})."
+        )
+        if persist_failed:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "in-memory registration succeeded but the DB INSERT for "
+                    "webhook_config failed — this webhook will accept "
+                    "requests now but will NOT survive a restart."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     @tool(
         "webhooks_remove",
@@ -401,32 +471,116 @@ class WebhookFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!webhooks remove",
     )
-    async def webhooks_remove(self, name: str) -> Dict[str, Any]:
+    async def webhooks_remove(self, name: str) -> ToolResult:
         """Remove a registered webhook.
 
         Args:
             name: The name of the webhook to remove
 
         Returns:
-            Dict with removal status.
+            ToolResult.ok on a clean remove (in-memory + persisted row).
+            PARTIAL when the receiver forgot it but the DB DELETE failed,
+            OR when the receiver had no record but a persisted-only row
+            was cleaned up (the latter can happen after a prior partial
+            failure or when a persisted webhook didn't load on startup —
+            retrying ``webhooks_remove`` must still scrub the row, so
+            we never short-circuit on the receiver miss alone).
+            ERROR only when neither the receiver nor the database
+            has any trace of the webhook.
         """
-        # Remove from receiver
-        removed = self.receiver.unregister_webhook(name)
+        # Remove from receiver (in-memory)
+        removed_from_memory = self.receiver.unregister_webhook(name)
 
-        # Remove from database
+        # Always attempt the DB DELETE, even if the receiver didn't
+        # have it. A prior call could have left a stale row behind
+        # (transient DB error → PARTIAL), or a persisted webhook may
+        # have failed to load into the receiver on startup. If we
+        # short-circuit on the receiver miss, that row gets
+        # resurrected on the next restart — codex caught this on
+        # round 1.
+        deleted_persisted_row = False
+        delete_failed = False
         if self._db:
             try:
-                await self._db.execute(
-                    "DELETE FROM webhook_config WHERE name = ? AND agent_id = ?",
+                # Probe first so we can tell "found-and-deleted" from
+                # "no-row-existed" without depending on cursor.rowcount,
+                # which is not uniformly exposed by the async DB
+                # adapter. Two queries instead of one is cheap; correctness
+                # is not.
+                existing = await self._db.fetchone(
+                    "SELECT id FROM webhook_config WHERE name = ? AND agent_id = ?",
                     (name, self._agent_id),
                 )
+                if existing is not None:
+                    await self._db.execute(
+                        "DELETE FROM webhook_config WHERE name = ? AND agent_id = ?",
+                        (name, self._agent_id),
+                    )
+                    deleted_persisted_row = True
             except Exception as exc:
                 logger.warning("WebhookFeature: failed to delete from DB: %s", exc)
+                delete_failed = True
 
-        if removed:
-            return {"success": True, "name": name, "status": "removed"}
-        else:
-            return {"success": False, "error": f"Webhook '{name}' not found"}
+        if not removed_from_memory and not deleted_persisted_row and not delete_failed:
+            return ToolResult.failed(error=f"Webhook '{name}' not found")
+
+        # When nothing was actually removed (neither receiver nor DB
+        # row was touched) but the DB probe blew up, we DO NOT know
+        # whether the webhook exists. Reporting "removed" in that
+        # state would be a lie — it's possible a persisted row is
+        # still there, and the user thinks they cleaned it up.
+        # Codex round 2 of #1126 caught this.
+        if delete_failed and not removed_from_memory and not deleted_persisted_row:
+            return ToolResult.failed(
+                error=(
+                    f"Could not remove webhook '{name}': not loaded in the "
+                    "receiver and the DB lookup against webhook_config "
+                    "failed; the persisted row (if any) is still there. "
+                    "Retry once the database is reachable."
+                ),
+                data={
+                    "name": name,
+                    "removed_from_memory": False,
+                    "deleted_from_db": False,
+                    "db_lookup_failed": True,
+                },
+            )
+
+        data = {
+            "name": name,
+            "status": "removed",
+            "removed_from_memory": removed_from_memory,
+            "deleted_from_db": deleted_persisted_row,
+        }
+        confirmation = f"Webhook '{name}' removed."
+
+        if delete_failed:
+            # Receiver removed it (since we got past the failed-only
+            # check above), but the DB DELETE didn't land — the row
+            # could resurrect on restart.
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "the receiver forgot this webhook but the DB DELETE for "
+                    "webhook_config failed — a restart could resurrect it "
+                    "from the persisted row."
+                ),
+                data=data,
+            )
+        if not removed_from_memory and deleted_persisted_row:
+            # Persisted-only cleanup — the receiver never had this
+            # webhook in this process. Surface that so the LLM doesn't
+            # claim it was actively serving requests right before the
+            # remove.
+            return ToolResult.partial(
+                confirmation,
+                (
+                    f"webhook '{name}' was not loaded in the in-memory "
+                    "receiver; cleaned up a stale row from webhook_config."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
 
     # ------------------------------------------------------------------
     # Audit logging
