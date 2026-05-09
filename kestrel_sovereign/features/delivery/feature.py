@@ -23,6 +23,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.delivery.queue import DeliveryQueue
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -108,28 +109,50 @@ class DeliveryFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!delivery status",
     )
-    async def delivery_status(self) -> Dict[str, Any]:
+    async def delivery_status(self) -> ToolResult:
         """
         Show current delivery queue status.
 
         Returns:
-            Dict with message counts by status and overall queue health.
+            ToolResult.ok with counts + total + queue_healthy flag.
+            PARTIAL when the dead-letter queue is non-empty (the
+            queue is operating, but messages have permanently failed
+            and the LLM should speak that). ERROR when the queue is
+            not available (no DB attached) or the count query raises.
         """
         if not self._queue:
-            return {"success": False, "error": "Delivery queue not available"}
+            return ToolResult.failed(error="Delivery queue not available")
 
         try:
             counts = await self._queue.get_status_counts()
             total = sum(counts.values())
-            return {
+            dead = counts.get("dead_letter", 0)
+            healthy = dead == 0
+            data = {
                 "agent_id": self._agent_id,
                 "counts": counts,
                 "total": total,
-                "queue_healthy": counts.get("dead_letter", 0) == 0,
+                "queue_healthy": healthy,
             }
+            confirmation = (
+                f"Delivery queue: {total} message(s) "
+                + ", ".join(f"{k}={v}" for k, v in counts.items())
+                + "."
+            )
+            if not healthy:
+                return ToolResult.partial(
+                    confirmation,
+                    (
+                        f"{dead} message(s) in dead_letter — they exhausted "
+                        "max_retries and will NOT be delivered without a "
+                        "manual !delivery retry."
+                    ),
+                    data=data,
+                )
+            return ToolResult.ok(confirmation, data=data)
         except Exception as e:
             logger.error("Failed to get delivery status: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
 
     @tool(
         "delivery_queue_list",
@@ -137,7 +160,7 @@ class DeliveryFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!delivery queue",
     )
-    async def delivery_queue_list(self, limit: int = 20) -> Dict[str, Any]:
+    async def delivery_queue_list(self, limit: int = 20) -> ToolResult:
         """
         List pending and retryable messages.
 
@@ -145,20 +168,24 @@ class DeliveryFeature(Feature):
             limit: Maximum number of entries to return (default: 20)
 
         Returns:
-            Dict with list of pending queue entries.
+            ToolResult.ok with the list of pending queue entries;
+            ERROR when the queue is not available or the query raises.
         """
         if not self._queue:
-            return {"success": False, "error": "Delivery queue not available"}
+            return ToolResult.failed(error="Delivery queue not available")
 
         try:
             entries = await self._queue.get_pending_entries(limit=limit)
-            return {
-                "entries": [e.to_dict() for e in entries],
-                "count": len(entries),
-            }
+            return ToolResult.ok(
+                f"Returned {len(entries)} pending delivery entry(ies).",
+                data={
+                    "entries": [e.to_dict() for e in entries],
+                    "count": len(entries),
+                },
+            )
         except Exception as e:
             logger.error("Failed to list delivery queue: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
 
     @tool(
         "delivery_failed",
@@ -166,7 +193,7 @@ class DeliveryFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!delivery failed",
     )
-    async def delivery_failed(self, limit: int = 20) -> Dict[str, Any]:
+    async def delivery_failed(self, limit: int = 20) -> ToolResult:
         """
         List messages in the dead letter queue.
 
@@ -174,20 +201,25 @@ class DeliveryFeature(Feature):
             limit: Maximum number of entries to return (default: 20)
 
         Returns:
-            Dict with list of dead letter entries.
+            ToolResult.ok with dead-letter entries (empty list is the
+            healthy case); ERROR when the queue is not available or
+            the query raises.
         """
         if not self._queue:
-            return {"success": False, "error": "Delivery queue not available"}
+            return ToolResult.failed(error="Delivery queue not available")
 
         try:
             entries = await self._queue.get_dead_letter_entries(limit=limit)
-            return {
-                "entries": entries,
-                "count": len(entries),
-            }
+            return ToolResult.ok(
+                f"Returned {len(entries)} dead-letter entry(ies).",
+                data={
+                    "entries": entries,
+                    "count": len(entries),
+                },
+            )
         except Exception as e:
             logger.error("Failed to list dead letter queue: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
 
     @tool(
         "delivery_retry",
@@ -195,7 +227,7 @@ class DeliveryFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!delivery retry",
     )
-    async def delivery_retry(self, message_id: str) -> Dict[str, Any]:
+    async def delivery_retry(self, message_id: str) -> ToolResult:
         """
         Manually retry a failed or dead-lettered message.
 
@@ -203,16 +235,39 @@ class DeliveryFeature(Feature):
             message_id: The queue entry ID or dead-letter ID to retry
 
         Returns:
-            Dict with retry status.
+            ToolResult.ok when the queue accepted the retry request;
+            ERROR when the queue is not available, the entry isn't
+            found, the message is already delivered or in flight, or
+            the queue raised. The underlying ``DeliveryQueue.retry``
+            returns ``{"success": True/False, ...}``; we route those
+            into OK / ERROR accordingly so callers don't have to
+            keep grepping a stringly-typed shape.
         """
         if not self._queue:
-            return {"success": False, "error": "Delivery queue not available"}
+            return ToolResult.failed(error="Delivery queue not available")
 
         try:
-            return await self._queue.retry(message_id)
+            payload = await self._queue.retry(message_id)
         except Exception as e:
             logger.error("Failed to retry delivery %s: %s", message_id, e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
+
+        # ``DeliveryQueue.retry`` returns the legacy
+        # ``{"success": ..., "error"?: ..., ...}`` shape; map it onto
+        # the envelope without dropping any caller-visible fields.
+        if not isinstance(payload, dict):
+            return ToolResult.ok(
+                f"Retried delivery for {message_id}.",
+                data={"message_id": message_id, "raw": payload},
+            )
+        if payload.get("success"):
+            confirmation = (
+                f"Queued retry for delivery {message_id}"
+                + (f" ({payload['status']})." if payload.get("status") else ".")
+            )
+            return ToolResult.ok(confirmation, data=payload)
+        err = payload.get("error") or f"Could not retry delivery {message_id}"
+        return ToolResult.failed(error=err, data=payload)
 
     @tool(
         "delivery_purge",
@@ -220,7 +275,7 @@ class DeliveryFeature(Feature):
         category=ToolCategory.COMMUNICATION,
         command_prefix="!delivery purge",
     )
-    async def delivery_purge(self, older_than_hours: int = 24) -> Dict[str, Any]:
+    async def delivery_purge(self, older_than_hours: int = 24) -> ToolResult:
         """
         Purge delivered messages older than the specified threshold.
 
@@ -228,18 +283,18 @@ class DeliveryFeature(Feature):
             older_than_hours: Remove entries delivered more than this many hours ago (default: 24)
 
         Returns:
-            Dict with the number of entries purged.
+            ToolResult.ok with the count purged. ERROR when the queue
+            is not available or the purge raises.
         """
         if not self._queue:
-            return {"success": False, "error": "Delivery queue not available"}
+            return ToolResult.failed(error="Delivery queue not available")
 
         try:
             purged = await self._queue.purge_delivered(older_than_hours=older_than_hours)
-            return {
-                "success": True,
-                "purged": purged,
-                "older_than_hours": older_than_hours,
-            }
+            return ToolResult.ok(
+                f"Purged {purged} delivered message(s) older than {older_than_hours}h.",
+                data={"purged": purged, "older_than_hours": older_than_hours},
+            )
         except Exception as e:
             logger.error("Failed to purge delivered messages: %s", e)
-            return {"success": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))

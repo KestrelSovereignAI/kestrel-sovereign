@@ -347,6 +347,7 @@ class TestDeliveryStatusTool:
 
     @pytest.mark.asyncio
     async def test_status_returns_counts(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._queue.get_status_counts = AsyncMock(return_value={
             "pending": 3,
             "in_flight": 1,
@@ -354,13 +355,16 @@ class TestDeliveryStatusTool:
             "failed": 2,
             "dead_letter": 0,
         })
-        result = await feature.delivery_status()
+        envelope = await feature.delivery_status()
+        assert envelope.status is ToolResultStatus.OK
+        result = envelope.data
         assert result["counts"]["pending"] == 3
         assert result["total"] == 16
         assert result["queue_healthy"] is True
 
     @pytest.mark.asyncio
     async def test_status_unhealthy_with_dead_letters(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._queue.get_status_counts = AsyncMock(return_value={
             "pending": 0,
             "in_flight": 0,
@@ -368,14 +372,19 @@ class TestDeliveryStatusTool:
             "failed": 0,
             "dead_letter": 2,
         })
-        result = await feature.delivery_status()
-        assert result["queue_healthy"] is False
+        envelope = await feature.delivery_status()
+        # Dead-letter > 0 surfaces as PARTIAL (queue is operating but
+        # messages have permanently failed).
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["queue_healthy"] is False
+        assert "dead_letter" in envelope.error
 
     @pytest.mark.asyncio
     async def test_status_no_queue(self, feature_no_db):
-        result = await feature_no_db.delivery_status()
-        assert result["success"] is False
-        assert "not available" in result["error"].lower()
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature_no_db.delivery_status()
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not available" in envelope.error.lower()
 
 
 # =========================================================================
@@ -388,9 +397,9 @@ class TestDeliveryQueueList:
     @pytest.mark.asyncio
     async def test_list_empty(self, feature):
         feature._queue.get_pending_entries = AsyncMock(return_value=[])
-        result = await feature.delivery_queue_list()
-        assert result["entries"] == []
-        assert result["count"] == 0
+        envelope = await feature.delivery_queue_list()
+        assert envelope.data["entries"] == []
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_list_returns_entries(self, feature):
@@ -402,14 +411,15 @@ class TestDeliveryQueueList:
             created_at="2026-01-01T00:00:00", delivered_at=None,
         )
         feature._queue.get_pending_entries = AsyncMock(return_value=[entry])
-        result = await feature.delivery_queue_list()
-        assert result["count"] == 1
-        assert result["entries"][0]["id"] == "e1"
+        envelope = await feature.delivery_queue_list()
+        assert envelope.data["count"] == 1
+        assert envelope.data["entries"][0]["id"] == "e1"
 
     @pytest.mark.asyncio
     async def test_list_no_queue(self, feature_no_db):
-        result = await feature_no_db.delivery_queue_list()
-        assert result["success"] is False
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature_no_db.delivery_queue_list()
+        assert envelope.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -422,9 +432,9 @@ class TestDeliveryFailed:
     @pytest.mark.asyncio
     async def test_failed_empty(self, feature):
         feature._queue.get_dead_letter_entries = AsyncMock(return_value=[])
-        result = await feature.delivery_failed()
-        assert result["entries"] == []
-        assert result["count"] == 0
+        envelope = await feature.delivery_failed()
+        assert envelope.data["entries"] == []
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_failed_returns_entries(self, feature):
@@ -440,14 +450,15 @@ class TestDeliveryFailed:
             "created_at": "2026-01-01T00:00:00",
         }
         feature._queue.get_dead_letter_entries = AsyncMock(return_value=[dl_entry])
-        result = await feature.delivery_failed()
-        assert result["count"] == 1
-        assert result["entries"][0]["error"] == "Connection refused"
+        envelope = await feature.delivery_failed()
+        assert envelope.data["count"] == 1
+        assert envelope.data["entries"][0]["error"] == "Connection refused"
 
     @pytest.mark.asyncio
     async def test_failed_no_queue(self, feature_no_db):
-        result = await feature_no_db.delivery_failed()
-        assert result["success"] is False
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature_no_db.delivery_failed()
+        assert envelope.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -459,27 +470,32 @@ class TestDeliveryRetry:
 
     @pytest.mark.asyncio
     async def test_retry_success(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._queue.retry = AsyncMock(return_value={
             "success": True,
             "entry_id": "e1",
             "status": "queued_for_retry",
         })
-        result = await feature.delivery_retry(message_id="e1")
-        assert result["success"] is True
+        envelope = await feature.delivery_retry(message_id="e1")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["entry_id"] == "e1"
 
     @pytest.mark.asyncio
     async def test_retry_not_found(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._queue.retry = AsyncMock(return_value={
             "success": False,
             "error": "Entry e1 not found",
         })
-        result = await feature.delivery_retry(message_id="e1")
-        assert result["success"] is False
+        envelope = await feature.delivery_retry(message_id="e1")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not found" in envelope.error
 
     @pytest.mark.asyncio
     async def test_retry_no_queue(self, feature_no_db):
-        result = await feature_no_db.delivery_retry(message_id="e1")
-        assert result["success"] is False
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature_no_db.delivery_retry(message_id="e1")
+        assert envelope.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
@@ -491,23 +507,25 @@ class TestDeliveryPurge:
 
     @pytest.mark.asyncio
     async def test_purge_success(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._queue.purge_delivered = AsyncMock(return_value=5)
-        result = await feature.delivery_purge()
-        assert result["success"] is True
-        assert result["purged"] == 5
-        assert result["older_than_hours"] == 24
+        envelope = await feature.delivery_purge()
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["purged"] == 5
+        assert envelope.data["older_than_hours"] == 24
 
     @pytest.mark.asyncio
     async def test_purge_custom_hours(self, feature):
         feature._queue.purge_delivered = AsyncMock(return_value=2)
-        result = await feature.delivery_purge(older_than_hours=48)
-        assert result["purged"] == 2
-        assert result["older_than_hours"] == 48
+        envelope = await feature.delivery_purge(older_than_hours=48)
+        assert envelope.data["purged"] == 2
+        assert envelope.data["older_than_hours"] == 48
 
     @pytest.mark.asyncio
     async def test_purge_no_queue(self, feature_no_db):
-        result = await feature_no_db.delivery_purge()
-        assert result["success"] is False
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature_no_db.delivery_purge()
+        assert envelope.status is ToolResultStatus.ERROR
 
 
 # =========================================================================
