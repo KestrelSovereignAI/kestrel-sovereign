@@ -1,6 +1,6 @@
 # Kestrel Workflows Feature — Architecture Design
 
-> Draft v3.3. Pre-filing. Revised after four review rounds (v1→v2 flipped the engine; v2→v3 hardened conformance / idempotency / leases / attestation / budgets; v3→v3.1 closed round-3 inline fixes; v3.1→v3.2 added Talon-aware constitutional injection §3.8; v3.2→v3.3 closed codex round-4 internal-consistency P2s). All changelogs in the appendix.
+> Draft v3.4. Filed as epic #1131. Revised after four review rounds + a load-bearing user correction on SQLite-default (v1→v2 flipped the engine; v2→v3 hardened conformance / idempotency / leases / attestation / budgets; v3→v3.1 closed round-3 inline fixes; v3.1→v3.2 added Talon-aware constitutional injection §3.8; v3.2→v3.3 closed codex round-4 internal-consistency P2s; v3.3→v3.4 removed every "drop SQLite, mandate Postgres" escape hatch — SQLite-default is non-negotiable). All changelogs in the appendix.
 
 ## Executive Summary
 
@@ -460,13 +460,21 @@ CREATE INDEX ON workflow_signals (run_id, stage, signal_name) WHERE consumed_at 
 - [ ] **Stress test 2 — fan-out under WAL contention (SQLite):** 30 parallel subworkflows, 50 stage_events/sec each, no deadlocks, no signal loss
 - [ ] **Stress test 3 — listener death:** kill the sole listener process between poll and consume; verify lease expires and a new listener resumes the run cleanly
 - [ ] **Stress test 4 — claim-and-crash:** worker claims a run, crashes mid-stage; lease expires; second worker reclaims; only one wins
-- [ ] **Latency budget:** p99 signal-arrival-to-wakeup latency ≤ 2s for SQLite poll-based, ≤ 200ms for Postgres LISTEN/NOTIFY. If unmet, downgrade SQLite to a documented "small-deployment" tier.
+- [ ] **Latency budget (per-backend tier, both supported):** p99 signal-arrival-to-wakeup latency ≤ 2s on SQLite poll-based, ≤ 200ms on Postgres LISTEN/NOTIFY. Both tiers ship; both are documented honestly. If a budget can't be met, the budget is revised (with rationale) — SQLite support is not removed.
 - [ ] **Concurrent-runs ceiling:** measure throughput; document the per-backend ceiling above which the operator gets a startup warning
 
 **Kill criteria (decided at end of week):**
-- If `StorageAdapter` cannot pass conformance + Stress 1–4 on SQLite, SQLite support is dropped, the Workflows feature mandates Postgres, and we revisit DBOS-as-primary.
-- If `DBOSAdapter` cannot pass the conformance contract, it's cut from Phase 1 (no relaxing the contract to fit DBOS — that breaks the swap-out story).
-- If both pass on Postgres but SQLite-StorageAdapter only passes a subset, we ship SQLite as a documented "small-deployment" tier with explicit limits.
+
+SQLite-default is non-negotiable for kestrel-feature-* packages (see memory `feedback_sqlite_non_negotiable.md`); "drop SQLite, mandate Postgres" is **not** on the kill list. If `StorageAdapter` cannot satisfy a particular invariant on SQLite with the same semantics as Postgres, the resolution is one of:
+
+- **Relax the invariant on the SQLite tier with documented trade-offs** (e.g., "`INV_4_signal_durable` holds on both backends; signal-arrival p99 latency budget is ≤ 200ms on Postgres LISTEN/NOTIFY, ≤ 2s on SQLite poll-based"). Both tiers ship, both work, both are documented honestly.
+- **Change the mechanism** to one that works on both backends (e.g., short-poll instead of LISTEN/NOTIFY for the SQLite path; the conformance test is the same shape, only the implementation differs).
+- **Change the invariant's wording** if it was Postgres-shaped and an equivalent SQLite-shaped invariant exists.
+
+The actual kill paths:
+
+- If `DBOSAdapter` cannot pass the conformance contract, it's cut from Phase 1 (no relaxing the contract to fit DBOS — that breaks the swap-out story). DBOSAdapter is optional acceleration; cutting it does not affect SQLite-default deployments.
+- If `StorageAdapter` cannot satisfy an invariant on either backend with any of the three resolutions above, the design returns to the drawing board on that invariant — we revise §2.3 before Phase 1 starts. The Workflows feature does not ship until the conformance contract holds on both backends.
 
 ### Phase 1 — Foundation
 
@@ -562,7 +570,7 @@ The FeatureFeature pipeline is the right pilot because:
 
 ## 8. Open Questions
 
-1. **`StorageAdapter` SQLite latency under sustained fan-out.** Phase-0 stress tests resolve the kill-or-tier question. The "≤ a few hundred runs" claim is replaced by whatever the spike measures; if SQLite cannot meet the documented latency budget, it ships as a "small-deployment tier" with hard ceilings or is dropped.
+1. **`StorageAdapter` SQLite latency under sustained fan-out.** Phase-0 stress tests measure the actual numbers; the documented latency budget gets revised to what the spike measures, with both backends shipping at their respective tiers. SQLite is not optional for the Workflows feature — see memory `feedback_sqlite_non_negotiable.md`.
 2. **Where do workflow definitions live?** In each consuming feature's package, or in a shared `kestrel-workflows-stdlib`? Lean: each consuming feature owns its definitions; this package only provides primitives. Resolved: lean is the answer unless a v1 consumer pushes back.
 3. **Reviewer attestation registry storage.** Two viable locations: (a) per-agent in the existing `features/identity/` attestation tables; (b) a fleet-wide registry in Castle/kestrel-claws. Lean: (a) for sovereign solos, (b) for managed fleets — the schema is the same, the storage layer is pluggable.
 4. **Determining `read_only=True` automatically.** §3.5 says the runner instruments stages declared `read_only=True` to verify they made no DB writes outside `workflow_*` tables. Mechanism is open: trigger-based (Postgres) vs. write-counter shim (both backends). Resolve in Phase 1.
@@ -574,7 +582,7 @@ The FeatureFeature pipeline is the right pilot because:
 | Risk | Mitigation |
 |---|---|
 | `StorageAdapter` durability semantics weaker than DBOS in subtle ways | Conformance test suite; DBOSAdapter as the second implementation forces the abstraction honest |
-| Pause-for-days on SQLite via polling has unacceptable latency | Spike-confirmed in Phase 0; if untenable, kill SQLite support and require Postgres |
+| Pause-for-days on SQLite via polling has unacceptable latency | Phase 0 measures actual numbers; latency budget is documented per-backend (SQLite tier ≤ 2s p99 today, revisable up if needed). SQLite support is not removed; if a budget can't be met, the design or the budget is revised. |
 | `red_team_clear` reviewer attestation registry becomes the new single point of trust | Registry entries are themselves DID-signed; rotation policy defined at registry creation |
 | Prompt-injection defense bypassed by future LLM behaviors | Canary-echo requirement is structural, not pattern-based; quote-fence + JSON-only response further narrows the attack surface |
 | Adapter interface leaks engine-isms | Conformance test suite catches divergence; second adapter from day one |
@@ -623,6 +631,16 @@ Round-3 review verdict was FILE; the following residual findings became sub-issu
 - **L3 — `read_only=True` mechanism.** Trigger-based vs. write-counter shim; closed in Phase 1. Promote to sub-issue.
 - **C2 follow-up — Provider signed-response receipts.** Upgrade hosted-model attestation when major providers ship them. Sub-issue.
 - **Talon integration upgrade.** Replace Talon's module-scoped `_CONSTITUTION_CACHE` with a `WorkflowStageContext`-backed loader so Talon and the workflow runner share one constitution-injection path; backport hash-verified injection, priority-ordered truncation, recursive ref-resolution, and `constitution_echo_verified` to standalone Talon runs. Sub-issue.
+
+### v3.3 → v3.4 changelog (SQLite-default doctrine correction)
+
+User caught a load-bearing wrong escape hatch in v3.3: Phase 0 kill criteria, Risks table, and an Open Question all listed "drop SQLite, mandate Postgres" or "small-deployment tier" as fallbacks. SQLite is Kestrel's default backend (`server.py:304`); kestrel-feature-* packages MUST work on SQLite. The kill option doesn't exist.
+
+- **§6 Phase 0 kill criteria:** rewrote. SQLite-default is non-negotiable. If a `StorageAdapter` invariant can't hold on SQLite with the same semantics as Postgres, the resolution is one of: (a) relax the invariant on the SQLite tier with documented trade-offs; (b) change the mechanism to one that works on both; (c) revise the invariant's wording. "Mandate Postgres" is not on the list. The actual kill paths: `DBOSAdapter` cut if it can't satisfy the contract (it's optional acceleration), and the design returns to the drawing board if no resolution holds on either backend.
+- **§6 Phase 0 latency budget:** rewrote as per-backend tier with both shipping; budget gets revised, support does not get dropped.
+- **§8 Open Q1:** rewrote — Phase 0 measures actual numbers; both backends ship at their respective tiers; SQLite is not optional. Linked to the new memory `feedback_sqlite_non_negotiable.md`.
+- **§9 Risks table:** rewrote the SQLite-latency row — no "kill SQLite support" path; budget or design gets revised.
+- **Memory added:** `feedback_sqlite_non_negotiable.md` so this doctrine sticks across sessions.
 
 ### v3.2 → v3.3 changelog (codex round 4 P2 internal-consistency fixes)
 
