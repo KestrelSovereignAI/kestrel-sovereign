@@ -214,7 +214,8 @@ class TestToolRegistration:
 class TestListVoices:
     @pytest.mark.asyncio
     async def test_list_all_voices(self, feature):
-        result = await feature.list_voices()
+        envelope = await feature.list_voices()
+        result = envelope.data
         assert result["count"] == 3  # 2 local + 1 cloud
         ids = [v["voice_id"] for v in result["voices"]]
         assert "local-v1" in ids
@@ -222,7 +223,8 @@ class TestListVoices:
 
     @pytest.mark.asyncio
     async def test_filter_by_provider(self, feature):
-        result = await feature.list_voices(provider="fake_local")
+        envelope = await feature.list_voices(provider="fake_local")
+        result = envelope.data
         assert result["count"] == 2
         assert all(v["provider"] == "fake_local" for v in result["voices"])
 
@@ -230,7 +232,8 @@ class TestListVoices:
     async def test_privacy_filters_cloud(self, feature):
         """Cloud voices hidden when privacy blocks cloud."""
         feature.agent.privacy_agent.can_use_cloud.return_value = False
-        result = await feature.list_voices()
+        envelope = await feature.list_voices()
+        result = envelope.data
         providers = {v["provider"] for v in result["voices"]}
         assert "fake_cloud" not in providers
         assert result["count"] == 2  # only local voices
@@ -243,40 +246,45 @@ class TestListVoices:
 class TestSetVoice:
     @pytest.mark.asyncio
     async def test_set_known_voice(self, feature):
-        result = await feature.set_voice(voice_id="nova")
-        assert result["success"] is True
-        assert result["voice_id"] == "nova"
-        assert result["provider"] == "fake_cloud"
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.set_voice(voice_id="nova")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["voice_id"] == "nova"
+        assert envelope.data["provider"] == "fake_cloud"
         assert feature._voice_config.tts_voice_id == "nova"
         assert feature._voice_config.tts_provider == "fake_cloud"
 
     @pytest.mark.asyncio
     async def test_set_voice_explicit_provider(self, feature):
-        result = await feature.set_voice(voice_id="local-v1", provider="fake_local")
-        assert result["success"] is True
-        assert result["provider"] == "fake_local"
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.set_voice(voice_id="local-v1", provider="fake_local")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["provider"] == "fake_local"
 
     @pytest.mark.asyncio
     async def test_set_unknown_voice(self, feature):
-        result = await feature.set_voice(voice_id="nonexistent")
-        assert result["success"] is False
-        assert "not find" in result["error"].lower()
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.set_voice(voice_id="nonexistent")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not find" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_set_cloud_voice_blocked_by_privacy(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature.agent.privacy_agent.can_use_cloud.return_value = False
-        result = await feature.set_voice(voice_id="nova", provider="fake_cloud")
-        assert result["success"] is False
-        assert "privacy" in result["error"].lower()
+        envelope = await feature.set_voice(voice_id="nova", provider="fake_cloud")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "privacy" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_set_voice_persists_to_identity(self):
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = _make_agent(has_identity=True, voice_config_dict={})
         f = VoiceFeature(agent)
         f._voice_registry = _make_registry()
         f._voice_config = VoiceConfig()
-        result = await f.set_voice(voice_id="nova")
-        assert result["success"] is True
+        envelope = await f.set_voice(voice_id="nova")
+        assert envelope.status is ToolResultStatus.OK
         assert agent.identity.voice_config["tts_voice_id"] == "nova"
 
 
@@ -287,10 +295,12 @@ class TestSetVoice:
 class TestSpeak:
     @pytest.mark.asyncio
     async def test_speak_returns_metadata(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._voice_config.tts_voice_id = "local-v1"
         feature._voice_config.tts_provider = "fake_local"
-        result = await feature.speak(text="Hello world")
-        assert result["success"] is True
+        envelope = await feature.speak(text="Hello world")
+        assert envelope.status is ToolResultStatus.OK
+        result = envelope.data
         assert result["content_hash"] == "sha256_abc123"
         assert result["voice_id"] == "local-v1"
         assert result["provider"] == "fake_local"
@@ -300,11 +310,12 @@ class TestSpeak:
     @pytest.mark.asyncio
     async def test_speak_auto_selects_voice(self, feature):
         """When no voice_id is set, pick the first available."""
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._voice_config.tts_provider = "fake_local"
         feature._voice_config.tts_voice_id = ""
-        result = await feature.speak(text="Auto voice")
-        assert result["success"] is True
-        assert result["voice_id"] == "local-v1"
+        envelope = await feature.speak(text="Auto voice")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["voice_id"] == "local-v1"
 
     @pytest.mark.asyncio
     async def test_speak_stores_via_storage(self, feature):
@@ -317,14 +328,20 @@ class TestSpeak:
         assert "speech" in call_args[0][1]
 
     @pytest.mark.asyncio
-    async def test_speak_no_storage_warns(self):
+    async def test_speak_no_storage_returns_partial(self):
+        """Synthesis succeeded but the audio is in memory only — the
+        non-ephemeral storage policy expected a content_hash and got
+        none, so subsequent retrieval will 404. Surface PARTIAL.
+        """
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = _make_agent(has_storage=False)
         f = VoiceFeature(agent)
         f._voice_registry = _make_registry()
         f._voice_config = VoiceConfig(tts_provider="fake_local", tts_voice_id="local-v1")
-        result = await f.speak(text="No storage")
-        assert result["success"] is True
-        assert result["content_hash"] == ""
+        envelope = await f.speak(text="No storage")
+        assert envelope.status is ToolResultStatus.PARTIAL
+        assert envelope.data["content_hash"] == ""
+        assert "not persisted" in envelope.error
 
     @pytest.mark.asyncio
     async def test_speak_blocked_by_privacy(self):
@@ -344,28 +361,31 @@ class TestSpeak:
 class TestTranscribe:
     @pytest.mark.asyncio
     async def test_transcribe_success(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature._voice_config.stt_provider = "fake_local_stt"
-        result = await feature.transcribe(audio_content_hash="hash123")
-        assert result["success"] is True
-        assert result["text"] == "transcribed text from local"
-        assert result["provider"] == "fake_local_stt"
+        envelope = await feature.transcribe(audio_content_hash="hash123")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["text"] == "transcribed text from local"
+        assert envelope.data["provider"] == "fake_local_stt"
 
     @pytest.mark.asyncio
     async def test_transcribe_file_not_found(self, feature):
+        from kestrel_sdk.tools.result import ToolResultStatus
         feature.agent.storage.retrieve_file = AsyncMock(return_value=None)
-        result = await feature.transcribe(audio_content_hash="missing")
-        assert result["success"] is False
-        assert "not found" in result["error"].lower()
+        envelope = await feature.transcribe(audio_content_hash="missing")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not found" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_transcribe_no_storage(self):
+        from kestrel_sdk.tools.result import ToolResultStatus
         agent = _make_agent(has_storage=False)
         f = VoiceFeature(agent)
         f._voice_registry = _make_registry()
         f._voice_config = VoiceConfig()
-        result = await f.transcribe(audio_content_hash="hash123")
-        assert result["success"] is False
-        assert "storage" in result["error"].lower()
+        envelope = await f.transcribe(audio_content_hash="hash123")
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "storage" in envelope.error.lower()
 
     @pytest.mark.asyncio
     async def test_transcribe_blocked_by_privacy(self):
