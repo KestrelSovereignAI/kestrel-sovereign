@@ -33,6 +33,17 @@ _HASH_PATTERN = r"^[0-9a-f]{64}$"
 # Lenient identifier pattern matching ``models._NAME_RE``.
 _NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$"
 
+# Source-reference pattern matching ``models._SOURCE_NAME_RE`` — wider
+# than ``_NAME_PATTERN`` because the design's ``agent.<did>`` source
+# names embed DIDs containing ``:``, ``@``, ``%``, ``+``.
+_SOURCE_NAME_PATTERN = r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$"
+
+# Pattern requiring at least one non-whitespace char anywhere in the
+# value. Schema's ``minLength: 1`` counts whitespace, but the dataclass
+# rejects whitespace-only via ``.strip()`` — round-10 P2 schema/model
+# parity. Use this wherever the dataclass strips before checking length.
+_NON_WHITESPACE_PATTERN = r"\S"
+
 
 def _gate_schema() -> dict[str, Any]:
     # Codex round 2 P2: mirror the dataclass's per-type required-params
@@ -63,6 +74,10 @@ def _gate_schema() -> dict[str, Any]:
                                 "prompt_pack_constraint": {
                                     "type": "string",
                                     "minLength": 1,
+                                    # Reject whitespace-only values so
+                                    # the schema matches Gate's
+                                    # ``not constraint.strip()`` check.
+                                    "pattern": _NON_WHITESPACE_PATTERN,
                                 },
                             },
                         },
@@ -116,14 +131,24 @@ def _stage_schema() -> dict[str, Any]:
         "required": ["name", "signal_source", "signal_mode", "compensate"],
         "properties": {
             "name": {"type": "string", "pattern": _NAME_PATTERN},
-            "signal_source": {"type": "string", "pattern": _NAME_PATTERN},
+            "signal_source": {
+                "type": "string",
+                # Source references use the wider source-name vocabulary
+                # so DID-bearing patterns like ``agent.did:web:k.example``
+                # validate at the wire boundary too (round 10 P2).
+                "pattern": _SOURCE_NAME_PATTERN,
+            },
             "signal_mode": {
                 "type": "string",
                 "enum": [m.value for m in SignalMode],
             },
             "params": {"type": "object"},
             "gate": _gate_schema(),
-            "compensate": {"type": "string", "minLength": 1},
+            "compensate": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": _NON_WHITESPACE_PATTERN,
+            },
             "forbidden_modules": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -292,7 +317,11 @@ def _trigger_schema() -> dict[str, Any]:
                 "required": ["kind", "cron_expression"],
                 "properties": {
                     "kind": {"const": TriggerKind.CRON.value},
-                    "cron_expression": {"type": "string", "minLength": 1},
+                    "cron_expression": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": _NON_WHITESPACE_PATTERN,
+                    },
                     "params": {"type": "object"},
                 },
             },
@@ -303,7 +332,7 @@ def _trigger_schema() -> dict[str, Any]:
                     "kind": {"const": TriggerKind.SIGNAL_SOURCE.value},
                     "signal_source": {
                         "type": "string",
-                        "pattern": _NAME_PATTERN,
+                        "pattern": _SOURCE_NAME_PATTERN,
                     },
                     "params": {"type": "object"},
                 },

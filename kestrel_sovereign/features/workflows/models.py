@@ -149,6 +149,17 @@ assert {s.value for s in GateOutcome} == _GATE_OUTCOMES
 
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
+
+# Source-reference names (Stage.signal_source, Edge.subworkflow_name when
+# the value is also used as a source name, Trigger.signal_source) are
+# more permissive than workflow / stage names because the design's
+# `agent.<did>` pattern embeds DIDs containing ``:``, ``@``, ``%``, etc.
+# Round 10 P2: rejecting these blocks legitimate registered source
+# names. SourceRegistry itself only requires non-empty + no whitespace;
+# we mirror that here while still demanding a leading alphanum (to
+# prevent control-char garbage at the start).
+_SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$")
+
 # Lowercase hex sha256 digest, 64 chars; mirrors signing-side helpers and the
 # JSON Schema `_HASH_PATTERN`.
 _IDEMPOTENCY_KEY_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -195,6 +206,18 @@ def _validate_name(label: str, name: str) -> None:
         raise WorkflowDefinitionError(
             f"{label} must be a non-empty identifier matching "
             f"{_NAME_RE.pattern!r}, got {name!r}"
+        )
+
+
+def _validate_source_name(label: str, name: str) -> None:
+    """Source references (Stage.signal_source, Trigger.signal_source,
+    Stage.compensate when it is a source name) accept the wider source-
+    name vocabulary, which includes DID-bearing patterns like
+    ``agent.did:web:k.example``.
+    """
+    if not isinstance(name, str) or not _SOURCE_NAME_RE.match(name):
+        raise WorkflowDefinitionError(
+            f"{label} must match {_SOURCE_NAME_RE.pattern!r}, got {name!r}"
         )
 
 
@@ -328,7 +351,7 @@ class Stage:
 
     def __post_init__(self) -> None:
         _validate_name("stage.name", self.name)
-        _validate_name("stage.signal_source", self.signal_source)
+        _validate_source_name("stage.signal_source", self.signal_source)
         object.__setattr__(self, "signal_mode", _coerce_signal_mode(self.signal_mode))
 
         if not isinstance(self.params, Mapping):
@@ -727,7 +750,9 @@ class Trigger:
                     "trigger.kind=cron must not set signal_source"
                 )
         elif self.kind == TriggerKind.SIGNAL_SOURCE:
-            _validate_name("trigger.signal_source", self.signal_source or "")
+            _validate_source_name(
+                "trigger.signal_source", self.signal_source or ""
+            )
             if self.cron_expression is not None:
                 raise WorkflowDefinitionError(
                     "trigger.kind=signal_source must not set cron_expression"

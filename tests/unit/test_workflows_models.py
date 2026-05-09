@@ -195,6 +195,24 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_signal_source_accepts_did_bearing_names():
+    """Round 10 P2: design's ``agent.<did>`` pattern embeds DIDs
+    containing ``:``. _NAME_RE rejected these; signal_source uses the
+    wider _SOURCE_NAME_RE."""
+    Stage(
+        name="ask_agent",
+        signal_source="agent.did:web:k.example",
+        signal_mode=SignalMode.COGNITION,
+        compensate="agent.did:web:k.example.compensate",
+    )
+    Stage(
+        name="ask_pkh",
+        signal_source="agent.did:pkh:eip155:1:0xabcdef",
+        signal_mode=SignalMode.COGNITION,
+        compensate="agent.did:pkh:eip155:1:0xabcdef.compensate",
+    )
+
+
 def test_stage_irreversible_requires_record_only_compensate():
     """Round 9 P2: design §3.5 — irreversible stages must use
     compensate_record_only. Any other compensate gives the runner
@@ -916,6 +934,26 @@ def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_rejects_whitespace_only_prompt_pack_constraint():
+    """Round 10 P2: schema/dataclass parity. Schema's minLength counts
+    whitespace; the dataclass's .strip() check rejects "   "."""
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {
+        "type": "red_team_clear",
+        "params": {"prompt_pack_constraint": "   "},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_accepts_did_bearing_signal_source():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["signal_source"] = "agent.did:web:k.example"
+    jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
