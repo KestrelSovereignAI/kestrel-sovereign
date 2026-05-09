@@ -1,8 +1,71 @@
 # Payer Policy Foundation
 
-**Status:** Draft for codex review
-**Branch:** `feat/payer-policy`
+**Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped locally
+**Branch (foundation):** `feat/payer-policy`
+**Branch (sdk):** `feat/payer-policy` (in `kestrel-sovereign-sdk`)
 **Last updated:** 2026-05-09
+
+## Plan stack (single source of truth)
+
+This work has grown into a stack of dependent PRs across two repos.
+The stack as it stands today, top-down:
+
+```
+                       ┌──────────────────────────────────────────┐
+                       │ MAIN PR (kestrel-sovereign):             │
+                       │   Payer Policy Phases 0, 2, 3, 3.5, 4, 5 │
+                       └────────────────────┬─────────────────────┘
+                                            │ depends on
+                       ┌────────────────────┴─────────────────────┐
+                       │ PREREQ-B PR (frinz):                     │
+                       │   Adopt relocated security modules       │
+                       │   (PlatformKeyStorage, UserKeyStorage,   │
+                       │   LayeredKeyResolver) from foundation    │
+                       └────────────────────┬─────────────────────┘
+                                            │ depends on
+                       ┌────────────────────┴─────────────────────┐
+                       │ PREREQ-A PR (kestrel-sovereign):         │
+                       │   Untangle Frinz product code from       │
+                       │   foundation security/ and services/     │
+                       └──────────────────────────────────────────┘
+
+                       ┌──────────────────────────────────────────┐
+                       │ SDK PR (kestrel-sovereign-sdk):          │
+                       │   PayerPolicy primitive (Phase 1)        │
+                       │   — INDEPENDENT — can ship anytime       │
+                       └──────────────────────────────────────────┘
+```
+
+**Why the prereq stack exists.** Survey performed 2026-05-09 (before
+Phase 2 implementation) discovered that `PlatformKeyStorage`,
+`UserKeyStorage`, and `LayeredKeyResolver` — though they live in
+`kestrel_sovereign/security/` and `kestrel_sovereign/services/` — are
+in fact Frinz product code that leaked into the foundation library.
+Their tables (`platform_service_keys`, the rich `user_service_keys`
+shape with `key_salt`/`key_nonce`) are defined in
+`frinz/migrations/020_key_layers.sql`, NOT in foundation CORE_SCHEMA.
+Their backend is `asyncpg.Pool` (PostgreSQL only), violating the
+SQLite-must-work invariant. Their vocabulary (`companion_id`,
+`margin_pct`, `wallet_debit`) is Frinz-shaped.
+
+Adding a PayerPolicy resolver on top of this muddle would either
+duplicate the abstraction or further entangle the boundary. The
+Path-X resolution (per user direction) is to untangle the boundary
+first as a prerequisite, then resume PayerPolicy Phase 2 with a clean
+foundation surface.
+
+## Status snapshot
+
+| Step | Status | Worktree | Tip |
+|---|---|---|---|
+| Plan + 9 codex rounds | done | `/private/tmp/kestrel-payer-policy` | a6ed1db1 |
+| Phase 0 cleanup (5 codex rounds) | done | same | 78d54d2a |
+| Phase 1 SDK primitive (2 codex rounds) | done | `/private/tmp/sdk-payer-policy` | 6f2c7d9 |
+| Survey of existing primitives | done (this doc) | n/a | n/a |
+| Prereq-A foundation untangle | not started | new worktree TBD | — |
+| Prereq-B frinz adoption | not started | new frinz worktree TBD | — |
+| Phase 2 (resolver, on clean foundation) | blocked on prereqs | foundation worktree | — |
+| Phase 3, 3.5, 4, 5 | not started | foundation worktree | — |
 
 ## Problem
 
@@ -369,7 +432,51 @@ exercised.
 **Codex review focus:** schema completeness, serialization stability,
 forward-compat for new resource classes and new payer kinds.
 
-### Phase 2 — `HostKeyStorage` + `PayerResolver` (~1 day)
+### Prereq-A — Untangle Frinz product code from foundation (~1 day, NEW PR)
+
+Discovered post-Phase-1 by survey (see "Plan stack" above). This phase
+ships in its own PR in `kestrel-sovereign`, BEFORE Phase 2 resumes.
+
+- Move out of `kestrel_sovereign/`:
+  - `security/platform_key_storage.py` → Frinz repo (`frinz/security/`)
+  - `security/user_key_storage.py` → Frinz repo (`frinz/security/`)
+  - `services/layered_key_resolver.py` → Frinz repo (`frinz/services/`)
+  - Their unit tests (e.g. [`tests/unit/test_layered_key_resolver.py`][lkr-test]).
+- The foundation `kestrel_sovereign/services/key_resolution.py`
+  (`KeyResolutionService`) stays — it's the genuinely-foundation
+  resolver and is `AsyncDatabase`-based.
+- Foundation CORE_SCHEMA's leaner `user_service_keys` shell stays for
+  now (it does not match Frinz's richer schema, but Frinz's migration
+  layer will continue to apply the rich schema on top of foundation
+  in Frinz deployments).
+- Foundation `agent_service_keys` and the rest are unchanged.
+- This PR REMOVES code, does not add features. Frinz starts breaking
+  on `from kestrel_sovereign.security.* import ...` after merge —
+  that's expected and is what Prereq-B fixes.
+
+**Codex review focus:** every removal is matched by a re-introduction
+in Prereq-B; nothing in foundation tests or production paths still
+imports the moved modules; the foundation README / KEY_MANAGEMENT.md
+docs that referenced them are updated to point at Frinz.
+
+### Prereq-B — Frinz adopts relocated modules (~half day, NEW PR in frinz)
+
+- New `frinz/security/platform_key_storage.py`,
+  `frinz/security/user_key_storage.py`,
+  `frinz/services/layered_key_resolver.py` — verbatim relocation of
+  the modules removed in Prereq-A.
+- `frinz/endpoints/admin_keys.py` and `frinz/endpoints/keys.py`
+  update their import paths.
+- Frinz `migrations/020_key_layers.sql` is unchanged; the schema
+  source-of-truth stays in Frinz.
+- Frinz tests run against the relocated modules.
+- Bumps the foundation pin to a commit that has Prereq-A merged.
+
+**Codex review focus:** every Frinz consumer of the relocated modules
+finds them at the new path; no stale imports of
+`kestrel_sovereign.security.platform_key_storage` remain.
+
+### Phase 2 — `HostKeyStorage` + `PayerResolver` (~1 day; resumes after prereqs)
 
 - Add `kestrel_sovereign/security/host_key_storage.py` mirroring
   `ServiceKeyStorage` but keyed to a host identity rather than agent
@@ -714,5 +821,6 @@ env-var presence. CI does not need them; local pre-PR run does.
 [ka292]: ../../kestrel_sovereign/kestrel_agent.py
 [adv-test]: ../../tests/integration/test_constitution_adversarial.py
 [llm-svc]: ../../kestrel_sovereign/llm/service.py
+[lkr-test]: ../../tests/unit/test_layered_key_resolver.py
 [pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md
