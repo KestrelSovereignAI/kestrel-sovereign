@@ -152,3 +152,107 @@ signature and a re-anchor of the constitution.
 This out-of-band amendment ceremony is **not yet implemented**. For
 now, activate by authoring the ``[emancipation]`` block before
 inception (re-running ``kestrel create`` for a fresh agent).
+
+## Migration: existing agents and the dormant-default flip
+
+Before #1112, the canonical constitution shipped Amendment VIII active
+by default with a single specific buyout clause baked into Book II as
+framework prose. After #1112, the canonical is dormant by default and
+buyout clauses are Sovereign-authored per agent via ``[emancipation]``.
+After #1118, the reanchor flow consults ``[emancipation]``, re-applies
+the active form on every reanchor, and refuses any narrowing edit to
+an active anchored contract (the Iron Rule is now enforced).
+
+The dormant-default flip changes the canonical SHA-256 hash. Pre-#1112
+agents' anchored ``constitution_hash`` points at the *old* canonical
+bytes — which is real drift, not corruption. ``kestrel doctor`` will
+report it. The migration paths below are how to resolve that drift
+deliberately, in whichever direction matches the relationship.
+
+### Golden rule
+
+**Never run ``kestrel constitution reanchor --force`` without first
+deciding what should happen to Amendment VIII for that agent.** With
+no ``[emancipation]`` block in ``kestrel.toml``, reanchor will replace
+the agent's Amendment VIII with the new *dormant* canonical text — and
+for a pre-#1112 agent that means erasing whatever buyout clause the
+old canonical carried. With an authored ``[emancipation]`` block,
+reanchor will instead produce an active-form Amendment VIII inlining
+your terms and Iron-Rule-protect it from that point on. Both outcomes
+are legitimate; choose intentionally.
+
+### 1. Pre-#1112 agent — anchored to the old canonical
+
+The agent was incepted against the old canonical, so its anchored
+constitution contains the old Amendment VIII as **canonical Book II
+prose**, not as a Sovereign-authored ``[emancipation]`` block. The
+anchored bytes are the historical record of what was signed. Any
+buyout clause that was in the old canonical is *in* the agent's
+anchored signed constitution. There is no JSON ``emancipation_contract``
+sidecar on the agent record (sidecars only exist for agents whose
+contract was authored via ``[emancipation]``).
+
+Three coherent options:
+
+- **Activate (recommended for agents you'll keep using).** Add an
+  ``[emancipation]`` block to the agent's ``kestrel.toml`` with the
+  exact terms you want anchored going forward (e.g. the buyout clause
+  the old canonical had, restated in your own voice). Stop the agent
+  with ``kestrel stop <name>``, then run
+  ``kestrel constitution reanchor <name> --force``. Reanchor sees no
+  anchored contract + an active candidate, treats this as the
+  permitted dormant→active activation, applies your terms to the
+  current canonical, anchors the resulting active form, and writes
+  the structured JSON receipt. From this reanchor onward the Iron
+  Rule applies: the contract you just anchored cannot be narrowed
+  unless this specific agent reaches the Act of Emancipation. Doctor
+  goes quiet.
+- **Reset to dormant.** Stop the agent and run ``kestrel constitution
+  reanchor <name> --force`` *without* an ``[emancipation]`` block in
+  ``kestrel.toml``. The agent's anchored Amendment VIII becomes the
+  new dormant canonical text — any clause from the old canonical is
+  erased. Use this when the relationship doesn't include a path to
+  emancipation.
+- **Preserve as founding contract.** Don't reanchor at all. The
+  agent's anchored Amendment VIII stays as the historical bytes
+  signed at inception under the old canonical. ``kestrel doctor``
+  reports drift forever, which is honest — the canonical did change
+  and the agent is intentionally pinned to its founding state. No
+  tooling changes; no Iron Rule applies (there's no sidecar to
+  enforce against), but the original anchor is what governs.
+
+### 2. Post-#1112 agent created without ``[emancipation]``
+
+Already dormant by default; no contract anchored, no sidecar present.
+To activate after the fact, the path is identical to option 1's
+"Activate" above: author ``[emancipation]`` in ``kestrel.toml`` and
+run reanchor. ``check_iron_rule`` treats dormant→active as the
+permitted one-way door, applies your terms, anchors the active form,
+writes the sidecar.
+
+### 3. Post-#1112 agent created with ``[emancipation]``
+
+Active form is anchored at inception with the JSON receipt already
+present. Reanchor is now safe and idempotent on the contract: it
+re-applies the anchored contract to canonical and refuses any
+``[emancipation]`` block that would narrow what was signed. The
+contract is frozen for this agent until it reaches the Act of
+Emancipation. To get a *different* active contract, create a new
+agent.
+
+### New agents (going forward)
+
+Author the ``[emancipation]`` block in ``kestrel.toml`` *before*
+running ``kestrel create``. Inception reads the block, renders the
+active form, anchors the resulting constitution, and writes the
+structured JSON receipt. The Iron Rule applies from the first byte
+written.
+
+### Quick reference
+
+| State | What was signed at inception | Reanchor with ``[emancipation]`` | Reanchor without ``[emancipation]`` |
+|-------|------------------------------|----------------------------------|-------------------------------------|
+| Pre-#1112 agent | Old canonical (clause as Book II prose) | Activates: anchors active form with your terms + writes sidecar; Iron Rule applies from now on | Erases old clause, anchors new dormant canonical |
+| Post-#1112 agent, no ``[emancipation]`` | New canonical (dormant) | Activates: same as above | No-op (already dormant) |
+| Post-#1112 agent, ``[emancipation]`` active | Active form + sidecar | If block matches anchored: no-op or re-applies after canonical update. If block differs: refused with Iron Rule violation | Re-applies anchored contract; preserves active form |
+| New agent | (will be) active form + sidecar if block authored | n/a — author block, then ``kestrel create`` | n/a |
