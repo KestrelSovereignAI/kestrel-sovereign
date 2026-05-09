@@ -102,6 +102,7 @@ class PayerKind(StrEnum):
 
 @dataclass(frozen=True)
 class PayerSpec:
+    vendor: str                            # "lighthouse" | "openrouter" | "local-disk" | "local-llm" | ...
     kind: PayerKind
     sponsor_did: Optional[str] = None
     monthly_cap_usd: Optional[Decimal] = None  # advisory; resolver may enforce per-vendor
@@ -118,6 +119,15 @@ class PayerPolicy:
     def host_env_default(cls) -> "PayerPolicy": ...  # preserves today's behavior
 ```
 
+`PayerSpec.vendor` is the second dimension of the support matrix —
+`(resource_class, vendor, kind)` is what the matrix is keyed by, and it
+is also what the resolver needs to decide which vendor-specific
+side-effect (if any) to run before returning a `KeyResolutionService`.
+Multi-vendor-per-class within a single agent is out of scope for v1; if
+an operator needs e.g. both Lighthouse and a local-disk fallback, that
+is modeled as a runtime fallback inside the storage provider, not as
+two parallel policy slots.
+
 `PayerSpec` is the only thing external features (Frinz, Talon, etc.)
 depend on. The resolver implementation lives in the main repo.
 
@@ -133,47 +143,76 @@ which provisioning side-effects) get applied for an agent before that
 service is handed to a provider.
 
 ```python
+class ResolvedResource:
+    enabled: bool                           # False iff policy is NONE for this slot
+    key_resolver: Optional[KeyResolutionService]   # only when enabled
+
 class PayerResolver(Protocol):
-    async def key_resolver_for(
+    async def resolve_for(
         self,
         agent_did: str,
         resource_class: ResourceClass,  # llm | storage | compute | tools | comms
-    ) -> KeyResolutionService
+    ) -> ResolvedResource
 ```
 
 The concrete implementation, called at agent-init time:
 
 1. Reads the agent's `PayerPolicy` (from agent metadata; defaults to
    `host_env_default` if missing for back-compat).
-2. Looks up the appropriate `PayerSpec` for the resource class.
-3. Returns a `KeyResolutionService` configured per `kind`:
-   - `NONE` → returns a sentinel resolver whose `resolve_key()` always
-     returns `None` AND tags the resolution as "explicitly disabled" so
-     callers can distinguish from "credential missing." Provider-side
-     callers must already handle `None` (e.g., LLM falls back to local
-     model; storage falls back to local disk).
-   - `HOST_ENV` → returns today's `KeyResolutionService` instance
-     unchanged. This is the back-compat path.
+2. Looks up the appropriate `PayerSpec` for the resource class. The
+   spec carries both `vendor` and `kind`, which together index the
+   support matrix.
+3. Returns a `ResolvedResource`:
+   - `NONE` → `ResolvedResource(enabled=False, key_resolver=None)`. The
+     **agent-init layer must treat this as "do not construct the
+     provider for this resource at all."** This is critical: returning
+     a sentinel `KeyResolutionService` is not enough, because providers
+     like `LighthouseProvider` accept an explicit `api_key` constructor
+     argument that today defaults to `os.environ["LIGHTHOUSE_API_KEY"]`
+     and is consulted as a fallback when the resolver returns `None`.
+     Honoring `NONE` therefore means *skipping provider construction*,
+     not relying on the resolver to neutralize the provider.
+   - `HOST_ENV` → wraps today's `KeyResolutionService` instance and
+     returns it. This is the back-compat path.
    - `HOST_MASTER_PROVISIONED` → invokes the vendor's provisioning API
-     once (idempotent — skip if a child credential is already minted for
-     this agent), stores the result in agent's `ServiceKeyStorage`, then
-     returns a normal `KeyResolutionService` that will find it there on
-     subsequent calls.
-   - `SELF_WALLET` → mints (idempotent) a wallet-signed credential using
-     the agent's existing wallet keypair, stores in agent's
-     `ServiceKeyStorage`, returns a normal `KeyResolutionService`. For
-     Lighthouse, this is the documented sign-message → API-key flow.
-     For LLM, this branch raises an explicit `NotImplementedError` until
-     x402-native LLM matures (see Risks).
-   - `SPONSOR` → identical mechanics to `HOST_MASTER_PROVISIONED` except
-     the master credential comes from the sponsor's `HostKeyStorage`,
-     not the operator's.
+     once for this `(agent_did, vendor)` pair (idempotent — skip if a
+     child credential is already minted for this agent), stores the
+     result in agent's `ServiceKeyStorage` under `provider=vendor`,
+     then returns a normal `KeyResolutionService` that will find it
+     there on subsequent calls.
+   - `SELF_WALLET` → mints (idempotent) a wallet-signed credential
+     using the agent's existing wallet keypair, stores in agent's
+     `ServiceKeyStorage` under `provider=vendor`, returns a normal
+     `KeyResolutionService`. For Lighthouse, this is the documented
+     sign-message → API-key flow. For LLM, this branch raises an
+     explicit `NotImplementedError` until x402-native LLM matures
+     (see Risks).
+   - `SPONSOR` → identical mechanics to `HOST_MASTER_PROVISIONED`
+     except the master credential comes from the sponsor's
+     `HostKeyStorage`, not the operator's.
 
 Crucially, providers like `LighthouseProvider` keep their existing
 `key_resolver: Optional[KeyResolutionService]` parameter unchanged.
-The wiring change is at one site (`kestrel_agent.py:initialize()`) where
-we ask `PayerResolver.key_resolver_for(agent_did, "storage")` and pass
-the result in.
+The wiring change is at one site (`kestrel_agent.py:initialize()`):
+
+```python
+storage = await payer_resolver.resolve_for(agent_did, "storage")
+if storage.enabled:
+    lighthouse = LighthouseProvider(
+        api_key=None,                       # explicit: do not seed from env at construction
+        key_resolver=storage.key_resolver,  # resolver is the only credential source
+    )
+else:
+    lighthouse = None  # storage explicitly disabled by policy
+```
+
+`api_key=None` paired with a non-None `key_resolver` is the contract:
+the provider must consult the resolver and not fall back to its own
+env-var path. Phase 3 includes a small refactor to
+`LighthouseProvider.__init__` so this contract is unambiguous (today's
+`api_key or os.environ.get(...)` pattern is replaced with explicit
+"if api_key is None and key_resolver is None: read env; else: use what
+was given").
 
 ### Storage tiers
 
@@ -254,10 +293,14 @@ kestrel.toml aside, regenerate from scratch.
   first need. Retirement service already guards on
   `openrouter_key_hash`; no change needed.
 - **Lighthouse:** `LighthouseProvider`'s existing
-  `key_resolver: Optional[KeyResolutionService]` parameter is unchanged.
-  In `kestrel_agent.py:initialize()` we call
-  `PayerResolver.key_resolver_for(agent_did, "storage")` and pass the
-  returned `KeyResolutionService` instance into the provider. The
+  `key_resolver: Optional[KeyResolutionService]` parameter is
+  unchanged. Phase 3 includes one small refactor to
+  `LighthouseProvider.__init__` so the constructor's `api_key` and
+  `key_resolver` parameters are mutually exclusive in spirit: when a
+  resolver is supplied, the env-var fallback is NOT consulted at
+  construction time. This is what lets the agent-init layer honor a
+  `NONE` policy by passing `api_key=None` with the resolver, and to
+  honor the other kinds without accidental env-var bleed-through. The
   provider's `_get_api_key()` continues to call
   `resolve_key("lighthouse", require=False)` exactly as it does today.
   `LighthouseTarget` gets the same treatment. Phase 3 ships
