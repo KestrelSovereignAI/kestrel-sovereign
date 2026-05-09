@@ -471,17 +471,32 @@ provider client. Today's exhaustive list (verified by grep against
 
 Tests in Phase 3 walk the `LLMService` class (and its mixins —
 `StreamingMixin` and friends, where streaming entry points actually
-live) via reflection at runtime, collecting every method that is
-`inspect.iscoroutinefunction` OR `inspect.isasyncgenfunction`. The
-streaming entry points (`generate_stream`, `get_streaming_response`,
-`stream_with_messages`, `stream_with_tool_detection`) are async
-generators, so a reflection sweep that only checks
-`iscoroutinefunction` would silently miss them and leave `llm = none`
-streamable through provider clients. Both kinds must be enumerated.
+live) via reflection at runtime. The collection predicate is:
+
+```
+(inspect.iscoroutinefunction(m) OR inspect.isasyncgenfunction(m))
+AND name matches a generation pattern
+```
+
+Generation patterns: name starts with `generate`, `get_response`,
+`get_audit_response`, `stream_`, or contains `_streaming_response`. The
+name filter is critical — without it the sweep would also collect
+non-generation methods (`discover_all_models`, `get_storage_info`,
+`pull_model`, `use_agent_key`, `close`) that are management or
+discovery, not policy-relevant. Async-generator coverage is critical
+too: the streaming entry points (`generate_stream`,
+`get_streaming_response`, `stream_with_messages`,
+`stream_with_tool_detection`) are async generators, so a sweep that
+only checks `iscoroutinefunction` would silently miss them and leave
+`llm = none` streamable through provider clients.
+
 The test then asserts each collected entry point calls
 `_check_policy()` at least once on the disabled path. This catches
 future entry points that forget the guard, in either the coroutine or
-async-generator form. Callers (chat endpoints, reflection loops) treat
+async-generator form. The generation-pattern list is itself part of
+the plan and updates require a same-PR change to the test (so adding
+a new entry point under a new naming convention is a deliberate, not
+accidental, choice). Callers (chat endpoints, reflection loops) treat
 the `PolicyDeniedError` the same way they treat "no key configured"
 today. The flag is in-memory per instance; persistence is unnecessary
 because the policy in kestrel.toml is the source of truth and is
