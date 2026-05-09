@@ -410,6 +410,15 @@ class Stage:
                 "'noop_idempotent' is the default; otherwise the name of a "
                 "registered SourceRegistration that runs the compensation)"
             )
+        # Round 18 P2: real compensation values are SourceRegistration
+        # names; they must satisfy the same naming invariant we apply
+        # to stage.signal_source. Otherwise the runner can't dispatch
+        # to the named source at cancellation, leaving side effects
+        # uncompensated. The two reserved sentinels (noop_idempotent,
+        # compensate_record_only) bypass this — they aren't dispatched
+        # as signals; they're handled inline by the runner.
+        if self.compensate not in ("noop_idempotent", "compensate_record_only"):
+            _validate_source_name("stage.compensate", self.compensate)
 
         if not isinstance(self.forbidden_modules, (list, tuple)) or not all(
             isinstance(m, str) for m in self.forbidden_modules

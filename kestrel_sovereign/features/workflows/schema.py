@@ -145,9 +145,20 @@ def _stage_schema() -> dict[str, Any]:
             "params": {"type": "object"},
             "gate": _gate_schema(),
             "compensate": {
+                # Codex round 18 P2: a real compensation must satisfy
+                # the source-name vocabulary so the runner can dispatch
+                # to it at cancellation. Two reserved sentinels
+                # (``noop_idempotent``, ``compensate_record_only``)
+                # bypass that — they aren't dispatched as signals;
+                # the runner handles them inline. ``anyOf`` (not
+                # ``oneOf``) so the sentinels still validate even
+                # though they also match the source-name pattern.
                 "type": "string",
-                "minLength": 1,
-                "pattern": _NON_WHITESPACE_PATTERN,
+                "anyOf": [
+                    {"const": "noop_idempotent"},
+                    {"const": "compensate_record_only"},
+                    {"pattern": _SOURCE_NAME_PATTERN},
+                ],
             },
             "forbidden_modules": {
                 "type": "array",

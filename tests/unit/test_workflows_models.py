@@ -195,6 +195,28 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_compensate_must_be_valid_source_name():
+    """Round 18 P2: a real compensate value is a SourceRegistration
+    name; whitespace/invalid chars in it would crash dispatch at cancel
+    time, leaving side effects uncompensated. Reserved sentinels
+    (noop_idempotent / compensate_record_only) bypass the check."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage(
+            name="x",
+            signal_source="x",
+            signal_mode=SignalMode.ACTION,
+            compensate="bad name",  # whitespace forbidden
+        )
+    # Reserved sentinels still accepted on appropriate stages:
+    Stage(
+        name="x",
+        signal_source="x",
+        signal_mode=SignalMode.ACTION,
+        read_only=True,
+        compensate="noop_idempotent",
+    )
+
+
 def test_stage_record_only_only_for_irreversible():
     """Round 13 P2: compensate_record_only is reserved for irreversible
     stages — a reversible stage that declares it would get a record-
