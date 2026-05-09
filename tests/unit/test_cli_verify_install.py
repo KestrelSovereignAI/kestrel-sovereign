@@ -330,15 +330,28 @@ def test_install_targets_use_pypi_packages_not_dead_local_paths(monkeypatch):
             f"not the dead $REPO/kestrel_feature_wallet path. "
             f"pip install target: {target!r}"
         )
-        assert not target.endswith("/kestrel-feature-intelligence"), (
-            f"Test 5 must install kestrel-feature-intelligence from PyPI, "
-            f"not the dead $REPO/... path. pip install target: {target!r}"
-        )
 
-    # And the PyPI names must each appear at least once.
+    # The SDK install always happens (Tests 1 + 4).
     assert "kestrel-sovereign-sdk" in pip_install_targets
-    assert "kestrel-feature-wallet" in pip_install_targets
-    assert "kestrel-feature-intelligence" in pip_install_targets
+
+    # Tests 3/4/5 are now driven by the feature registry instead of
+    # hardcoding specific package names: every package registered with
+    # ``core = false`` must appear as a pip install target. This wires
+    # the verifier to whatever the registry currently considers
+    # extracted, so a new extraction is auto-verified the moment its
+    # registry entry flips and no extraction can quietly drift away
+    # from CI coverage.
+    extracted = mod._extracted_feature_packages()
+    assert extracted, (
+        "feature_registry.toml must declare at least one core = false "
+        "package, otherwise Tests 3/4/5 have nothing to verify."
+    )
+    for package, _classes in extracted:
+        assert package in pip_install_targets, (
+            f"registry says {package!r} is extracted (core = false) but "
+            f"pip install was never invoked for it across Tests 3/4/5. "
+            f"Check the registry-driven iteration in cli_verify_install."
+        )
 
 
 def test_run_streaming_does_not_capture(monkeypatch):
