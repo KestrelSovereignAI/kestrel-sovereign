@@ -77,10 +77,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
-from typing import Any, Awaitable, Callable, Coroutine, Optional, Protocol
+from typing import Any, Awaitable, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
 
 from kestrel_sdk.signals import (
@@ -96,11 +98,58 @@ from kestrel_sdk.signals import (
     Urgency,
     Visibility,
 )
+from kestrel_sovereign.signals.constitution_canary import (
+    CanaryStatus,
+    derive_canary,
+)
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
 from kestrel_sovereign.signals.store import SignalLogStore
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Constitutional injection — kestrel-sovereign#1137 chunk 1G
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ConstitutionAudit:
+    """Per-dispatch constitutional-injection audit record.
+
+    Threaded from `_route_under_locks` through `_success` / `_fail` to
+    `_log_safe`, where its fields land in `signal_log` (chunk 1C).
+    Defaults reflect "ACTION/ARTIFACT or COGNITION with
+    `constitution_injection='none'`": all None, status NOT_REQUIRED.
+    """
+
+    constitution_hash: Optional[str] = None
+    doctrine_bundle_hash: Optional[str] = None
+    echo_canary_status: CanaryStatus = CanaryStatus.NOT_REQUIRED
+    injected_clauses: Optional[List[str]] = None
+    dropped_clauses: Optional[List[str]] = None
+    # Set when bundle-hash drift was detected; the dispatcher returns
+    # DROPPED_VALIDATION but still writes the (mismatched) hashes to
+    # signal_log so an auditor can see exactly what diverged.
+    drift_error: Optional[str] = None
+
+
+def _audit_to_log_kwargs(audit: Optional[_ConstitutionAudit]) -> dict:
+    """Convert audit to the kwargs `SignalLogStore.append` expects.
+
+    A None audit (the legacy ACTION/ARTIFACT path that doesn't go
+    through constitutional injection) maps to all-None kwargs, which
+    `store.append` documented as "no system prompt path"."""
+    if audit is None:
+        return {}
+    return {
+        "constitution_hash": audit.constitution_hash,
+        "doctrine_bundle_hash": audit.doctrine_bundle_hash,
+        "echo_canary_status": audit.echo_canary_status.value,
+        "injected_clauses": audit.injected_clauses,
+        "dropped_clauses": audit.dropped_clauses,
+    }
 
 
 DEFAULT_TTL = 5
@@ -499,35 +548,8 @@ class SignalDispatcher:
                     )
 
                 if signal.mode == SignalMode.COGNITION:
-                    assert registration.prompt_template is not None
-                    prompt = self._render_prompt(signal, registration)
-                    # Set the in-flight turn's causation chain (already
-                    # extended with this hop's frame in step 2 of the
-                    # pipeline) so outbound A2A tasks created during
-                    # the turn carry the lineage forward (#905 review
-                    # P1). The chain lives in a ContextVar so
-                    # concurrent COGNITION dispatches stay isolated —
-                    # agent-level mutable state would race here
-                    # (#906 review P1: dispatcher set/clear runs
-                    # OUTSIDE the CONVERSATION lock that process_input
-                    # acquires inside its body).
-                    set_chain = getattr(self._agent, "_set_current_chain", None)
-                    clear_chain = getattr(self._agent, "_clear_current_chain", None)
-                    token = None
-                    if set_chain is not None:
-                        token = set_chain(signal.causation_chain)
-                    try:
-                        result = await self._agent.process_input(prompt)
-                    finally:
-                        if clear_chain is not None:
-                            clear_chain(token)
-                    return self._success(
-                        signal,
-                        start,
-                        registration,
-                        artifact=None,
-                        action_result=None,
-                        cognition_result=result,
+                    return await self._dispatch_cognition(
+                        signal, registration, start
                     )
 
                 # Unreachable — validation step rejected unknown modes.
@@ -553,6 +575,243 @@ class SignalDispatcher:
                     error=f"{type(e).__name__}: {e}",
                     registration=registration,
                 )
+
+    # ------------------------------------------------------------------
+    # COGNITION dispatch — extracted so the constitutional-injection
+    # audit (kestrel-sovereign#1137 chunk 1G) has a clear ownership
+    # boundary and can pre-flight + post-flight without complicating
+    # the ACTION/ARTIFACT branches.
+    # ------------------------------------------------------------------
+
+    async def _dispatch_cognition(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        start: float,
+    ) -> SignalResult:
+        assert registration.prompt_template is not None
+
+        # Step A: build the constitutional audit BEFORE the dispatch
+        # runs. For sources with `constitution_injection="full"` this
+        # resolves the operative constitution_hash, computes the live
+        # doctrine_bundle_hash, and compares to the anchored value.
+        # Drift → DROPPED_VALIDATION (the bundle is what would be
+        # injected; refusing the dispatch is safer than dispatching
+        # under tampered doctrine).
+        audit = await self._build_constitution_audit(signal, registration)
+        if audit.drift_error is not None:
+            return self._fail(
+                signal,
+                start,
+                Status.DROPPED_VALIDATION,
+                error=audit.drift_error,
+                registration=registration,
+                audit=audit,
+            )
+
+        prompt = self._render_prompt(signal, registration)
+        # Set the in-flight turn's causation chain (already extended
+        # with this hop's frame in step 2 of the pipeline) so outbound
+        # A2A tasks created during the turn carry the lineage forward
+        # (#905 review P1). The chain lives in a ContextVar so
+        # concurrent COGNITION dispatches stay isolated — agent-level
+        # mutable state would race here (#906 review P1: dispatcher
+        # set/clear runs OUTSIDE the CONVERSATION lock that
+        # process_input acquires inside its body).
+        set_chain = getattr(self._agent, "_set_current_chain", None)
+        clear_chain = getattr(self._agent, "_clear_current_chain", None)
+        token = None
+        if set_chain is not None:
+            token = set_chain(signal.causation_chain)
+        try:
+            result = await self._agent.process_input(prompt)
+        finally:
+            if clear_chain is not None:
+                clear_chain(token)
+
+        # Step B: post-dispatch echo verification. If the source
+        # opted in to `require_constitution_echo=True` the dispatcher
+        # asks the agent for the format-specific receipt. A MISSING
+        # outcome flips the dispatch to FAILED with
+        # `error="constitution_not_received"` per design §3.
+        if registration.require_constitution_echo:
+            await self._verify_canary_post_dispatch(signal, registration, audit)
+            if audit.echo_canary_status is CanaryStatus.MISSING:
+                return self._fail(
+                    signal,
+                    start,
+                    Status.FAILED,
+                    error="constitution_not_received",
+                    registration=registration,
+                    audit=audit,
+                )
+
+        return self._success(
+            signal,
+            start,
+            registration,
+            audit=audit,
+            cognition_result=result,
+        )
+
+    async def _build_constitution_audit(
+        self, signal: Signal, registration: SourceRegistration
+    ) -> _ConstitutionAudit:
+        """Resolve the per-dispatch audit before the LLM call.
+
+        For sources with `constitution_injection="none"` this returns
+        a default audit (all None, status=NOT_REQUIRED) — the legacy
+        path. For `"full"` it consults optional agent hooks
+        (`get_constitution_hash`, `get_anchored_doctrine_bundle_hash`,
+        `compute_live_doctrine_bundle_hash`) via `getattr` so the
+        dispatcher remains usable with minimal/test agents that
+        don't provide them; the audit fields are populated where
+        possible and drift is detected only when both anchored and
+        live hashes are available."""
+        audit = _ConstitutionAudit()
+
+        if registration.constitution_injection != "full":
+            return audit
+
+        get_const = getattr(self._agent, "get_constitution_hash", None)
+        if callable(get_const):
+            try:
+                value = get_const()
+                if asyncio.iscoroutine(value):
+                    value = await value
+                audit.constitution_hash = value
+            except Exception:
+                logger.exception(
+                    "agent.get_constitution_hash raised for signal %s; "
+                    "leaving constitution_hash NULL",
+                    signal.id,
+                )
+
+        anchored_hash: Optional[str] = None
+        live_hash: Optional[str] = None
+
+        get_anchored = getattr(
+            self._agent, "get_anchored_doctrine_bundle_hash", None
+        )
+        if callable(get_anchored):
+            try:
+                value = get_anchored()
+                if asyncio.iscoroutine(value):
+                    value = await value
+                anchored_hash = value
+            except Exception:
+                logger.exception(
+                    "agent.get_anchored_doctrine_bundle_hash raised for "
+                    "signal %s",
+                    signal.id,
+                )
+
+        get_live = getattr(self._agent, "compute_live_doctrine_bundle_hash", None)
+        if callable(get_live):
+            try:
+                value = get_live()
+                if asyncio.iscoroutine(value):
+                    value = await value
+                live_hash = value
+            except Exception:
+                logger.exception(
+                    "agent.compute_live_doctrine_bundle_hash raised for "
+                    "signal %s",
+                    signal.id,
+                )
+
+        # The audit records the LIVE hash (what would actually be
+        # injected); auditors comparing across dispatches see what
+        # ran. The anchored hash is in agent_node.properties already.
+        audit.doctrine_bundle_hash = live_hash
+
+        if (
+            anchored_hash is not None
+            and live_hash is not None
+            and anchored_hash != live_hash
+        ):
+            audit.drift_error = (
+                f"doctrine_bundle_drift: anchored={anchored_hash[:16]}... "
+                f"live={live_hash[:16]}..."
+            )
+            # Pin the anchored hash on the audit so the signal_log row
+            # reflects what was expected, not just what the bundle was
+            # at fail time.
+            audit.doctrine_bundle_hash = anchored_hash
+
+        # Echo defaults to NOT_REQUIRED unless the registration opts
+        # in. The post-dispatch verifier flips it to VERIFIED or
+        # MISSING based on the agent's receipt channel.
+        if registration.require_constitution_echo:
+            # Tentatively MISSING until the post-dispatch verifier
+            # confirms; this way a dispatch that crashes mid-flight
+            # is recorded as MISSING (operator sees it; safer default).
+            audit.echo_canary_status = CanaryStatus.MISSING
+
+        return audit
+
+    async def _verify_canary_post_dispatch(
+        self,
+        signal: Signal,
+        registration: SourceRegistration,
+        audit: _ConstitutionAudit,
+    ) -> None:
+        """Post-dispatch hook to verify the format-specific receipt.
+
+        Calls the optional agent hook `verify_constitution_echo(canary,
+        format, since)` if available. The hook returns a
+        `CanaryStatus` (or None on agent-side failure to introspect,
+        which we treat as MISSING). With no hook, the dispatcher
+        cannot verify and stamps MISSING — Phase 1 sources do not opt
+        into echo so this branch is silent in default deployments;
+        the contract is in place for Phase 2 source migration."""
+        if not registration.require_constitution_echo:
+            audit.echo_canary_status = CanaryStatus.NOT_REQUIRED
+            return
+
+        if not audit.constitution_hash:
+            # Without an anchored constitution we can't derive a stable
+            # canary; record MISSING so the operator sees the dispatch
+            # ran without proper anchoring.
+            audit.echo_canary_status = CanaryStatus.MISSING
+            return
+
+        canary = derive_canary(
+            signal_id=signal.id,
+            constitution_hash=audit.constitution_hash,
+            engine_nonce=secrets.token_hex(16),
+        )
+
+        verifier = getattr(self._agent, "verify_constitution_echo", None)
+        if not callable(verifier):
+            audit.echo_canary_status = CanaryStatus.MISSING
+            return
+
+        try:
+            value = verifier(
+                canary=canary,
+                prompt_template_format=registration.prompt_template_format,
+                signal_id=signal.id,
+            )
+            if asyncio.iscoroutine(value):
+                value = await value
+        except Exception:
+            logger.exception(
+                "agent.verify_constitution_echo raised for signal %s",
+                signal.id,
+            )
+            audit.echo_canary_status = CanaryStatus.MISSING
+            return
+
+        if isinstance(value, CanaryStatus):
+            audit.echo_canary_status = value
+        elif isinstance(value, str):
+            try:
+                audit.echo_canary_status = CanaryStatus(value)
+            except ValueError:
+                audit.echo_canary_status = CanaryStatus.MISSING
+        else:
+            audit.echo_canary_status = CanaryStatus.MISSING
 
     def _render_prompt(
         self, signal: Signal, registration: SourceRegistration
@@ -587,6 +846,7 @@ class SignalDispatcher:
         artifact: Any = None,
         action_result: Any = None,
         cognition_result: Any = None,
+        audit: Optional[_ConstitutionAudit] = None,
     ) -> SignalResult:
         # SignalResult has separate fields for side-effect action results and
         # generated artifacts. A cognition dispatch produces user-visible turn
@@ -603,7 +863,7 @@ class SignalDispatcher:
         # Fire-and-forget log write; if logging fails it's logged but does
         # not fail the dispatch.
         self._agent._track_background_task(
-            self._log_safe(signal, registration, result),
+            self._log_safe(signal, registration, result, audit=audit),
             name=f"signal_log:{signal.source}:{signal.id}",
         )
         return result
@@ -616,6 +876,7 @@ class SignalDispatcher:
         *,
         error: Optional[str],
         registration: Optional[SourceRegistration] = None,
+        audit: Optional[_ConstitutionAudit] = None,
     ) -> SignalResult:
         result = SignalResult(
             signal_id=signal.id,
@@ -626,7 +887,7 @@ class SignalDispatcher:
         )
         if registration is not None:
             self._agent._track_background_task(
-            self._log_safe(signal, registration, result),
+            self._log_safe(signal, registration, result, audit=audit),
             name=f"signal_log:{signal.source}:{signal.id}",
         )
         return result
@@ -636,10 +897,12 @@ class SignalDispatcher:
         signal: Signal,
         registration: SourceRegistration,
         result: SignalResult,
+        *,
+        audit: Optional[_ConstitutionAudit] = None,
     ) -> None:
         try:
             result_summary = await self._store.append(
-                signal, registration, result
+                signal, registration, result, **_audit_to_log_kwargs(audit)
             )
         except Exception:
             logger.exception(
