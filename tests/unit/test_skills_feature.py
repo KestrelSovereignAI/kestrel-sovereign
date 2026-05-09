@@ -858,6 +858,22 @@ class TestPartialFailures:
         assert "graph node" in envelope.error and "associative recall" in envelope.error
 
     @pytest.mark.asyncio
+    async def test_delete_stale_graph_node_with_file_already_absent_returns_ok(self, feature, tmp_path):
+        """Skills dir is configured but the file is already gone (stale
+        graph-only state from a previous partial delete or external
+        scrub). The graph delete succeeds. There's nothing to
+        resurrect, so the result must be OK — not PARTIAL with a
+        "could not be unlinked" caveat. Codex round 2 of #1130 caught
+        this falsely showing as PARTIAL.
+        """
+        # No file was ever written; skills_dir is set on the feature.
+        feature.agent.storage.delete_node = AsyncMock(return_value=None)
+        envelope = await feature.skill_delete(skill_id="skill_stale_node")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_file"] is False
+        assert envelope.data["removed_node"] is True
+
+    @pytest.mark.asyncio
     async def test_delete_graph_only_no_skills_dir_returns_ok(self, feature):
         """Graph-only agent (no skills directory configured) — a
         successful graph node deletion must NOT trip the asymmetric-

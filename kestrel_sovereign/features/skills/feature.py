@@ -330,21 +330,23 @@ class SkillsFeature(Feature):
         """
         removed_file = False
         removed_node = False
-        file_attempted = self._skills_dir is not None
-        graph_attempted = False
+        file_unlink_failed = False
+        file_was_present = False
 
-        if file_attempted:
+        if self._skills_dir is not None:
             path = self._skill_path(skill_id)
             if path.exists():
+                file_was_present = True
                 try:
                     path.unlink()
                     removed_file = True
                 except OSError as e:
                     logger.warning("Could not remove skill file %s: %s", path, e)
+                    file_unlink_failed = True
 
         storage = getattr(self.agent, "storage", None)
-        if storage is not None and hasattr(storage, "delete_node"):
-            graph_attempted = True
+        graph_attempted = storage is not None and hasattr(storage, "delete_node")
+        if graph_attempted:
             try:
                 await storage.delete_node(skill_id)
                 removed_node = True
@@ -359,29 +361,44 @@ class SkillsFeature(Feature):
             "removed_file": removed_file,
             "removed_node": removed_node,
         }
-        # Asymmetric outcomes only matter when *both* layers were
-        # available to try. If only one layer applies (graph-only
-        # agent, or no graph backend), the single-layer outcome is
-        # symmetric by construction — no PARTIAL needed.
-        # File is the source of truth — if file went but graph didn't,
-        # the skill is "deleted" semantically but a stale graph node
-        # may still surface in recall. If graph went but file didn't,
-        # the next save targeting this id will hit FileExistsError.
-        if file_attempted and graph_attempted and removed_file != removed_node:
-            if removed_file and not removed_node:
-                caveat = (
-                    f"file removed but graph node {skill_id} could not be "
-                    "deleted — it will still surface in associative recall "
-                    "until the graph is reachable again."
-                )
-            else:
-                # Only safe to call _skill_path here because file_attempted
-                # implies _skills_dir is not None (codex round 1 of #1130).
-                caveat = (
-                    f"graph node removed but file at {self._skill_path(skill_id)} "
-                    "could not be unlinked — the skill will reload on next "
-                    "list/save attempt."
-                )
+        # PARTIAL only fires for *real asymmetric leftover state*.
+        #
+        # 1. File unlink genuinely failed (file existed, OSError) AND
+        #    graph delete succeeded — the file will resurrect on the
+        #    next list/save.
+        # 2. File deletion succeeded AND graph_attempted but the
+        #    delete_node call raised — the graph node may still
+        #    surface in associative recall. (We can't reliably tell
+        #    "raised because already absent" from "raised because
+        #    backend down" without backend-specific introspection,
+        #    so this caveat is conservatively spoken.)
+        #
+        # Cases that are NOT asymmetric and stay OK (codex round 2 of
+        # #1130 caught these falsely showing as PARTIAL):
+        # - file already absent + graph deleted (stale-node cleanup;
+        #   nothing to resurrect).
+        # - graph never attempted + file removed (single-layer agent).
+        if file_unlink_failed and removed_node:
+            # Case 1: real file-side failure.
+            assert self._skills_dir is not None  # file_unlink_failed implies it
+            caveat = (
+                f"graph node removed but file at {self._skill_path(skill_id)} "
+                "could not be unlinked — the skill will reload on next "
+                "list/save attempt."
+            )
+            return ToolResult.partial(
+                f"Skill {skill_id} partially removed.",
+                caveat,
+                data=data,
+            )
+        if removed_file and graph_attempted and not removed_node:
+            # Case 2: file went, graph delete raised. Conservative
+            # PARTIAL — see comment above.
+            caveat = (
+                f"file removed but graph node {skill_id} could not be "
+                "deleted — it may still surface in associative recall "
+                "until the graph is reachable again."
+            )
             return ToolResult.partial(
                 f"Skill {skill_id} partially removed.",
                 caveat,
