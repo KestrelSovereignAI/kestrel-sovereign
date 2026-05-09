@@ -1,0 +1,1883 @@
+"""Dispatcher integration tests for constitutional injection.
+
+Pin the wiring kestrel-sovereign#1137 chunk 1G adds:
+
+- For sources with `constitution_injection="full"`, the dispatcher
+  consults optional agent hooks (`get_constitution_hash`,
+  `get_anchored_doctrine_bundle_hash`,
+  `compute_live_doctrine_bundle_hash`) and stamps signal_log.
+- Bundle drift (anchored vs live mismatch) → DROPPED_VALIDATION with
+  `error="doctrine_bundle_drift"` and the hashes recorded.
+- For `require_constitution_echo=True`, the dispatcher derives a
+  canary and asks `agent.verify_constitution_echo`. MISSING flips
+  the dispatch to FAILED with `error="constitution_not_received"`.
+- Agents that don't expose the optional hooks fall back to safe
+  defaults (NULL hashes, MISSING canary).
+- ACTION/ARTIFACT signals are unaffected — the audit defaults to
+  NOT_REQUIRED with all-NULL signal_log fields.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Optional
+
+import pytest
+
+from kestrel_sdk.signals import (
+    RedactionPolicy,
+    Signal,
+    SignalMode,
+    SourceRegistration,
+    Status,
+    Trust,
+)
+from kestrel_sovereign.signals import (
+    OrderedLockManager,
+    SignalDispatcher,
+    SignalLogStore,
+    SourceRegistry,
+)
+from kestrel_sovereign.signals.constitution_canary import CanaryStatus
+from kestrel_sovereign.storage.db import SQLiteBackend
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _redaction() -> RedactionPolicy:
+    return RedactionPolicy(summarize=lambda p: "<redacted>")
+
+
+class _AuditingAgent:
+    """Stand-in agent supporting the optional constitutional-injection
+    hooks. Tests configure each hook's return value explicitly so the
+    dispatcher's behavior under partial / missing data is exercised."""
+
+    def __init__(
+        self,
+        *,
+        did: str = "agent-test",
+        constitution_hash: Optional[str] = None,
+        anchored_bundle_hash: Optional[str] = None,
+        live_bundle_hash: Optional[str] = None,
+        echo_status: Optional[CanaryStatus] = None,
+        echo_raises: bool = False,
+        process_input_return: object = "ok",
+    ):
+        self._did = did
+        self._const = constitution_hash
+        self._anchored = anchored_bundle_hash
+        self._live = live_bundle_hash
+        self._echo_status = echo_status
+        self._echo_raises = echo_raises
+        self.background_tasks: list[asyncio.Task] = []
+        self.process_input_calls: list[str] = []
+        self.process_input_return = process_input_return
+        self.verify_calls: list[dict] = []
+
+    @property
+    def did(self) -> str:
+        return self._did
+
+    async def process_input(self, prompt: str, **kwargs):
+        # Capture both positional + the new system_prompt_addendum
+        # kwarg so chunk-1G tests can assert on either channel.
+        self.process_input_calls.append(prompt)
+        self.process_input_kwargs = list(
+            getattr(self, "process_input_kwargs", [])
+        )
+        self.process_input_kwargs.append(kwargs)
+        return self.process_input_return
+
+    def _track_background_task(self, coro, *, name: str):
+        task = asyncio.create_task(coro, name=name)
+        self.background_tasks.append(task)
+        return task
+
+    # Default stub constitution for full-injection tests. Subclasses
+    # in the no-constitution test override this to return "" or None.
+    async def _get_governing_constitution(self) -> str:
+        return "ARTICLE STUB — test constitution"
+
+    # Optional constitutional-injection hooks.
+    def get_constitution_hash(self) -> Optional[str]:
+        return self._const
+
+    def get_anchored_doctrine_bundle_hash(self) -> Optional[str]:
+        return self._anchored
+
+    async def compute_live_doctrine_bundle_hash(self) -> Optional[str]:
+        return self._live
+
+    async def verify_constitution_echo(
+        self,
+        *,
+        canary: str,
+        prompt_template_format: str,
+        signal_id: str,
+    ) -> Optional[CanaryStatus]:
+        self.verify_calls.append(
+            {
+                "canary": canary,
+                "format": prompt_template_format,
+                "signal_id": signal_id,
+            }
+        )
+        if self._echo_raises:
+            raise RuntimeError("verify boom")
+        return self._echo_status
+
+
+class _MinimalAgent:
+    """Agent that does NOT implement the optional hooks. Exercises
+    the safe-default paths: NULL hashes + MISSING canary when echo
+    is required."""
+
+    def __init__(self):
+        self._did = "minimal"
+        self.background_tasks: list[asyncio.Task] = []
+
+    @property
+    def did(self) -> str:
+        return self._did
+
+    async def process_input(self, prompt: str, **kwargs):
+        return "ok"
+
+    def _track_background_task(self, coro, *, name: str):
+        task = asyncio.create_task(coro, name=name)
+        self.background_tasks.append(task)
+        return task
+
+
+@pytest.fixture
+def template_path(tmp_path) -> Path:
+    p = tmp_path / "tpl.md"
+    p.write_text("source={source} kind={kind} target={target_agent} payload={payload} urgency={urgency} arrived={arrived_at}", encoding="utf-8")
+    return p
+
+
+async def _make_dispatcher(tmp_path, agent) -> SimpleNamespace:
+    backend = SQLiteBackend(str(tmp_path / "signal_log.db"))
+    await backend.connect()
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    locks = OrderedLockManager()
+    dispatcher = SignalDispatcher(
+        agent=agent, registry=registry, lock_manager=locks, store=store
+    )
+    return SimpleNamespace(
+        dispatcher=dispatcher,
+        agent=agent,
+        registry=registry,
+        store=store,
+        backend=backend,
+    )
+
+
+def _signal(source: str, *, target="agent-test", mode=SignalMode.COGNITION) -> Signal:
+    return Signal(
+        source=source,
+        kind="tick",
+        mode=mode,
+        payload={},
+        target_agent=target,
+    )
+
+
+def _cognition_reg(
+    template_path: Path, name: str = "cog_src", **overrides
+) -> SourceRegistration:
+    base = dict(
+        name=name,
+        schema=dict,
+        default_mode=SignalMode.COGNITION,
+        allowed_modes=frozenset({SignalMode.COGNITION}),
+        prompt_template=template_path,
+        log_redaction=_redaction(),
+    )
+    base.update(overrides)
+    return SourceRegistration(**base)
+
+
+async def _drain(env: SimpleNamespace) -> None:
+    pending = [t for t in env.agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# constitution_injection="none" — the legacy COGNITION path is unchanged
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_legacy_cognition_signals_skip_audit_entirely(
+    tmp_path, template_path
+):
+    agent = _AuditingAgent(
+        constitution_hash="should_not_be_recorded",
+        anchored_bundle_hash="bundle_a",
+        live_bundle_hash="bundle_a",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(template_path, name="legacy_cog")
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("legacy_cog"))
+    await _drain(env)
+
+    assert result.status == Status.OK
+
+    # Verify signal_log was stamped with all-NULL constitutional fields:
+    # legacy sources don't go through the audit at all.
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, "
+        "echo_canary_status FROM signal_log"
+    )
+    assert rows == [(None, None, "not_required")]
+    await env.backend.close()
+
+
+# ---------------------------------------------------------------------------
+# constitution_injection="full" — happy path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_full_injection_records_hashes_when_no_drift(
+    tmp_path, template_path
+):
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle_xyz",
+        live_bundle_hash="bundle_xyz",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path, name="full_cog", constitution_injection="full"
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("full_cog"))
+    await _drain(env)
+
+    assert result.status == Status.OK
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, "
+        "echo_canary_status FROM signal_log"
+    )
+    assert rows == [("con_abc", "bundle_xyz", "not_required")]
+    await env.backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Doctrine-bundle drift detection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_full_injection_drift_returns_dropped_validation(
+    tmp_path, template_path
+):
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle_anchored",
+        live_bundle_hash="bundle_DRIFTED",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="drift_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("drift_cog"))
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "doctrine_bundle_drift" in (result.error or "")
+    # process_input must NOT have been called — the dispatcher
+    # refuses the dispatch BEFORE the LLM turn.
+    assert agent.process_input_calls == []
+
+    # signal_log records the anchored hash (what was expected) so an
+    # auditor sees what diverged.
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, "
+        "echo_canary_status FROM signal_log"
+    )
+    assert rows == [("con_abc", "bundle_anchored", "not_required")]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_full_injection_no_drift_when_only_one_hash_resolvable(
+    tmp_path, template_path
+):
+    """If only ONE of (anchored, live) is available the dispatcher
+    cannot conclude drift — record what it has, run the dispatch."""
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash=None,  # not anchored yet (first run)
+        live_bundle_hash="bundle_live",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="first_run_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("first_run_cog"))
+    await _drain(env)
+
+    assert result.status == Status.OK
+    rows = await env.backend.fetch_all(
+        "SELECT doctrine_bundle_hash FROM signal_log"
+    )
+    # The LIVE hash gets recorded (audit reflects what would have been
+    # injected).
+    assert rows == [("bundle_live",)]
+    await env.backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Echo verification — require_constitution_echo=True branch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_echo_required_verified_status_succeeds(
+    tmp_path, template_path
+):
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="echo_ok_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("echo_ok_cog"))
+    await _drain(env)
+
+    assert result.status == Status.OK
+    # The verifier was called exactly once with the right format.
+    assert len(agent.verify_calls) == 1
+    call = agent.verify_calls[0]
+    assert call["format"] == "codex"
+    # Canary is well-formed: 16 lowercase hex.
+    assert len(call["canary"]) == 16
+    assert all(c in "0123456789abcdef" for c in call["canary"])
+
+    # The canary directive must reach the model via the SYSTEM PROMPT
+    # (not the user prompt — would persist into conversation history
+    # and break cache stability). Verify it appears in the
+    # `system_prompt_addendum` kwarg passed to process_input.
+    assert len(agent.process_input_calls) == 1
+    addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
+    assert addendum is not None
+    assert call["canary"] in addendum
+    # Codex format instruction is recognizable.
+    assert "constitution_canary" in addendum
+    # And the user prompt does NOT carry the canary (no pollution).
+    assert call["canary"] not in agent.process_input_calls[0]
+
+    rows = await env.backend.fetch_all(
+        "SELECT echo_canary_status FROM signal_log"
+    )
+    assert rows == [("verified",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_canary_injected_pre_dispatch_matches_verifier_input(
+    tmp_path, template_path
+):
+    """Codex round-1 P1 regression guard: the canary token sent to
+    the verifier MUST be the same one embedded in the prompt that
+    `process_input` received. Otherwise the model can't satisfy a
+    request it never saw."""
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="cross_check",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="local",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("cross_check"))
+    await _drain(env)
+
+    addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
+    canary_sent_to_verifier = agent.verify_calls[0]["canary"]
+    # Same token in addendum and verifier input.
+    assert canary_sent_to_verifier in addendum
+    # Local-format instruction (JSON requirement) appears.
+    assert "_canary" in addendum
+    # User prompt is clean.
+    assert canary_sent_to_verifier not in agent.process_input_calls[0]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_echo_required_missing_status_fails_dispatch(
+    tmp_path, template_path
+):
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.MISSING,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="echo_missing_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("echo_missing_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    assert result.error == "constitution_not_received"
+
+    rows = await env.backend.fetch_all(
+        "SELECT echo_canary_status FROM signal_log"
+    )
+    assert rows == [("missing",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_echo_required_verifier_raises_records_missing(
+    tmp_path, template_path
+):
+    """Agent-side bug in verify_constitution_echo must not crash the
+    dispatch — degrade to MISSING (the safe default)."""
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_raises=True,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="echo_boom_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("echo_boom_cog"))
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    assert result.error == "constitution_not_received"
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_echo_required_no_constitution_hash_refused_pre_execution(
+    tmp_path, template_path
+):
+    """Codex round-21 P2: when echo is required but the agent can't
+    produce a constitution_hash, the dispatcher refuses BEFORE
+    calling process_input. Running the turn would incur side effects
+    only to fail constitution_not_received afterward."""
+    agent = _AuditingAgent(
+        constitution_hash=None,
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,  # never reached
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="echo_no_const_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("echo_no_const_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "constitution_hash" in (result.error or "")
+    # Verifier never called.
+    assert agent.verify_calls == []
+    # process_input never ran — no side effects from the unverifiable
+    # turn.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+# ---------------------------------------------------------------------------
+# Minimal agent fallback — no optional hooks at all
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_minimal_agent_full_injection_refused(
+    tmp_path, template_path
+):
+    """Agent without `_get_governing_constitution` cannot satisfy
+    `constitution_injection="full"` — the dispatcher must refuse
+    rather than run the dispatch with NULLs (which would be a silent
+    Phase-1 failure of the security property). Codex round-5 P1
+    drives this stricter behavior."""
+    agent = _MinimalAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="min_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("min_cog"))
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_minimal_agent_echo_required_refused(tmp_path, template_path):
+    """Minimal agent (no `_get_governing_constitution`) + full
+    injection + echo required: the dispatcher refuses earlier than
+    the verifier is reached — DROPPED_VALIDATION at the constitution
+    resolution step."""
+    agent = _MinimalAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="min_echo_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("min_echo_cog"))
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
+    await env.backend.close()
+
+
+# ---------------------------------------------------------------------------
+# ACTION / ARTIFACT signals are unaffected
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_echo_required_treats_not_required_as_failure(
+    tmp_path, template_path
+):
+    """Codex round-3 P2: when echo IS required, a verifier that
+    returns NOT_REQUIRED is a contract violation, not a pass. The
+    dispatch must fail with `constitution_not_received`."""
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.NOT_REQUIRED,  # bogus answer
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="echo_bogus_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("echo_bogus_cog"))
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    assert result.error == "constitution_not_received"
+    rows = await env.backend.fetch_all(
+        "SELECT echo_canary_status FROM signal_log"
+    )
+    # Stamp reflects what the verifier said — auditor sees the
+    # protocol violation rather than a stomp to MISSING.
+    assert rows == [("not_required",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_audit_preserved_when_process_input_raises(
+    tmp_path, template_path
+):
+    """Codex round-3 P2: if process_input raises after the audit was
+    built, the audit fields (constitution_hash, doctrine_bundle_hash)
+    must still land in signal_log so the per-dispatch forensic trail
+    survives LLM/API failures."""
+
+    class _RaisingAgent(_AuditingAgent):
+        async def process_input(self, prompt: str):
+            self.process_input_calls.append(prompt)
+            raise RuntimeError("openai 503")
+
+    agent = _RaisingAgent(
+        constitution_hash="con_traceable",
+        anchored_bundle_hash="bundle_anchored",
+        live_bundle_hash="bundle_anchored",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="will_raise_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("will_raise_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.FAILED
+    # Outer message includes the raising cause.
+    assert "openai 503" in (result.error or "")
+
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, "
+        "echo_canary_status FROM signal_log"
+    )
+    # Audit preserved even though process_input failed.
+    assert rows == [("con_traceable", "bundle_anchored", "not_required")]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_full_injection_records_kestrel_constitution_clause(
+    tmp_path,
+):
+    """For full-injection sources the dispatcher records
+    `KESTREL_CONSTITUTION` in `injected_clauses_json`. The constitution
+    body itself lives in the agent's system prompt via the existing
+    `build_system_prompt` path — the dispatcher does NOT duplicate it
+    into the user prompt (which would pollute history) or into the
+    canary addendum (which is a per-turn directive). The clause name
+    in the audit reflects what was OPERATIVE during the dispatch, not
+    what the dispatcher itself prepended."""
+
+    class _GovernedAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "ARTICLE I — sovereignty over data"
+
+    template_path = tmp_path / "tpl_no_placeholder.md"
+    template_path.write_text(
+        "Reviewer task: payload={payload}", encoding="utf-8"
+    )
+
+    agent = _GovernedAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="codex_no_placeholder",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(
+        _signal("codex_no_placeholder")
+    )
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    # codex format: dispatcher INLINES the constitution into the
+    # prompt body because external reviewers don't have a separate
+    # system-prompt assembly path (codex round-11 P1 fix).
+    assert "ARTICLE I — sovereignty over data" in rendered
+    assert "GOVERNING CONSTITUTION" in rendered
+
+    # Canary directive arrives via system_prompt_addendum kwarg.
+    # (For codex/local, the agent might also need it inlined into
+    # the body — but stock agents that route claude_code through
+    # in-agent ignore the addendum harmlessly.)
+    addendum = agent.process_input_kwargs[0].get("system_prompt_addendum")
+    assert addendum is not None
+    assert "constitution_canary" in addendum
+
+    # injected_clauses records that KESTREL_CONSTITUTION was operative.
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    assert _json.loads(rows[0][0]) == ["KESTREL_CONSTITUTION"]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_full_injection_drops_validation_when_no_constitution_body(
+    tmp_path, template_path
+):
+    """If `_get_governing_constitution` returns empty/None for a
+    full-injection source, the dispatcher must REFUSE the dispatch —
+    logging VERIFIED while the model saw no constitution would be a
+    silent security failure."""
+
+    class _NoConstitutionAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return ""  # nothing to inject
+
+    agent = _NoConstitutionAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="empty_const_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("empty_const_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
+    # process_input was NEVER called — no chance to verify a canary
+    # against a non-existent constitution.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_code_format_does_not_inline_constitution(
+    tmp_path, template_path
+):
+    """Codex round-11 P1 boundary: for `claude_code` format the
+    constitution arrives via the agent's system-prompt path, not via
+    the dispatcher's prompt body. The dispatcher MUST NOT inline the
+    constitution for in-agent dispatches — that would duplicate it
+    AND pollute conversation history."""
+
+    class _GovernedAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "ARTICLE I — sovereignty over data"
+
+    agent = _GovernedAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    # claude_code format with full injection but no echo (claude_code
+    # echo requires Phase 2 phantom-tool wiring; default off).
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="in_agent_full",
+            constitution_injection="full",
+            require_constitution_echo=False,
+            prompt_template_format="claude_code",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("in_agent_full"))
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    # Constitution is NOT in the user prompt for claude_code.
+    assert "ARTICLE I — sovereignty over data" not in rendered
+    assert "GOVERNING CONSTITUTION" not in rendered
+
+    # But the audit still records that the constitution was operative
+    # (it lives in the agent's system prompt path).
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json, constitution_hash FROM signal_log"
+    )
+    import json as _json
+
+    assert _json.loads(rows[0][0]) == ["KESTREL_CONSTITUTION"]
+    assert rows[0][1] == "con_abc"
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_render_constitution_placeholder_always_empty(tmp_path):
+    """`_render_prompt` accepts the legacy `{constitution}`
+    placeholder for backward compat with templates from an earlier
+    chunk-1G round; it ALWAYS substitutes empty. The dispatcher does
+    not put the constitution body in the user prompt — that lives in
+    the agent's system prompt via the existing build_system_prompt
+    path."""
+
+    class _GovernedAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "DO NOT APPEAR IN USER PROMPT"
+
+    template_path = tmp_path / "tpl_with_legacy_placeholder.md"
+    template_path.write_text("[BODY]{constitution}[/BODY]", encoding="utf-8")
+
+    agent = _GovernedAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="legacy_placeholder_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(
+        _signal("legacy_placeholder_cog")
+    )
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    # Placeholder substituted with empty (the body block itself is
+    # `[BODY][/BODY]` after substitution).
+    assert "[BODY][/BODY]" in rendered
+    # For codex format, the dispatcher does inline the constitution
+    # via the prepend — separate from the legacy `{constitution}`
+    # placeholder which always renders empty.
+    assert "DO NOT APPEAR IN USER PROMPT" in rendered  # via prepend
+    # And the prepend appears BEFORE the body block.
+    assert rendered.index("GOVERNING CONSTITUTION") < rendered.index(
+        "[BODY]"
+    )
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_get_constitution_hash_reads_node():
+    """The default ConstitutionMixin hook returns
+    agent_node.properties['constitution_hash'] — the trivial wiring
+    that lets real agents stop silently null-stamping signal_log."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    class _Agent(ConstitutionMixin):
+        def __init__(self, hash_value):
+            self.agent_id = "agent-x"
+            node = MagicMock()
+            node.properties = {"constitution_hash": hash_value}
+            self.storage = MagicMock()
+            self.storage.get_node = AsyncMock(return_value=node)
+
+    agent = _Agent("con_real_anchored")
+    assert await agent.get_constitution_hash() == "con_real_anchored"
+
+    # Missing node → None (no crash)
+    class _NoNodeAgent(ConstitutionMixin):
+        def __init__(self):
+            self.agent_id = "missing"
+            self.storage = MagicMock()
+            self.storage.get_node = AsyncMock(return_value=None)
+
+    assert await _NoNodeAgent().get_constitution_hash() is None
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_codex_raw_string_uses_codex_field():
+    """Codex round-12 P2: when the codex reviewer returns raw JSON
+    text (not a parsed dict), the verifier must look for
+    `constitution_canary`, not the local-format default `_canary`."""
+    import json as _json
+
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CODEX_CANARY_FIELD,
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    raw = _json.dumps({CODEX_CANARY_FIELD: canary})
+    result = _Agent().verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="codex",
+        signal_id="sig_x",
+        response=raw,
+    )
+    assert result is CanaryStatus.VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_codex_format():
+    """Default verifier on `ConstitutionMixin` parses codex format
+    structured-response dicts. Returns VERIFIED when the canary
+    matches the structured field; MISSING otherwise."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CODEX_CANARY_FIELD,
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+
+    agent = _Agent()
+    # Matching dict response → VERIFIED.
+    result = agent.verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="codex",
+        signal_id="sig_x",
+        response={CODEX_CANARY_FIELD: canary, "verdict": "OK"},
+    )
+    assert result is CanaryStatus.VERIFIED
+
+    # Non-matching → MISSING.
+    result = agent.verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="codex",
+        signal_id="sig_x",
+        response={CODEX_CANARY_FIELD: "f" * 16},
+    )
+    assert result is CanaryStatus.MISSING
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_local_format_extracts_json():
+    """For local format the verifier accepts raw text and extracts
+    the first balanced JSON block (model output discipline varies)."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        LOCAL_CANARY_FIELD,
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    text = (
+        "```json\n"
+        f'{{"{LOCAL_CANARY_FIELD}": "{canary}"}}\n'
+        "```"
+    )
+    result = _Agent().verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="local",
+        signal_id="sig_x",
+        response=text,
+    )
+    assert result is CanaryStatus.VERIFIED
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_verify_echo_claude_code_returns_missing():
+    """Phase 1 default returns MISSING for claude_code format —
+    Phase 2 wires the phantom-tool receipt channel."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.signals.constitution_canary import (
+        CanaryStatus,
+        derive_canary,
+    )
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    canary = derive_canary(
+        signal_id="sig_x",
+        constitution_hash="con_x",
+        engine_nonce="nonce_x",
+    )
+    result = _Agent().verify_constitution_echo(
+        canary=canary,
+        prompt_template_format="claude_code",
+        signal_id="sig_x",
+        response="some assistant text containing " + canary,
+    )
+    assert result is CanaryStatus.MISSING
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_passes_response_to_verifier_when_supported(
+    tmp_path, template_path
+):
+    """Codex round-9 P2 #1: the dispatcher must give the verifier the
+    LLM response so it can parse the format-specific receipt without
+    relying on the agent storing per-signal state."""
+    from kestrel_sovereign.signals.constitution_canary import (
+        CODEX_CANARY_FIELD,
+    )
+
+    captured_response = {"box": None}
+
+    class _ResponseChecking(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            self.process_input_calls.append(prompt)
+            self.process_input_kwargs = list(
+                getattr(self, "process_input_kwargs", [])
+            )
+            self.process_input_kwargs.append(kwargs)
+            # Pretend the codex reviewer returned a structured dict
+            # containing the canary the dispatcher just injected.
+            addendum = kwargs.get("system_prompt_addendum") or ""
+            # Extract the canary from the addendum text (16 lowercase hex).
+            import re
+
+            m = re.search(r"[0-9a-f]{16}", addendum)
+            return {CODEX_CANARY_FIELD: m.group(0) if m else "missing"}
+
+        def verify_constitution_echo(self, *, canary, prompt_template_format, signal_id, response=None):
+            # Use the dispatcher-supplied response; assert we got one.
+            captured_response["box"] = response
+            from kestrel_sovereign.signals.constitution_canary import (
+                CanaryStatus,
+                verify_in_structured_response,
+            )
+            return verify_in_structured_response(response, canary)
+
+    agent = _ResponseChecking(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="response_check_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("response_check_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.OK
+    assert captured_response["box"] is not None
+    assert isinstance(captured_response["box"], dict)
+    assert CODEX_CANARY_FIELD in captured_response["box"]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_passes_budget_to_agent_when_accepted(
+    tmp_path, template_path
+):
+    """Codex round-9 P2 #2: registered system_prompt_budget_bytes
+    propagates to the agent's process_input call when the agent
+    accepts the kwarg, so the agent's build_context can route to the
+    budget-aware tracking assembler."""
+    captured = {"budget_kw": None}
+
+    class _BudgetAwareAgent(_AuditingAgent):
+        async def process_input(
+            self, prompt: str,
+            *,
+            system_prompt_addendum=None,
+            system_prompt_budget_bytes=None,
+        ):
+            captured["budget_kw"] = system_prompt_budget_bytes
+            return "ok"
+
+    agent = _BudgetAwareAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="budget_aware_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+            system_prompt_budget_bytes=4096,
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("budget_aware_cog"))
+    await _drain(env)
+    assert captured["budget_kw"] == 4096
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_does_not_retry_on_internal_typeerror(
+    tmp_path, template_path
+):
+    """Codex round-9 P2 #3: a TypeError raised INSIDE process_input
+    (e.g. from a tool call or LLM error) must NOT trigger a silent
+    retry without the addendum — that would duplicate side effects.
+    Verify the dispatcher surfaces the TypeError as a normal failure."""
+
+    class _RaisingAgent(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            self.process_input_calls.append(prompt)
+            raise TypeError("internal LLM error")
+
+    agent = _RaisingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="internal_typeerror_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("internal_typeerror_cog")
+    )
+    await _drain(env)
+
+    # Single call (no silent retry), failure surfaced.
+    assert len(agent.process_input_calls) == 1
+    assert result.status == Status.FAILED
+    assert "internal LLM error" in (result.error or "")
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_echo_required_refuses_when_agent_rejects_addendum_kwarg(
+    tmp_path, template_path
+):
+    """Codex round-19 P2: when echo is required but the agent's
+    process_input doesn't accept system_prompt_addendum, the
+    dispatcher must refuse BEFORE calling process_input (not run
+    the turn and then fail verification afterward). Side effects
+    from the turn must not occur for unverifiable dispatches."""
+
+    class _NoAddendumAgent(_AuditingAgent):
+        async def process_input(self, prompt: str):  # NO **kwargs
+            self.process_input_calls.append(prompt)
+            return "should not run"
+
+    agent = _NoAddendumAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="cant_receive_canary",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("cant_receive_canary")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "system_prompt_addendum" in (result.error or "")
+    # process_input was NEVER called — turn refused pre-execution.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_clears_stale_tracking_before_processing(
+    tmp_path, template_path
+):
+    """Codex round-15 P2: when process_input returns early (safe
+    mode, bootstrap, ! command) without going through build_context,
+    the dispatcher must NOT pick up the previous turn's tracking.
+    Pin the reset by pre-seeding the ContextVar with stale data and
+    confirming this dispatch records no injected/dropped clauses
+    from it."""
+    from kestrel_sovereign.agent.context_manager import (
+        _INJECTION_TRACKING_VAR,
+    )
+
+    # Pre-seed with stale tracking from a "previous turn".
+    _INJECTION_TRACKING_VAR.set(
+        (["STALE_PREV_TURN"], ["STALE_DROPPED"])
+    )
+
+    class _EarlyReturnAgent(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            # Simulate an early-return path (e.g. safe mode)
+            # — does NOT call build_context, so doesn't update
+            # the ContextVar.
+            self.process_input_calls.append(prompt)
+            self.process_input_kwargs = list(
+                getattr(self, "process_input_kwargs", [])
+            )
+            self.process_input_kwargs.append(kwargs)
+            return "early-return result"
+
+    agent = _EarlyReturnAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="early_return_cog",
+            constitution_injection="full",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("early_return_cog"))
+    await _drain(env)
+
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json, dropped_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    injected = _json.loads(rows[0][0]) if rows[0][0] else None
+    dropped = _json.loads(rows[0][1]) if rows[0][1] else None
+    # Stale clauses MUST NOT appear in this dispatch's audit.
+    assert "STALE_PREV_TURN" not in (injected or [])
+    assert "STALE_DROPPED" not in (dropped or [])
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_format_inlines_doctrine_in_prompt(
+    tmp_path, template_path
+):
+    """Codex round-23 P2: codex/local reviewer prompts have no
+    separate system-prompt path. The dispatcher must inline BOTH the
+    constitution AND anchored doctrine so the reviewer actually sees
+    what the canary will verify. Otherwise drift-checking the bundle
+    hash claims coverage the reviewer never received."""
+    from collections import OrderedDict
+
+    class _DoctrineProvidingAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "ARTICLE I — sovereignty"
+
+        async def get_anchored_doctrine_files(self):
+            return OrderedDict(
+                [
+                    ("TORTOISE_DOCTRINE.md", "TORTOISE BODY"),
+                    ("AGENTS.md", "AGENTS BODY"),
+                ]
+            )
+
+    agent = _DoctrineProvidingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="codex_with_doctrine",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("codex_with_doctrine"))
+    await _drain(env)
+
+    rendered = agent.process_input_calls[0]
+    assert "ARTICLE I — sovereignty" in rendered
+    assert "TORTOISE BODY" in rendered
+    assert "AGENTS BODY" in rendered
+    # Audit lists all clauses present in the prompt.
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    clauses = _json.loads(rows[0][0])
+    assert "KESTREL_CONSTITUTION" in clauses
+    assert "TORTOISE_DOCTRINE.md" in clauses
+    assert "AGENTS.md" in clauses
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_get_anchored_files_skips_duplicate_basenames(
+    tmp_path, monkeypatch,
+):
+    """Codex round-23 P2: when operator declares two paths with the
+    same basename, the OrderedDict-by-basename approach would
+    overwrite. Detect duplicates and skip with a logged warning so
+    the assembled prompt is deterministic and the operator sees the
+    conflict."""
+    import logging as _logging
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import (
+        DEFAULT_ANCHORED_PATHS,
+        PROP_BUNDLE_ANCHORED_PATHS,
+    )
+    from unittest.mock import AsyncMock, MagicMock
+
+    # Default doctrine files at one location.
+    for rel in DEFAULT_ANCHORED_PATHS:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"original {rel}", encoding="utf-8")
+    # An operator-declared path with the SAME BASENAME as AGENTS.md.
+    duplicate_dir = tmp_path / "duplicate"
+    duplicate_dir.mkdir()
+    (duplicate_dir / "AGENTS.md").write_text(
+        "DUPLICATE AGENTS", encoding="utf-8"
+    )
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test"
+
+        def __init__(self):
+            self.storage = MagicMock()
+            node = MagicMock()
+            node.properties = {
+                PROP_BUNDLE_ANCHORED_PATHS: ["duplicate/AGENTS.md"],
+            }
+            self.storage.get_node = AsyncMock(return_value=node)
+
+    _logging.disable(_logging.CRITICAL)
+    try:
+        files = await _Agent().get_anchored_doctrine_files()
+    finally:
+        _logging.disable(_logging.NOTSET)
+
+    assert files is not None
+    # Default AGENTS.md wins (first occurrence); duplicate skipped.
+    assert "AGENTS.md" in files
+    assert files["AGENTS.md"].startswith("original ")
+    # The basename "AGENTS.md" appears exactly once.
+    assert sum(1 for k in files if k == "AGENTS.md") == 1
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_skips_constitution_in_anchored_doctrine(
+    tmp_path, monkeypatch,
+):
+    """Codex round-18 P2: the system prompt path independently
+    delivers the constitution via `_get_governing_constitution`. The
+    anchored-doctrine injection map must NOT include
+    KESTREL_CONSTITUTION.md or the constitution would appear twice.
+    Bundle-hash semantics still include it (drift completeness)."""
+    import logging as _logging
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import DEFAULT_ANCHORED_PATHS
+
+    for rel in DEFAULT_ANCHORED_PATHS:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"contents of {rel}", encoding="utf-8")
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test"
+
+    _logging.disable(_logging.CRITICAL)
+    try:
+        files = await _Agent().get_anchored_doctrine_files()
+    finally:
+        _logging.disable(_logging.NOTSET)
+
+    assert files is not None
+    # Constitution excluded.
+    assert "KESTREL_CONSTITUTION.md" not in files
+    # Other doctrine still present.
+    assert "TORTOISE_DOCTRINE.md" in files
+    assert "AGENTS.md" in files
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_auto_anchors_doctrine_bundle_on_first_dispatch(
+    tmp_path, template_path
+):
+    """Codex round-18 P1: agents upgraded to Phase 1 with no
+    pre-existing doctrine_bundle_hash should have it auto-anchored
+    on the first full-injection dispatch. The dispatcher calls
+    `ensure_doctrine_bundle_anchored` before the audit, so first-run
+    dispatches establish the anchor; subsequent runs detect drift."""
+
+    class _AnchorTrackingAgent(_AuditingAgent):
+        ensure_calls = 0
+
+        async def ensure_doctrine_bundle_anchored(self):
+            type(self).ensure_calls += 1
+            # First call: simulate writing the anchor.
+            self._anchored = self._live  # match → no drift
+            return self._anchored
+
+    agent = _AnchorTrackingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash=None,  # not anchored yet
+        live_bundle_hash="bundle_to_anchor",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="auto_anchor_cog",
+            constitution_injection="full",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("auto_anchor_cog"))
+    await _drain(env)
+
+    assert result.status == Status.OK
+    assert _AnchorTrackingAgent.ensure_calls == 1
+    rows = await env.backend.fetch_all(
+        "SELECT doctrine_bundle_hash FROM signal_log"
+    )
+    # Live hash matches anchored after auto-anchor; recorded value
+    # is the live (post-anchor) hash.
+    assert rows == [("bundle_to_anchor",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_compute_live_returns_none_when_no_project_root(
+    monkeypatch,
+):
+    """When neither `KESTREL_PROJECT_ROOT` env var nor a `.git`/
+    `pyproject.toml` ancestor is reachable, the default returns
+    None — drift detection skipped without crashing."""
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", "/nonexistent/missing/path")
+
+    class _Agent(ConstitutionMixin):
+        pass
+
+    # Patch the walk-up resolver to return None too, simulating a
+    # deployment without repo markers.
+    agent = _Agent()
+    agent._resolve_project_root_for_doctrine = (
+        lambda: __import__("asyncio").sleep(0, result=None)
+    )
+    # Simpler: monkey-patch directly via async wrapper.
+    async def _none():
+        return None
+
+    agent._resolve_project_root_for_doctrine = _none
+
+    assert await agent.compute_live_doctrine_bundle_hash() is None
+
+
+@pytest.mark.asyncio
+async def test_constitution_mixin_compute_live_returns_hash_when_project_root_exists(
+    tmp_path, monkeypatch,
+):
+    """When KESTREL_PROJECT_ROOT points at a directory containing
+    the doctrine files, the default computes a real bundle hash so
+    drift detection actually fires for production agents (codex
+    round-16 P2 fix). Also verifies storage-lookup failures are
+    swallowed gracefully (the stub has no storage attribute)."""
+    import logging as _logging
+    from kestrel_sovereign.agent.constitution import ConstitutionMixin
+    from kestrel_sovereign.agent.doctrine_bundle import DEFAULT_ANCHORED_PATHS
+
+    # Create dummy doctrine files under tmp_path.
+    for rel in DEFAULT_ANCHORED_PATHS:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"contents of {rel}", encoding="utf-8")
+
+    monkeypatch.setenv("KESTREL_PROJECT_ROOT", str(tmp_path))
+
+    class _Agent(ConstitutionMixin):
+        agent_id = "test-agent"
+
+    agent = _Agent()
+    # Suppress the expected agent_node error log.
+    _logging.disable(_logging.CRITICAL)
+    try:
+        h = await agent.compute_live_doctrine_bundle_hash()
+    finally:
+        _logging.disable(_logging.NOTSET)
+    assert isinstance(h, str)
+    assert len(h) == 64  # sha256 hex
+    assert all(c in "0123456789abcdef" for c in h)
+
+
+@pytest.mark.asyncio
+async def test_constitution_error_sentinel_refused(
+    tmp_path, template_path
+):
+    """Codex round-7 P2: `ConstitutionMixin._get_governing_constitution`
+    returns strings like `"Error: Could not retrieve constitution..."`
+    on storage failure. Those are NOT a constitution body and must
+    not be prepended as if they were. Refuse the dispatch instead."""
+
+    class _ErrorSentinelAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "Error: Could not retrieve constitution for hash abcdef. Reason: storage offline"
+
+    agent = _ErrorSentinelAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="error_sentinel_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("error_sentinel_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
+    # process_input never ran — we didn't prepend the error sentinel
+    # and call the model.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_constitution_hash_refreshed_after_lazy_anchoring(tmp_path):
+    """Codex round-6 P2: `_get_governing_constitution()` can lazily
+    anchor on first call (writing constitution_hash). Without a
+    post-getter refresh, the first echo-required dispatch would see
+    `audit.constitution_hash=None` (recorded pre-getter), skip canary
+    derivation, and falsely fail. Pin the refresh."""
+
+    class _LazyAnchorAgent(_AuditingAgent):
+        def __init__(self):
+            super().__init__(
+                # Pre-anchor: get_constitution_hash returns None.
+                constitution_hash=None,
+                anchored_bundle_hash="bundle",
+                live_bundle_hash="bundle",
+                echo_status=CanaryStatus.VERIFIED,
+            )
+            self.anchored_value: Optional[str] = None
+
+        async def _get_governing_constitution(self) -> str:
+            # Simulate lazy anchoring: first call writes to the
+            # backing store; subsequent get_constitution_hash sees it.
+            self.anchored_value = "con_lazy_anchored"
+            self._const = self.anchored_value
+            return "ARTICLE I — sovereignty over data"
+
+    template_path = tmp_path / "tpl.md"
+    template_path.write_text("payload={payload}", encoding="utf-8")
+
+    agent = _LazyAnchorAgent()
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="lazy_anchor_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("lazy_anchor_cog")
+    )
+    await _drain(env)
+
+    # First-time dispatch under lazy anchoring SUCCEEDS — canary was
+    # derived from the post-anchor hash, the model saw it, the
+    # verifier confirmed.
+    assert result.status == Status.OK
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, echo_canary_status FROM signal_log"
+    )
+    assert rows == [("con_lazy_anchored", "verified")]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_budget_bytes_passes_through_to_agent(tmp_path):
+    """`system_prompt_budget_bytes` is a hint for the agent's
+    `build_system_prompt_with_tracking` (chunk 1E) — enforced inside
+    the system-prompt assembler. The dispatcher does NOT enforce a
+    budget on the user prompt because the constitution and other
+    cache-stable content live in the system prompt path. A registered
+    budget value passes through; the dispatch runs normally and the
+    agent's path applies the cap when assembled."""
+    template_path = tmp_path / "tpl.md"
+    template_path.write_text("payload={payload}", encoding="utf-8")
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="budget_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+            system_prompt_budget_bytes=8192,
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(_signal("budget_cog"))
+    await _drain(env)
+
+    # Dispatch runs; budget is registration metadata for the agent
+    # path, not a dispatcher-side gate.
+    assert result.status == Status.OK
+    assert (
+        env.registry.get("budget_cog").system_prompt_budget_bytes == 8192
+    )
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_records_echo_verified_counter(
+    tmp_path, template_path
+):
+    """Chunk 1H: a VERIFIED echo dispatch increments the
+    `kestrel_constitution_echo_verified_total` counter."""
+    from kestrel_sovereign.signals import constitution_metrics
+
+    if not constitution_metrics.PROMETHEUS_AVAILABLE:
+        pytest.skip("prometheus-client not installed")
+
+    counter = constitution_metrics.CONSTITUTION_ECHO_VERIFIED_TOTAL
+    before = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_verified_cog"}
+        ):
+            before = sample.value
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="metric_verified_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+    await env.dispatcher.dispatch_signal(_signal("metric_verified_cog"))
+    await _drain(env)
+
+    after = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_verified_cog"}
+        ):
+            after = sample.value
+    assert after - before == 1.0
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_records_doctrine_bundle_drift_counter(
+    tmp_path, template_path
+):
+    """Chunk 1H: a drift refusal increments
+    `kestrel_doctrine_bundle_drift_total`."""
+    from kestrel_sovereign.signals import constitution_metrics
+
+    if not constitution_metrics.PROMETHEUS_AVAILABLE:
+        pytest.skip("prometheus-client not installed")
+
+    counter = constitution_metrics.DOCTRINE_BUNDLE_DRIFT_TOTAL
+    before = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_drift_cog"}
+        ):
+            before = sample.value
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle_a",
+        live_bundle_hash="bundle_b",  # drift
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="metric_drift_cog",
+            constitution_injection="full",
+        )
+    )
+    await env.dispatcher.dispatch_signal(_signal("metric_drift_cog"))
+    await _drain(env)
+
+    after = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_drift_cog"}
+        ):
+            after = sample.value
+    assert after - before == 1.0
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_action_signals_bypass_constitutional_audit(tmp_path):
+    agent = _AuditingAgent(
+        constitution_hash="should_not_be_used",
+        anchored_bundle_hash="bundle_a",
+        live_bundle_hash="bundle_b",  # would be drift, but ACTION skips
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+
+    async def _h(payload):
+        return {"ok": True}
+
+    env.registry.register(
+        SourceRegistration(
+            name="act_src",
+            schema=dict,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=_h,
+            log_redaction=_redaction(),
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("act_src", mode=SignalMode.ACTION)
+    )
+    await _drain(env)
+
+    assert result.status == Status.OK  # drift would have failed COGNITION
+    rows = await env.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, "
+        "echo_canary_status FROM signal_log"
+    )
+    # ACTION signals leave all constitutional fields NULL — chunk 1C
+    # pinned the same in `test_constitution_columns_default_to_null`
+    # and the dispatcher's COGNITION-only audit preserves that.
+    assert rows == [(None, None, None)]
+    await env.backend.close()

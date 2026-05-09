@@ -17,9 +17,10 @@ Refactored to serve as an orchestration layer that delegates to specialized mana
 import json
 import logging
 import os
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional, TYPE_CHECKING
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 from .context_builder import ContextBuilder
 from .token_counter import TokenCounter, get_token_counter
@@ -35,6 +36,41 @@ if TYPE_CHECKING:
     from kestrel_sovereign.llm.service import LLMService
 
 logger = logging.getLogger(__name__)
+
+
+# Per-async-task tracking of constitutional-injection clauses for the
+# current build_context call. The dispatcher reads this AFTER
+# process_input returns so it can land in signal_log.injected_clauses_json
+# / dropped_clauses_json. Using a ContextVar (not a shared agent
+# attribute) so concurrent COGNITION dispatches don't race — each
+# dispatch's task sees its OWN value (codex round-14 P2 catch).
+_INJECTION_TRACKING_VAR: ContextVar[
+    Optional[Tuple[Optional[List[str]], Optional[List[str]]]]
+] = ContextVar("kestrel_constitution_injection_tracking", default=None)
+
+
+def get_current_injection_tracking() -> Optional[
+    Tuple[Optional[List[str]], Optional[List[str]]]
+]:
+    """Return the (injected, dropped) clause tuple for the CURRENT
+    async task's most recent build_context invocation, or None.
+
+    Used by `SignalDispatcher` after `agent.process_input` returns to
+    populate signal_log audit fields. Per-task isolation via ContextVar
+    means concurrent dispatches do not see each other's tracking.
+    """
+    return _INJECTION_TRACKING_VAR.get()
+
+
+def reset_injection_tracking() -> None:
+    """Clear the current task's injection tracking ContextVar.
+
+    Called by `SignalDispatcher._dispatch_cognition` at dispatch
+    start so an early-return `process_input` (safe mode, bootstrap,
+    `!` command) doesn't leak the PREVIOUS turn's tracking into
+    this dispatch's signal_log row (codex round-15 P2 fix).
+    """
+    _INJECTION_TRACKING_VAR.set(None)
 
 
 @dataclass
@@ -54,6 +90,14 @@ class ContextResult:
     # OpenAI prefix cache, Anthropic cache_control) can actually hit.
     # Callers prepend this to the current user message content.
     dynamic_user_context: str = ""
+    # Constitutional-injection tracking — populated only when the
+    # caller supplies `system_prompt_budget_bytes` and the
+    # priority-aware tracking assembler runs (kestrel-sovereign#1137).
+    # The dispatcher reads these via `self._agent._last_injection_tracking`
+    # after `process_input` returns and threads them into
+    # `signal_log.injected_clauses_json` / `dropped_clauses_json`.
+    injected_clauses: Optional[List[str]] = None
+    dropped_clauses: Optional[List[str]] = None
 
 
 class ContextManager:
@@ -182,6 +226,9 @@ class ContextManager:
         emotional_context: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[List[Dict]] = None,
         reflection_guidance: Optional[List[str]] = None,
+        system_prompt_addendum: Optional[str] = None,
+        system_prompt_budget_bytes: Optional[int] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
     ) -> ContextResult:
         """
         Build complete context for an LLM request.
@@ -216,7 +263,10 @@ class ContextManager:
             return await self._build_ephemeral_context(
                 query=query,
                 constitution=constitution,
-                include_briefing=include_briefing
+                include_briefing=include_briefing,
+                system_prompt_addendum=system_prompt_addendum,
+                system_prompt_budget_bytes=system_prompt_budget_bytes,
+                anchored_doctrine=anchored_doctrine,
             )
 
         # Use provided history or fetch from storage
@@ -239,13 +289,69 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"Failed to get constitutional state of mind: {e}")
 
-        # 1. Build system prompt
-        system_prompt = self.context_builder.build_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind
-        )
+        # 1. Build system prompt. When the caller sets
+        # `system_prompt_budget_bytes` (a per-source registration knob
+        # threaded through by the SignalDispatcher), route to the
+        # priority-aware tracking assembler so the budget actually
+        # takes effect. The legacy build_system_prompt is byte-stable
+        # for the cache path; the tracking variant intentionally has
+        # different bytes (different fence convention) so it's only
+        # used when the source explicitly opts in via budget.
+        #
+        # Codex round-12 P2: the addendum (canary directive) must
+        # count toward the budget. Reserve its bytes BEFORE the
+        # assembler truncates so the final assembled prompt
+        # (assembler output + joiner + addendum) fits within the cap.
+        # Codex round-17 P2: route to the tracking assembler when
+        # EITHER a budget is set OR anchored doctrine is supplied
+        # (the legacy build_system_prompt has no anchored_doctrine
+        # parameter). Otherwise full-injection sources without a
+        # budget would silently fall back to the legacy path that
+        # ignores doctrine.
+        injected_clauses_for_audit: Optional[List[str]] = None
+        dropped_clauses_for_audit: Optional[List[str]] = None
+        if system_prompt_budget_bytes is not None or anchored_doctrine:
+            # Effective budget: when caller set a budget, reserve
+            # addendum bytes from it (codex round-12); when no
+            # budget is set but anchored_doctrine triggered this
+            # path (codex round-17), pass None to the assembler so
+            # it doesn't truncate.
+            effective_budget: Optional[int]
+            if system_prompt_budget_bytes is None:
+                effective_budget = None
+            else:
+                reserved = 0
+                if system_prompt_addendum:
+                    reserved = (
+                        len(system_prompt_addendum.encode("utf-8")) + 2
+                    )  # 2 bytes for the "\n\n" joiner
+                effective_budget = max(
+                    1, system_prompt_budget_bytes - reserved
+                )
+            tracking_result = self.context_builder.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                budget_bytes=effective_budget,
+                anchored_doctrine=anchored_doctrine,
+            )
+            system_prompt = tracking_result.prompt
+            # Surface tracking back to the caller so the dispatcher
+            # can populate signal_log.injected_clauses_json /
+            # dropped_clauses_json (codex round-13 P2 fix).
+            injected_clauses_for_audit = list(tracking_result.injected_clauses)
+            dropped_clauses_for_audit = list(tracking_result.dropped_clauses)
+            if system_prompt_addendum:
+                system_prompt = f"{system_prompt}\n\n{system_prompt_addendum}"
+        else:
+            system_prompt = self.context_builder.build_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                system_prompt_addendum=system_prompt_addendum,
+            )
         system_tokens = self.counter.count(system_prompt)
         budget.use("system", system_tokens)
 
@@ -264,10 +370,35 @@ class ContextManager:
             for item in reflection_guidance:
                 guidance_text += f"- {item}\n"
             guidance_text += "--- END GUIDANCE ---"
-            guidance_tokens = self.counter.count(guidance_text)
-            budget.use("system", guidance_tokens)
-            system_prompt = f"{system_prompt}\n\n{guidance_text}"
-            logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
+            # Codex round-15 P2: when a per-source budget is in
+            # effect, the late append of reflection guidance must
+            # NOT push the total over the cap. Skip the append if
+            # there's no room — the budget contract takes precedence
+            # over reflection guidance (operator can raise the cap
+            # to admit it back).
+            if system_prompt_budget_bytes is not None:
+                projected = (
+                    len(system_prompt.encode("utf-8"))
+                    + 2  # "\n\n" joiner
+                    + len(guidance_text.encode("utf-8"))
+                )
+                if projected > system_prompt_budget_bytes:
+                    logger.warning(
+                        "Skipping reflection guidance for budgeted "
+                        "dispatch (would push prompt %d over cap %d)",
+                        projected,
+                        system_prompt_budget_bytes,
+                    )
+                else:
+                    guidance_tokens = self.counter.count(guidance_text)
+                    budget.use("system", guidance_tokens)
+                    system_prompt = f"{system_prompt}\n\n{guidance_text}"
+                    logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
+            else:
+                guidance_tokens = self.counter.count(guidance_text)
+                budget.use("system", guidance_tokens)
+                system_prompt = f"{system_prompt}\n\n{guidance_text}"
+                logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
 
         # 1c. Microcompact: clear stale tool results (zero-cost, no LLM)
         microcompact_savings = self._microcompact_tool_results(history)
@@ -281,12 +412,31 @@ class ContextManager:
                 max_episodes=5
             )
             if episode_context:
-                episode_tokens = self.counter.count(episode_context)
-                budget.use("episodes", episode_tokens)
-                system_prompt = f"{system_prompt}\n\n{episode_context}"
-                # Count episodes (rough estimate from formatting)
-                episode_count = episode_context.count("**") // 2
-                logger.debug(f"Added {episode_count} episodes to context")
+                # Codex round-15 P2: same budget guard as reflection
+                # guidance. Skip episode append if it would push the
+                # final prompt over the per-source cap.
+                if system_prompt_budget_bytes is not None:
+                    projected = (
+                        len(system_prompt.encode("utf-8"))
+                        + 2
+                        + len(episode_context.encode("utf-8"))
+                    )
+                    if projected > system_prompt_budget_bytes:
+                        logger.warning(
+                            "Skipping episode context for budgeted "
+                            "dispatch (would push prompt %d over cap %d)",
+                            projected,
+                            system_prompt_budget_bytes,
+                        )
+                        episode_context = None
+
+                if episode_context:
+                    episode_tokens = self.counter.count(episode_context)
+                    budget.use("episodes", episode_tokens)
+                    system_prompt = f"{system_prompt}\n\n{episode_context}"
+                    # Count episodes (rough estimate from formatting)
+                    episode_count = episode_context.count("**") // 2
+                    logger.debug(f"Added {episode_count} episodes to context")
 
         # 3. Retrieve emotionally-weighted memories (placed in dynamic user
         # context, not system, so the system prefix stays cacheable).
@@ -380,6 +530,14 @@ class ContextManager:
             f"{memory_count} memories, {rag_chunks} docs)"
         )
 
+        # Codex round-14 P2: publish per-task tracking via ContextVar
+        # so concurrent COGNITION dispatches don't race on a shared
+        # agent attribute. Dispatcher reads via
+        # `get_current_injection_tracking()` after process_input.
+        _INJECTION_TRACKING_VAR.set(
+            (injected_clauses_for_audit, dropped_clauses_for_audit)
+        )
+
         return ContextResult(
             system_prompt=system_prompt,
             messages=formatted_history,
@@ -390,13 +548,18 @@ class ContextManager:
             rag_chunks=rag_chunks,
             warnings=warnings,
             dynamic_user_context=dynamic_user_context,
+            injected_clauses=injected_clauses_for_audit,
+            dropped_clauses=dropped_clauses_for_audit,
         )
 
     async def _build_ephemeral_context(
         self,
         query: str,
         constitution: str,
-        include_briefing: bool
+        include_briefing: bool,
+        system_prompt_addendum: Optional[str] = None,
+        system_prompt_budget_bytes: Optional[int] = None,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
     ) -> ContextResult:
         """
         Build minimal context for EPHEMERAL privacy mode.
@@ -414,14 +577,61 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"Failed to get constitutional state of mind: {e}")
 
-        system_prompt = self.context_builder.build_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing,
-            prompt_adaptation=prompt_adaptation,
-            state_of_mind=state_of_mind
+        # The EPHEMERAL MODE notice is fixed text appended after the
+        # budget-aware assembly. Codex round-13 P2 caught that we
+        # must reserve its bytes too, otherwise the notice can push
+        # the final prompt over the configured budget.
+        ephemeral_notice = (
+            "--- EPHEMERAL MODE ACTIVE ---\n"
+            "This conversation is not being recorded. "
+            "No history or memories are available.\n"
+            "--- END NOTICE ---"
         )
 
-        # Add ephemeral mode notice
+        ephemeral_tracking = None
+        injected_clauses_for_audit: Optional[List[str]] = None
+        dropped_clauses_for_audit: Optional[List[str]] = None
+        if system_prompt_budget_bytes is not None or anchored_doctrine:
+            # Reserve addendum + ephemeral notice + their joiners.
+            effective_budget: Optional[int]
+            if system_prompt_budget_bytes is None:
+                effective_budget = None
+            else:
+                reserved = 0
+                if system_prompt_addendum:
+                    reserved += (
+                        len(system_prompt_addendum.encode("utf-8")) + 2
+                    )
+                reserved += len(ephemeral_notice.encode("utf-8")) + 2
+                effective_budget = max(
+                    1, system_prompt_budget_bytes - reserved
+                )
+            ephemeral_tracking = self.context_builder.build_system_prompt_with_tracking(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                budget_bytes=effective_budget,
+                anchored_doctrine=anchored_doctrine,
+            )
+            system_prompt = ephemeral_tracking.prompt
+            injected_clauses_for_audit = list(ephemeral_tracking.injected_clauses)
+            dropped_clauses_for_audit = list(ephemeral_tracking.dropped_clauses)
+            if system_prompt_addendum:
+                system_prompt = (
+                    f"{system_prompt}\n\n{system_prompt_addendum}"
+                )
+        else:
+            system_prompt = self.context_builder.build_system_prompt(
+                constitution=constitution,
+                include_briefing=include_briefing,
+                prompt_adaptation=prompt_adaptation,
+                state_of_mind=state_of_mind,
+                system_prompt_addendum=system_prompt_addendum,
+            )
+
+        # Append the ephemeral notice (already accounted for in the
+        # reserved budget above when budget_bytes was set).
         system_prompt = (
             f"{system_prompt}\n\n"
             "--- EPHEMERAL MODE ACTIVE ---\n"
@@ -432,12 +642,19 @@ class ContextManager:
 
         tokens = self.counter.count(system_prompt)
 
+        # Same per-task tracking publish as the non-ephemeral path.
+        _INJECTION_TRACKING_VAR.set(
+            (injected_clauses_for_audit, dropped_clauses_for_audit)
+        )
+
         return ContextResult(
             system_prompt=system_prompt,
             messages=[],
             total_tokens=tokens,
             budget_summary={"mode": "ephemeral"},
             warnings=["EPHEMERAL mode: no history available"],
+            injected_clauses=injected_clauses_for_audit,
+            dropped_clauses=dropped_clauses_for_audit,
         )
 
     # Delegate to ConversationManager

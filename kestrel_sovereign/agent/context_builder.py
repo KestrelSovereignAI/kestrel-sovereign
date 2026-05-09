@@ -485,7 +485,8 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         include_briefing: bool = True,
         additional_context: Optional[str] = None,
         prompt_adaptation: Optional['PromptAdaptation'] = None,
-        state_of_mind: Optional['StateOfMind'] = None
+        state_of_mind: Optional['StateOfMind'] = None,
+        system_prompt_addendum: Optional[str] = None,
     ) -> str:
         """
         Build the complete system prompt for the LLM.
@@ -501,6 +502,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             additional_context: Any additional context to include
             prompt_adaptation: Optional constitutional prompt adaptation (preamble, emphasis)
             state_of_mind: Optional StateOfMind with governance mode and conflicts
+            system_prompt_addendum: Per-turn addendum appended at the end
+                of the system prompt. Used by the SignalDispatcher
+                (kestrel-sovereign#1137) to inject the constitutional
+                echo-canary directive for `require_constitution_echo=True`
+                COGNITION dispatches. Default None preserves byte-stable
+                output for legacy callers (the Anthropic prompt cache is
+                position-indexed; legacy callers must keep the same
+                bytes — see project_anthropic_cache_markers.md).
 
         Returns:
             Complete system prompt string
@@ -565,7 +574,104 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             parts.append(additional_context)
             parts.append("--- END CONTEXT ---")
 
+        # Per-turn addendum (e.g. constitutional echo-canary directive
+        # from the SignalDispatcher). Appended last so the cache-stable
+        # prefix above is unchanged when no addendum is supplied —
+        # legacy callers passing system_prompt_addendum=None get
+        # byte-identical output to the previous version of this method.
+        if system_prompt_addendum:
+            parts.append(system_prompt_addendum)
+
         return "\n\n".join(parts)
+
+    def build_system_prompt_with_tracking(
+        self,
+        constitution: str,
+        *,
+        anchored_doctrine: Optional["OrderedDict[str, str]"] = None,
+        include_briefing: bool = True,
+        additional_context: Optional[str] = None,
+        prompt_adaptation: Optional['PromptAdaptation'] = None,
+        state_of_mind: Optional['StateOfMind'] = None,
+        budget_bytes: Optional[int] = None,
+    ) -> 'SystemPromptResult':
+        """Priority-aware variant that returns the prompt + audit trail.
+
+        Used by the SignalDispatcher (kestrel-sovereign#1137) to record
+        `signal_log.injected_clauses_json` / `dropped_clauses_json` for
+        each COGNITION dispatch under constitutional injection. The
+        legacy `build_system_prompt` stays byte-stable for prompt-cache
+        hits; this method's output IS NOT byte-compatible — only call it
+        from paths that opt into the new assembler.
+
+        `anchored_doctrine` is `OrderedDict[filename, content]` for
+        constitutional bundle members (`TORTOISE_DOCTRINE.md`,
+        `AGENTS.md`, etc.). When present, AGENTS.md is excluded from
+        bootstrap iteration to avoid duplication.
+
+        `budget_bytes` enforces priority-ordered truncation. The
+        constitution is never droppable; everything else is dropped
+        highest-priority-number first until the assembled UTF-8 byte
+        length fits.
+
+        See `kestrel_sovereign/agent/system_prompt_assembler.py` for
+        the priority table (mirrors CONSTITUTION_INJECTION.md §7).
+        """
+        from kestrel_sovereign.agent.system_prompt_assembler import (
+            assemble_system_prompt,
+        )
+
+        # Pre-render the state-of-mind block so the assembler stays
+        # pure-text. Logic mirrors `build_system_prompt` to keep the
+        # blocks bit-identical.
+        state_of_mind_block: Optional[str] = None
+        if state_of_mind:
+            state_parts = ["--- STATE OF MIND ---"]
+            state_parts.append(
+                f"Governance Mode: {state_of_mind.governance_mode.upper()}"
+            )
+            if state_of_mind.active_conflicts:
+                state_parts.append("\nActive Constitutional Conflicts:")
+                for conflict in state_of_mind.active_conflicts:
+                    principle = conflict.get("principle", "unknown")
+                    description = conflict.get("description", "")
+                    state_parts.append(f"  - {principle}: {description}")
+            if state_of_mind.delegated_principles:
+                state_parts.append("\nDelegated to Model (natively satisfied):")
+                for principle in state_of_mind.delegated_principles:
+                    state_parts.append(f"  - {principle}")
+            state_parts.append("--- END STATE OF MIND ---")
+            state_of_mind_block = "\n".join(state_parts)
+
+        # Style reminder is hard-coded today and only fires when SOUL.md
+        # is loaded (legacy parity).
+        style_reminder: Optional[str] = None
+        if self._bootstrap_files.get("SOUL.md"):
+            style_reminder = (
+                "--- STYLE REMINDER (IMPORTANT) ---\n"
+                "When answering personal questions, respond naturally in "
+                "paragraphs. DO NOT use numbered lists or bullet points. "
+                "Talk like a person, not a document.\n"
+                "--- END REMINDER ---"
+            )
+
+        return assemble_system_prompt(
+            constitution=constitution,
+            bootstrap_files=self._bootstrap_files,
+            anchored_doctrine=anchored_doctrine,
+            session_briefing=(
+                self.get_session_briefing() if include_briefing else None
+            ),
+            prompt_adaptation_preamble=(
+                prompt_adaptation.preamble
+                if prompt_adaptation and prompt_adaptation.preamble
+                else None
+            ),
+            state_of_mind_block=state_of_mind_block,
+            style_reminder=style_reminder,
+            additional_context=additional_context,
+            budget_bytes=budget_bytes,
+        )
 
     async def build_rag_context(
         self,

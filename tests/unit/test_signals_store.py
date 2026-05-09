@@ -148,6 +148,111 @@ async def test_failed_redaction_does_not_block_logging(store):
 
 
 @pytest.mark.asyncio
+async def test_constitution_columns_default_to_null(store):
+    """kestrel-sovereign#1137 chunk 1C — when a caller doesn't pass the
+    new constitutional-injection kwargs (i.e. legacy ACTION/ARTIFACT
+    sources, or the dispatcher hasn't wired them yet), the columns are
+    NULL. Pinning this so the migration is genuinely additive."""
+    sig = _signal()
+    reg = _registration()
+    await store.append(sig, reg, _ok_result(sig))
+
+    rows = await store.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, echo_canary_status, "
+        "injected_clauses_json, dropped_clauses_json FROM signal_log"
+    )
+    assert rows[0] == (None, None, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_constitution_columns_persist_supplied_values(store):
+    """The dispatcher (chunk 1G) will pass these for COGNITION dispatches
+    that go through constitutional injection. Pin the round-trip."""
+    import json as _json
+
+    sig = _signal()
+    reg = _registration()
+    await store.append(
+        sig,
+        reg,
+        _ok_result(sig),
+        constitution_hash="con_abc123",
+        doctrine_bundle_hash="bun_def456",
+        echo_canary_status="verified",
+        injected_clauses=["KESTREL_CONSTITUTION", "TORTOISE_DOCTRINE", "AGENTS.md"],
+        dropped_clauses=["docs/research/long-supplement.md"],
+    )
+    rows = await store.backend.fetch_all(
+        "SELECT constitution_hash, doctrine_bundle_hash, echo_canary_status, "
+        "injected_clauses_json, dropped_clauses_json FROM signal_log"
+    )
+    row = rows[0]
+    assert row[0] == "con_abc123"
+    assert row[1] == "bun_def456"
+    assert row[2] == "verified"
+    assert _json.loads(row[3]) == [
+        "KESTREL_CONSTITUTION",
+        "TORTOISE_DOCTRINE",
+        "AGENTS.md",
+    ]
+    assert _json.loads(row[4]) == ["docs/research/long-supplement.md"]
+
+
+@pytest.mark.asyncio
+async def test_empty_clause_list_distinct_from_null(store):
+    """Empty list serializes to '[]' (system-prompt path ran but
+    contributed nothing trackable); None stays NULL (no system-prompt
+    path at all). Pinning this distinction so an auditor can tell the
+    difference."""
+    import json as _json
+
+    sig1 = _signal("with_empty_lists")
+    reg = _registration()
+    await store.append(
+        sig1,
+        reg,
+        _ok_result(sig1),
+        injected_clauses=[],
+        dropped_clauses=[],
+    )
+
+    sig2 = _signal("with_none_lists")
+    await store.append(sig2, reg, _ok_result(sig2))
+
+    rows = await store.backend.fetch_all(
+        "SELECT source, injected_clauses_json, dropped_clauses_json "
+        "FROM signal_log ORDER BY source"
+    )
+    by_source = {r[0]: (r[1], r[2]) for r in rows}
+    assert by_source["with_empty_lists"] == ("[]", "[]")
+    assert by_source["with_none_lists"] == (None, None)
+    # Round-trip JSON parsing
+    assert _json.loads(by_source["with_empty_lists"][0]) == []
+
+
+@pytest.mark.asyncio
+async def test_constitution_hash_index_exists(store):
+    """The partial index `idx_signal_log_constitution_hash` enables the
+    auditor query 'all dispatches under constitution X' without a full
+    table scan. Verify by querying SQLite's sqlite_master catalog."""
+    rows = await store.backend.fetch_all(
+        "SELECT name, sql FROM sqlite_master WHERE type='index' "
+        "AND name='idx_signal_log_constitution_hash'"
+    )
+    assert len(rows) == 1
+    assert "constitution_hash IS NOT NULL" in (rows[0][1] or "")
+
+
+@pytest.mark.asyncio
+async def test_initialize_is_idempotent_on_new_columns(store):
+    """Running initialize() twice doesn't error (additive ALTERs are
+    silently skipped on already-applied)."""
+    await store.initialize()
+    await store.initialize()
+    # If we got here without raising, idempotency holds.
+
+
+@pytest.mark.asyncio
 async def test_purge_expired_deletes_only_old_rows(store):
     sig_old = _signal("old")
     sig_new = _signal("new")

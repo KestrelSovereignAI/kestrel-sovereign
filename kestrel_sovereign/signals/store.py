@@ -152,18 +152,26 @@ class SignalLogStore(UnifiedStoreBase):
         # opt in by setting `SourceRegistration.result_summary`.
         # Existing databases get the column via this additive ALTER
         # (silently ignored if already applied).
-        try:
-            await self._backend.execute(
-                f"ALTER TABLE {self.TABLE} ADD COLUMN result_summary TEXT"
-            )
-        except Exception as e:
-            msg = str(e).lower()
-            if "duplicate column" in msg or "already exists" in msg:
-                pass  # additive migration already applied
-            else:
-                logger.warning(
-                    "result_summary ALTER failed (proceeding without it): %s", e,
-                )
+        await self._additive_alter("result_summary TEXT")
+
+        # kestrel-sovereign#1137 chunk 1C — constitutional-injection
+        # forensics. Each is an additive ALTER following the same
+        # silently-skip-on-already-applied pattern as `result_summary`.
+        # See docs/architecture/CONSTITUTION_INJECTION.md v1.4 §5.
+        # All columns are NULL for ACTION/ARTIFACT signals (no system
+        # prompt, no constitution applied) and for legacy entries that
+        # predate the migration.
+        await self._additive_alter("constitution_hash TEXT")
+        await self._additive_alter("doctrine_bundle_hash TEXT")
+        # echo_canary_status: 'verified' | 'missing' | 'not_required'
+        await self._additive_alter("echo_canary_status TEXT")
+        # injected_clauses_json / dropped_clauses_json: JSON list of
+        # clause names. NULL for ACTION/ARTIFACT (no system prompt was
+        # built); empty list for COGNITION dispatches that injected
+        # nothing or dropped nothing. Kept as TEXT (JSON-validated at
+        # write time) for SQLite/Postgres parity.
+        await self._additive_alter("injected_clauses_json TEXT")
+        await self._additive_alter("dropped_clauses_json TEXT")
 
         # Indexes for the queries we expect: by source, by target_agent,
         # by status (for failure dashboards), and by retention_until (sweep).
@@ -183,7 +191,38 @@ class SignalLogStore(UnifiedStoreBase):
             f"CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_retention "
             f"ON {self.TABLE}(retention_until)"
         )
+        # kestrel-sovereign#1137 chunk 1C — auditor query: "all dispatches
+        # under constitution X." Partial index keeps the index small (most
+        # rows are pre-#1137 or non-COGNITION and have NULL constitution_hash).
+        await self._backend.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{self.TABLE}_constitution_hash "
+            f"ON {self.TABLE}(constitution_hash) "
+            f"WHERE constitution_hash IS NOT NULL"
+        )
         logger.info(f"SignalLogStore initialized ({self._backend.backend_type})")
+
+    async def _additive_alter(self, column_def: str) -> None:
+        """Apply an additive ALTER TABLE ADD COLUMN, silently skipping
+        when the column already exists.
+
+        Centralized helper so future additive migrations can mirror the
+        Phase 7 #889 / #1137 chunk 1C pattern without copy-pasting the
+        try/except. The ALTER is applied via a normal ``execute`` so it
+        commits even on backends that auto-commit DDL.
+        """
+        try:
+            await self._backend.execute(
+                f"ALTER TABLE {self.TABLE} ADD COLUMN {column_def}"
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate column" in msg or "already exists" in msg:
+                return  # additive migration already applied; idempotent
+            logger.warning(
+                "Additive ALTER (%s) failed (proceeding without it): %s",
+                column_def,
+                e,
+            )
 
     # ------------------------------------------------------------------
     # Write path
@@ -194,11 +233,34 @@ class SignalLogStore(UnifiedStoreBase):
         signal: Signal,
         registration: SourceRegistration,
         result: SignalResult,
+        *,
+        constitution_hash: Optional[str] = None,
+        doctrine_bundle_hash: Optional[str] = None,
+        echo_canary_status: Optional[str] = None,
+        injected_clauses: Optional[list[str]] = None,
+        dropped_clauses: Optional[list[str]] = None,
     ) -> Optional[str]:
         """Persist a dispatch outcome. Payload redaction runs HERE
         (the dispatcher does not see the redacted form before this
         call); per-source result UI summarization also runs here so
         the bounded body is stored AND returned for the SSE payload.
+
+        Args:
+            signal / registration / result: the dispatch context.
+            constitution_hash: kestrel-sovereign#1137 chunk 1C — the
+                operative constitution_hash for this dispatch (NULL for
+                ACTION/ARTIFACT signals or pre-#1137 entries).
+            doctrine_bundle_hash: same, for the operative doctrine bundle.
+            echo_canary_status: 'verified' | 'missing' | 'not_required'
+                per CONSTITUTION_INJECTION.md §3 receipt semantics.
+            injected_clauses: ordered list of clause names that ended up
+                in the system prompt (NULL for ACTION/ARTIFACT). Empty
+                list means "system prompt was assembled but contained
+                nothing trackable" — distinct from NULL ("no system
+                prompt path").
+            dropped_clauses: list of clause names dropped by the
+                priority-ordered truncation (NULL when no truncation
+                happened or no system prompt path).
 
         Returns the `result_summary` text the source produced (or None
         when the source didn't set `result_summary` on its
@@ -278,6 +340,16 @@ class SignalLogStore(UnifiedStoreBase):
             else None
         )
 
+        # kestrel-sovereign#1137 chunk 1C — serialize clause lists as
+        # JSON-validated TEXT for SQLite/Postgres parity. None lists stay
+        # NULL in the column; explicit empty lists serialize to "[]".
+        injected_clauses_json: Optional[str] = (
+            json.dumps(injected_clauses) if injected_clauses is not None else None
+        )
+        dropped_clauses_json: Optional[str] = (
+            json.dumps(dropped_clauses) if dropped_clauses is not None else None
+        )
+
         await self._backend.execute(
             f"""
             INSERT INTO {self.TABLE} (
@@ -287,8 +359,10 @@ class SignalLogStore(UnifiedStoreBase):
                 turn_id, artifact_digest, action_result_digest,
                 payload_digest, payload_redacted, payload_raw,
                 result_summary,
-                causation_chain_digest, error, retention_until
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                causation_chain_digest, error, retention_until,
+                constitution_hash, doctrine_bundle_hash, echo_canary_status,
+                injected_clauses_json, dropped_clauses_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -315,6 +389,11 @@ class SignalLogStore(UnifiedStoreBase):
                 _digest(_serialize_chain(signal.causation_chain)),
                 result.error,
                 self.to_timestamp_param(retention_until),
+                constitution_hash,
+                doctrine_bundle_hash,
+                echo_canary_status,
+                injected_clauses_json,
+                dropped_clauses_json,
             ),
         )
 
