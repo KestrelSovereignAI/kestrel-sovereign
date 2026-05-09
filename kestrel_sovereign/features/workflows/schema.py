@@ -497,10 +497,10 @@ def validate_spec_payload(payload: Any) -> None:
     - ``jsonschema.ValidationError`` from the schema layer.
     - ``ValueError`` from the graph layer (so callers can disambiguate).
 
-    Importing jsonschema lazily keeps the schema module importable in
-    environments that haven't installed it.
+    ``jsonschema`` is a runtime dependency of kestrel-sovereign (added
+    for this surface specifically), so the import is unconditional.
     """
-    import jsonschema  # local import — see docstring
+    import jsonschema
 
     jsonschema.validate(instance=payload, schema=WORKFLOW_SPEC_SCHEMA)
 
