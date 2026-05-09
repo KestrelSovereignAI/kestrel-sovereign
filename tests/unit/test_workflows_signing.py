@@ -55,10 +55,14 @@ def _resolver_for(*identities: AgentIdentity):
     """Return a public-key resolver that knows the supplied identities.
 
     The resolver maps DID → uncompressed X9.62 bytes (the form
-    ``CryptoSuite.deserialize_public_key`` expects for secp256k1)."""
+    ``CryptoSuite.deserialize_public_key`` expects for secp256k1).
+    Phase 0 helpers sign with the legacy ECDSA key and identify as
+    the LEGACY DID (not signing_did, which can be the new did:web on
+    a hybrid agent), so the resolver maps legacy_did → legacy pubkey.
+    """
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
     table = {
-        ai.signing_did: suite.serialize_public_key(ai.legacy_keypair.public_key)
+        ai.legacy_did: suite.serialize_public_key(ai.legacy_keypair.public_key)
         for ai in identities
     }
 
@@ -97,7 +101,10 @@ def _spec(**overrides):
 def test_sign_then_verify_round_trip():
     ai = _agent_identity()
     signed = sign_workflow_spec(_spec(), ai)
-    assert signed.author_did == ai.signing_did
+    # Phase 0: sign with legacy ECDSA key; author_did is the legacy DID
+    # (see signing.py rationale — pre-ceremony agents have legacy_did
+    # == signing_did, hybrid agents see the legacy DID here too).
+    assert signed.author_did == ai.legacy_did
     assert signed.spec_hash and len(signed.spec_hash) == 64
     assert signed.author_sig
     assert verify_workflow_spec(signed, _resolver_for(ai)) is True
@@ -174,6 +181,36 @@ def test_sign_rejects_mismatched_author_did():
     spec = _spec(author_did="did:web:author.example")
     with pytest.raises(WorkflowDefinitionError):
         sign_workflow_spec(spec, ai)
+
+
+def test_sign_uses_legacy_did_for_hybrid_agent():
+    """Round-2 P2: post-ceremony hybrid agents have ``signing_did``
+    pointing at the new did:web (whose VMs publish ed25519 + ml-dsa-65).
+    Phase 0 signs with the LEGACY ECDSA key, so the spec must list
+    ``legacy_did`` as author so verifiers resolve the right key."""
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    legacy_kp = suite.generate_keypair()
+    # Construct a synthetic hybrid AgentIdentity by setting new_did.
+    # We don't need real hybrid keys — sign_workflow_spec should
+    # pick legacy_did regardless of the hybrid state.
+    ai = AgentIdentity(
+        legacy_did="did:pkh:eip155:1:0xabc",
+        legacy_keypair=legacy_kp,
+        legacy_did_document={},
+        # hybrid_keypair left None to keep this fixture simple; the
+        # invariant we care about (author_did == legacy_did) doesn't
+        # depend on the hybrid keypair shape.
+        new_did="did:web:k.example",
+    )
+    # Pre-ceremony assertion: signing_did != legacy_did when new_did
+    # is set without hybrid_keypair (is_hybrid=False because the
+    # property checks hybrid_keypair).
+    assert ai.legacy_did == "did:pkh:eip155:1:0xabc"
+    signed = sign_workflow_spec(_spec(), ai)
+    # MUST be the legacy DID, not new_did, because that's the DID
+    # whose VMs cover the ECDSA secp256k1 alg we just used to sign.
+    assert signed.author_did == ai.legacy_did
+    assert verify_workflow_spec(signed, _resolver_for(ai)) is True
 
 
 def test_sign_accepts_matching_pre_set_author_did():
@@ -253,7 +290,7 @@ def test_verify_stage_transition_does_not_accept_sentinel_replay():
     """End-to-end: a signature produced for ``signal_id=None`` must NOT
     verify against a StageLink whose ``signal_id='none'``."""
     ai = _agent_identity()
-    sig_none = sign_stage_transition(
+    actor_did, sig_none = sign_stage_transition(
         run_id="r-1",
         stage_name="lint",
         attempt_number=1,
@@ -267,7 +304,7 @@ def test_verify_stage_transition_does_not_accept_sentinel_replay():
         stage_name="lint",
         attempt_number=1,
         idempotency_key="0" * 64,
-        actor_did=ai.signing_did,
+        actor_did=actor_did,
         actor_sig=sig_none,
         signal_id="none",  # literal string — MUST NOT match the None sig
     )
@@ -276,7 +313,7 @@ def test_verify_stage_transition_does_not_accept_sentinel_replay():
 
 def test_sign_then_verify_stage_transition():
     ai = _agent_identity()
-    sig_hex = sign_stage_transition(
+    actor_did, sig_hex = sign_stage_transition(
         run_id="r-1",
         stage_name="lint",
         attempt_number=1,
@@ -284,13 +321,14 @@ def test_sign_then_verify_stage_transition():
         gate_outcome="pass",
         agent_identity=ai,
     )
+    assert actor_did == ai.legacy_did
     link = StageLink(
         link_id="l-1",
         run_id="r-1",
         stage_name="lint",
         attempt_number=1,
         idempotency_key="0" * 64,
-        actor_did=ai.signing_did,
+        actor_did=actor_did,
         actor_sig=sig_hex,
         signal_id="signal-1",
         gate_outcome=GateOutcome.PASS,
@@ -300,7 +338,7 @@ def test_sign_then_verify_stage_transition():
 
 def test_verify_stage_transition_fails_under_tamper():
     ai = _agent_identity()
-    sig_hex = sign_stage_transition(
+    actor_did, sig_hex = sign_stage_transition(
         run_id="r-1",
         stage_name="lint",
         attempt_number=1,
@@ -316,7 +354,7 @@ def test_verify_stage_transition_fails_under_tamper():
         stage_name="lint",
         attempt_number=2,
         idempotency_key="0" * 64,
-        actor_did=ai.signing_did,
+        actor_did=actor_did,
         actor_sig=sig_hex,
         signal_id="signal-1",
         gate_outcome=GateOutcome.PASS,
@@ -340,7 +378,7 @@ def test_verify_stage_transition_fails_with_bad_hex():
 
 def test_verify_stage_transition_fails_when_resolver_unknown():
     ai = _agent_identity()
-    sig_hex = sign_stage_transition(
+    actor_did, sig_hex = sign_stage_transition(
         run_id="r-1",
         stage_name="lint",
         attempt_number=1,
@@ -354,7 +392,7 @@ def test_verify_stage_transition_fails_when_resolver_unknown():
         stage_name="lint",
         attempt_number=1,
         idempotency_key="0" * 64,
-        actor_did=ai.signing_did,
+        actor_did=actor_did,
         actor_sig=sig_hex,
     )
 

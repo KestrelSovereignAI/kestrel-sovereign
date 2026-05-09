@@ -112,25 +112,32 @@ def sign_workflow_spec(
             "via sign_hybrid; until then this helper requires a legacy key."
         )
 
-    # Codex chunk-D-review P2: a pre-set ``author_did`` that differs
-    # from the local agent's ``signing_did`` would produce an
-    # unverifiable signed spec — the signature is over a payload
-    # naming author_did=X, but the private key is the agent's key
-    # which a public-key resolver maps from agent_identity.signing_did,
-    # not X. Phase 0 sign helper requires the two to agree (either
-    # the spec carries no author_did and we set it from the agent, or
-    # the spec carries the agent's DID). Delegated-signing flows where
-    # a different author signs via a third party belong in a Phase 1+
-    # multisig surface, not this helper.
-    if spec.author_did and spec.author_did != agent_identity.signing_did:
+    # Codex chunk-D round-2 P2: Phase 0 always signs with the legacy
+    # ECDSA key, so ``author_did`` MUST be the *legacy* DID — not
+    # ``signing_did``. For pre-ceremony agents these are equal. For
+    # post-ceremony hybrid agents, ``signing_did`` is the new did:web
+    # whose VMs publish ed25519 + ml-dsa-65 — a resolver mapping that
+    # DID would NOT return the legacy ECDSA public key, so verification
+    # would fail. The signed spec must carry the DID whose VMs cover
+    # the actual signing algorithm. Phase 1 adds the hybrid path
+    # (sign_hybrid + new did:web author) once the runner exercises
+    # signatures end-to-end.
+    chosen_author = agent_identity.legacy_did
+
+    # Codex chunk-D round-1 P2 (carried): a pre-set ``author_did``
+    # must match the DID we'll actually sign for. For Phase 0 that's
+    # the legacy DID. Delegated-signing flows where the spec author
+    # differs from the local signer belong in a Phase 1+ multisig
+    # surface, not this helper.
+    if spec.author_did and spec.author_did != chosen_author:
         raise WorkflowDefinitionError(
             f"sign_workflow_spec: spec.author_did {spec.author_did!r} does "
-            f"not match agent_identity.signing_did "
-            f"{agent_identity.signing_did!r}. Use a delegated-signing "
-            "helper (Phase 1+) for cross-author signatures, or clear "
-            "spec.author_did so this helper sets it from the agent."
+            f"not match the legacy DID {chosen_author!r} this helper signs "
+            "as in Phase 0. Use a delegated-signing helper (Phase 1+) for "
+            "cross-author signatures, or clear spec.author_did so this "
+            "helper sets it from the agent's legacy DID."
         )
-    signing_did = agent_identity.signing_did
+    signing_did = chosen_author
 
     # The canonical payload INCLUDES ``author_did`` (it's part of what
     # the author signs). Therefore set the author_did first, recompute
@@ -277,12 +284,15 @@ def sign_stage_transition(
     signal_id: Optional[str],
     gate_outcome: Optional[str],
     agent_identity: AgentIdentity,
-) -> str:
-    """Returns the lowercase-hex secp256k1 signature for a stage
-    transition. Caller writes this into ``StageLink.actor_sig``.
+) -> tuple[str, str]:
+    """Returns ``(actor_did, actor_sig_hex)`` for a stage transition.
 
-    Mirrors :func:`sign_workflow_spec`: legacy ECDSA only in Phase 0;
-    hybrid signing follows once the runner is in place.
+    Same Phase 0 invariant as :func:`sign_workflow_spec`: we sign with
+    the legacy ECDSA key, so the returned ``actor_did`` is the agent's
+    *legacy* DID. Caller writes both into ``StageLink.actor_did`` /
+    ``StageLink.actor_sig`` so verification resolves the matching
+    public key. Phase 1 hybrid signing returns the new DID + a v2
+    signature array.
     """
     if agent_identity.legacy_keypair.private_key is None:
         raise WorkflowDefinitionError(
@@ -302,7 +312,7 @@ def sign_stage_transition(
         raise WorkflowDefinitionError(
             f"sign_stage_transition failed: {exc}"
         ) from exc
-    return sig.hex()
+    return agent_identity.legacy_did, sig.hex()
 
 
 def verify_stage_transition(
