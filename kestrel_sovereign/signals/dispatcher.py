@@ -847,7 +847,26 @@ class SignalDispatcher:
         # Cache stability for the COMMON path (no echo) is unchanged
         # because no addendum is supplied.
         addendum: Optional[str] = None
-        if registration.require_constitution_echo and audit.constitution_hash:
+        if registration.require_constitution_echo:
+            # Codex round-21 P2: refuse pre-execution when echo is
+            # required but no canary can be derived (no
+            # constitution_hash). Running the turn anyway would
+            # incur side effects only to fail
+            # constitution_not_received afterward.
+            if not audit.constitution_hash:
+                return self._fail(
+                    signal,
+                    start,
+                    Status.DROPPED_VALIDATION,
+                    error=(
+                        "require_constitution_echo=True but agent "
+                        "could not provide a constitution_hash; canary "
+                        "cannot be derived. Anchor the constitution "
+                        "before enabling echo on this source."
+                    ),
+                    registration=registration,
+                    audit=audit,
+                )
             canary = derive_canary(
                 signal_id=signal.id,
                 constitution_hash=audit.constitution_hash,

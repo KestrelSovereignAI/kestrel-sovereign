@@ -519,20 +519,18 @@ async def test_echo_required_verifier_raises_records_missing(
 
 
 @pytest.mark.asyncio
-async def test_echo_required_no_constitution_hash_records_missing(
+async def test_echo_required_no_constitution_hash_refused_pre_execution(
     tmp_path, template_path
 ):
-    """Without an anchored constitution we can't derive a stable
-    canary; the dispatch still runs (model gets the user prompt
-    without an injected directive) but the verifier is NOT called
-    and signal_log records MISSING. Failing here surfaces the
-    anchoring gap rather than fabricating a token the model never
-    saw."""
+    """Codex round-21 P2: when echo is required but the agent can't
+    produce a constitution_hash, the dispatcher refuses BEFORE
+    calling process_input. Running the turn would incur side effects
+    only to fail constitution_not_received afterward."""
     agent = _AuditingAgent(
         constitution_hash=None,
         anchored_bundle_hash="bundle",
         live_bundle_hash="bundle",
-        echo_status=CanaryStatus.VERIFIED,  # would have been verified
+        echo_status=CanaryStatus.VERIFIED,  # never reached
     )
     env = await _make_dispatcher(tmp_path, agent)
     env.registry.register(
@@ -550,14 +548,13 @@ async def test_echo_required_no_constitution_hash_records_missing(
     )
     await _drain(env)
 
-    assert result.status == Status.FAILED
-    assert result.error == "constitution_not_received"
-    # Verifier was NOT called because canary derivation was skipped.
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "constitution_hash" in (result.error or "")
+    # Verifier never called.
     assert agent.verify_calls == []
-    # process_input still ran — the dispatch didn't drop pre-LLM —
-    # but the rendered prompt has NO injected canary directive.
-    assert len(agent.process_input_calls) == 1
-    assert "constitution_canary" not in agent.process_input_calls[0]
+    # process_input never ran — no side effects from the unverifiable
+    # turn.
+    assert agent.process_input_calls == []
     await env.backend.close()
 
 
