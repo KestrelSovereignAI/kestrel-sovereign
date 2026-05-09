@@ -381,10 +381,57 @@ async def test_echo_required_verified_status_succeeds(
     assert len(call["canary"]) == 16
     assert all(c in "0123456789abcdef" for c in call["canary"])
 
+    # Codex P1 fix: the canary must have been injected into the prompt
+    # the model saw — verify it appears in the rendered prompt that
+    # process_input received, AND it equals what the verifier was
+    # asked about (same token in both places).
+    assert len(agent.process_input_calls) == 1
+    rendered_prompt = agent.process_input_calls[0]
+    assert call["canary"] in rendered_prompt
+    # Codex format instruction is recognizable.
+    assert "constitution_canary" in rendered_prompt
+
     rows = await env.backend.fetch_all(
         "SELECT echo_canary_status FROM signal_log"
     )
     assert rows == [("verified",)]
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_canary_injected_pre_dispatch_matches_verifier_input(
+    tmp_path, template_path
+):
+    """Codex round-1 P1 regression guard: the canary token sent to
+    the verifier MUST be the same one embedded in the prompt that
+    `process_input` received. Otherwise the model can't satisfy a
+    request it never saw."""
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="cross_check",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="local",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("cross_check"))
+    await _drain(env)
+
+    rendered_prompt = agent.process_input_calls[0]
+    canary_sent_to_verifier = agent.verify_calls[0]["canary"]
+    # Same token in both places.
+    assert canary_sent_to_verifier in rendered_prompt
+    # Local-format instruction (JSON requirement) appears.
+    assert "_canary" in rendered_prompt
     await env.backend.close()
 
 
@@ -459,8 +506,12 @@ async def test_echo_required_verifier_raises_records_missing(
 async def test_echo_required_no_constitution_hash_records_missing(
     tmp_path, template_path
 ):
-    """Without an anchored constitution we can't derive a stable canary;
-    record MISSING and fail rather than fabricating one."""
+    """Without an anchored constitution we can't derive a stable
+    canary; the dispatch still runs (model gets the user prompt
+    without an injected directive) but the verifier is NOT called
+    and signal_log records MISSING. Failing here surfaces the
+    anchoring gap rather than fabricating a token the model never
+    saw."""
     agent = _AuditingAgent(
         constitution_hash=None,
         anchored_bundle_hash="bundle",
@@ -487,6 +538,10 @@ async def test_echo_required_no_constitution_hash_records_missing(
     assert result.error == "constitution_not_received"
     # Verifier was NOT called because canary derivation was skipped.
     assert agent.verify_calls == []
+    # process_input still ran — the dispatch didn't drop pre-LLM —
+    # but the rendered prompt has NO injected canary directive.
+    assert len(agent.process_input_calls) == 1
+    assert "constitution_canary" not in agent.process_input_calls[0]
     await env.backend.close()
 
 

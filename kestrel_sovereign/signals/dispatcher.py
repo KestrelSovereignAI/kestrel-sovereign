@@ -100,6 +100,7 @@ from kestrel_sdk.signals import (
 )
 from kestrel_sovereign.signals.constitution_canary import (
     CanaryStatus,
+    build_canary_instruction,
     derive_canary,
 )
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
@@ -133,6 +134,13 @@ class _ConstitutionAudit:
     # DROPPED_VALIDATION but still writes the (mismatched) hashes to
     # signal_log so an auditor can see exactly what diverged.
     drift_error: Optional[str] = None
+    # Pre-derived canary value (populated before the LLM call when
+    # `require_constitution_echo=True`) so the post-dispatch verifier
+    # checks against the same token the model saw embedded in its
+    # prompt. The dispatcher derives once and reuses; deriving again
+    # post-dispatch with a fresh nonce would race the model against
+    # a moving target.
+    canary: Optional[str] = None
 
 
 def _audit_to_log_kwargs(audit: Optional[_ConstitutionAudit]) -> dict:
@@ -610,6 +618,31 @@ class SignalDispatcher:
             )
 
         prompt = self._render_prompt(signal, registration)
+
+        # Step A.5: derive canary + inject the format-appropriate
+        # instruction into the rendered prompt BEFORE the LLM call.
+        # Codex P1 (chunk 1G round 1): if we derived after, the model
+        # would never see the directive and verification would always
+        # MISS for legitimate dispatches. Phase 1 only injects into
+        # the user-prompt body the dispatcher controls; system-prompt
+        # injection (and phantom-tool registration for claude_code)
+        # require deeper agent integration and ship in Phase 2 of the
+        # epic. For codex/local formats, the entire prompt IS a single
+        # user message to the reviewer model, so user-prompt injection
+        # is the natural channel.
+        if registration.require_constitution_echo and audit.constitution_hash:
+            canary = derive_canary(
+                signal_id=signal.id,
+                constitution_hash=audit.constitution_hash,
+                engine_nonce=secrets.token_hex(16),
+            )
+            audit.canary = canary
+            instruction = build_canary_instruction(
+                canary, registration.prompt_template_format
+            )
+            if instruction is not None:
+                prompt = f"{prompt}\n\n{instruction}"
+
         # Set the in-flight turn's causation chain (already extended
         # with this hop's frame in step 2 of the pipeline) so outbound
         # A2A tasks created during the turn carry the lineage forward
@@ -631,9 +664,11 @@ class SignalDispatcher:
 
         # Step B: post-dispatch echo verification. If the source
         # opted in to `require_constitution_echo=True` the dispatcher
-        # asks the agent for the format-specific receipt. A MISSING
-        # outcome flips the dispatch to FAILED with
-        # `error="constitution_not_received"` per design §3.
+        # asks the agent for the format-specific receipt — checking
+        # against the SAME canary that was injected pre-dispatch
+        # (audit.canary, derived in Step A.5). MISSING outcome flips
+        # the dispatch to FAILED with `error="constitution_not_received"`
+        # per design §3.
         if registration.require_constitution_echo:
             await self._verify_canary_post_dispatch(signal, registration, audit)
             if audit.echo_canary_status is CanaryStatus.MISSING:
@@ -758,29 +793,30 @@ class SignalDispatcher:
     ) -> None:
         """Post-dispatch hook to verify the format-specific receipt.
 
-        Calls the optional agent hook `verify_constitution_echo(canary,
-        format, since)` if available. The hook returns a
-        `CanaryStatus` (or None on agent-side failure to introspect,
-        which we treat as MISSING). With no hook, the dispatcher
-        cannot verify and stamps MISSING — Phase 1 sources do not opt
-        into echo so this branch is silent in default deployments;
-        the contract is in place for Phase 2 source migration."""
+        The canary was derived BEFORE `process_input` and stored on
+        `audit.canary` so the model actually saw the directive in its
+        prompt. Here we ask `agent.verify_constitution_echo(canary,
+        format, signal_id)` whether the model honored it via the
+        format-specific channel.
+
+        Outcomes:
+        - `audit.canary is None` (couldn't derive: no constitution
+          hash) → MISSING.
+        - No verifier hook → MISSING (Phase 1 contract; sources
+          shipping echo=True before agents implement the hook fail
+          loudly so the gap is visible, not silent).
+        - Verifier raises → MISSING (safe degradation).
+        - Verifier returns non-CanaryStatus / non-string → MISSING.
+        - Otherwise → whatever the verifier reports."""
         if not registration.require_constitution_echo:
             audit.echo_canary_status = CanaryStatus.NOT_REQUIRED
             return
 
-        if not audit.constitution_hash:
-            # Without an anchored constitution we can't derive a stable
-            # canary; record MISSING so the operator sees the dispatch
-            # ran without proper anchoring.
+        if audit.canary is None:
+            # Pre-dispatch derivation skipped (no constitution hash);
+            # the model never saw a canary so verification is moot.
             audit.echo_canary_status = CanaryStatus.MISSING
             return
-
-        canary = derive_canary(
-            signal_id=signal.id,
-            constitution_hash=audit.constitution_hash,
-            engine_nonce=secrets.token_hex(16),
-        )
 
         verifier = getattr(self._agent, "verify_constitution_echo", None)
         if not callable(verifier):
@@ -789,7 +825,7 @@ class SignalDispatcher:
 
         try:
             value = verifier(
-                canary=canary,
+                canary=audit.canary,
                 prompt_template_format=registration.prompt_template_format,
                 signal_id=signal.id,
             )
