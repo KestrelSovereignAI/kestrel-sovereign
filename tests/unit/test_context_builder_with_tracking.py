@@ -1,0 +1,190 @@
+"""Tests for `ContextBuilder.build_system_prompt_with_tracking`.
+
+The new method is the dispatcher's entry point for constitutional
+injection (kestrel-sovereign#1137 chunk 1E). It MUST:
+
+1. Return a `SystemPromptResult` (not a bare str) so the dispatcher
+   can persist `injected_clauses_json` / `dropped_clauses_json`.
+2. Render anchored doctrine, state-of-mind, prompt-adaptation, and
+   style-reminder consistently with the assembler's contract.
+3. Honor `budget_bytes` truncation.
+4. Leave the legacy `build_system_prompt` byte-stable — the existing
+   prompt-cache invariants (Anthropic's position-indexed cache)
+   depend on it.
+"""
+
+from __future__ import annotations
+
+from collections import OrderedDict
+from typing import List, Optional
+from unittest.mock import MagicMock
+
+import pytest
+
+from kestrel_sovereign.agent.context_builder import ContextBuilder
+from kestrel_sovereign.agent.system_prompt_assembler import (
+    CLAUSE_KESTREL_CONSTITUTION,
+    CLAUSE_PROMPT_ADAPTATION,
+    CLAUSE_STATE_OF_MIND,
+    CLAUSE_STYLE_REMINDER,
+    SystemPromptResult,
+)
+
+
+class _FakePromptAdaptation:
+    def __init__(self, preamble: str = "") -> None:
+        self.preamble = preamble
+
+
+class _FakeStateOfMind:
+    def __init__(
+        self,
+        governance_mode: str = "balanced",
+        active_conflicts: Optional[List[dict]] = None,
+        delegated_principles: Optional[List[str]] = None,
+    ) -> None:
+        self.governance_mode = governance_mode
+        self.active_conflicts = active_conflicts or []
+        self.delegated_principles = delegated_principles or []
+
+
+def _stub_builder(bootstrap: dict) -> ContextBuilder:
+    cb = object.__new__(ContextBuilder)
+    cb._llm_service = None
+    cb._model_fallback = "test-model"
+    cb._counter = MagicMock()
+    cb._counter_model = "test-model"
+    cb._bootstrap_loader = MagicMock()
+    cb._bootstrap_loader.load = MagicMock(return_value=OrderedDict(bootstrap))
+    cb._bootstrap_loader.get_file = MagicMock(
+        side_effect=lambda name: bootstrap.get(name)
+    )
+    cb.storage = MagicMock()
+    return cb
+
+
+def test_returns_system_prompt_result():
+    cb = _stub_builder({"SOUL.md": "soul body"})
+    result = cb.build_system_prompt_with_tracking(
+        constitution="C",
+        include_briefing=False,
+    )
+    assert isinstance(result, SystemPromptResult)
+    assert CLAUSE_KESTREL_CONSTITUTION in result.injected_clauses
+    assert "SOUL.md" in result.injected_clauses
+
+
+def test_anchored_doctrine_appears_in_clauses():
+    cb = _stub_builder({"SOUL.md": "soul"})
+    result = cb.build_system_prompt_with_tracking(
+        constitution="C",
+        anchored_doctrine=OrderedDict(
+            [
+                ("TORTOISE_DOCTRINE.md", "tortoise body"),
+                ("AGENTS.md", "agents body"),
+            ]
+        ),
+        include_briefing=False,
+    )
+    assert "TORTOISE_DOCTRINE.md" in result.injected_clauses
+    assert "AGENTS.md" in result.injected_clauses
+    assert "tortoise body" in result.prompt
+    assert "agents body" in result.prompt
+
+
+def test_state_of_mind_renders_when_provided():
+    cb = _stub_builder({"SOUL.md": "soul"})
+    state = _FakeStateOfMind(
+        governance_mode="firm",
+        active_conflicts=[
+            {"principle": "sovereignty", "description": "tension X"}
+        ],
+        delegated_principles=["honesty"],
+    )
+    result = cb.build_system_prompt_with_tracking(
+        constitution="C",
+        state_of_mind=state,
+        include_briefing=False,
+    )
+    assert CLAUSE_STATE_OF_MIND in result.injected_clauses
+    assert "Governance Mode: FIRM" in result.prompt
+    assert "sovereignty: tension X" in result.prompt
+    assert "honesty" in result.prompt
+
+
+def test_prompt_adaptation_preamble_renders():
+    cb = _stub_builder({"SOUL.md": "soul"})
+    adapt = _FakePromptAdaptation(preamble="emphasis on truth")
+    result = cb.build_system_prompt_with_tracking(
+        constitution="C",
+        prompt_adaptation=adapt,
+        include_briefing=False,
+    )
+    assert CLAUSE_PROMPT_ADAPTATION in result.injected_clauses
+    assert "emphasis on truth" in result.prompt
+
+
+def test_prompt_adaptation_skipped_when_preamble_empty():
+    cb = _stub_builder({"SOUL.md": "soul"})
+    adapt = _FakePromptAdaptation(preamble="")  # falsy preamble
+    result = cb.build_system_prompt_with_tracking(
+        constitution="C",
+        prompt_adaptation=adapt,
+        include_briefing=False,
+    )
+    assert CLAUSE_PROMPT_ADAPTATION not in result.injected_clauses
+
+
+def test_style_reminder_only_emitted_when_soul_loaded():
+    """Legacy parity: style reminder requires SOUL.md to be present.
+    Without SOUL.md, the reminder is omitted."""
+    cb_no_soul = _stub_builder({"TOOLS.md": "tools"})
+    result = cb_no_soul.build_system_prompt_with_tracking(
+        constitution="C", include_briefing=False
+    )
+    assert CLAUSE_STYLE_REMINDER not in result.injected_clauses
+
+    cb_with_soul = _stub_builder({"SOUL.md": "soul"})
+    result2 = cb_with_soul.build_system_prompt_with_tracking(
+        constitution="C", include_briefing=False
+    )
+    assert CLAUSE_STYLE_REMINDER in result2.injected_clauses
+
+
+def test_budget_truncation_drops_low_priority():
+    cb = _stub_builder(
+        {
+            "SOUL.md": "soul",
+            "TOOLS.md": "x" * 1000,  # bulk in priority 6
+        }
+    )
+    result = cb.build_system_prompt_with_tracking(
+        constitution="C",
+        additional_context="y" * 1000,  # bulk in priority 7
+        include_briefing=False,
+        budget_bytes=400,
+    )
+    # Constitution survives.
+    assert CLAUSE_KESTREL_CONSTITUTION in result.injected_clauses
+    # ADDITIONAL_CONTEXT (priority 7) drops first.
+    assert "ADDITIONAL_CONTEXT" in result.dropped_clauses
+    assert len(result.prompt.encode("utf-8")) <= 400
+
+
+def test_legacy_build_system_prompt_remains_byte_stable():
+    """The legacy method must NOT route through the new assembler —
+    byte-equivalent output is the load-bearing prompt-cache invariant.
+    Pin a small fixture: same inputs → same bytes across calls."""
+    cb = _stub_builder({"SOUL.md": "soul"})
+    cb.get_session_briefing = lambda: "briefing"
+
+    out1 = cb.build_system_prompt(constitution="C", include_briefing=True)
+    out2 = cb.build_system_prompt(constitution="C", include_briefing=True)
+    assert out1 == out2  # idempotent
+    # Specifically check the legacy fence labels still appear (so a
+    # refactor that accidentally rerouted through the new assembler
+    # would fail this).
+    assert "--- GOVERNING CONSTITUTION ---" in out1
+    assert "--- END CONSTITUTION ---" in out1  # asymmetric legacy fence
+    assert "--- YOUR IDENTITY ---" in out1
+    assert "--- END IDENTITY ---" in out1
