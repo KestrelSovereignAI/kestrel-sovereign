@@ -892,7 +892,16 @@ class WorkflowSpec:
             raise WorkflowDefinitionError(
                 "workflow.triggers must be a list of Trigger instances"
             )
-        object.__setattr__(self, "triggers", tuple(self.triggers))
+        # Round 12 P2: an explicit empty triggers list normalizes to
+        # the manual-default ``(Trigger.MANUAL,)`` here too, matching
+        # ``from_dict``'s behavior. Otherwise a direct constructor with
+        # ``triggers=[]`` and ``from_dict`` of the same wire form would
+        # produce different ``compute_spec_hash`` values, breaking
+        # signature verification across persistence boundaries.
+        if not self.triggers:
+            object.__setattr__(self, "triggers", (Trigger(kind=TriggerKind.MANUAL),))
+        else:
+            object.__setattr__(self, "triggers", tuple(self.triggers))
 
         if not isinstance(self.params_schema, Mapping):
             raise WorkflowDefinitionError(

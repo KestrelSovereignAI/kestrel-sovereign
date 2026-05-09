@@ -789,6 +789,24 @@ def test_edge_subworkflow_rejects_bool_for_version():
         )
 
 
+def test_workflow_spec_empty_triggers_round_trip_stable():
+    """Round 12 P2: an empty triggers list constructs a spec whose
+    hash matches a from_dict-loaded spec of the same wire form.
+    Otherwise persisting a signed spec with empty triggers and
+    reloading would change the canonical hash, breaking signature
+    verification."""
+    direct = WorkflowSpec(
+        name="r",
+        version=1,
+        stages=[_action_stage(name="lint")],
+        triggers=[],  # explicit empty
+    )
+    loaded = WorkflowSpec.from_dict(direct.to_dict())
+    assert direct.compute_spec_hash() == loaded.compute_spec_hash()
+    assert direct.triggers == loaded.triggers
+    assert direct.triggers[0].kind == TriggerKind.MANUAL
+
+
 def test_workflow_spec_from_dict_rejects_explicit_null_triggers():
     """Round 7 P2: an explicit ``triggers: null`` was silently rewritten
     to the manual-default trigger, letting a schema-invalid wire form
