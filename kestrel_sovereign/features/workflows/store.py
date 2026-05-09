@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
@@ -142,6 +142,7 @@ class WorkflowStore(UnifiedStoreBase):
                 finished_at               {ts_type},
                 deleted_at                {ts_type},
                 FOREIGN KEY (parent_run_id) REFERENCES {self.RUNS_TABLE}(run_id)
+                    ON DELETE SET NULL
             )
         """)
         await self._backend.execute(
@@ -196,7 +197,8 @@ class WorkflowStore(UnifiedStoreBase):
                 actor_did         TEXT NOT NULL,
                 actor_sig         TEXT NOT NULL,
                 occurred_at       {ts_type} NOT NULL {ts_default},
-                FOREIGN KEY (run_id) REFERENCES {self.RUNS_TABLE}(run_id),
+                FOREIGN KEY (run_id) REFERENCES {self.RUNS_TABLE}(run_id)
+                    ON DELETE CASCADE,
                 UNIQUE (run_id, stage_name, attempt_number)
             )
         """)
@@ -306,29 +308,55 @@ class WorkflowStore(UnifiedStoreBase):
         """Delete finished workflow runs past their definition's
         retention window.
 
-        Mirrors :meth:`SignalLogStore.purge_expired` shape so the
-        retention-sweep cron task in Phase 1 can call both with the
-        same ``now`` parameter for deterministic timekeeping.
+        Codex round-1 P1: this used to compare ``finished_at < now``,
+        which deleted every finished run with a retention policy
+        immediately on the next sweep regardless of ``retention_days``.
+        Per-row interval arithmetic differs between Postgres
+        (``r.finished_at + interval``) and SQLite (``datetime(...,
+        '+N days')``), so we resolve the cutoff per row in Python and
+        bulk-delete the IDs that have actually expired. The retention
+        sweep is a cron task — not a hot path — so the extra round
+        trip is fine and the dialect-portability win is the more
+        important property.
+
+        Stage links cascade via ON DELETE CASCADE on the FK, so this
+        also tears down the per-stage history rows for every purged
+        run. (Codex round-1 P2.)
+
         Returns the number of run rows purged.
         """
         cutoff_now = now if now is not None else datetime.now(timezone.utc)
-        # Join against definitions to resolve retention; SQLite and
-        # Postgres both support the same join shape.
-        return await self._backend.execute(
+        rows = await self._backend.fetch_all(
             f"""
-            DELETE FROM {self.RUNS_TABLE}
-            WHERE run_id IN (
-                SELECT r.run_id
-                FROM {self.RUNS_TABLE} r
-                JOIN {self.DEFINITIONS_TABLE} d
-                  ON d.name = r.workflow_name
-                 AND d.version = r.workflow_ver
-                WHERE r.finished_at IS NOT NULL
-                  AND d.retention_days IS NOT NULL
-                  AND r.finished_at < ?
-            )
-            """,
-            (
-                self.to_timestamp_param(cutoff_now),
-            ),
+            SELECT r.run_id, r.finished_at, d.retention_days
+            FROM {self.RUNS_TABLE} r
+            JOIN {self.DEFINITIONS_TABLE} d
+              ON d.name = r.workflow_name
+             AND d.version = r.workflow_ver
+            WHERE r.finished_at IS NOT NULL
+              AND d.retention_days IS NOT NULL
+            """
+        )
+
+        expired: list[str] = []
+        for run_id, finished_at_value, retention_days in rows:
+            finished_at = self.from_timestamp_field(finished_at_value)
+            if finished_at is None:
+                continue
+            # ``finished_at`` may be naive on SQLite (we store ISO
+            # without tz); promote to UTC so comparison is correct.
+            if finished_at.tzinfo is None:
+                finished_at = finished_at.replace(tzinfo=timezone.utc)
+            expiry = finished_at + timedelta(days=int(retention_days))
+            if expiry < cutoff_now:
+                expired.append(run_id)
+
+        if not expired:
+            return 0
+
+        placeholders = ", ".join("?" * len(expired))
+        return await self._backend.execute(
+            f"DELETE FROM {self.RUNS_TABLE} "
+            f"WHERE run_id IN ({placeholders})",
+            tuple(expired),
         )

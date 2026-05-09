@@ -199,41 +199,76 @@ async def test_stage_links_unique_constraint(store: WorkflowStore):
 # ---------------------------------------------------------------------------
 
 
-async def test_purge_expired_runs(store: WorkflowStore):
+async def test_purge_expired_runs_respects_retention_days(store: WorkflowStore):
+    """Codex round-1 P1: the predicate must be ``finished_at + retention_days
+    < now``, not ``finished_at < now``. retention_days=1 means a run
+    finished 12 hours ago must SURVIVE; only 30-days-old gets purged."""
     spec = _signed_spec(retention_days=1)
     await store.insert_definition_for_test(spec)
 
     now = datetime.now(timezone.utc)
     long_ago = (now - timedelta(days=30)).isoformat()
-    recent = (now - timedelta(hours=1)).isoformat()
+    half_a_day = (now - timedelta(hours=12)).isoformat()
+    just_finished = (now - timedelta(minutes=5)).isoformat()
 
-    # Two finished runs: one past retention, one fresh.
-    await store.backend.execute(
-        f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
-        f"params_json, status, started_by_did, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("run-old", "release", 1, "{}", "completed", "did:web:k.example", long_ago),
-    )
-    await store.backend.execute(
-        f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
-        f"params_json, status, started_by_did, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("run-new", "release", 1, "{}", "completed", "did:web:k.example", recent),
-    )
-    # An unfinished run must NEVER be purged regardless of age.
+    for run_id, finished_at_iso, status in (
+        ("run-old", long_ago, "completed"),
+        ("run-12h", half_a_day, "completed"),
+        ("run-fresh", just_finished, "completed"),
+    ):
+        await store.backend.execute(
+            f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, "
+            f"workflow_ver, params_json, status, started_by_did, "
+            f"finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id, "release", 1, "{}",
+                status, "did:web:k.example", finished_at_iso,
+            ),
+        )
+    # Unfinished run must NEVER be purged regardless of age.
     await store.backend.execute(
         f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
         f"params_json, status, started_by_did) VALUES (?, ?, ?, ?, ?, ?)",
         ("run-running", "release", 1, "{}", "running", "did:web:k.example"),
     )
 
-    cutoff = now - timedelta(days=1)
-    purged = await store.purge_expired_runs(now=cutoff)
-    assert purged == 1
+    purged = await store.purge_expired_runs(now=now)
+    assert purged == 1  # only run-old; run-12h and run-fresh survive
 
     rows = await store.backend.fetch_all(
         f"SELECT run_id FROM {store.RUNS_TABLE} ORDER BY run_id"
     )
     surviving = sorted(r[0] for r in rows)
-    assert surviving == ["run-new", "run-running"]
+    assert surviving == ["run-12h", "run-fresh", "run-running"]
+
+
+async def test_purge_cascades_stage_links(store: WorkflowStore):
+    """Codex round-1 P2: ``ON DELETE CASCADE`` on the stage_links FK
+    means purging an expired run also drops its stage history rows.
+    Without cascade the FK would block the run delete."""
+    spec = _signed_spec(retention_days=1)
+    await store.insert_definition_for_test(spec)
+
+    now = datetime.now(timezone.utc)
+    long_ago = (now - timedelta(days=30)).isoformat()
+    await store.backend.execute(
+        f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
+        f"params_json, status, started_by_did, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("run-old", "release", 1, "{}", "completed", "did:web:k.example", long_ago),
+    )
+    await store.backend.execute(
+        f"INSERT INTO {store.STAGE_LINKS_TABLE} "
+        f"(link_id, run_id, stage_name, attempt_number, idempotency_key, "
+        f"actor_did, actor_sig) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("l-1", "run-old", "lint", 1, "0" * 64, "did:web:k.example", "sig"),
+    )
+
+    purged = await store.purge_expired_runs(now=now)
+    assert purged == 1
+    remaining_links = await store.backend.fetch_all(
+        f"SELECT link_id FROM {store.STAGE_LINKS_TABLE}"
+    )
+    assert remaining_links == []
 
 
 async def test_purge_skips_definitions_with_null_retention(store: WorkflowStore):
