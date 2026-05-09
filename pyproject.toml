@@ -266,6 +266,11 @@ test = [
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
     "asgi-lifespan>=2.1.0",
+    # Workflows feature (#1131) ships JSON Schemas for its dataclasses.
+    # The schema-parity tests assert that what validates against the
+    # schema also constructs in the dataclass; pinning jsonschema as a
+    # test dep makes CI exercise that contract instead of skipping it.
+    "jsonschema>=4.20",
 ]
 
 [tool.pytest.ini_options]

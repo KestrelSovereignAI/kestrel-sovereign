@@ -533,6 +533,63 @@ def test_schema_requires_compensate_so_dataclass_can_construct():
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_enforces_noop_idempotent_eligibility():
+    """Codex round 2 P2: schema must reject ``compensate=noop_idempotent``
+    on writeful ACTION stages (no read_only=True, no consent_collect
+    gate) — same rule as Stage.__post_init__."""
+    spec = _minimal_spec().to_dict()
+    spec["stages"].append(
+        {
+            "name": "publish",
+            "signal_source": "ci.publish",
+            "signal_mode": "action",
+            "compensate": "noop_idempotent",
+            "read_only": False,
+            "gate": {"type": "signal_status_ok"},
+        }
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_accepts_noop_idempotent_with_consent_gate():
+    """The escape hatch: noop_idempotent is also valid when the gate is
+    consent_collect, regardless of read_only — design §3.5."""
+    spec = _minimal_spec().to_dict()
+    spec["stages"].append(
+        {
+            "name": "ask_user",
+            "signal_source": "hooks.consent",
+            "signal_mode": "action",
+            "compensate": "noop_idempotent",
+            "read_only": False,
+            "gate": {"type": "consent_collect", "params": {"scope": "publish"}},
+        }
+    )
+    jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_red_team_clear_prompt_pack_constraint():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {"type": "red_team_clear", "params": {}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {
+        "type": "constitutional_boundary_clean",
+        "params": {},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
 def test_schema_rejects_unknown_gate_type():
     spec = _minimal_spec().to_dict()
     spec["stages"][0]["gate"] = {"type": "custom_callable"}

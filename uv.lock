@@ -2349,6 +2349,7 @@ wallet = [
 [package.dev-dependencies]
 dev = [
     { name = "asgi-lifespan" },
+    { name = "jsonschema" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
@@ -2356,6 +2357,7 @@ dev = [
 ]
 test = [
     { name = "asgi-lifespan" },
+    { name = "jsonschema" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-timeout" },
@@ -2471,6 +2473,7 @@ provides-extras = ["test", "ml", "local", "voice-local", "voice-cloud", "voice",
 [package.metadata.requires-dev]
 dev = [
     { name = "asgi-lifespan", specifier = ">=2.1.0" },
+    { name = "jsonschema", specifier = ">=4.20" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },
@@ -2478,6 +2481,7 @@ dev = [
 ]
 test = [
     { name = "asgi-lifespan", specifier = ">=2.1.0" },
+    { name = "jsonschema", specifier = ">=4.20" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=1.1.0" },
     { name = "pytest-timeout", specifier = ">=2.3.1" },

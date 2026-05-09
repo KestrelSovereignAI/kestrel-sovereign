@@ -35,6 +35,10 @@ _NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$"
 
 
 def _gate_schema() -> dict[str, Any]:
+    # Codex round 2 P2: mirror the dataclass's per-type required-params
+    # rules into the schema so the wire contract doesn't accept gates
+    # that ``Gate.__post_init__`` would reject. Two gate types require
+    # specific params today (the rest accept any object).
     return {
         "type": "object",
         "additionalProperties": False,
@@ -43,6 +47,53 @@ def _gate_schema() -> dict[str, Any]:
             "type": {"type": "string", "enum": sorted(BUILT_IN_GATE_TYPES)},
             "params": {"type": "object"},
         },
+        "allOf": [
+            {
+                "if": {
+                    "properties": {"type": {"const": "red_team_clear"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["prompt_pack_constraint"],
+                            "properties": {
+                                "prompt_pack_constraint": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "if": {
+                    "properties": {
+                        "type": {"const": "constitutional_boundary_clean"}
+                    },
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["forbidden_modules"],
+                            "properties": {
+                                "forbidden_modules": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "minItems": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        ],
     }
 
 
@@ -55,6 +106,10 @@ def _stage_schema() -> dict[str, Any]:
     # the schema but the dataclass rejects in __post_init__. Forcing
     # the field at the wire boundary keeps schema parity with the
     # dataclass — what validates here also constructs in Python.
+    #
+    # Codex round 2 P2: ``noop_idempotent`` eligibility (design §3.5)
+    # is also enforced here via if/then/anyOf so the schema rejects the
+    # same ineligible payloads that the dataclass would reject.
     return {
         "type": "object",
         "additionalProperties": False,
@@ -77,6 +132,39 @@ def _stage_schema() -> dict[str, Any]:
             "non_deterministic": {"type": "boolean"},
             "read_only": {"type": "boolean"},
         },
+        "allOf": [
+            {
+                "if": {
+                    "properties": {
+                        "compensate": {"const": "noop_idempotent"},
+                    },
+                    "required": ["compensate"],
+                },
+                "then": {
+                    "anyOf": [
+                        {
+                            "properties": {
+                                "signal_mode": {"const": "action"},
+                                "read_only": {"const": True},
+                            },
+                            "required": ["signal_mode", "read_only"],
+                        },
+                        {
+                            "properties": {
+                                "gate": {
+                                    "type": "object",
+                                    "properties": {
+                                        "type": {"const": "consent_collect"},
+                                    },
+                                    "required": ["type"],
+                                },
+                            },
+                            "required": ["gate"],
+                        },
+                    ],
+                },
+            },
+        ],
     }
 
 
