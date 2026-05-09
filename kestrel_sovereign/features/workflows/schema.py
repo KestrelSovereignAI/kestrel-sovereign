@@ -239,7 +239,11 @@ def _edge_schema() -> dict[str, Any]:
                 "properties": {
                     **base,
                     "kind": {"const": EdgeKind.BRANCH.value},
-                    "condition": {"type": "string", "minLength": 1},
+                    "condition": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": _NON_WHITESPACE_PATTERN,
+                    },
                     "true_stage": {
                         "type": "string",
                         "pattern": _NAME_PATTERN,

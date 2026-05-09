@@ -937,6 +937,44 @@ def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_rejects_whitespace_only_branch_condition():
+    """Round 11 P2: same pattern as prompt_pack_constraint —
+    Edge.__post_init__ rejects whitespace-only via .strip(); schema
+    must too."""
+    spec = _minimal_spec().to_dict()
+    # Need three stages so the branch has both targets declared.
+    spec["stages"].extend(
+        [
+            {
+                "name": "branch_t",
+                "signal_source": "x.t",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": True,
+            },
+            {
+                "name": "branch_f",
+                "signal_source": "x.f",
+                "signal_mode": "action",
+                "compensate": "noop_idempotent",
+                "read_only": True,
+            },
+        ]
+    )
+    spec["edges"] = [
+        {
+            "kind": "branch",
+            "from_stage": "lint",
+            "condition": "   ",
+            "true_stage": "branch_t",
+            "false_stage": "branch_f",
+        }
+    ]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
 def test_schema_rejects_whitespace_only_prompt_pack_constraint():
     """Round 10 P2: schema/dataclass parity. Schema's minLength counts
     whitespace; the dataclass's .strip() check rejects "   "."""
