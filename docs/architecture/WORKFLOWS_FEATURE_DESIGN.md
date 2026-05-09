@@ -1,6 +1,6 @@
 # Kestrel Workflows Feature — Architecture Design
 
-> Draft v4. Filed as epic #1131 (body to be updated when v4 lands). v1→v3.4 history at the bottom of the appendix; v3.4→v4 was a load-bearing reframing after a platform survey caught v3.4 designing a parallel runtime instead of composing on top of the existing Signal Dispatcher.
+> Draft v4.1. Filed as epic #1131 (body to be updated when v4.1 lands). v1→v3.4 history at the bottom of the appendix; v3.4→v4 was a load-bearing reframing after a platform survey caught v3.4 designing a parallel runtime instead of composing on top of the existing Signal Dispatcher; v4→v4.1 closed two codex round-5 P2s where v4 referenced SignalDispatcher contract fields that don't exist.
 
 ## Executive Summary
 
@@ -75,9 +75,10 @@ That's the pattern Kestrel needs everywhere — sovereignty CAR export/import, q
   - `gate` (closed vocabulary, §3.3)
   - `compensate` (mandatory; closed eligibility for `noop_idempotent`, §3.5)
   - `forbidden_modules: list[str]` (optional, §3.7)
-  - `prompt_template_override` (optional; defaults to source's registered `prompt_template`)
   - `irreversible: bool` (default False; affects compensation, §3.5)
   - `non_deterministic: bool` (declares attempt-input non-determinism for retry-key salting)
+  - `read_only: bool` (default False; gates eligibility for `noop_idempotent` compensation, §3.5)
+- **Per-stage prompt selection.** Workflows do NOT carry their own prompt-template overrides. The current `SignalDispatcher` renders only `registration.prompt_template`; per-signal overrides would require a contract change. If a workflow needs a different prompt for a COGNITION stage, the operator registers a new SourceRegistration with that prompt and the stage's `signal_source` points to it. (Follow-up: per-signal prompt overrides as a SignalDispatcher contract change, coordinated with #1137 — sub-issue.)
 - **Edge** — typed connection: `Sequential`, `Branch(condition, true_stage, false_stage)`, `Parallel(stages[], join_strategy)`, `Subworkflow(name, version, params)`.
 - **Gate** — pass/fail predicate evaluated after a stage's `SignalResult` returns. Closed vocabulary in §3.3.
 - **WorkflowRun** — one execution. Tracks current stage(s), parent_run_id (subworkflows), `started_by_did`, `scheduler_task_id` (when cron-triggered), status, signed transitions.
@@ -159,9 +160,9 @@ Adversarial review is non-optional for any stage that publishes code. Hardened m
 - The `WorkflowHarness` MUST exercise the action_complete↔cancel race (test fixture in Phase 1).
 
 **Compensation:**
-- `compensate` is mandatory on every stage. Default `noop_idempotent` is a **closed eligibility set**:
-  - `signal_source.mode == ACTION` AND `read_only=True` (declared; runner instruments to verify no DB writes outside `workflow_*` tables in the stage's window).
-  - `consent_collect` stages where rejection naturally compensates the request.
+- `compensate` is mandatory on every stage. Default `noop_idempotent` is a **closed eligibility set** evaluated against fields on the **Stage** (not on `SourceRegistration`, which intentionally exposes `allowed_modes`/`default_mode` only):
+  - `stage.signal_mode == ACTION` AND `stage.read_only == True` (the latter is the Stage-declared field from §3.1; runner instruments to verify no DB writes outside `workflow_*` tables in the stage's window — §8 Open Q1 covers the mechanism).
+  - Stages whose gate is `consent_collect` (where rejection naturally compensates the request).
 - All other stages declare a real `compensate` (a separate signal source dispatched in compensation order).
 - Compensation events run reverse-order over completed stages, each as its own dispatched signal with its own idempotency key.
 
@@ -395,6 +396,13 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 ---
 
 ## Appendix: Changelogs
+
+### v4 → v4.1 changelog (codex round-5 P2 fixes)
+
+Two findings, both spec bugs where v4 referenced SignalDispatcher contract fields that don't exist:
+
+- **§3.1 Stage `prompt_template_override` removed.** SignalDispatcher renders `registration.prompt_template` only; per-signal overrides require a contract change. Stages that need a different prompt for a COGNITION source register a new SourceRegistration. Per-signal prompt-override is a follow-up coordinated with #1137.
+- **§3.5 `noop_idempotent` eligibility re-grounded on Stage fields.** v4 said "`signal_source.mode == ACTION` AND `read_only=True`" but `SourceRegistration` has `allowed_modes`/`default_mode` (no `mode`) and no `read_only` field. v4.1 evaluates against `stage.signal_mode == ACTION` AND `stage.read_only == True`; added explicit `read_only: bool` field to the Stage model in §3.1.
 
 ### v3.4 → v4 changelog (platform-survey reframing)
 
