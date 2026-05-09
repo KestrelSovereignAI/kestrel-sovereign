@@ -195,6 +195,59 @@ def test_stage_invalid_signal_mode_raises():
         )
 
 
+def test_stage_irreversible_requires_record_only_compensate():
+    """Round 9 P2: design §3.5 — irreversible stages must use
+    compensate_record_only. Any other compensate gives the runner
+    conflicting cancellation instructions."""
+    with pytest.raises(WorkflowDefinitionError):
+        Stage(
+            name="ship",
+            signal_source="ci.publish",
+            signal_mode=SignalMode.ACTION,
+            irreversible=True,
+            compensate="ci.publish.compensate",  # reversible compensate
+        )
+    # OK with the right compensate:
+    Stage(
+        name="ship",
+        signal_source="ci.publish",
+        signal_mode=SignalMode.ACTION,
+        irreversible=True,
+        compensate="compensate_record_only",
+    )
+
+
+def test_workflow_run_rejects_iso_string_for_timestamp():
+    """Round 9 P2: schema permits string timestamps but the dataclass
+    is the canonical Python view (datetime). Storage adapters MUST
+    parse before constructing — otherwise to_dict() crashes calling
+    .isoformat() on a string."""
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=1,
+            params={},
+            status=RunStatus.RUNNING,
+            started_by_did="did:web:k.example",
+            cancel_barrier_at="2026-05-09T12:00:00+00:00",
+        )
+
+
+def test_stage_link_rejects_iso_string_for_occurred_at():
+    with pytest.raises(WorkflowDefinitionError):
+        StageLink(
+            link_id="l-1",
+            run_id="r-1",
+            stage_name="lint",
+            attempt_number=1,
+            idempotency_key="0" * 64,
+            actor_did="did:web:k.example",
+            actor_sig="deadbeef",
+            occurred_at="2026-05-09T12:00:00+00:00",
+        )
+
+
 def test_stage_from_dict_requires_compensate():
     """Round 8 P2: signed-spec integrity. Defaulting ``compensate`` in
     from_dict lets a wire form omit it and re-hash to a canonical
@@ -861,6 +914,22 @@ def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
         "type": "constitutional_boundary_clean",
         "params": {},
     }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_irreversible_stage_requires_record_only_compensate():
+    spec = _minimal_spec().to_dict()
+    spec["stages"].append(
+        {
+            "name": "ship",
+            "signal_source": "ci.publish",
+            "signal_mode": "action",
+            "compensate": "ci.publish.compensate",
+            "irreversible": True,
+        }
+    )
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 

@@ -164,6 +164,20 @@ def _stage_schema() -> dict[str, Any]:
                     ],
                 },
             },
+            # Codex round 9 P2: irreversible stages must use
+            # compensate_record_only (design §3.5).
+            {
+                "if": {
+                    "properties": {"irreversible": {"const": True}},
+                    "required": ["irreversible"],
+                },
+                "then": {
+                    "properties": {
+                        "compensate": {"const": "compensate_record_only"},
+                    },
+                    "required": ["compensate"],
+                },
+            },
         ],
     }
 

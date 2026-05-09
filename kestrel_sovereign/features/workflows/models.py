@@ -384,6 +384,19 @@ class Stage:
                     "declare a real compensate (a registered SourceRegistration)."
                 )
 
+        # Round 9 P2: irreversible stages MUST use ``compensate_record_only``
+        # per design §3.5 — "engine records the cancellation but does
+        # not attempt to reverse the side effect." Accepting any other
+        # ``compensate`` for an irreversible stage gives the runner
+        # conflicting instructions on the cancellation path (try to
+        # reverse vs. record-only). The schema mirrors this rule.
+        if self.irreversible and self.compensate != "compensate_record_only":
+            raise WorkflowDefinitionError(
+                f"stage {self.name!r}: irreversible=True requires "
+                "compensate=\"compensate_record_only\" per design §3.5; "
+                f"got compensate={self.compensate!r}"
+            )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
@@ -1061,6 +1074,21 @@ class WorkflowRun:
                 "run.signature_post_revocation must be bool"
             )
 
+        # Round 9 P2: timestamp fields are typed ``Optional[datetime]``.
+        # The wire form passes these as ISO strings; this dataclass is
+        # the canonical Python view, so callers/storage adapters MUST
+        # parse before construction. Reject str (or any non-datetime,
+        # non-None value) here so ``to_dict()`` doesn't crash later
+        # calling ``.isoformat()`` on a string.
+        for ts_field in ("cancel_barrier_at", "started_at", "finished_at", "deleted_at"):
+            value = getattr(self, ts_field)
+            if value is not None and not isinstance(value, datetime):
+                raise WorkflowDefinitionError(
+                    f"run.{ts_field} must be a datetime or None; storage "
+                    f"adapters must parse ISO strings before constructing "
+                    f"the run (got {type(value).__name__})"
+                )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "run_id": self.run_id,
@@ -1169,6 +1197,14 @@ class StageLink:
         if not isinstance(self.post_cancel, bool):
             raise WorkflowDefinitionError(
                 "stage_link.post_cancel must be bool"
+            )
+
+        # Round 9 P2: same datetime-or-None invariant as WorkflowRun;
+        # storage adapters must parse ISO strings before constructing.
+        if self.occurred_at is not None and not isinstance(self.occurred_at, datetime):
+            raise WorkflowDefinitionError(
+                "stage_link.occurred_at must be a datetime or None; "
+                f"got {type(self.occurred_at).__name__}"
             )
 
     def to_dict(self) -> dict[str, Any]:
