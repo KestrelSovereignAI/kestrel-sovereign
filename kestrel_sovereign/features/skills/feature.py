@@ -319,20 +319,21 @@ class SkillsFeature(Feature):
         """Remove a skill from disk and the graph.
 
         Returns:
-            ToolResult.ok when both the file and the graph node were
-            removed (or when only one path applies — e.g. no graph
-            backend); PARTIAL when only one of the two layers
-            succeeded (the file is the source of truth, but a leftover
-            graph node will surface in associative recall and a
-            leftover file resurrects on every save attempt — either
-            asymmetric outcome should be spoken); ERROR when neither
+            ToolResult.ok when every layer that *could* apply did its
+            job (both file + graph deleted, or only one layer was
+            available and it succeeded); PARTIAL when both layers
+            were available but only one succeeded — the asymmetric
+            outcome must be spoken because a stale graph node still
+            surfaces in associative recall and a stale file
+            resurrects on the next list/save; ERROR when neither
             layer found anything to remove.
         """
         removed_file = False
         removed_node = False
+        file_attempted = self._skills_dir is not None
         graph_attempted = False
 
-        if self._skills_dir:
+        if file_attempted:
             path = self._skill_path(skill_id)
             if path.exists():
                 try:
@@ -358,11 +359,15 @@ class SkillsFeature(Feature):
             "removed_file": removed_file,
             "removed_node": removed_node,
         }
+        # Asymmetric outcomes only matter when *both* layers were
+        # available to try. If only one layer applies (graph-only
+        # agent, or no graph backend), the single-layer outcome is
+        # symmetric by construction — no PARTIAL needed.
         # File is the source of truth — if file went but graph didn't,
         # the skill is "deleted" semantically but a stale graph node
         # may still surface in recall. If graph went but file didn't,
         # the next save targeting this id will hit FileExistsError.
-        if graph_attempted and removed_file != removed_node:
+        if file_attempted and graph_attempted and removed_file != removed_node:
             if removed_file and not removed_node:
                 caveat = (
                     f"file removed but graph node {skill_id} could not be "
@@ -370,6 +375,8 @@ class SkillsFeature(Feature):
                     "until the graph is reachable again."
                 )
             else:
+                # Only safe to call _skill_path here because file_attempted
+                # implies _skills_dir is not None (codex round 1 of #1130).
                 caveat = (
                     f"graph node removed but file at {self._skill_path(skill_id)} "
                     "could not be unlinked — the skill will reload on next "

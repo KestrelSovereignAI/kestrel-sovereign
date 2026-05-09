@@ -858,6 +858,24 @@ class TestPartialFailures:
         assert "graph node" in envelope.error and "associative recall" in envelope.error
 
     @pytest.mark.asyncio
+    async def test_delete_graph_only_no_skills_dir_returns_ok(self, feature):
+        """Graph-only agent (no skills directory configured) — a
+        successful graph node deletion must NOT trip the asymmetric-
+        PARTIAL branch, which would call ``_skill_path`` and raise
+        AssertionError. Codex round 1 of #1130 caught this.
+
+        A "no file_attempted, only graph_attempted" delete is
+        symmetric by construction — the graph layer is the only one
+        that could apply.
+        """
+        feature._skills_dir = None  # graph-only agent
+        feature.agent.storage.delete_node = AsyncMock(return_value=None)
+        envelope = await feature.skill_delete(skill_id="skill_graph_only")
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["removed_file"] is False
+        assert envelope.data["removed_node"] is True
+
+    @pytest.mark.asyncio
     async def test_list_skips_unparseable_files(self, feature, tmp_path):
         """A human-edited file that broke the parser must not poison listing."""
         good = Skill(
