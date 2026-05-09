@@ -2,6 +2,7 @@
 
 import asyncio
 import pytest
+from kestrel_sdk.tools.result import ToolResultStatus
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 from pathlib import Path
@@ -94,21 +95,21 @@ class TestSpawnFeatureAutoManager:
         feature._child_results = {}
         feature._child_tasks = {}
         feature._lifecycle = None
-        result = await feature.list_children()
-        assert result["children"] == []
-        assert result["count"] == 0
+        envelope = await feature.list_children()
+        assert envelope.data["children"] == []
+        assert envelope.data["count"] == 0
 
     @pytest.mark.asyncio
     async def test_delegate_without_children(self):
         feature = _make_spawn_feature(manager=MagicMock())
-        result = await feature.delegate_task(child_name="child1", task="do stuff")
-        assert result["delegated"] is False
+        envelope = await feature.delegate_task(child_name="child1", task="do stuff")
+        assert envelope.status is ToolResultStatus.ERROR
 
     @pytest.mark.asyncio
     async def test_terminate_without_manager(self):
         feature = _make_spawn_feature(manager=None)
-        result = await feature.terminate_child(child_name="child1")
-        assert result["terminated"] is False
+        envelope = await feature.terminate_child(child_name="child1")
+        assert envelope.status is ToolResultStatus.ERROR
 
 
 class TestSpawnFeatureWithManager:
@@ -123,7 +124,7 @@ class TestSpawnFeatureWithManager:
         manager.spawn_agent = AsyncMock(return_value=child)
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.spawn_agent(
+        envelope = await feature.spawn_agent(
             name="helper",
             purpose="assist with research",
             budget=10.0,
@@ -132,9 +133,9 @@ class TestSpawnFeatureWithManager:
             features="memory,web_search",
         )
 
-        assert result["spawned"] is True
-        assert result["child_name"] == "helper"
-        assert result["child_did"] == "did:child"
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["child_name"] == "helper"
+        assert envelope.data["child_did"] == "did:child"
 
         # Verify mandate was constructed correctly
         call_args = manager.spawn_agent.call_args
@@ -153,10 +154,10 @@ class TestSpawnFeatureWithManager:
         manager.spawn_agent = AsyncMock(side_effect=ValueError("already exists"))
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.spawn_agent(name="dup", purpose="test")
+        envelope = await feature.spawn_agent(name="dup", purpose="test")
 
-        assert result["spawned"] is False
-        assert "already exists" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "already exists" in envelope.error
 
     @pytest.mark.asyncio
     async def test_list_children(self):
@@ -168,11 +169,11 @@ class TestSpawnFeatureWithManager:
         manager.get_agent = MagicMock(return_value=child)
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.list_children()
+        envelope = await feature.list_children()
 
-        assert result["count"] == 1
-        assert result["children"][0]["name"] == "helper"
-        assert result["children"][0]["status"] == "running"
+        assert envelope.data["count"] == 1
+        assert envelope.data["children"][0]["name"] == "helper"
+        assert envelope.data["children"][0]["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_delegate_task_success(self):
@@ -186,10 +187,10 @@ class TestSpawnFeatureWithManager:
         manager._lifecycle.report_result = AsyncMock()
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.delegate_task(child_name="helper", task="analyze data")
+        envelope = await feature.delegate_task(child_name="helper", task="analyze data")
 
-        assert result["delegated"] is True
-        assert result["child_name"] == "helper"
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["child_name"] == "helper"
 
         # Wait briefly for the async task to start
         await asyncio.sleep(0.1)
@@ -206,10 +207,10 @@ class TestSpawnFeatureWithManager:
         manager.get_children = MagicMock(return_value=[])  # not our child
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.delegate_task(child_name="stranger", task="hack")
+        envelope = await feature.delegate_task(child_name="stranger", task="hack")
 
-        assert result["delegated"] is False
-        assert "not a child" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not a child" in envelope.error
 
     @pytest.mark.asyncio
     async def test_get_child_result_after_delegation(self):
@@ -227,9 +228,9 @@ class TestSpawnFeatureWithManager:
         await feature.delegate_task(child_name="helper", task="analyze")
         await asyncio.sleep(0.2)  # Let the task complete
 
-        result = await feature.get_child_result(child_name="helper")
-        assert result["ready"] is True
-        assert result["result"] == "analysis complete: 42"
+        envelope = await feature.get_child_result(child_name="helper")
+        assert envelope.data["ready"] is True
+        assert envelope.data["result"] == "analysis complete: 42"
 
     @pytest.mark.asyncio
     async def test_delegate_task_ignores_non_lifecycle_manager_attr(self):
@@ -246,9 +247,9 @@ class TestSpawnFeatureWithManager:
         await feature.delegate_task(child_name="helper", task="analyze")
         await asyncio.sleep(0.2)
 
-        result = await feature.get_child_result(child_name="helper")
-        assert result["ready"] is True
-        assert result["result"] == "analysis complete: 42"
+        envelope = await feature.get_child_result(child_name="helper")
+        assert envelope.data["ready"] is True
+        assert envelope.data["result"] == "analysis complete: 42"
 
     @pytest.mark.asyncio
     async def test_get_child_result_still_running(self):
@@ -269,9 +270,9 @@ class TestSpawnFeatureWithManager:
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
         await feature.delegate_task(child_name="helper", task="slow work")
 
-        result = await feature.get_child_result(child_name="helper")
-        assert result["ready"] is False
-        assert "still running" in result["note"]
+        envelope = await feature.get_child_result(child_name="helper")
+        assert envelope.data["ready"] is False
+        assert "still running" in envelope.data["note"]
 
         # Clean up
         feature._child_tasks["helper"].cancel()
@@ -279,8 +280,8 @@ class TestSpawnFeatureWithManager:
     @pytest.mark.asyncio
     async def test_get_child_result_no_task(self):
         feature = _make_spawn_feature(manager=MagicMock())
-        result = await feature.get_child_result(child_name="nobody")
-        assert result["ready"] is False
+        envelope = await feature.get_child_result(child_name="nobody")
+        assert envelope.data["ready"] is False
 
     @pytest.mark.asyncio
     async def test_terminate_child_success(self):
@@ -292,9 +293,9 @@ class TestSpawnFeatureWithManager:
         manager._lifecycle.terminate = AsyncMock(return_value=SimpleNamespace())
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.terminate_child(child_name="helper")
+        envelope = await feature.terminate_child(child_name="helper")
 
-        assert result["terminated"] is True
+        assert envelope.status is ToolResultStatus.OK
         manager._lifecycle.terminate.assert_awaited_once_with(
             child_name="helper",
             reason="explicit termination",
@@ -310,9 +311,9 @@ class TestSpawnFeatureWithManager:
         manager.terminate_child = AsyncMock(return_value=True)
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.terminate_child(child_name="helper")
+        envelope = await feature.terminate_child(child_name="helper")
 
-        assert result["terminated"] is True
+        assert envelope.status is ToolResultStatus.OK
         manager.terminate_child.assert_awaited_once_with("did:parent", "helper")
 
     @pytest.mark.asyncio
@@ -323,10 +324,10 @@ class TestSpawnFeatureWithManager:
         manager.get_children = MagicMock(return_value=[])
 
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
-        result = await feature.terminate_child(child_name="stranger")
+        envelope = await feature.terminate_child(child_name="stranger")
 
-        assert result["terminated"] is False
-        assert "not a child" in result["error"]
+        assert envelope.status is ToolResultStatus.ERROR
+        assert "not a child" in envelope.error
 
     @pytest.mark.asyncio
     async def test_shutdown_cancels_tasks(self):
@@ -502,23 +503,24 @@ class TestSpawnLifecycle:
         feature = _make_spawn_feature(parent_agent=parent, manager=manager)
 
         # 1. Spawn
-        spawn_result = await feature.spawn_agent(name="worker", purpose="compute")
-        assert spawn_result["spawned"] is True
+        spawn_envelope = await feature.spawn_agent(name="worker", purpose="compute")
+        assert spawn_envelope.status is ToolResultStatus.OK
 
         # 2. Delegate
-        delegate_result = await feature.delegate_task(
+        delegate_envelope = await feature.delegate_task(
             child_name="worker", task="compute 6*7"
         )
-        assert delegate_result["delegated"] is True
+        assert delegate_envelope.status is ToolResultStatus.OK
 
         # 3. Wait for result
         await asyncio.sleep(0.2)
 
         # 4. Get result
-        get_result = await feature.get_child_result(child_name="worker")
-        assert get_result["ready"] is True
-        assert get_result["result"] == "result: 42"
+        get_envelope = await feature.get_child_result(child_name="worker")
+        assert get_envelope.status is ToolResultStatus.OK
+        assert get_envelope.data["ready"] is True
+        assert get_envelope.data["result"] == "result: 42"
 
         # 5. Terminate
-        term_result = await feature.terminate_child(child_name="worker")
-        assert term_result["terminated"] is True
+        term_envelope = await feature.terminate_child(child_name="worker")
+        assert term_envelope.status is ToolResultStatus.OK

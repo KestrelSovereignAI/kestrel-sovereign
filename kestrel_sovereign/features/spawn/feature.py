@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ class SpawnFeature(Feature):
         ttl: int = 3600,
         constraints: str = "",
         features: str = "",
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """
         Create a child agent with a signed mandate.
 
@@ -142,13 +143,17 @@ class SpawnFeature(Feature):
             ttl: Time-to-live in seconds (default 3600)
             constraints: Comma-separated additional constraints
             features: Comma-separated list of allowed features
+
+        Returns:
+            ToolResult.ok with child name + DID + purpose + TTL.
+            ERROR when no AgentManager is wired up (agent isn't
+            running in a multi-agent host) or the spawn raised.
         """
         manager = self._get_agent_manager()
         if manager is None:
-            return {
-                "spawned": False,
-                "error": "No AgentManager available — agent is not running in a multi_agent",
-            }
+            return ToolResult.failed(
+                error="No AgentManager available — agent is not running in a multi_agent"
+            )
 
         # Parse comma-separated strings into lists
         constraint_dict = {}
@@ -194,29 +199,39 @@ class SpawnFeature(Feature):
                     purpose=purpose,
                     mode=SpawnMode.EPHEMERAL if ttl > 0 else SpawnMode.PERSISTENT,
                 )
-            return {
-                "spawned": True,
-                "child_name": name,
-                "child_did": child.agent_id,
-                "purpose": purpose,
-                "ttl": ttl,
-            }
+            return ToolResult.ok(
+                f"Spawned child '{name}' (did={child.agent_id}, ttl={ttl}s).",
+                data={
+                    "spawned": True,
+                    "child_name": name,
+                    "child_did": child.agent_id,
+                    "purpose": purpose,
+                    "ttl": ttl,
+                },
+            )
         except Exception as e:
             logger.error(f"Failed to spawn child agent '{name}': {e}")
-            return {"spawned": False, "error": str(e)}
+            return ToolResult.failed(error=str(e))
 
     @tool(
         name="list_children",
         description="List all active child agents spawned by this agent, with their status.",
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def list_children(self) -> Dict[str, Any]:
+    async def list_children(self) -> ToolResult:
         """
         List active children with status.
+
+        Returns:
+            ToolResult.ok with the list of children and their status.
+            ERROR when there's no AgentManager (agent isn't in a
+            multi-agent host) — was the legacy
+            ``{"children": [], "error": "..."}`` shape that mixed
+            empty-list-of-children with the no-host-error case.
         """
         manager = self._get_agent_manager()
         if manager is None:
-            return {"children": [], "error": "No AgentManager available"}
+            return ToolResult.failed(error="No AgentManager available")
 
         parent_did = self.agent.agent_id
         child_names = manager.get_children(parent_did)
@@ -239,7 +254,17 @@ class SpawnFeature(Feature):
                 "has_pending_task": has_pending_task,
             })
 
-        return {"children": children, "count": len(children)}
+        if not children:
+            return ToolResult.ok(
+                "No active children.",
+                data={"children": [], "count": 0},
+            )
+        return ToolResult.ok(
+            f"{len(children)} active child(ren): "
+            + ", ".join(f"{c['name']} ({c['status']})" for c in children)
+            + ".",
+            data={"children": children, "count": len(children)},
+        )
 
     @tool(
         name="delegate_task",
@@ -250,32 +275,36 @@ class SpawnFeature(Feature):
         ),
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def delegate_task(self, child_name: str, task: str) -> Dict[str, Any]:
+    async def delegate_task(self, child_name: str, task: str) -> ToolResult:
         """
         Send work to an existing child agent.
 
         Args:
             child_name: Name of the child agent to delegate to
             task: The task description for the child to execute
+
+        Returns:
+            ToolResult.ok with the queued task info and a note that
+            ``get_child_result`` is the way to retrieve the output.
+            ERROR for no-AgentManager, child-not-running, and
+            child-not-belonging-to-this-parent paths.
         """
         manager = self._get_agent_manager()
         if manager is None:
-            return {"delegated": False, "error": "No AgentManager available"}
+            return ToolResult.failed(error="No AgentManager available")
 
         child_agent = manager.get_agent(child_name)
         if child_agent is None:
-            return {
-                "delegated": False,
-                "error": f"Child agent '{child_name}' not found or not running",
-            }
+            return ToolResult.failed(
+                error=f"Child agent '{child_name}' not found or not running"
+            )
 
         # Verify this is actually our child
         parent_did = self.agent.agent_id
         if child_name not in manager.get_children(parent_did):
-            return {
-                "delegated": False,
-                "error": f"Agent '{child_name}' is not a child of this agent",
-            }
+            return ToolResult.failed(
+                error=f"Agent '{child_name}' is not a child of this agent"
+            )
 
         # Run the task asynchronously via the child agent's chat method
         async def _run_child_task():
@@ -313,70 +342,111 @@ class SpawnFeature(Feature):
 
         self._child_tasks[child_name] = asyncio.create_task(_run_child_task())
 
-        return {
-            "delegated": True,
-            "child_name": child_name,
-            "task": task,
-            "note": "Task is running. Use get_child_result to retrieve the result.",
-        }
+        return ToolResult.ok(
+            f"Delegated task to '{child_name}'. Use get_child_result to retrieve the result.",
+            data={
+                "delegated": True,
+                "child_name": child_name,
+                "task": task,
+                "note": "Task is running. Use get_child_result to retrieve the result.",
+            },
+        )
 
     @tool(
         name="get_child_result",
         description="Retrieve the result from a child agent's completed task.",
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def get_child_result(self, child_name: str) -> Dict[str, Any]:
+    async def get_child_result(self, child_name: str) -> ToolResult:
         """
         Retrieve results from a completed child task.
 
         Args:
             child_name: Name of the child agent to get results from
+
+        Returns:
+            ToolResult.ok with ready=True + the child's task output
+            on success. PARTIAL when the task is still running OR no
+            result is available — these are not errors (the LLM may
+            legitimately need to poll), but the LLM must NOT report
+            them as completed work; the caveat says exactly which
+            "not ready" state we're in.
+            ERROR when the underlying child task itself raised — the
+            stored failure dict carries ``error`` and the envelope
+            ERROR copies it through so the LLM speaks the failure
+            instead of treating "ready=True" as success.
         """
         # Check if there's a pending task still running
         if child_name in self._child_tasks and not self._child_tasks[child_name].done():
-            return {
-                "ready": False,
-                "child_name": child_name,
-                "note": "Task is still running. Try again later.",
-            }
+            return ToolResult.partial(
+                f"Task for '{child_name}' is still running.",
+                "no result yet — try get_child_result again after the task completes.",
+                data={
+                    "ready": False,
+                    "child_name": child_name,
+                    "note": "Task is still running. Try again later.",
+                },
+            )
 
         if child_name not in self._child_results:
-            return {
-                "ready": False,
-                "child_name": child_name,
-                "note": "No result available. Either no task was delegated or it hasn't completed.",
-            }
+            return ToolResult.partial(
+                f"No result available for '{child_name}'.",
+                (
+                    "either no task was delegated to this child, or the "
+                    "previous result was already consumed by a prior "
+                    "get_child_result call (this surface pops on read)."
+                ),
+                data={
+                    "ready": False,
+                    "child_name": child_name,
+                    "note": "No result available. Either no task was delegated or it hasn't completed.",
+                },
+            )
 
         result = self._child_results.pop(child_name)
-        return {
-            "ready": True,
-            "child_name": child_name,
-            **result,
-        }
+        # The stored result has ``success`` and either ``result`` (on
+        # success) or ``error`` (on failure). Surface child-side
+        # failures as ERROR so the LLM doesn't claim the delegated
+        # work succeeded.
+        if not result.get("success"):
+            err = result.get("error") or f"Child task for '{child_name}' failed"
+            return ToolResult.failed(
+                error=err,
+                data={"ready": True, "child_name": child_name, **result},
+            )
+        return ToolResult.ok(
+            f"Retrieved result for '{child_name}'.",
+            data={"ready": True, "child_name": child_name, **result},
+        )
 
     @tool(
         name="terminate_child",
         description="Terminate a child agent, stopping it and releasing its resources.",
         category=ToolCategory.AGENT_MANAGEMENT,
     )
-    async def terminate_child(self, child_name: str) -> Dict[str, Any]:
+    async def terminate_child(self, child_name: str) -> ToolResult:
         """
         Terminate a child agent early.
 
         Args:
             child_name: Name of the child agent to terminate
+
+        Returns:
+            ToolResult.ok when the child was actually terminated.
+            ERROR when there's no AgentManager, the named agent is
+            not a child of this parent, or the underlying terminate
+            call returned False.
         """
         manager = self._get_agent_manager()
         if manager is None:
-            return {"terminated": False, "error": "No AgentManager available"}
+            return ToolResult.failed(error="No AgentManager available")
 
         # Verify this is our child
         parent_did = self.agent.agent_id
         if child_name not in manager.get_children(parent_did):
-            return {
-                "terminated": False,
-                "error": f"Agent '{child_name}' is not a child of this agent",
-            }
+            return ToolResult.failed(
+                error=f"Agent '{child_name}' is not a child of this agent"
+            )
 
         # Cancel any running task
         if child_name in self._child_tasks and not self._child_tasks[child_name].done():
@@ -397,12 +467,12 @@ class SpawnFeature(Feature):
         else:
             removed = await manager.terminate_child(parent_did, child_name)
         if removed:
-            return {"terminated": True, "child_name": child_name}
+            return ToolResult.ok(
+                f"Terminated child '{child_name}'.",
+                data={"terminated": True, "child_name": child_name},
+            )
 
-        return {
-            "terminated": False,
-            "error": f"Failed to terminate '{child_name}'",
-        }
+        return ToolResult.failed(error=f"Failed to terminate '{child_name}'")
 
     async def shutdown(self):
         """Clean up running tasks on feature shutdown."""
