@@ -46,6 +46,17 @@ from kestrel_sdk.signals import (
     Trust,
 )
 
+# Allowed values for the SDK-typed Literal fields. The SDK dataclass
+# only declares these via `Literal[...]` annotations, which Python does
+# NOT enforce at runtime — a typo like `"codxe"` would otherwise slip
+# past every format-specific rule below and surface as an opaque
+# dispatcher failure later. We allowlist explicitly here so registration
+# is the single point that catches the error.
+_VALID_PROMPT_TEMPLATE_FORMATS = frozenset(
+    {"claude_code", "codex", "local", "bare"}
+)
+_VALID_CONSTITUTION_INJECTION = frozenset({"full", "none"})
+
 # Reviewer formats that exist solely to verify constitution receipt.
 # Echo opt-out is rejected for these.
 _ECHO_REQUIRED_FORMATS = frozenset({"codex", "local"})
@@ -167,6 +178,25 @@ class SourceRegistry:
     @staticmethod
     def _validate_constitution_injection(reg: SourceRegistration) -> None:
         fmt = reg.prompt_template_format
+
+        # Allowlist enum-like fields BEFORE applying format-specific
+        # rules. SDK Literal annotations are not runtime-enforced; a
+        # typo like `prompt_template_format="codxe"` would otherwise
+        # silently bypass the codex/local echo requirement (codex
+        # round-1 P2 finding). Same for `constitution_injection`.
+        if fmt not in _VALID_PROMPT_TEMPLATE_FORMATS:
+            raise RegistrationError(
+                f"Source '{reg.name}': prompt_template_format='{fmt}' is "
+                "not a recognized format. Allowed: "
+                f"{sorted(_VALID_PROMPT_TEMPLATE_FORMATS)}."
+            )
+        if reg.constitution_injection not in _VALID_CONSTITUTION_INJECTION:
+            raise RegistrationError(
+                f"Source '{reg.name}': constitution_injection="
+                f"'{reg.constitution_injection}' is not a recognized "
+                "value. Allowed: "
+                f"{sorted(_VALID_CONSTITUTION_INJECTION)}."
+            )
 
         # Hard error — reviewer formats may not opt out of echo.
         if fmt in _ECHO_REQUIRED_FORMATS and not reg.require_constitution_echo:

@@ -636,6 +636,54 @@ def test_codex_format_does_not_warn_when_documented():
     assert echo_warnings == []
 
 
+def test_register_rejects_unknown_prompt_template_format():
+    """Codex round-1 P2: SDK `Literal` annotations are not runtime-
+    enforced. A typo like 'codxe' must fail at registration, not slip
+    through to the dispatcher as an unknown-format error after the
+    fact."""
+    reg = SourceRegistry()
+    with pytest.raises(RegistrationError, match="prompt_template_format='codxe'"):
+        reg.register(
+            _valid_cognition_reg(
+                "typo_format",
+                prompt_template_format="codxe",
+                require_constitution_echo=True,
+            )
+        )
+
+
+def test_register_rejects_unknown_constitution_injection_value():
+    """Same concern for `constitution_injection` — 'ful' must fail
+    at registration."""
+    reg = SourceRegistry()
+    with pytest.raises(
+        RegistrationError, match="constitution_injection='ful'"
+    ):
+        reg.register(
+            _valid_cognition_reg(
+                "typo_injection",
+                constitution_injection="ful",
+            )
+        )
+
+
+def test_typo_format_does_not_bypass_echo_requirement():
+    """Specifically pin the round-1 attack vector: a typo in a value
+    that LOOKS like a reviewer format must NOT slip past the echo
+    requirement just because the literal-string match in
+    `_ECHO_REQUIRED_FORMATS` fails. The allowlist check fires first
+    and raises before the echo rule even runs."""
+    reg = SourceRegistry()
+    with pytest.raises(RegistrationError, match="not a recognized format"):
+        reg.register(
+            _valid_cognition_reg(
+                "near_codex",
+                prompt_template_format="cdex",
+                require_constitution_echo=False,
+            )
+        )
+
+
 def test_constitution_injection_validation_runs_after_other_invariants():
     """The new validator must not mask earlier errors — a registration
     that fails an existing invariant (e.g. missing handler) must still
