@@ -96,16 +96,24 @@ class ConstitutionMixin:
             timezone.utc
         ).isoformat()
         # Recompute the contributing files list so an auditor knows
-        # which files went into the anchored hash.
+        # which files went into the anchored hash. Codex round-22 P3:
+        # include operator-declared `doctrine_anchored_paths` so the
+        # file list matches the hash for that extensibility case.
         try:
             from kestrel_sovereign.agent.doctrine_bundle import (
+                PROP_BUNDLE_ANCHORED_PATHS,
                 compute_doctrine_bundle_hash,
                 resolve_anchored_paths,
             )
 
             project_root = await self._resolve_project_root_for_doctrine()
             if project_root is not None:
-                paths = resolve_anchored_paths(project_root=project_root)
+                extra_paths = (
+                    agent_node.properties.get(PROP_BUNDLE_ANCHORED_PATHS) or []
+                )
+                paths = resolve_anchored_paths(
+                    project_root=project_root, extra_paths=extra_paths
+                )
                 cb = getattr(self, "context_builder", None)
                 bootstrap = OrderedDict()
                 if cb is not None:
