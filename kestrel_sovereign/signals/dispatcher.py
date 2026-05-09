@@ -678,6 +678,26 @@ class SignalDispatcher:
                         "constitution body for a full-injection source",
                         signal.id,
                     )
+            # Codex round-7 P2: the existing
+            # `ConstitutionMixin._get_governing_constitution` returns
+            # error-sentinel strings like
+            # "Error: Could not retrieve constitution..." on storage
+            # failures. Those are non-empty strings but emphatically
+            # NOT a constitution body. Treat them as missing — refuse
+            # the dispatch rather than prepend the error message and
+            # pretend it counts as a constitution receipt.
+            if (
+                isinstance(constitution_text, str)
+                and constitution_text.lstrip().startswith("Error:")
+            ):
+                logger.warning(
+                    "_get_governing_constitution returned an error "
+                    "sentinel for signal %s; refusing dispatch "
+                    "rather than injecting the error string as if it "
+                    "were the constitution",
+                    signal.id,
+                )
+                constitution_text = None
             if not constitution_text:
                 # Refuse the dispatch — full injection without an
                 # injectable constitution would log VERIFIED while

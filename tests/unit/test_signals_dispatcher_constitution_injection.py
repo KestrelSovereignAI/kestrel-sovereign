@@ -887,6 +887,49 @@ async def test_constitution_mixin_compute_live_returns_none_default():
 
 
 @pytest.mark.asyncio
+async def test_constitution_error_sentinel_refused(
+    tmp_path, template_path
+):
+    """Codex round-7 P2: `ConstitutionMixin._get_governing_constitution`
+    returns strings like `"Error: Could not retrieve constitution..."`
+    on storage failure. Those are NOT a constitution body and must
+    not be prepended as if they were. Refuse the dispatch instead."""
+
+    class _ErrorSentinelAgent(_AuditingAgent):
+        async def _get_governing_constitution(self) -> str:
+            return "Error: Could not retrieve constitution for hash abcdef. Reason: storage offline"
+
+    agent = _ErrorSentinelAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="error_sentinel_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+
+    result = await env.dispatcher.dispatch_signal(
+        _signal("error_sentinel_cog")
+    )
+    await _drain(env)
+
+    assert result.status == Status.DROPPED_VALIDATION
+    assert "could not produce a constitution body" in (result.error or "")
+    # process_input never ran — we didn't prepend the error sentinel
+    # and call the model.
+    assert agent.process_input_calls == []
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_constitution_hash_refreshed_after_lazy_anchoring(tmp_path):
     """Codex round-6 P2: `_get_governing_constitution()` can lazily
     anchor on first call (writing constitution_hash). Without a
