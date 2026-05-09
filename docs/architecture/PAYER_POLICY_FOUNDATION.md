@@ -362,40 +362,103 @@ mode of `ServiceKeyStorage`.
 
 ### Phase 3 — Wire OpenRouter and Lighthouse through the resolver (`HOST_ENV` + `HOST_MASTER_PROVISIONED`) (~1 day)
 
-- At agent-init time in `kestrel_agent.py:initialize()`, call
-  `PayerResolver.resolve_for(agent_did, "storage")` and
-  `PayerResolver.resolve_for(agent_did, "llm")`. For each
-  `ResolvedResource`:
-  - `enabled=False` → DO NOT construct the provider (Lighthouse provider
-    / Lighthouse target / LLM client) at all. Storage features that
-    depend on it must already tolerate `None` (today's `LIGHTHOUSE_API_KEY`
-    not being set is functionally the same condition).
-  - `enabled=True` → construct the provider with `api_key=None` and the
-    `key_resolver` from `ResolvedResource`. The provider's existing
-    `key_resolver` parameter is unchanged.
-- Small refactor to `LighthouseProvider.__init__`: when both `api_key`
-  and `key_resolver` are `None`, fall back to `os.environ` (today's
-  behavior); otherwise use whichever was supplied verbatim. No silent
-  env-var bleed-through when the resolver is in charge.
-- `OpenRouterProvisioningService.create_agent_key` becomes the
-  side-effect inside `PayerResolver.resolve_for(agent_did, "llm")` when
-  the policy spec is `HOST_MASTER_PROVISIONED`. Idempotent: skip if a
-  child key for this agent already exists in `ServiceKeyStorage`. Keep
-  the current direct-call path available for the existing
-  `manage_openrouter_keys.py` script.
+Storage and LLM have different init shapes today and the wiring respects
+that. Both go through `PayerResolver.resolve_for(...)` but apply the
+result differently.
+
+#### Storage path (per-agent provider construction)
+
+`LighthouseProvider` and `LighthouseTarget` are constructed per agent
+in `kestrel_agent.py:initialize()`. Wiring:
+
+```python
+storage = await payer_resolver.resolve_for(agent_did, "storage")
+if storage.enabled:
+    lighthouse = LighthouseProvider(
+        api_key=None,                       # no env-var seeding
+        key_resolver=storage.key_resolver,  # only credential source
+    )
+else:
+    lighthouse = None  # NONE policy: provider not constructed at all
+```
+
+Small refactor to `LighthouseProvider.__init__`: when both `api_key`
+and `key_resolver` are `None`, fall back to `os.environ` (today's
+behavior, kept for non-policy callers); otherwise use whichever was
+supplied verbatim. No silent env-var bleed-through when the resolver is
+in charge.
+
+#### LLM path (shared service, per-agent key swap)
+
+`LLMService` is constructed once at process startup with shared
+provider clients (today's behavior, unchanged — `LLMService.__init__`
+and `ProviderRegistry` are NOT modified). Per-agent customization
+happens after agent load via the existing
+[`LLMService.use_agent_key(agent_did, db, provider)`][use_agent_key]
+mechanism. The current direct call at
+[`kestrel_agent.py:806-820`][use-agent-key-call] (which keys off the
+deprecated `openrouter_key_hash` agent metadata field) is replaced
+with a policy-aware version:
+
+```python
+llm = await payer_resolver.resolve_for(agent_did, "llm")
+match (llm.enabled, policy.llm.kind, policy.llm.vendor):
+    case (False, _, _):
+        # NONE: agent has no LLM; LLMService refuses calls for this agent
+        llm_service.disable_for_agent(agent_did)
+    case (True, "host_env", _):
+        # Shared key path; nothing to swap
+        pass
+    case (True, "host_master_provisioned", vendor):
+        # Resolver already minted the child key in agent's ServiceKeyStorage.
+        # Swap shared client for agent-specific one for this vendor's routes.
+        await llm_service.use_agent_key(agent_did, db, provider=vendor)
+    case (True, "sponsor", vendor):
+        # Same as host_master but the resolver used sponsor's HostKeyStorage.
+        await llm_service.use_agent_key(agent_did, db, provider=vendor)
+    case (True, "self_wallet", _):
+        raise NotImplementedError("self_wallet for llm deferred")
+```
+
+`LLMService.disable_for_agent(agent_did)` is a small new method: it
+flags the agent as forbidden for this LLMService instance. Subsequent
+calls keyed to that agent return a structured "policy denied" error
+that callers (chat endpoints, reflection loops) treat as "no LLM
+available" — same surface as today's "no key configured" condition.
+The flag lives in-memory on the LLMService; it does not persist to the
+agent's DB (the policy itself is the source of truth).
+
+The `OpenRouterProvisioningService.create_agent_key` side-effect runs
+inside `PayerResolver.resolve_for(agent_did, "llm")` when the spec is
+`HOST_MASTER_PROVISIONED` — idempotent, skipped if a child key already
+exists in `ServiceKeyStorage`. The standalone
+`manage_openrouter_keys.py` script still calls the provisioning
+service directly, unchanged.
+
+#### Common
+
 - Inception service stays simple: it does NOT provision vendor keys.
   First-use lazy provisioning is the contract.
+- The deprecated `openrouter_key_hash` agent metadata field is left in
+  place for one release for back-compat; the policy is the new source
+  of truth. Removal is tracked separately, not in this PR.
 - Tests:
-  - per-agent OpenRouter key isolation against a mock REST.
+  - per-agent OpenRouter key swap against a mock REST + a mock
+    LLMService.use_agent_key.
   - existing Lighthouse env-var path still works (back-compat).
   - cold-start restore regression test still passes.
   - `storage = none` actually disables Lighthouse on a host that has
     `LIGHTHOUSE_API_KEY` set (regression for the round-2 finding).
+  - `llm = none` causes LLMService calls for that agent to return the
+    "policy denied" surface, not silently fall through to the shared
+    key.
 
-**Codex review focus:** the lazy-provisioning contract is observable
-and idempotent under retry; cold-start restore from Lighthouse still
-works; no regression in today's `LIGHTHOUSE_API_KEY` env-var behavior;
-`NONE` policy actually disables.
+**Codex review focus:** the storage and LLM wiring contracts are
+clearly distinct and neither bleeds into the other; the lazy-
+provisioning contract is observable and idempotent under retry;
+cold-start restore from Lighthouse still works; no regression in
+today's `LIGHTHOUSE_API_KEY` env-var behavior; `NONE` policy actually
+disables on both surfaces.
 
 ### Phase 3.5 — Lighthouse `HOST_MASTER_PROVISIONED` and `SELF_WALLET` (~half day)
 
@@ -542,5 +605,7 @@ env-var presence. CI does not need them; local pre-PR run does.
 [emma2]: ../../scripts/rotate_emma_key.py
 [mgmt]: ../../scripts/manage_openrouter_keys.py
 [kr]: ../../kestrel_sovereign/services/key_resolution.py
+[use_agent_key]: ../../kestrel_sovereign/llm/service.py
+[use-agent-key-call]: ../../kestrel_sovereign/kestrel_agent.py
 [pe]: PROVIDER_ECONOMICS.md
 [da06]: ../diagrams/data-architecture/DA-06-filecoin-lighthouse.md
