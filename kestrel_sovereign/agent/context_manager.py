@@ -62,6 +62,17 @@ def get_current_injection_tracking() -> Optional[
     return _INJECTION_TRACKING_VAR.get()
 
 
+def reset_injection_tracking() -> None:
+    """Clear the current task's injection tracking ContextVar.
+
+    Called by `SignalDispatcher._dispatch_cognition` at dispatch
+    start so an early-return `process_input` (safe mode, bootstrap,
+    `!` command) doesn't leak the PREVIOUS turn's tracking into
+    this dispatch's signal_log row (codex round-15 P2 fix).
+    """
+    _INJECTION_TRACKING_VAR.set(None)
+
+
 @dataclass
 class ContextResult:
     """Result of context assembly."""
@@ -341,10 +352,35 @@ class ContextManager:
             for item in reflection_guidance:
                 guidance_text += f"- {item}\n"
             guidance_text += "--- END GUIDANCE ---"
-            guidance_tokens = self.counter.count(guidance_text)
-            budget.use("system", guidance_tokens)
-            system_prompt = f"{system_prompt}\n\n{guidance_text}"
-            logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
+            # Codex round-15 P2: when a per-source budget is in
+            # effect, the late append of reflection guidance must
+            # NOT push the total over the cap. Skip the append if
+            # there's no room — the budget contract takes precedence
+            # over reflection guidance (operator can raise the cap
+            # to admit it back).
+            if system_prompt_budget_bytes is not None:
+                projected = (
+                    len(system_prompt.encode("utf-8"))
+                    + 2  # "\n\n" joiner
+                    + len(guidance_text.encode("utf-8"))
+                )
+                if projected > system_prompt_budget_bytes:
+                    logger.warning(
+                        "Skipping reflection guidance for budgeted "
+                        "dispatch (would push prompt %d over cap %d)",
+                        projected,
+                        system_prompt_budget_bytes,
+                    )
+                else:
+                    guidance_tokens = self.counter.count(guidance_text)
+                    budget.use("system", guidance_tokens)
+                    system_prompt = f"{system_prompt}\n\n{guidance_text}"
+                    logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
+            else:
+                guidance_tokens = self.counter.count(guidance_text)
+                budget.use("system", guidance_tokens)
+                system_prompt = f"{system_prompt}\n\n{guidance_text}"
+                logger.info(f"Injected {len(reflection_guidance)} reflection guidance items into prompt")
 
         # 1c. Microcompact: clear stale tool results (zero-cost, no LLM)
         microcompact_savings = self._microcompact_tool_results(history)
@@ -358,12 +394,31 @@ class ContextManager:
                 max_episodes=5
             )
             if episode_context:
-                episode_tokens = self.counter.count(episode_context)
-                budget.use("episodes", episode_tokens)
-                system_prompt = f"{system_prompt}\n\n{episode_context}"
-                # Count episodes (rough estimate from formatting)
-                episode_count = episode_context.count("**") // 2
-                logger.debug(f"Added {episode_count} episodes to context")
+                # Codex round-15 P2: same budget guard as reflection
+                # guidance. Skip episode append if it would push the
+                # final prompt over the per-source cap.
+                if system_prompt_budget_bytes is not None:
+                    projected = (
+                        len(system_prompt.encode("utf-8"))
+                        + 2
+                        + len(episode_context.encode("utf-8"))
+                    )
+                    if projected > system_prompt_budget_bytes:
+                        logger.warning(
+                            "Skipping episode context for budgeted "
+                            "dispatch (would push prompt %d over cap %d)",
+                            projected,
+                            system_prompt_budget_bytes,
+                        )
+                        episode_context = None
+
+                if episode_context:
+                    episode_tokens = self.counter.count(episode_context)
+                    budget.use("episodes", episode_tokens)
+                    system_prompt = f"{system_prompt}\n\n{episode_context}"
+                    # Count episodes (rough estimate from formatting)
+                    episode_count = episode_context.count("**") // 2
+                    logger.debug(f"Added {episode_count} episodes to context")
 
         # 3. Retrieve emotionally-weighted memories (placed in dynamic user
         # context, not system, so the system prefix stays cacheable).

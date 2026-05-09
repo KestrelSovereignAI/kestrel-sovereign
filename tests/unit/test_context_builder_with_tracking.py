@@ -301,6 +301,46 @@ async def test_context_manager_ephemeral_honors_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reflection_guidance_skipped_when_over_budget():
+    """Codex round-15 P2: reflection guidance is appended after the
+    budget-aware assembler runs. If adding it would push the prompt
+    over the per-source cap, skip the append rather than silently
+    exceed the budget."""
+    from collections import OrderedDict
+    from unittest.mock import AsyncMock, MagicMock
+
+    from kestrel_sovereign.agent.context_manager import ContextManager
+
+    cb = _stub_builder({"SOUL.md": "soul body"})
+    cb.get_session_briefing = lambda: ""
+
+    cm = ContextManager(storage=MagicMock(), context_builder=cb)
+    cm.conversation_manager = MagicMock()
+    cm.conversation_manager.get_conversation_history = AsyncMock(
+        return_value=[]
+    )
+    cm.llm_service = None
+
+    # Tight budget; reflection guidance is bulky and would exceed cap.
+    bulky_guidance = ["X" * 200] * 5
+    result = await cm.build_context(
+        query="q",
+        constitution="C",
+        include_briefing=False,
+        include_memories=False,
+        include_rag=False,
+        privacy_mode="NORMAL",
+        conversation_history=[],
+        reflection_guidance=bulky_guidance,
+        system_prompt_budget_bytes=400,
+    )
+    # Final prompt within cap (reflection guidance was skipped).
+    assert len(result.system_prompt.encode("utf-8")) <= 400
+    # And the guidance fence DOES NOT appear.
+    assert "ACTIVE REFLECTION GUIDANCE" not in result.system_prompt
+
+
+@pytest.mark.asyncio
 async def test_injection_tracking_is_per_async_task_isolated():
     """Codex round-14 P2: injection tracking must be per-async-task,
     not stored on a shared agent attribute that concurrent dispatches

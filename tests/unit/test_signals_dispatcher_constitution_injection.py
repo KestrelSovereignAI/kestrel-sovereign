@@ -1241,6 +1241,67 @@ async def test_dispatcher_does_not_retry_on_internal_typeerror(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_clears_stale_tracking_before_processing(
+    tmp_path, template_path
+):
+    """Codex round-15 P2: when process_input returns early (safe
+    mode, bootstrap, ! command) without going through build_context,
+    the dispatcher must NOT pick up the previous turn's tracking.
+    Pin the reset by pre-seeding the ContextVar with stale data and
+    confirming this dispatch records no injected/dropped clauses
+    from it."""
+    from kestrel_sovereign.agent.context_manager import (
+        _INJECTION_TRACKING_VAR,
+    )
+
+    # Pre-seed with stale tracking from a "previous turn".
+    _INJECTION_TRACKING_VAR.set(
+        (["STALE_PREV_TURN"], ["STALE_DROPPED"])
+    )
+
+    class _EarlyReturnAgent(_AuditingAgent):
+        async def process_input(self, prompt: str, **kwargs):
+            # Simulate an early-return path (e.g. safe mode)
+            # — does NOT call build_context, so doesn't update
+            # the ContextVar.
+            self.process_input_calls.append(prompt)
+            self.process_input_kwargs = list(
+                getattr(self, "process_input_kwargs", [])
+            )
+            self.process_input_kwargs.append(kwargs)
+            return "early-return result"
+
+    agent = _EarlyReturnAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="early_return_cog",
+            constitution_injection="full",
+        )
+    )
+
+    await env.dispatcher.dispatch_signal(_signal("early_return_cog"))
+    await _drain(env)
+
+    rows = await env.backend.fetch_all(
+        "SELECT injected_clauses_json, dropped_clauses_json FROM signal_log"
+    )
+    import json as _json
+
+    injected = _json.loads(rows[0][0]) if rows[0][0] else None
+    dropped = _json.loads(rows[0][1]) if rows[0][1] else None
+    # Stale clauses MUST NOT appear in this dispatch's audit.
+    assert "STALE_PREV_TURN" not in (injected or [])
+    assert "STALE_DROPPED" not in (dropped or [])
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_constitution_mixin_compute_live_returns_none_default():
     """Phase 1: default implementation returns None. Phase 2 wires
     project_root + bootstrap loader to produce a real hash."""

@@ -625,6 +625,16 @@ class SignalDispatcher:
     ) -> SignalResult:
         assert registration.prompt_template is not None
 
+        # Codex round-15 P2: clear the ContextVar at dispatch start
+        # so an early-return process_input (safe mode, bootstrap, !
+        # command) doesn't leak previous-turn injection tracking
+        # into this dispatch's signal_log row.
+        from kestrel_sovereign.agent.context_manager import (
+            reset_injection_tracking,
+        )
+
+        reset_injection_tracking()
+
         # Step A: build the constitutional audit BEFORE the dispatch
         # runs. For sources with `constitution_injection="full"` this
         # resolves the operative constitution_hash, computes the live
