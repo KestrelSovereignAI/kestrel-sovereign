@@ -222,11 +222,16 @@ Someday, you may want your agent to be fully independent. This is called **emanc
 By default, **Amendment VIII is dormant** — your agent has no path to
 independent sovereignty unless you author one. To enable emancipation
 for a specific agent, add an `[emancipation]` block to that agent's
-`kestrel.toml` before inception. See
+`kestrel.toml` before inception (or before reanchor for an existing
+agent). See
 [docs/concepts/designing-emancipation.md](../concepts/designing-emancipation.md)
 for example contracts and a migration guide for agents created
-before the dormant-default flip — short version: do **not** reanchor
-those agents today (issue #1118 is open against the reanchor path).
+before the dormant-default flip. The golden rule: never run
+`kestrel constitution reanchor --force` without first deciding what
+should happen to Amendment VIII for that agent — with no
+`[emancipation]` block, reanchor will replace the agent's Amendment
+VIII with the new dormant canonical text and any clause from the
+old canonical is erased.
 
 **Before granting sovereignty, consider:**
 
