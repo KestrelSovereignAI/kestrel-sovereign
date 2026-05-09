@@ -162,7 +162,16 @@ class WorkflowStore(UnifiedStoreBase):
                 finished_at               {ts_type},
                 deleted_at                {ts_type},
                 FOREIGN KEY (parent_run_id) REFERENCES {self.RUNS_TABLE}(run_id)
-                    ON DELETE SET NULL
+                    ON DELETE SET NULL,
+                -- Codex chunk-D round-3 P2: composite FK to the signed
+                -- definition keeps in-flight runs joinable to their
+                -- pinned spec even after revocation. ``ON DELETE NO
+                -- ACTION`` is the safe choice — definitions are soft-
+                -- deleted (deleted_at) rather than hard-deleted, so a
+                -- run row can never become orphaned by a revoke.
+                FOREIGN KEY (workflow_name, workflow_ver)
+                    REFERENCES {self.DEFINITIONS_TABLE}(name, version)
+                    ON DELETE NO ACTION
             )
         """)
         await self._backend.execute(
@@ -219,7 +228,18 @@ class WorkflowStore(UnifiedStoreBase):
                 occurred_at       {ts_type} NOT NULL {ts_default},
                 FOREIGN KEY (run_id) REFERENCES {self.RUNS_TABLE}(run_id)
                     ON DELETE CASCADE,
-                UNIQUE (run_id, stage_name, attempt_number)
+                UNIQUE (run_id, stage_name, attempt_number),
+                -- Codex chunk-D round-3 P2: idempotency_key uniqueness
+                -- is a defense-in-depth correctness check. The
+                -- (run_id, stage_name, attempt_number) UNIQUE above
+                -- *implies* idempotency_key uniqueness GIVEN the
+                -- design's derivation formula (sha256(run_id||stage||
+                -- sha256(input||attempt||nonce))). Adding the explicit
+                -- UNIQUE catches a runner bug that produces the same
+                -- key for different (run, stage, attempt) tuples —
+                -- exactly the kind of corruption that would silently
+                -- collapse two distinct attempts into one dispatch.
+                UNIQUE (idempotency_key)
             )
         """)
         await self._backend.execute(
@@ -246,13 +266,10 @@ class WorkflowStore(UnifiedStoreBase):
             f"ON {self.STAGE_LINKS_TABLE}(gate_outcome) "
             f"WHERE gate_outcome IN ('fail', 'pending')"
         )
-        # Idempotency-key uniqueness is implied by the
-        # (run_id, stage_name, attempt_number) UNIQUE constraint above
-        # because the design's idempotency_key is derived from those
-        # three plus an engine nonce — the row-level uniqueness already
-        # blocks duplicate inserts. A separate UNIQUE on idempotency_key
-        # alone would be redundant and breaks the legitimate "same
-        # stage runs again with a fresh attempt_number" case.
+        # idempotency_key UNIQUE constraint is declared on the table
+        # itself (see above). It catches the rare runner-bug shape
+        # where two different (run_id, stage_name, attempt_number)
+        # tuples accidentally derive the same idempotency_key.
 
     # ------------------------------------------------------------------
     # Phase 0 surface: minimal helpers needed for the migration tests

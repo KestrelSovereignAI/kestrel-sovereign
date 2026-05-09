@@ -145,6 +145,53 @@ async def test_unsigned_spec_rejected(store: WorkflowStore):
 # ---------------------------------------------------------------------------
 
 
+async def test_runs_table_rejects_unknown_definition(store: WorkflowStore):
+    """Codex chunk-D round-3 P2: composite FK (workflow_name,
+    workflow_ver) keeps in-flight runs joinable to their pinned
+    signed definition."""
+    with pytest.raises(Exception):
+        await store.backend.execute(
+            f"""
+            INSERT INTO {store.RUNS_TABLE}
+                (run_id, workflow_name, workflow_ver, params_json,
+                 status, started_by_did)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            ("orphan", "ghost", 99, "{}", "running", "did:web:k.example"),
+        )
+
+
+async def test_stage_links_idempotency_key_unique(store: WorkflowStore):
+    """Codex chunk-D round-3 P2: UNIQUE(idempotency_key) catches the
+    runner-bug shape where two distinct (run_id, stage_name,
+    attempt_number) tuples accidentally derive the same key."""
+    spec = _signed_spec()
+    await store.insert_definition_for_test(spec)
+    await store.backend.execute(
+        f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, "
+        f"workflow_ver, params_json, status, started_by_did) "
+        f"VALUES (?, ?, ?, ?, ?, ?)",
+        ("run-1", "release", 1, "{}", "running", "did:web:k.example"),
+    )
+    insert_link = (
+        f"INSERT INTO {store.STAGE_LINKS_TABLE} "
+        f"(link_id, run_id, stage_name, attempt_number, idempotency_key, "
+        f"actor_did, actor_sig) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    )
+    await store.backend.execute(
+        insert_link,
+        ("l-1", "run-1", "lint", 1, "0" * 64, "did:web:k.example", "sig"),
+    )
+    # Same idempotency_key, different (stage, attempt) — would be
+    # accepted under the (run_id, stage_name, attempt_number) UNIQUE
+    # alone; the dedicated UNIQUE on idempotency_key now rejects it.
+    with pytest.raises(Exception):
+        await store.backend.execute(
+            insert_link,
+            ("l-2", "run-1", "lint", 2, "0" * 64, "did:web:k.example", "sig"),
+        )
+
+
 async def test_runs_table_accepts_minimal_row(store: WorkflowStore):
     spec = _signed_spec()
     await store.insert_definition_for_test(spec)
