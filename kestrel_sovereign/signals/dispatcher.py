@@ -738,11 +738,39 @@ class SignalDispatcher:
 
         prompt = self._render_prompt(signal, registration)
         if constitution_text is not None:
-            # Prepend a single canonical fenced block. Templates may
-            # also include the deprecated `{constitution}` placeholder
-            # (now substituted with empty string in `_render_prompt`)
-            # without changing this prepend — the security guarantee
-            # holds regardless of template content.
+            # PHASE 1 LIMITATION (codex round-8 P2): the dispatcher
+            # passes `prompt` to `agent.process_input`, which is the
+            # user-turn channel. For real `KestrelAgent` instances
+            # this means the prepended constitution + canary
+            # directive land in conversation history and are
+            # exposed as user content — NOT the design's intended
+            # system-prompt-with-hidden-receipt path. The Phase 1
+            # contract is still useful in three contexts:
+            #   1. External reviewer sources (codex/local) where the
+            #      "user prompt" is a one-shot call without
+            #      persistence (operator routes process_input to a
+            #      non-history handler for these).
+            #   2. Test harnesses with stubbed process_input.
+            #   3. Audit/forensic recording (hashes + clauses still
+            #      land in signal_log regardless of injection
+            #      semantics).
+            # Phase 2 (epic Phase 2) wires real system-prompt
+            # injection + phantom-tool registration. Until then,
+            # operators using `constitution_injection="full"` on a
+            # claude_code in-agent source will see the constitution
+            # in their conversation history and should disable echo
+            # for that path until Phase 2 ships.
+            logger.warning(
+                "Phase-1 constitutional injection: source '%s' has "
+                "constitution_injection='full' and the dispatcher is "
+                "prepending the constitution to the rendered prompt. "
+                "If this signal routes through KestrelAgent.process_input "
+                "the constitution will appear in conversation history. "
+                "Phase 2 of #1137 wires system-prompt injection; until "
+                "then, full injection is intended for external "
+                "reviewer paths (codex/local) only.",
+                registration.name,
+            )
             prompt = (
                 "--- GOVERNING CONSTITUTION ---\n"
                 f"{constitution_text}\n"
