@@ -42,6 +42,7 @@ from kestrel_sovereign.constitution.hierarchy import (
     parse_amendment_ix_grants,
 )
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sdk.tools.result import ToolResult
 from kestrel_sdk.tools.base import ToolCategory
 
 from .audit import AuditLog, AuditRecord
@@ -466,7 +467,7 @@ class ComputerUseFeature(Feature):
         category=ToolCategory.FILE_OPERATIONS,
         command_prefix="!fs-read",
     )
-    async def fs_read(self, path: str) -> Dict[str, Any]:
+    async def fs_read(self, path: str) -> ToolResult:
         """Read a file the sovereign has authorized.
 
         Args:
@@ -480,7 +481,7 @@ class ComputerUseFeature(Feature):
             write=False,
         )
         if not outcome:
-            return {"success": False, "error": outcome.denied_reason}
+            return ToolResult.failed(error=outcome.denied_reason)
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved = Path(payload["path"])
@@ -495,12 +496,25 @@ class ComputerUseFeature(Feature):
                 outcome="ok",
                 duration_ms=duration_ms,
             )
-            return {
-                "success": True,
-                "path": str(resolved),
-                "bytes": len(data),
-                "content": data.decode("utf-8", errors="replace"),
-            }
+            content_str = data.decode("utf-8", errors="replace")
+            # Render the file contents inside the confirmation so the
+            # !fs-read CLI surface still shows what the user came for —
+            # the command-handler envelope formatter suppresses scalar
+            # ``data`` (no list/nested-dict values triggers the
+            # structural-payload heuristic), so anything the user is
+            # expected to see has to live in ``confirmation``.
+            confirmation = (
+                f"Read {len(data)} bytes from {resolved}:\n"
+                + (content_str if content_str else "(empty file)")
+            )
+            return ToolResult.ok(
+                confirmation,
+                data={
+                    "path": str(resolved),
+                    "bytes": len(data),
+                    "content": content_str,
+                },
+            )
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
@@ -511,7 +525,7 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
                 error=str(exc),
             )
-            return {"success": False, "error": str(exc)}
+            return ToolResult.failed(error=str(exc))
 
     @tool(
         name="fs_list",
@@ -519,7 +533,7 @@ class ComputerUseFeature(Feature):
         category=ToolCategory.FILE_OPERATIONS,
         command_prefix="!fs-list",
     )
-    async def fs_list(self, path: str) -> Dict[str, Any]:
+    async def fs_list(self, path: str) -> ToolResult:
         """List a directory the sovereign has authorized.
 
         Args:
@@ -533,7 +547,7 @@ class ComputerUseFeature(Feature):
             write=False,
         )
         if not outcome:
-            return {"success": False, "error": outcome.denied_reason}
+            return ToolResult.failed(error=outcome.denied_reason)
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved = Path(payload["path"])
@@ -548,11 +562,13 @@ class ComputerUseFeature(Feature):
                 outcome="ok",
                 duration_ms=duration_ms,
             )
-            return {
-                "success": True,
-                "path": str(resolved),
-                "entries": [e.__dict__ for e in entries],
-            }
+            return ToolResult.ok(
+                f"Listed {len(entries)} entry(ies) under {resolved}.",
+                data={
+                    "path": str(resolved),
+                    "entries": [e.__dict__ for e in entries],
+                },
+            )
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
@@ -563,7 +579,7 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
                 error=str(exc),
             )
-            return {"success": False, "error": str(exc)}
+            return ToolResult.failed(error=str(exc))
 
     @tool(
         name="fs_write",
@@ -571,7 +587,7 @@ class ComputerUseFeature(Feature):
         category=ToolCategory.FILE_OPERATIONS,
         command_prefix="!fs-write",
     )
-    async def fs_write(self, path: str, content: str) -> Dict[str, Any]:
+    async def fs_write(self, path: str, content: str) -> ToolResult:
         """Write to a file (always approval-gated).
 
         The diff preview shown to the human approver is computed inside
@@ -599,7 +615,7 @@ class ComputerUseFeature(Feature):
             pre_approval=_prepare,
         )
         if not outcome:
-            return {"success": False, "error": outcome.denied_reason}
+            return ToolResult.failed(error=outcome.denied_reason)
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved = Path(payload["path"])
@@ -614,7 +630,10 @@ class ComputerUseFeature(Feature):
                 outcome="ok",
                 duration_ms=duration_ms,
             )
-            return {"success": True, "path": str(resolved), "bytes_written": written}
+            return ToolResult.ok(
+                f"Wrote {written} bytes to {resolved}.",
+                data={"path": str(resolved), "bytes_written": written},
+            )
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
@@ -625,7 +644,7 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
                 error=str(exc),
             )
-            return {"success": False, "error": str(exc)}
+            return ToolResult.failed(error=str(exc))
 
     @tool(
         name="fs_edit",
@@ -635,7 +654,7 @@ class ComputerUseFeature(Feature):
     )
     async def fs_edit(
         self, path: str, old_text: str, new_text: str, occurrence: int = 1
-    ) -> Dict[str, Any]:
+    ) -> ToolResult:
         """Targeted in-place edit of a file.
 
         The tool replaces the ``occurrence``-th instance of ``old_text``
@@ -704,7 +723,7 @@ class ComputerUseFeature(Feature):
             pre_approval=_prepare,
         )
         if not outcome:
-            return {"success": False, "error": outcome.denied_reason}
+            return ToolResult.failed(error=outcome.denied_reason)
 
         payload = outcome.payload  # type: ignore[attr-defined]
         resolved = Path(payload["path"])
@@ -725,12 +744,14 @@ class ComputerUseFeature(Feature):
                 outcome="ok",
                 duration_ms=duration_ms,
             )
-            return {
-                "success": True,
-                "path": str(resolved),
-                "bytes_written": written,
-                "occurrence": occurrence,
-            }
+            return ToolResult.ok(
+                f"Edited {resolved} (occurrence {occurrence}, {written} bytes written).",
+                data={
+                    "path": str(resolved),
+                    "bytes_written": written,
+                    "occurrence": occurrence,
+                },
+            )
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
@@ -741,7 +762,7 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
                 error=str(exc),
             )
-            return {"success": False, "error": str(exc)}
+            return ToolResult.failed(error=str(exc))
 
     @tool(
         name="shell",
@@ -749,16 +770,24 @@ class ComputerUseFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
-    async def shell(self, command: str, timeout: int = 60) -> Dict[str, Any]:
+    async def shell(self, command: str, timeout: int = 60) -> ToolResult:
         """Run a shell command after policy + approval.
 
         Args:
             command: The shell command to run; tokenized with shlex.
             timeout: Wall-clock seconds before the process is killed.
+
+        Returns:
+            ToolResult.ok when the command exits 0; PARTIAL when the
+            command ran but exited non-zero or timed out (the LLM
+            should NOT claim success — but the shell did run, which
+            matters for audit and for follow-up steps that read
+            stdout/stderr); ERROR for empty-command, gate denial,
+            or any backend exception.
         """
         argv = split_command(command)
         if not argv:
-            return {"success": False, "error": "empty command"}
+            return ToolResult.failed(error="empty command")
 
         # Capability depends on which backend is wired up; gate semantics
         # treat the two as distinct constitutional grants.
@@ -780,7 +809,7 @@ class ComputerUseFeature(Feature):
             argv=argv,
         )
         if not outcome:
-            return {"success": False, "error": outcome.denied_reason}
+            return ToolResult.failed(error=outcome.denied_reason)
 
         payload = outcome.payload  # type: ignore[attr-defined]
         started = time.monotonic()
@@ -795,14 +824,48 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
                 error=None if result.returncode == 0 else f"exit {result.returncode}",
             )
-            return {
-                "success": result.returncode == 0,
+            data = {
                 "returncode": result.returncode,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "duration_ms": result.duration_ms,
                 "timed_out": result.timed_out,
             }
+            # Render stdout/stderr inside the confirmation so the
+            # !shell CLI surface keeps showing the command output —
+            # the command-handler envelope formatter suppresses
+            # scalar-only ``data`` (the structural-payload heuristic
+            # only fires on list/nested-dict values), so the user-
+            # visible payload has to live in ``confirmation``.
+            stdout_block = (
+                f"\nstdout:\n{result.stdout}" if result.stdout else ""
+            )
+            stderr_block = (
+                f"\nstderr:\n{result.stderr}" if result.stderr else ""
+            )
+            if result.returncode == 0:
+                return ToolResult.ok(
+                    f"Command ran successfully (rc=0, {result.duration_ms}ms)."
+                    + stdout_block
+                    + stderr_block,
+                    data=data,
+                )
+            # Non-zero exit: PARTIAL — the shell ran (so audit / follow-up
+            # tooling that reads stdout/stderr is meaningful) but the
+            # LLM must not claim success.
+            stderr_tail = (result.stderr or "")[-200:].strip()
+            caveat = (
+                f"command exited rc={result.returncode}"
+                + (" (timed out)" if result.timed_out else "")
+                + (f"; stderr tail: {stderr_tail}" if stderr_tail else "")
+            )
+            return ToolResult.partial(
+                f"Command ran but failed (rc={result.returncode}, {result.duration_ms}ms)."
+                + stdout_block
+                + stderr_block,
+                caveat,
+                data=data,
+            )
         except Exception as exc:  # noqa: BLE001
             duration_ms = int((time.monotonic() - started) * 1000)
             await self._audit_run(
@@ -813,7 +876,7 @@ class ComputerUseFeature(Feature):
                 duration_ms=duration_ms,
                 error=str(exc),
             )
-            return {"success": False, "error": str(exc)}
+            return ToolResult.failed(error=str(exc))
 
 
 def _diff_preview(path: Path, new_bytes: bytes, *, max_chars: int = 4000) -> str:

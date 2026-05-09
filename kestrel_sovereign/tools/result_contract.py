@@ -85,6 +85,7 @@ MIGRATED_FEATURE_MODULES: frozenset[str] = frozenset({
     "kestrel_sovereign.features.webhooks.feature",
     "kestrel_sovereign.features.voice.feature",
     "kestrel_sovereign.features.delivery.feature",
+    "kestrel_sovereign.features.computer_use.feature",
 })
 
 

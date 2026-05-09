@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.features.computer_use.feature import ComputerUseFeature
 from kestrel_sovereign.privacy import PrivacyConfig
@@ -91,9 +92,9 @@ async def test_disabled_feature_returns_error(tmp_path: Path):
     )
     feature = ComputerUseFeature(agent)
     feature._cfg = _config(tmp_path, enabled=False)
-    result = await feature.fs_read(path=str(tmp_path / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("readiness:")
+    envelope = await feature.fs_read(path=str(tmp_path / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("readiness:")
 
 
 @pytest.mark.asyncio
@@ -105,9 +106,9 @@ async def test_privacy_gate_blocks_when_flag_off(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("privacy")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("privacy")
 
 
 @pytest.mark.asyncio
@@ -124,9 +125,9 @@ async def test_constitution_gate_blocks_without_grant(workspace: Path):
     await feature.initialize()
     # Now strip the filesystem grant to test the gate at call time.
     agent.granted_capabilities = frozenset({"shell_execution_sandboxed", "shell_execution_host"})
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("constitution")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("constitution")
 
 
 @pytest.mark.asyncio
@@ -139,9 +140,9 @@ async def test_deny_path_hard_rejects_before_approval(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("policy:deny")
+    envelope = await feature.fs_read(path=str(workspace / "secret" / "leak.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("policy:deny")
     assert queue.calls == []  # never reached the approval queue
 
 
@@ -155,9 +156,9 @@ async def test_allowed_read_succeeds_without_approval(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is True
-    assert result["content"] == "hello"
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["content"] == "hello"
     assert queue.calls == []  # auto-approved
 
 
@@ -176,8 +177,8 @@ async def test_write_requires_approval(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.fs_write(path=str(workspace / "new.txt"), content="data")
-    assert result["success"] is True
+    envelope = await feature.fs_write(path=str(workspace / "new.txt"), content="data")
+    assert envelope.status is ToolResultStatus.OK
     assert len(queue.calls) == 1
     assert queue.calls[0]["tool"] == "fs-write"
     assert "diff_preview" in queue.calls[0]["args"]
@@ -199,9 +200,9 @@ async def test_write_denied_when_user_refuses(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.fs_write(path=str(workspace / "new.txt"), content="data")
-    assert result["success"] is False
-    assert result["error"].startswith("approval")
+    envelope = await feature.fs_write(path=str(workspace / "new.txt"), content="data")
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("approval")
     assert not (workspace / "new.txt").exists()
 
 
@@ -215,9 +216,9 @@ async def test_shell_denied_binary(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.shell(command="rm -rf /tmp", timeout=5)
-    assert result["success"] is False
-    assert result["error"].startswith("policy:deny")
+    envelope = await feature.shell(command="rm -rf /tmp", timeout=5)
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("policy:deny")
     assert queue.calls == []
 
 
@@ -231,10 +232,10 @@ async def test_shell_allowed_runs(workspace: Path):
     )
     feature = await _make_feature(workspace, agent=agent)
     await feature.initialize()
-    result = await feature.shell(command="echo hi", timeout=5)
-    assert result["success"] is True
-    assert result["returncode"] == 0
-    assert "hi" in result["stdout"]
+    envelope = await feature.shell(command="echo hi", timeout=5)
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["returncode"] == 0
+    assert "hi" in envelope.data["stdout"]
     assert len(queue.calls) == 1
 
 
@@ -273,6 +274,6 @@ async def test_local_backend_requires_both_shell_grants(workspace: Path):
     # initialize swallows CapabilityBlocked and leaves backend=None
     await feature.initialize()
     assert feature._backend is None
-    result = await feature.fs_read(path=str(workspace / "ok.txt"))
-    assert result["success"] is False
-    assert result["error"].startswith("readiness:")
+    envelope = await feature.fs_read(path=str(workspace / "ok.txt"))
+    assert envelope.status is not ToolResultStatus.OK
+    assert envelope.error.startswith("readiness:")
