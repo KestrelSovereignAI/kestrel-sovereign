@@ -143,6 +143,47 @@ async def test_spawn_history_filtered_by_parent_did(monkeypatch):
     )
 
 
+@pytest.mark.asyncio
+async def test_spawn_history_excludes_legacy_records_without_parent_did(monkeypatch):
+    """Old SpawnResult records (serialized before #1149 round 4)
+    have ``parent_did == ""`` by default. The filter must EXCLUDE
+    those from every agent's panel rather than including them
+    everywhere — codex round 5 of #1149 caught this. Showing an
+    unattributed record in nobody's panel is strictly better than
+    showing the same record in every agent's panel.
+    """
+    from kestrel_sovereign.spawn.lifecycle import SpawnResult, SpawnStatus
+    from decimal import Decimal
+
+    legacy_result = SpawnResult(
+        child_name="legacy-orphan",
+        child_did="did:child:legacy",
+        status=SpawnStatus.COMPLETED,
+        started_at="2026-04-01T00:00:00Z",
+        # parent_did defaulted to "" by the back-compat field default
+        budget_consumed=Decimal("0"),
+    )
+
+    lifecycle = SimpleNamespace(
+        _tracked={},
+        _results={"legacy-orphan": legacy_result},
+    )
+    manager = MagicMock()
+    manager._lifecycle = lifecycle
+    manager.get_children.return_value = []
+
+    agent = SimpleNamespace(agent_id="did:parent:A", _agent_manager=None)
+    request = _make_request(agent_manager=manager)
+    monkeypatch.setattr(spawn_endpoints, "get_agent", lambda r: agent)
+
+    result = await spawn_endpoints.get_spawn_children(request)
+    history_names = [h["child_name"] for h in result["history"]]
+    assert "legacy-orphan" not in history_names, (
+        "Legacy results without parent_did must NOT appear in any "
+        f"agent's history; got {history_names}"
+    )
+
+
 def test_get_agent_manager_helper_prefers_agent_then_app_state():
     """Direct unit test of the helper — agent.attached wins over app.state."""
     agent_mgr = MagicMock(name="agent-attached")

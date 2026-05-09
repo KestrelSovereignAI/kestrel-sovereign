@@ -180,12 +180,16 @@ def _build_spawn_history(agent, manager, request: Request | None = None) -> list
     if lifecycle is not None:
         # Completed/terminated results — filter by parent_did.
         # SpawnResult.parent_did was added in #1149 round 4. Old
-        # serialized records may lack it (defaulted to ""); when
-        # that's the case we fall through to the active-tracked
-        # cross-reference below.
+        # serialized records may lack it (defaulted to ""); we
+        # EXCLUDE those rather than letting them leak across every
+        # parent's panel (#1149 round 5 caught the leak — passing
+        # them through "for back-compat" meant the same legacy
+        # record appeared in every agent's history in multi-agent
+        # mode). Showing an unattributed record in nobody's panel
+        # is strictly better than showing it in everybody's.
         for name, result in lifecycle._results.items():
             result_parent = getattr(result, "parent_did", "") or ""
-            if result_parent and result_parent != parent_did:
+            if result_parent != parent_did:
                 continue
             history.append({
                 "event": "terminated",
