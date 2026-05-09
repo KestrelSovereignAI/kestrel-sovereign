@@ -1069,6 +1069,103 @@ async def test_dispatch_succeeds_when_prompt_fits_budget(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_records_echo_verified_counter(
+    tmp_path, template_path
+):
+    """Chunk 1H: a VERIFIED echo dispatch increments the
+    `kestrel_constitution_echo_verified_total` counter."""
+    from kestrel_sovereign.signals import constitution_metrics
+
+    if not constitution_metrics.PROMETHEUS_AVAILABLE:
+        pytest.skip("prometheus-client not installed")
+
+    counter = constitution_metrics.CONSTITUTION_ECHO_VERIFIED_TOTAL
+    before = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_verified_cog"}
+        ):
+            before = sample.value
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle",
+        live_bundle_hash="bundle",
+        echo_status=CanaryStatus.VERIFIED,
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="metric_verified_cog",
+            constitution_injection="full",
+            require_constitution_echo=True,
+            prompt_template_format="codex",
+        )
+    )
+    await env.dispatcher.dispatch_signal(_signal("metric_verified_cog"))
+    await _drain(env)
+
+    after = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_verified_cog"}
+        ):
+            after = sample.value
+    assert after - before == 1.0
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_records_doctrine_bundle_drift_counter(
+    tmp_path, template_path
+):
+    """Chunk 1H: a drift refusal increments
+    `kestrel_doctrine_bundle_drift_total`."""
+    from kestrel_sovereign.signals import constitution_metrics
+
+    if not constitution_metrics.PROMETHEUS_AVAILABLE:
+        pytest.skip("prometheus-client not installed")
+
+    counter = constitution_metrics.DOCTRINE_BUNDLE_DRIFT_TOTAL
+    before = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_drift_cog"}
+        ):
+            before = sample.value
+
+    agent = _AuditingAgent(
+        constitution_hash="con_abc",
+        anchored_bundle_hash="bundle_a",
+        live_bundle_hash="bundle_b",  # drift
+    )
+    env = await _make_dispatcher(tmp_path, agent)
+    env.registry.register(
+        _cognition_reg(
+            template_path,
+            name="metric_drift_cog",
+            constitution_injection="full",
+        )
+    )
+    await env.dispatcher.dispatch_signal(_signal("metric_drift_cog"))
+    await _drain(env)
+
+    after = 0.0
+    for sample in counter.collect()[0].samples:
+        if (
+            sample.name.endswith("_total")
+            and sample.labels == {"source": "metric_drift_cog"}
+        ):
+            after = sample.value
+    assert after - before == 1.0
+    await env.backend.close()
+
+
+@pytest.mark.asyncio
 async def test_action_signals_bypass_constitutional_audit(tmp_path):
     agent = _AuditingAgent(
         constitution_hash="should_not_be_used",

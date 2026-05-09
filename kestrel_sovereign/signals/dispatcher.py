@@ -103,9 +103,15 @@ from kestrel_sovereign.signals.constitution_canary import (
     build_canary_instruction,
     derive_canary,
 )
+from kestrel_sovereign.signals.constitution_metrics import (
+    record_doctrine_bundle_drift,
+    record_echo_missing,
+    record_echo_verified,
+)
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
 from kestrel_sovereign.signals.store import SignalLogStore
+from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
 
@@ -607,10 +613,38 @@ class SignalDispatcher:
         # injected; refusing the dispatch is safer than dispatching
         # under tampered doctrine).
         audit = await self._build_constitution_audit(signal, registration)
+        # OTel span (#1137 chunk 1H): emit a span for every COGNITION
+        # dispatch with constitutional-injection attributes. No-op
+        # when tracing is disabled. The span attributes are set as
+        # the audit fills out so a partial dispatch (e.g. drift
+        # refusal) still records what was resolved.
+        span_attrs = {
+            "kestrel.signal.source": signal.source,
+            "kestrel.signal.id": signal.id,
+            "kestrel.constitution.injection": registration.constitution_injection,
+            "kestrel.constitution.format": registration.prompt_template_format,
+            "kestrel.constitution.echo_required": registration.require_constitution_echo,
+        }
+        if audit.constitution_hash:
+            span_attrs["kestrel.constitution.hash"] = audit.constitution_hash[:16]
+        if audit.doctrine_bundle_hash:
+            span_attrs["kestrel.doctrine_bundle.hash"] = audit.doctrine_bundle_hash[:16]
         try:
-            return await self._run_cognition_with_audit(
-                signal, registration, start, audit
-            )
+            with optional_span(
+                "signal.dispatch.cognition", span_attrs
+            ) as span:
+                result = await self._run_cognition_with_audit(
+                    signal, registration, start, audit
+                )
+                if span is not None:
+                    span.set_attribute(
+                        "kestrel.constitution.echo_status",
+                        audit.echo_canary_status.value,
+                    )
+                    span.set_attribute(
+                        "kestrel.signal.status", result.status.value
+                    )
+                return result
         except Exception as e:
             # Codex round-3 P2: if process_input raises, the audit
             # would otherwise be lost when the outer try/except in
@@ -641,6 +675,7 @@ class SignalDispatcher:
         audit: "_ConstitutionAudit",
     ) -> SignalResult:
         if audit.drift_error is not None:
+            record_doctrine_bundle_drift(signal.source)
             return self._fail(
                 signal,
                 start,
@@ -862,7 +897,10 @@ class SignalDispatcher:
         # echo IS required is a contract violation, not a pass.
         if registration.require_constitution_echo:
             await self._verify_canary_post_dispatch(signal, registration, audit)
-            if audit.echo_canary_status is not CanaryStatus.VERIFIED:
+            if audit.echo_canary_status is CanaryStatus.VERIFIED:
+                record_echo_verified(signal.source)
+            else:
+                record_echo_missing(signal.source)
                 return self._fail(
                     signal,
                     start,
