@@ -28,6 +28,23 @@ from kestrel_sovereign.features.wallet import (
 )
 
 
+def _wallet_render(envelope) -> str:
+    """Flatten a ToolResult into a string for legacy `in` substring tests.
+
+    Wallet tool returns historically were strings; the migrated envelopes
+    keep the same human-facing copy in ``confirmation`` (OK/PARTIAL) or
+    ``error`` (ERROR). This helper concatenates both so existing
+    ``"some text" in result`` assertions translate cleanly to
+    ``"some text" in _wallet_render(envelope)``.
+    """
+    parts = []
+    if envelope.confirmation:
+        parts.append(envelope.confirmation)
+    if envelope.error:
+        parts.append(envelope.error)
+    return "\n".join(parts)
+
+
 # Skip network tests by default - they require real network access
 NETWORK_TESTS_ENABLED = os.environ.get("RUN_NETWORK_TESTS") == "true"
 
@@ -284,16 +301,16 @@ class TestWalletFeatureFilecoinCommands:
     @pytest.mark.asyncio
     async def test_wallet_address_without_address(self, wallet_feature):
         """Should prompt to generate address."""
-        result = await wallet_feature.wallet_address()
-        assert "No Filecoin Address" in result
-        assert "!wallet-generate-address" in result
+        envelope = await wallet_feature.wallet_address()
+        assert "No Filecoin Address" in _wallet_render(envelope)
+        assert "!wallet-generate-address" in _wallet_render(envelope)
 
     @pytest.mark.asyncio
     async def test_wallet_sync_without_address(self, wallet_feature):
         """Should prompt to generate address first."""
-        result = await wallet_feature.wallet_sync()
-        assert "No Filecoin Address" in result
-        assert "!wallet-generate-address" in result
+        envelope = await wallet_feature.wallet_sync()
+        assert "No Filecoin Address" in _wallet_render(envelope)
+        assert "!wallet-generate-address" in _wallet_render(envelope)
 
 
 class TestFilecoinAddressPersistence:

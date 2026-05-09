@@ -29,6 +29,7 @@ from typing import List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sdk.hooks.base import Hook
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from .feature import WalletAgent, Currency
 from .transaction_hook import TransactionSecurityHook
 from .economic_gates import EconomicGateMixin
@@ -138,7 +139,7 @@ class WalletFeature(
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-balance"
     )
-    async def wallet_balance(self, currency: str = "all") -> str:
+    async def wallet_balance(self, currency: str = "all") -> ToolResult:
         """
         Check wallet balance for one or all currencies.
 
@@ -146,10 +147,11 @@ class WalletFeature(
             currency: Currency to check - 'FIL', 'USDC', 'USDT', or 'all' (default)
 
         Returns:
-            Formatted balance report
+            ToolResult.ok with the formatted balance report. ERROR
+            for wallet-not-initialized and unknown-currency.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         currency_upper = currency.upper()
 
@@ -168,25 +170,39 @@ class WalletFeature(
                     lines.append("")
 
             lines.append(f"**Total USD Value:** ${total_usd:.2f}")
-            return "\n".join(lines)
+            return ToolResult.ok(
+                "\n".join(lines),
+                data={"balances": balances, "total_usd": f"{total_usd:.2f}"},
+            )
 
         else:
             # Show specific currency
             try:
                 curr_enum = Currency(currency_upper)
             except ValueError:
-                return f"❌ Unknown currency: {currency}. Use FIL, USDC, USDT, or 'all'"
+                return ToolResult.failed(
+                    error=f"❌ Unknown currency: {currency}. Use FIL, USDC, USDT, or 'all'"
+                )
 
             main = self.wallet.get_balance(curr_enum, "main")
             audit = self.wallet.get_balance(curr_enum, "audit")
             total = main + audit
             usd_value = self.wallet.convert_to_usd(total, curr_enum)
 
-            return f"""💰 **{currency_upper} Balance**
+            return ToolResult.ok(
+                f"""💰 **{currency_upper} Balance**
 Main: {main} {currency_upper}
 Audit: {audit} {currency_upper}
 Total: {total} {currency_upper}
-USD Value: ${usd_value:.2f}"""
+USD Value: ${usd_value:.2f}""",
+                data={
+                    "currency": currency_upper,
+                    "main": str(main),
+                    "audit": str(audit),
+                    "total": str(total),
+                    "usd_value": f"{usd_value:.2f}",
+                },
+            )
 
     @tool(
         name="wallet_transfer",
@@ -199,7 +215,7 @@ USD Value: ${usd_value:.2f}"""
         amount: str,
         currency: str = "FIL",
         memo: str = ""
-    ) -> str:
+    ) -> ToolResult:
         """
         Transfer funds from the main balance.
 
@@ -209,31 +225,39 @@ USD Value: ${usd_value:.2f}"""
             memo: Optional transaction memo
 
         Returns:
-            Transfer result message
+            ToolResult.ok on a successful transfer (with the new
+            balance in the confirmation). ERROR for wallet-not-
+            initialized, invalid-amount, non-positive amount,
+            unknown-currency, insufficient-funds, and underlying
+            transfer-returned-False.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         # Parse amount
         try:
             amount_decimal = Decimal(amount)
         except InvalidOperation:
-            return f"❌ Invalid amount: {amount}"
+            return ToolResult.failed(error=f"❌ Invalid amount: {amount}")
 
         if amount_decimal <= 0:
-            return "❌ Amount must be positive"
+            return ToolResult.failed(error="❌ Amount must be positive")
 
         # Parse currency
         currency_upper = currency.upper()
         try:
             curr_enum = Currency(currency_upper)
         except ValueError:
-            return f"❌ Unknown currency: {currency}. Use FIL, USDC, or USDT"
+            return ToolResult.failed(
+                error=f"❌ Unknown currency: {currency}. Use FIL, USDC, or USDT"
+            )
 
         # Check balance
         if not self.wallet.can_afford(amount_decimal, curr_enum):
             current = self.wallet.get_balance(curr_enum, "main")
-            return f"❌ Insufficient funds. Have {current} {currency_upper}, need {amount_decimal}"
+            return ToolResult.failed(
+                error=f"❌ Insufficient funds. Have {current} {currency_upper}, need {amount_decimal}"
+            )
 
         # Execute transfer
         memo = memo or "manual transfer"
@@ -241,12 +265,19 @@ USD Value: ${usd_value:.2f}"""
 
         if success:
             new_balance = self.wallet.get_balance(curr_enum, "main")
-            return f"""✅ **Transfer Successful**
+            return ToolResult.ok(
+                f"""✅ **Transfer Successful**
 Amount: {amount_decimal} {currency_upper}
 Memo: {memo}
-New Balance: {new_balance} {currency_upper}"""
-        else:
-            return "❌ Transfer failed"
+New Balance: {new_balance} {currency_upper}""",
+                data={
+                    "amount": str(amount_decimal),
+                    "currency": currency_upper,
+                    "memo": memo,
+                    "new_balance": str(new_balance),
+                },
+            )
+        return ToolResult.failed(error="❌ Transfer failed")
 
     @tool(
         name="wallet_deposit",
@@ -259,7 +290,7 @@ New Balance: {new_balance} {currency_upper}"""
         amount: str,
         currency: str = "FIL",
         memo: str = ""
-    ) -> str:
+    ) -> ToolResult:
         """
         Record a deposit to the wallet.
         Deposits are split 90% to main balance, 10% to audit reserve.
@@ -270,26 +301,34 @@ New Balance: {new_balance} {currency_upper}"""
             memo: Optional deposit memo
 
         Returns:
-            Deposit result message
+            ToolResult.ok when both the main and audit splits land.
+            PARTIAL when only one half succeeded — the wallet now
+            holds the deposit only in the half that worked, so the
+            sovereign should be told which split landed and which
+            didn't (and may need to retry the failed half manually).
+            ERROR for wallet-not-initialized, invalid amount, and
+            unknown currency.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         # Parse amount
         try:
             amount_decimal = Decimal(amount)
         except InvalidOperation:
-            return f"❌ Invalid amount: {amount}"
+            return ToolResult.failed(error=f"❌ Invalid amount: {amount}")
 
         if amount_decimal <= 0:
-            return "❌ Amount must be positive"
+            return ToolResult.failed(error="❌ Amount must be positive")
 
         # Parse currency
         currency_upper = currency.upper()
         try:
             curr_enum = Currency(currency_upper)
         except ValueError:
-            return f"❌ Unknown currency: {currency}. Use FIL, USDC, or USDT"
+            return ToolResult.failed(
+                error=f"❌ Unknown currency: {currency}. Use FIL, USDC, or USDT"
+            )
 
         # Split deposit 90/10
         main_amount = amount_decimal * Decimal('0.9')
@@ -307,18 +346,66 @@ New Balance: {new_balance} {currency_upper}"""
             audit_amount, curr_enum, to_audit=True, memo=f"{memo} (audit)"
         )
 
+        new_main = self.wallet.get_balance(curr_enum, "main")
+        new_audit = self.wallet.get_balance(curr_enum, "audit")
+
         if success_main and success_audit:
-            new_main = self.wallet.get_balance(curr_enum, "main")
-            new_audit = self.wallet.get_balance(curr_enum, "audit")
-            return f"""✅ **Deposit Recorded**
+            return ToolResult.ok(
+                f"""✅ **Deposit Recorded**
 Total: {amount_decimal} {currency_upper}
   → Main (90%): {main_amount} {currency_upper}
   → Audit (10%): {audit_amount} {currency_upper}
 New Balances:
   Main: {new_main} {currency_upper}
-  Audit: {new_audit} {currency_upper}"""
-        else:
-            return "❌ Deposit failed"
+  Audit: {new_audit} {currency_upper}""",
+                data={
+                    "amount": str(amount_decimal),
+                    "currency": currency_upper,
+                    "main_amount": str(main_amount),
+                    "audit_amount": str(audit_amount),
+                    "new_main": str(new_main),
+                    "new_audit": str(new_audit),
+                    "memo": memo,
+                },
+            )
+        if not success_main and not success_audit:
+            return ToolResult.failed(
+                error="❌ Deposit failed (both main and audit splits)",
+                data={
+                    "amount": str(amount_decimal),
+                    "currency": currency_upper,
+                    "main_succeeded": False,
+                    "audit_succeeded": False,
+                },
+            )
+        # Asymmetric: one half landed, the other didn't.
+        landed_split = "main" if success_main else "audit"
+        failed_split = "audit" if success_main else "main"
+        landed_amount = main_amount if success_main else audit_amount
+        return ToolResult.partial(
+            f"""⚠️ **Deposit Partially Recorded**
+Total requested: {amount_decimal} {currency_upper}
+  → {landed_split.capitalize()}: {landed_amount} {currency_upper} ✓
+  → {failed_split.capitalize()} split FAILED — retry manually if needed
+Current Balances:
+  Main: {new_main} {currency_upper}
+  Audit: {new_audit} {currency_upper}""",
+            (
+                f"deposit '{landed_split}' split landed but '{failed_split}' "
+                "split failed — the audit/main accounting is now skewed; "
+                "retry the failed half via wallet_deposit or reconcile via "
+                "wallet_transfer."
+            ),
+            data={
+                "amount": str(amount_decimal),
+                "currency": currency_upper,
+                "main_succeeded": success_main,
+                "audit_succeeded": success_audit,
+                "new_main": str(new_main),
+                "new_audit": str(new_audit),
+                "memo": memo,
+            },
+        )
 
     @tool(
         name="wallet_history",
@@ -326,7 +413,7 @@ New Balances:
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-history"
     )
-    async def wallet_history(self, limit: int = 10) -> str:
+    async def wallet_history(self, limit: int = 10) -> ToolResult:
         """
         View recent transaction history.
 
@@ -334,17 +421,21 @@ New Balances:
             limit: Number of transactions to show (default: 10, max: 50)
 
         Returns:
-            Formatted transaction history
+            ToolResult.ok with the formatted history. ERROR when the
+            wallet is not initialized.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         limit = min(max(1, limit), 50)  # Clamp to 1-50
 
         history = self.wallet.transaction_history[-limit:]
 
         if not history:
-            return "📜 No transactions yet"
+            return ToolResult.ok(
+                "📜 No transactions yet",
+                data={"history": [], "count": 0},
+            )
 
         lines = [f"📜 **Transaction History** (last {len(history)})", ""]
 
@@ -377,7 +468,10 @@ New Balances:
                 lines.append(f"   Time: {timestamp}")
             lines.append("")
 
-        return "\n".join(lines)
+        return ToolResult.ok(
+            "\n".join(lines),
+            data={"history": list(history), "count": len(history)},
+        )
 
     @tool(
         name="wallet_status",
@@ -385,15 +479,19 @@ New Balances:
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-status"
     )
-    async def wallet_status(self) -> str:
+    async def wallet_status(self) -> ToolResult:
         """
         Get complete wallet status including balances, cryostasis info, and stats.
 
         Returns:
-            Comprehensive wallet status report
+            ToolResult.ok on a healthy balance. PARTIAL when below
+            the cryostasis threshold — the wallet is operating but
+            the agent is at risk of running out of funds, and the
+            LLM should NOT report the status as healthy. ERROR when
+            the wallet isn't initialized.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         status = self.wallet.get_status()
 
@@ -435,7 +533,19 @@ New Balances:
             if curr != "USD":
                 lines.append(f"  1 {curr} = ${rate}")
 
-        return "\n".join(lines)
+        confirmation = "\n".join(lines)
+        if below_threshold:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    f"wallet total USD value (${Decimal(status['total_usd']):.2f}) is "
+                    f"below the cryostasis threshold (${threshold:.2f}) — the agent "
+                    "is approaching insolvency and may suspend non-critical "
+                    "operations. Top up before initiating new spending."
+                ),
+                data=status,
+            )
+        return ToolResult.ok(confirmation, data=status)
 
     @tool(
         name="wallet_exchange_rates",
@@ -447,7 +557,7 @@ New Balances:
         self,
         currency: str = "",
         rate: str = ""
-    ) -> str:
+    ) -> ToolResult:
         """
         View or update exchange rates.
 
@@ -456,43 +566,59 @@ New Balances:
             rate: New USD rate (empty to just view)
 
         Returns:
-            Exchange rate information
+            ToolResult.ok for view + update operations. ERROR for
+            wallet-not-initialized, unknown-currency, invalid-rate,
+            and non-positive rate.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         # If no currency specified, show all rates
         if not currency:
             lines = ["💱 **Exchange Rates**", ""]
+            rates_data = {}
             for curr in Currency:
                 if curr != Currency.USD:
                     curr_rate = self.wallet._exchange_rates.get(curr, Decimal("0"))
+                    rates_data[curr.value] = str(curr_rate)
                     lines.append(f"1 {curr.value} = ${curr_rate}")
-            return "\n".join(lines)
+            return ToolResult.ok("\n".join(lines), data={"rates": rates_data})
 
         # Parse currency
         currency_upper = currency.upper()
         try:
             curr_enum = Currency(currency_upper)
         except ValueError:
-            return f"❌ Unknown currency: {currency}. Use FIL, USDC, or USDT"
+            return ToolResult.failed(
+                error=f"❌ Unknown currency: {currency}. Use FIL, USDC, or USDT"
+            )
 
         # If no rate specified, show current rate
         if not rate:
             current_rate = self.wallet._exchange_rates.get(curr_enum, Decimal("0"))
-            return f"💱 1 {currency_upper} = ${current_rate}"
+            return ToolResult.ok(
+                f"💱 1 {currency_upper} = ${current_rate}",
+                data={"currency": currency_upper, "rate": str(current_rate)},
+            )
 
         # Update rate
         try:
             rate_decimal = Decimal(rate)
         except InvalidOperation:
-            return f"❌ Invalid rate: {rate}"
+            return ToolResult.failed(error=f"❌ Invalid rate: {rate}")
 
         if rate_decimal <= 0:
-            return "❌ Rate must be positive"
+            return ToolResult.failed(error="❌ Rate must be positive")
 
         old_rate = self.wallet._exchange_rates.get(curr_enum, Decimal("0"))
         self.wallet.update_exchange_rate(curr_enum, rate_decimal)
 
-        return f"""✅ **Exchange Rate Updated**
-{currency_upper}: ${old_rate} → ${rate_decimal}"""
+        return ToolResult.ok(
+            f"""✅ **Exchange Rate Updated**
+{currency_upper}: ${old_rate} → ${rate_decimal}""",
+            data={
+                "currency": currency_upper,
+                "old_rate": str(old_rate),
+                "new_rate": str(rate_decimal),
+            },
+        )

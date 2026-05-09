@@ -15,7 +15,16 @@ from pathlib import Path
 
 from kestrel_sovereign.features.base import tool
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
 from .feature import Currency
+
+
+def _is_error_string(text: str) -> bool:
+    """Heuristic for the legacy stringly-typed ``❌``-prefix error format
+    that wallet tools used before #1061 wave 32. We keep the strings
+    intact (they're already user-facing) but route them to the right
+    envelope status based on the prefix."""
+    return text.lstrip().startswith("❌")
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +42,7 @@ class FilecoinToolsMixin:
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-generate-address"
     )
-    async def wallet_generate_address(self) -> str:
+    async def wallet_generate_address(self) -> ToolResult:
         """
         Generate a new Filecoin Calibration testnet address.
 
@@ -41,19 +50,28 @@ class FilecoinToolsMixin:
         The private key is stored encrypted if KESTREL_DATA_KEY is set.
 
         Returns:
-            Address generation result with faucet instructions
+            ToolResult.ok with the generated address + faucet
+            instructions; ToolResult.failed when the wallet isn't
+            initialized or address generation raises.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
-        # Check if already has address
+        # Check if already has address — this is OK (idempotent),
+        # but we surface it through the OK confirmation so the LLM
+        # tells the sovereign "you already have one" instead of
+        # claiming a new address was generated.
         if self.wallet.filecoin_address:
-            return f"""ℹ️ **Wallet Already Has Address**
-Address: `{self.wallet.filecoin_address}`
+            existing_address = self.wallet.filecoin_address
+            return ToolResult.ok(
+                f"""ℹ️ **Wallet Already Has Address**
+Address: `{existing_address}`
 
-View on explorer: https://calibration.filfox.info/en/address/{self.wallet.filecoin_address}
+View on explorer: https://calibration.filfox.info/en/address/{existing_address}
 
-Use `!wallet-sync` to sync with on-chain balance."""
+Use `!wallet-sync` to sync with on-chain balance.""",
+                data={"already_existed": True, "address": existing_address},
+            )
 
         try:
             from .filecoin_keys import FilecoinKeyManager
@@ -76,7 +94,8 @@ Use `!wallet-sync` to sync with on-chain balance."""
             faucet_url = key_manager.get_faucet_url()
             explorer_url = key_manager.get_explorer_url(address)
 
-            return f"""✅ **Filecoin Address Generated**
+            return ToolResult.ok(
+                f"""✅ **Filecoin Address Generated**
 
 **Address:** `{address}`
 
@@ -91,16 +110,23 @@ Use `!wallet-sync` to sync with on-chain balance."""
 
 **View on Explorer:** {explorer_url}
 
-⚠️ This is testnet FIL with no real value. For mainnet, use a proper wallet."""
+⚠️ This is testnet FIL with no real value. For mainnet, use a proper wallet.""",
+                data={
+                    "address": address,
+                    "already_existed": False,
+                    "faucet_url": faucet_url,
+                    "explorer_url": explorer_url,
+                },
+            )
 
         except ValueError as e:
-            return f"❌ {e}"
+            return ToolResult.failed(error=f"❌ {e}")
         except (ImportError, OSError) as e:
             logger.error(f"Failed to generate address: {e}", exc_info=True)
-            return f"❌ Failed to generate address: {e}"
+            return ToolResult.failed(error=f"❌ Failed to generate address: {e}")
         except Exception as e:
             logger.error(f"Failed to generate address: {e}", exc_info=True)
-            return f"❌ Failed to generate address: {e}"
+            return ToolResult.failed(error=f"❌ Failed to generate address: {e}")
 
     @tool(
         name="wallet_sync",
@@ -108,7 +134,7 @@ Use `!wallet-sync` to sync with on-chain balance."""
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-sync"
     )
-    async def wallet_sync(self) -> str:
+    async def wallet_sync(self) -> ToolResult:
         """
         Sync wallet balance with Filecoin Calibration testnet.
 
@@ -116,17 +142,23 @@ Use `!wallet-sync` to sync with on-chain balance."""
         to match. Detects deposits and withdrawals.
 
         Returns:
-            Sync result with balance information
+            ToolResult.ok on a clean sync (with deposit/withdrawal
+            detection in the confirmation). ToolResult.failed for
+            wallet-not-initialized, no-address, on-chain-query-
+            failure, and the underlying ``sync_on_chain_balance``
+            returning False.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         if not self.wallet.filecoin_address:
-            return """❌ **No Filecoin Address Configured**
+            return ToolResult.failed(
+                error="""❌ **No Filecoin Address Configured**
 
 Generate one with: `!wallet-generate-address`
 
 Or manually set with an existing address."""
+            )
 
         try:
             # Get current internal balance
@@ -135,13 +167,15 @@ Or manually set with an existing address."""
             # Get on-chain balance
             on_chain_balance = await self.wallet.get_on_chain_balance()
             if on_chain_balance is None:
-                return "❌ Failed to query on-chain balance. Check network connectivity."
+                return ToolResult.failed(
+                    error="❌ Failed to query on-chain balance. Check network connectivity."
+                )
 
             # Sync
             success = await self.wallet.sync_on_chain_balance()
 
             if not success:
-                return "❌ Sync failed. Check logs for details."
+                return ToolResult.failed(error="❌ Sync failed. Check logs for details.")
 
             # Calculate difference
             difference = on_chain_balance - internal_balance
@@ -161,17 +195,26 @@ Or manually set with an existing address."""
             lines.append(f"**Internal Balance:** {self.wallet.get_total_balance(Currency.FIL)} FIL")
             lines.append(f"**Total USD Value:** ${self.wallet.get_total_balance_usd():.2f}")
 
-            return "\n".join(lines)
+            return ToolResult.ok(
+                "\n".join(lines),
+                data={
+                    "address": self.wallet.filecoin_address,
+                    "on_chain_balance": str(on_chain_balance),
+                    "internal_balance": str(self.wallet.get_total_balance(Currency.FIL)),
+                    "difference": str(difference),
+                    "total_usd": f"{self.wallet.get_total_balance_usd():.2f}",
+                },
+            )
 
         except (ConnectionError, TimeoutError) as e:
             logger.error(f"Sync failed (network error): {e}", exc_info=True)
-            return f"❌ Sync failed: {e}"
+            return ToolResult.failed(error=f"❌ Sync failed: {e}")
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Sync failed (data parsing error): {e}", exc_info=True)
-            return f"❌ Sync failed: {e}"
+            return ToolResult.failed(error=f"❌ Sync failed: {e}")
         except Exception as e:
             logger.error(f"Sync failed: {e}", exc_info=True)
-            return f"❌ Sync failed: {e}"
+            return ToolResult.failed(error=f"❌ Sync failed: {e}")
 
     @tool(
         name="wallet_address",
@@ -179,20 +222,27 @@ Or manually set with an existing address."""
         category=ToolCategory.SYSTEM,
         command_prefix="!wallet-address"
     )
-    async def wallet_address(self) -> str:
+    async def wallet_address(self) -> ToolResult:
         """
         Show the wallet's Filecoin address and helpful links.
 
         Returns:
-            Address information with explorer and faucet links
+            ToolResult.ok with address info and explorer/faucet
+            links; PARTIAL when the on-chain balance query failed
+            (the address is valid and the balance shown will say
+            "Unable to query" — the LLM should not promise the
+            user a balance number from this call); ToolResult.failed
+            for wallet-not-initialized and no-address paths.
         """
         if not self.wallet:
-            return "❌ Wallet not initialized"
+            return ToolResult.failed(error="❌ Wallet not initialized")
 
         if not self.wallet.filecoin_address:
-            return """❌ **No Filecoin Address**
+            return ToolResult.failed(
+                error="""❌ **No Filecoin Address**
 
 Generate one with: `!wallet-generate-address`"""
+            )
 
         address = self.wallet.filecoin_address
         explorer_url = f"https://calibration.filfox.info/en/address/{address}"
@@ -202,7 +252,7 @@ Generate one with: `!wallet-generate-address`"""
         on_chain = await self.wallet.get_on_chain_balance()
         balance_str = f"{on_chain} FIL" if on_chain is not None else "Unable to query"
 
-        return f"""🔗 **Filecoin Address**
+        confirmation = f"""🔗 **Filecoin Address**
 
 **Address:** `{address}`
 **Network:** Calibration (testnet)
@@ -213,3 +263,21 @@ Generate one with: `!wallet-generate-address`"""
 - [Request Test FIL]({faucet_url})
 
 Use `!wallet-sync` to sync on-chain balance with wallet."""
+
+        data = {
+            "address": address,
+            "explorer_url": explorer_url,
+            "faucet_url": faucet_url,
+            "on_chain_balance": str(on_chain) if on_chain is not None else None,
+        }
+        if on_chain is None:
+            return ToolResult.partial(
+                confirmation,
+                (
+                    "on-chain balance query failed (network/RPC issue) — "
+                    "the address itself is valid but the balance shown is "
+                    "stale. Retry !wallet-sync once connectivity is back."
+                ),
+                data=data,
+            )
+        return ToolResult.ok(confirmation, data=data)
