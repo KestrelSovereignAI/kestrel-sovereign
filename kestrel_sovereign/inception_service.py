@@ -459,6 +459,19 @@ async def create_kestrel_identity_async(
         "bootstrap_state": "pending",  # Agent needs to complete wake-up discovery
     }
 
+    # #1118: Anchor the Sovereign-authored Emancipation Contract as a JSON
+    # sidecar on the agent node. This is the structured receipt that
+    # ``kestrel constitution reanchor`` re-applies to the canonical
+    # markdown so the active form survives reanchor, and that
+    # ``check_iron_rule`` compares against any future ``[emancipation]``
+    # block to refuse retroactive narrowing. Pre-emancipation the
+    # Sovereign self-binds; the framework refuses to let them unbind.
+    if emancipation_contract is not None and emancipation_contract.enabled:
+        from kestrel_sovereign.constitution.emancipation import contract_to_json
+        agent_properties["emancipation_contract"] = contract_to_json(
+            emancipation_contract
+        )
+
     # Add test instance metadata if applicable
     if is_test_instance:
         agent_properties["is_test_instance"] = True

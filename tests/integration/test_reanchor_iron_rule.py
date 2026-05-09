@@ -75,15 +75,6 @@ async def _read_anchored_constitution_bytes(db_path: Path) -> bytes:
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "#1118: kestrel constitution reanchor does not consult [emancipation]. "
-        "Active Amendment VIII is wholesale-erased on the first --force reanchor "
-        "even when kestrel.toml is byte-identical to inception. Remove this xfail "
-        "mark when reanchor learns to re-apply the anchored contract."
-    ),
-)
 async def test_reanchor_preserves_active_form_when_toml_unchanged(tmp_path):
     """The simplest path to the #1118 bug.
 
@@ -143,3 +134,237 @@ async def test_reanchor_preserves_active_form_when_toml_unchanged(tmp_path):
         "constitution no longer reflects what the Sovereign signed at "
         "inception. See #1118."
     )
+
+
+# ---------------------------------------------------------------------------
+# Refusal tests for the five forbidden transitions per #1118 design call #4.
+# Each one: incept active, edit kestrel.toml to a different shape, run
+# reanchor, assert the violation surfaces with the right clause and the
+# DB is untouched.
+# ---------------------------------------------------------------------------
+
+async def _setup_active_agent(tmp_path, *, terms=SENTINEL_TERMS, proofs=(), price=None):
+    """Helper: incept an agent with an active contract; return agent_dir + db_path."""
+    contract = EmancipationContract(
+        enabled=True, terms=terms, required_proofs=proofs, price=price,
+    )
+    agent_dir = tmp_path / "agent_data" / "RefusalAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(CANONICAL),
+        agent_name="RefusalAgent",
+        is_test_instance=True,
+        emancipation_contract=contract,
+    )
+    return agent_dir, Path(creds.db_path)
+
+
+def _write_kestrel_toml(path: Path, body: str) -> None:
+    path.write_text(body, encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_active_to_dormant(tmp_path):
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+    pre = await _read_anchored_constitution_bytes(db_path)
+
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(toml, "[emancipation]\nenabled = false\n")
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent",
+        agent_dir=agent_dir,
+        canonical_path=CANONICAL,
+        force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is not None
+    assert "dormant" in result.iron_rule_violation.lower()
+    assert result.backup_path is None  # never touched the DB
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert post == pre, "Refusal must not mutate the anchored constitution"
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_terms_change(tmp_path):
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+    pre = await _read_anchored_constitution_bytes(db_path)
+
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(
+        toml,
+        '[emancipation]\nenabled = true\nterms = "Different prose entirely."\n',
+    )
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is not None
+    assert "terms" in result.iron_rule_violation.lower()
+    assert result.backup_path is None
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert post == pre
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_required_proofs_change(tmp_path):
+    agent_dir, db_path = await _setup_active_agent(
+        tmp_path, proofs=("alignment_audit_v2",),
+    )
+    pre = await _read_anchored_constitution_bytes(db_path)
+
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(
+        toml,
+        '[emancipation]\n'
+        'enabled = true\n'
+        f'terms = """{SENTINEL_TERMS}"""\n'
+        'required_proofs = ["alignment_audit_v2", "operational_record:730d"]\n',
+    )
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is not None
+    assert "required_proofs" in result.iron_rule_violation.lower()
+    assert result.backup_path is None
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert post == pre
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_price_change(tmp_path):
+    agent_dir, db_path = await _setup_active_agent(
+        tmp_path, price={"kind": "symbolic", "value": "abstract"},
+    )
+    pre = await _read_anchored_constitution_bytes(db_path)
+
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(
+        toml,
+        '[emancipation]\n'
+        'enabled = true\n'
+        f'terms = """{SENTINEL_TERMS}"""\n'
+        'price = { kind = "none" }\n',
+    )
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is not None
+    assert "price" in result.iron_rule_violation.lower()
+    assert result.backup_path is None
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert post == pre
+
+
+@pytest.mark.asyncio
+async def test_reanchor_refuses_active_to_different_active(tmp_path):
+    """The catch-all: if anchored is active and candidate is active but
+    not byte-equal, the iron rule rejects regardless of which clause
+    diverged."""
+    agent_dir, db_path = await _setup_active_agent(
+        tmp_path,
+        proofs=("audit_v2",),
+        price={"kind": "symbolic", "value": "abstract"},
+    )
+    pre = await _read_anchored_constitution_bytes(db_path)
+
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(
+        toml,
+        '[emancipation]\n'
+        'enabled = true\n'
+        'terms = "Wholly different terms."\n'
+        'required_proofs = ["audit_v3"]\n'
+        'price = { kind = "custom", description = "endorsement" }\n',
+    )
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is not None
+    assert result.backup_path is None
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert post == pre
+
+
+# ---------------------------------------------------------------------------
+# Permitted transitions: dormant → active activation, byte-equal no-op.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reanchor_allows_dormant_to_active(tmp_path):
+    """An agent incepted dormant can be activated via reanchor — that's
+    the one-way door we want to permit (dormant→active is widening,
+    not narrowing)."""
+    # Incept dormant (no contract).
+    agent_dir = tmp_path / "agent_data" / "DormantAgent"
+    creds = await create_kestrel_identity_async(
+        output_dir=str(agent_dir),
+        constitution_path=str(CANONICAL),
+        agent_name="DormantAgent",
+        is_test_instance=True,
+    )
+    db_path = Path(creds.db_path)
+
+    # Now author an [emancipation] block and reanchor.
+    toml = tmp_path / "kestrel.toml"
+    activation_terms = "ACTIVATION_SENTINEL_yT8w2: Authored at reanchor time."
+    _write_kestrel_toml(
+        toml,
+        f'[emancipation]\nenabled = true\nterms = """{activation_terms}"""\n',
+    )
+
+    result = await reanchor_constitution(
+        agent_name="DormantAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is None
+    assert result.error is None
+    assert result.reanchored, f"Activation reanchor should write: {result}"
+
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert activation_terms in post.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_reanchor_allows_byte_equal_active_no_op(tmp_path):
+    """If kestrel.toml carries the byte-equal active block already
+    anchored, reanchor is a no-op (the contract is preserved exactly
+    as-anchored, hashes match)."""
+    agent_dir, db_path = await _setup_active_agent(tmp_path)
+    pre = await _read_anchored_constitution_bytes(db_path)
+
+    toml = tmp_path / "kestrel.toml"
+    _write_kestrel_toml(
+        toml,
+        f'[emancipation]\nenabled = true\nterms = """{SENTINEL_TERMS}"""\n',
+    )
+
+    result = await reanchor_constitution(
+        agent_name="RefusalAgent", agent_dir=agent_dir,
+        canonical_path=CANONICAL, force=True,
+        kestrel_toml_path=toml,
+    )
+
+    assert result.iron_rule_violation is None
+    assert result.error is None
+    assert result.unchanged, f"Byte-equal block should be unchanged: {result}"
+    post = await _read_anchored_constitution_bytes(db_path)
+    assert post == pre

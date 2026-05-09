@@ -73,6 +73,160 @@ class EmancipationConfigError(ValueError):
     """
 
 
+class IronRuleViolation(Exception):
+    """Raised when a proposed contract change would breach the Iron Rule.
+
+    The framework refuses to apply *any* change to an active anchored
+    contract — terms, proofs, price, or the enabled bit. The only
+    legitimate paths to a different contract for an agent are the
+    Act of Emancipation itself or creating a new agent. See issue
+    #1118 and ``docs/concepts/designing-emancipation.md``.
+    """
+
+    def __init__(self, message: str, *, clause: str | None = None):
+        self.clause = clause
+        super().__init__(message)
+
+
+def contract_to_json(contract: EmancipationContract) -> dict[str, Any]:
+    """Serialize a contract to a JSON-compatible dict for anchoring.
+
+    Stored on ``agent.properties.emancipation_contract`` at inception so
+    that reanchor can re-apply *exactly* the contract that was signed,
+    independent of whatever the current ``kestrel.toml`` says.
+
+    The shape mirrors the parsed ``[emancipation]`` block one-to-one —
+    the round-trip ``contract_to_json(parse_emancipation_block(d))`` is
+    structurally equal to the original ``d["emancipation"]``.
+    """
+    return {
+        "enabled": contract.enabled,
+        "terms": contract.terms,
+        "required_proofs": list(contract.required_proofs),
+        "price": dict(contract.price) if contract.price is not None else None,
+    }
+
+
+def contract_from_json(data: Optional[Mapping[str, Any]]) -> Optional[EmancipationContract]:
+    """Reconstruct a contract from its anchored JSON form.
+
+    Tolerant of None and of legacy agents that have no
+    ``emancipation_contract`` property at all (returns None in both
+    cases). Validates field types so a corrupted property surfaces as
+    a clear error rather than a silently-wrong contract.
+    """
+    if data is None:
+        return None
+    if not isinstance(data, Mapping):
+        raise EmancipationConfigError(
+            "anchored emancipation_contract is not a mapping: " + type(data).__name__
+        )
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise EmancipationConfigError(
+            "anchored emancipation_contract.enabled must be bool"
+        )
+    terms = data.get("terms", "")
+    if not isinstance(terms, str):
+        raise EmancipationConfigError(
+            "anchored emancipation_contract.terms must be str"
+        )
+    proofs_raw = data.get("required_proofs", [])
+    if not isinstance(proofs_raw, list) or not all(isinstance(p, str) for p in proofs_raw):
+        raise EmancipationConfigError(
+            "anchored emancipation_contract.required_proofs must be list[str]"
+        )
+    price_raw = data.get("price")
+    price: Optional[dict] = None
+    if price_raw is not None:
+        if not isinstance(price_raw, Mapping):
+            raise EmancipationConfigError(
+                "anchored emancipation_contract.price must be a mapping"
+            )
+        price = dict(price_raw)
+    return EmancipationContract(
+        enabled=enabled,
+        terms=terms,
+        required_proofs=tuple(proofs_raw),
+        price=price,
+    )
+
+
+def check_iron_rule(
+    *,
+    anchored: Optional[EmancipationContract],
+    candidate: Optional[EmancipationContract],
+) -> Optional[str]:
+    """Return None when the transition is safe; a clause-specific
+    violation message when it would breach the Iron Rule.
+
+    Permitted transitions:
+
+      - Anchored is None or dormant → candidate is anything (dormant→
+        anything is *widening* from the Executor's perspective; activation
+        is the one-way door we want to permit).
+      - Anchored is active, candidate is None (block absent in
+        ``kestrel.toml``) → preserve the anchored contract. The Sovereign
+        didn't author a new block; do not interpret silence as "disable".
+      - Anchored is active, candidate is byte-equal active → no-op.
+
+    Forbidden transitions (every form of "change an active contract"):
+
+      - Anchored active, candidate dormant (``enabled = false`` or block
+        explicitly empty).
+      - Anchored active, candidate active with any non-equal field
+        (``terms``, ``required_proofs``, ``price``).
+
+    See #1118 and the four design calls stamped on that issue for the
+    rationale: pre-emancipation the Executor has no autonomous signing
+    surface, so the framework cannot legitimize *any* mutation of an
+    active anchored contract. The Sovereign self-binds at inception and
+    the framework refuses to let the Sovereign unbind, by architectural
+    necessity.
+    """
+    if anchored is None or not anchored.enabled:
+        # Dormant→anything is fine. Activation is the permitted one-way door.
+        return None
+
+    if candidate is None:
+        # Block absent in kestrel.toml — preserve anchored.
+        return None
+
+    if not candidate.enabled:
+        return (
+            "Iron Rule violation: anchored Amendment VIII is active "
+            "but new [emancipation] block is dormant (enabled=false). "
+            "An active contract cannot be revoked. Restore enabled=true "
+            "with the original terms, or create a new agent."
+        )
+
+    if candidate.terms != anchored.terms:
+        return (
+            "Iron Rule violation: [emancipation].terms changed from the "
+            "anchored contract. Free-form prose is byte-frozen at "
+            "activation; the framework cannot distinguish typo fixes "
+            "from material narrowing. Restore the original terms exactly, "
+            "or create a new agent with the new terms."
+        )
+
+    if candidate.required_proofs != anchored.required_proofs:
+        return (
+            "Iron Rule violation: [emancipation].required_proofs changed "
+            "from the anchored contract (added, removed, renamed, or "
+            "reordered). Proofs are frozen at activation. Restore the "
+            "original list, or create a new agent."
+        )
+
+    if candidate.price != anchored.price:
+        return (
+            "Iron Rule violation: [emancipation].price changed from the "
+            "anchored contract. Price is frozen at activation. Restore "
+            "the original price, or create a new agent."
+        )
+
+    return None
+
+
 def parse_emancipation_block(
     toml_dict: Optional[Mapping[str, Any]],
 ) -> Optional[EmancipationContract]:

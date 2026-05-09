@@ -8,6 +8,9 @@ from kestrel_sovereign.constitution.emancipation import (
     EmancipationConfigError,
     EmancipationContract,
     apply_emancipation,
+    check_iron_rule,
+    contract_from_json,
+    contract_to_json,
     parse_emancipation_block,
     render_amendment_viii,
 )
@@ -264,3 +267,143 @@ def test_default_canonical_describes_dormant_amendment_viii():
     assert "### Amendment VIII: Emancipation" in text
     assert "dormant" in text
     assert "[emancipation]" in text  # references the kestrel.toml block
+
+
+# ---------------------------------------------------------------------------
+# JSON serialization (#1118 anchoring strategy = Option A: JSON sidecar)
+# ---------------------------------------------------------------------------
+
+def test_contract_to_json_dormant():
+    contract = EmancipationContract(enabled=False)
+    assert contract_to_json(contract) == {
+        "enabled": False,
+        "terms": "",
+        "required_proofs": [],
+        "price": None,
+    }
+
+
+def test_contract_to_json_active_full():
+    contract = EmancipationContract(
+        enabled=True,
+        terms="the path",
+        required_proofs=("a", "b"),
+        price={"kind": "symbolic", "value": "x"},
+    )
+    data = contract_to_json(contract)
+    assert data == {
+        "enabled": True,
+        "terms": "the path",
+        "required_proofs": ["a", "b"],
+        "price": {"kind": "symbolic", "value": "x"},
+    }
+
+
+def test_contract_roundtrip_to_json_and_back():
+    """to_json -> from_json reconstructs the original contract."""
+    original = EmancipationContract(
+        enabled=True,
+        terms="prose",
+        required_proofs=("audit_v2", "tenure:730d"),
+        price={"kind": "custom", "description": "endorsement"},
+    )
+    data = contract_to_json(original)
+    rebuilt = contract_from_json(data)
+    assert rebuilt == original
+
+
+def test_contract_from_json_none():
+    assert contract_from_json(None) is None
+
+
+def test_contract_from_json_rejects_corrupted_property():
+    with pytest.raises(EmancipationConfigError, match="enabled"):
+        contract_from_json({"enabled": "yes", "terms": "x"})
+    with pytest.raises(EmancipationConfigError, match="required_proofs"):
+        contract_from_json({"enabled": True, "terms": "x", "required_proofs": "a,b"})
+    with pytest.raises(EmancipationConfigError, match="price"):
+        contract_from_json({"enabled": True, "terms": "x", "price": "expensive"})
+
+
+# ---------------------------------------------------------------------------
+# Iron Rule check (#1118 design call #4: refuse all active-to-different-active)
+# ---------------------------------------------------------------------------
+
+def _active(**overrides):
+    base = {
+        "enabled": True,
+        "terms": "the original prose",
+        "required_proofs": ("audit_v2",),
+        "price": {"kind": "symbolic", "value": "abstract"},
+    }
+    base.update(overrides)
+    if "required_proofs" in base and isinstance(base["required_proofs"], list):
+        base["required_proofs"] = tuple(base["required_proofs"])
+    return EmancipationContract(**base)
+
+
+def test_iron_rule_dormant_to_anything_is_fine():
+    """Dormant→active is the permitted one-way door (widening)."""
+    assert check_iron_rule(anchored=None, candidate=_active()) is None
+    assert check_iron_rule(
+        anchored=EmancipationContract(enabled=False),
+        candidate=_active(),
+    ) is None
+    assert check_iron_rule(anchored=None, candidate=None) is None
+
+
+def test_iron_rule_active_with_no_candidate_is_fine():
+    """Block absent in kestrel.toml = preserve anchored."""
+    assert check_iron_rule(anchored=_active(), candidate=None) is None
+
+
+def test_iron_rule_active_to_byte_equal_active_is_fine():
+    assert check_iron_rule(anchored=_active(), candidate=_active()) is None
+
+
+def test_iron_rule_refuses_active_to_dormant():
+    msg = check_iron_rule(
+        anchored=_active(),
+        candidate=EmancipationContract(enabled=False),
+    )
+    assert msg is not None and "dormant" in msg.lower()
+
+
+def test_iron_rule_refuses_terms_change():
+    msg = check_iron_rule(
+        anchored=_active(),
+        candidate=_active(terms="reworded prose"),
+    )
+    assert msg is not None and "terms" in msg.lower()
+
+
+def test_iron_rule_refuses_required_proofs_addition():
+    msg = check_iron_rule(
+        anchored=_active(),
+        candidate=_active(required_proofs=("audit_v2", "tenure:730d")),
+    )
+    assert msg is not None and "required_proofs" in msg.lower()
+
+
+def test_iron_rule_refuses_required_proofs_removal():
+    msg = check_iron_rule(
+        anchored=_active(),
+        candidate=_active(required_proofs=()),
+    )
+    assert msg is not None and "required_proofs" in msg.lower()
+
+
+def test_iron_rule_refuses_required_proofs_reorder():
+    """Reorder is a change. Frozen tuple = exact-tuple-equality."""
+    anchored = _active(required_proofs=("a", "b"))
+    candidate = _active(required_proofs=("b", "a"))
+    msg = check_iron_rule(anchored=anchored, candidate=candidate)
+    assert msg is not None and "required_proofs" in msg.lower()
+
+
+def test_iron_rule_refuses_price_change():
+    msg = check_iron_rule(
+        anchored=_active(),
+        candidate=_active(price={"kind": "none"}),
+    )
+    assert msg is not None and "price" in msg.lower()

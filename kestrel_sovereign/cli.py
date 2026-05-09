@@ -918,6 +918,7 @@ def cmd_constitution_reanchor(args) -> int:
             canonical_path=canonical,
             force=args.force,
             authorization=f"kestrel constitution reanchor (cli, {args.agent_name})",
+            kestrel_toml_path=project_dir / "kestrel.toml",
         )
     )
 
