@@ -48,8 +48,9 @@ class SpawnFeature(Feature):
     def get_router(self):
         """Return the Spawn panel router for dynamic mounting.
 
-        The router is defined in endpoints/spawn.py and mounted by the
-        server only when SpawnFeature is discovered and enabled.
+        The router exposes ``/api/spawn/children`` to the Console UI.
+        Lives at ``kestrel_sovereign/endpoints/spawn.py`` (inlined
+        from the archived ``kestrel-feature-spawn`` package).
         """
         from kestrel_sovereign.endpoints.spawn import router
         return router

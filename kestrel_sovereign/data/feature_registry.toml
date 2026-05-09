@@ -285,13 +285,13 @@ send_channel_message = { description = "Send a message to a channel", category =
 list_channels = { description = "List configured channels", category = "communication", tags = ["channels"] }
 
 [spawn]
-package = "kestrel-feature-spawn"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-spawn.git"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["SpawnFeature"]
 description = "Child agent spawning, delegation, and lifecycle management"
 tags = ["agents", "spawn", "delegation"]
 icon = "git-branch"
-core = false
+core = true
 
 [spawn.skills]
 spawn_agent = { description = "Spawn a child agent for a task", category = "agent_management", tags = ["spawn", "agents"] }
@@ -456,13 +456,13 @@ icon = "users"
 core = true
 
 [bridge]
-package = "kestrel-feature-spawn"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-spawn.git"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["BridgeFeature"]
 description = "Cross-protocol bridge for external system integration"
 tags = ["integration", "bridge", "interop"]
 icon = "arrow-left-right"
-core = false
+core = true
 
 [code_edit]
 package = "kestrel-feature-code"

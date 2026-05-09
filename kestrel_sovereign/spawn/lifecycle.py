@@ -69,6 +69,13 @@ class SpawnResult:
     ended_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
+    # parent_did identifies which parent agent spawned this child.
+    # Required for filtering history by parent in multi-agent mode
+    # where the lifecycle is shared across all loaded agents
+    # (#1149 round 4 — without this the spawn panel could leak
+    # other parents' history). Defaulted to "" for back-compat with
+    # any existing serialized SpawnResult dataclasses.
+    parent_did: str = ""
 
 
 @dataclass
@@ -213,6 +220,7 @@ class SpawnedAgentLifecycle:
             output_artifacts=output_artifacts or {},
             budget_consumed=budget_consumed,
             started_at=tracked.started_at,
+            parent_did=tracked.parent_did,
         )
 
         tracked.result = result
@@ -284,6 +292,7 @@ class SpawnedAgentLifecycle:
             child_did=tracked.child_did,
             status=SpawnStatus.TERMINATED,
             started_at=tracked.started_at,
+            parent_did=tracked.parent_did,
         )
         tracked.result = result
         self._results[child_name] = result
@@ -323,6 +332,7 @@ class SpawnedAgentLifecycle:
             child_did=tracked.child_did,
             status=SpawnStatus.TIMED_OUT,
             started_at=tracked.started_at,
+            parent_did=tracked.parent_did,
         )
         tracked.result = result
         self._results[child_name] = result
