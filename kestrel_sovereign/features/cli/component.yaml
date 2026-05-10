@@ -1,0 +1,18 @@
+name: cli
+description: Registered feature-owned CLI workflows using installed tools and existing user authentication
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - cli_status
+  - github_cli_auth_status
+  - github_pr_view
+  - github_pr_diff
+  - github_read_file_at_ref
+
+files:
+  - feature.py
+  - adapters.py
+  - terminal.py
+
+dependencies: []
