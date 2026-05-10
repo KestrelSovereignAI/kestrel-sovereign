@@ -462,7 +462,7 @@ features = ["CodeEditFeature"]
 description = "Agent self-modification with constitutional approval (sovereign-only)"
 tags = ["devtools", "code", "editing", "sovereign"]
 icon = "code"
-core = true
+core = false
 
 [delivery]
 package = "kestrel-feature-delivery"
