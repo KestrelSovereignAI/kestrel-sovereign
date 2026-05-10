@@ -160,6 +160,18 @@ def test_gate_lint_clean_requires_scopes():
     Gate(type="lint_clean", params={"scopes": ["kestrel_sovereign/features/workflows"]})
 
 
+def test_gate_consent_collect_requires_scope():
+    with pytest.raises(WorkflowDefinitionError, match="params.scope"):
+        Gate(type="consent_collect")
+    with pytest.raises(WorkflowDefinitionError, match="params.scope"):
+        Gate(type="consent_collect", params={"scope": ""})
+    with pytest.raises(WorkflowDefinitionError, match="params.scope"):
+        Gate(type="consent_collect", params={"scope": "   "})
+    with pytest.raises(WorkflowDefinitionError, match="whitespace"):
+        Gate(type="consent_collect", params={"scope": " publish_pr "})
+    Gate(type="consent_collect", params={"scope": "publish_pr"})
+
+
 def test_gate_signature_collected_requires_did():
     with pytest.raises(WorkflowDefinitionError, match="params.did"):
         Gate(type="signature_collected")
@@ -1153,6 +1165,13 @@ def test_schema_requires_compensate_so_dataclass_can_construct():
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 
+    spec["stages"][0]["gate"] = {
+        "type": "consent_collect",
+        "params": {"scope": "publish_pr\n"},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
 def test_schema_enforces_noop_idempotent_eligibility():
@@ -1247,6 +1266,21 @@ def test_schema_requires_signature_collected_did():
     spec["stages"][0]["gate"] = {
         "type": "signature_collected",
         "params": {"did": " did:web:k.example "},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_consent_collect_scope():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {"type": "consent_collect", "params": {}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "consent_collect",
+        "params": {"scope": "   "},
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)

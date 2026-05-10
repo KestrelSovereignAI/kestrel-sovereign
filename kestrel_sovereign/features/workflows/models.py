@@ -373,6 +373,18 @@ class Gate:
                     "gate lint_clean requires params.scopes: "
                     "non-empty list[str] per design §3.3"
                 )
+        if self.type == "consent_collect":
+            scope = self.params.get("scope")
+            if not isinstance(scope, str) or not scope.strip():
+                raise WorkflowDefinitionError(
+                    "gate consent_collect requires non-empty params.scope "
+                    "per design §3.3"
+                )
+            if scope != scope.strip():
+                raise WorkflowDefinitionError(
+                    "gate consent_collect params.scope must not have "
+                    "leading or trailing whitespace"
+                )
         if self.type == "signature_collected":
             did = self.params.get("did")
             if not isinstance(did, str) or not did.strip():

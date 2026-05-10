@@ -10,6 +10,7 @@ import pytest
 from kestrel_sdk.signals import RedactionPolicy, SignalMode, SourceRegistration
 
 from kestrel_sovereign.features.workflows.feature import WorkflowsFeature
+from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
 from kestrel_sovereign.security.crypto_suite import (
     ALG_ECDSA_SECP256K1_SHA256,
@@ -148,6 +149,119 @@ async def test_workflow_run_status_history_and_list_runs(feature_components):
     runs = await c.feature.workflow_list_runs(workflow_name="release")
     assert runs.status.value == "ok"
     assert runs.data["runs"][0]["run_id"] == run_result.data["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_resume_resolves_pending_consent_from_approval_queue(
+    feature_components,
+):
+    c = feature_components
+    queue = ApprovalQueue()
+    c.agent.features = {"SecurityFeature": SimpleNamespace(approval_queue=queue)}
+    approval_task = asyncio.create_task(
+        queue.request_approval(
+            "WorkflowsFeature",
+            "publish",
+            {"scope": "publish_pr"},
+        )
+    )
+    while not queue.pending_requests:
+        await asyncio.sleep(0)
+    approval_id = queue.pending_requests[0].id
+
+    async def handler(payload):
+        return {
+            "scope": payload["scope"],
+            "status": "pending",
+            "approval_id": approval_id,
+        }
+
+    c.agent.signal_registry.register(
+        SourceRegistration(
+            name="hooks.consent",
+            schema=dict,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            log_redaction=_redaction(),
+        )
+    )
+    spec = _spec()
+    spec["stages"][0]["name"] = "approve"
+    spec["stages"][0]["signal_source"] = "hooks.consent"
+    spec["stages"][0]["read_only"] = False
+    spec["stages"][0]["gate"] = {
+        "type": "consent_collect",
+        "params": {"scope": "publish_pr"},
+    }
+    await c.feature.workflow_define(spec)
+
+    run = await c.feature.workflow_run("release")
+    assert run.status.value == "ok"
+    assert run.data["status"] == "waiting"
+
+    assert queue.submit_decision(approval_id, True, "once") is True
+    resumed = await c.feature.workflow_resume(run.data["run_id"])
+    approved, scope = await approval_task
+
+    assert approved is True
+    assert scope == "once"
+    assert resumed.status.value == "ok"
+    assert resumed.data["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_workflow_resume_rejects_unrelated_consent_approval(
+    feature_components,
+):
+    c = feature_components
+    queue = ApprovalQueue()
+    c.agent.features = {"SecurityFeature": SimpleNamespace(approval_queue=queue)}
+    approval_task = asyncio.create_task(
+        queue.request_approval(
+            "WorkflowsFeature",
+            "other",
+            {"scope": "delete_prod"},
+        )
+    )
+    while not queue.pending_requests:
+        await asyncio.sleep(0)
+    approval_id = queue.pending_requests[0].id
+
+    async def handler(payload):
+        return {
+            "scope": payload["scope"],
+            "status": "pending",
+            "approval_id": approval_id,
+        }
+
+    c.agent.signal_registry.register(
+        SourceRegistration(
+            name="hooks.consent",
+            schema=dict,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=handler,
+            log_redaction=_redaction(),
+        )
+    )
+    spec = _spec()
+    spec["stages"][0]["name"] = "approve"
+    spec["stages"][0]["signal_source"] = "hooks.consent"
+    spec["stages"][0]["read_only"] = False
+    spec["stages"][0]["gate"] = {
+        "type": "consent_collect",
+        "params": {"scope": "publish_pr"},
+    }
+    await c.feature.workflow_define(spec)
+
+    run = await c.feature.workflow_run("release")
+    assert queue.submit_decision(approval_id, True, "once") is True
+    resumed = await c.feature.workflow_resume(run.data["run_id"])
+    await approval_task
+
+    assert resumed.status.value == "ok"
+    assert resumed.data["status"] == "failed"
 
 
 @pytest.mark.asyncio

@@ -76,6 +76,7 @@ class WorkflowsFeature(Feature):
             agent_identity=identity,
             public_key_resolver=self._public_key_resolver,
             verification_methods_resolver=self._verification_methods_resolver,
+            consent_collect_provider=self._consent_collect_provider,
         )
 
     def _public_key_resolver(self, did: str) -> bytes:
@@ -108,6 +109,71 @@ class WorkflowsFeature(Feature):
         ):
             return list(identity.new_verification_methods or [])
         raise KeyError(did)
+
+    async def _consent_collect_provider(
+        self,
+        gate: Any,
+        run: Any,
+        stage: Any,
+        link: Any,
+    ) -> dict[str, Any]:
+        external = getattr(self.agent, "workflow_consent_collect_provider", None)
+        if external is not None:
+            result = external(gate, run, stage, link)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+
+        request_id = _pending_consent_request_id(link.gate_reason)
+        if request_id is None:
+            return {
+                "scope": gate.params["scope"],
+                "approved": False,
+                "reason": "missing approval request id",
+            }
+
+        security = _security_feature(self.agent)
+        approval_queue = getattr(security, "approval_queue", None)
+        if approval_queue is None:
+            return {
+                "scope": gate.params["scope"],
+                "approved": False,
+                "reason": "approval queue unavailable",
+            }
+
+        request = approval_queue.get_request(request_id)
+        if request is None:
+            return {
+                "scope": gate.params["scope"],
+                "approved": False,
+                "reason": f"approval request not found:{request_id}",
+            }
+
+        status = getattr(getattr(request, "status", None), "value", None)
+        if not _approval_request_matches_scope(request, gate.params["scope"]):
+            return {
+                "scope": gate.params["scope"],
+                "approved": False,
+                "reason": "approval request scope mismatch",
+            }
+        if status == "pending":
+            return {
+                "scope": gate.params["scope"],
+                "status": "pending",
+                "approval_id": request_id,
+            }
+        if status == "approved":
+            return {
+                "scope": gate.params["scope"],
+                "approved": True,
+                "approval_id": request_id,
+                "approval_scope": getattr(request, "user_decision", None),
+            }
+        return {
+            "scope": gate.params["scope"],
+            "approved": False,
+            "reason": status or "approval request denied",
+        }
 
     def _require_store(self) -> WorkflowStore:
         if self.store is None:
@@ -415,6 +481,39 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_ready(v) for v in value]
     return value
+
+
+def _pending_consent_request_id(reason: Any) -> Optional[str]:
+    if not isinstance(reason, str):
+        return None
+    prefix = "consent_collect_pending:"
+    if not reason.startswith(prefix):
+        return None
+    request_id = reason[len(prefix) :].strip()
+    return request_id or None
+
+
+def _security_feature(agent: Any) -> Any:
+    direct = getattr(agent, "security_feature", None)
+    if direct is not None:
+        return direct
+    features = getattr(agent, "features", None)
+    if isinstance(features, dict):
+        return (
+            features.get("SecurityFeature")
+            or features.get("Security")
+            or features.get("security")
+        )
+    return None
+
+
+def _approval_request_matches_scope(request: Any, scope: str) -> bool:
+    if getattr(request, "feature_name", None) != "WorkflowsFeature":
+        return False
+    tool_args = getattr(request, "tool_args", None)
+    if not isinstance(tool_args, dict):
+        return False
+    return tool_args.get("scope") == scope
 
 
 __all__ = ["WorkflowsFeature"]
