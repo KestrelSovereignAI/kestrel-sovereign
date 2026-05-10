@@ -14,7 +14,7 @@ Kestrel operates as a **provider middleman**, enabling users to either bring the
 
 ## PayerPolicy Foundation (2026-05)
 
-Below the two-mode framing sits a foundation primitive — `PayerPolicy` — that names *who pays for which metered resource* per agent. Direct Mode and Managed Mode are user-facing labels; PayerPolicy is the per-agent declarative knob the framework reasons about. See [PAYER_POLICY_FOUNDATION.md](PAYER_POLICY_FOUNDATION.md) for the full plan and [kestrel_sdk/payer_policy.py](../../kestrel_sovereign-sdk/kestrel_sdk/payer_policy.py) for the schema.
+Below the two-mode framing sits a foundation primitive — `PayerPolicy` — that names *who pays for which metered resource* per agent. Direct Mode and Managed Mode are user-facing labels; PayerPolicy is the per-agent declarative knob the framework reasons about. See [PAYER_POLICY_FOUNDATION.md](PAYER_POLICY_FOUNDATION.md) for the full plan; the schema lives in the [kestrel-sovereign-sdk repo](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk) at `kestrel_sdk/payer_policy.py`.
 
 ### Six funding patterns
 
@@ -24,7 +24,7 @@ Below the two-mode framing sits a foundation primitive — `PayerPolicy` — tha
 | `HOST_MASTER_PROVISIONED` | Managed | Operator's master account; child key per agent | Master in `HostKeyStorage`; resolver mints child via OpenRouter Provisioning API |
 | `USER_MASTER_PROVISIONED` | Direct (user-bound) | User's own master account | Same mechanism; `master_did` carries user DID |
 | `SPONSOR` | Managed (third-party) | Third party (family member, employer, etc.) | Same mechanism; `master_did` carries sponsor DID |
-| `SELF_WALLET` | Sovereign-pays | Agent's own crypto wallet (e.g. x402) | Lighthouse only today (Phase 3.5); LLM x402 deferred until standards mature |
+| `SELF_WALLET` | Sovereign-pays | Agent's own crypto wallet (e.g. x402) | **Deferred (matrix `NOT_IMPLEMENTED`)** — Phase 3.5 of the plan ships the Lighthouse wallet-signed key flow; LLM `x402` deferred indefinitely until the standard matures. The wizard refuses to offer this kind for any resource until Phase 3.5 lands. |
 | `NONE` | (none) | Resource is unavailable to this agent | `LLMService.disabled = True`; storage provider not constructed |
 
 ### Resource classes
