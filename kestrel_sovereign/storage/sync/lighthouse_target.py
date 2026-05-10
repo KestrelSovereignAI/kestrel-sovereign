@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
 from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
@@ -40,6 +41,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     # Tag prefix for filtering uploads via Lighthouse API
     SNAPSHOT_TAG = "kestrel-state"
     MANIFEST_TAG = "kestrel-manifest"
+    SNAPSHOT_FORMAT_CAR_V1 = "car-v1/raw-sqlite"
 
     def __init__(
         self,
@@ -101,14 +103,11 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             client = LighthouseRestClient(api_key=self.api_key)
 
             tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
-            result = await client.upload(
-                content=content,
-                filename=db_path.name,
-                tag=tag,
-            )
+            car_bytes, payload_cid = self._build_snapshot_car(content)
+            result = await client.upload_car(car_bytes=car_bytes, tag=tag)
 
             cid = result.get("Hash") or result.get("cid")
-            size = int(result.get("Size", len(content)))
+            size = int(result.get("Size", len(car_bytes)))
 
             if not cid:
                 raise ValueError(f"No CID returned from Lighthouse upload: {result}")
@@ -121,6 +120,9 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 "agent_id": self.agent_id,
                 "snapshot_cid": cid,
                 "snapshot_size": size,
+                "snapshot_format": self.SNAPSHOT_FORMAT_CAR_V1,
+                "snapshot_payload_cid": payload_cid,
+                "raw_snapshot_size": len(content),
                 "uploaded_at": timestamp.isoformat(),
                 "source_file": db_path.name,
                 "content_hash": content_hash,
@@ -134,7 +136,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 bytes_synced=size,
                 frames_synced=0,
                 timestamp=timestamp,
-                metadata={"cid": cid},
+                metadata={"cid": cid, "format": self.SNAPSHOT_FORMAT_CAR_V1},
             )
 
         except Exception as e:
@@ -205,6 +207,8 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 logger.warning("Empty snapshot downloaded from Lighthouse")
                 return None
 
+            content = self._extract_snapshot_content(content)
+
             # Write to destination
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             with open(dest_path, "wb") as f:
@@ -233,6 +237,31 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 timestamp=timestamp,
                 error=str(e),
             )
+
+    def _build_snapshot_car(self, content: bytes) -> tuple[bytes, str]:
+        """Pack a SQLite snapshot as a single-block CAR archive."""
+        builder = CARBuilder()
+        payload_cid = builder.add_raw_block(content)
+        builder.set_root(payload_cid)
+        return builder.build(), payload_cid
+
+    def _extract_snapshot_content(self, content: bytes) -> bytes:
+        """Return raw SQLite bytes from CAR snapshots, preserving legacy raw files."""
+        try:
+            reader = CARReader(content)
+            if not reader.verify():
+                raise ValueError("CAR verification failed")
+
+            root_block = reader.get_block(reader.root_cid)
+            if root_block is None:
+                raise ValueError(f"CAR root block missing: {reader.root_cid}")
+            return root_block
+        except Exception as e:
+            logger.debug(
+                "Downloaded snapshot is not a CAR archive; treating as raw SQLite: %s",
+                e,
+            )
+            return content
 
     async def _resolve_latest_cid(self) -> Optional[str]:
         """

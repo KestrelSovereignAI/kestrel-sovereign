@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 
+from kestrel_sovereign.storage.car_builder import CARBuilder
 from kestrel_sovereign.storage.sync.targets import LighthouseTarget, SyncResult
 
 
@@ -98,10 +99,14 @@ def _mock_rest_client(upload_responses=None, download_content=None, uploads_list
     mock_client = AsyncMock()
 
     if upload_error:
-        mock_client.upload = AsyncMock(side_effect=upload_error)
+        mock_client.upload_car = AsyncMock(side_effect=upload_error)
     elif upload_responses:
-        mock_client.upload = AsyncMock(side_effect=upload_responses)
+        mock_client.upload_car = AsyncMock(side_effect=upload_responses[:1])
+        mock_client.upload = AsyncMock(side_effect=upload_responses[1:])
     else:
+        mock_client.upload_car = AsyncMock(
+            return_value={"Hash": "QmDefault", "Size": "0"}
+        )
         mock_client.upload = AsyncMock(return_value={"Hash": "QmDefault", "Size": "0"})
 
     mock_client.download = AsyncMock(return_value=download_content or b"")
@@ -141,12 +146,17 @@ class TestSyncSnapshot:
         assert result.success is True
         assert result.bytes_synced == 23
         assert result.metadata["cid"] == "QmSnapshot123"
+        assert result.metadata["format"] == "car-v1/raw-sqlite"
         assert target._latest_cid == "QmSnapshot123"
+        mock_client.upload_car.assert_awaited_once()
 
         # Verify manifest was saved locally
         manifest = target._load_local_manifest()
         assert manifest is not None
         assert manifest["snapshot_cid"] == "QmSnapshot123"
+        assert manifest["snapshot_format"] == "car-v1/raw-sqlite"
+        assert manifest["raw_snapshot_size"] == len(b"SQLite database content")
+        assert manifest["snapshot_payload_cid"].startswith("b")
 
     @pytest.mark.asyncio
     async def test_sync_snapshot_upload_failure(self, target, tmp_path):
@@ -190,10 +200,12 @@ class TestSyncSnapshot:
 
         mock_client = _mock_rest_client()
         # Snapshot succeeds, manifest upload fails
-        mock_client.upload = AsyncMock(side_effect=[
-            {"Hash": "QmSnapshot123", "Size": "4"},
-            ConnectionError("manifest upload failed"),
-        ])
+        mock_client.upload_car = AsyncMock(
+            return_value={"Hash": "QmSnapshot123", "Size": "4"}
+        )
+        mock_client.upload = AsyncMock(
+            side_effect=ConnectionError("manifest upload failed")
+        )
 
         with patch(
             LIGHTHOUSE_REST_CLIENT,
@@ -204,6 +216,14 @@ class TestSyncSnapshot:
         # Snapshot should still succeed
         assert result.success is True
         assert result.metadata["cid"] == "QmSnapshot123"
+
+    def test_build_snapshot_car_round_trips_raw_content(self, target):
+        content = b"SQLite database content"
+
+        car_bytes, payload_cid = target._build_snapshot_car(content)
+
+        assert payload_cid.startswith("b")
+        assert target._extract_snapshot_content(car_bytes) == content
 
 
 class TestRestoreSnapshot:
@@ -222,6 +242,29 @@ class TestRestoreSnapshot:
         db_content = b"restored database content"
 
         mock_client = _mock_rest_client(download_content=db_content)
+
+        with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmExplicit123"}):
+            with patch(
+                LIGHTHOUSE_REST_CLIENT,
+                return_value=mock_client,
+            ):
+                result = await target.restore_snapshot(dest)
+
+        assert result is not None
+        assert result.success is True
+        assert result.bytes_synced == len(db_content)
+        assert dest.read_bytes() == db_content
+
+    @pytest.mark.asyncio
+    async def test_restore_from_car_snapshot(self, target, tmp_path):
+        """Should extract raw SQLite bytes from CAR snapshots."""
+        dest = tmp_path / "restored.db"
+        db_content = b"restored database content"
+        builder = CARBuilder()
+        payload_cid = builder.add_raw_block(db_content)
+        builder.set_root(payload_cid)
+
+        mock_client = _mock_rest_client(download_content=builder.build())
 
         with patch.dict("os.environ", {"LIGHTHOUSE_STATE_CID": "QmExplicit123"}):
             with patch(
