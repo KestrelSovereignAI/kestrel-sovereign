@@ -39,6 +39,7 @@ _NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$"
 _SOURCE_NAME_PATTERN = r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$"
 _GITHUB_REPO_PATTERN = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 _DID_PATTERN = r"^did:[a-z0-9]+:\S+$"
+_SCRIPT_HASH_PATTERN = r"^sha256:[0-9a-f]{64}$"
 
 # Pattern requiring at least one non-whitespace char anywhere in the
 # value. Schema's ``minLength: 1`` counts whitespace, but the dataclass
@@ -289,11 +290,11 @@ def _gate_schema() -> dict[str, Any]:
                             "properties": {
                                 "language": {
                                     "type": "string",
-                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                    "enum": ["bash", "python"],
                                 },
                                 "src_hash": {
                                     "type": "string",
-                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                    "pattern": _SCRIPT_HASH_PATTERN,
                                 },
                                 "signature": {
                                     "type": "string",
@@ -301,7 +302,7 @@ def _gate_schema() -> dict[str, Any]:
                                 },
                                 "signing_did": {
                                     "type": "string",
-                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                    "pattern": _DID_PATTERN,
                                 },
                                 "sandbox": {
                                     "type": "string",

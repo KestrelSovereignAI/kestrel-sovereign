@@ -209,7 +209,7 @@ def test_gate_script_requires_all_security_fields():
     signing_did, sandbox) are security-load-bearing per design §3.3."""
     full_params = {
         "language": "python",
-        "src_hash": "sha256:abcd",
+        "src_hash": "sha256:" + ("a" * 64),
         "signature": "deadbeef",
         "signing_did": "did:web:k.example",
         "sandbox": "compute:firecracker",
@@ -219,6 +219,17 @@ def test_gate_script_requires_all_security_fields():
         partial = {k: v for k, v in full_params.items() if k != missing}
         with pytest.raises(WorkflowDefinitionError):
             Gate(type="script", params=partial)
+    with pytest.raises(WorkflowDefinitionError, match="params.language"):
+        Gate(type="script", params={**full_params, "language": "ruby"})
+    with pytest.raises(WorkflowDefinitionError, match="params.src_hash"):
+        Gate(type="script", params={**full_params, "src_hash": "abcd"})
+    with pytest.raises(WorkflowDefinitionError, match="params.src_hash"):
+        Gate(
+            type="script",
+            params={**full_params, "src_hash": "sha256:" + ("A" * 64)},
+        )
+    with pytest.raises(WorkflowDefinitionError, match="params.signing_did"):
+        Gate(type="script", params={**full_params, "signing_did": "k.example"})
 
 
 def test_gate_round_trip_dict():
@@ -1342,10 +1353,32 @@ def test_schema_requires_all_script_gate_fields():
         "type": "script",
         "params": {
             "language": "python",
-            "src_hash": "sha256:abcd",
+            "src_hash": "sha256:" + ("a" * 64),
             # signature, signing_did, sandbox missing
         },
     }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "script",
+        "params": {
+            "language": "ruby",
+            "src_hash": "sha256:" + ("a" * 64),
+            "signature": "deadbeef",
+            "signing_did": "did:web:k.example",
+            "sandbox": "compute:uv",
+        },
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"]["params"]["language"] = "python"
+    spec["stages"][0]["gate"]["params"]["src_hash"] = "abcd"
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"]["params"]["src_hash"] = "sha256:" + ("A" * 64)
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 

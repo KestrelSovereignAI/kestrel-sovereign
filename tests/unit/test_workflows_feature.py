@@ -8,7 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 from kestrel_sdk.signals import RedactionPolicy, SignalMode, SourceRegistration
+from kestrel_sdk.tools.result import ToolResult
 
+from kestrel_sovereign.features.compute.models import ComputeScript
 from kestrel_sovereign.features.workflows.feature import WorkflowsFeature
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
@@ -109,6 +111,13 @@ def _spec() -> dict:
     }
 
 
+def _script_hash(script: ComputeScript) -> str:
+    import hashlib
+
+    canonical = f"{script.name}|{script.language}|{script.content}|{script.purpose}"
+    return "sha256:" + hashlib.sha256(canonical.encode()).hexdigest()
+
+
 @pytest.mark.asyncio
 async def test_workflow_define_signs_and_lists_definition(feature_components):
     c = feature_components
@@ -149,6 +158,70 @@ async def test_workflow_run_status_history_and_list_runs(feature_components):
     runs = await c.feature.workflow_list_runs(workflow_name="release")
     assert runs.status.value == "ok"
     assert runs.data["runs"][0]["run_id"] == run_result.data["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_runner_preserves_missing_script_provider_for_preflight(
+    feature_components,
+):
+    c = feature_components
+    c.agent.workflow_script_artifact_resolver = lambda gate: object()
+
+    c.feature._build_runner()
+
+    assert c.feature.runner is not None
+    assert c.feature.runner.script_gate_provider is None
+    assert c.feature.runner.script_artifact_resolver is not None
+
+
+@pytest.mark.asyncio
+async def test_runner_uses_compute_feature_for_script_gates(feature_components):
+    c = feature_components
+    script = ComputeScript(
+        id="script-1",
+        name="workflow predicate",
+        language="python",
+        content="print('ok')\n",
+        purpose="workflow gate predicate",
+    )
+    script.signature = "ecdsa:signature"
+    script.signed_by = c.agent.identity.legacy_did
+    gate = SimpleNamespace(
+        params={
+            "language": script.language,
+            "src_hash": _script_hash(script),
+            "signature": script.signature,
+            "signing_did": script.signed_by,
+            "sandbox": "compute:uv",
+        }
+    )
+    calls: list[tuple[str, str]] = []
+
+    class Store:
+        async def list_recent(self, limit: int):
+            assert limit == 10000
+            return [script]
+
+    class Compute:
+        script_store = Store()
+
+        async def run_script(self, script_id: str, *, executor: str):
+            calls.append((script_id, executor))
+            return ToolResult.ok(
+                "ran",
+                data={"exit_code": 0, "succeeded": True},
+            )
+
+    c.agent.features = {"ComputeFeature": Compute()}
+
+    c.feature._build_runner()
+    artifact = await c.feature.runner.script_artifact_resolver(gate)
+    marker = await c.feature.runner.script_gate_provider(gate, object())
+
+    assert artifact is script
+    assert marker["src_hash"] == gate.params["src_hash"]
+    assert marker["exit_code"] == 0
+    assert calls == [("script-1", "uv")]
 
 
 @pytest.mark.asyncio

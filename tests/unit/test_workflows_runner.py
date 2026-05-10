@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 from types import SimpleNamespace
 from urllib.error import HTTPError
@@ -16,6 +18,7 @@ from kestrel_sdk.signals import (
 )
 
 import kestrel_sovereign.features.workflows.runner as workflow_runner_module
+from kestrel_sovereign.features.compute.models import ComputeScript
 from kestrel_sovereign.features.workflows import (
     Edge,
     EdgeKind,
@@ -104,6 +107,23 @@ def _identity(did: str = "did:web:k.example") -> AgentIdentity:
         legacy_did=did,
         legacy_keypair=suite.generate_keypair(),
         legacy_did_document={},
+    )
+
+
+def _hybrid_identity() -> AgentIdentity:
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    hybrid = generate_hybrid_keypair()
+    new_did = "did:web:k.example:hybrid"
+    return AgentIdentity(
+        legacy_did="did:pkh:eip155:1:0xabc",
+        legacy_keypair=suite.generate_keypair(),
+        legacy_did_document={},
+        hybrid_keypair=hybrid,
+        new_did=new_did,
+        new_verification_methods=build_verification_methods(
+            new_did,
+            hybrid.public_keys(),
+        ),
     )
 
 
@@ -2267,6 +2287,464 @@ async def test_runner_council_approve_gate_rejects_cognition_before_signal(
         match="requires signal_mode=ACTION or ARTIFACT",
     ):
         await c.runner.run_to_completion(name="release")
+
+
+_OTHER_SCRIPT_HASH = "sha256:" + ("b" * 64)
+
+
+def _script_content_hash(script: ComputeScript) -> str:
+    canonical = f"{script.name}|{script.language}|{script.content}|{script.purpose}"
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _script_signature_payload(script: ComputeScript) -> bytes:
+    return hashlib.sha256(_script_content_hash(script).encode()).digest()
+
+
+def _signed_script(identity: AgentIdentity) -> ComputeScript:
+    script = ComputeScript(
+        id="script-1",
+        name="workflow predicate",
+        language="python",
+        content="print('ok')\n",
+        purpose="workflow gate predicate",
+    )
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    signature = suite.sign(
+        _script_signature_payload(script),
+        identity.legacy_keypair.private_key,
+    )
+    script.signature = "ecdsa:" + base64.b64encode(signature).decode()
+    script.signed_by = identity.legacy_did
+    return script
+
+
+def _hybrid_signed_script(identity: AgentIdentity) -> ComputeScript:
+    script = ComputeScript(
+        id="script-1",
+        name="workflow predicate",
+        language="python",
+        content="print('hybrid ok')\n",
+        purpose="workflow gate predicate",
+    )
+    signatures = sign_hybrid(
+        _script_signature_payload(script),
+        identity.hybrid_keypair,
+    )
+    script.signature = "hybrid:" + base64.b64encode(
+        json.dumps(signatures).encode()
+    ).decode()
+    # ComputeFeature persists agent.did in signed_by today, even after
+    # hybrid rotation, so the workflow gate must verify through the
+    # successor verification methods for this legacy DID.
+    script.signed_by = identity.legacy_did
+    return script
+
+
+def _script_gate_params(script: ComputeScript) -> dict[str, str]:
+    return {
+        "language": script.language,
+        "src_hash": f"sha256:{_script_content_hash(script)}",
+        "signature": script.signature,
+        "signing_did": script.signed_by,
+        "sandbox": "compute:uv",
+    }
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_accepts_matching_exit_zero_marker(
+    runner_components,
+):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {**gate_params, "exit_code": 0, "status": "success"}
+
+    async def script_provider(gate, result):
+        return result.action_result
+
+    c.runner.script_gate_provider = script_provider
+    c.runner.script_artifact_resolver = lambda gate: script
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads[0]["src_hash"] == gate_params["src_hash"]
+    assert payloads[0]["sandbox"] == gate_params["sandbox"]
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_fails_contract_mismatch(runner_components):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+
+    async def handler(payload):
+        return {**gate_params, "src_hash": _OTHER_SCRIPT_HASH, "exit_code": 0}
+
+    async def script_provider(gate, result):
+        return result.action_result
+
+    c.runner.script_gate_provider = script_provider
+    c.runner.script_artifact_resolver = lambda gate: script
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_reason == f"script_src_hash_mismatch:{gate_params['src_hash']}"
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_fails_nonzero_marker(runner_components):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+
+    async def handler(payload):
+        return {**gate_params, "exit_code": 2, "stderr": "boom"}
+
+    async def script_provider(gate, result):
+        return result.action_result
+
+    c.runner.script_gate_provider = script_provider
+    c.runner.script_artifact_resolver = lambda gate: script
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_reason == "script_failed:exit_code=2"
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_without_resolver_fails_closed(runner_components):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {**gate_params, "exit_code": 0, "status": "success"}
+
+    c.runner.script_artifact_resolver = lambda gate: script
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_reason == "script_no_resolver"
+    assert links[0].signal_id is None
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_without_script_artifact_fails_closed(
+    runner_components,
+):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {**gate_params, "exit_code": 0, "status": "success"}
+
+    async def script_provider(gate, result):
+        return result.action_result
+
+    c.runner.script_gate_provider = script_provider
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_reason == "script_no_script_resolver"
+    assert links[0].signal_id is None
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_rejects_forged_script_signature(
+    runner_components,
+):
+    c = runner_components
+    forged = _signed_script(c.identity)
+    forged.signature = "ecdsa:" + base64.b64encode(b"not a real signature").decode()
+    forged.signed_by = c.identity.legacy_did
+    gate_params = _script_gate_params(forged)
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {**gate_params, "exit_code": 0, "status": "success"}
+
+    async def script_provider(gate, result):
+        return result.action_result
+
+    c.runner.script_gate_provider = script_provider
+    c.runner.script_artifact_resolver = lambda gate: forged
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_reason == "script_invalid_signature"
+    assert links[0].signal_id is None
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_accepts_hybrid_signed_script_under_legacy_did(
+    runner_components,
+):
+    c = runner_components
+    identity = _hybrid_identity()
+    c.identity = identity
+    c.runner.agent_identity = identity
+    c.runner.public_key_resolver = _resolver_for(identity)
+    c.runner.verification_methods_resolver = lambda did: (
+        identity.new_verification_methods
+        if did == identity.legacy_did
+        else (_ for _ in ()).throw(KeyError(did))
+    )
+    script = _hybrid_signed_script(identity)
+    gate_params = _script_gate_params(script)
+
+    async def handler(payload):
+        return {**gate_params, "exit_code": 0, "status": "success"}
+
+    async def script_provider(gate, result):
+        return result.action_result
+
+    c.runner.script_gate_provider = script_provider
+    c.runner.script_artifact_resolver = lambda gate: script
+    c.registry.register(_action_source("compute.script", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_uses_provider_for_cognition_stage(
+    runner_components,
+):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+    prompt = c.tmp_path / "script.md"
+    prompt.write_text("payload={payload}", encoding="utf-8")
+
+    async def script_provider(gate, result):
+        return {**gate.params, "ok": True}
+
+    c.runner.script_gate_provider = script_provider
+    c.runner.script_artifact_resolver = lambda gate: script
+    c.registry.register(_action_source("undo.script", lambda payload: {"ok": True}))
+    c.registry.register(
+        _cognition_source(
+            "agent.review",
+            prompt,
+            require_constitution_echo=True,
+        )
+    )
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="agent.review",
+                    signal_mode=SignalMode.COGNITION,
+                    compensate="undo.script",
+                    read_only=True,
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_script_gate_rejects_artifact_mode_before_signal(
+    runner_components,
+):
+    c = runner_components
+    script = _signed_script(c.identity)
+    gate_params = _script_gate_params(script)
+    calls = 0
+
+    async def handler(signal):
+        nonlocal calls
+        calls += 1
+        return {**gate_params, "exit_code": 0}
+
+    c.registry.register(_artifact_source("compute.script", handler))
+    c.registry.register(_action_source("undo.script", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="script-check",
+                    signal_source="compute.script",
+                    signal_mode=SignalMode.ARTIFACT,
+                    compensate="undo.script",
+                    gate=Gate(type="script", params=gate_params),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(
+        WorkflowRunnerError,
+        match="requires signal_mode=ACTION or COGNITION",
+    ):
+        await c.runner.run_to_completion(name="release")
+
+    assert calls == 0
 
 
 @pytest.mark.asyncio
