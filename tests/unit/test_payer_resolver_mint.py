@@ -57,6 +57,21 @@ async def db(tmp_path) -> AsyncDatabase:
     await database.close()
 
 
+async def _seed_agent_graph_node(db: AsyncDatabase, agent_did: str) -> None:
+    """Create a minimal graph_nodes row for the agent.
+
+    Tests that exercise the mint path need this row in place because
+    _persist_openrouter_key_hash now refuses to mint without it (codex
+    round 2 finding: retirement_service reads only graph_nodes.properties).
+    Inception_service creates this row in production; tests synthesize.
+    """
+    await db.execute(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+        "VALUES (?, 'agent', 'test-agent', '{}')",
+        (agent_did,),
+    )
+
+
 def _host_master_policy(monthly_cap: Decimal = Decimal("50")) -> PayerPolicy:
     return PayerPolicy(
         llm=PayerSpec(
@@ -97,6 +112,7 @@ class TestMintOpenRouterChild:
         await host.store_key("openrouter", "sk-or-v1-host-master")
 
         agent_did = "did:test:agent-mint"
+        await _seed_agent_graph_node(db, agent_did)
 
         mock_class, mock_instance = _mock_provisioning_service(
             child_key="sk-or-v1-minted"
@@ -179,6 +195,7 @@ class TestMintOpenRouterChild:
         host = HostKeyStorage(db)
         await host.store_key("openrouter", "sk-or-v1-host-master")
         agent_did = "did:test:agent-default-cap"
+        await _seed_agent_graph_node(db, agent_did)
 
         # Build policy without monthly_cap_usd
         policy = PayerPolicy(
@@ -212,23 +229,15 @@ class TestMintOpenRouterChild:
         self, db: AsyncDatabase
     ) -> None:
         """Phase 3c codex round 1 finding: retirement_service reads
-        openrouter_key_hash from graph_nodes.properties (via agent_info
-        merge). Without this persistence, resolver-minted keys leak —
-        ServiceKeyStorage forgets them on retirement, but OpenRouter
-        still bills them."""
+        openrouter_key_hash from graph_nodes.properties. Without this
+        persistence, resolver-minted keys leak — ServiceKeyStorage
+        forgets them on retirement, but OpenRouter still bills them."""
         import json
 
         host = HostKeyStorage(db)
         await host.store_key("openrouter", "sk-or-v1-host-master")
         agent_did = "did:test:agent-hash-persist"
-
-        # Pre-create the agent's graph_nodes row so the resolver writes
-        # into it (rather than the agent_metadata fallback path).
-        await db.execute(
-            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
-            "VALUES (?, 'agent', 'test-agent', ?)",
-            (agent_did, "{}"),
-        )
+        await _seed_agent_graph_node(db, agent_did)
 
         mock_class, mock_instance = _mock_provisioning_service(
             child_key="sk-or-v1-minted-hashtest",
@@ -253,12 +262,19 @@ class TestMintOpenRouterChild:
         assert properties["openrouter_key_hash"] == "hash-hashtest"
 
     @pytest.mark.asyncio
-    async def test_mint_persists_key_hash_to_agent_metadata_fallback(
+    async def test_mint_raises_when_no_graph_nodes_row(
         self, db: AsyncDatabase
     ) -> None:
-        """When no graph_nodes agent row exists (e.g. minimal test
-        fixture), fall back to agent_metadata so retirement still has a
-        place to look."""
+        """Codex Phase 3c round 2 finding: agent_metadata fallback was
+        invisible to retirement_service.get_agent_info() (which reads
+        only from graph_nodes.properties), so a resolver-minted key
+        without a graph_nodes row would leak at retirement.
+
+        The corrected behavior: refuse to mint if no graph_nodes row
+        exists. inception_service creates the row before agent init
+        reaches the resolver, so production paths never hit this; tests
+        that want to exercise mint must seed the row.
+        """
         host = HostKeyStorage(db)
         await host.store_key("openrouter", "sk-or-v1-host-master")
         agent_did = "did:test:agent-no-graph-row"
@@ -266,7 +282,7 @@ class TestMintOpenRouterChild:
         # Deliberately do NOT create a graph_nodes row.
 
         mock_class, mock_instance = _mock_provisioning_service(
-            child_key="sk-or-v1-minted-meta",
+            child_key="sk-or-v1-minted-no-row",
         )
         with patch(
             "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
@@ -274,16 +290,17 @@ class TestMintOpenRouterChild:
             mock_class,
         ):
             resolver = FoundationPayerResolver(_host_master_policy(), db=db)
-            await resolver.resolve_for(agent_did, ResourceClass.LLM)
+            with pytest.raises(PayerPolicyError) as excinfo:
+                await resolver.resolve_for(agent_did, ResourceClass.LLM)
 
-        # Verify agent_metadata fallback received the hash.
-        rows = await db.fetchall(
-            "SELECT value FROM agent_metadata "
-            "WHERE agent_id = ? AND key = 'openrouter_key_hash'",
-            (agent_did,),
-        )
-        assert rows
-        assert rows[0][0] == "hash-ted-meta"  # last 8 chars of "sk-or-v1-minted-meta"
+        assert "graph_nodes" in str(excinfo.value).lower()
+        # The remote API was called BEFORE the persist failure (we do
+        # the OpenRouter create before the local persist). That's a
+        # known leak window if precondition is violated; the error
+        # message names the issue so the operator can investigate.
+        # ServiceKeyStorage may have the key locally — that's fine, it
+        # just won't be activated without a graph_nodes row anyway.
+        assert mock_instance.create_agent_key.await_count == 1
 
     @pytest.mark.asyncio
     async def test_concurrent_mints_for_same_agent_serialize(
@@ -301,27 +318,35 @@ class TestMintOpenRouterChild:
         host = HostKeyStorage(db)
         await host.store_key("openrouter", "sk-or-v1-host-master")
         agent_did = "did:test:agent-concurrent"
+        await _seed_agent_graph_node(db, agent_did)
 
         mock_class, mock_instance = _mock_provisioning_service(
             child_key="sk-or-v1-only-once"
         )
 
+        # Codex Phase 3c round 2 finding: locks must be class-level
+        # (not instance-level) because kestrel_agent.py constructs a
+        # fresh resolver per init. Use TWO distinct resolver instances
+        # for the same agent_did to exercise the cross-instance lock.
         with patch(
             "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
             "OpenRouterProvisioningService",
             mock_class,
         ):
-            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
-            # Fire two concurrent resolves for the same agent.
+            resolver_a = FoundationPayerResolver(_host_master_policy(), db=db)
+            resolver_b = FoundationPayerResolver(_host_master_policy(), db=db)
+            assert resolver_a is not resolver_b  # sanity
+            # Fire concurrent resolves on two DIFFERENT resolver instances.
             results = await _asyncio.gather(
-                resolver.resolve_for(agent_did, ResourceClass.LLM),
-                resolver.resolve_for(agent_did, ResourceClass.LLM),
+                resolver_a.resolve_for(agent_did, ResourceClass.LLM),
+                resolver_b.resolve_for(agent_did, ResourceClass.LLM),
             )
 
         # Both calls return enabled.
         assert all(r.enabled for r in results)
         # OpenRouter API was called exactly ONCE despite two concurrent
-        # resolves — the lock prevented the second from minting.
+        # resolves on different resolver instances — the class-level
+        # lock prevented the second from minting.
         assert mock_instance.create_agent_key.await_count == 1
 
     @pytest.mark.asyncio

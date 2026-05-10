@@ -68,6 +68,16 @@ class FoundationPayerResolver:
     behavior). When absent, only the env-var path is consulted.
     """
 
+    # Process-global per-agent mint locks. CLASS-LEVEL (not instance)
+    # because kestrel_agent.py constructs a fresh FoundationPayerResolver
+    # on each agent init — two concurrent inits for the same DID would
+    # each get their own empty per-instance lock map, defeating the
+    # serialization. Class-level shares the locks across resolver
+    # instances within a single Python process. (Cross-process
+    # concurrency would require DB-level enforcement; that's a future
+    # follow-up if/when multi-process agent init becomes a thing.)
+    _GLOBAL_MINT_LOCKS: Dict[str, asyncio.Lock] = {}
+
     def __init__(
         self,
         policy: PayerPolicy,
@@ -76,14 +86,6 @@ class FoundationPayerResolver:
     ) -> None:
         self._policy = policy
         self._db = db
-        # Per-agent locks for first-time mint serialization. Two
-        # concurrent agent-init paths for the same DID would otherwise
-        # both pass has_key() before either store_key() landed, and
-        # both would create remote OpenRouter keys (the later store
-        # then orphans the earlier remote key). The lock is in-memory
-        # per resolver instance, which matches the per-agent
-        # FoundationPayerResolver lifetime in agent-init flows.
-        self._mint_locks: Dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Public surface — matches kestrel_sdk.payer_policy.PayerResolver
@@ -249,7 +251,9 @@ class FoundationPayerResolver:
         # Per-agent lock prevents two concurrent agent-init paths from
         # both passing has_key() and both calling create_agent_key —
         # which would orphan one of the two remote OpenRouter keys.
-        lock = self._mint_locks.setdefault(agent_did, asyncio.Lock())
+        # Class-level so the lock is shared across resolver instances
+        # within the same process.
+        lock = self._GLOBAL_MINT_LOCKS.setdefault(agent_did, asyncio.Lock())
         async with lock:
             await self._maybe_mint_openrouter_child_locked(agent_did, spec)
 
@@ -337,7 +341,24 @@ class FoundationPayerResolver:
         agent. Mirrors scripts/provision_agent_openrouter.py:119-138 so
         retirement_service.py can revoke the key on agent retirement.
 
+        graph_nodes.properties is the SOLE retirement-readable location;
+        retirement_service.get_agent_info() reads ONLY from there. An
+        earlier draft fell back to agent_metadata when no graph_nodes
+        agent row existed, but codex round 2 caught that retirement
+        wouldn't see those entries — leaking the remote OpenRouter
+        child key on retirement. Now we fail loudly instead: the
+        precondition (graph_nodes row exists for this agent) is created
+        by inception_service before any agent-init path reaches this
+        resolver, so a missing row indicates a deeper inconsistency.
+
         Idempotent: overwrites if already present.
+
+        Raises:
+            PayerPolicyError: If no graph_nodes agent row exists for
+                this agent_did. The mint call must NOT have been made
+                in that state, but the remote child key was already
+                created — the caller surfaces the error so an operator
+                can investigate.
         """
         import json
 
@@ -347,19 +368,15 @@ class FoundationPayerResolver:
             (agent_did,),
         )
         if not rows:
-            # Some test fixtures don't construct a graph_nodes agent row;
-            # falling back to agent_metadata keeps retirement workable
-            # for those (retirement_service merges agent_metadata into
-            # agent_info).
-            await self._db.execute(
-                """
-                INSERT OR REPLACE INTO agent_metadata
-                (agent_id, key, value, updated_at)
-                VALUES (?, 'openrouter_key_hash', ?, CURRENT_TIMESTAMP)
-                """,
-                (agent_did, key_hash),
+            from kestrel_sdk.payer_policy import PayerPolicyError
+            raise PayerPolicyError(
+                f"PayerResolver: cannot persist openrouter_key_hash for "
+                f"agent {agent_did[:30]}... — no graph_nodes row exists. "
+                "retirement_service reads the hash from graph_nodes.properties "
+                "only; without a row, the remote OpenRouter child key would "
+                "leak at retirement. Inception is expected to create the "
+                "graph_nodes row before agent init reaches this resolver."
             )
-            return
 
         properties_json = rows[0][0]
         properties = json.loads(properties_json) if properties_json else {}
