@@ -75,6 +75,8 @@ let buttonEl = null;
 // AGENT_TEXT_DELTA events can stream into it. Reset to null when finalized.
 let agentMsgDiv = null;
 let agentTextBuffer = '';
+let userMsgDiv = null;
+let userTranscriptBuffer = '';
 let pathBadgeEl = null;
 let pickerModalEl = null;
 let privacyBannerEl = null;
@@ -88,6 +90,7 @@ let currentState = State.IDLE;
 // session.instructions.
 const SETTINGS_KEY = 'kestrel.voice.settings';
 let settings = loadSettings();
+let pickerRequestId = 0;
 
 
 // ---------------------------------------------------------------------------
@@ -236,7 +239,6 @@ function mountPickerModal() {
 
 
 function setState(next) {
-  if (next === currentState) return;
   currentState = next;
   buttonEl.textContent = STATE_GLYPH[next];
   buttonEl.title = STATE_LABELS[next];
@@ -300,7 +302,16 @@ async function startSession() {
       return;
     } catch (err) {
       if (err && err.code === 'REALTIME_UNAVAILABLE') {
-        console.info('[voice/ui] Realtime declined, falling back to Pipeline:', err.fallback?.reason);
+        const fallback = err.fallback || {};
+        const canUsePipeline =
+          (fallback.path === 'pipeline' || fallback.path === 'local') &&
+          fallback.fallback_tts &&
+          fallback.fallback_stt;
+        if (!canUsePipeline) {
+          surfaceFatalError(new Error(fallback.reason || err.message || 'Voice unavailable'));
+          return;
+        }
+        console.info('[voice/ui] Realtime declined, falling back to Pipeline:', fallback.reason);
         client = null;
       } else {
         surfaceFatalError(err);
@@ -347,8 +358,24 @@ function surfaceFatalError(err) {
   console.error('[voice/ui] fatal voice error:', err);
   setState(State.ERROR);
   // Surface as an agent message so the user sees it inline with the chat.
-  addMessage('agent', `⚠ Voice error: ${err?.message || 'session failed'}`);
+  addMessage('agent', `⚠ Voice error: ${formatVoiceError(err)}`);
   client = null;
+}
+
+
+function formatVoiceError(err) {
+  const message = err?.message || 'session failed';
+  if (
+    err?.name === 'NotAllowedError' ||
+    err?.name === 'SecurityError' ||
+    /permission denied|permission dismissed|not allowed|denied/i.test(message)
+  ) {
+    return 'Microphone permission denied. Allow microphone access for this site, then click the mic again. If this browser has no microphone permission control, open Kestrel in Chrome or Safari.';
+  }
+  if (/getUserMedia is not available/i.test(message)) {
+    return 'Microphone capture is unavailable. Voice requires a browser with microphone support on localhost or HTTPS.';
+  }
+  return message;
 }
 
 
@@ -367,12 +394,14 @@ function handleClientEvent(ev) {
   if (nextState !== null) setState(nextState);
 
   switch (ev.kind) {
-    // User-side transcript: only the FINAL adds a chat message. Live
-    // partials would create N nested user bubbles; chat history wants one.
+    // User-side transcript: reserve/update one user bubble per voice turn.
+    // Realtime can start the agent answer before final transcription arrives;
+    // the reserved bubble keeps the visual order as user -> agent.
+    case Events.USER_TRANSCRIPT_DELTA:
+      updateUserTurn(ev.text || '');
+      break;
     case Events.USER_TRANSCRIPT_FINAL:
-      if (ev.text && ev.text.trim()) {
-        addMessage('user', ev.text);
-      }
+      finalizeUserTurn(ev.text || userTranscriptBuffer);
       break;
 
     // SPEAKING_STARTED marks the start of a NEW agent response (mapped
@@ -383,12 +412,18 @@ function handleClientEvent(ev) {
     // appends to the old bubble forever.
     case Events.SPEAKING_STARTED:
       if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
+      ensureUserTurn();
       break;
 
     // LISTENING_STARTED (user begins speaking) is also an unambiguous
     // "current agent turn is over" signal. Same defensive close.
     case Events.LISTENING_STARTED:
       if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
+      if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
+      break;
+
+    case Events.LISTENING_STOPPED:
+      ensureUserTurn();
       break;
 
     // Agent reply streams into a single message bubble. AGENT_TEXT_DELTA
@@ -409,6 +444,7 @@ function handleClientEvent(ev) {
       finalizeAgentTurn(ev.text || agentTextBuffer);
       break;
     case Events.RESPONSE_DONE:
+      if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
       finalizeAgentTurn(agentTextBuffer);
       break;
 
@@ -421,6 +457,7 @@ function handleClientEvent(ev) {
     case Events.SESSION_CLOSED:
       // Drop any in-flight agent message back into the chat so the user
       // sees what they got even if the session ended mid-response.
+      if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
       if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
       break;
 
@@ -433,9 +470,8 @@ function handleClientEvent(ev) {
       }
       break;
 
-    // SESSION_READY / LISTENING_STOPPED / SPEAKING_STOPPED / THINKING_STARTED
-    // handled entirely by the state-machine transition above. (LISTENING_STARTED
-    // and SPEAKING_STARTED have explicit cases above to close stale bubbles.)
+    // SESSION_READY / SPEAKING_STOPPED / THINKING_STARTED handled entirely by
+    // the state-machine transition above.
     default:
       break;
   }
@@ -459,9 +495,52 @@ function finalizeAgentTurn(text) {
 }
 
 
+function ensureUserTurn() {
+  if (userMsgDiv) return;
+  userMsgDiv = addMessageStreaming('user');
+  userTranscriptBuffer = '';
+  const contentDiv = userMsgDiv.querySelector('.message-content');
+  if (contentDiv) contentDiv.textContent = 'Transcribing...';
+}
+
+
+function updateUserTurn(text) {
+  ensureUserTurn();
+  userTranscriptBuffer = text || userTranscriptBuffer;
+  const contentDiv = userMsgDiv?.querySelector('.message-content');
+  if (contentDiv && userTranscriptBuffer.trim()) {
+    contentDiv.textContent = userTranscriptBuffer;
+  }
+}
+
+
+function finalizeUserTurn(text) {
+  const div = userMsgDiv;
+  const buf = (text || '').trim();
+  userMsgDiv = null;
+  userTranscriptBuffer = '';
+  if (!div) {
+    if (buf) addMessage('user', buf);
+    return;
+  }
+
+  const contentDiv = div.querySelector('.message-content');
+  if (!buf) {
+    div.remove();
+    return;
+  }
+  if (contentDiv) {
+    contentDiv.classList.remove('streaming');
+    contentDiv.textContent = buf;
+  }
+}
+
+
 function resetTurnState() {
   agentMsgDiv = null;
   agentTextBuffer = '';
+  userMsgDiv = null;
+  userTranscriptBuffer = '';
 }
 
 
@@ -488,7 +567,7 @@ async function handleToolCall(ev) {
   try {
     const resp = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...voiceAuthHeaders() },
+      headers: { 'Content-Type': 'application/json', ...await voiceAuthHeaders() },
       body: JSON.stringify({
         call_id: ev.call_id,
         name: ev.name,
@@ -529,7 +608,7 @@ function setPathBadge(label, tooltip) {
   if (!pathBadgeEl) return;  // status indicator wasn't mountable
   pathBadgeEl.textContent = label || '';
   pathBadgeEl.title = tooltip || '';
-  pathBadgeEl.dataset.path = (label || '').toLowerCase();
+  pathBadgeEl.dataset.path = (label || '').split(/\s+/)[0].toLowerCase();
   // Mirror the active voice model into the chat-header model selector area
   // so the user can see at a glance that voice is using a different model
   // than text chat. The chat model selector itself is unchanged (text chat
@@ -574,49 +653,31 @@ async function openPicker() {
   // Populate from /voice/voices + show a live preview of the resolved
   // route given the current overrides. Both fetches happen on every open
   // so a chat-LLM swap (or restart) is reflected immediately.
+  const requestId = ++pickerRequestId;
   const voiceSel = document.getElementById('voice-picker-select');
   const ttsSel = document.getElementById('voice-picker-tts');
   const modeSel = document.getElementById('voice-picker-mode');
   const instructionsEl = document.getElementById('voice-picker-instructions');
 
-  voiceSel.innerHTML = '<option value="">Loading...</option>';
+  voiceSel.innerHTML = '<option value="">Loading voices...</option>';
   modeSel.value = settings.mode || 'auto';
   instructionsEl.value = settings.instructions || '';
 
-  // Voices
-  try {
-    const voices = await fetchVoices();
-    voiceSel.innerHTML = '';
-    if (voices.length === 0) {
-      const opt = document.createElement('option');
-      opt.value = '';
-      opt.textContent = 'No voices available — install a voice provider';
-      voiceSel.appendChild(opt);
-    } else {
-      for (const v of voices) {
-        const opt = document.createElement('option');
-        opt.value = v.voice_id;
-        opt.textContent = `${v.name} (${v.gender}, ${v.accent})`;
-        if (v.voice_id === settings.voice) opt.selected = true;
-        voiceSel.appendChild(opt);
-      }
-    }
-  } catch (err) {
-    voiceSel.innerHTML = `<option value="">Failed to load voices: ${err.message}</option>`;
-  }
-
-  // Route preview + TTS provider list (both come from /voice/realtime/route).
-  await refreshRoutePreview();
-  // Re-preview when the user toggles mode or TTS — gives instant feedback.
-  modeSel.onchange = refreshRoutePreview;
-  ttsSel.onchange = refreshRoutePreview;
-
+  // Show the modal before provider calls finish. A slow auth bootstrap,
+  // rate-limit, or provider probe should render as a loading/error state in
+  // the picker, not as an apparently frozen right-click.
   pickerModalEl.hidden = false;
   instructionsEl.focus();
+
+  // Route preview + TTS provider list (both come from /voice/realtime/route).
+  refreshRoutePreview(requestId);
+  // Re-preview when the user toggles mode or TTS — gives instant feedback.
+  modeSel.onchange = () => refreshRoutePreview(++pickerRequestId);
+  ttsSel.onchange = () => refreshRoutePreview(++pickerRequestId);
 }
 
 
-async function refreshRoutePreview() {
+async function refreshRoutePreview(requestId = pickerRequestId) {
   const previewEl = document.getElementById('voice-picker-route-preview');
   const ttsSel = document.getElementById('voice-picker-tts');
   const modeSel = document.getElementById('voice-picker-mode');
@@ -629,9 +690,12 @@ async function refreshRoutePreview() {
   try {
     route = await fetchRoute(overrides);
   } catch (err) {
+    if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
     previewEl.textContent = `Route preview failed: ${err.message}`;
+    await refreshVoiceList(voiceSel, '', requestId);
     return;
   }
+  if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
 
   // Render the human summary.
   const parts = [];
@@ -675,7 +739,7 @@ async function refreshRoutePreview() {
   } else {
     voiceListProvider = previousTts || route.tts_provider || '';
   }
-  await refreshVoiceList(voiceSel, voiceListProvider);
+  await refreshVoiceList(voiceSel, voiceListProvider, requestId);
 
   // Bug #2: live-update the chat-header annotation when the picker mode
   // changes, not only after a session successfully starts. Otherwise the
@@ -702,10 +766,11 @@ async function refreshRoutePreview() {
 }
 
 
-async function refreshVoiceList(selectEl, providerName) {
+async function refreshVoiceList(selectEl, providerName, requestId = pickerRequestId) {
   selectEl.innerHTML = '<option value="">Loading voices...</option>';
   try {
     const voices = await fetchVoices(providerName);
+    if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
     selectEl.innerHTML = '';
     if (voices.length === 0) {
       // Empty list: ask /voice/providers/status for the actual reason and
@@ -713,6 +778,7 @@ async function refreshVoiceList(selectEl, providerName) {
       // by elevenlabs" with no way to tell it's an API-key permission
       // issue, package version mismatch, etc.
       const reason = await fetchProviderReason(providerName);
+      if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
       const opt = document.createElement('option');
       opt.value = '';
       opt.textContent = reason || (providerName
@@ -733,6 +799,7 @@ async function refreshVoiceList(selectEl, providerName) {
       selectEl.appendChild(opt);
     }
   } catch (err) {
+    if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
     selectEl.innerHTML = `<option value="">Failed to load voices: ${err.message}</option>`;
   }
 }
@@ -756,13 +823,14 @@ async function fetchRoute(overrides = {}) {
   if (overrides.preferred_stt) params.set('preferred_stt', overrides.preferred_stt);
   const qs = params.toString();
   const url = API.buildAgentUrl(`/voice/realtime/route${qs ? `?${qs}` : ''}`);
-  const resp = await fetch(url, { headers: voiceAuthHeaders() });
+  const resp = await fetch(url, { headers: await voiceAuthHeaders() });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   return resp.json();
 }
 
 
 function closePicker() {
+  pickerRequestId++;
   pickerModalEl.hidden = true;
 }
 
@@ -790,7 +858,7 @@ async function fetchVoices(providerName = '') {
   const url = API.buildAgentUrl(
     `/voice/voices${providerName ? `?provider=${encodeURIComponent(providerName)}` : ''}`,
   );
-  const resp = await fetch(url, { headers: voiceAuthHeaders() });
+  const resp = await fetch(url, { headers: await voiceAuthHeaders() });
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const body = await resp.json();
   return Array.isArray(body.voices) ? body.voices : [];
@@ -806,7 +874,7 @@ async function fetchProviderReason(providerName) {
   if (!providerName) return null;
   try {
     const url = API.buildAgentUrl('/voice/providers/status');
-    const res = await fetch(url, { headers: voiceAuthHeaders() });
+    const res = await fetch(url, { headers: await voiceAuthHeaders() });
     if (!res.ok) return null;
     const body = await res.json();
     const rows = (body && body.providers) || [];

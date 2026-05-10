@@ -201,6 +201,8 @@ class TestRealtimeSessionSuccess:
         kwargs = provider.mint_calls[0]
         assert kwargs["voice"] == "marin"
         assert "You are warm." in kwargs["instructions"]
+        assert "audio-only" in kwargs["instructions"]
+        assert "Never claim that you can see the user" in kwargs["instructions"]
         assert "Like a 1920s newscaster." in kwargs["instructions"]
         assert kwargs["tools"][0].name == "echo"
         assert kwargs["turn_detection"].mode == "semantic_vad"
@@ -345,6 +347,13 @@ class TestComposeInstructions:
         agent = SimpleNamespace()  # no identity
         out = _compose_instructions(agent, "hello")
         assert "hello" in out
+
+    def test_includes_audio_only_guardrail(self) -> None:
+        agent = SimpleNamespace(identity=SimpleNamespace(system_prompt=""))
+        out = _compose_instructions(agent, "")
+        assert "audio-only" in out
+        assert "camera" in out
+        assert "Never claim that you can see the user" in out
 
 
 class TestCollectTools:
