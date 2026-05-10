@@ -124,6 +124,32 @@ def test_gate_tests_pass_requires_suite():
     Gate(type="tests_pass", params={"suite": "unit"})
 
 
+def test_gate_ci_green_requires_repo_and_branch():
+    with pytest.raises(WorkflowDefinitionError, match="params.repo"):
+        Gate(type="ci_green", params={"branch": "main"})
+    with pytest.raises(WorkflowDefinitionError, match="params.branch"):
+        Gate(type="ci_green", params={"repo": "owner/repo"})
+    with pytest.raises(WorkflowDefinitionError, match="owner/repo"):
+        Gate(type="ci_green", params={"repo": "repo", "branch": "main"})
+    with pytest.raises(WorkflowDefinitionError, match="owner/repo"):
+        Gate(type="ci_green", params={"repo": "owner/repo/extra", "branch": "main"})
+    with pytest.raises(WorkflowDefinitionError, match="required_checks"):
+        Gate(
+            type="ci_green",
+            params={"repo": "owner/repo", "branch": "main", "required_checks": []},
+        )
+    with pytest.raises(WorkflowDefinitionError, match="poll_interval_seconds"):
+        Gate(
+            type="ci_green",
+            params={
+                "repo": "owner/repo",
+                "branch": "main",
+                "poll_interval_seconds": True,
+            },
+        )
+    Gate(type="ci_green", params={"repo": "owner/repo", "branch": "main"})
+
+
 def test_gate_lint_clean_requires_scopes():
     with pytest.raises(WorkflowDefinitionError, match="params.scopes"):
         Gate(type="lint_clean")
@@ -1158,6 +1184,28 @@ def test_schema_accepts_noop_idempotent_with_consent_gate():
 def test_schema_requires_tests_pass_suite():
     spec = _minimal_spec().to_dict()
     spec["stages"][0]["gate"] = {"type": "tests_pass", "params": {}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_ci_green_repo_and_branch():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {"type": "ci_green", "params": {"repo": "owner/repo"}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "ci_green",
+        "params": {"repo": "owner/repo/extra", "branch": "main"},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "ci_green",
+        "params": {"repo": "owner/repo", "branch": "main", "required_checks": []},
+    }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 

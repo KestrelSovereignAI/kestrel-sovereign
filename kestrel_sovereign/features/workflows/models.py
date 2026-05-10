@@ -160,6 +160,7 @@ _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
 # we mirror that here while still demanding a leading alphanum (to
 # prevent control-char garbage at the start).
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$")
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # Lowercase hex sha256 digest, 64 chars; mirrors signing-side helpers and the
 # JSON Schema `_HASH_PATTERN`.
@@ -327,6 +328,39 @@ class Gate:
                     "gate tests_pass requires non-empty params.suite "
                     "per design §3.3"
                 )
+        if self.type == "ci_green":
+            for required in ("repo", "branch"):
+                value = self.params.get(required)
+                if not isinstance(value, str) or not value.strip():
+                    raise WorkflowDefinitionError(
+                        f"gate ci_green requires non-empty params.{required} "
+                        "per design §3.3"
+                    )
+            repo = self.params["repo"]
+            if not _GITHUB_REPO_RE.fullmatch(repo):
+                raise WorkflowDefinitionError(
+                    "gate ci_green params.repo must use 'owner/repo' GitHub syntax"
+                )
+            required_checks = self.params.get("required_checks")
+            if required_checks is not None and (
+                not isinstance(required_checks, (list, tuple))
+                or len(required_checks) < 1
+                or not all(
+                    isinstance(check, str) and check.strip()
+                    for check in required_checks
+                )
+            ):
+                raise WorkflowDefinitionError(
+                    "gate ci_green params.required_checks must be "
+                    "a non-empty list[str] when present"
+                )
+            for optional_timeout in ("poll_interval_seconds", "max_wait_seconds"):
+                value = self.params.get(optional_timeout)
+                if value is not None and not _is_strict_positive_int(value):
+                    raise WorkflowDefinitionError(
+                        f"gate ci_green params.{optional_timeout} must be "
+                        "a positive integer when present"
+                    )
         if self.type == "lint_clean":
             scopes = self.params.get("scopes")
             if (

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from urllib.error import HTTPError
 
 import pytest
 
@@ -14,6 +15,7 @@ from kestrel_sdk.signals import (
     SourceRegistration,
 )
 
+import kestrel_sovereign.features.workflows.runner as workflow_runner_module
 from kestrel_sovereign.features.workflows import (
     Edge,
     EdgeKind,
@@ -971,6 +973,440 @@ async def test_runner_tests_pass_gate_ignores_http_status_code_metadata(
 
     assert result.status == RunStatus.COMPLETED
     assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_ci_green_gate_accepts_required_checks(runner_components):
+    c = runner_components
+    payloads: list[dict] = []
+    provider_calls: list[tuple[str, str]] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {"queued": True}
+
+    async def provider(gate, result):
+        assert result.action_result == {"queued": True}
+        provider_calls.append((gate.params["repo"], gate.params["branch"]))
+        return {
+            "check_runs": [
+                {
+                    "name": "unit-tests",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+                {
+                    "name": "lint-and-imports",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ],
+            "required_checks": ["unit-tests", "lint-and-imports"],
+        }
+
+    c.runner.ci_green_provider = provider
+    c.registry.register(_action_source("ci.github", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="ci",
+                    signal_source="ci.github",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="ci_green",
+                        params={
+                            "repo": "KestrelSovereignAI/kestrel-sovereign",
+                            "branch": "main",
+                            "required_checks": ["unit-tests", "lint-and-imports"],
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads == [
+        {
+            "repo": "KestrelSovereignAI/kestrel-sovereign",
+            "branch": "main",
+            "required_checks": ["unit-tests", "lint-and-imports"],
+        }
+    ]
+    assert provider_calls == [("KestrelSovereignAI/kestrel-sovereign", "main")]
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_ci_green_gate_fails_missing_required_check(
+    runner_components,
+):
+    c = runner_components
+
+    async def provider(gate, result):
+        return {
+            "check_runs": [
+                {
+                    "name": "unit-tests",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ],
+            "required_checks": ["unit-tests", "lint-and-imports"],
+        }
+
+    c.runner.ci_green_provider = provider
+
+    async def handler(payload):
+        return {"queued": True}
+
+    c.registry.register(_action_source("ci.github", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="ci",
+                    signal_source="ci.github",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="ci_green",
+                        params={
+                            "repo": "KestrelSovereignAI/kestrel-sovereign",
+                            "branch": "main",
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == (
+        "ci_green_failed:missing_required_checks:lint-and-imports"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_ci_green_gate_fails_failed_check(runner_components):
+    c = runner_components
+
+    async def provider(gate, result):
+        return {
+            "check_runs": [
+                {
+                    "name": "unit-tests",
+                    "status": "completed",
+                    "conclusion": "failure",
+                }
+            ]
+        }
+
+    c.runner.ci_green_provider = provider
+
+    async def handler(payload):
+        return {"queued": True}
+
+    c.registry.register(_action_source("ci.github", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="ci",
+                    signal_source="ci.github",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="ci_green",
+                        params={
+                            "repo": "KestrelSovereignAI/kestrel-sovereign",
+                            "branch": "main",
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "ci_green_failed:unit-tests:conclusion='failure'"
+
+
+@pytest.mark.asyncio
+async def test_runner_ci_green_gate_requires_action_mode_before_signal(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(signal):
+        nonlocal calls
+        calls += 1
+        return {"queued": True}
+
+    c.registry.register(_artifact_source("ci.github", handler))
+    c.registry.register(_action_source("undo.ci", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="ci",
+                    signal_source="ci.github",
+                    signal_mode=SignalMode.ARTIFACT,
+                    compensate="undo.ci",
+                    gate=Gate(
+                        type="ci_green",
+                        params={
+                            "repo": "KestrelSovereignAI/kestrel-sovereign",
+                            "branch": "main",
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="requires signal_mode=ACTION"):
+        await c.runner.run_to_completion(name="release")
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_default_ci_green_provider_polls_pending_checks(monkeypatch):
+    markers = [
+        {
+            "check_runs": [
+                {
+                    "name": "unit-tests",
+                    "status": "queued",
+                    "conclusion": None,
+                }
+            ],
+            "required_checks": ["unit-tests"],
+        },
+        {
+            "check_runs": [
+                {
+                    "name": "unit-tests",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ],
+            "required_checks": ["unit-tests"],
+        },
+    ]
+    sleeps: list[float] = []
+
+    def fetch(gate):
+        return markers.pop(0)
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(workflow_runner_module, "_fetch_github_ci_marker", fetch)
+    monkeypatch.setattr(workflow_runner_module.asyncio, "sleep", sleep)
+
+    marker = await workflow_runner_module._default_ci_green_provider(
+        Gate(
+            type="ci_green",
+            params={
+                "repo": "KestrelSovereignAI/kestrel-sovereign",
+                "branch": "main",
+                "poll_interval_seconds": 1,
+                "max_wait_seconds": 30,
+            },
+        ),
+        SimpleNamespace(),
+    )
+
+    assert marker["check_runs"][0]["conclusion"] == "success"
+    assert sleeps == [1]
+    assert markers == []
+
+
+def test_github_required_checks_permission_error_fails_closed(monkeypatch):
+    def raise_forbidden(url, *, headers):
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    monkeypatch.setattr(workflow_runner_module, "_github_json", raise_forbidden)
+
+    with pytest.raises(HTTPError):
+        workflow_runner_module._github_json_optional(
+            "https://api.github.com/repos/owner/repo/branches/main/protection/"
+            "required_status_checks",
+            headers={},
+        )
+
+
+def test_ci_green_pending_does_not_mask_observed_required_failure():
+    gate = Gate(
+        type="ci_green",
+        params={
+            "repo": "KestrelSovereignAI/kestrel-sovereign",
+            "branch": "main",
+            "required_checks": ["unit-tests", "lint-and-imports"],
+        },
+    )
+    marker = {
+        "check_runs": [
+            {
+                "name": "unit-tests",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+    }
+
+    assert workflow_runner_module._ci_marker_pending(gate, marker) is False
+    assert workflow_runner_module._ci_marker_reason(gate, marker) == (
+        "unit-tests:conclusion='failure'"
+    )
+
+
+def test_fetch_github_ci_marker_skips_protection_when_checks_explicit(monkeypatch):
+    optional_calls: list[str] = []
+
+    def github_json(url, *, headers):
+        if "/branches/" in url:
+            return {"commit": {"sha": "abc123"}}
+        if "/check-runs" in url:
+            return {
+                "check_runs": [
+                    {
+                        "name": "unit-tests",
+                        "status": "completed",
+                        "conclusion": "success",
+                    }
+                ]
+            }
+        if url.endswith("/status"):
+            return {"statuses": []}
+        raise AssertionError(url)
+
+    def github_json_optional(url, *, headers):
+        optional_calls.append(url)
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_test")
+    monkeypatch.setattr(workflow_runner_module, "_github_json", github_json)
+    monkeypatch.setattr(
+        workflow_runner_module, "_github_json_optional", github_json_optional
+    )
+
+    marker = workflow_runner_module._fetch_github_ci_marker(
+        Gate(
+            type="ci_green",
+            params={
+                "repo": "KestrelSovereignAI/kestrel-sovereign",
+                "branch": "main",
+                "required_checks": ["unit-tests"],
+            },
+        )
+    )
+
+    assert marker["required_checks"] == ("unit-tests",)
+    assert optional_calls == []
+
+
+def test_fetch_github_ci_marker_pages_check_runs(monkeypatch):
+    check_run_urls: list[str] = []
+
+    def github_json(url, *, headers):
+        if "/branches/" in url:
+            return {"commit": {"sha": "abc123"}}
+        if "/check-runs" in url:
+            check_run_urls.append(url)
+            if url.endswith("page=1"):
+                return {
+                    "total_count": 101,
+                    "check_runs": [
+                        {
+                            "name": f"matrix-{index}",
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                        for index in range(100)
+                    ],
+                }
+            if url.endswith("page=2"):
+                return {
+                    "total_count": 101,
+                    "check_runs": [
+                        {
+                            "name": "required-late",
+                            "status": "completed",
+                            "conclusion": "success",
+                        }
+                    ],
+                }
+            raise AssertionError(url)
+        if url.endswith("/status"):
+            return {"statuses": []}
+        raise AssertionError(url)
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghs_test")
+    monkeypatch.setattr(workflow_runner_module, "_github_json", github_json)
+    monkeypatch.setattr(
+        workflow_runner_module,
+        "_github_json_optional",
+        lambda url, *, headers: {"contexts": ["required-late"]},
+    )
+
+    marker = workflow_runner_module._fetch_github_ci_marker(
+        Gate(
+            type="ci_green",
+            params={
+                "repo": "KestrelSovereignAI/kestrel-sovereign",
+                "branch": "main",
+            },
+        )
+    )
+
+    assert marker["required_checks"] == ("required-late",)
+    assert marker["check_runs"][-1]["name"] == "required-late"
+    assert [url.rsplit("page=", 1)[1] for url in check_run_urls] == ["1", "2"]
+
+
+def test_github_required_check_names_reads_contexts_and_checks():
+    names = workflow_runner_module._github_required_check_names(
+        {
+            "contexts": ["lint"],
+            "checks": [
+                {"context": "unit-tests", "app_id": 1},
+                {"name": "integration-tests", "app_id": 2},
+                {"context": "lint", "app_id": 3},
+            ],
+        }
+    )
+
+    assert names == ("lint", "unit-tests", "integration-tests")
 
 
 @pytest.mark.asyncio
