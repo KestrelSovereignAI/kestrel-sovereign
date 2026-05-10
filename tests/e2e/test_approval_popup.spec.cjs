@@ -88,9 +88,16 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('.modal-btn:has-text("Deny")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("This Time")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("This Session")')).toBeVisible();
-        await expect(page.locator('.modal-btn:has-text("Enable Auto")')).toBeVisible();
         await expect(page.locator('.modal-btn:has-text("Always")')).toBeVisible();
+        await expect(page.locator('.modal-btn:has-text("Enable Auto Mode")')).toBeVisible();
         await expect(modalBody).toContainText('Auto Mode approves this request');
+        expect((await page.locator('.modal-btn').allTextContents()).map((text) => text.trim())).toEqual([
+            'Deny',
+            'This Time',
+            'This Session',
+            'Always',
+            'Enable Auto Mode',
+        ]);
 
         // Click "This Session" and verify the decision is posted.
         await page.click('.modal-btn:has-text("This Session")');
@@ -140,6 +147,18 @@ test.describe('#748 security approval popup', () => {
 
         const autoModeCalls = [];
         await page.route('**/api/security/auto-mode', async (route, request) => {
+            if (request.method() !== 'POST') {
+                await route.fulfill({
+                    status: 200,
+                    contentType: 'application/json',
+                    body: JSON.stringify({
+                        enabled: false,
+                        warning: 'Auto Mode is off.',
+                    }),
+                });
+                return;
+            }
+
             autoModeCalls.push(JSON.parse(request.postData() || '{}'));
             await route.fulfill({
                 status: 200,
@@ -153,11 +172,13 @@ test.describe('#748 security approval popup', () => {
 
         await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
 
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Off');
         await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
-        await page.click('.modal-btn:has-text("Enable Auto")');
+        await page.click('.modal-btn:has-text("Enable Auto Mode")');
 
         await expect.poll(() => autoModeCalls.length, { timeout: 5000 }).toBe(1);
         expect(autoModeCalls[0]).toMatchObject({ enabled: true });
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
 
         await expect.poll(() => approveCalls.length, { timeout: 5000 }).toBe(1);
         expect(approveCalls[0]).toMatchObject({

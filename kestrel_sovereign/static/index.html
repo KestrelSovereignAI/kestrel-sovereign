@@ -171,8 +171,13 @@
                             </select>
                         </div>
 
-                        <!-- Right: Privacy Mode -->
-                        <div id="chat-privacy-indicator"></div>
+                        <!-- Right: Global security mode + Privacy Mode -->
+                        <div style="display: flex; gap: 0.5rem; align-items: center;">
+                            <button id="chat-auto-mode-btn" onclick="Security.toggleGlobalAutoMode()" class="btn btn-secondary text-sm security-auto-mode-toggle" data-label-key="btn_auto_mode" title="Turn on session-scoped global Auto for non-denied tools.">
+                                Auto Mode: Off
+                            </button>
+                            <div id="chat-privacy-indicator"></div>
+                        </div>
                     </div>
 
                     <!-- Chat Messages -->
@@ -853,7 +858,7 @@
                 <div class="mb-5 section-divider">
                     <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-gear"></span> <span data-label-key="security_session_controls">Session Controls</span></h3>
                     <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
-                        <button id="security-auto-mode-btn" onclick="Security.toggleGlobalAutoMode()" class="btn btn-secondary text-sm" data-label-key="btn_auto_mode">
+                        <button id="security-auto-mode-btn" onclick="Security.toggleGlobalAutoMode()" class="btn btn-secondary text-sm security-auto-mode-toggle" data-label-key="btn_auto_mode">
                             Auto Mode: Off
                         </button>
                         <button onclick="Security.resetSession()" class="btn btn-secondary text-sm" data-label-key="btn_reset_session">
