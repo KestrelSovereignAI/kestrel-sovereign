@@ -107,6 +107,22 @@ class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
 
 
+class PolicyDeniedError(LLMServiceError):
+    """Raised when a generation call is attempted on an LLMService whose
+    PayerPolicy slot is `PayerKind.NONE`.
+
+    The agent-init layer sets `LLMService.disabled = True` when the
+    agent's policy says "no LLM at all" for this agent. Every public
+    generation entry point on `LLMService` (and its mixins) calls
+    `_check_policy()` at the top, which raises this error when
+    `disabled` is True. Callers (chat endpoints, reflection loops,
+    audit pipelines) treat this the same way they treat
+    `KeyNotConfiguredError` today: the agent has no LLM available;
+    surface a structured error rather than silently falling through to
+    a shared host key.
+    """
+
+
 class LLMServiceAlreadyAttachedError(LLMServiceError):
     """Raised when a second agent tries to claim an LLMService that is
     already attached to a different agent.
@@ -818,6 +834,29 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.error(f"Failed to initialize providers: {e}")
             return []
 
+    def _check_policy(self) -> None:
+        """Guard called at the top of every public generation entry point.
+
+        When `PayerPolicy.llm.kind == PayerKind.NONE`, the agent-init
+        layer sets `self.disabled = True`. This method raises
+        `PolicyDeniedError` in that case, preventing every documented
+        generation method (`generate`, `get_response`, the streaming
+        variants, `get_audit_response`, etc.) from silently falling
+        through to a shared host key.
+
+        Centralized here so adding a new generation entry point in the
+        future means one line at the top of the new method instead of
+        re-implementing the gate. The Phase 3b reflection test asserts
+        every async-coroutine and async-generator method whose name
+        matches a generation pattern calls this guard.
+        """
+        if self.disabled:
+            raise PolicyDeniedError(
+                "LLMService is disabled by PayerPolicy "
+                "(llm.kind = NONE). The agent has no LLM available; "
+                "callers should treat this the same as 'no key configured'."
+            )
+
     def attach_to_agent(self, agent_did: str) -> None:
         """Claim this LLMService instance for a specific agent.
 
@@ -1277,6 +1316,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
     async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
         """Get a structured audit response from the normal provider chain."""
+        self._check_policy()
         if not self.providers:
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available."}
 
@@ -1400,6 +1440,7 @@ No other text or formatting.
         Returns:
             String content or LLMResponse (if tools provided or structured output)
         """
+        self._check_policy()
         start_time = time.time()
 
         if not self.providers:
@@ -1485,6 +1526,7 @@ No other text or formatting.
         auto_pull: bool = True
     ) -> str:
         """Get a response using a specific model."""
+        self._check_policy()
         provider_for_model = None
         for provider in self.providers:
             if provider["model"] == model_id or model_id in provider["model"]:
@@ -1628,6 +1670,7 @@ No other text or formatting.
         Returns:
             String content or LLMResponse (if tools/structured output)
         """
+        self._check_policy()
         with optional_span("agent.llm_call", {
             "llm.method": "generate",
             "llm.model": model_override or "",
@@ -1716,6 +1759,7 @@ No other text or formatting.
         Returns:
             String content or LLMResponse
         """
+        self._check_policy()
         # Try remote GPU first when active AND routing isn't pinned — #734.
         if (
             self._backend == BackendType.REMOTE_GPU
