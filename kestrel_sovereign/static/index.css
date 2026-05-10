@@ -958,7 +958,10 @@ nav {
 
 /* Tool activity indicators */
 .tool-activity-container {
+    display: flex;
+    flex-direction: column;
     font-size: 0.8rem;
+    gap: 0.35rem;
     padding: 0.5rem;
     margin-bottom: 0.5rem;
     background: var(--bg-tertiary);
@@ -968,6 +971,11 @@ nav {
 
 .tool-activity-expandable {
     display: block;
+}
+
+.tool-activity-call + .tool-activity-call {
+    border-top: 1px solid var(--border-color);
+    padding-top: 0.35rem;
 }
 
 .tool-activity-summary {

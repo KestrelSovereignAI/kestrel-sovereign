@@ -164,11 +164,10 @@ test('pendingRevise flag pinned on pane shape (initial value + reset on wipe)', 
         + 'the wiped conversation can\'t bleed into the next dispatch');
 });
 
-test('streaming loop drops pre-tool prose when pane.pendingRevise is set', async () => {
-    // Canonical Wave 5D shape: agent emits "Saving that now..." pre-tool,
-    // server fires revising on ToolCallStarted, agent emits post-tool
-    // synthesis chunks. The bubble must end up rendering ONLY the
-    // post-tool synthesis — the pre-tool optimistic text is retracted.
+test('streaming loop preserves visible pre-tool prose when pane.pendingRevise is set', async () => {
+    // The agent emits "Saving that now..." before a tool boundary, then
+    // post-tool synthesis chunks. The sentinel/flag is a wire marker, not
+    // a command to make already-visible text vanish.
     renderCalls.length = 0; finalizeCalls.length = 0;
 
     const pane = getOrCreateChatPane('revise-A');
@@ -207,9 +206,8 @@ test('streaming loop drops pre-tool prose when pane.pendingRevise is set', async
 
     apiModule.default.streamInvoke = origStream;
 
-    // The finalized text fed to finalizeMarkdown must contain ONLY
-    // the post-tool synthesis. The pre-tool optimistic claim was
-    // dropped at the revise boundary.
+    // The finalized text fed to finalizeMarkdown must preserve both
+    // visible parts of the stream.
     assert.equal(finalizeCalls.length, 1,
         'finalizeMarkdown should run exactly once at end of stream');
     const finalText = finalizeCalls[0];
@@ -218,8 +216,8 @@ test('streaming loop drops pre-tool prose when pane.pendingRevise is set', async
         `post-tool synthesis must reach finalizeMarkdown, got: ${JSON.stringify(finalText)}`,
     );
     assert.ok(
-        !finalText.includes('Saving that now'),
-        `pre-tool optimistic prose must NOT reach finalizeMarkdown, got: ${JSON.stringify(finalText)}`,
+        finalText.includes('Saving that now'),
+        `pre-tool prose must remain visible, got: ${JSON.stringify(finalText)}`,
     );
 
     // Flag is cleared once the stream completes so the next turn
@@ -261,10 +259,10 @@ test('streaming loop without revise leaves pre-tool prose intact (regression gua
 
 test('SSE listener routes revising event to the matching pane only', async () => {
     // Codex P3: prior tests flipped pane.pendingRevise directly, so
-    // a broken listener registration / request-id matcher would
-    // still pass. Drive the path end-to-end through a fake
-    // EventSource: register the listener, dispatch an event, assert
-    // ONLY the matching pane gets the placeholder + flag.
+    // a broken listener registration / request-id matcher would still
+    // pass. Drive the path end-to-end through a fake EventSource:
+    // register the listener, dispatch an event, assert ONLY the
+    // matching pane gets the flag.
     renderCalls.length = 0; finalizeCalls.length = 0;
 
     // Fake EventSource that captures handlers and exposes a fire helper.
@@ -324,14 +322,12 @@ test('SSE listener routes revising event to the matching pane only', async () =>
     assert.equal(paneB.pendingRevise, false,
         'pane B (non-matching) must NOT be touched');
 
-    // The matching pane's bubble shows the placeholder; the
-    // non-matching pane's bubble is untouched.
+    // The visible bubbles are untouched; the matching pane only records
+    // the pending boundary flag.
     const slotA = msgA.querySelector('.message-content') || msgA;
     const slotB = msgB.querySelector('.message-content') || msgB;
-    assert.ok(
-        (slotA._innerHTML || '').includes('Revising'),
-        `pane A bubble must show the revising placeholder, got: ${JSON.stringify(slotA._innerHTML)}`,
-    );
+    assert.ok(!(slotA._innerHTML || '').includes('Revising'),
+        'pane A bubble must not be replaced by a revising placeholder');
     assert.ok(
         !(slotB._innerHTML || '').includes('Revising'),
         'pane B bubble must NOT show the placeholder',
@@ -354,13 +350,9 @@ test('SSE listener routes revising event to the matching pane only', async () =>
 // Wave 5E in-band sentinel — strict-ordering signal on the chat stream
 // =====================================================================
 
-test('inband sentinel: pre-tool retracted, sentinel stripped, post-tool kept', async () => {
+test('inband sentinel: visible prose kept, sentinel stripped', async () => {
     // Server emits the sentinel between pre-tool prose and post-tool
-    // synthesis. Client must:
-    //  * detect the sentinel
-    //  * NOT include it in the rendered/persisted text
-    //  * drop pre-tool prose accumulated so far
-    //  * paint post-tool chunks fresh into the now-empty bubble
+    // synthesis. Client strips the marker while preserving visible text.
     renderCalls.length = 0; finalizeCalls.length = 0;
 
     const pane = getOrCreateChatPane('inband-A');
@@ -395,8 +387,8 @@ test('inband sentinel: pre-tool retracted, sentinel stripped, post-tool kept', a
     const finalText = finalizeCalls[0];
     assert.ok(finalText.includes('did not persist'),
         `post-tool prose must reach finalize, got: ${JSON.stringify(finalText)}`);
-    assert.ok(!finalText.includes('Saving that now'),
-        `pre-tool prose must NOT reach finalize, got: ${JSON.stringify(finalText)}`);
+    assert.ok(finalText.includes('Saving that now'),
+        `pre-tool prose must remain visible, got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('\x1e'),
         `wire-protocol \\x1e must never reach finalize, got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('KESTREL:REVISE'),
@@ -404,9 +396,8 @@ test('inband sentinel: pre-tool retracted, sentinel stripped, post-tool kept', a
 });
 
 test('inband sentinel fused into a single chunk: pre + sentinel + post', async () => {
-    // The chunk happens to contain pre-tool, the sentinel, AND post-
-    // tool all together. The strip drops pre-sentinel + sentinel,
-    // keeping only post-sentinel as the new bubble's leading text.
+    // The chunk happens to contain pre-tool, the sentinel, AND post-tool
+    // all together. The strip removes only the sentinel.
     renderCalls.length = 0; finalizeCalls.length = 0;
 
     const pane = getOrCreateChatPane('inband-B');
@@ -434,14 +425,85 @@ test('inband sentinel fused into a single chunk: pre + sentinel + post', async (
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'fresh start',
-        `fused chunk must drop pre-sentinel + sentinel, keep post-sentinel; got: ${JSON.stringify(finalText)}`);
+    assert.equal(finalText, 'Savingfresh start',
+        `fused chunk must strip only the sentinel; got: ${JSON.stringify(finalText)}`);
+});
+
+test('multiple inband sentinels in one chunk preserve intervening prose', async () => {
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('multi-sentinel-A');
+    apiModule.default.setHostAgent('multi-sentinel-A');
+    mountChatPane('multi-sentinel-A');
+    pane.sessionId = 'sess-ms1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push(
+        'before' +
+        '\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e' +
+        'between' +
+        '\x1eKESTREL:REVISE:{"index":1,"tool_call_id":"tc2","tool_name":"y"}\x1e' +
+        'after',
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'beforebetweenafter',
+        `multiple sentinels must strip markers only; got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('KESTREL:REVISE'));
+    assert.ok(!finalText.includes('\x1e'));
+});
+
+test('complete sentinel followed by split sentinel prefix buffers the second marker', async () => {
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('adjacent-split-A');
+    apiModule.default.setHostAgent('adjacent-split-A');
+    mountChatPane('adjacent-split-A');
+    pane.sessionId = 'sess-as1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push(
+        'before' +
+        '\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e' +
+        'between\x1eKESTREL:REV',
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.push('ISE:{"index":1,"tool_call_id":"tc2","tool_name":"y"}\x1eafter');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'beforebetweenafter',
+        `adjacent split sentinel must strip markers only; got: ${JSON.stringify(finalText)}`);
+    assert.ok(!finalText.includes('KESTREL:REVISE'));
+    assert.ok(!finalText.includes('\x1e'));
 });
 
 test('inband sentinel + SSE listener are idempotent (both fire, retract once)', async () => {
     // If both signals arrive (the common case), pendingRevise gets
-    // set twice but only triggers ONE retraction. The second signal
-    // is a no-op against the already-cleared accumulator.
+    // set but must not clear visible prose.
     renderCalls.length = 0; finalizeCalls.length = 0;
 
     const pane = getOrCreateChatPane('idempotent-A');
@@ -473,8 +535,8 @@ test('inband sentinel + SSE listener are idempotent (both fire, retract once)', 
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
     assert.ok(finalText.includes('post-tool answer'));
-    assert.ok(!finalText.includes('pre-tool'),
-        'pre-tool prose must be retracted exactly once even with both signals');
+    assert.ok(finalText.includes('pre-tool'),
+        'pre-tool prose must remain visible even with both signals');
     assert.ok(!finalText.includes('\x1e'));
 });
 
@@ -510,8 +572,8 @@ test('inband sentinel split across chunk boundary: buffering wrapper reassembles
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'clean post-tool',
-        `split sentinel should reassemble + retract; got: ${JSON.stringify(finalText)}`);
+    assert.equal(finalText, 'Savingclean post-tool',
+        `split sentinel should reassemble and strip only the marker; got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('\x1e'));
     assert.ok(!finalText.includes('KESTREL:REVISE'));
 });
@@ -594,7 +656,7 @@ test('late SSE after in-band consumed: actual listener dispatch is no-op', async
     assert.ok(finalText.includes('did not persist'));
     assert.ok(finalText.includes('Try a different store'),
         `late post-tool chunks must survive late-SSE no-op, got: ${JSON.stringify(finalText)}`);
-    assert.ok(!finalText.includes('Saving that now'));
+    assert.ok(finalText.includes('Saving that now'));
 });
 
 test('partial prefix split inside the sentinel prefix string (codex P2 of #1089)', async () => {
@@ -629,9 +691,9 @@ test('partial prefix split inside the sentinel prefix string (codex P2 of #1089)
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'fresh post-tool',
-        `partial-prefix split must reassemble + retract; got: ${JSON.stringify(finalText)}`);
-    assert.ok(!finalText.includes('Saving'));
+    assert.equal(finalText, 'Savingfresh post-tool',
+        `partial-prefix split must reassemble and strip only the marker; got: ${JSON.stringify(finalText)}`);
+    assert.ok(finalText.includes('Saving'));
     assert.ok(!finalText.includes('KESTREL'));
     assert.ok(!finalText.includes('\x1e'));
 });

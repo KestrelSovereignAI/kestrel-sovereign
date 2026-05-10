@@ -34,6 +34,44 @@ function renderToolActivityLineHtml(line) {
     return `<div class="tool-activity">${escaped}</div>`;
 }
 
+function parseToolActivityLine(line) {
+    const text = String(line || '').trim();
+    const startMatch = text.match(/^\u{1F527}\s*(?:Calling\s+)?(.+?)(?:\.\.\.)?$/u);
+    const doneMatch = text.match(/^\u2713\s*(.+?)\s+(complete|done)(?:\s+\((.+)\))?$/u);
+    const errorMatch = text.match(/^\u274C\s*(.+?)\s+failed(?::\s*(.*))?$/u);
+    if (startMatch) return { kind: 'start', name: startMatch[1], line: text };
+    if (doneMatch) return { kind: 'done', name: doneMatch[1], detail: doneMatch[3] || '', line: text };
+    if (errorMatch) return { kind: 'error', name: errorMatch[1], detail: errorMatch[2] || '', line: text };
+    return { kind: 'note', name: '', line: text };
+}
+
+function groupToolActivity(lines) {
+    const groups = [];
+    for (const line of lines) {
+        const parsed = parseToolActivityLine(line);
+        if (parsed.kind === 'start') {
+            groups.push({ name: parsed.name, status: 'running', detail: '', lines: [line] });
+            continue;
+        }
+
+        const target = [...groups].reverse().find((group) => group.name === parsed.name && group.status === 'running');
+        if (target && (parsed.kind === 'done' || parsed.kind === 'error')) {
+            target.status = parsed.kind === 'done' ? 'complete' : 'error';
+            target.detail = parsed.detail;
+            target.lines.push(line);
+            continue;
+        }
+
+        groups.push({
+            name: parsed.name || line,
+            status: parsed.kind === 'error' ? 'error' : parsed.kind === 'done' ? 'complete' : 'note',
+            detail: parsed.detail || '',
+            lines: [line],
+        });
+    }
+    return groups;
+}
+
 function isToolActivityLine(line) {
     const text = String(line || '').trim();
     return (
@@ -49,32 +87,88 @@ function isToolActivityStartLine(line) {
 
 export function splitToolActivity(content) {
     const text = String(content || '');
-    const parts = text.split('\n---\n');
-    const firstLine = text.split('\n').find((line) => line.trim()) || '';
-    const hasToolIndicators = isToolActivityStartLine(firstLine);
-    if (hasToolIndicators && parts.length > 1) {
+    const [beforeSeparator, ...afterSeparatorParts] = text.split('\n---\n');
+    const beforeLines = beforeSeparator.split('\n');
+    const toolStartIndex = beforeLines.findIndex(isToolActivityStartLine);
+    if (toolStartIndex < 0) {
         return {
-            toolActivity: parts[0],
-            response: parts.slice(1).join('\n---\n'),
-            hasToolActivity: !!parts[0].trim(),
+            prelude: '',
+            toolActivity: '',
+            response: text,
+            hasToolActivity: false,
         };
     }
-    if (hasToolIndicators) {
-        const lines = text.split('\n');
-        const responseStart = lines.findIndex((line) => line.trim() && !isToolActivityLine(line));
-        if (responseStart >= 0) {
-            return {
-                toolActivity: lines.slice(0, responseStart).join('\n'),
-                response: lines.slice(responseStart).join('\n'),
-                hasToolActivity: true,
-            };
-        }
+
+    const prelude = beforeLines.slice(0, toolStartIndex).join('\n').trimEnd();
+    if (afterSeparatorParts.length > 0) {
+        const toolActivity = beforeLines.slice(toolStartIndex).join('\n');
+        const response = afterSeparatorParts.join('\n---\n');
+        return {
+            prelude,
+            toolActivity,
+            response,
+            hasToolActivity: !!toolActivity.trim(),
+        };
     }
+
+    const toolAndMaybeResponse = beforeLines.slice(toolStartIndex);
+    const responseStart = toolAndMaybeResponse.findIndex((line) => line.trim() && !isToolActivityLine(line));
+    if (responseStart >= 0) {
+        const toolActivity = toolAndMaybeResponse.slice(0, responseStart).join('\n');
+        const response = toolAndMaybeResponse.slice(responseStart).join('\n');
+        return {
+            prelude,
+            toolActivity,
+            response,
+            hasToolActivity: true,
+        };
+    }
+
+    const toolActivity = toolAndMaybeResponse.join('\n');
     return {
-        toolActivity: hasToolIndicators ? text : '',
-        response: hasToolIndicators ? '' : text,
-        hasToolActivity: hasToolIndicators,
+        prelude,
+        toolActivity,
+        response: '',
+        hasToolActivity: !!toolActivity.trim(),
     };
+}
+
+function renderStreamingResponseSections({ prelude, toolActivity, response, hasToolActivity }, originalContent) {
+    if (!hasToolActivity) {
+        return renderStreamingMarkdown(originalContent);
+    }
+
+    const sections = [];
+    if (prelude) {
+        sections.push(`<div class="response-content response-prelude">${renderStreamingMarkdown(prelude)}</div>`);
+    }
+    if (toolActivity) {
+        sections.push(renderToolActivityHtml(toolActivity));
+    }
+    if (response) {
+        sections.push(`<div class="response-content">${renderStreamingMarkdown(response)}</div>`);
+    }
+    return sections.join('');
+}
+
+async function finalizeAgentContent(contentDiv, content) {
+    const split = splitToolActivity(content);
+    const { toolActivity, response, hasToolActivity, prelude } = split;
+    if (!hasToolActivity) {
+        await finalizeMarkdown(contentDiv, content);
+        return;
+    }
+
+    const preludeHtml = prelude
+        ? `<div class="response-content response-prelude">${renderMarkdown(prelude)}</div>`
+        : '';
+    contentDiv.innerHTML = `${preludeHtml}${renderToolActivityHtml(toolActivity)}`;
+    if (response) {
+        const responseDiv = document.createElement('div');
+        responseDiv.className = 'response-content';
+        contentDiv.appendChild(responseDiv);
+        await finalizeMarkdown(responseDiv, response);
+    }
 }
 
 export function renderToolActivityHtml(activityText) {
@@ -84,93 +178,63 @@ export function renderToolActivityHtml(activityText) {
         .filter(Boolean);
     if (lines.length === 0) return '';
 
-    const toolNames = lines.map((line) => {
-        const startMatch = line.match(/^\u{1F527}\s*(?:Calling\s+)?(.+?)(?:\.\.\.)?$/u);
-        const doneMatch = line.match(/^\u2713\s*(.+?)\s+(?:complete|done)(?:\s+\(.+\))?$/u);
-        const errorMatch = line.match(/^\u274C\s*(.+?)\s+failed(?::.*)?$/u);
-        return startMatch?.[1] || doneMatch?.[1] || errorMatch?.[1] || null;
-    }).filter(Boolean);
-    const uniqueToolNames = [...new Set(toolNames)];
-    const latest = uniqueToolNames[uniqueToolNames.length - 1];
-    const summaryText = uniqueToolNames.length === 1
-        ? `Tool call: ${latest}`
-        : `${uniqueToolNames.length || lines.length} tool call events`;
-    const eventCount = lines.length === 1 ? '1 event' : `${lines.length} events`;
-    const activityHtml = lines.map(renderToolActivityLineHtml).join('');
+    const groups = groupToolActivity(lines);
+    const callsHtml = groups.map((group) => {
+        const eventCount = group.lines.length === 1 ? '1 event' : `${group.lines.length} events`;
+        const detail = group.detail ? ` · ${group.detail}` : '';
+        const meta = `${group.status}${detail} · ${eventCount}`;
+        const activityHtml = group.lines.map(renderToolActivityLineHtml).join('');
 
-    return `
-        <details class="tool-activity-container tool-activity-expandable">
+        return `
+        <details class="tool-activity-expandable tool-activity-call">
             <summary class="tool-activity-summary">
-                <span>${escapeHtml(summaryText)}</span>
-                <span class="tool-activity-count">${escapeHtml(eventCount)}</span>
+                <span>${escapeHtml(`Tool call: ${group.name}`)}</span>
+                <span class="tool-activity-count">${escapeHtml(meta)}</span>
             </summary>
             <div class="tool-activity-list">${activityHtml}</div>
         </details>
     `;
-}
+    }).join('');
 
-async function finalizeAgentContent(contentDiv, content) {
-    const { toolActivity, response, hasToolActivity } = splitToolActivity(content);
-    if (!hasToolActivity) {
-        await finalizeMarkdown(contentDiv, content);
-        return;
-    }
-
-    contentDiv.innerHTML = renderToolActivityHtml(toolActivity);
-    if (response) {
-        const responseDiv = document.createElement('div');
-        responseDiv.className = 'response-content';
-        contentDiv.appendChild(responseDiv);
-        await finalizeMarkdown(responseDiv, response);
-    }
+    return `<div class="tool-activity-container">${callsHtml}</div>`;
 }
 
 /**
  * Detect and strip in-band revise sentinels from a chat-stream chunk.
  *
- * Returns ``{ textBefore, textAfter, sawSentinel }``:
- *   * No sentinel in chunk → ``textBefore = chunk``, ``textAfter = ''``,
- *     ``sawSentinel = false``. Caller renders ``textBefore``.
- *   * Complete sentinel(s) in chunk → ``textBefore`` is the pre-
- *     sentinel slice (pre-tool prose, will be retracted),
- *     ``textAfter`` is the post-sentinel slice (post-tool, becomes
- *     the start of fresh content), ``sawSentinel = true``.
- *   * Split sentinel (prefix without close) → ``textBefore`` is the
- *     pre-sentinel slice (pre-tool), ``textAfter = ''``,
- *     ``sawSentinel = true``. The closing-half chunk's wire-metadata
- *     bytes leak into the next render frame as a transient UI glitch;
- *     the Wave 5C SSE listener catches the same marker as a backup
- *     so correctness (pendingRevise armed) is preserved. Tracked as
- *     a known limitation — split delivery requires a sentinel landing
- *     exactly on a TCP/buffer boundary, vanishingly rare in practice
- *     because FastAPI's StreamingResponse buffers per-yield.
- *
- * Caller flips ``pane.pendingRevise = true`` on ``sawSentinel`` and
- * reads only ``textAfter`` going forward (or ``textBefore`` when no
- * sentinel).
+ * Returns ``{ textBefore, textAfter, sawSentinel }``. ``textBefore``
+ * contains the chunk with all complete sentinel markers removed.
+ * ``textAfter`` is kept for the legacy call shape but is always empty.
+ * Incomplete sentinels are buffered by the streaming loop before this
+ * helper runs, so wire metadata should never be rendered as prose.
  */
 function stripReviseSentinel(chunk) {
     const start = chunk.indexOf(REVISE_SENTINEL_PREFIX);
     if (start < 0) {
         return { textBefore: chunk, textAfter: '', sawSentinel: false };
     }
-    const textBefore = chunk.slice(0, start);
-    const sentinelOpenEnd = start + REVISE_SENTINEL_PREFIX.length;
-    const closeIdx = chunk.indexOf(REVISE_SENTINEL_SUFFIX, sentinelOpenEnd);
-    if (closeIdx < 0) {
-        return { textBefore, textAfter: '', sawSentinel: true };
+
+    let stripped = '';
+    let cursor = 0;
+    let sawSentinel = false;
+    while (cursor < chunk.length) {
+        const sentinelStart = chunk.indexOf(REVISE_SENTINEL_PREFIX, cursor);
+        if (sentinelStart < 0) {
+            stripped += chunk.slice(cursor);
+            break;
+        }
+
+        stripped += chunk.slice(cursor, sentinelStart);
+        const sentinelOpenEnd = sentinelStart + REVISE_SENTINEL_PREFIX.length;
+        const closeIdx = chunk.indexOf(REVISE_SENTINEL_SUFFIX, sentinelOpenEnd);
+        if (closeIdx < 0) {
+            break;
+        }
+
+        sawSentinel = true;
+        cursor = closeIdx + REVISE_SENTINEL_SUFFIX.length;
     }
-    const after = chunk.slice(closeIdx + REVISE_SENTINEL_SUFFIX.length);
-    // Recurse to handle multiple sentinels in the same chunk
-    // (consecutive ToolCallStarted markers in a single yield, very
-    // rare). Only the LAST sentinel's post-slice survives — every
-    // intermediate slice is pre-tool of the next boundary.
-    const tail = stripReviseSentinel(after);
-    return {
-        textBefore,
-        textAfter: tail.sawSentinel ? tail.textAfter : after,
-        sawSentinel: true,
-    };
+    return { textBefore: stripped, textAfter: '', sawSentinel };
 }
 
 // ============================================================================
@@ -432,14 +496,9 @@ export function connectNotifications() {
 
         // Constitutional honesty signal — Wave 5C of #1048.
         //
-        // Idempotency contract (Wave 5E refined): the in-band sentinel
-        // and this SSE event can both fire for the same request. We
-        // mark a request as "revise consumed" once either path
-        // processes it; subsequent fires for the same request_id are
-        // ignored. Without this, a delayed SSE arriving AFTER the
-        // in-band path already retracted + re-rendered post-tool
-        // would re-arm pendingRevise and clear the post-tool text.
-        // Codex P1 of #1089.
+        // The event marks the tool boundary, but it should not clear
+        // already-visible prose. The in-band sentinel is stripped from
+        // the chat stream; prose before and after it remains visible.
         notificationEventSource.addEventListener('revising', (e) => {
             try {
                 const data = JSON.parse(e.data);
@@ -454,11 +513,6 @@ export function connectNotifications() {
                     if (!pane.streamingMsgDiv) return;
                     pane.pendingRevise = true;
                     pane.reviseConsumedRequestId = targetRequestId;
-                    const contentSlot =
-                        pane.streamingMsgDiv.querySelector('.message-content')
-                        || pane.streamingMsgDiv;
-                    contentSlot.innerHTML =
-                        '<em class="revising-placeholder">Revising — checking tool result...</em>';
                     return;
                 }
             } catch (err) {
@@ -778,10 +832,9 @@ export async function sendMessage() {
                             sentinelBuffer = merged.slice(lastFullPrefixIdx);
                         }
                     }
-                    // Strip any complete sentinels in processable.
-                    // Pre-sentinel slice (textBefore) = pre-tool prose
-                    // (gets retracted). Post-sentinel (textAfter) =
-                    // start of post-tool synthesis.
+                    // Strip any complete sentinels in processable. The
+                    // sentinel is a wire marker, not a command to hide
+                    // user-visible prose.
                     let { textBefore, textAfter, sawSentinel } =
                         stripReviseSentinel(processable);
                     // Case B: a PARTIAL prefix at the tail of post-
@@ -791,7 +844,7 @@ export async function sendMessage() {
                     // misidentify the closing \\x1e of a just-stripped
                     // sentinel as a new prefix start. Codex P2 of #1089.
                     if (!sentinelBuffer) {
-                        const target = sawSentinel ? textAfter : textBefore;
+                        const target = textBefore;
                         if (target.length > 0) {
                             const maxCheck = Math.min(
                                 target.length,
@@ -802,46 +855,27 @@ export async function sendMessage() {
                                 if (REVISE_SENTINEL_PREFIX.startsWith(tail)) {
                                     sentinelBuffer = tail;
                                     const trimmed = target.slice(0, target.length - i);
-                                    if (sawSentinel) textAfter = trimmed;
-                                    else textBefore = trimmed;
+                                    textBefore = trimmed;
                                     break;
                                 }
                             }
                         }
                     }
                     if (sawSentinel) {
-                        pane.pendingRevise = true;
                         // Mark this request's revise as consumed so a
-                        // delayed SSE arriving after the in-band path
-                        // already retracted + re-rendered post-tool
-                        // becomes a no-op. The in-band path itself
-                        // doesn't need this guard (each ToolCallStarted
-                        // produces exactly one sentinel — no double-
-                        // arming risk on this side).
+                        // delayed SSE arriving after the in-band path is
+                        // treated as a no-op.
                         const rid = API.getCurrentStreamRequestId(dispatchAgent);
                         if (rid) pane.reviseConsumedRequestId = rid;
-                        if (pane.streamingMsgDiv) {
-                            const slot =
-                                pane.streamingMsgDiv.querySelector('.message-content')
-                                || pane.streamingMsgDiv;
-                            slot.innerHTML =
-                                '<em class="revising-placeholder">Revising — checking tool result...</em>';
-                        }
                     }
-                    // Wave 5C: pendingRevise might have been armed
-                    // either by the SSE listener OR by the in-band
-                    // sentinel above. Either way: drop the pre-tool
-                    // prose accumulated so far so the next painted
-                    // text starts fresh in the now-empty bubble.
+                    // A legacy SSE revising event can still arrive before
+                    // the in-band sentinel. Clear the flag without clearing
+                    // the visible accumulator; the sentinel itself is the
+                    // only thing that should disappear.
                     if (pane.pendingRevise) {
-                        fullContent = '';
                         pane.pendingRevise = false;
                     }
-                    // When a sentinel was seen, only post-sentinel
-                    // content survives. Pre-sentinel content is
-                    // pre-tool and gets dropped (along with anything
-                    // already in fullContent — already reset above).
-                    const chunk = sawSentinel ? textAfter : textBefore;
+                    const chunk = sawSentinel ? textBefore + textAfter : textBefore;
                     if (!chunk) continue;
                     fullContent += chunk;
                     // The server resolves the effective session_id and
@@ -1128,14 +1162,10 @@ export function addMessageStreaming(role, paneElement = null) {
 export function updateStreamingMessage(msgDiv, content, paneElement = null) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
-        const { toolActivity, response, hasToolActivity } = splitToolActivity(content);
+        const split = splitToolActivity(content);
 
-        if (hasToolActivity && !response) {
-            // Still in tool execution phase - show as expandable activity.
-            contentDiv.innerHTML = renderToolActivityHtml(content);
-        } else if (toolActivity) {
-            // Have both tool activity and response
-            contentDiv.innerHTML = `${renderToolActivityHtml(toolActivity)}<div class="response-content">${renderStreamingMarkdown(response)}</div>`;
+        if (split.hasToolActivity) {
+            contentDiv.innerHTML = renderStreamingResponseSections(split, content);
             highlightCodeBlocks(contentDiv, true);
         } else {
             // No tool indicators - regular markdown
