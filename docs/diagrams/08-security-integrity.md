@@ -437,6 +437,7 @@ graph TD
 
     subgraph decisions["Decision Types"]
         D1["auto_allowed<br/>Permission was ALLOW"]
+        D1A["auto_mode_allowed<br/>Permission was AUTO and earlier policy hooks did not flag"]
         D2["auto_denied<br/>Permission was DENY"]
         D3["user_approved<br/>User said yes"]
         D4["user_denied<br/>User said no"]

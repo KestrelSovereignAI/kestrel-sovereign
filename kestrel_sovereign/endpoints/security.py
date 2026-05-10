@@ -20,7 +20,7 @@ class SetPermissionRequest(BaseModel):
     """Request to set a tool permission."""
     feature: str
     tool: Optional[str] = None
-    level: str  # "allow", "deny", "ask", "session"
+    level: str  # "allow", "auto", "deny", "ask", "session"
 
 
 class SetFeaturePermissionRequest(BaseModel):
@@ -34,6 +34,11 @@ class ApprovalDecisionRequest(BaseModel):
     approval_id: str
     approved: bool
     scope: str = "once"  # "once", "session", "always"
+
+
+class AutoModeRequest(BaseModel):
+    """Request to enable or disable global Auto mode."""
+    enabled: bool
 
 
 class ToolPermissionResponse(BaseModel):
@@ -83,6 +88,12 @@ class AuditLogEntry(BaseModel):
 class AuditLogResponse(BaseModel):
     """Audit log response."""
     logs: List[AuditLogEntry]
+
+
+class AutoModeResponse(BaseModel):
+    """Global Auto mode status."""
+    enabled: bool
+    warning: str
 
 
 # === Helper Functions ===
@@ -158,7 +169,7 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid level '{data.level}'. Use: allow, deny, ask, session"
+            detail=f"Invalid level '{data.level}'. Use: allow, auto, deny, ask, session"
         )
 
     if level == PermissionLevel.DENY:
@@ -169,12 +180,19 @@ async def set_tool_permission(request: Request, data: SetPermissionRequest):
         await security.permission_store.set_permission(
             data.feature, data.tool, level
         )
-        return {"success": True, "message": f"Set {data.feature}.{data.tool} to {data.level}"}
+        response = {"success": True, "message": f"Set {data.feature}.{data.tool} to {data.level}"}
     else:
         await security.permission_store.set_feature_permission(
             data.feature, level
         )
-        return {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}
+        response = {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}
+    if level == PermissionLevel.AUTO:
+        response["warning"] = (
+            "Auto mode skips human approval when earlier constitutional, honesty, "
+            "and security hooks do not flag the call. It is not a guarantee that "
+            "every risk has been detected."
+        )
+    return response
 
 
 @router.post("/permissions/feature")
@@ -194,7 +212,7 @@ async def set_feature_permission(request: Request, data: SetFeaturePermissionReq
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail=f"Invalid level '{data.level}'. Use: allow, deny, ask, session"
+            detail=f"Invalid level '{data.level}'. Use: allow, auto, deny, ask, session"
         )
 
     if level == PermissionLevel.DENY:
@@ -202,7 +220,14 @@ async def set_feature_permission(request: Request, data: SetFeaturePermissionReq
         await enforce_destructive_op(request)
 
     await security.permission_store.set_feature_permission(data.feature, level)
-    return {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}
+    response = {"success": True, "message": f"Set all tools in {data.feature} to {data.level}"}
+    if level == PermissionLevel.AUTO:
+        response["warning"] = (
+            "Auto mode skips human approval when earlier constitutional, honesty, "
+            "and security hooks do not flag the call. It is not a guarantee that "
+            "every risk has been detected."
+        )
+    return response
 
 
 @router.get("/pending", response_model=PendingListResponse)
@@ -227,6 +252,57 @@ async def get_pending_approvals(request: Request):
             for r in pending
         ],
         count=len(pending)
+    )
+
+
+@router.get("/auto-mode", response_model=AutoModeResponse)
+async def get_auto_mode(request: Request):
+    """
+    Get global Auto mode status.
+
+    Global Auto is session-scoped. While enabled, non-DENY tool
+    permissions behave as AUTO, so human approval is skipped after
+    earlier constitutional, honesty, and security hooks do not flag.
+    """
+    security = get_security_feature(request)
+    enabled = security.permission_store.get_global_auto_mode()
+    return AutoModeResponse(
+        enabled=enabled,
+        warning=(
+            "Global Auto skips human approval for non-DENY tools when earlier "
+            "constitutional, honesty, and security hooks do not flag the call. "
+            "It is session-scoped and is not a guarantee that every risk has "
+            "been detected."
+        ),
+    )
+
+
+@router.post("/auto-mode", response_model=AutoModeResponse)
+@limiter.limit("30/minute")
+async def set_auto_mode(request: Request, data: AutoModeRequest):
+    """
+    Enable or disable global Auto mode for this server session.
+
+    Explicit DENY permissions remain DENY. All other configured or
+    unregistered tools resolve as AUTO while this switch is enabled.
+    """
+    security = get_security_feature(request)
+    security.permission_store.set_global_auto_mode(data.enabled)
+    await security.permission_store.log_decision(
+        feature_name="SecurityFeature",
+        tool_name="global_auto_mode",
+        action="mode_change",
+        decision="global_auto_enabled" if data.enabled else "global_auto_disabled",
+        user_choice="session",
+    )
+    return AutoModeResponse(
+        enabled=security.permission_store.get_global_auto_mode(),
+        warning=(
+            "Global Auto skips human approval for non-DENY tools when earlier "
+            "constitutional, honesty, and security hooks do not flag the call. "
+            "It is session-scoped and is not a guarantee that every risk has "
+            "been detected."
+        ),
     )
 
 

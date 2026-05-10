@@ -157,6 +157,29 @@ class TestPermissionStore:
         assert level == PermissionLevel.ASK
 
     @pytest.mark.asyncio
+    async def test_global_auto_mode_overrides_non_denied_permissions(self, store):
+        await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ASK)
+        await store.register_tool("WalletAgent", "delete_everything", PermissionLevel.DENY)
+        await store.register_tool("SearchFeature", "web_search", PermissionLevel.ALLOW)
+
+        store.set_global_auto_mode(True)
+
+        assert await store.get_permission("WalletAgent", "get_balance") == PermissionLevel.AUTO
+        assert await store.get_permission("SearchFeature", "web_search") == PermissionLevel.AUTO
+        assert await store.get_permission("NewFeature", "new_tool") == PermissionLevel.AUTO
+        assert await store.get_permission("WalletAgent", "delete_everything") == PermissionLevel.DENY
+
+    @pytest.mark.asyncio
+    async def test_clear_session_overrides_disables_global_auto(self, store):
+        await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ASK)
+        store.set_global_auto_mode(True)
+
+        store.clear_session_overrides()
+
+        assert store.get_global_auto_mode() is False
+        assert await store.get_permission("WalletAgent", "get_balance") == PermissionLevel.ASK
+
+    @pytest.mark.asyncio
     async def test_set_feature_permission(self, store):
         # Register multiple tools
         await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ASK)
@@ -188,6 +211,17 @@ class TestPermissionStore:
         search_feature = next(f for f in tree if f.feature_name == "SearchFeature")
         assert len(search_feature.tools) == 1
         assert search_feature.rollup_state == "ask_all"
+
+    @pytest.mark.asyncio
+    async def test_auto_permission_rolls_up(self, store):
+        await store.register_tool("ComputeFeature", "run_script", PermissionLevel.AUTO)
+        await store.register_tool("ComputeFeature", "list_scripts", PermissionLevel.AUTO)
+
+        tree = await store.get_permission_tree()
+
+        compute_feature = next(f for f in tree if f.feature_name == "ComputeFeature")
+        assert compute_feature.rollup_state == "auto_all"
+        assert {tool.level for tool in compute_feature.tools} == {PermissionLevel.AUTO}
 
     @pytest.mark.asyncio
     async def test_log_decision(self, store):
@@ -570,6 +604,32 @@ class TestSecurityHook:
         output = await hook.execute(input)
         assert output.continue_execution is True
         assert output.permission_decision == PermissionDecision.ALLOW
+
+    @pytest.mark.asyncio
+    async def test_auto_mode_allows_without_queue_and_audits_distinctly(
+        self, hook, permission_store, approval_queue
+    ):
+        await permission_store.register_tool(
+            "WalletAgent", "get_balance", PermissionLevel.AUTO
+        )
+
+        input = HookInput(
+            session_id="test",
+            hook_event_name="PreToolUse",
+            tool_name="get_balance",
+            feature_name="WalletAgent",
+            tool_input={},
+        )
+
+        output = await hook.execute(input)
+
+        assert output.continue_execution is True
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert approval_queue.pending_requests == []
+
+        logs = await permission_store.get_audit_log(limit=1)
+        assert logs[0]["decision"] == "auto_mode_allowed"
+        assert logs[0]["user_choice"] == "constitutional_honesty_unflagged"
 
     @pytest.mark.asyncio
     async def test_auto_deny(self, hook, permission_store):
