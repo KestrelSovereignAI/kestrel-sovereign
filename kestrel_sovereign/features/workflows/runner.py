@@ -85,6 +85,7 @@ _RUNNER_GATE_TYPES = frozenset(
         "council_approve",
         "consent_collect",
         "signature_collected",
+        "script",
         "constitution_echo_verified",
         "constitutional_boundary_clean",
     }
@@ -99,6 +100,8 @@ CouncilApproveProvider = Callable[
     [Gate, WorkflowRun, Stage, StageLink],
     Awaitable[Any] | Any,
 ]
+ScriptGateProvider = Callable[[Gate, Any], Awaitable[Any] | Any]
+ScriptArtifactResolver = Callable[[Gate], Awaitable[Any] | Any]
 
 
 class WorkflowRunnerError(RuntimeError):
@@ -128,6 +131,8 @@ class WorkflowRunner:
         ci_green_provider: Optional[CiGreenProvider] = None,
         consent_collect_provider: Optional[ConsentCollectProvider] = None,
         council_approve_provider: Optional[CouncilApproveProvider] = None,
+        script_gate_provider: Optional[ScriptGateProvider] = None,
+        script_artifact_resolver: Optional[ScriptArtifactResolver] = None,
     ) -> None:
         self.store = store
         self.dispatcher = dispatcher
@@ -138,6 +143,8 @@ class WorkflowRunner:
         self.ci_green_provider = ci_green_provider or _default_ci_green_provider
         self.consent_collect_provider = consent_collect_provider
         self.council_approve_provider = council_approve_provider
+        self.script_gate_provider = script_gate_provider
+        self.script_artifact_resolver = script_artifact_resolver
 
     async def start_run(
         self,
@@ -475,6 +482,14 @@ class WorkflowRunner:
                     "requires signal_mode=ACTION or ARTIFACT"
                 )
             if (
+                stage.gate.type == "script"
+                and stage.signal_mode not in {SignalMode.ACTION, SignalMode.COGNITION}
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} gate {stage.gate.type!r} "
+                    "requires signal_mode=ACTION or COGNITION"
+                )
+            if (
                 stage.gate.type == "constitution_echo_verified"
                 and stage.signal_mode != SignalMode.COGNITION
             ):
@@ -650,6 +665,33 @@ class WorkflowRunner:
         )
         await self.store.insert_stage_link(link)
 
+        preflight_outcome, preflight_reason = await self._preflight_stage_gate(stage)
+        if preflight_outcome is not None:
+            actor_did, actor_sig = sign_stage_transition(
+                run_id=run.run_id,
+                stage_name=stage.name,
+                attempt_number=attempt_number,
+                signal_id=None,
+                gate_outcome=preflight_outcome.value,
+                agent_identity=self.agent_identity,
+                use_hybrid=True,
+            )
+            await self.store.update_stage_link_transition(
+                link.link_id,
+                signal_id=None,
+                gate_outcome=preflight_outcome,
+                gate_reason=preflight_reason,
+                actor_did=actor_did,
+                actor_sig=actor_sig,
+                post_cancel=False,
+            )
+            if stage.compensate == "noop_idempotent":
+                await self.store.update_compensate_state(
+                    link.link_id, "not_required"
+                )
+            record_gate_outcome(spec.name, stage.name, preflight_outcome.value)
+            return preflight_outcome
+
         payload = {**stage.to_dict()["params"], **run.to_dict()["params"]}
         if stage.gate.type in {
             "tests_pass",
@@ -658,6 +700,7 @@ class WorkflowRunner:
             "council_approve",
             "consent_collect",
             "signature_collected",
+            "script",
         }:
             payload.update(stage.gate.to_dict()["params"])
         if stage.gate.type == "signature_collected":
@@ -729,6 +772,18 @@ class WorkflowRunner:
             await self.store.update_compensate_state(link.link_id, "not_required")
         record_gate_outcome(spec.name, stage.name, gate_outcome.value)
         return gate_outcome
+
+    async def _preflight_stage_gate(
+        self, stage: Stage
+    ) -> tuple[Optional[GateOutcome], Optional[str]]:
+        if stage.gate.type != "script":
+            return None, None
+        if self.script_gate_provider is None:
+            return GateOutcome.FAIL, "script_no_resolver"
+        outcome, reason = await self._verify_script_gate_artifact(stage.gate)
+        if outcome == GateOutcome.PASS:
+            return None, None
+        return outcome, reason
 
     async def _evaluate_waiting_stage(
         self, run: WorkflowRun, spec: WorkflowSpec, stage: Stage
@@ -849,6 +904,8 @@ class WorkflowRunner:
             return _evaluate_consent_collect_gate(stage.gate, result)
         if stage.gate.type == "council_approve":
             return _evaluate_council_approve_gate(stage.gate, result)
+        if stage.gate.type == "script":
+            return await self._evaluate_script_gate(stage.gate, result)
         if stage.gate.type == "signature_collected":
             return self._evaluate_signature_collected_gate(
                 stage.gate,
@@ -933,6 +990,42 @@ class WorkflowRunner:
                         f"constitutional_boundary_violation:{normalized}",
                     )
         return GateOutcome.PASS, None
+
+    async def _evaluate_script_gate(
+        self, gate: Gate, result: Any
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if result.mode not in {SignalMode.ACTION, SignalMode.COGNITION}:
+            return GateOutcome.FAIL, "script_requires_action_or_cognition_result"
+        if self.script_gate_provider is None:
+            return GateOutcome.FAIL, "script_no_resolver"
+        try:
+            marker = self.script_gate_provider(gate, result)
+            if inspect.isawaitable(marker):
+                marker = await marker
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            return GateOutcome.FAIL, f"script_error:{exc}"
+        outcome, reason = _evaluate_script_gate_marker(gate, marker)
+        if outcome != GateOutcome.PASS:
+            return outcome, reason
+        return await self._verify_script_gate_artifact(gate)
+
+    async def _verify_script_gate_artifact(
+        self, gate: Gate
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if self.script_artifact_resolver is None:
+            return GateOutcome.FAIL, "script_no_script_resolver"
+        try:
+            artifact = self.script_artifact_resolver(gate)
+            if inspect.isawaitable(artifact):
+                artifact = await artifact
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            return GateOutcome.FAIL, f"script_resolver_error:{exc}"
+        return _verify_script_gate_artifact(
+            gate,
+            artifact,
+            public_key_resolver=self.public_key_resolver,
+            verification_methods_resolver=self.verification_methods_resolver,
+        )
 
     async def _compensate(
         self,
@@ -1233,6 +1326,168 @@ def _evaluate_council_approve_marker(
             f"council_approve_quorum_not_met:{len(approved_dids)}/{quorum}",
         )
     return GateOutcome.PASS, None
+
+
+def _evaluate_script_gate_marker(
+    gate: Gate, marker: Any
+) -> tuple[GateOutcome, Optional[str]]:
+    if not isinstance(marker, dict):
+        return GateOutcome.FAIL, "script_missing_result"
+    mismatch = _script_marker_contract_mismatch(gate, marker)
+    if mismatch is not None:
+        return GateOutcome.FAIL, mismatch
+    if _has_explicit_bad_status(marker):
+        return GateOutcome.FAIL, f"script_failed:{_result_marker_reason(marker)}"
+    if _result_marker_passed(gate, marker):
+        return GateOutcome.PASS, None
+    return GateOutcome.FAIL, f"script_failed:{_result_marker_reason(marker)}"
+
+
+def _verify_script_gate_artifact(
+    gate: Gate,
+    artifact: Any,
+    *,
+    public_key_resolver: PublicKeyResolver,
+    verification_methods_resolver: Optional[VerificationMethodsResolver],
+) -> tuple[GateOutcome, Optional[str]]:
+    if artifact is None:
+        return GateOutcome.FAIL, "script_missing_artifact"
+
+    expected_language = gate.params["language"]
+    observed_language = _script_artifact_string(artifact, "language")
+    if observed_language != expected_language:
+        return GateOutcome.FAIL, f"script_language_mismatch:{expected_language}"
+
+    expected_hash = gate.params["src_hash"]
+    observed_hash = _script_artifact_content_address(artifact)
+    if observed_hash != expected_hash:
+        return GateOutcome.FAIL, f"script_src_hash_unresolved:{expected_hash}"
+
+    expected_signature = gate.params["signature"]
+    observed_signature = _script_artifact_string(artifact, "signature")
+    if observed_signature != expected_signature:
+        return GateOutcome.FAIL, "script_signature_mismatch"
+
+    expected_did = gate.params["signing_did"]
+    observed_did = _script_artifact_string(artifact, "signed_by")
+    if observed_did != expected_did:
+        return GateOutcome.FAIL, f"script_signing_did_mismatch:{expected_did}"
+
+    payload = _script_signature_payload(artifact)
+    if payload is None or not _verify_script_artifact_signature(
+        did=expected_did,
+        signature=expected_signature,
+        payload=payload,
+        public_key_resolver=public_key_resolver,
+        verification_methods_resolver=verification_methods_resolver,
+    ):
+        return GateOutcome.FAIL, "script_invalid_signature"
+    return GateOutcome.PASS, None
+
+
+def _script_artifact_string(artifact: Any, field: str) -> Optional[str]:
+    if isinstance(artifact, Mapping):
+        value = artifact.get(field)
+    else:
+        value = getattr(artifact, field, None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _script_artifact_content_address(artifact: Any) -> Optional[str]:
+    content_hash = _script_artifact_content_hash(artifact)
+    if content_hash is None:
+        return None
+    return f"sha256:{content_hash}"
+
+
+def _script_signature_payload(artifact: Any) -> Optional[bytes]:
+    content_hash = _script_artifact_content_hash(artifact)
+    if content_hash is None:
+        return None
+    return hashlib.sha256(content_hash.encode()).digest()
+
+
+def _script_artifact_content_hash(artifact: Any) -> Optional[str]:
+    name = _script_artifact_raw_string(artifact, "name")
+    language = _script_artifact_raw_string(artifact, "language")
+    content = _script_artifact_raw_string(artifact, "content")
+    purpose = _script_artifact_raw_string(artifact, "purpose")
+    if None in {name, language, content, purpose}:
+        return None
+    canonical = f"{name}|{language}|{content}|{purpose}"
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _script_artifact_raw_string(artifact: Any, field: str) -> Optional[str]:
+    if isinstance(artifact, Mapping):
+        value = artifact.get(field)
+    else:
+        value = getattr(artifact, field, None)
+    return value if isinstance(value, str) else None
+
+
+def _verify_script_artifact_signature(
+    *,
+    did: str,
+    signature: str,
+    payload: bytes,
+    public_key_resolver: PublicKeyResolver,
+    verification_methods_resolver: Optional[VerificationMethodsResolver],
+) -> bool:
+    if signature.startswith("hybrid:"):
+        try:
+            decoded = base64.b64decode(signature[len("hybrid:") :]).decode()
+            signatures = json.loads(decoded)
+        except Exception:
+            return False
+        if not isinstance(signatures, list):
+            return False
+        return _verify_signature_collected_hybrid(
+            did=did,
+            signatures=signatures,
+            payload=payload,
+            verification_methods_resolver=verification_methods_resolver,
+        )
+    if not signature.startswith("ecdsa:"):
+        return False
+    try:
+        public_key_bytes = public_key_resolver(did)
+        public_key = get_suite(
+            ALG_ECDSA_SECP256K1_SHA256
+        ).deserialize_public_key(public_key_bytes)
+        signature_bytes = base64.b64decode(signature[len("ecdsa:") :])
+    except Exception:
+        return False
+    try:
+        return get_suite(ALG_ECDSA_SECP256K1_SHA256).verify(
+            payload,
+            signature_bytes,
+            public_key,
+        )
+    except CryptoSuiteError:
+        return False
+
+
+def _script_marker_contract_mismatch(
+    gate: Gate, marker: dict[str, Any]
+) -> Optional[str]:
+    aliases = {
+        "language": ("language", "script_language"),
+        "src_hash": ("src_hash", "script_hash", "content_hash"),
+        "signature": ("signature", "script_signature"),
+        "signing_did": ("signing_did", "signed_by", "signer_did"),
+        "sandbox": ("sandbox", "executor", "execution_sandbox"),
+    }
+    for param_key, marker_keys in aliases.items():
+        observed = _first_marker_string(marker, marker_keys)
+        expected = gate.params[param_key]
+        if observed is None:
+            return f"script_missing_{param_key}"
+        if observed != expected:
+            return f"script_{param_key}_mismatch:{expected}"
+    return None
 
 
 def _signature_marker_did(marker: dict[str, Any]) -> Optional[str]:

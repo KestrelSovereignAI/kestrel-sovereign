@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Optional
 
@@ -78,6 +79,22 @@ class WorkflowsFeature(Feature):
             verification_methods_resolver=self._verification_methods_resolver,
             consent_collect_provider=self._consent_collect_provider,
             council_approve_provider=self._council_approve_provider,
+            script_gate_provider=(
+                self._script_gate_provider
+                if (
+                    hasattr(self.agent, "workflow_script_gate_provider")
+                    or self._compute_feature() is not None
+                )
+                else None
+            ),
+            script_artifact_resolver=(
+                self._script_artifact_resolver
+                if (
+                    hasattr(self.agent, "workflow_script_artifact_resolver")
+                    or self._compute_feature() is not None
+                )
+                else None
+            ),
         )
 
     def _public_key_resolver(self, did: str) -> bytes:
@@ -106,7 +123,7 @@ class WorkflowsFeature(Feature):
         if (
             identity is not None
             and identity.is_hybrid
-            and did == identity.signing_did
+            and did in {identity.signing_did, identity.legacy_did}
         ):
             return list(identity.new_verification_methods or [])
         raise KeyError(did)
@@ -193,6 +210,86 @@ class WorkflowsFeature(Feature):
         if hasattr(result, "__await__"):
             result = await result
         return result
+
+    async def _script_gate_provider(self, gate: Any, result: Any) -> dict[str, Any]:
+        external = getattr(self.agent, "workflow_script_gate_provider", None)
+        if external is not None:
+            provided = external(gate, result)
+            if hasattr(provided, "__await__"):
+                provided = await provided
+            return provided
+
+        compute = self._compute_feature()
+        if compute is None or not hasattr(compute, "run_script"):
+            return {
+                "status": "failed",
+                "reason": "script gate resolver unavailable",
+            }
+        artifact = await self._script_artifact_resolver(gate)
+        if artifact is None:
+            return {
+                **gate.params,
+                "status": "failed",
+                "reason": "script artifact unavailable",
+            }
+        executor = _script_gate_executor(gate)
+        run_result = compute.run_script(artifact.id, executor=executor)
+        if hasattr(run_result, "__await__"):
+            run_result = await run_result
+        data = getattr(run_result, "data", None) or {}
+        return {
+            **gate.params,
+            "status": getattr(getattr(run_result, "status", None), "value", "failed"),
+            "exit_code": data.get("exit_code"),
+            "succeeded": data.get("succeeded"),
+            "error": getattr(run_result, "error", None),
+            "message": getattr(run_result, "confirmation", None),
+        }
+
+    async def _script_artifact_resolver(self, gate: Any) -> Any:
+        external = getattr(self.agent, "workflow_script_artifact_resolver", None)
+        if external is not None:
+            artifact = external(gate)
+            if hasattr(artifact, "__await__"):
+                artifact = await artifact
+            return artifact
+
+        compute = self._compute_feature()
+        store = getattr(compute, "script_store", None)
+        if store is None:
+            return None
+        ensure_initialized = getattr(compute, "_ensure_initialized", None)
+        if ensure_initialized is not None:
+            initialized = ensure_initialized()
+            if hasattr(initialized, "__await__"):
+                await initialized
+        scripts = store.list_recent(limit=10000)
+        if hasattr(scripts, "__await__"):
+            scripts = await scripts
+        matches = [
+            script
+            for script in scripts
+            if _script_artifact_matches_gate(gate, script)
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _compute_feature(self) -> Any:
+        features = getattr(self.agent, "features", None)
+        if not isinstance(features, dict):
+            return None
+        compute = features.get("ComputeFeature")
+        if compute is not None:
+            return compute
+        for feature in features.values():
+            if (
+                feature.__class__.__name__ == "ComputeFeature"
+                or (
+                    hasattr(feature, "script_store")
+                    and hasattr(feature, "run_script")
+                )
+            ):
+                return feature
+        return None
 
     def _require_store(self) -> WorkflowStore:
         if self.store is None:
@@ -524,6 +621,31 @@ def _security_feature(agent: Any) -> Any:
             or features.get("security")
         )
     return None
+
+
+def _script_gate_executor(gate: Any) -> str:
+    sandbox = gate.params["sandbox"].strip()
+    return sandbox.removeprefix("compute:") or sandbox
+
+
+def _script_artifact_matches_gate(gate: Any, script: Any) -> bool:
+    return (
+        getattr(script, "language", None) == gate.params["language"]
+        and getattr(script, "signature", None) == gate.params["signature"]
+        and getattr(script, "signed_by", None) == gate.params["signing_did"]
+        and _script_artifact_content_address(script) == gate.params["src_hash"]
+    )
+
+
+def _script_artifact_content_address(script: Any) -> Optional[str]:
+    name = getattr(script, "name", None)
+    language = getattr(script, "language", None)
+    content = getattr(script, "content", None)
+    purpose = getattr(script, "purpose", None)
+    if not all(isinstance(value, str) for value in (name, language, content, purpose)):
+        return None
+    canonical = f"{name}|{language}|{content}|{purpose}"
+    return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
 
 
 def _approval_request_matches_scope(request: Any, scope: str) -> bool:

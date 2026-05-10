@@ -162,6 +162,7 @@ _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$")
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _DID_RE = re.compile(r"^did:[a-z0-9]+:\S+$")
+_SCRIPT_HASH_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # Lowercase hex sha256 digest, 64 chars; mirrors signing-side helpers and the
 # JSON Schema `_HASH_PATTERN`.
@@ -451,6 +452,18 @@ class Gate:
                         "(language, src_hash, signature, signing_did, sandbox) "
                         "per design §3.3"
                     )
+            if self.params["language"] not in {"bash", "python"}:
+                raise WorkflowDefinitionError(
+                    "gate script params.language must be 'bash' or 'python'"
+                )
+            if not _SCRIPT_HASH_RE.fullmatch(self.params["src_hash"]):
+                raise WorkflowDefinitionError(
+                    "gate script params.src_hash must be a sha256:<hex> digest"
+                )
+            if not _DID_RE.fullmatch(self.params["signing_did"]):
+                raise WorkflowDefinitionError(
+                    "gate script params.signing_did must be a DID string"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         return {"type": self.type, "params": _thaw_value(self.params)}
