@@ -219,6 +219,10 @@ export const Security = {
                         <p style="margin-top: 1rem; color: var(--text-secondary); font-size: 0.875rem;">
                             Choose how to handle this permission:
                         </p>
+                        <p style="margin: 0.5rem 0 0; color: var(--warning); font-size: 0.8125rem;">
+                            Auto Mode approves this request and future non-denied requests while this session is active.
+                            Constitutional, honesty, and security hooks can still flag or block.
+                        </p>
                     </div>
                 `,
                 buttons: [
@@ -244,6 +248,21 @@ export const Security = {
                         onClick: () => {
                             Modal.hide();
                             wrappedResolve({ approved: true, scope: 'session' });
+                        }
+                    },
+                    {
+                        label: `${kicon('shield')} Enable Auto`,
+                        type: 'primary',
+                        onClick: async () => {
+                            try {
+                                const response = await this.setGlobalAutoMode(true);
+                                Modal.hide();
+                                Toast.warning(response.warning);
+                                wrappedResolve({ approved: true, scope: 'once' });
+                            } catch (error) {
+                                console.error('Failed to enable Auto mode from approval modal:', error);
+                                Toast.error('Failed to enable Auto mode');
+                            }
                         }
                     },
                     {
@@ -724,6 +743,16 @@ export const Security = {
         }
     },
 
+    async setGlobalAutoMode(enabled) {
+        const response = await API.request('/api/security/auto-mode', {
+            method: 'POST',
+            body: JSON.stringify({ enabled })
+        });
+        this.globalAutoMode = Boolean(response.enabled);
+        this.renderAutoModeButton();
+        return response;
+    },
+
     renderAutoModeButton() {
         const button = document.getElementById('security-auto-mode-btn');
         if (!button) return;
@@ -764,12 +793,7 @@ export const Security = {
                 if (!confirmed) return;
             }
 
-            const response = await API.request('/api/security/auto-mode', {
-                method: 'POST',
-                body: JSON.stringify({ enabled: nextEnabled })
-            });
-            this.globalAutoMode = Boolean(response.enabled);
-            this.renderAutoModeButton();
+            const response = await this.setGlobalAutoMode(nextEnabled);
             Toast[this.globalAutoMode ? 'warning' : 'success'](
                 this.globalAutoMode ? response.warning : 'Global Auto mode disabled'
             );
