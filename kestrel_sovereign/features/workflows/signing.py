@@ -1,4 +1,4 @@
-"""Workflow definition + transition signing helpers (Phase 0 chunk C).
+"""Workflow definition + transition signing helpers.
 
 Implements the small surface called out in design §6 Phase 0:
 
@@ -13,12 +13,11 @@ existing :mod:`kestrel_sovereign.security.crypto_suite` and
 :class:`kestrel_sovereign.identity.runtime_identity.AgentIdentity`
 primitives directly.
 
-Phase 0 ships:
+This module ships:
 
 - :func:`sign_workflow_spec` — populate ``spec.spec_hash`` and
-  ``author_sig`` (ECDSA secp256k1 over the canonical bytes; hybrid
-  signatures land in Phase 1 once the workflow runner needs the v2
-  array shape).
+  ``author_sig``. Legacy agents use ECDSA secp256k1; hybrid agents can
+  opt into a ``hybrid:`` Ed25519 + ML-DSA-65 signature bundle.
 - :func:`verify_workflow_spec` — recompute the hash, verify the
   signature against an author public key bytes blob.
 - :func:`canonical_transition_payload` — the deterministic byte form
@@ -29,24 +28,23 @@ Phase 0 ships:
 
 What this module deliberately does NOT do:
 
-- Hybrid (classical + PQ) signatures. Phase 0 tracks the legacy ECDSA
-  field that already exists on every agent. Hybrid wraps the same
-  byte payload and lives behind the existing ``sign_hybrid`` helper;
-  Phase 1 adds it once the workflow runner is exercising signatures
-  end-to-end.
 - DID-document resolution. The ``public_key_resolver`` parameter is a
   pluggable callable so callers can resolve over ``did:web``,
   ``did:pkh``, in-memory test fixtures, or :class:`AgentIdentity`'s
-  legacy keypair without this module owning that lookup.
+  legacy keypair without this module owning that lookup. The
+  ``verification_methods_resolver`` parameter does the same for hybrid
+  Multikey verification methods.
 - Anchor-style hashing. Workflow definitions sign the canonical JSON
   bytes directly; we do not Merkle-anchor or chain.
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from dataclasses import replace
-from typing import Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from kestrel_sovereign.features.workflows.models import (
     StageLink,
@@ -69,6 +67,9 @@ logger = logging.getLogger(__name__)
 # their keys from W3C Multikey VMs use
 # ``serialize_public_key_for_multikey``'s inverse.
 PublicKeyResolver = Callable[[str], bytes]
+VerificationMethodsResolver = Callable[[str], list[Mapping[str, Any]]]
+
+_HYBRID_PREFIX = "hybrid:"
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +80,8 @@ PublicKeyResolver = Callable[[str], bytes]
 def sign_workflow_spec(
     spec: WorkflowSpec,
     agent_identity: AgentIdentity,
+    *,
+    use_hybrid: bool = False,
 ) -> WorkflowSpec:
     """Sign ``spec`` with the agent's legacy ECDSA secp256k1 key.
 
@@ -103,16 +106,22 @@ def sign_workflow_spec(
     if not isinstance(spec, WorkflowSpec):
         raise TypeError("sign_workflow_spec requires a WorkflowSpec instance")
 
-    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    if use_hybrid and agent_identity.is_hybrid:
+        chosen_author = agent_identity.signing_did
+    else:
+        chosen_author = agent_identity.legacy_did
 
-    if agent_identity.legacy_keypair.private_key is None:
+    if (
+        not (use_hybrid and agent_identity.is_hybrid)
+        and agent_identity.legacy_keypair.private_key is None
+    ):
         raise WorkflowDefinitionError(
             "sign_workflow_spec: AgentIdentity has no legacy private key "
             "(post-destruction state). Phase 1 will use the hybrid keypair "
             "via sign_hybrid; until then this helper requires a legacy key."
         )
 
-    # Codex chunk-D round-2 P2: Phase 0 always signs with the legacy
+    # Codex chunk-D round-2 P2: Phase 0 always signed with the legacy
     # ECDSA key, so ``author_did`` MUST be the *legacy* DID — not
     # ``signing_did``. For pre-ceremony agents these are equal. For
     # post-ceremony hybrid agents, ``signing_did`` is the new did:web
@@ -122,7 +131,9 @@ def sign_workflow_spec(
     # the actual signing algorithm. Phase 1 adds the hybrid path
     # (sign_hybrid + new did:web author) once the runner exercises
     # signatures end-to-end.
-    chosen_author = agent_identity.legacy_did
+    # Phase 1 keeps that legacy path as the default for backward
+    # compatibility, and enables a caller-selected hybrid path for
+    # post-ceremony agents.
 
     # Codex chunk-D round-1 P2 (carried): a pre-set ``author_did``
     # must match the DID we'll actually sign for. For Phase 0 that's
@@ -132,10 +143,10 @@ def sign_workflow_spec(
     if spec.author_did and spec.author_did != chosen_author:
         raise WorkflowDefinitionError(
             f"sign_workflow_spec: spec.author_did {spec.author_did!r} does "
-            f"not match the legacy DID {chosen_author!r} this helper signs "
-            "as in Phase 0. Use a delegated-signing helper (Phase 1+) for "
-            "cross-author signatures, or clear spec.author_did so this "
-            "helper sets it from the agent's legacy DID."
+            f"not match the DID {chosen_author!r} this helper signs as. "
+            "Use a delegated-signing helper (Phase 1+) for cross-author "
+            "signatures, or clear spec.author_did so this helper sets it "
+            "from the signing identity."
         )
     signing_did = chosen_author
 
@@ -154,26 +165,45 @@ def sign_workflow_spec(
     )
     spec_hash = pre_sign.compute_spec_hash()
 
-    try:
-        sig = suite.sign(
-            spec_hash.encode("utf-8"),
-            agent_identity.legacy_keypair.private_key,
+    if use_hybrid and agent_identity.is_hybrid:
+        from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
+
+        vms = agent_identity.new_verification_methods or []
+        classical_kid = vms[0]["id"].rsplit("#", 1)[-1] if vms else "key-1"
+        pq_kid = vms[1]["id"].rsplit("#", 1)[-1] if len(vms) > 1 else "key-2"
+        sig = _encode_hybrid_signatures(
+            sign_hybrid(
+                spec_hash_to_bytes(spec_hash),
+                agent_identity.hybrid_keypair,
+                classical_kid=classical_kid,
+                pq_kid=pq_kid,
+            )
         )
-    except CryptoSuiteError as exc:
-        raise WorkflowDefinitionError(
-            f"sign_workflow_spec failed: {exc}"
-        ) from exc
+    else:
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+        try:
+            legacy_sig = suite.sign(
+                spec_hash.encode("utf-8"),
+                agent_identity.legacy_keypair.private_key,
+            )
+        except CryptoSuiteError as exc:
+            raise WorkflowDefinitionError(
+                f"sign_workflow_spec failed: {exc}"
+            ) from exc
+        sig = legacy_sig.hex()
 
     return replace(
         pre_sign,
         spec_hash=spec_hash,
-        author_sig=sig.hex(),
+        author_sig=sig,
     )
 
 
 def verify_workflow_spec(
     spec: WorkflowSpec,
     public_key_resolver: PublicKeyResolver,
+    *,
+    verification_methods_resolver: Optional[VerificationMethodsResolver] = None,
 ) -> bool:
     """Recompute the canonical hash and verify ``spec.author_sig``.
 
@@ -197,6 +227,23 @@ def verify_workflow_spec(
     expected_hash = spec.compute_spec_hash()
     if expected_hash != spec.spec_hash:
         return False
+
+    if spec.author_sig.startswith(_HYBRID_PREFIX):
+        if verification_methods_resolver is None:
+            return False
+        try:
+            from kestrel_sovereign.identity.hybrid_keypair import verify_hybrid
+
+            signatures = _decode_hybrid_signatures(spec.author_sig)
+            methods = verification_methods_resolver(spec.author_did)
+            return verify_hybrid(
+                spec_hash_to_bytes(spec.spec_hash),
+                signatures,
+                methods,
+            ).ok
+        except Exception as exc:  # noqa: BLE001 - verifier is fail-closed
+            logger.debug("verify_workflow_spec hybrid failed: %s", exc)
+            return False
 
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
 
@@ -284,6 +331,7 @@ def sign_stage_transition(
     signal_id: Optional[str],
     gate_outcome: Optional[str],
     agent_identity: AgentIdentity,
+    use_hybrid: bool = False,
 ) -> tuple[str, str]:
     """Returns ``(actor_did, actor_sig_hex)`` for a stage transition.
 
@@ -294,6 +342,31 @@ def sign_stage_transition(
     public key. Phase 1 hybrid signing returns the new DID + a v2
     signature array.
     """
+    if use_hybrid and agent_identity.is_hybrid:
+        from kestrel_sovereign.identity.hybrid_keypair import sign_hybrid
+
+        payload = canonical_transition_payload(
+            run_id=run_id,
+            stage_name=stage_name,
+            attempt_number=attempt_number,
+            signal_id=signal_id,
+            gate_outcome=gate_outcome,
+        )
+        vms = agent_identity.new_verification_methods or []
+        classical_kid = vms[0]["id"].rsplit("#", 1)[-1] if vms else "key-1"
+        pq_kid = vms[1]["id"].rsplit("#", 1)[-1] if len(vms) > 1 else "key-2"
+        return (
+            agent_identity.signing_did,
+            _encode_hybrid_signatures(
+                sign_hybrid(
+                    payload,
+                    agent_identity.hybrid_keypair,
+                    classical_kid=classical_kid,
+                    pq_kid=pq_kid,
+                )
+            ),
+        )
+
     if agent_identity.legacy_keypair.private_key is None:
         raise WorkflowDefinitionError(
             "sign_stage_transition: AgentIdentity has no legacy private key"
@@ -318,6 +391,8 @@ def sign_stage_transition(
 def verify_stage_transition(
     link: StageLink,
     public_key_resolver: PublicKeyResolver,
+    *,
+    verification_methods_resolver: Optional[VerificationMethodsResolver] = None,
 ) -> bool:
     """Verify a stage transition's actor signature.
 
@@ -332,6 +407,33 @@ def verify_stage_transition(
         return False
     if not link.actor_did or not link.actor_sig:
         return False
+
+    payload = canonical_transition_payload(
+        run_id=link.run_id,
+        stage_name=link.stage_name,
+        attempt_number=link.attempt_number,
+        signal_id=link.signal_id,
+        gate_outcome=(
+            link.gate_outcome.value
+            if link.gate_outcome is not None
+            else None
+        ),
+    )
+
+    if link.actor_sig.startswith(_HYBRID_PREFIX):
+        if verification_methods_resolver is None:
+            return False
+        try:
+            from kestrel_sovereign.identity.hybrid_keypair import verify_hybrid
+
+            return verify_hybrid(
+                payload,
+                _decode_hybrid_signatures(link.actor_sig),
+                verification_methods_resolver(link.actor_did),
+            ).ok
+        except Exception as exc:  # noqa: BLE001 - verifier is fail-closed
+            logger.debug("verify_stage_transition hybrid failed: %s", exc)
+            return False
 
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
 
@@ -351,25 +453,31 @@ def verify_stage_transition(
     except ValueError:
         return False
 
-    payload = canonical_transition_payload(
-        run_id=link.run_id,
-        stage_name=link.stage_name,
-        attempt_number=link.attempt_number,
-        signal_id=link.signal_id,
-        gate_outcome=(
-            link.gate_outcome.value
-            if link.gate_outcome is not None
-            else None
-        ),
-    )
     try:
         return suite.verify(payload, sig_bytes, public_key)
     except CryptoSuiteError:
         return False
 
 
+def _encode_hybrid_signatures(signatures: list[dict]) -> str:
+    return _HYBRID_PREFIX + base64.b64encode(
+        json.dumps(signatures, sort_keys=True, separators=(",", ":")).encode()
+    ).decode()
+
+
+def _decode_hybrid_signatures(signature: str) -> list[Mapping[str, str]]:
+    if not signature.startswith(_HYBRID_PREFIX):
+        raise ValueError("not a hybrid workflow signature")
+    decoded = base64.b64decode(signature[len(_HYBRID_PREFIX):]).decode()
+    payload = json.loads(decoded)
+    if not isinstance(payload, list):
+        raise ValueError("hybrid workflow signature payload must be a list")
+    return payload
+
+
 __all__ = [
     "PublicKeyResolver",
+    "VerificationMethodsResolver",
     "canonical_transition_payload",
     "sign_stage_transition",
     "sign_workflow_spec",

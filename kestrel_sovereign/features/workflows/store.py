@@ -1,4 +1,4 @@
-"""Workflow storage (Phase 0 chunk B).
+"""Workflow storage for the Workflows feature.
 
 Implements the three workflow-only tables called out in §5 of
 ``docs/architecture/WORKFLOWS_FEATURE_DESIGN.md`` (v4.1):
@@ -19,9 +19,9 @@ exclusively (``timestamp_type``, ``json_type``, ``boolean_type``,
 SQLite migration code; the same DDL works against both backends. This
 matches the pattern proven by ``signal_log`` and the unified A2A stores.
 
-Phase 0 deliverable: schema only — no read/write helpers beyond
-``initialize`` and ``purge_expired`` (the retention sweep). Tool surface
-and runner-driven inserts/updates land in Phase 1.
+Phase 0 shipped the schema and retention sweep. Phase 1 adds the
+runner-facing definition/run/stage-link helpers below while keeping the
+same dialect-helper discipline.
 """
 
 from __future__ import annotations
@@ -32,7 +32,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
-from kestrel_sovereign.features.workflows.models import WorkflowSpec
+from kestrel_sovereign.features.workflows.models import (
+    GateOutcome,
+    RunStatus,
+    StageLink,
+    WorkflowRun,
+    WorkflowSpec,
+)
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
@@ -49,21 +55,17 @@ class WorkflowStore(UnifiedStoreBase):
     """Backend-agnostic persistence for workflow definitions, runs, and
     stage-link rows.
 
-    Phase 0 ships only the migration surface: ``initialize()`` creates
-    the three tables and indexes idempotently. Phase 1 adds:
+    ``initialize()`` creates the three tables and indexes idempotently;
+    the remaining methods are the runner/tool persistence surface:
 
     - ``put_definition(spec)`` / ``get_definition(name, version)`` /
       ``revoke_definition(...)``.
-    - Run lifecycle: ``insert_run(run)``, ``update_run_status(...)``,
-      ``set_cancel_barrier(...)``, ``mark_finished(...)``.
+    - Run lifecycle: ``insert_run(run)``, ``get_run(...)``,
+      ``update_run_status(...)``, ``set_cancel_barrier(...)``.
     - Stage-link lifecycle: ``insert_stage_link(link)``,
-      ``update_gate_outcome(...)``, ``update_compensate_state(...)``.
-    - ``purge_expired_runs(now)`` — retention sweep, mirroring
-      ``SignalLogStore.purge_expired``.
-
-    Splitting the layers this way keeps Phase 0 reviewable on its own:
-    the migration is correct against the design doc and the dataclass
-    contract before any business logic runs over it.
+      ``update_stage_link_transition(...)``,
+      ``update_compensate_state(...)``.
+    - ``purge_expired_runs(now)`` — retention sweep.
     """
 
     DEFINITIONS_TABLE = "workflow_definitions"
@@ -153,6 +155,7 @@ class WorkflowStore(UnifiedStoreBase):
                 parent_run_id             TEXT,
                 params_json               TEXT NOT NULL,
                 status                    TEXT NOT NULL,
+                engine_nonce              TEXT NOT NULL,
                 current_stages_json       TEXT NOT NULL DEFAULT '[]',
                 cancel_barrier_at         {ts_type},
                 started_by_did            TEXT NOT NULL,
@@ -174,6 +177,21 @@ class WorkflowStore(UnifiedStoreBase):
                     ON DELETE NO ACTION
             )
         """)
+        # Phase 1 adds ``engine_nonce`` for auditable idempotency-key
+        # derivation. Existing Phase 0 databases created the table
+        # without this column, so initialize() carries the lightweight
+        # additive migration too. The all-zero default only backfills
+        # pre-run-start rows; new runner-created rows always store a
+        # fresh 16-byte nonce.
+        try:
+            await self._backend.execute(
+                f"ALTER TABLE {self.RUNS_TABLE} "
+                "ADD COLUMN engine_nonce TEXT NOT NULL "
+                "DEFAULT '00000000000000000000000000000000'"
+            )
+        except Exception as exc:  # noqa: BLE001 - duplicate column is benign
+            if "duplicate" not in str(exc).lower() and "exists" not in str(exc).lower():
+                raise
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.RUNS_TABLE}_workflow "
             f"ON {self.RUNS_TABLE}(workflow_name, workflow_ver, status)"
@@ -339,6 +357,351 @@ class WorkflowStore(UnifiedStoreBase):
             "revocation_reason": row[9],
         }
 
+    async def put_definition(self, spec: WorkflowSpec) -> None:
+        """Persist a signed workflow definition.
+
+        Phase 1's feature/tool layer performs signature verification
+        before calling this. The store still refuses unsigned drafts so
+        direct callers cannot bypass the signed-artifact invariant.
+        """
+        await self.insert_definition_for_test(spec)
+
+    async def get_definition(
+        self, name: str, version: int
+    ) -> Optional[WorkflowSpec]:
+        row = await self.get_definition_row(name, version)
+        if row is None:
+            return None
+        return WorkflowSpec.from_dict(json.loads(row["spec_json"]))
+
+    async def get_latest_definition(self, name: str) -> Optional[WorkflowSpec]:
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT spec_json
+            FROM {self.DEFINITIONS_TABLE}
+            WHERE name = ? AND deleted_at IS NULL
+            ORDER BY version DESC
+            LIMIT 1
+            """,
+            (name,),
+        )
+        if row is None:
+            return None
+        return WorkflowSpec.from_dict(json.loads(row[0]))
+
+    async def list_definitions(self) -> list[dict[str, Any]]:
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT name, version, spec_hash, author_did, retention_days,
+                   created_at, deleted_at, revocation_reason
+            FROM {self.DEFINITIONS_TABLE}
+            ORDER BY name, version DESC
+            """
+        )
+        return [
+            {
+                "name": row[0],
+                "version": row[1],
+                "spec_hash": row[2],
+                "author_did": row[3],
+                "retention_days": row[4],
+                "created_at": self.from_timestamp_field(row[5]),
+                "deleted_at": self.from_timestamp_field(row[6]),
+                "revocation_reason": row[7],
+            }
+            for row in rows
+        ]
+
+    async def revoke_definition(
+        self,
+        name: str,
+        version: int,
+        *,
+        reason: str,
+        revoked_at: Optional[datetime] = None,
+    ) -> bool:
+        when = revoked_at or datetime.now(timezone.utc)
+        changed = await self._backend.execute(
+            f"""
+            UPDATE {self.DEFINITIONS_TABLE}
+            SET deleted_at = ?, revocation_reason = ?
+            WHERE name = ? AND version = ? AND deleted_at IS NULL
+            """,
+            (self.to_timestamp_param(when), reason, name, version),
+        )
+        return changed > 0
+
+    async def insert_run(self, run: WorkflowRun) -> None:
+        await self._backend.execute(
+            f"""
+            INSERT INTO {self.RUNS_TABLE}
+                (run_id, workflow_name, workflow_ver, parent_run_id,
+                 params_json, status, engine_nonce, current_stages_json,
+                 cancel_barrier_at, started_by_did, scheduler_task_id,
+                 signature_post_revocation, started_at, finished_at, deleted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run.run_id,
+                run.workflow_name,
+                run.workflow_ver,
+                run.parent_run_id,
+                json.dumps(
+                    run.to_dict()["params"],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                run.status.value,
+                run.engine_nonce,
+                json.dumps(list(run.current_stages)),
+                self.to_timestamp_param(run.cancel_barrier_at),
+                run.started_by_did,
+                run.scheduler_task_id,
+                self.to_bool_param(run.signature_post_revocation),
+                self.to_timestamp_param(run.started_at or datetime.now(timezone.utc)),
+                self.to_timestamp_param(run.finished_at),
+                self.to_timestamp_param(run.deleted_at),
+            ),
+        )
+
+    async def get_run(self, run_id: str) -> Optional[WorkflowRun]:
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT run_id, workflow_name, workflow_ver, parent_run_id,
+                   params_json, status, engine_nonce, current_stages_json,
+                   cancel_barrier_at, started_by_did, scheduler_task_id,
+                   signature_post_revocation, started_at, finished_at,
+                   deleted_at
+            FROM {self.RUNS_TABLE}
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        )
+        if row is None:
+            return None
+        return WorkflowRun(
+            run_id=row[0],
+            workflow_name=row[1],
+            workflow_ver=row[2],
+            parent_run_id=row[3],
+            params=json.loads(row[4]),
+            status=row[5],
+            engine_nonce=row[6],
+            current_stages=json.loads(row[7]),
+            cancel_barrier_at=self.from_timestamp_field(row[8]),
+            started_by_did=row[9],
+            scheduler_task_id=row[10],
+            signature_post_revocation=bool(row[11]),
+            started_at=self.from_timestamp_field(row[12]),
+            finished_at=self.from_timestamp_field(row[13]),
+            deleted_at=self.from_timestamp_field(row[14]),
+        )
+
+    async def list_runs(
+        self,
+        *,
+        workflow_name: Optional[str] = None,
+        status: Optional[RunStatus | str] = None,
+        limit: int = 50,
+    ) -> list[WorkflowRun]:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        filters: list[str] = []
+        params: list[Any] = []
+        if workflow_name is not None:
+            filters.append("workflow_name = ?")
+            params.append(workflow_name)
+        if status is not None:
+            filters.append("status = ?")
+            params.append(RunStatus(status).value)
+        where = f"WHERE {' AND '.join(filters)}" if filters else ""
+        params.append(limit)
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT run_id
+            FROM {self.RUNS_TABLE}
+            {where}
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        runs: list[WorkflowRun] = []
+        for row in rows:
+            run = await self.get_run(row[0])
+            if run is not None:
+                runs.append(run)
+        return runs
+
+    async def update_run_status(
+        self,
+        run_id: str,
+        status: RunStatus | str,
+        *,
+        current_stages: Optional[list[str]] = None,
+        finished_at: Optional[datetime] = None,
+        clear_finished_at: bool = False,
+    ) -> None:
+        parsed_status = RunStatus(status)
+        fields = ["status = ?"]
+        params: list[Any] = [parsed_status.value]
+        if current_stages is not None:
+            fields.append("current_stages_json = ?")
+            params.append(json.dumps(current_stages))
+        if clear_finished_at and finished_at is not None:
+            raise ValueError("clear_finished_at and finished_at are mutually exclusive")
+        if clear_finished_at:
+            fields.append("finished_at = NULL")
+        if finished_at is not None:
+            fields.append("finished_at = ?")
+            params.append(self.to_timestamp_param(finished_at))
+        params.append(run_id)
+        await self._backend.execute(
+            f"UPDATE {self.RUNS_TABLE} SET {', '.join(fields)} WHERE run_id = ?",
+            tuple(params),
+        )
+
+    async def mark_run_signature_post_revocation(self, run_id: str) -> None:
+        await self._backend.execute(
+            f"""
+            UPDATE {self.RUNS_TABLE}
+            SET signature_post_revocation = ?
+            WHERE run_id = ?
+            """,
+            (self.to_bool_param(True), run_id),
+        )
+
+    async def set_cancel_barrier(
+        self, run_id: str, *, cancelled_at: Optional[datetime] = None
+    ) -> bool:
+        when = cancelled_at or datetime.now(timezone.utc)
+        changed = await self._backend.execute(
+            f"""
+            UPDATE {self.RUNS_TABLE}
+            SET cancel_barrier_at = ?, status = ?
+            WHERE run_id = ? AND cancel_barrier_at IS NULL
+            """,
+            (self.to_timestamp_param(when), RunStatus.COMPENSATING.value, run_id),
+        )
+        return changed > 0
+
+    async def insert_stage_link(self, link: StageLink) -> None:
+        await self._backend.execute(
+            f"""
+            INSERT INTO {self.STAGE_LINKS_TABLE}
+                (link_id, run_id, stage_name, attempt_number, signal_id,
+                 idempotency_key, gate_outcome, gate_reason,
+                 compensate_state, post_cancel, actor_did, actor_sig,
+                 occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                link.link_id,
+                link.run_id,
+                link.stage_name,
+                link.attempt_number,
+                link.signal_id,
+                link.idempotency_key,
+                link.gate_outcome.value if link.gate_outcome else None,
+                link.gate_reason,
+                link.compensate_state,
+                self.to_bool_param(link.post_cancel),
+                link.actor_did,
+                link.actor_sig,
+                self.to_timestamp_param(
+                    link.occurred_at or datetime.now(timezone.utc)
+                ),
+            ),
+        )
+
+    async def update_stage_link_transition(
+        self,
+        link_id: str,
+        *,
+        signal_id: Optional[str],
+        gate_outcome: Optional[GateOutcome | str],
+        gate_reason: Optional[str],
+        actor_did: str,
+        actor_sig: str,
+        post_cancel: bool = False,
+    ) -> None:
+        parsed_outcome = (
+            GateOutcome(gate_outcome).value if gate_outcome is not None else None
+        )
+        await self._backend.execute(
+            f"""
+            UPDATE {self.STAGE_LINKS_TABLE}
+            SET signal_id = ?, gate_outcome = ?, gate_reason = ?,
+                actor_did = ?, actor_sig = ?, post_cancel = ?
+            WHERE link_id = ?
+            """,
+            (
+                signal_id,
+                parsed_outcome,
+                gate_reason,
+                actor_did,
+                actor_sig,
+                self.to_bool_param(post_cancel),
+                link_id,
+            ),
+        )
+
+    async def update_compensate_state(
+        self, link_id: str, compensate_state: str
+    ) -> None:
+        await self._backend.execute(
+            f"""
+            UPDATE {self.STAGE_LINKS_TABLE}
+            SET compensate_state = ?
+            WHERE link_id = ?
+            """,
+            (compensate_state, link_id),
+        )
+
+    async def list_stage_links(self, run_id: str) -> list[StageLink]:
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT link_id, run_id, stage_name, attempt_number, signal_id,
+                   idempotency_key, gate_outcome, gate_reason,
+                   compensate_state, post_cancel, actor_did, actor_sig,
+                   occurred_at
+            FROM {self.STAGE_LINKS_TABLE}
+            WHERE run_id = ?
+            ORDER BY occurred_at, attempt_number
+            """,
+            (run_id,),
+        )
+        return [
+            StageLink(
+                link_id=row[0],
+                run_id=row[1],
+                stage_name=row[2],
+                attempt_number=row[3],
+                signal_id=row[4],
+                idempotency_key=row[5],
+                gate_outcome=row[6],
+                gate_reason=row[7],
+                compensate_state=row[8],
+                post_cancel=bool(row[9]),
+                actor_did=row[10],
+                actor_sig=row[11],
+                occurred_at=self.from_timestamp_field(row[12]),
+            )
+            for row in rows
+        ]
+
+    async def next_attempt_number(self, run_id: str, stage_name: str) -> int:
+        row = await self._backend.fetch_one(
+            f"""
+            SELECT MAX(attempt_number)
+            FROM {self.STAGE_LINKS_TABLE}
+            WHERE run_id = ? AND stage_name = ?
+            """,
+            (run_id, stage_name),
+        )
+        current = row[0] if row is not None else None
+        return int(current or 0) + 1
+
     async def purge_expired_runs(
         self, *, now: Optional[datetime] = None
     ) -> int:
@@ -371,8 +734,15 @@ class WorkflowStore(UnifiedStoreBase):
               ON d.name = r.workflow_name
              AND d.version = r.workflow_ver
             WHERE r.finished_at IS NOT NULL
+              AND r.status IN (?, ?, ?, ?)
               AND d.retention_days IS NOT NULL
-            """
+            """,
+            (
+                RunStatus.COMPLETED.value,
+                RunStatus.FAILED.value,
+                RunStatus.CANCELLED.value,
+                RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE.value,
+            ),
         )
 
         expired: list[str] = []

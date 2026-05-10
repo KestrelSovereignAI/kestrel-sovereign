@@ -28,6 +28,8 @@ from kestrel_sovereign.features.workflows.signing import (
     verify_stage_transition,
     verify_workflow_spec,
 )
+from kestrel_sovereign.identity.did_web import build_verification_methods
+from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
 from kestrel_sovereign.security.crypto_suite import (
     ALG_ECDSA_SECP256K1_SHA256,
@@ -48,6 +50,22 @@ def _agent_identity(did: str = "did:web:k.example") -> AgentIdentity:
         legacy_did=did,
         legacy_keypair=kp,
         legacy_did_document={},
+    )
+
+
+def _hybrid_identity() -> AgentIdentity:
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    legacy_kp = suite.generate_keypair()
+    hybrid = generate_hybrid_keypair()
+    new_did = "did:web:k.example:hybrid"
+    vms = build_verification_methods(new_did, hybrid.public_keys())
+    return AgentIdentity(
+        legacy_did="did:pkh:eip155:1:0xabc",
+        legacy_keypair=legacy_kp,
+        legacy_did_document={},
+        hybrid_keypair=hybrid,
+        new_did=new_did,
+        new_verification_methods=vms,
     )
 
 
@@ -221,6 +239,26 @@ def test_sign_accepts_matching_pre_set_author_did():
     assert verify_workflow_spec(signed, _resolver_for(ai)) is True
 
 
+def test_hybrid_sign_workflow_spec_uses_new_did_and_verifies():
+    ai = _hybrid_identity()
+    signed = sign_workflow_spec(_spec(), ai, use_hybrid=True)
+
+    assert signed.author_did == ai.signing_did
+    assert signed.author_sig.startswith("hybrid:")
+    assert verify_workflow_spec(
+        signed,
+        _resolver_for(ai),
+        verification_methods_resolver=lambda did: ai.new_verification_methods,
+    ) is True
+
+
+def test_hybrid_workflow_spec_requires_verification_methods_resolver():
+    ai = _hybrid_identity()
+    signed = sign_workflow_spec(_spec(), ai, use_hybrid=True)
+
+    assert verify_workflow_spec(signed, _resolver_for(ai)) is False
+
+
 # ---------------------------------------------------------------------------
 # Stage transition signing
 # ---------------------------------------------------------------------------
@@ -334,6 +372,37 @@ def test_sign_then_verify_stage_transition():
         gate_outcome=GateOutcome.PASS,
     )
     assert verify_stage_transition(link, _resolver_for(ai)) is True
+
+
+def test_hybrid_sign_then_verify_stage_transition():
+    ai = _hybrid_identity()
+    actor_did, sig = sign_stage_transition(
+        run_id="r-1",
+        stage_name="lint",
+        attempt_number=1,
+        signal_id="signal-1",
+        gate_outcome="pass",
+        agent_identity=ai,
+        use_hybrid=True,
+    )
+    assert actor_did == ai.signing_did
+    assert sig.startswith("hybrid:")
+    link = StageLink(
+        link_id="l-1",
+        run_id="r-1",
+        stage_name="lint",
+        attempt_number=1,
+        idempotency_key="0" * 64,
+        actor_did=actor_did,
+        actor_sig=sig,
+        signal_id="signal-1",
+        gate_outcome=GateOutcome.PASS,
+    )
+    assert verify_stage_transition(
+        link,
+        _resolver_for(ai),
+        verification_methods_resolver=lambda did: ai.new_verification_methods,
+    ) is True
 
 
 def test_verify_stage_transition_fails_under_tamper():

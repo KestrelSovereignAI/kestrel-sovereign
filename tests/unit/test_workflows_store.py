@@ -154,10 +154,10 @@ async def test_runs_table_rejects_unknown_definition(store: WorkflowStore):
             f"""
             INSERT INTO {store.RUNS_TABLE}
                 (run_id, workflow_name, workflow_ver, params_json,
-                 status, started_by_did)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 status, engine_nonce, started_by_did)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            ("orphan", "ghost", 99, "{}", "running", "did:web:k.example"),
+            ("orphan", "ghost", 99, "{}", "running", "0" * 32, "did:web:k.example"),
         )
 
 
@@ -169,9 +169,9 @@ async def test_stage_links_idempotency_key_unique(store: WorkflowStore):
     await store.insert_definition_for_test(spec)
     await store.backend.execute(
         f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, "
-        f"workflow_ver, params_json, status, started_by_did) "
-        f"VALUES (?, ?, ?, ?, ?, ?)",
-        ("run-1", "release", 1, "{}", "running", "did:web:k.example"),
+        f"workflow_ver, params_json, status, engine_nonce, started_by_did) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("run-1", "release", 1, "{}", "running", "0" * 32, "did:web:k.example"),
     )
     insert_link = (
         f"INSERT INTO {store.STAGE_LINKS_TABLE} "
@@ -199,10 +199,10 @@ async def test_runs_table_accepts_minimal_row(store: WorkflowStore):
         f"""
         INSERT INTO {store.RUNS_TABLE}
             (run_id, workflow_name, workflow_ver, params_json,
-             status, started_by_did)
-        VALUES (?, ?, ?, ?, ?, ?)
+             status, engine_nonce, started_by_did)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        ("run-1", "release", 1, "{}", "running", "did:web:k.example"),
+        ("run-1", "release", 1, "{}", "running", "0" * 32, "did:web:k.example"),
     )
     row = await store.backend.fetch_one(
         f"SELECT run_id, status FROM {store.RUNS_TABLE} WHERE run_id = ?",
@@ -216,8 +216,9 @@ async def test_stage_links_unique_constraint(store: WorkflowStore):
     await store.insert_definition_for_test(spec)
     await store.backend.execute(
         f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
-        f"params_json, status, started_by_did) VALUES (?, ?, ?, ?, ?, ?)",
-        ("run-1", "release", 1, "{}", "running", "did:web:k.example"),
+        f"params_json, status, engine_nonce, started_by_did) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("run-1", "release", 1, "{}", "running", "0" * 32, "did:web:k.example"),
     )
     insert_link = (
         f"INSERT INTO {store.STAGE_LINKS_TABLE} "
@@ -265,18 +266,19 @@ async def test_purge_expired_runs_respects_retention_days(store: WorkflowStore):
     ):
         await store.backend.execute(
             f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, "
-            f"workflow_ver, params_json, status, started_by_did, "
-            f"finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            f"workflow_ver, params_json, status, engine_nonce, started_by_did, "
+            f"finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id, "release", 1, "{}",
-                status, "did:web:k.example", finished_at_iso,
+                status, "0" * 32, "did:web:k.example", finished_at_iso,
             ),
         )
     # Unfinished run must NEVER be purged regardless of age.
     await store.backend.execute(
         f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
-        f"params_json, status, started_by_did) VALUES (?, ?, ?, ?, ?, ?)",
-        ("run-running", "release", 1, "{}", "running", "did:web:k.example"),
+        f"params_json, status, engine_nonce, started_by_did) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("run-running", "release", 1, "{}", "running", "0" * 32, "did:web:k.example"),
     )
 
     purged = await store.purge_expired_runs(now=now)
@@ -305,11 +307,11 @@ async def test_purge_handles_batch_size_overflow(store: WorkflowStore):
     for i in range(n):
         await store.backend.execute(
             f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, "
-            f"workflow_ver, params_json, status, started_by_did, "
-            f"finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            f"workflow_ver, params_json, status, engine_nonce, started_by_did, "
+            f"finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 f"run-{i:04d}", "release", 1, "{}",
-                "completed", "did:web:k.example", long_ago,
+                "completed", "0" * 32, "did:web:k.example", long_ago,
             ),
         )
 
@@ -332,8 +334,12 @@ async def test_purge_cascades_stage_links(store: WorkflowStore):
     long_ago = (now - timedelta(days=30)).isoformat()
     await store.backend.execute(
         f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
-        f"params_json, status, started_by_did, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("run-old", "release", 1, "{}", "completed", "did:web:k.example", long_ago),
+        f"params_json, status, engine_nonce, started_by_did, finished_at) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "run-old", "release", 1, "{}", "completed", "0" * 32,
+            "did:web:k.example", long_ago,
+        ),
     )
     await store.backend.execute(
         f"INSERT INTO {store.STAGE_LINKS_TABLE} "
@@ -357,8 +363,12 @@ async def test_purge_skips_definitions_with_null_retention(store: WorkflowStore)
     long_ago = (datetime.now(timezone.utc) - timedelta(days=365)).isoformat()
     await store.backend.execute(
         f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
-        f"params_json, status, started_by_did, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        ("run-old", "release", 1, "{}", "completed", "did:web:k.example", long_ago),
+        f"params_json, status, engine_nonce, started_by_did, finished_at) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            "run-old", "release", 1, "{}", "completed", "0" * 32,
+            "did:web:k.example", long_ago,
+        ),
     )
     purged = await store.purge_expired_runs(now=datetime.now(timezone.utc))
     assert purged == 0

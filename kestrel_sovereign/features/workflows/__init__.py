@@ -25,6 +25,13 @@ from kestrel_sovereign.features.workflows.models import (
     WorkflowRun,
     WorkflowSpec,
 )
+from kestrel_sovereign.features.workflows.runner import (
+    WorkflowRunResult,
+    WorkflowRunner,
+    WorkflowRunnerError,
+    derive_stage_idempotency_key,
+)
+from kestrel_sovereign.features.workflows.feature import WorkflowsFeature
 
 __all__ = [
     "BUILT_IN_GATE_TYPES",
@@ -40,5 +47,10 @@ __all__ = [
     "TriggerKind",
     "WorkflowDefinitionError",
     "WorkflowRun",
+    "WorkflowRunResult",
+    "WorkflowRunner",
+    "WorkflowRunnerError",
     "WorkflowSpec",
+    "WorkflowsFeature",
+    "derive_stage_idempotency_key",
 ]

@@ -449,13 +449,21 @@ WORKFLOW_RUN_SCHEMA: dict[str, Any] = {
     "title": "WorkflowRun",
     "type": "object",
     "additionalProperties": False,
-    "required": ["run_id", "workflow_name", "workflow_ver", "params", "status"],
+    "required": [
+        "run_id",
+        "workflow_name",
+        "workflow_ver",
+        "params",
+        "status",
+        "engine_nonce",
+    ],
     "properties": {
         "run_id": {"type": "string", "minLength": 1},
         "workflow_name": {"type": "string", "pattern": _NAME_PATTERN},
         "workflow_ver": {"type": "integer", "minimum": 1},
         "params": {"type": "object"},
         "status": {"type": "string", "enum": [s.value for s in RunStatus]},
+        "engine_nonce": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
         "current_stages": {
             "type": "array",
             "items": {"type": "string", "pattern": _NAME_PATTERN},

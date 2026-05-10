@@ -262,6 +262,7 @@ def test_workflow_run_rejects_non_string_optional_ids():
             workflow_ver=1,
             params={},
             status=RunStatus.RUNNING,
+            engine_nonce="0" * 32,
             started_by_did="did:web:k.example",
             parent_run_id=42,  # int, not str-or-None
         )
@@ -272,6 +273,7 @@ def test_workflow_run_rejects_non_string_optional_ids():
             workflow_ver=1,
             params={},
             status=RunStatus.RUNNING,
+            engine_nonce="0" * 32,
             started_by_did="did:web:k.example",
             scheduler_task_id=object(),  # arbitrary, not str-or-None
         )
@@ -313,6 +315,7 @@ def test_workflow_run_validates_current_stage_names():
             workflow_ver=1,
             params={},
             status=RunStatus.RUNNING,
+            engine_nonce="0" * 32,
             current_stages=("bad name",),  # whitespace forbidden
             started_by_did="did:web:k.example",
         )
@@ -370,6 +373,7 @@ def test_workflow_run_rejects_iso_string_for_timestamp():
             workflow_ver=1,
             params={},
             status=RunStatus.RUNNING,
+            engine_nonce="0" * 32,
             started_by_did="did:web:k.example",
             cancel_barrier_at="2026-05-09T12:00:00+00:00",
         )
@@ -670,6 +674,7 @@ def test_workflow_run_status_string_coercion():
         workflow_ver=1,
         params={},
         status="running",
+            engine_nonce="0" * 32,
         started_by_did="did:web:k.example",
     )
     assert run.status == RunStatus.RUNNING
@@ -683,6 +688,20 @@ def test_workflow_run_rejects_bad_status():
             workflow_ver=1,
             params={},
             status="exploded",
+            engine_nonce="0" * 32,
+            started_by_did="did:web:k.example",
+        )
+
+
+def test_workflow_run_requires_hex_engine_nonce():
+    with pytest.raises(WorkflowDefinitionError):
+        WorkflowRun(
+            run_id="r-1",
+            workflow_name="release",
+            workflow_ver=1,
+            params={},
+            status=RunStatus.RUNNING,
+            engine_nonce="not-a-hex-nonce",
             started_by_did="did:web:k.example",
         )
 
@@ -787,6 +806,7 @@ def test_workflow_run_rejects_non_string_non_enum_status():
             workflow_ver=1,
             params={},
             status=42,
+            engine_nonce="0" * 32,
             started_by_did="did:web:k.example",
         )
 
@@ -885,6 +905,7 @@ def test_workflow_run_rejects_bool_for_workflow_ver():
             workflow_ver=True,
             params={},
             status=RunStatus.RUNNING,
+            engine_nonce="0" * 32,
             started_by_did="did:web:k.example",
         )
 
@@ -1034,6 +1055,7 @@ def test_workflow_run_to_dict_validates_against_schema():
         workflow_ver=1,
         params={"branch": "main"},
         status=RunStatus.RUNNING,
+            engine_nonce="0" * 32,
         current_stages=("lint",),
         started_by_did="did:web:k.example",
     )

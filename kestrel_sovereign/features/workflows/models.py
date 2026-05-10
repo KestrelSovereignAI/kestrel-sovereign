@@ -1129,6 +1129,7 @@ class WorkflowRun:
     workflow_ver: int
     params: Mapping[str, Any]
     status: RunStatus
+    engine_nonce: str
     current_stages: Sequence[str] = ()
     parent_run_id: Optional[str] = None
     cancel_barrier_at: Optional[datetime] = None
@@ -1169,6 +1170,14 @@ class WorkflowRun:
         if not isinstance(self.params, Mapping):
             raise WorkflowDefinitionError("run.params must be a mapping")
         object.__setattr__(self, "params", _freeze_value(self.params))
+
+        if not isinstance(self.engine_nonce, str) or not re.match(
+            r"^[0-9a-f]{32}$", self.engine_nonce
+        ):
+            raise WorkflowDefinitionError(
+                "run.engine_nonce must be 16 random bytes encoded as "
+                "lowercase hex (32 chars)"
+            )
 
         if not isinstance(self.current_stages, (list, tuple)) or not all(
             isinstance(s, str) for s in self.current_stages
@@ -1225,6 +1234,7 @@ class WorkflowRun:
             "workflow_ver": self.workflow_ver,
             "params": _thaw_value(self.params),
             "status": self.status.value,
+            "engine_nonce": self.engine_nonce,
             "current_stages": list(self.current_stages),
             "parent_run_id": self.parent_run_id,
             "cancel_barrier_at": _iso(self.cancel_barrier_at),
