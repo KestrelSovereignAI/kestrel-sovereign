@@ -149,7 +149,8 @@ Adversarial review is non-optional for any stage that publishes code. Hardened m
 - Each `red_team_clear` event records `(prompt_pack_name, prompt_pack_version, prompt_hash, constraint)` signed.
 
 **Cost budget:**
-- Gate accepts `max_total_cost_usd` and `max_total_tokens` ceilings. Operator default in `kestrel.toml`. Effective ceiling is `min(operator_default, definition_value)` (operator policy is upper bound; sub-issue covers this rule).
+- Gate accepts `max_total_cost_usd` and `max_total_tokens` ceilings. Operator default in `kestrel.toml`. Effective ceiling is `min(operator_default, definition_value)` when both are present, the sole configured value when only one is present, and unbounded only when neither is present.
+- Operator policy is an upper bound: a workflow definition whose declared ceiling exceeds the operator default fails closed at run start instead of being silently clipped.
 - Overrun → `gate_fail(reason=red_team_budget_exhausted)`.
 
 ### 3.5 Saga semantics

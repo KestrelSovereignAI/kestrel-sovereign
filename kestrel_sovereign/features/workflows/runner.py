@@ -150,6 +150,8 @@ class WorkflowRunner:
         red_team_prompt_pack_resolver: Optional[
             RedTeamPromptPackResolver
         ] = None,
+        red_team_max_total_tokens: Optional[int] = None,
+        red_team_max_total_cost_usd: Optional[float] = None,
     ) -> None:
         self.store = store
         self.dispatcher = dispatcher
@@ -164,6 +166,12 @@ class WorkflowRunner:
         self.script_artifact_resolver = script_artifact_resolver
         self.red_team_attestation_resolver = red_team_attestation_resolver
         self.red_team_prompt_pack_resolver = red_team_prompt_pack_resolver
+        self.red_team_max_total_tokens = _validate_red_team_operator_tokens(
+            red_team_max_total_tokens
+        )
+        self.red_team_max_total_cost_usd = _validate_red_team_operator_cost(
+            red_team_max_total_cost_usd
+        )
 
     async def start_run(
         self,
@@ -545,6 +553,11 @@ class WorkflowRunner:
                     f"is not allowed by source {stage.signal_source!r}"
                 )
             if stage.gate.type == "red_team_clear":
+                _validate_red_team_budget_policy(
+                    stage,
+                    operator_token_limit=self.red_team_max_total_tokens,
+                    operator_cost_limit=self.red_team_max_total_cost_usd,
+                )
                 await self._validate_red_team_clear_start(spec, stage)
             if stage.compensate not in (
                 "noop_idempotent",
@@ -1087,11 +1100,18 @@ class WorkflowRunner:
                 canary=canary,
                 stage_output=stage_output,
                 prompt_pack=prompt_pack,
+                operator_token_limit=self.red_team_max_total_tokens,
+                operator_cost_limit=self.red_team_max_total_cost_usd,
             )
             if review_outcome != GateOutcome.PASS:
                 return review_outcome, review_reason
             reviewer_results.append((reviewer, marker))
-            budget = _red_team_budget_reason(gate, reviewer_results)
+            budget = _red_team_budget_reason(
+                gate,
+                reviewer_results,
+                operator_token_limit=self.red_team_max_total_tokens,
+                operator_cost_limit=self.red_team_max_total_cost_usd,
+            )
             if budget is not None:
                 return GateOutcome.FAIL, budget
 
@@ -1108,6 +1128,8 @@ class WorkflowRunner:
         canary: str,
         stage_output: str,
         prompt_pack: Mapping[str, Any],
+        operator_token_limit: Optional[int],
+        operator_cost_limit: Optional[float],
     ) -> tuple[GateOutcome, Optional[str], Mapping[str, Any]]:
         source = _red_team_reviewer_source(reviewer)
         reviewer_id = _red_team_reviewer_identity(reviewer)
@@ -1118,7 +1140,12 @@ class WorkflowRunner:
             payload={
                 "pr_diff": _fence_untrusted(stage_output),
                 "canary": canary,
-                "rubric": _red_team_rubric(gate, prompt_pack),
+                "rubric": _red_team_rubric(
+                    gate,
+                    prompt_pack,
+                    operator_token_limit=operator_token_limit,
+                    operator_cost_limit=operator_cost_limit,
+                ),
                 "reviewer": reviewer_id,
                 "workflow_run_id": run.run_id,
                 "workflow_stage_name": stage.name,
@@ -1577,6 +1604,82 @@ def _validate_red_team_prompt_pack(stage: Stage, prompt_pack: Any) -> None:
         )
 
 
+def _validate_red_team_operator_tokens(value: Optional[int]) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise WorkflowRunnerError(
+            "red_team operator max_total_tokens must be a positive integer"
+        )
+    return value
+
+
+def _validate_red_team_operator_cost(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value <= 0
+    ):
+        raise WorkflowRunnerError(
+            "red_team operator max_total_cost_usd must be a positive finite number"
+        )
+    return float(value)
+
+
+def _validate_red_team_budget_policy(
+    stage: Stage,
+    *,
+    operator_token_limit: Optional[int],
+    operator_cost_limit: Optional[float],
+) -> None:
+    definition_tokens = stage.gate.params.get("max_total_tokens")
+    if (
+        operator_token_limit is not None
+        and definition_tokens is not None
+        and definition_tokens > operator_token_limit
+    ):
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear max_total_tokens "
+            f"{definition_tokens} exceeds operator ceiling {operator_token_limit}"
+        )
+
+    definition_cost = stage.gate.params.get("max_total_cost_usd")
+    if (
+        operator_cost_limit is not None
+        and definition_cost is not None
+        and float(definition_cost) > operator_cost_limit
+    ):
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear max_total_cost_usd "
+            f"{definition_cost} exceeds operator ceiling {operator_cost_limit:g}"
+        )
+
+
+def _effective_red_team_token_limit(
+    gate: Gate, operator_token_limit: Optional[int]
+) -> Optional[int]:
+    definition_limit = gate.params.get("max_total_tokens")
+    if definition_limit is None:
+        return operator_token_limit
+    if operator_token_limit is None:
+        return definition_limit
+    return min(operator_token_limit, definition_limit)
+
+
+def _effective_red_team_cost_limit(
+    gate: Gate, operator_cost_limit: Optional[float]
+) -> Optional[float]:
+    definition_limit = gate.params.get("max_total_cost_usd")
+    if definition_limit is None:
+        return operator_cost_limit
+    if operator_cost_limit is None:
+        return float(definition_limit)
+    return min(operator_cost_limit, float(definition_limit))
+
+
 def _red_team_attested_family(
     stage: Stage, reviewer: str, attestation: Any
 ) -> str:
@@ -1638,7 +1741,11 @@ def _fence_untrusted(value: str) -> str:
 
 
 def _red_team_rubric(
-    gate: Gate, prompt_pack: Mapping[str, Any]
+    gate: Gate,
+    prompt_pack: Mapping[str, Any],
+    *,
+    operator_token_limit: Optional[int] = None,
+    operator_cost_limit: Optional[float] = None,
 ) -> dict[str, Any]:
     return {
         "blockers": gate.params.get("blockers", "zero"),
@@ -1646,8 +1753,12 @@ def _red_team_rubric(
         "prompt_pack_name": prompt_pack["name"],
         "prompt_pack_version": prompt_pack["version"],
         "prompt_hash": prompt_pack["prompt_hash"],
-        "max_total_cost_usd": gate.params.get("max_total_cost_usd"),
-        "max_total_tokens": gate.params.get("max_total_tokens"),
+        "max_total_cost_usd": _effective_red_team_cost_limit(
+            gate, operator_cost_limit
+        ),
+        "max_total_tokens": _effective_red_team_token_limit(
+            gate, operator_token_limit
+        ),
     }
 
 
@@ -1701,10 +1812,14 @@ def _evaluate_red_team_marker(
 
 
 def _red_team_budget_reason(
-    gate: Gate, reviewer_results: list[tuple[str, Mapping[str, Any]]]
+    gate: Gate,
+    reviewer_results: list[tuple[str, Mapping[str, Any]]],
+    *,
+    operator_token_limit: Optional[int] = None,
+    operator_cost_limit: Optional[float] = None,
 ) -> Optional[str]:
-    token_limit = gate.params.get("max_total_tokens")
-    cost_limit = gate.params.get("max_total_cost_usd")
+    token_limit = _effective_red_team_token_limit(gate, operator_token_limit)
+    cost_limit = _effective_red_team_cost_limit(gate, operator_cost_limit)
     total_tokens = 0
     total_cost = 0.0
     for _, marker in reviewer_results:
