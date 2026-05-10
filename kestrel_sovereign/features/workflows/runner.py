@@ -82,6 +82,7 @@ _RUNNER_GATE_TYPES = frozenset(
         "ci_green",
         "lint_clean",
         "signature_collected",
+        "constitution_echo_verified",
         "constitutional_boundary_clean",
     }
 )
@@ -362,11 +363,28 @@ class WorkflowRunner:
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
                     "requires signal_mode=ACTION"
                 )
+            if (
+                stage.gate.type == "constitution_echo_verified"
+                and stage.signal_mode != SignalMode.COGNITION
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} gate {stage.gate.type!r} "
+                    "requires signal_mode=COGNITION"
+                )
             registration = self.registry.get(stage.signal_source)
             if registration is None:
                 raise WorkflowRunnerError(
                     f"stage {stage.name!r} references unregistered source "
                     f"{stage.signal_source!r}"
+                )
+            if (
+                stage.gate.type == "constitution_echo_verified"
+                and not registration.require_constitution_echo
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} gate constitution_echo_verified "
+                    f"requires source {stage.signal_source!r} to set "
+                    "require_constitution_echo=True"
                 )
             if stage.signal_mode not in registration.allowed_modes:
                 raise WorkflowRunnerError(
@@ -623,6 +641,10 @@ class WorkflowRunner:
                 stage_name=stage.name,
                 attempt_number=attempt_number,
             )
+        if stage.gate.type == "constitution_echo_verified":
+            if result.mode != SignalMode.COGNITION:
+                return GateOutcome.FAIL, "constitution_echo_requires_cognition_result"
+            return GateOutcome.PASS, None
         if stage.gate.type == "constitutional_boundary_clean":
             return self._evaluate_constitutional_boundary_gate(stage, result)
         if stage.gate.type not in _RUNNER_GATE_TYPES:
