@@ -11,3 +11,21 @@ def test_feature_proof_matrix_marks_mcp_as_external_package_boundary():
 
     assert "`mcp` | `kestrel-feature-mcp`" in matrix
     assert "kestrel_sovereign/features/mcp.py" not in matrix
+
+
+def test_observability_feature_is_external_to_core():
+    registry = (PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml").read_text()
+    feature_dir = PROJECT_ROOT / "kestrel_sovereign/features/observability"
+
+    assert 'package = "kestrel-feature-observability"' in registry
+    assert "[observability]" in registry
+    assert "`observability` | `kestrel-feature-observability`" in (
+        PROJECT_ROOT / "docs/audit/FEATURE_PROOF_MATRIX.md"
+    ).read_text()
+    observability_block = registry.split("[observability]", 1)[1].split("\n[", 1)[0]
+    assert "core = false" in observability_block
+    source_files = [
+        path for path in feature_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if feature_dir.exists() else []
+    assert source_files == []

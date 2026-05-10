@@ -31,6 +31,7 @@ Status meanings:
 | `memory` | `kestrel_sovereign/features/memory.py` | `tests/unit/test_memory_manager.py`, `tests/unit/test_memory_system.py`, `tests/integration/test_memory_feature_e2e.py` | Direct |
 | `memory_agency` | `kestrel_sovereign/features/memory_agency.py` | `tests/unit/test_memory_agency_feature.py` | Direct |
 | `model` | `kestrel_sovereign/features/model/feature.py` | `tests/unit/test_model_selection_contracts.py`, `tests/unit/test_model_set_openrouter.py`, `tests/integration/test_model_set_routing_e2e.py` | Direct |
+| `observability` | `kestrel-feature-observability` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-observability` | Boundary |
 | `peers` | `kestrel_sovereign/features/peers/` | `tests/unit/test_peers_feature.py` | Direct |
 | `reflection` | `kestrel_sovereign/features/reflection/` | `tests/integration/test_reflection_e2e.py` | Direct |
 | `runpod` | `kestrel_sovereign/features/runpod/` | `tests/unit/test_runpod_model_contracts.py`, `tests/unit/test_runpod_logs.py`, `tests/integration/test_runpod_feature.py` | Direct |

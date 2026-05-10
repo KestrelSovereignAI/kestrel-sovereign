@@ -331,7 +331,7 @@ features = ["ObservabilityFeature"]
 description = "Event tracking, metrics, and observability dashboard"
 tags = ["monitoring", "observability", "metrics"]
 icon = "activity"
-core = true
+core = false
 
 [scheduler]
 package = "kestrel-feature-scheduler"
