@@ -37,6 +37,7 @@ _NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$"
 # than ``_NAME_PATTERN`` because the design's ``agent.<did>`` source
 # names embed DIDs containing ``:``, ``@``, ``%``, ``+``.
 _SOURCE_NAME_PATTERN = r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$"
+_GITHUB_REPO_PATTERN = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 
 # Pattern requiring at least one non-whitespace char anywhere in the
 # value. Schema's ``minLength: 1`` counts whitespace, but the dataclass
@@ -100,6 +101,47 @@ def _gate_schema() -> dict[str, Any]:
                                         "pattern": _NON_WHITESPACE_PATTERN,
                                     },
                                     "minItems": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "if": {
+                    "properties": {"type": {"const": "ci_green"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["repo", "branch"],
+                            "properties": {
+                                "repo": {
+                                    "type": "string",
+                                    "pattern": _GITHUB_REPO_PATTERN,
+                                },
+                                "branch": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                                "required_checks": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "pattern": _NON_WHITESPACE_PATTERN,
+                                    },
+                                    "minItems": 1,
+                                },
+                                "poll_interval_seconds": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                },
+                                "max_wait_seconds": {
+                                    "type": "integer",
+                                    "minimum": 1,
                                 },
                             },
                         },

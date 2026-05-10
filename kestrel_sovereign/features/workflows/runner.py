@@ -16,13 +16,20 @@ contract established here.
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import hashlib
+import inspect
 import json
+import os
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
+from urllib.error import HTTPError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
@@ -66,10 +73,13 @@ _RUNNER_GATE_TYPES = frozenset(
     {
         "signal_status_ok",
         "tests_pass",
+        "ci_green",
         "lint_clean",
         "constitutional_boundary_clean",
     }
 )
+
+CiGreenProvider = Callable[[Gate, Any], Awaitable[Any] | Any]
 
 
 class WorkflowRunnerError(RuntimeError):
@@ -96,6 +106,7 @@ class WorkflowRunner:
         verification_methods_resolver: Optional[
             VerificationMethodsResolver
         ] = None,
+        ci_green_provider: Optional[CiGreenProvider] = None,
     ) -> None:
         self.store = store
         self.dispatcher = dispatcher
@@ -103,6 +114,7 @@ class WorkflowRunner:
         self.agent_identity = agent_identity
         self.public_key_resolver = public_key_resolver
         self.verification_methods_resolver = verification_methods_resolver
+        self.ci_green_provider = ci_green_provider or _default_ci_green_provider
 
     async def start_run(
         self,
@@ -333,10 +345,11 @@ class WorkflowRunner:
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
                     "is not implemented in the workflow runner"
                 )
-            if (
-                stage.gate.type in {"tests_pass", "lint_clean"}
-                and stage.signal_mode != SignalMode.ACTION
-            ):
+            if stage.gate.type in {
+                "tests_pass",
+                "ci_green",
+                "lint_clean",
+            } and stage.signal_mode != SignalMode.ACTION:
                 raise WorkflowRunnerError(
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
                     "requires signal_mode=ACTION"
@@ -501,7 +514,7 @@ class WorkflowRunner:
         await self.store.insert_stage_link(link)
 
         payload = {**stage.to_dict()["params"], **run.to_dict()["params"]}
-        if stage.gate.type in {"tests_pass", "lint_clean"}:
+        if stage.gate.type in {"tests_pass", "ci_green", "lint_clean"}:
             payload.update(stage.gate.to_dict()["params"])
 
         signal = Signal(
@@ -526,7 +539,7 @@ class WorkflowRunner:
             ],
         )
         result = await self.dispatcher.dispatch_signal(signal)
-        gate_outcome, gate_reason = self._evaluate_gate(stage, result)
+        gate_outcome, gate_reason = await self._evaluate_gate(stage, result)
         actor_did, actor_sig = sign_stage_transition(
             run_id=run.run_id,
             stage_name=stage.name,
@@ -554,13 +567,17 @@ class WorkflowRunner:
         record_gate_outcome(spec.name, stage.name, gate_outcome.value)
         return gate_outcome
 
-    def _evaluate_gate(self, stage: Stage, result) -> tuple[GateOutcome, Optional[str]]:
+    async def _evaluate_gate(
+        self, stage: Stage, result
+    ) -> tuple[GateOutcome, Optional[str]]:
         if result.status != Status.OK:
             return GateOutcome.FAIL, result.error or result.status.value
         if stage.gate.type == "signal_status_ok":
             return GateOutcome.PASS, None
         if stage.gate.type in {"tests_pass", "lint_clean"}:
             return _evaluate_exit_marker_gate(stage.gate, result)
+        if stage.gate.type == "ci_green":
+            return await self._evaluate_ci_green_gate(stage.gate, result)
         if stage.gate.type == "constitutional_boundary_clean":
             return self._evaluate_constitutional_boundary_gate(stage, result)
         if stage.gate.type not in _RUNNER_GATE_TYPES:
@@ -569,6 +586,21 @@ class WorkflowRunner:
                 f"gate {stage.gate.type!r} is not implemented in the workflow runner",
             )
         return GateOutcome.FAIL, f"gate {stage.gate.type!r} failed closed"
+
+    async def _evaluate_ci_green_gate(
+        self, gate: Gate, result: Any
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if result.mode != SignalMode.ACTION:
+            return GateOutcome.FAIL, "ci_green_requires_action_result"
+        try:
+            marker = self.ci_green_provider(gate, result)
+            if inspect.isawaitable(marker):
+                marker = await marker
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            return GateOutcome.FAIL, f"ci_green_error:{exc}"
+        if _ci_marker_green(gate, marker):
+            return GateOutcome.PASS, None
+        return GateOutcome.FAIL, f"ci_green_failed:{_ci_marker_reason(gate, marker)}"
 
     def _evaluate_constitutional_boundary_gate(
         self, stage: Stage, result
@@ -784,6 +816,326 @@ def _evaluate_exit_marker_gate(
         return GateOutcome.PASS, None
     reason = _result_marker_reason(marker)
     return GateOutcome.FAIL, f"{gate.type}_failed:{reason}"
+
+
+async def _default_ci_green_provider(gate: Gate, result: Any) -> Any:
+    del result
+    interval = gate.params.get("poll_interval_seconds", 10)
+    max_wait = gate.params.get("max_wait_seconds", 600)
+    deadline = time.monotonic() + max_wait
+    marker: Any = None
+
+    while True:
+        marker = await asyncio.to_thread(_fetch_github_ci_marker, gate)
+        if _ci_marker_green(gate, marker):
+            return marker
+        if not _ci_marker_pending(gate, marker) or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+
+    if _ci_marker_pending(gate, marker):
+        if isinstance(marker, dict):
+            return {
+                **marker,
+                "status": "timeout",
+                "message": "ci_green timed out waiting for checks to complete",
+            }
+        return {
+            "status": "timeout",
+            "message": "ci_green timed out waiting for checks to start",
+        }
+    return marker
+
+
+def _fetch_github_ci_marker(gate: Gate) -> dict[str, Any]:
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not token:
+        return {
+            "status": "error",
+            "message": "GITHUB_TOKEN or GH_TOKEN is required for ci_green",
+        }
+
+    repo = gate.params["repo"]
+    branch = gate.params["branch"]
+    repo_path = _quote_repo_path(repo)
+    branch_ref = quote(branch, safe="")
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "kestrel-workflows-ci-green",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    branch_doc = _github_json(
+        f"https://api.github.com/repos/{repo_path}/branches/{branch_ref}",
+        headers=headers,
+    )
+    sha = branch_doc["commit"]["sha"]
+    check_runs = _github_paginated_items(
+        f"https://api.github.com/repos/{repo_path}/commits/{sha}/check-runs?per_page=100",
+        headers=headers,
+        item_key="check_runs",
+    )
+    statuses_doc = _github_json(
+        f"https://api.github.com/repos/{repo_path}/commits/{sha}/status",
+        headers=headers,
+    )
+    required_checks = tuple(gate.params.get("required_checks") or ())
+    required_doc = None
+    if not required_checks:
+        required_doc = _github_json_optional(
+            (
+                "https://api.github.com/repos/"
+                f"{repo_path}/branches/{branch_ref}/protection/required_status_checks"
+            ),
+            headers=headers,
+        )
+    if not required_checks and isinstance(required_doc, dict):
+        required_checks = _github_required_check_names(required_doc)
+
+    return {
+        "repo": repo,
+        "branch": branch,
+        "sha": sha,
+        "check_runs": check_runs,
+        "statuses": statuses_doc.get("statuses", []),
+        "required_checks": required_checks,
+    }
+
+
+def _quote_repo_path(repo: str) -> str:
+    owner, _, name = repo.partition("/")
+    if not owner or not name or "/" in name:
+        raise WorkflowRunnerError(
+            "ci_green params.repo must use 'owner/repo' GitHub syntax"
+        )
+    return f"{quote(owner, safe='')}/{quote(name, safe='')}"
+
+
+def _github_json(url: str, *, headers: dict[str, str]) -> Any:
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=15) as response:  # noqa: S310 - GitHub API only
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _github_paginated_items(
+    url: str, *, headers: dict[str, str], item_key: str
+) -> list[Any]:
+    items: list[Any] = []
+    page = 1
+    separator = "&" if "?" in url else "?"
+    while True:
+        payload = _github_json(f"{url}{separator}page={page}", headers=headers)
+        page_items = payload.get(item_key, [])
+        if not isinstance(page_items, list):
+            return items
+        items.extend(page_items)
+        total_count = payload.get("total_count")
+        if not isinstance(total_count, int) or len(items) >= total_count:
+            return items
+        if not page_items:
+            return items
+        page += 1
+
+
+def _github_required_check_names(required_doc: dict[str, Any]) -> tuple[str, ...]:
+    names: list[str] = []
+    for item in required_doc.get("contexts") or ():
+        if isinstance(item, str) and item.strip():
+            names.append(item.strip())
+    checks = required_doc.get("checks")
+    if isinstance(checks, list):
+        for item in checks:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("context") or item.get("name")
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+    return tuple(dict.fromkeys(names))
+
+
+def _github_json_optional(url: str, *, headers: dict[str, str]) -> Any:
+    try:
+        return _github_json(url, headers=headers)
+    except HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise
+
+
+def _ci_marker_green(gate: Gate, marker: Any) -> bool:
+    if isinstance(marker, bool):
+        return marker
+    if isinstance(marker, str):
+        return marker.strip().lower() in {"ok", "pass", "passed", "success", "green"}
+    if not isinstance(marker, dict):
+        return False
+
+    if _has_explicit_bad_status(marker):
+        return False
+    check_entries = _ci_check_entries(marker)
+    required_names = _ci_required_names(gate, marker)
+    if check_entries:
+        return _ci_checks_green(check_entries, required_names)
+    if required_names:
+        return False
+    if any(marker.get(key) is True for key in ("ok", "success", "passed", "green")):
+        return True
+    state = marker.get("state") or marker.get("status") or marker.get("conclusion")
+    return isinstance(state, str) and state.strip().lower() in {
+        "ok",
+        "pass",
+        "passed",
+        "success",
+        "green",
+    }
+
+
+def _ci_marker_pending(gate: Gate, marker: Any) -> bool:
+    if not isinstance(marker, dict):
+        return False
+    if _has_explicit_bad_status(marker):
+        return False
+    check_entries = _ci_check_entries(marker)
+    required_names = _ci_required_names(gate, marker)
+    if not check_entries:
+        return True
+    relevant = [
+        entry
+        for name, entry in check_entries
+        if not required_names or name in required_names
+    ]
+    if any(
+        _ci_check_failure_reason(entry) is not None
+        for entry in relevant
+        if not _ci_check_pending(entry)
+    ):
+        return False
+    if required_names and not required_names.issubset(
+        {name for name, _ in check_entries}
+    ):
+        return True
+    return any(_ci_check_pending(entry) for entry in relevant)
+
+
+def _ci_marker_reason(gate: Gate, marker: Any) -> str:
+    if isinstance(marker, dict):
+        check_entries = _ci_check_entries(marker)
+        required_names = _ci_required_names(gate, marker)
+        observed_names = {name for name, _ in check_entries}
+        for name, entry in check_entries:
+            if required_names and name not in required_names:
+                continue
+            reason = _ci_check_failure_reason(entry)
+            if reason is not None:
+                return f"{name}:{reason}"
+        missing = sorted(required_names - observed_names)
+        if missing:
+            return "missing_required_checks:" + ",".join(missing)
+        for key in ("message", "error", "summary", "status", "state", "conclusion"):
+            reason = marker.get(key)
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip()
+    return repr(marker)
+
+
+def _ci_required_names(gate: Gate, marker: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    names.update(_marker_strings(gate.params.get("required_checks")))
+    names.update(_marker_strings(marker.get("required_checks")))
+    return names
+
+
+def _ci_check_entries(marker: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    entries: list[tuple[str, dict[str, Any]]] = []
+    for key in ("checks", "check_runs", "statuses"):
+        value = marker.get(key)
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("context") or item.get("check_name")
+            if isinstance(name, str) and name.strip():
+                entries.append((name.strip(), item))
+    return entries
+
+
+def _ci_checks_green(
+    check_entries: list[tuple[str, dict[str, Any]]], required_names: set[str]
+) -> bool:
+    relevant = [
+        (name, entry)
+        for name, entry in check_entries
+        if not required_names or name in required_names
+    ]
+    if not relevant:
+        return False
+    if required_names and not required_names.issubset({name for name, _ in relevant}):
+        return False
+    return all(_ci_check_success(entry) for _, entry in relevant)
+
+
+def _ci_check_failure_reason(entry: dict[str, Any]) -> Optional[str]:
+    if _ci_check_pending(entry):
+        return None
+    status = entry.get("status")
+    conclusion = entry.get("conclusion") or entry.get("state")
+    if isinstance(status, str) and status.strip().lower() not in {
+        "completed",
+        "success",
+        "ok",
+    }:
+        return f"status={status.strip()}"
+    if conclusion is None and isinstance(status, str):
+        return None
+    if isinstance(conclusion, str) and conclusion.strip().lower() in {
+        "success",
+        "neutral",
+        "skipped",
+    }:
+        return None
+    return f"conclusion={conclusion!r}"
+
+
+def _ci_check_success(entry: dict[str, Any]) -> bool:
+    if _ci_check_pending(entry):
+        return False
+    status = entry.get("status")
+    conclusion = entry.get("conclusion") or entry.get("state")
+    if isinstance(status, str) and status.strip().lower() not in {
+        "completed",
+        "success",
+        "ok",
+    }:
+        return False
+    return isinstance(conclusion, str) and conclusion.strip().lower() in {
+        "success",
+        "neutral",
+        "skipped",
+    }
+
+
+def _ci_check_pending(entry: dict[str, Any]) -> bool:
+    status = entry.get("status")
+    conclusion = entry.get("conclusion") or entry.get("state")
+    if isinstance(status, str) and status.strip().lower() in {
+        "queued",
+        "in_progress",
+        "pending",
+        "requested",
+        "waiting",
+    }:
+        return True
+    if conclusion is None and isinstance(status, str):
+        return status.strip().lower() not in {"completed", "success", "ok"}
+    if isinstance(conclusion, str) and conclusion.strip().lower() in {
+        "pending",
+        "queued",
+        "in_progress",
+    }:
+        return True
+    return False
 
 
 def _result_marker_passed(gate: Gate, value: Any) -> bool:
