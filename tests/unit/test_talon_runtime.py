@@ -11,7 +11,9 @@ from kestrel_sovereign.features.talon.runtime import (
     TalonRuntimeError,
     TalonRuntimeRequest,
     build_talon_invocation,
+    load_talon_policy_preference,
     sanitize_env_for_backend,
+    write_talon_preference,
 )
 
 
@@ -161,3 +163,32 @@ def test_codex_without_model_omits_model_flag():
     assert invocation.backend == "codex"
     assert invocation.model is None
     assert "--codex-model" not in invocation.argv
+
+
+def test_string_false_preference_values_parse_as_false(tmp_path):
+    path = tmp_path / "kestrel.toml"
+
+    result = write_talon_preference(
+        {
+            "default_backend": "codex",
+            "default_model": "gpt-5.4-mini",
+            "default_auth_lane": "oauth",
+            "skip_clarification": "false",
+            "self_review": "0",
+        },
+        kestrel_toml_path=path,
+    )
+    _policy, preference = load_talon_policy_preference(path)
+
+    assert result["preference"]["skip_clarification"] is False
+    assert result["preference"]["self_review"] is False
+    assert preference.skip_clarification is False
+    assert preference.self_review is False
+
+
+def test_invalid_string_bool_preference_rejected(tmp_path):
+    with pytest.raises(TalonRuntimeError, match="skip_clarification"):
+        write_talon_preference(
+            {"skip_clarification": "definitely"},
+            kestrel_toml_path=tmp_path / "kestrel.toml",
+        )

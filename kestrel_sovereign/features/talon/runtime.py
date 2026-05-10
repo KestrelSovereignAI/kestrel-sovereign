@@ -142,6 +142,23 @@ def normalize_auth_lane(value: str | None) -> AuthLane | None:
     return value  # type: ignore[return-value]
 
 
+def parse_talon_bool(value: Any, key: str) -> bool:
+    """Parse bool-like tool/config values without truthiness surprises."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "y", "on"):
+            return True
+        if normalized in ("false", "0", "no", "n", "off"):
+            return False
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    raise TalonRuntimeError(
+        f"Talon {key} must be a boolean or one of true/false, yes/no, 1/0"
+    )
+
+
 def resolve_runtime(
     request: TalonRuntimeRequest,
     preference: TalonPreference,
@@ -341,12 +358,19 @@ def _policy_from_mapping(data: Mapping[str, Any]) -> TalonPolicy:
         raise TalonRuntimeError("talon.policy.allowed_backends cannot be empty")
     return TalonPolicy(
         allowed_backends=allowed,  # type: ignore[arg-type]
-        allow_api_billing=bool(data.get("allow_api_billing", False)),
-        require_worktree=bool(data.get("require_worktree", True)),
-        require_sandboxed_workspace=bool(
-            data.get("require_sandboxed_workspace", True)
+        allow_api_billing=parse_talon_bool(
+            data.get("allow_api_billing", False), "policy.allow_api_billing"
         ),
-        allow_background_jobs=bool(data.get("allow_background_jobs", True)),
+        require_worktree=parse_talon_bool(
+            data.get("require_worktree", True), "policy.require_worktree"
+        ),
+        require_sandboxed_workspace=parse_talon_bool(
+            data.get("require_sandboxed_workspace", True),
+            "policy.require_sandboxed_workspace",
+        ),
+        allow_background_jobs=parse_talon_bool(
+            data.get("allow_background_jobs", True), "policy.allow_background_jobs"
+        ),
     )
 
 
@@ -361,8 +385,12 @@ def _preference_from_mapping(data: Mapping[str, Any]) -> TalonPreference:
         default_auth_lane=auth_lane,
         max_iterations=int(data.get("max_iterations", 3)),
         max_turns=int(data.get("max_turns", 50)),
-        skip_clarification=bool(data.get("skip_clarification", True)),
-        self_review=bool(data.get("self_review", True)),
+        skip_clarification=parse_talon_bool(
+            data.get("skip_clarification", True), "preference.skip_clarification"
+        ),
+        self_review=parse_talon_bool(
+            data.get("self_review", True), "preference.self_review"
+        ),
     )
     if pref.max_iterations < 1:
         raise TalonRuntimeError("talon.preference.max_iterations must be >= 1")

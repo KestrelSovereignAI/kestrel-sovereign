@@ -33,8 +33,9 @@ class TestTalonCoordinatorInit:
 
 class TestTalonClaim:
     @pytest.mark.asyncio
-    async def test_claim_mesh_success(self):
+    async def test_claim_mesh_success(self, tmp_path, monkeypatch):
         """When mesh dispatch works, returns dispatched=True."""
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         feature = TalonCoordinatorFeature(_make_agent())
         with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh:
             mock_mesh.return_value = {
@@ -57,6 +58,7 @@ class TestTalonClaim:
         workspace state.
         """
         monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
         feature = TalonCoordinatorFeature(_make_agent())
         ready_state = {
@@ -156,6 +158,65 @@ class TestTalonClaim:
         assert loaded.data["preference"]["default_model"] == "gpt-5.4-mini"
         assert loaded.data["preference"]["max_iterations"] == 2
         assert loaded.data["policy"]["allow_api_billing"] is False
+
+    @pytest.mark.asyncio
+    async def test_talon_set_config_parses_string_false(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        result = await feature.talon_set_config(
+            default_backend="codex",
+            default_model="gpt-5.4-mini",
+            default_auth_lane="oauth",
+            skip_clarification="false",
+            self_review="no",
+        )
+        loaded = await feature.talon_get_config()
+
+        assert result.status is ToolResultStatus.OK
+        assert loaded.data["preference"]["skip_clarification"] is False
+        assert loaded.data["preference"]["self_review"] is False
+
+    @pytest.mark.asyncio
+    async def test_claim_parses_string_false_override(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        ready_state = {
+            "repo": "org/repo",
+            "path": str(tmp_path / "org__repo"),
+            "exists": True,
+            "is_git": True,
+            "head": "main",
+            "clean": True,
+            "last_fetch_at": None,
+            "safe": True,
+        }
+        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(TalonCoordinatorFeature, "_workspace_state", return_value=ready_state):
+            mock_mesh.return_value = {"dispatched": False, "reason": "no_mesh_host"}
+            mock_bg.return_value = {
+                "dispatched": True,
+                "method": "cli_background",
+                "job_id": "abc",
+                "pid": 1234,
+            }
+            result = await feature.talon_claim(
+                repo="org/repo",
+                issue=42,
+                backend="codex",
+                model="gpt-5.4-mini",
+                auth_lane="oauth",
+                skip_clarification="false",
+                self_review="false",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        args = mock_bg.call_args[0][0]
+        assert "--skip-clarification" not in args
+        assert "--self-review" not in args
 
     @pytest.mark.asyncio
     async def test_claim_refuses_when_workspace_not_provisioned(self):
