@@ -181,8 +181,9 @@ Adversarial review is non-optional for any stage that publishes code. Hardened m
 ### 3.6 Definition versioning, revocation, signature verification
 
 - **In-flight runs pin to definition version at start.** A run started against v3 keeps running against v3 even if v4 publishes mid-flight. No auto-promotion.
-- **Definition signature re-verification on every run start.** A revoked DID's definitions fail to start; in-flight runs continue (because aborting could leave irreversible residue) with `signature_post_revocation=True` on the run row.
-- **Typed revocation reasons** (`compromised` triggers `force_revoke`-with-compensation; `retired` allows in-flight to drain) — sub-issue covers the typing rules.
+- **Definition signature re-verification on every run start.** A revoked DID's definitions fail to start; in-flight runs continue (because aborting could leave irreversible residue) with `signature_post_revocation=True` on the run row unless the revocation reason is `compromised`.
+- **Typed revocation reasons** are a closed vocabulary: `compromised`, `retired`, `rotated`. Each revocation records the revoking authority DID and signature alongside `deleted_at`.
+- **Revocation semantics:** `compromised` triggers `force_revoke`-with-compensation for active runs by default; `retired` allows in-flight runs to drain and refuses new starts; `rotated` also allows pinned in-flight runs to continue, while new starts must target the replacement key/version.
 - **`force_revoke` admin path** for compromise scenarios; cancels all in-flight runs of the DID's definitions with full compensation. Logged with admin DID signature.
 
 ### 3.7 `forbidden_modules` runtime enforcement

@@ -7,6 +7,7 @@ import base64
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from urllib.error import HTTPError
 
@@ -24,6 +25,7 @@ from kestrel_sovereign.features.workflows import (
     Edge,
     EdgeKind,
     Gate,
+    RevocationReason,
     RunStatus,
     Stage,
     WorkflowRunner,
@@ -2112,7 +2114,11 @@ async def test_runner_rejects_revoked_definition(runner_components):
         ),
     )
     assert await c.store.revoke_definition(
-        "release", 1, reason="retired"
+        "release",
+        1,
+        reason=RevocationReason.RETIRED,
+        authority_did=c.identity.legacy_did,
+        authority_sig="sig-retired",
     )
 
     with pytest.raises(WorkflowRunnerError, match="not found"):
@@ -4889,6 +4895,340 @@ async def test_runner_cancel_compensates_completed_stages_reverse_order(
 
 
 @pytest.mark.asyncio
+async def test_runner_compromised_revocation_force_cancels_in_flight_run(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def do_one(payload):
+        events.append("do_one")
+        return {"ok": True}
+
+    async def undo_one(payload):
+        events.append("undo_one")
+        return {"ok": True}
+
+    c.registry.register(_action_source("do.one", do_one))
+    c.registry.register(_action_source("undo.one", undo_one))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.one",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    spec = await c.store.get_definition("release", 1)
+    await c.runner._dispatch_stage(run, spec, spec.stages[0])
+    await c.store.update_run_status(run.run_id, RunStatus.PAUSED)
+
+    result = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+    )
+
+    assert result.changed is True
+    assert result.reason is RevocationReason.COMPROMISED
+    assert result.force_revoked_run_ids == (run.run_id,)
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    assert events == ["do_one", "undo_one"]
+    row = await c.store.get_definition_row("release", 1)
+    assert row["revocation_reason"] == "compromised"
+    assert row["revocation_authority_did"] == c.identity.legacy_did
+    assert row["revocation_authority_sig"]
+
+
+@pytest.mark.asyncio
+async def test_runner_compromised_revocation_from_store_cancels_on_resume(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def do_one(payload):
+        events.append("do_one")
+        return {"ok": True}
+
+    async def undo_one(payload):
+        events.append("undo_one")
+        return {"ok": True}
+
+    c.registry.register(_action_source("do.one", do_one))
+    c.registry.register(_action_source("undo.one", undo_one))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.one",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    spec = await c.store.get_definition("release", 1)
+    await c.runner._dispatch_stage(run, spec, spec.stages[0])
+    await c.store.update_run_status(run.run_id, RunStatus.PAUSED)
+    assert await c.store.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+        authority_did=c.identity.legacy_did,
+        authority_sig="sig-compromised",
+    )
+
+    result = await c.runner.continue_run(run.run_id)
+
+    assert result.status == RunStatus.CANCELLED
+    assert events == ["do_one", "undo_one"]
+    stored = await c.store.get_run(run.run_id)
+    assert stored.signature_post_revocation is True
+    assert stored.cancel_barrier_at is not None
+
+
+@pytest.mark.asyncio
+async def test_runner_compromised_revocation_rerun_force_cancels_active_runs(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def do_one(payload):
+        events.append("do_one")
+        return {"ok": True}
+
+    async def undo_one(payload):
+        events.append("undo_one")
+        return {"ok": True}
+
+    c.registry.register(_action_source("do.one", do_one))
+    c.registry.register(_action_source("undo.one", undo_one))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.one",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    spec = await c.store.get_definition("release", 1)
+    await c.runner._dispatch_stage(run, spec, spec.stages[0])
+    await c.store.update_run_status(run.run_id, RunStatus.PAUSED)
+    assert await c.store.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+        authority_did=c.identity.legacy_did,
+        authority_sig="sig-compromised",
+    )
+
+    result = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+    )
+
+    assert result.changed is False
+    assert result.force_revoked_run_ids == (run.run_id,)
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    assert events == ["do_one", "undo_one"]
+
+
+@pytest.mark.asyncio
+async def test_runner_compromised_revocation_finishes_running_run(
+    runner_components,
+):
+    c = runner_components
+    calls: list[str] = []
+
+    async def handler(payload):
+        calls.append("lint")
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+
+    result = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+    )
+
+    assert result.force_revoked_run_ids == (run.run_id,)
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    assert stored.finished_at is not None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_compromised_revocation_skips_concurrently_terminal_run(
+    runner_components,
+):
+    c = runner_components
+    calls: list[str] = []
+
+    async def handler(payload):
+        calls.append(payload["run_label"])
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    first = await c.runner.start_run(name="release", params={"run_label": "first"})
+    second = await c.runner.start_run(name="release", params={"run_label": "second"})
+    original_force_cancel = c.runner._force_cancel_run
+
+    async def finish_first_then_force_cancel(run_id: str):
+        if run_id == first.run_id:
+            await c.store.update_run_status(
+                run_id,
+                RunStatus.COMPLETED,
+                finished_at=datetime.now(timezone.utc),
+            )
+        return await original_force_cancel(run_id)
+
+    c.runner._force_cancel_run = finish_first_then_force_cancel
+
+    result = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+    )
+
+    assert result.force_revoked_run_ids == (second.run_id,)
+    first_stored = await c.store.get_run(first.run_id)
+    second_stored = await c.store.get_run(second.run_id)
+    assert first_stored.status == RunStatus.COMPLETED
+    assert second_stored.status == RunStatus.CANCELLED
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_rotated_revocation_drains_in_flight_run(
+    runner_components,
+):
+    c = runner_components
+    calls: list[str] = []
+
+    async def handler(payload):
+        calls.append("lint")
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+
+    result = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.ROTATED,
+    )
+
+    assert result.changed is True
+    assert result.reason is RevocationReason.ROTATED
+    assert result.force_revoked_run_ids == ()
+    with pytest.raises(WorkflowRunnerError, match="revoked"):
+        await c.runner.run_to_completion(name="release", version=1)
+
+    completed = await c.runner.continue_run(run.run_id)
+
+    assert completed.status == RunStatus.COMPLETED
+    assert calls == ["lint"]
+    stored = await c.store.get_run(run.run_id)
+    assert stored.signature_post_revocation is True
+
+
+@pytest.mark.asyncio
+async def test_runner_compromised_revocation_upgrades_rotated_revocation(
+    runner_components,
+):
+    c = runner_components
+    calls: list[str] = []
+
+    async def handler(payload):
+        calls.append("lint")
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    rotated = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.ROTATED,
+    )
+    assert rotated.changed is True
+
+    compromised = await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+    )
+
+    assert compromised.changed is True
+    assert compromised.force_revoked_run_ids == (run.run_id,)
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    assert calls == []
+    row = await c.store.get_definition_row("release", 1)
+    assert row["revocation_reason"] == "compromised"
+
+
+@pytest.mark.asyncio
 async def test_runner_cancel_active_run_sets_barrier_without_compensating_twice(
     runner_components,
 ):
@@ -5183,7 +5523,13 @@ async def test_runner_marks_post_revocation_resume_for_audit(
     )
     run = await c.runner.start_run(name="release")
     await c.store.update_run_status(run.run_id, RunStatus.PAUSED)
-    assert await c.store.revoke_definition("release", 1, reason="retired")
+    assert await c.store.revoke_definition(
+        "release",
+        1,
+        reason="retired",
+        authority_did=c.identity.legacy_did,
+        authority_sig="sig-retired",
+    )
 
     result = await c.runner.continue_run(run.run_id)
 
@@ -5244,6 +5590,44 @@ async def test_runner_retries_failed_stage_with_fresh_attempt_number(
     assert links[0].gate_outcome.value == "fail"
     assert links[1].gate_outcome.value == "pass"
     assert links[0].idempotency_key != links[1].idempotency_key
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        RevocationReason.COMPROMISED,
+        RevocationReason.RETIRED,
+        RevocationReason.ROTATED,
+    ],
+)
+async def test_runner_retry_refuses_revoked_definition(
+    runner_components,
+    reason,
+):
+    c = runner_components
+
+    async def handler(payload):
+        raise RuntimeError("boom")
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    failed = await c.runner.run_to_completion(name="release")
+    await c.runner.revoke_definition(
+        "release",
+        1,
+        reason=reason,
+    )
+
+    with pytest.raises(WorkflowRunnerError, match=f"revoked \\({reason.value}\\)"):
+        await c.runner.retry_stage(failed.run_id, "lint")
 
 
 @pytest.mark.asyncio

@@ -16,13 +16,16 @@ from kestrel_sdk.signals import SignalMode
 
 from kestrel_sovereign.features.workflows import (
     GateOutcome,
+    RevocationReason,
     Stage,
     StageLink,
     WorkflowSpec,
 )
 from kestrel_sovereign.features.workflows import WorkflowDefinitionError
 from kestrel_sovereign.features.workflows.signing import (
+    canonical_definition_revocation_payload,
     canonical_transition_payload,
+    sign_definition_revocation,
     sign_stage_transition,
     sign_workflow_spec,
     verify_stage_transition,
@@ -469,3 +472,26 @@ def test_verify_stage_transition_fails_when_resolver_unknown():
         raise KeyError(did)
 
     assert verify_stage_transition(link, resolver) is False
+
+
+def test_sign_definition_revocation_binds_typed_reason():
+    ai = _agent_identity()
+    revoked_at = "2026-05-10T22:00:00+00:00"
+
+    authority_did, sig_hex = sign_definition_revocation(
+        name="release",
+        version=3,
+        reason=RevocationReason.COMPROMISED,
+        revoked_at=revoked_at,
+        agent_identity=ai,
+    )
+
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    public_key = suite.deserialize_public_key(_resolver_for(ai)(authority_did))
+    payload = canonical_definition_revocation_payload(
+        name="release",
+        version=3,
+        reason="compromised",
+        revoked_at=revoked_at,
+    )
+    assert suite.verify(payload, bytes.fromhex(sig_hex), public_key)

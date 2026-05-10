@@ -47,6 +47,7 @@ from dataclasses import replace
 from typing import Any, Callable, Mapping, Optional
 
 from kestrel_sovereign.features.workflows.models import (
+    RevocationReason,
     StageLink,
     WorkflowDefinitionError,
     WorkflowSpec,
@@ -70,6 +71,67 @@ PublicKeyResolver = Callable[[str], bytes]
 VerificationMethodsResolver = Callable[[str], list[Mapping[str, Any]]]
 
 _HYBRID_PREFIX = "hybrid:"
+
+
+# ---------------------------------------------------------------------------
+# Definition revocation signing
+# ---------------------------------------------------------------------------
+
+
+def canonical_definition_revocation_payload(
+    *,
+    name: str,
+    version: int,
+    reason: RevocationReason | str,
+    revoked_at: str,
+) -> bytes:
+    """Canonical payload signed for a workflow definition revocation."""
+
+    payload = {
+        "name": name,
+        "reason": RevocationReason(reason).value,
+        "revoked_at": revoked_at,
+        "version": version,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def sign_definition_revocation(
+    *,
+    name: str,
+    version: int,
+    reason: RevocationReason | str,
+    revoked_at: str,
+    agent_identity: AgentIdentity,
+) -> tuple[str, str]:
+    """Sign a definition revocation with the legacy authority DID.
+
+    Phase 1 stores the signature and authority DID with the revocation
+    event. Hybrid revocation signatures can layer on this helper later,
+    but the default path mirrors Phase 0 definition signing: legacy DID
+    plus ECDSA secp256k1.
+    """
+
+    if agent_identity.legacy_keypair.private_key is None:
+        raise WorkflowDefinitionError(
+            "sign_definition_revocation: AgentIdentity has no legacy private key"
+        )
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    payload = canonical_definition_revocation_payload(
+        name=name,
+        version=version,
+        reason=reason,
+        revoked_at=revoked_at,
+    )
+    try:
+        sig = suite.sign(payload, agent_identity.legacy_keypair.private_key)
+    except CryptoSuiteError as exc:
+        raise WorkflowDefinitionError(
+            f"sign_definition_revocation failed: {exc}"
+        ) from exc
+    return agent_identity.legacy_did, sig.hex()
 
 
 # ---------------------------------------------------------------------------
