@@ -236,8 +236,9 @@ class TestInteractiveFlow:
         assert policy.llm.kind is PayerKind.HOST_ENV
 
         # CRITICAL: every kind shown to the user came from the matrix.
-        # For lighthouse storage, only HOST_ENV and NONE should appear
-        # (the four delegated/self-wallet kinds are NOT_IMPLEMENTED).
+        # For lighthouse storage, HOST_ENV, SELF_WALLET, and NONE should
+        # appear. Delegated-master kinds remain deferred until there is a
+        # payer-wallet custody/consent path for host/user/sponsor wallets.
         kind_question_pairs = [
             (msg, choices) for msg, choices in prompter.asked_select
             if "how is it paid" in msg
@@ -248,11 +249,11 @@ class TestInteractiveFlow:
             choices for msg, choices in kind_question_pairs
             if "storage/lighthouse" in msg
         )
-        # The matrix says only HOST_ENV + NONE are READY for lighthouse storage.
+        # The matrix says HOST_ENV + SELF_WALLET + NONE are READY.
         assert any("host_env" in c for c in lighthouse_kinds)
+        assert any("self_wallet" in c for c in lighthouse_kinds)
         assert any("none" in c for c in lighthouse_kinds)
-        # Must NOT offer the deferred ones.
-        assert not any("self_wallet" in c for c in lighthouse_kinds)
+        # Must NOT offer the delegated-master kinds yet.
         assert not any("host_master_provisioned" in c for c in lighthouse_kinds)
 
     def test_interactive_idempotent_no_change(self, tmp_path: Path) -> None:

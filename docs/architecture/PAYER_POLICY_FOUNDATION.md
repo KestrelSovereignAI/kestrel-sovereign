@@ -305,15 +305,13 @@ Combinations not listed here are NOT offered to the operator:
 |---|---|---|---|---|---|---|
 | llm | openrouter | ✅ | ✅ | ❌ (deferred — see Risks #4) | ✅ | ✅ |
 | llm | local (ollama/llama.cpp) | ✅ | n/a | n/a | n/a | ✅ |
-| storage | lighthouse | ✅ | ⏳ Phase 3.5 | ⏳ Phase 3.5 | ⏳ Phase 3.5 | ✅ |
+| storage | lighthouse | ✅ | ❌ (deferred) | ✅ | ❌ (deferred) | ✅ |
 | storage | local-disk | ✅ | n/a | n/a | n/a | ✅ |
 | compute | (any) | ✅ | ❌ (out of scope this PR) | ❌ | ❌ | ✅ |
 | tools | (any) | ✅ | ❌ (out of scope this PR) | ❌ | ❌ | ✅ |
 | comms | (any) | ✅ | ❌ (out of scope this PR) | ❌ | ❌ | ✅ |
 
 `✅` = implemented and verifiable in this PR.
-`⏳` = scaffolded as `NotImplementedError` in Phase 3, filled in Phase
-3.5 of this PR (small follow-up phase before wizard).
 `❌ (deferred)` = `PayerKind` enum value exists, resolver raises
 `NotImplementedError`, wizard refuses to offer it.
 `❌ (out of scope this PR)` = same as deferred but tracked as future
@@ -373,8 +371,10 @@ kestrel.toml aside, regenerate from scratch.
   construction time. The provider's `_get_api_key()` continues to call
   `resolve_key("lighthouse", require=False)` exactly as it does today.
   `LighthouseTarget` gets the same treatment. Phase 3 ships
-  `HOST_ENV`; Phase 3.5 ships `HOST_MASTER_PROVISIONED` and
-  `SELF_WALLET` for storage (the wallet-signed API key flow).
+  `HOST_ENV`; Phase 3.5 ships `SELF_WALLET` for storage via the
+  wallet-signed API key flow. Delegated-master Lighthouse remains
+  deferred until host/user/sponsor wallet custody and consent are
+  designed.
 - **Stripe on-ramp:** unchanged. It already serves the
   fiat→crypto→agent-wallet flow that backs `SELF_WALLET`. The wizard
   step's "I want to fund this agent" branch points at the existing
@@ -697,28 +697,26 @@ cold-start restore from Lighthouse still works; no regression in
 today's `LIGHTHOUSE_API_KEY` env-var behavior; `NONE` policy actually
 disables on both surfaces.
 
-### Phase 3.5 — Lighthouse `HOST_MASTER_PROVISIONED` and `SELF_WALLET` (~half day)
+### Phase 3.5 — Lighthouse `SELF_WALLET`
 
 Separated from Phase 3 so wizard work in Phase 4 does not advertise
-unimplemented Lighthouse paths. After this phase the Lighthouse row of
-the support matrix is fully `✅` (host_env) and `✅` (host_master,
-self_wallet) — wizard can offer all three honestly.
+unimplemented Lighthouse paths. After this phase the Lighthouse row
+offers `host_env`, `self_wallet`, and `none` honestly.
 
 - Implement the Lighthouse wallet-signed API key flow in
   `PayerResolver` for `SELF_WALLET`: GET
   `/api/auth/get_message?publicKey=<...>`, sign with the agent's
   existing secp256k1 wallet keypair, POST `/api/auth/create_api_key`,
   store the result in `ServiceKeyStorage`. Idempotent.
-- Implement `HOST_MASTER_PROVISIONED` for Lighthouse: same wallet-signed
-  flow but using the host's master Lighthouse wallet from
-  `HostKeyStorage`. Each agent gets its own scoped child key.
-- Tests gated behind a burner-wallet env-var: real round-trip against
-  Lighthouse's auth API to confirm the documented protocol matches
-  reality before we ship.
+- Delegated-master Lighthouse remains deferred: using a host/user/sponsor
+  wallet needs an explicit custody and consent path rather than reusing
+  the agent's own wallet key.
+- Live verification uses a burner wallet against Lighthouse's auth API to
+  confirm the documented protocol matches reality.
 
-**Codex review focus:** the live test against Lighthouse passed;
-`SELF_WALLET` cannot accidentally use the host's master wallet (and
-vice versa); resolver caching does not leak credentials across agents.
+**Codex review focus:** `SELF_WALLET` signs with the agent wallet only;
+deferred delegated-master storage cannot accidentally fall through to
+the host env var; resolver caching does not leak credentials across agents.
 
 ### Phase 4 — Setup wizard `payments` step (~1 day)
 
@@ -791,10 +789,10 @@ env-var presence. CI does not need them; local pre-PR run does.
 1. **`HostKeyStorage` vs. extending `ServiceKeyStorage`.** The
    foundation may be cleaner if `ServiceKeyStorage` simply admits a
    non-agent-DID owner ID. Codex review of Phase 2 should weigh in.
-2. **Lighthouse wallet-signed API key flow** is mature externally but
-   unverified in our codebase. Phase 3.5 must include a one-shot live
-   test against a burner wallet to confirm the protocol behaves as
-   documented before the wizard offers `SELF_WALLET` for storage.
+2. **Lighthouse wallet-signed API key flow** is implemented with mocked
+   unit coverage. Before publishing a production release, run a one-shot
+   live test against a burner wallet to confirm the protocol still
+   behaves as documented.
 3. **OpenRouter `POST /api/v1/keys` rate limit** on mass inception. If
    we ever spawn N agents in a burst, we need a backoff queue. The
    provisioning service has 3-retry exponential backoff; whether it's

@@ -6,7 +6,7 @@ agent-init time. Side effects (provisioning a child credential,
 signing a wallet auth message, persisting into ServiceKeyStorage)
 happen here so providers downstream stay simple.
 
-This Phase 2 implementation ships the two simplest paths:
+Implemented paths:
 
 - ``HOST_ENV`` — wraps today's `KeyResolutionService` and returns it.
   This is the back-compat path that preserves every standalone
@@ -17,20 +17,21 @@ This Phase 2 implementation ships the two simplest paths:
   resolver is insufficient against constructor-time env-var
   fallbacks. Plan v11 spells this out for the Lighthouse path
   specifically.
+- ``HOST_MASTER_PROVISIONED`` for OpenRouter LLM — mints a per-agent
+  child key under the host's master OpenRouter key.
+- ``SELF_WALLET`` for Lighthouse storage — signs Lighthouse's wallet
+  auth message with the agent's secp256k1 key, creates an API key, and
+  stores it in ServiceKeyStorage.
 
-All other `PayerKind` values (``HOST_MASTER_PROVISIONED``,
-``USER_MASTER_PROVISIONED``, ``SPONSOR``, ``SELF_WALLET``) raise
-`NotImplementedError` with a clear message naming the (resource_class,
-vendor, kind) triple. Phase 3 fills in the OpenRouter provisioning and
-Phase 3.5 the Lighthouse wallet-signed key flow. The wizard step in
-Phase 4 reads the same SUPPORT_MATRIX the resolver consults, so an
-operator never picks a path the resolver cannot honor.
+Unsupported combinations raise before side effects. The setup wizard
+reads the same SUPPORT_MATRIX the resolver consults, so an operator
+never picks a path the resolver cannot honor.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from kestrel_sdk.payer_policy import (
     PayerKind,
@@ -100,6 +101,7 @@ class FoundationPayerResolver:
         *,
         db: Optional["AsyncDatabase"] = None,
         host_db: Optional["AsyncDatabase"] = None,
+        wallet_private_key: Optional[Any] = None,
     ) -> None:
         """
         Args:
@@ -121,6 +123,7 @@ class FoundationPayerResolver:
         # (agent's vs the shared host.db); in tests one db often
         # serves both roles.
         self._host_db = host_db if host_db is not None else db
+        self._wallet_private_key = wallet_private_key
 
     # ------------------------------------------------------------------
     # Public surface — matches kestrel_sdk.payer_policy.PayerResolver
@@ -170,7 +173,8 @@ class FoundationPayerResolver:
         #
         # For STORAGE / COMPUTE / TOOLS / COMMS, delegated-master kinds
         # are NOT yet wired (no analogous "child credential already
-        # provisioned" path; minting requires Phase 3.5+). The SDK
+        # provisioned" path; minting requires payer-wallet custody and
+        # consent for host/user/sponsor wallets). The SDK
         # SUPPORT_MATRIX marks those triples as NOT_IMPLEMENTED so the
         # matrix-validation gate above raises
         # UnsupportedCombinationError before reaching this code. We
@@ -192,7 +196,7 @@ class FoundationPayerResolver:
                 f"PayerKind.{spec.kind.name} resolution for "
                 f"({resource_class.value}, vendor={spec.vendor!r}) is not "
                 "yet implemented (delegated-master kinds for non-LLM "
-                "resources land in Phase 3.5+). The SDK support matrix "
+                "resources need payer-wallet custody/consent). The SDK support matrix "
                 "should already mark this combination NOT_IMPLEMENTED — "
                 "if you're reaching this gate, the matrix is stale or "
                 "the SDK pin is too loose."
@@ -207,6 +211,24 @@ class FoundationPayerResolver:
             and spec.vendor == "openrouter"
         ):
             await self._maybe_mint_openrouter_child(agent_did, spec)
+
+        if (
+            spec.kind is PayerKind.SELF_WALLET
+            and resource_class is ResourceClass.STORAGE
+            and spec.vendor == "lighthouse"
+        ):
+            await self._maybe_mint_lighthouse_self_wallet_key(agent_did)
+            logger.debug(
+                f"PayerPolicy.{resource_class.value}: SELF_WALLET for agent "
+                f"{agent_did[:30]}..."
+            )
+            from kestrel_sovereign.security.service_key_storage import (
+                ServiceKeyStorage,
+            )
+
+            storage = ServiceKeyStorage(self._db, agent_did)
+            resolver = KeyResolutionService(storage=storage, agent_did=agent_did)
+            return ResolvedResource(enabled=True, key_resolver=resolver)
 
         if spec.kind is PayerKind.HOST_ENV or spec.kind in delegated_master_kinds:
             logger.debug(
@@ -235,17 +257,130 @@ class FoundationPayerResolver:
             resolver = KeyResolutionService(storage=storage, agent_did=agent_did)
             return ResolvedResource(enabled=True, key_resolver=resolver)
 
-        # All other kinds are stubbed in Phase 2; Phase 3 / 3.5 fill them in.
+        # All other kinds are stubbed.
         # We raise here rather than silently degrading because a wizard
         # that respects SUPPORT_MATRIX should never land us here.
         raise NotImplementedError(
             f"PayerKind.{spec.kind.name} resolution for "
             f"({resource_class.value}, vendor={spec.vendor!r}) is not yet "
-            "implemented in the foundation resolver. Phase 3 of the "
-            "PayerPolicy plan adds HOST_MASTER_PROVISIONED for OpenRouter; "
-            "Phase 3.5 adds Lighthouse SELF_WALLET. See "
+            "implemented in the foundation resolver. See "
             "docs/architecture/PAYER_POLICY_FOUNDATION.md."
         )
+
+    async def _maybe_mint_lighthouse_self_wallet_key(self, agent_did: str) -> None:
+        """Mint/store an agent-scoped Lighthouse key via SELF_WALLET.
+
+        Lighthouse authenticates API-key creation by asking an EVM wallet
+        to sign a challenge. Kestrel agents already have a secp256k1 key
+        for the legacy did:pkh identity, so SELF_WALLET signs with that
+        key and stores the resulting Lighthouse API key in
+        ServiceKeyStorage under the agent DID.
+        """
+        if self._db is None:
+            from kestrel_sdk.payer_policy import PayerPolicyError
+
+            raise PayerPolicyError(
+                "PayerPolicy.storage.kind = SELF_WALLET for lighthouse, "
+                "but no agent database was provided. The minted Lighthouse "
+                "API key would have nowhere to be stored."
+            )
+        if self._wallet_private_key is None:
+            from kestrel_sdk.payer_policy import PayerPolicyError
+
+            raise PayerPolicyError(
+                "PayerPolicy.storage.kind = SELF_WALLET for lighthouse, "
+                "but the agent's secp256k1 wallet private key is unavailable."
+            )
+
+        lock = self._GLOBAL_MINT_LOCKS.setdefault(
+            f"{agent_did}:storage:lighthouse", asyncio.Lock()
+        )
+        async with lock:
+            await self._maybe_mint_lighthouse_self_wallet_key_locked(agent_did)
+
+    async def _maybe_mint_lighthouse_self_wallet_key_locked(
+        self, agent_did: str
+    ) -> None:
+        from kestrel_sovereign.security.service_key_storage import (
+            ServiceKeyStorage,
+        )
+        from kestrel_sovereign.storage.providers.lighthouse_rest import (
+            LighthouseRestClient,
+        )
+
+        agent_storage = ServiceKeyStorage(self._db, agent_did)
+        if await agent_storage.has_key("lighthouse"):
+            logger.debug(
+                f"PayerResolver: agent {agent_did[:30]}... already has "
+                "Lighthouse key; skipping wallet auth."
+            )
+            return
+
+        address = self._evm_address_from_private_key()
+        client = LighthouseRestClient(api_key="")
+        try:
+            message = await client.get_auth_message(address)
+            signature = self._sign_eth_message(message)
+            api_key = await client.create_api_key(address, signature)
+        finally:
+            await client.close()
+
+        await agent_storage.store_key(
+            provider_id="lighthouse",
+            api_key=api_key,
+        )
+        logger.info(
+            f"PayerResolver: minted Lighthouse SELF_WALLET key for agent "
+            f"{agent_did[:30]}... using wallet {address[:10]}..."
+        )
+
+    def _evm_address_from_private_key(self) -> str:
+        account = self._eth_account_from_private_key()
+        return str(account.address)
+
+    def _sign_eth_message(self, message: str) -> str:
+        try:
+            from eth_account.messages import encode_defunct
+        except ImportError as exc:
+            from kestrel_sdk.payer_policy import PayerPolicyError
+
+            raise PayerPolicyError(
+                "Lighthouse SELF_WALLET requires eth-account. Install the "
+                "wallet extra before using PayerPolicy.storage.self_wallet."
+            ) from exc
+
+        account = self._eth_account_from_private_key()
+        signed = account.sign_message(encode_defunct(text=message))
+        signature = signed.signature.hex()
+        return signature if signature.startswith("0x") else f"0x{signature}"
+
+    def _eth_account_from_private_key(self) -> Any:
+        try:
+            from eth_account import Account
+        except ImportError as exc:
+            from kestrel_sdk.payer_policy import PayerPolicyError
+
+            raise PayerPolicyError(
+                "Lighthouse SELF_WALLET requires eth-account. Install the "
+                "wallet extra before using PayerPolicy.storage.self_wallet."
+            ) from exc
+
+        private_key = self._wallet_private_key
+        if isinstance(private_key, str):
+            key_hex = private_key if private_key.startswith("0x") else f"0x{private_key}"
+        elif isinstance(private_key, bytes):
+            key_hex = f"0x{private_key.hex()}"
+        elif hasattr(private_key, "private_numbers"):
+            key_int = private_key.private_numbers().private_value
+            key_hex = f"0x{key_int.to_bytes(32, 'big').hex()}"
+        else:
+            from kestrel_sdk.payer_policy import PayerPolicyError
+
+            raise PayerPolicyError(
+                "Unsupported Lighthouse SELF_WALLET private key type: "
+                f"{type(private_key).__name__}"
+            )
+        return Account.from_key(key_hex)
 
     # ------------------------------------------------------------------
     # Internals

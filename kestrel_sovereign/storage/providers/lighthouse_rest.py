@@ -218,3 +218,67 @@ class LighthouseRestClient:
         if isinstance(data, dict) and "data" in data:
             return data
         return {"data": data}
+
+    async def get_auth_message(self, public_key: str) -> str:
+        """
+        Fetch Lighthouse's wallet-auth challenge for an EVM public address.
+
+        Args:
+            public_key: EVM address (0x...) that will sign the challenge
+
+        Returns:
+            Message string to sign with Ethereum personal_sign semantics.
+        """
+        client = await self._get_client()
+        response = await client.get(
+            f"{self.API_URL}/api/auth/get_message",
+            params={"publicKey": public_key},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        if isinstance(data, dict):
+            if isinstance(data.get("data"), dict) and data["data"].get("message"):
+                return str(data["data"]["message"])
+            if data.get("message"):
+                return str(data["message"])
+        if (
+            isinstance(data, list)
+            and data
+            and isinstance(data[0], dict)
+            and data[0].get("message")
+        ):
+            return str(data[0]["message"])
+        raise ValueError("Lighthouse auth message response did not include a message")
+
+    async def create_api_key(self, public_key: str, signature: str) -> str:
+        """
+        Create a Lighthouse API key from a signed wallet-auth challenge.
+
+        Args:
+            public_key: EVM address (0x...) that signed the challenge
+            signature: Ethereum personal_sign signature for the challenge
+
+        Returns:
+            Lighthouse API key.
+        """
+        client = await self._get_client()
+        response = await client.post(
+            f"{self.API_URL}/api/auth/create_api_key",
+            params={"publicKey": public_key, "signature": signature},
+            headers={"Accept": "application/json"},
+        )
+        response.raise_for_status()
+
+        data = response.json()
+        candidates = []
+        if isinstance(data, dict):
+            candidates.append(data)
+            if isinstance(data.get("data"), dict):
+                candidates.append(data["data"])
+        for item in candidates:
+            for key in ("apiKey", "api_key", "key"):
+                value = item.get(key)
+                if value:
+                    return str(value)
+        raise ValueError("Lighthouse create_api_key response did not include an API key")
