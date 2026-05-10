@@ -18,6 +18,7 @@ from kestrel_sovereign.setup.steps import (
     integrations,
     keys,
     llm,
+    payments,
     talon,
     verify,
 )
@@ -37,6 +38,12 @@ from kestrel_sovereign.setup.steps import (
 #: dormant (no block written, Amendment VIII renders dormant).
 ORDERED = (
     ("keys", keys.run),
+    # ``payments`` runs after ``keys`` so KESTREL_DATA_KEY is in .env
+    # before HostKeyStorage encrypts the operator's master credentials.
+    # It runs before ``llm`` so per-agent OpenRouter provisioning can
+    # find the master at first agent init. See
+    # docs/architecture/PAYER_POLICY_FOUNDATION.md.
+    ("payments", payments.run),
     ("llm", llm.run),
     ("integrations", integrations.run),
     ("emancipation", emancipation.run),
@@ -54,5 +61,5 @@ BY_NAME = {name: fn for name, fn in (*ORDERED, *OPTIONAL)}
 
 __all__ = [
     "ORDERED", "OPTIONAL", "BY_NAME",
-    "agent", "emancipation", "integrations", "keys", "llm", "talon", "verify",
+    "agent", "emancipation", "integrations", "keys", "llm", "payments", "talon", "verify",
 ]
