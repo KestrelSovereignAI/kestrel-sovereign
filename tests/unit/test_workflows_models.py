@@ -160,6 +160,18 @@ def test_gate_lint_clean_requires_scopes():
     Gate(type="lint_clean", params={"scopes": ["kestrel_sovereign/features/workflows"]})
 
 
+def test_gate_signature_collected_requires_did():
+    with pytest.raises(WorkflowDefinitionError, match="params.did"):
+        Gate(type="signature_collected")
+    with pytest.raises(WorkflowDefinitionError, match="params.did"):
+        Gate(type="signature_collected", params={"did": ""})
+    with pytest.raises(WorkflowDefinitionError, match="DID"):
+        Gate(type="signature_collected", params={"did": "k.example"})
+    with pytest.raises(WorkflowDefinitionError, match="DID"):
+        Gate(type="signature_collected", params={"did": " did:web:k.example "})
+    Gate(type="signature_collected", params={"did": "did:web:k.example"})
+
+
 def test_gate_red_team_clear_requires_prompt_pack_constraint():
     with pytest.raises(WorkflowDefinitionError):
         Gate(type="red_team_clear", params={"reviewer_pool": ["did:web:r1"]})
@@ -1214,6 +1226,28 @@ def test_schema_requires_ci_green_repo_and_branch():
 def test_schema_requires_lint_clean_scopes():
     spec = _minimal_spec().to_dict()
     spec["stages"][0]["gate"] = {"type": "lint_clean", "params": {"scopes": []}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_signature_collected_did():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {"type": "signature_collected", "params": {}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "signature_collected",
+        "params": {"did": "k.example"},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "signature_collected",
+        "params": {"did": " did:web:k.example "},
+    }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 

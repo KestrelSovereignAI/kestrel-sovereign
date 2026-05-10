@@ -29,6 +29,11 @@ from kestrel_sovereign.features.workflows import (
 )
 from kestrel_sovereign.features.workflows.signing import sign_workflow_spec
 from kestrel_sovereign.features.workflows.store import WorkflowStore
+from kestrel_sovereign.identity.did_web import build_verification_methods
+from kestrel_sovereign.identity.hybrid_keypair import (
+    generate_hybrid_keypair,
+    sign_hybrid,
+)
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
 from kestrel_sovereign.security.crypto_suite import (
     ALG_ECDSA_SECP256K1_SHA256,
@@ -115,6 +120,14 @@ def _stage(name: str, source: str) -> Stage:
         signal_mode=SignalMode.ACTION,
         read_only=True,
     )
+
+
+def _sign_payload(identity: AgentIdentity, payload: str) -> str:
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    return suite.sign(
+        payload.encode("utf-8"),
+        identity.legacy_keypair.private_key,
+    ).hex()
 
 
 @pytest.fixture
@@ -1186,6 +1199,274 @@ async def test_runner_ci_green_gate_requires_action_mode_before_signal(
                             "repo": "KestrelSovereignAI/kestrel-sovereign",
                             "branch": "main",
                         },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="requires signal_mode=ACTION"):
+        await c.runner.run_to_completion(name="release")
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_signature_collected_gate_accepts_matching_signature(
+    runner_components,
+):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {
+            "did": payload["did"],
+            "signature": _sign_payload(c.identity, payload["signature_payload"]),
+            "status": "signed",
+        }
+
+    c.registry.register(_action_source("sign.operator", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="operator-signature",
+                    signal_source="sign.operator",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="signature_collected",
+                        params={"did": c.identity.legacy_did},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads[0]["did"] == c.identity.legacy_did
+    assert payloads[0]["workflow_run_id"] == result.run_id
+    assert payloads[0]["workflow_stage_name"] == "operator-signature"
+    assert payloads[0]["workflow_attempt_number"] == 1
+    assert payloads[0]["signature_payload"].startswith(
+        "workflow.signature_collected.v1\n"
+    )
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_signature_collected_gate_fails_wrong_did(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "did": "did:web:other.example",
+            "signature": _sign_payload(c.identity, payload["signature_payload"]),
+        }
+
+    c.registry.register(_action_source("sign.operator", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="operator-signature",
+                    signal_source="sign.operator",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="signature_collected",
+                        params={"did": "did:web:operator.example"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == (
+        "signature_collected_did_mismatch:did:web:operator.example"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_signature_collected_gate_fails_missing_signature(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"did": payload["did"], "status": "signed"}
+
+    c.registry.register(_action_source("sign.operator", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="operator-signature",
+                    signal_source="sign.operator",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="signature_collected",
+                        params={"did": "did:web:operator.example"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "signature_collected_missing_signature"
+
+
+@pytest.mark.asyncio
+async def test_runner_signature_collected_gate_fails_forged_signature(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"did": payload["did"], "signature": "ecdsa:deadbeef"}
+
+    c.registry.register(_action_source("sign.operator", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="operator-signature",
+                    signal_source="sign.operator",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="signature_collected",
+                        params={"did": c.identity.legacy_did},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "signature_collected_invalid_signature"
+
+
+@pytest.mark.asyncio
+async def test_runner_signature_collected_gate_accepts_hybrid_signature(
+    runner_components,
+):
+    c = runner_components
+    hybrid_did = "did:web:operator.example"
+    hybrid = generate_hybrid_keypair()
+    verification_methods = build_verification_methods(
+        hybrid_did,
+        hybrid.public_keys(),
+    )
+
+    def resolve_vms(did: str):
+        if did != hybrid_did:
+            raise KeyError(did)
+        return verification_methods
+
+    c.runner.verification_methods_resolver = resolve_vms
+
+    async def handler(payload):
+        return {
+            "did": payload["did"],
+            "signatures": sign_hybrid(
+                payload["signature_payload"].encode("utf-8"),
+                hybrid,
+            ),
+            "status": "signed",
+        }
+
+    c.registry.register(_action_source("sign.operator", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="operator-signature",
+                    signal_source="sign.operator",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="signature_collected",
+                        params={"did": hybrid_did},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_signature_collected_gate_requires_action_mode_before_signal(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(signal):
+        nonlocal calls
+        calls += 1
+        return {"did": "did:web:operator.example", "signature": "ecdsa:deadbeef"}
+
+    c.registry.register(_artifact_source("sign.operator", handler))
+    c.registry.register(_action_source("undo.signature", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="operator-signature",
+                    signal_source="sign.operator",
+                    signal_mode=SignalMode.ARTIFACT,
+                    compensate="undo.signature",
+                    gate=Gate(
+                        type="signature_collected",
+                        params={"did": "did:web:operator.example"},
                     ),
                 )
             ],

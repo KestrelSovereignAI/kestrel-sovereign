@@ -38,6 +38,7 @@ _NAME_PATTERN = r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$"
 # names embed DIDs containing ``:``, ``@``, ``%``, ``+``.
 _SOURCE_NAME_PATTERN = r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$"
 _GITHUB_REPO_PATTERN = r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+_DID_PATTERN = r"^did:[a-z0-9]+:\S+$"
 
 # Pattern requiring at least one non-whitespace char anywhere in the
 # value. Schema's ``minLength: 1`` counts whitespace, but the dataclass
@@ -142,6 +143,27 @@ def _gate_schema() -> dict[str, Any]:
                                 "max_wait_seconds": {
                                     "type": "integer",
                                     "minimum": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "if": {
+                    "properties": {"type": {"const": "signature_collected"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["did"],
+                            "properties": {
+                                "did": {
+                                    "type": "string",
+                                    "pattern": _DID_PATTERN,
                                 },
                             },
                         },
