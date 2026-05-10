@@ -5,7 +5,12 @@
 
 import API from './api.js';
 import { state, Toast, escapeHtml } from './ui.js';
-import { updateContextStatus, wipeAgentChatPane } from './chat.js';
+import {
+    updateContextStatus,
+    wipeAgentChatPane,
+    renderToolActivityHtml,
+    splitToolActivity,
+} from './chat.js';
 
 // ============================================================================
 // Chat History Browser
@@ -258,15 +263,24 @@ window.loadConversation = async function(sessionId) {
         data.messages.forEach(msg => {
             if (msg.role !== 'system') {
                 let toolHtml = '';
+                let content = msg.content;
                 if (msg.role === 'assistant' && msg.metadata?.tool_events?.length > 0) {
-                    toolHtml = msg.metadata.tool_events.map(ev => {
-                        if (ev.type === 'start') return `<div class="tool-activity tool-start">\u{1F527} Calling ${escapeHtml(ev.tool)}...</div>`;
-                        if (ev.type === 'complete') return `<div class="tool-activity tool-done">\u2713 ${escapeHtml(ev.tool)} complete (${ev.ms}ms)</div>`;
-                        if (ev.type === 'error') return `<div class="tool-activity tool-error">\u274C ${escapeHtml(ev.tool)} failed: ${escapeHtml(ev.error || '')}</div>`;
+                    const toolActivityText = msg.metadata.tool_events.map(ev => {
+                        if (ev.type === 'start') return `\u{1F527} Calling ${ev.tool}...`;
+                        if (ev.type === 'complete') return `\u2713 ${ev.tool} complete (${ev.ms}ms)`;
+                        if (ev.type === 'error') return `\u274C ${ev.tool} failed: ${ev.error || ''}`;
                         return '';
-                    }).join('');
+                    }).filter(Boolean).join('\n');
+                    toolHtml = renderToolActivityHtml(toolActivityText);
                 }
-                addMessageToChat(msg.role, msg.content, msg.encrypted && !state.showDecrypted, msg.id, toolHtml);
+                if (msg.role === 'assistant') {
+                    const split = splitToolActivity(content);
+                    if (split.hasToolActivity) {
+                        if (!toolHtml) toolHtml = renderToolActivityHtml(split.toolActivity);
+                        content = split.response;
+                    }
+                }
+                addMessageToChat(msg.role, content, msg.encrypted && !state.showDecrypted, msg.id, toolHtml);
             }
         });
 
@@ -434,10 +448,7 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null, 
 
     // Render tool activity above the message content
     if (toolActivityHtml) {
-        const activityDiv = document.createElement('div');
-        activityDiv.className = 'tool-activity-container';
-        activityDiv.innerHTML = toolActivityHtml;
-        messageDiv.appendChild(activityDiv);
+        messageDiv.insertAdjacentHTML('beforeend', toolActivityHtml);
     }
 
     if (isEncrypted) {

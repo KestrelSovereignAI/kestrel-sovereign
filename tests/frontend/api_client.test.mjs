@@ -148,7 +148,7 @@ test('request hits canonical paths — no companion-prefix rewriting (#863)', as
 
     assert.deepEqual(fetchFn.calls.map((call) => call.url), ['/api/models']);
     assert.equal(client.setAgentId, undefined);
-    assert.equal(client.isMultiAgentMode, undefined);
+    assert.equal(client.isMultiAgentMode(), false);
 });
 
 test('request with API key refreshes bootstrap key once and retries the original request', async () => {
