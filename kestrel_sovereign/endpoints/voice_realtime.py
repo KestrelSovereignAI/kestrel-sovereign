@@ -45,6 +45,13 @@ logger = logging.getLogger(__name__)
 # the parent router so the same nesting is exercised.
 router = APIRouter(prefix="/realtime", tags=["voice"])
 
+_AUDIO_ONLY_GUARDRAIL = (
+    "This voice session is audio-only. You do not receive camera, video, "
+    "screen, image, or visual input. Never claim that you can see the user, "
+    "their room, their lighting, their camera, or anything in a video feed "
+    "unless a separate tool result explicitly provides visual information."
+)
+
 
 # ---------------------------------------------------------------------------
 # Request / response models
@@ -261,6 +268,8 @@ def _compose_instructions(agent: Any, user_override: str) -> str:
         system_prompt = getattr(identity, "system_prompt", "") or ""
     if system_prompt.strip():
         parts.append(system_prompt.strip())
+
+    parts.append(_AUDIO_ONLY_GUARDRAIL)
 
     snippet = voice_tags.get_voice_prompt_snippet()
     if snippet.strip():

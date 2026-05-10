@@ -104,11 +104,20 @@ class MockLLMService:
         self._persistence_callback = callback
 
 
+class MockWallet:
+    def can_afford(self, amount):
+        return True
+
+    async def transfer(self, amount, memo):
+        return True
+
+
 @pytest.mark.asyncio
 async def test_agent_export_command(temp_db, skip_bootstrap):
     """Test the agent !export-sovereignty command works with new async API."""
     agent = KestrelAgent("did:test:agent", storage_path=temp_db, llm_service=MockLLMService())
     await agent.initialize()
+    agent.wallet = MockWallet()
 
     # Skip bootstrap to test commands directly
     await skip_bootstrap(agent)

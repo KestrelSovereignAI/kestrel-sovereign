@@ -110,10 +110,13 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
             # graph_nodes: node_id
             # graph_edges: (source_id, target_id, label) composite
             # agent_metadata: (agent_id, key) composite
+            # host_service_keys: provider_id (the actual UNIQUE; `id` is a
+            #   fresh UUID per insert and would never trigger a replace)
             known_pks = {
                 'graph_nodes': ['node_id'],
                 'graph_edges': ['source_id', 'target_id', 'label'],
                 'agent_metadata': ['agent_id', 'key'],
+                'host_service_keys': ['provider_id'],
             }
             pk_columns = known_pks.get(
                 table_name.lower(),

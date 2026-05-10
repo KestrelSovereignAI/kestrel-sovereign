@@ -31,6 +31,7 @@ Status meanings:
 | `memory` | `kestrel_sovereign/features/memory.py` | `tests/unit/test_memory_manager.py`, `tests/unit/test_memory_system.py`, `tests/integration/test_memory_feature_e2e.py` | Direct |
 | `memory_agency` | `kestrel_sovereign/features/memory_agency.py` | `tests/unit/test_memory_agency_feature.py` | Direct |
 | `model` | `kestrel_sovereign/features/model/feature.py` | `tests/unit/test_model_selection_contracts.py`, `tests/unit/test_model_set_openrouter.py`, `tests/integration/test_model_set_routing_e2e.py` | Direct |
+| `observability` | `kestrel-feature-observability` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-observability` | Boundary |
 | `peers` | `kestrel_sovereign/features/peers/` | `tests/unit/test_peers_feature.py` | Direct |
 | `reflection` | `kestrel_sovereign/features/reflection/` | `tests/integration/test_reflection_e2e.py` | Direct |
 | `runpod` | `kestrel_sovereign/features/runpod/` | `tests/unit/test_runpod_model_contracts.py`, `tests/unit/test_runpod_logs.py`, `tests/integration/test_runpod_feature.py` | Direct |
@@ -43,7 +44,7 @@ Status meanings:
 | `tasks` | `kestrel_sovereign/features/tasks/` | `tests/unit/test_workflow_executor.py`, `tests/unit/test_a2a_task_manager.py`, `tests/integration/test_orchestration_e2e.py` | Direct |
 | `vastai` | `kestrel_sovereign/features/vastai/` | `tests/unit/test_vastai_feature.py`, `tests/unit/test_cloud_launcher_contracts.py`, `tests/integration/test_vastai_e2e.py` | Direct |
 | `visual_identity` | `kestrel_sovereign/features/visual_identity/` | `tests/unit/test_visual_identity_feature.py` | Direct |
-| `wallet` | `kestrel_feature_wallet` (external package) | `tests/unit/test_wallet_agent.py`, `tests/unit/test_wallet_limits.py`, `tests/integration/test_wallet_feature_e2e.py` | Direct |
+| `wallet` | `kestrel-feature-wallet` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-wallet` | Boundary |
 | `web_search` | `kestrel_sovereign/features/web_search/` | `tests/unit/test_web_search_feature.py` | Direct |
 | `webhooks` | `kestrel_sovereign/features/webhooks.py` | `tests/unit/test_webhooks_feature.py` | Direct |
 | `wellness` | `kestrel_sovereign/features/wellness.py` | `tests/unit/test_wellness_feature.py`, `tests/unit/test_wellness_telemetry_guard.py` | Direct |

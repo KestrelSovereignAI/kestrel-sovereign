@@ -265,7 +265,7 @@ def test_aead_v2_round_trip_through_secure_key_storage(
 
 def test_aead_cross_version_legacy_fernet_then_v2_write(kestrel_data_key):
     """The Wave 0C migration story: legacy data still decrypts, new
-    writes are KSAv2. This is the same path scripts/rotate_emma_key.py
+    writes are KSAv2. This is the same path scripts/rotate_agent_key.py
     already exercises in production migrations.
     """
     raw_key = b"k" * 32

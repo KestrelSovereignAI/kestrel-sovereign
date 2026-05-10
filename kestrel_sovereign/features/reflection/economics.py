@@ -6,12 +6,17 @@ economic status (paid tier, revenue share, etc.).
 """
 
 import logging
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from kestrel_sovereign.features.wallet.wallet_feature import WalletFeature
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
+
+
+class EconomicWallet(Protocol):
+    """Wallet feature methods used by reflection's economic gates."""
+
+    def is_paid_tier(self) -> bool: ...
+
+    def has_revenue_share(self) -> bool: ...
 
 
 class ConfigurationError(Exception):
@@ -30,7 +35,7 @@ class EconomicGate:
     feature is not properly configured.
     """
 
-    def __init__(self, wallet_feature: "WalletFeature"):
+    def __init__(self, wallet_feature: EconomicWallet):
         """Initialize the economic gate.
 
         Args:

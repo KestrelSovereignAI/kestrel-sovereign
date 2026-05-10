@@ -39,6 +39,36 @@ Kestrel uses a two-layer key architecture that separates **Sovereign control** (
 │  │  • Sovereignty exports (content key in manifest)         │  │
 │  │  • Backup archives (encrypted with derived key)          │  │
 │  └──────────────────────────────────────────────────────────┘  │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Service API Keys (PayerPolicy, 2026-05)                 │  │
+│  │  • ServiceKeyStorage: per-agent vendor keys (OpenRouter, │  │
+│  │    Lighthouse) encrypted with agent-DID-derived key      │  │
+│  │  • Key derivation: HKDF(KESTREL_DATA_KEY, salt=agent_did │  │
+│  │    info='service-keys') — agent A cannot decrypt         │  │
+│  │    agent B's keys                                        │  │
+│  │  • Resolver auto-mints child keys at first agent init    │  │
+│  │    when policy.kind == HOST_MASTER_PROVISIONED           │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│            HOST (Operator, deployment-wide, 2026-05)            │
+│                                                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  HostKeyStorage                                          │  │
+│  │  • One file at <project>/agent_data/host.db              │  │
+│  │  • Stores the operator's master credentials              │  │
+│  │    (master OpenRouter API key today; Lighthouse master   │  │
+│  │    in Phase 3.5)                                         │  │
+│  │  • Encrypted with HKDF(KESTREL_DATA_KEY, salt='host',    │  │
+│  │    info='service-keys') — distinct derivation from any   │  │
+│  │    agent's, so host and agent storage cannot collide     │  │
+│  │  • Wizard's `kestrel setup payments` step writes here    │  │
+│  │  • Resolver reads here when policy.kind ==               │  │
+│  │    HOST_MASTER_PROVISIONED, then mints a per-agent       │  │
+│  │    child credential into ServiceKeyStorage               │  │
+│  └──────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -142,6 +172,38 @@ The encryption key is derived from `KESTREL_DATA_KEY` using PBKDF2:
 - **Iterations**: 600,000 (OWASP 2023+ recommendation)
 - **Salt**: 16 bytes (128 bits), randomly generated per key
 - **Output**: 32 bytes (256 bits) for AES-256
+
+## Service API Keys (PayerPolicy, 2026-05)
+
+The `PayerPolicy` foundation introduces two encrypted credential stores under `KESTREL_DATA_KEY`:
+
+| Store | Scope | Identity (HKDF salt) | Where |
+|---|---|---|---|
+| `ServiceKeyStorage` | Per-agent | `agent_did` | Inside each agent's own DB (`agent_service_keys` table) |
+| `HostKeyStorage` | Per-deployment | literal `"host"` | `<project>/agent_data/host.db` (`host_service_keys` table) |
+
+Both use the same SDK `encrypt(identity, "service-keys", plaintext)` contract. Different identity → different HKDF derivation → no possible cross-decryption between an agent's store and the host's store.
+
+### Auto-mint flow (HOST_MASTER_PROVISIONED)
+
+When `kestrel.toml [payments] llm.kind = "host_master_provisioned"`, agent init invokes the resolver, which:
+
+1. Pre-flight checks the agent's `graph_nodes` row exists.
+2. Acquires a class-level `asyncio.Lock` keyed by `agent_did` (serializes concurrent inits).
+3. Reads the host master from `HostKeyStorage`.
+4. Calls `OpenRouterProvisioningService.create_agent_key` → remote child key.
+5. Persists `openrouter_key_hash` to `graph_nodes.properties` (so retirement can revoke).
+6. Stores the child key in the agent's `ServiceKeyStorage`.
+
+Steps 4–6 are atomic-with-rollback: if (5) fails, (6) doesn't run and the remote key from (4) is revoked. Retry sees a clean slate.
+
+### NONE policy
+
+`PayerKind.NONE` for the LLM slot sets `LLMService.disabled = True`. A `_check_policy()` guard at every generation entry point (verified by reflection test) raises `PolicyDeniedError` rather than silently falling through to the shared host key.
+
+For storage, `NONE` causes the agent-init layer to skip provider construction entirely — `LighthouseProvider` is never built, so even the env-var fallback path can't fire.
+
+See [docs/architecture/PROVIDER_ECONOMICS.md](../PROVIDER_ECONOMICS.md) for the funding-pattern framing and [docs/architecture/PAYER_POLICY_FOUNDATION.md](../PAYER_POLICY_FOUNDATION.md) for the full plan.
 
 ## Data Encryption
 

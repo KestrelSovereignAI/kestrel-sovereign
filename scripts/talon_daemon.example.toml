@@ -9,9 +9,10 @@
 [daemon]
 poll_interval = 300          # 5 minutes between polls
 cooldown = 60                # 1 minute between issues (KV cache turnover)
-backend = "claude"           # "claude" (Max OAuth) or "opencode" (local Kimi)
-model = "opus"               # Claude model when backend=claude
-opencode_model = "kimi-local/kimi-k2.5"  # Model when backend=opencode
+backend = "codex"            # "codex" (ChatGPT/Codex OAuth), "claude", or "opencode"
+model = "gpt-5.5"            # Set "" to use backend default instead of pinning
+auth_lane = "oauth"          # "oauth", "api_key" for Claude API billing, or "provider_config"
+opencode_model = "kimi-local/kimi-k2.5"  # Legacy alias when backend=opencode
 gh_user = "your-github-username"
 max_daily_issues = 50
 worktree = true              # Process in isolated worktrees

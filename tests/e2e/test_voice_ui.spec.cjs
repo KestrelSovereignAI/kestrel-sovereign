@@ -42,7 +42,8 @@ const BASE_URL = process.env.KESTREL_URL || 'http://localhost:8888';
 const VOICE_STUB_INIT_SCRIPT = `
 (() => {
   const listeners = { event: [] };
-  const recorded = { rtcOffers: 0, rtcCloses: 0, wsSends: 0, wsCloses: 0, micRequests: 0 };
+  const recorded = { rtcOffers: 0, rtcCloses: 0, wsOpens: 0, wsSends: 0, wsCloses: 0, micRequests: 0 };
+  let lastDC = null;
 
   // Fake mic stream — empty MediaStream, satisfies addTrack.
   navigator.mediaDevices.getUserMedia = async () => {
@@ -70,6 +71,7 @@ const VOICE_STUB_INIT_SCRIPT = `
         onopen: null, onmessage: null, onclose: null, onerror: null,
       };
       this._dataChannels.push(dc);
+      lastDC = dc;
       // Emit a synthetic SESSION_READY-equivalent OpenAI event after the
       // page processes the SDP answer. The shell handler translates it.
       setTimeout(() => {
@@ -106,6 +108,7 @@ const VOICE_STUB_INIT_SCRIPT = `
       this.url = url;
       this.readyState = 0;  // CONNECTING
       this.binaryType = 'arraybuffer';
+      recorded.wsOpens++;
       lastWS = this;
       // Fire 'open' on next tick.
       setTimeout(() => {
@@ -136,6 +139,12 @@ const VOICE_STUB_INIT_SCRIPT = `
         super(...args);
       }
       get audioWorklet() { return FakeAudioWorklet; }
+      createMediaStreamSource(_stream) {
+        return {
+          connect: () => {},
+          disconnect: () => {},
+        };
+      }
     };
     window.AudioContext = wrap(realAudioContext);
   }
@@ -154,6 +163,7 @@ const VOICE_STUB_INIT_SCRIPT = `
 
   window.__voiceStub = {
     recorded,
+    pushRtc(event) { if (lastDC && lastDC.onmessage) lastDC.onmessage({ data: JSON.stringify(event) }); },
     pushWs(frame) { if (lastWS && lastWS.onmessage) lastWS.onmessage({ data: frame }); },
     closeWs() { if (lastWS) lastWS.close(); },
   };
@@ -187,12 +197,19 @@ const MOCK_REALTIME_409 = {
   fallback_stt: 'openai',
 };
 
+const MOCK_REALTIME_UNAVAILABLE_409 = {
+  path: null,
+  reason: 'Voice unavailable: no TTS and STT provider installed.',
+  fallback_tts: null,
+  fallback_stt: null,
+};
+
 /**
  * Wire up route mocks. Pass `realtimeStatus` to control the
  * /voice/realtime/session response: 200 → Realtime path, 409 → Pipeline
  * fallback.
  */
-async function installRoutes(page, { realtimeStatus = 200 } = {}) {
+async function installRoutes(page, { realtimeStatus = 200, realtime409Body = MOCK_REALTIME_409 } = {}) {
   // Voices endpoint — same in both paths.
   await page.route('**/voice/voices', (route) =>
     route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(MOCK_VOICES) }),
@@ -201,11 +218,15 @@ async function installRoutes(page, { realtimeStatus = 200 } = {}) {
     route.fulfill({
       status: realtimeStatus,
       contentType: 'application/json',
-      body: JSON.stringify(realtimeStatus === 409 ? MOCK_REALTIME_409 : MOCK_REALTIME_SESSION),
+      body: JSON.stringify(realtimeStatus === 409 ? realtime409Body : MOCK_REALTIME_SESSION),
     }),
   );
   // /voice/config + /voice/chat are the existing endpoints; let the WS stub
   // handle /voice/chat upgrade. /voice/config not exercised here.
+}
+
+async function openChatPanel(page) {
+  await page.getByRole('button', { name: 'Chat' }).click();
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +244,7 @@ test.describe('Voice UI shell', () => {
     await installRoutes(page);
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     const btn = page.locator('#voice-toggle-btn');
     await expect(btn).toBeVisible({ timeout: 10000 });
@@ -234,43 +256,139 @@ test.describe('Voice UI shell', () => {
     await installRoutes(page, { realtimeStatus: 200 });
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     await page.locator('#voice-toggle-btn').click();
-    // Drawer becomes visible during a session.
-    const drawer = page.locator('#voice-drawer');
-    await expect(drawer).toBeVisible({ timeout: 5000 });
-
-    const badge = drawer.locator('.kestrel-voice-path-badge');
-    await expect(badge).toHaveText('Realtime', { timeout: 5000 });
+    const badge = page.locator('.kestrel-voice-path-badge');
+    await expect(badge).toBeVisible({ timeout: 5000 });
+    await expect(badge).toContainText('Realtime', { timeout: 5000 });
     await expect(badge).toHaveAttribute('data-path', 'realtime');
 
     // Mic button transitions to listening once the stub fires session.created.
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
   });
 
+  test('Realtime path keeps user transcript before agent response when events race', async ({ page }) => {
+    await installRoutes(page, { realtimeStatus: 200 });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#voice-toggle-btn').click();
+    await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+
+    await page.evaluate(() => {
+      window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_started' });
+      window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_stopped' });
+      window.__voiceStub.pushRtc({ type: 'response.created' });
+      window.__voiceStub.pushRtc({ type: 'response.audio_transcript.delta', delta: 'Agent answer first.' });
+      window.__voiceStub.pushRtc({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'User question arrived late.',
+      });
+      window.__voiceStub.pushRtc({ type: 'response.audio_transcript.done', transcript: 'Agent answer first.' });
+      window.__voiceStub.pushRtc({ type: 'response.done' });
+    });
+
+    await expect(page.locator('.message')).toHaveCount(2, { timeout: 5000 });
+    const messages = await page.locator('.message').evaluateAll((nodes) =>
+      nodes.map((node) => ({
+        cls: node.className,
+        text: node.textContent.trim(),
+      })),
+    );
+    expect(messages[0]).toMatchObject({ text: 'User question arrived late.' });
+    expect(messages[0].cls).toContain('user-message');
+    expect(messages[1]).toMatchObject({ text: 'Agent answer first.' });
+    expect(messages[1].cls).toContain('agent-message');
+  });
+
+  test('Realtime path removes stale transcribing placeholder when speech restarts', async ({ page }) => {
+    await installRoutes(page, { realtimeStatus: 200 });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#voice-toggle-btn').click();
+    await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+
+    await page.evaluate(() => {
+      window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_started' });
+      window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_stopped' });
+      window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_started' });
+      window.__voiceStub.pushRtc({
+        type: 'conversation.item.input_audio_transcription.completed',
+        transcript: 'Actual transcript.',
+      });
+    });
+
+    await expect(page.locator('.message')).toHaveCount(1, { timeout: 5000 });
+    await expect(page.locator('.message')).toHaveText('Actual transcript.');
+    await expect(page.locator('#chat-container')).not.toContainText('Transcribing...');
+  });
+
+  test('microphone permission denial shows actionable voice error', async ({ page }) => {
+    await page.addInitScript(() => {
+      navigator.mediaDevices.getUserMedia = async () => {
+        const err = new Error('Permission denied');
+        err.name = 'NotAllowedError';
+        throw err;
+      };
+    });
+    await installRoutes(page, { realtimeStatus: 200 });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#voice-toggle-btn').click();
+
+    await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'error', { timeout: 5000 });
+    await expect(page.locator('#chat-container')).toContainText(
+      'Microphone permission denied. Allow microphone access for this site, then click the mic again. If this browser has no microphone permission control, open Kestrel in Chrome or Safari.',
+    );
+  });
+
   test('Pipeline fallback: 409 from realtime endpoint engages WebSocket path', async ({ page }) => {
     await installRoutes(page, { realtimeStatus: 409 });
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     await page.locator('#voice-toggle-btn').click();
 
-    const drawer = page.locator('#voice-drawer');
-    await expect(drawer).toBeVisible({ timeout: 5000 });
-
-    const badge = drawer.locator('.kestrel-voice-path-badge');
+    const badge = page.locator('.kestrel-voice-path-badge');
+    await expect(badge).toBeVisible({ timeout: 5000 });
     await expect(badge).toHaveText('Pipeline', { timeout: 5000 });
     await expect(badge).toHaveAttribute('data-path', 'pipeline');
 
     // The Pipeline client opened a WebSocket — confirm via the stub recorder.
-    const wsOpens = await page.evaluate(() => window.__voiceStub.recorded.wsSends >= 0);
-    expect(wsOpens).toBe(true);
+    const wsOpens = await page.evaluate(() => window.__voiceStub.recorded.wsOpens);
+    expect(wsOpens).toBe(1);
+  });
+
+  test('Unavailable voice: 409 without Pipeline providers does not open WebSocket', async ({ page }) => {
+    await installRoutes(page, {
+      realtimeStatus: 409,
+      realtime409Body: MOCK_REALTIME_UNAVAILABLE_409,
+    });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    await page.locator('#voice-toggle-btn').click();
+
+    await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'error', { timeout: 5000 });
+    await expect(page.locator('#chat-container')).toContainText('Voice unavailable: no TTS and STT provider installed.');
+
+    const wsOpens = await page.evaluate(() => window.__voiceStub.recorded.wsOpens);
+    expect(wsOpens).toBe(0);
   });
 
   test('Esc closes an active session and returns to idle', async ({ page }) => {
     await installRoutes(page, { realtimeStatus: 200 });
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     await page.locator('#voice-toggle-btn').click();
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
@@ -280,13 +398,14 @@ test.describe('Voice UI shell', () => {
     await page.keyboard.press('Escape');
 
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'idle', { timeout: 5000 });
-    await expect(page.locator('#voice-drawer')).toBeHidden();
+    await expect(page.locator('.kestrel-voice-path-badge')).toBeHidden();
   });
 
   test('voice picker lists discovered voices and persists selection', async ({ page }) => {
     await installRoutes(page);
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     // Right-click the mic to open the picker without starting a session.
     await page.locator('#voice-toggle-btn').click({ button: 'right' });
@@ -316,6 +435,7 @@ test.describe('Voice UI shell', () => {
     await installRoutes(page);
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     // Focus the textarea and type a space — voice should NOT engage because
     // focus is on a text input.
@@ -336,6 +456,7 @@ test.describe('Voice UI shell', () => {
     await installRoutes(page, { realtimeStatus: 200 });
     await page.goto(BASE_URL);
     await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
 
     const btn = page.locator('#voice-toggle-btn');
     await btn.click();
@@ -344,6 +465,6 @@ test.describe('Voice UI shell', () => {
     // Click again → stops.
     await btn.click();
     await expect(btn).toHaveAttribute('data-state', 'idle', { timeout: 5000 });
-    await expect(page.locator('#voice-drawer')).toBeHidden();
+    await expect(page.locator('.kestrel-voice-path-badge')).toBeHidden();
   });
 });

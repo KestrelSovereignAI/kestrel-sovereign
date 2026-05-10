@@ -290,6 +290,18 @@ class KestrelAgent(
         self.storage = None
 
         self.llm_service = llm_service or LLMService()
+        # Claim this LLMService for this agent. If an externally-provided
+        # llm_service was already claimed by another agent (the adversarial-
+        # test sharing pattern), this raises LLMServiceAlreadyAttachedError
+        # so the cross-agent state-leak invariant is enforced at construction
+        # time. See LLMService.attach_to_agent for the rationale.
+        #
+        # Guarded by hasattr because some tests inject lightweight LLM fakes
+        # (MockLLMService et al.) that only implement the generate/model
+        # surface. Real LLMService instances always have attach_to_agent;
+        # the invariant is enforced for them and silently waived for fakes.
+        if hasattr(self.llm_service, "attach_to_agent"):
+            self.llm_service.attach_to_agent(did)
         self.pg_pool = pg_pool
         # Note: agent_id is a @property that returns self.did (see below).
         # Do NOT set self.agent_id = ... here; it would shadow the property.
@@ -653,14 +665,67 @@ class KestrelAgent(
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
 
-            if os.environ.get("LIGHTHOUSE_API_KEY"):
-                try:
-                    from kestrel_sovereign.storage.providers.lighthouse_provider import LighthouseProvider
-                    self.lighthouse_provider = LighthouseProvider()
+            # Storage path through PayerPolicy resolver. Honors the policy's
+            # `storage` slot:
+            #   NONE     → do not construct LighthouseProvider at all
+            #   HOST_ENV → construct with the resolver as the single credential
+            #              source (no constructor-time env-var bleed-through)
+            #   SELF_WALLET → mint/store a Lighthouse key by signing the
+            #                 auth challenge with the agent's secp256k1 key
+            #
+            # Cold-start restore above (line ~488) is intentionally policy-
+            # unaware: it runs before the agent's DB exists and so cannot
+            # consult the policy. Operators who want NONE storage should not
+            # set LIGHTHOUSE_API_KEY.
+            try:
+                from kestrel_sdk.payer_policy import ResourceClass
+                from kestrel_sovereign.services.payer_resolver import (
+                    FoundationPayerResolver,
+                    load_policy_from_toml,
+                )
+                from kestrel_sovereign.storage.providers.lighthouse_provider import (
+                    LighthouseProvider,
+                )
+
+                _policy = load_policy_from_toml()
+                # Open the shared host.db for HostKeyStorage if the
+                # payments wizard has been run. None means no host
+                # master is configured yet — resolver falls back to
+                # the agent's db (same db) which has no host_service_keys
+                # rows, surfacing as 'no host master' for delegated kinds.
+                from kestrel_sovereign.services.payer_resolver import open_host_db
+                _host_db = await open_host_db(
+                    storage_path=self.storage_path,
+                )
+                _resolver = FoundationPayerResolver(
+                    _policy,
+                    db=self._raw_storage.db if self._raw_storage else None,
+                    host_db=_host_db,
+                    wallet_private_key=self._private_key,
+                )
+                _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
+                if _resolved.enabled:
+                    self.lighthouse_provider = LighthouseProvider(
+                        api_key=None,
+                        key_resolver=_resolved.key_resolver,
+                    )
+                    # With api_key=None at construction, the provider's
+                    # internal client isn't created until _ensure_client()
+                    # consults the resolver. Drive that once now so
+                    # is_available() reflects the resolver's result rather
+                    # than the (None) constructor input. Without this poke
+                    # the provider would always look unavailable post-policy.
+                    await self.lighthouse_provider._ensure_client()
                     if not self.lighthouse_provider.is_available():
                         self.lighthouse_provider = None
-                except Exception as e:
-                    logging.warning(f"LighthouseProvider init failed: {e}")
+                # else: NONE policy — leave self.lighthouse_provider as None
+            except NotImplementedError:
+                # Deferred PayerKind values (for example Lighthouse
+                # HOST_MASTER_PROVISIONED) raise here. Surface
+                # explicitly rather than degrading silently.
+                raise
+            except Exception as e:
+                logging.warning(f"LighthouseProvider init failed: {e}")
 
             # Sync service — event-driven snapshots to all configured targets.
             # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
@@ -685,8 +750,15 @@ class KestrelAgent(
                             api_url=sovereign_url, agent_id=agent_id, state_dir=state_dir,
                         ))
 
-                    # Delegated: Lighthouse (API key)
-                    if os.environ.get("LIGHTHOUSE_API_KEY"):
+                    # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
+                    # if the resolver came back with no LighthouseProvider
+                    # (NONE policy, or no resolver-supplied key, or env var
+                    # unset), DO NOT add the sync target. Otherwise the
+                    # policy would gate live storage but leave snapshot
+                    # uploads going to Lighthouse anyway.
+                    if self.lighthouse_provider is not None and os.environ.get(
+                        "LIGHTHOUSE_API_KEY"
+                    ):
                         self._sync_service.add_target(LighthouseTarget(
                             api_key=os.environ["LIGHTHOUSE_API_KEY"],
                             agent_id=agent_id, state_dir=state_dir,
@@ -803,21 +875,109 @@ class KestrelAgent(
             if self._is_demo:
                 logging.info(f"DEMO AGENT detected: {self._agent_name} — destructive ops permitted")
 
-            # Activate agent's own OpenRouter key for isolated billing
-            openrouter_key_hash = agent_node.properties.get("openrouter_key_hash")
-            if openrouter_key_hash:
-                try:
-                    key_activated = await self.llm_service.use_agent_key(
-                        agent_did=self.did,
-                        db=self._raw_storage.db,
-                        provider="openrouter",
+            # LLM path through PayerPolicy resolver. Phase 3a ships:
+            #   NONE     → flag the agent's LLMService disabled (Phase 3b
+            #              adds the _check_policy guard on generation
+            #              entry points that honors this flag).
+            #   HOST_ENV → no-op; the shared key already serves this agent.
+            #   HOST_MASTER_PROVISIONED / SPONSOR → call use_agent_key
+            #              against the agent's previously-provisioned key
+            #              (back-compat with manual provisioning via
+            #              scripts/provision_agent_openrouter.py). Phase 3c
+            #              wires the resolver to mint child credentials
+            #              automatically when none exist yet.
+            #   SELF_WALLET → NotImplementedError (deferred indefinitely
+            #                 per support matrix; x402-native LLM is not
+            #                 a today-shippable contract).
+            try:
+                from kestrel_sdk.payer_policy import ResourceClass
+                from kestrel_sovereign.services.payer_resolver import (
+                    FoundationPayerResolver,
+                    load_policy_from_toml,
+                )
+
+                _llm_policy = load_policy_from_toml()
+                from kestrel_sovereign.services.payer_resolver import open_host_db
+                _llm_host_db = await open_host_db(
+                    storage_path=self.storage_path,
+                )
+                _llm_resolver = FoundationPayerResolver(
+                    _llm_policy,
+                    db=self._raw_storage.db if self._raw_storage else None,
+                    host_db=_llm_host_db,
+                )
+                _llm_resolved = await _llm_resolver.resolve_for(
+                    self.did, ResourceClass.LLM
+                )
+                if not _llm_resolved.enabled:
+                    # NONE: Phase 3b's _check_policy guard reads this flag.
+                    self.llm_service.disabled = True
+                    logging.info(
+                        f"PayerPolicy.llm = NONE for agent {self.did[:30]}...; "
+                        f"LLMService.disabled = True"
                     )
-                    if key_activated:
-                        logging.info(f"Agent using own OpenRouter key (hash: {openrouter_key_hash[:16]}...)")
-                except (KeyError, ValueError, AttributeError, ConnectionError) as e:
-                    logging.warning(f"Could not activate agent OpenRouter key: {e}")
-                except Exception as e:
-                    logging.warning(f"Could not activate agent OpenRouter key: {e}", exc_info=True)
+                else:
+                    # Always try to swap to a per-agent key. use_agent_key
+                    # returns False if no key is in ServiceKeyStorage —
+                    # same end result as today's no-key-hash condition,
+                    # but no longer keyed off the deprecated
+                    # openrouter_key_hash metadata field. Phase 3c's
+                    # resolver may have just minted a child key under
+                    # HOST_MASTER_PROVISIONED policy; this call picks it
+                    # up. Manually-provisioned agents (via
+                    # scripts/provision_agent_openrouter.py) also work
+                    # here because that script writes to the same
+                    # ServiceKeyStorage.
+                    try:
+                        key_activated = await self.llm_service.use_agent_key(
+                            agent_did=self.did,
+                            db=self._raw_storage.db,
+                            provider="openrouter",
+                        )
+                        if key_activated:
+                            logging.info(
+                                f"Agent using own OpenRouter key "
+                                f"(agent={self.did[:30]}...)"
+                            )
+                    except (KeyError, ValueError, AttributeError, ConnectionError) as e:
+                        logging.warning(
+                            f"Could not activate agent OpenRouter key: {e}"
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            f"Could not activate agent OpenRouter key: {e}",
+                            exc_info=True,
+                        )
+            except NotImplementedError:
+                # SELF_WALLET / phase-deferred kinds. Re-raise so the
+                # operator sees a clear failure rather than a half-init
+                # agent.
+                raise
+            except Exception as e:
+                # Fail-closed for known policy/provisioning errors:
+                # PayerPolicyError (e.g., HOST_MASTER_PROVISIONED but
+                # no master configured) and OpenRouterProvisioningError
+                # (rate limited, invalid master, network error during
+                # mint) are intentional fail-fast signals. Letting the
+                # agent boot on the shared host key would silently
+                # violate the policy. Re-raise so init fails loudly.
+                _exc_module = type(e).__module__
+                _exc_name = type(e).__qualname__
+                if (
+                    _exc_name == "PayerPolicyError"
+                    or _exc_name == "UnsupportedCombinationError"
+                    or "OpenRouterProvisioning" in _exc_name
+                ):
+                    logging.error(
+                        f"PayerPolicy.llm resolution FAILED CLOSED for agent "
+                        f"{self.did[:30]}... ({_exc_module}.{_exc_name}): {e}"
+                    )
+                    raise
+                logging.warning(
+                    f"PayerPolicy.llm resolution failed for agent "
+                    f"{self.did[:30]}...: {e}",
+                    exc_info=True,
+                )
 
             # Initialize memory system (single source of truth for all memory components)
             logging.info("Creating MemorySystem")

@@ -76,7 +76,6 @@ MIGRATED_FEATURE_MODULES: frozenset[str] = frozenset({
     "kestrel_sovereign.features.state_of_mind",
     "kestrel_sovereign.features.constitution",
     "kestrel_sovereign.features.deploy.feature",
-    "kestrel_sovereign.features.observability.feature",
     "kestrel_sovereign.features.wellness.feature",
     "kestrel_sovereign.features.sovereignty.feature",
     "kestrel_sovereign.features.response_audit.feature",
@@ -88,7 +87,6 @@ MIGRATED_FEATURE_MODULES: frozenset[str] = frozenset({
     "kestrel_sovereign.features.computer_use.feature",
     "kestrel_sovereign.features.skills.feature",
     "kestrel_sovereign.features.spawn.feature",
-    "kestrel_sovereign.features.wallet.wallet_feature",
 })
 
 

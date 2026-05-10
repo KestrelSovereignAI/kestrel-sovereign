@@ -406,24 +406,6 @@ class TestSecurityFeatureGetHooks:
         assert hooks[0].name == "security_guard"
 
 
-class TestObservabilityFeatureGetHooks:
-    """Test that ObservabilityFeature returns its hook via get_hooks()."""
-
-    @pytest.mark.asyncio
-    async def test_observability_get_hooks_after_init(self, mock_agent):
-        from kestrel_sovereign.features.observability.feature import ObservabilityFeature
-
-        feature = ObservabilityFeature(mock_agent)
-        # Before init
-        assert feature.get_hooks() == []
-
-        # After init
-        await feature.initialize()
-        hooks = feature.get_hooks()
-        assert len(hooks) == 1
-        assert hooks[0].name == "observability"
-
-
 # === Tests: Disabled Skills ===
 
 class TestDisabledSkills:

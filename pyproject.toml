@@ -35,14 +35,18 @@ classifiers = [
 dependencies = [
     # Extracted SDK — base interfaces/protocols/data models for feature packages.
     # Lives at https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk and is
-    # published independently to PyPI. The 35 `from kestrel_sdk.*` imports across
+    # published independently to PyPI. The 35+ `from kestrel_sdk.*` imports across
     # kestrel_sovereign/ resolve against this installed package.
     # Bumped to >=0.11 in #1137 chunk 1A (PR sdk#12, published as v0.11.0)
     # to bring in the SourceRegistration constitutional-injection fields
     # (require_constitution_echo / prompt_template_format /
     # constitution_injection / system_prompt_budget_bytes) that chunks 1D,
     # 1F, and 1G consume. Defaults are backwards-compatible.
-    "kestrel-sovereign-sdk>=0.11,<1",
+    #
+    # 0.13 floor: required for Lighthouse SELF_WALLET in the
+    # PayerPolicy support matrix (see
+    # docs/architecture/PAYER_POLICY_FOUNDATION.md).
+    "kestrel-sovereign-sdk>=0.13,<1",
     # Core web framework
     "fastapi==0.128.1",
     "uvicorn==0.35.0",

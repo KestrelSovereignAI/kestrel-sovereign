@@ -15,11 +15,33 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Optional
-
-from kestrel_sovereign.features.wallet.feature import Currency, WalletAgent
+from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
+
+
+class WalletProtocol(Protocol):
+    """Minimal wallet surface required for delegated budget accounting."""
+
+    _balances: dict
+
+    async def initialize(self) -> None: ...
+
+    def can_afford(self, amount: Decimal, currency: Any) -> bool: ...
+
+    def get_balance(self, currency: Any, balance_type: str = "main") -> Decimal: ...
+
+    async def transfer(
+        self, amount: Decimal, memo: str = "", currency: Any = None
+    ) -> bool: ...
+
+    async def deposit(
+        self,
+        amount: Decimal,
+        currency: Any = None,
+        to_audit: bool = False,
+        memo: str = "",
+    ) -> bool: ...
 
 
 class BudgetExceededError(Exception):
@@ -58,7 +80,7 @@ class DelegatedWallet:
 
     def __init__(
         self,
-        wallet: WalletAgent,
+        wallet: WalletProtocol,
         allocation: BudgetAllocation,
     ):
         self._wallet = wallet
@@ -88,7 +110,7 @@ class DelegatedWallet:
         self,
         cost: Decimal,
         memo: str,
-        currency: Currency = Currency.FIL,
+        currency: Any = None,
     ) -> bool:
         """Spend from the delegated budget.
 
@@ -103,12 +125,15 @@ class DelegatedWallet:
         Raises:
             BudgetExceededError: If the spend would exceed the ceiling.
         """
+        currency = currency or _default_currency_for(self._wallet)
+
         if cost <= 0:
             raise ValueError("Spend amount must be positive")
 
         if not self.can_spend(cost):
+            currency_value = _currency_value(currency)
             raise BudgetExceededError(
-                f"Transaction of {cost} {currency.value} would exceed budget ceiling. "
+                f"Transaction of {cost} {currency_value} would exceed budget ceiling. "
                 f"Ceiling: {self.allocation.amount}, "
                 f"Spent: {self.allocation.spent}, "
                 f"Remaining: {self.allocation.remaining}, "
@@ -120,9 +145,10 @@ class DelegatedWallet:
             return False
 
         self.allocation.spent += cost
+        currency_value = _currency_value(currency)
         self.transactions.append({
             "type": "delegated_spend",
-            "currency": currency.value,
+            "currency": currency_value,
             "amount": str(cost),
             "memo": memo,
             "spent_total": str(self.allocation.spent),
@@ -132,7 +158,7 @@ class DelegatedWallet:
 
         logger.info(
             "Delegated spend: %s %s for '%s'. Spent: %s/%s",
-            cost, currency.value, memo,
+            cost, currency_value, memo,
             self.allocation.spent, self.allocation.amount,
         )
         return True
@@ -151,11 +177,11 @@ class DelegatedWallet:
 
 
 async def create_delegated_wallet(
-    parent_wallet: WalletAgent,
+    parent_wallet: WalletProtocol,
     parent_did: str,
     child_did: str,
     budget: Decimal,
-    currency: Currency = Currency.FIL,
+    currency: Any = None,
 ) -> DelegatedWallet:
     """Create a delegated wallet by holding budget from the parent.
 
@@ -181,11 +207,14 @@ async def create_delegated_wallet(
     if budget <= 0:
         raise ValueError("Budget must be positive")
 
+    currency = currency or _default_currency_for(parent_wallet)
+
     if not parent_wallet.can_afford(budget, currency):
         parent_balance = parent_wallet.get_balance(currency, "main")
+        currency_value = _currency_value(currency)
         raise ValueError(
             f"Parent has insufficient funds. "
-            f"Need {budget} {currency.value}, have {parent_balance} {currency.value}"
+            f"Need {budget} {currency_value}, have {parent_balance} {currency_value}"
         )
 
     # Hold: debit the parent
@@ -198,7 +227,8 @@ async def create_delegated_wallet(
         raise ValueError("Failed to debit parent wallet for budget hold")
 
     # Create child wallet with the delegated budget (all goes to main, no 90/10 split)
-    child_wallet = WalletAgent(
+    wallet_cls = type(parent_wallet)
+    child_wallet = wallet_cls(
         agent_id=child_did,
         initial_balance=Decimal("0"),
         initial_currency=currency,
@@ -215,7 +245,7 @@ async def create_delegated_wallet(
 
     logger.info(
         "Created delegated wallet: child=%s, budget=%s %s, parent=%s",
-        child_did, budget, currency.value, parent_did,
+        child_did, budget, _currency_value(currency), parent_did,
     )
 
     return DelegatedWallet(wallet=child_wallet, allocation=allocation)
@@ -223,8 +253,8 @@ async def create_delegated_wallet(
 
 async def release_delegated_wallet(
     delegated_wallet: DelegatedWallet,
-    parent_wallet: WalletAgent,
-    currency: Currency = Currency.FIL,
+    parent_wallet: WalletProtocol,
+    currency: Any = None,
 ) -> Decimal:
     """Release a delegated wallet, returning unspent funds to the parent.
 
@@ -240,6 +270,7 @@ async def release_delegated_wallet(
     Returns:
         The amount returned to the parent.
     """
+    currency = currency or _default_currency_for(parent_wallet)
     unspent = delegated_wallet.remaining
 
     if unspent > 0:
@@ -253,8 +284,23 @@ async def release_delegated_wallet(
     logger.info(
         "Released delegated wallet: child=%s, returned=%s %s, spent=%s %s",
         delegated_wallet.allocation.child_did,
-        unspent, currency.value,
-        delegated_wallet.spent, currency.value,
+        unspent, _currency_value(currency),
+        delegated_wallet.spent, _currency_value(currency),
     )
 
     return unspent
+
+
+def _default_currency_for(wallet: WalletProtocol) -> Any:
+    """Return the wallet's FIL-like currency key without importing wallet code."""
+    balances = getattr(wallet, "_balances", {})
+    for currency in balances:
+        if getattr(currency, "value", currency) == "FIL":
+            return currency
+    if balances:
+        return next(iter(balances))
+    return "FIL"
+
+
+def _currency_value(currency: Any) -> str:
+    return str(getattr(currency, "value", currency))
