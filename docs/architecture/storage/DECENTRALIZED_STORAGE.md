@@ -67,6 +67,42 @@ The technical realization of this vision is detailed in **[SOVEREIGNTY_V2_TECHNI
 
 **Recommendation:** Lighthouse remains the default for both CLOUD_HOT pinning and CLOUD_COLD perpetual storage. Filebase is registered as a CLOUD_HOT alternative when its keys are present.
 
+## Operator Health Checks
+
+Use `kestrel storage health` to distinguish normal Lighthouse deal lag from
+storage risk. The command checks the latest Lighthouse snapshot CID, its
+Filecoin deal count, whether a no-deal upload is still inside the configured
+grace window, and whether the GCS fallback bucket has a `latest.db` snapshot.
+
+Default interpretation:
+
+- `lighthouse: ok` means the latest matching snapshot has one or more Filecoin
+  deals.
+- `lighthouse: pending` means the latest snapshot has no deals yet but is less
+  than 24 hours old.
+- `lighthouse: warning` means the latest snapshot is older than the grace window
+  and still has no Filecoin deals.
+- `gcs: ok` means `GCS_BACKUP_BUCKET` is reachable and `latest.db` exists for
+  the selected agent.
+
+Storage tiers should be read as layered backups, not equivalent sovereignty:
+
+- Lighthouse is the delegated durable path: IPFS gateway access plus Filecoin
+  deals once Lighthouse aggregation completes.
+- GCS is an expedient operational fallback: fast restore on infrastructure we
+  already operate, but not decentralized.
+- Self-hosted Kubo with the GCS-backed Docker image is the sovereign path when
+  `SOVEREIGN_IPFS_URL` is configured; its blocks are backed up to GCS by the
+  IPFS container.
+
+Examples:
+
+```bash
+kestrel storage health --agent-id did:example:agent
+kestrel storage health --agent-id did:example:agent --lighthouse-grace-hours 48
+kestrel storage health --agent-id did:example:agent --json
+```
+
 ## Pricing Reality (Mar 2026)
 
 | Storage Type | Cost | Duration | Notes |
