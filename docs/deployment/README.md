@@ -89,9 +89,13 @@ Or directly via `gcloud`:
 gcloud secrets versions add <secret-name> --data-file=<path>
 ```
 
-## Kestrel GitHub Agent — update flow
+## Kestrel GitHub Bot — update flow
 
-The GitHub Agent ([`kestrel_sovereign/features/github_app/`](../../kestrel_sovereign/features/github_app/)) runs on the same Cloud Run multi_agent as the main Kestrel agents. Its source code (and the codebase it reads when answering questions) is baked into the Docker image at build time.
+The Kestrel GitHub bot is the hosted GitHub App/webhook service that answers
+project issues and discussions. It is an application surface, not a
+`kestrel-feature-*` package for arbitrary agents. Its source code (and the
+codebase it reads when answering questions) is baked into the Docker image at
+build time.
 
 **When you change source code, it won't reflect on the agent until you redeploy:**
 
@@ -110,7 +114,7 @@ The agent uses `min-instances=1` to stay warm (LLM calls exceed GitHub's 10s web
 The dev deployment runs **multi_agent mode** — a host process routes traffic to per-agent subprocesses. See [`host.py`](../../host.py) for the host, [`server.py`](../../server.py) for individual agents.
 
 Two agents ship in the default multi_agent image:
-- `Kestrel` (port 8801) — main agent with all features including GitHubApp
+- `Kestrel` (port 8801) — main agent and GitHub bot webhook target
 - `kestrel-demo` (port 8802) — demo agent for UI examples
 
 The `/webhooks/github-app` endpoint is a proxy on the host that forwards to the first agent (Kestrel).

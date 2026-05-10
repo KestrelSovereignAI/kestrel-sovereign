@@ -428,15 +428,6 @@ tags = ["legal", "incorporation", "wyoming", "dao"]
 icon = "scale"
 core = false
 
-[github_app]
-package = "kestrel-feature-github-app"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-github-app.git"
-features = ["GitHubAppFeature"]
-description = "GitHub App webhook handler — responds to issues and discussions with grounded answers"
-tags = ["integration", "github", "bot", "support"]
-icon = "message-square"
-core = false
-
 [consent]
 package = "kestrel-feature-consent"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-consent.git"

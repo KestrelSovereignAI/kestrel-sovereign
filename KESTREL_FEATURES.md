@@ -175,6 +175,16 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `WellnessFeature`
 - `WorkflowsFeature`
 
+## External App Surfaces
+
+These are maintained Kestrel applications or services, but they are not
+agent feature packages and should not be listed in
+`kestrel_sovereign.features` package registry metadata.
+
+- **Kestrel GitHub bot** — the hosted GitHub App/webhook service used by the
+  project for issue and discussion automation. This is an application surface,
+  not a reusable `kestrel-feature-*` capability for arbitrary agents.
+
 ## Public HTTP Surface
 
 ### App-level routes in `kestrel_sovereign/server.py`

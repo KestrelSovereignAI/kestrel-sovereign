@@ -182,7 +182,7 @@ The 42 modules in the current audited snapshot span the following capability dom
 | **Memory & Context** | Session memory, persistent memory, strategic memory, memory agency, context management, reflection |
 | **Communication** | Voice, channels, delivery, webhooks, peers, bridge, mesh |
 | **Compute & Deployment** | General compute, GCP compute, RunPod, Vast.ai, deployment management |
-| **Productivity & Tools** | Tasks, scheduler, code editing, web search, file saving, GitHub, GitHub Apps |
+| **Productivity & Tools** | Tasks, scheduler, code editing, web search, file saving, GitHub |
 | **Operations** | Observability, security, heartbeat, wellness, state of mind |
 | **Platform** | Bootstrap, sovereignty, spawn, model/LLM management, wallet, response audit, Talon coordination |
 
