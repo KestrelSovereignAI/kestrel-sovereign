@@ -39,6 +39,7 @@ from kestrel_sovereign.features.talon.runtime import (
     load_talon_policy_preference,
     normalize_auth_lane,
     normalize_backend,
+    parse_talon_bool,
     resolve_runtime,
     sanitize_env_for_backend,
     write_talon_preference,
@@ -285,12 +286,12 @@ class TalonCoordinatorFeature(Feature):
                     else preference.max_turns
                 ),
                 skip_clarification=(
-                    bool(skip_clarification)
+                    parse_talon_bool(skip_clarification, "skip_clarification")
                     if skip_clarification is not None
                     else preference.skip_clarification
                 ),
                 self_review=(
-                    bool(self_review)
+                    parse_talon_bool(self_review, "self_review")
                     if self_review is not None
                     else preference.self_review
                 ),
