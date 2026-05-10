@@ -625,6 +625,55 @@ class TestMintOpenRouterChild:
         await result.close()
 
     @pytest.mark.asyncio
+    async def test_open_host_db_skips_agent_data_without_host_db(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex Phase 4 round 5: alias path itself has an 'agent_data'
+        segment that is NOT the real deployment root. Earlier code
+        returned the first agent_data ancestor found, even if its
+        host.db was absent. Now the walk skips agent_data dirs with
+        no host.db and continues to the resolved candidate.
+
+        Layout:
+        - <project>/agent_data/host.db (real)
+        - <project>/agent_data/test-agent.db (real)
+        - <home>/agent_data/current.db → symlink to test-agent.db
+          (lexical walk finds <home>/agent_data, no host.db there;
+           must continue to resolved walk to find <project>/agent_data)
+        """
+        import os
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+
+        # Real deployment with a host.db.
+        project = tmp_path / "project"
+        project.mkdir()
+        real_agent_data = project / "agent_data"
+        real_agent_data.mkdir()
+        host_db_real = await AsyncDatabase.sqlite(str(real_agent_data / "host.db"))
+        await host_db_real.close()
+        real_agent_db = real_agent_data / "test-agent.db"
+        real_agent_db.write_text("")
+
+        # Decoy agent_data dir without a host.db.
+        home = tmp_path / "home"
+        decoy_agent_data = home / "agent_data"
+        decoy_agent_data.mkdir(parents=True)
+        # Note: NO host.db here.
+        alias_path = decoy_agent_data / "current.db"
+        try:
+            os.symlink(real_agent_db, alias_path)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+
+        result = await open_host_db(storage_path=alias_path)
+        assert result is not None, (
+            "open_host_db returned None when alias-path's lexical "
+            "agent_data ancestor lacked host.db; the resolved-walk "
+            "fallback that DID have host.db was not consulted."
+        )
+        await result.close()
+
+    @pytest.mark.asyncio
     async def test_open_host_db_returns_none_when_no_agent_data_ancestor(
         self, tmp_path: Path
     ) -> None:

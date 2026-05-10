@@ -504,34 +504,34 @@ class FoundationPayerResolver:
 # ----------------------------------------------------------------------
 
 
-def _find_agent_data_root(start: "Path") -> Optional["Path"]:
-    """Walk up from ``start`` looking for a directory named
-    ``agent_data``. Returns the first match or None.
+def _find_host_db(start: "Path") -> Optional["Path"]:
+    """Walk up from ``start`` looking for an ``agent_data`` directory
+    that contains a ``host.db`` file. Returns the first such
+    ``host.db`` path, or None.
 
     Handles both layouts:
-    - Multi-agent: ``<project>/agent_data/<name>/kestrel_prime.db`` →
-      parent is ``<name>``, parent.parent is ``agent_data``.
-    - Flat:       ``<project>/agent_data/<name>.db`` →
-      parent is ``agent_data``.
+    - Multi-agent: ``<project>/agent_data/<name>/kestrel_prime.db``
+    - Flat:       ``<project>/agent_data/<name>.db``
 
-    Walking up is robust against future layout changes too. Stops at
-    filesystem root.
+    And both symlink directions:
+    - Case A: ``<project>/agent_data`` is a symlink to a mount.
+      Lexical walk finds 'agent_data' segment; resolved walk would
+      lose it.
+    - Case B: storage_path is a symlink alias outside agent_data that
+      points into ``<project>/agent_data``. Lexical walk fails (no
+      'agent_data' segment); resolved walk wins.
+    - Case C: alias path itself has an 'agent_data' segment that's
+      NOT the real root (e.g. ``~/agent_data/current.db`` symlink
+      target ``<project>/agent_data/<name>.db``). Both walks find an
+      'agent_data' but only one has the host.db. Returning the FIRST
+      ancestor named 'agent_data' would pick the wrong one — instead
+      we keep walking until host.db is actually present, across both
+      candidates.
+
+    Stops at filesystem root for each candidate.
     """
     from pathlib import Path
 
-    # Two-pass walk to handle two symmetric symlink edge cases:
-    #
-    # 1. <project>/agent_data is a symlink to /mnt/data — lexical
-    #    walk works (segment 'agent_data' is in the path), resolved
-    #    walk fails (resolve() expands the symlink away).
-    #
-    # 2. storage_path is itself a symlink alias outside agent_data
-    #    that points into <project>/agent_data — lexical walk fails
-    #    (no 'agent_data' segment), resolved walk works.
-    #
-    # Try lexical first (covers case 1 and the common no-symlink case);
-    # fall back to resolved (covers case 2). Both passes terminate at
-    # filesystem root.
     candidates = [Path(start).absolute()]
     try:
         resolved = Path(start).resolve()
@@ -547,7 +547,9 @@ def _find_agent_data_root(start: "Path") -> Optional["Path"]:
             cur = cur.parent
         while cur != cur.parent:
             if cur.name == "agent_data":
-                return cur
+                candidate_host_db = cur / "host.db"
+                if candidate_host_db.exists():
+                    return candidate_host_db
             cur = cur.parent
     return None
 
@@ -581,20 +583,21 @@ async def open_host_db(
     from pathlib import Path
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    host_db_path: Path
+    host_db_path: Optional[Path]
     if storage_path is not None:
-        found = _find_agent_data_root(Path(storage_path))
-        if found is None:
-            # No agent_data ancestor — degrade gracefully.
-            return None
-        host_db_path = found / "host.db"
+        # _find_host_db walks both lexical and resolved paths, and
+        # only returns an agent_data ancestor that actually contains
+        # a host.db. Returns None if none of the candidates yields one.
+        host_db_path = _find_host_db(Path(storage_path))
     elif agent_data_dir is not None:
-        host_db_path = Path(agent_data_dir) / "host.db"
+        candidate = Path(agent_data_dir) / "host.db"
+        host_db_path = candidate if candidate.exists() else None
     else:
         root = project_dir if project_dir is not None else Path.cwd()
-        host_db_path = root / "agent_data" / "host.db"
+        candidate = root / "agent_data" / "host.db"
+        host_db_path = candidate if candidate.exists() else None
 
-    if not host_db_path.exists():
+    if host_db_path is None:
         return None
     return await AsyncDatabase.sqlite(str(host_db_path))
 
