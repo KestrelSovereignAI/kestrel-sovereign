@@ -320,6 +320,24 @@ class Gate:
         # (e.g. red_team_clear's reviewer pool size) belong in Phase 2's
         # gate-specific validators. Phase 0 catches the cheap, type-
         # required-field mistakes that would otherwise corrupt storage.
+        if self.type == "tests_pass":
+            suite = self.params.get("suite")
+            if not isinstance(suite, str) or not suite.strip():
+                raise WorkflowDefinitionError(
+                    "gate tests_pass requires non-empty params.suite "
+                    "per design §3.3"
+                )
+        if self.type == "lint_clean":
+            scopes = self.params.get("scopes")
+            if (
+                not isinstance(scopes, (list, tuple))
+                or len(scopes) < 1
+                or not all(isinstance(scope, str) and scope.strip() for scope in scopes)
+            ):
+                raise WorkflowDefinitionError(
+                    "gate lint_clean requires params.scopes: "
+                    "non-empty list[str] per design §3.3"
+                )
         if self.type == "constitutional_boundary_clean":
             forbidden = self.params.get("forbidden_modules")
             # Round 6 P2: ``all([]) is True`` so an explicit empty list

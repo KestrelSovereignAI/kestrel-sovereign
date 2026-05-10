@@ -38,6 +38,7 @@ from kestrel_sdk.signals import (
 
 from kestrel_sovereign.features.workflows.models import (
     EdgeKind,
+    Gate,
     GateOutcome,
     RunStatus,
     Stage,
@@ -64,6 +65,8 @@ from kestrel_sovereign.signals import SignalDispatcher, SourceRegistry
 _RUNNER_GATE_TYPES = frozenset(
     {
         "signal_status_ok",
+        "tests_pass",
+        "lint_clean",
         "constitutional_boundary_clean",
     }
 )
@@ -330,6 +333,14 @@ class WorkflowRunner:
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
                     "is not implemented in the workflow runner"
                 )
+            if (
+                stage.gate.type in {"tests_pass", "lint_clean"}
+                and stage.signal_mode != SignalMode.ACTION
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} gate {stage.gate.type!r} "
+                    "requires signal_mode=ACTION"
+                )
             registration = self.registry.get(stage.signal_source)
             if registration is None:
                 raise WorkflowRunnerError(
@@ -489,11 +500,15 @@ class WorkflowRunner:
         )
         await self.store.insert_stage_link(link)
 
+        payload = {**stage.to_dict()["params"], **run.to_dict()["params"]}
+        if stage.gate.type in {"tests_pass", "lint_clean"}:
+            payload.update(stage.gate.to_dict()["params"])
+
         signal = Signal(
             source=stage.signal_source,
             kind="workflow.stage",
             mode=stage.signal_mode,
-            payload={**stage.to_dict()["params"], **run.to_dict()["params"]},
+            payload=payload,
             target_agent=run.started_by_did,
             visibility=Visibility.INTERNAL,
             session_id=run.run_id,
@@ -544,6 +559,8 @@ class WorkflowRunner:
             return GateOutcome.FAIL, result.error or result.status.value
         if stage.gate.type == "signal_status_ok":
             return GateOutcome.PASS, None
+        if stage.gate.type in {"tests_pass", "lint_clean"}:
+            return _evaluate_exit_marker_gate(stage.gate, result)
         if stage.gate.type == "constitutional_boundary_clean":
             return self._evaluate_constitutional_boundary_gate(stage, result)
         if stage.gate.type not in _RUNNER_GATE_TYPES:
@@ -732,6 +749,16 @@ _CONTAINER_RESULT_KEYS = frozenset(
         "results",
     }
 )
+_EXIT_CODE_KEYS = ("exit_code", "returncode", "return_code")
+_FAILURE_COUNT_KEYS = (
+    "failed",
+    "failures",
+    "failure_count",
+    "errors",
+    "error_count",
+    "violations",
+    "violation_count",
+)
 
 
 def _iter_emitted_code(result: Any) -> Iterable[str]:
@@ -740,6 +767,209 @@ def _iter_emitted_code(result: Any) -> Iterable[str]:
         getattr(result, "artifact", None),
     ):
         yield from _iter_code_payload(payload, root=True)
+
+
+def _evaluate_exit_marker_gate(
+    gate: Gate, result: Any
+) -> tuple[GateOutcome, Optional[str]]:
+    if result.mode != SignalMode.ACTION:
+        return GateOutcome.FAIL, f"{gate.type}_requires_action_result"
+    marker = getattr(result, "action_result", None)
+    if marker is None:
+        return GateOutcome.FAIL, f"{gate.type}_missing_result"
+    if _result_marker_passed(gate, marker):
+        contract_reason = _quality_gate_contract_reason(gate, marker)
+        if contract_reason is not None:
+            return GateOutcome.FAIL, contract_reason
+        return GateOutcome.PASS, None
+    reason = _result_marker_reason(marker)
+    return GateOutcome.FAIL, f"{gate.type}_failed:{reason}"
+
+
+def _result_marker_passed(gate: Gate, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value == 0
+    if isinstance(value, str):
+        return value.lower() in {"ok", "pass", "passed", "success", "clean"}
+    if isinstance(value, dict):
+        if _has_explicit_nonzero_exit(value):
+            return False
+        if _has_explicit_failure_count(value):
+            return False
+        if _has_explicit_bad_status(value):
+            return False
+        if any(_is_zero(value.get(key)) for key in _EXIT_CODE_KEYS):
+            return True
+        if any(value.get(key) is True for key in ("ok", "success", "passed", "clean")):
+            return True
+        status = value.get("status")
+        if isinstance(status, str) and status.strip().lower() in {
+            "ok",
+            "pass",
+            "passed",
+            "success",
+            "clean",
+        }:
+            return True
+        if gate.type == "tests_pass" and _has_zero_test_counts(value):
+            return True
+        if gate.type == "lint_clean" and _has_zero_lint_counts(value):
+            return True
+    return False
+
+
+def _has_explicit_bad_status(value: dict[str, Any]) -> bool:
+    status = value.get("status")
+    if not isinstance(status, str):
+        return False
+    return status.strip().lower() in {
+        "error",
+        "errored",
+        "fail",
+        "failed",
+        "failure",
+        "timeout",
+        "timed_out",
+    }
+
+
+def _has_explicit_nonzero_exit(value: dict[str, Any]) -> bool:
+    for key in _EXIT_CODE_KEYS:
+        code = value.get(key)
+        if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+            return True
+    return False
+
+
+def _has_explicit_failure_count(value: dict[str, Any]) -> bool:
+    for key in _FAILURE_COUNT_KEYS:
+        count = value.get(key)
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            return True
+    return False
+
+
+def _has_zero_test_counts(value: dict[str, Any]) -> bool:
+    has_failure_count = any(
+        key in value and _is_zero(value.get(key))
+        for key in ("failed", "failures", "failure_count")
+    )
+    has_error_count = any(
+        key in value and _is_zero(value.get(key))
+        for key in ("errors", "error_count")
+    )
+    return has_failure_count and has_error_count
+
+
+def _has_zero_lint_counts(value: dict[str, Any]) -> bool:
+    has_violation_count = any(
+        key in value and _is_zero(value.get(key))
+        for key in ("violations", "violation_count")
+    )
+    has_error_count = any(
+        key in value and _is_zero(value.get(key))
+        for key in ("errors", "error_count")
+    )
+    return has_violation_count and has_error_count
+
+
+def _quality_gate_contract_reason(gate: Gate, marker: Any) -> Optional[str]:
+    if not isinstance(marker, dict):
+        # Design §3.3 defines tests_pass(suite) as "pytest ... exit 0
+        # = pass"; the runner supplies the suite to the ACTION source
+        # payload, and simple command-style sources may return only the
+        # scalar process exit marker. lint_clean still needs structured
+        # scope coverage, so it remains dict-only below.
+        if gate.type == "tests_pass":
+            return None
+        return f"{gate.type}_missing_contract_echo"
+    if gate.type == "tests_pass":
+        expected_suite = gate.params["suite"]
+        if not any(
+            key in marker
+            for key in ("suite", "suites", "test_suite", "test_suites")
+        ):
+            return None
+        if _marker_contains_string(
+            marker,
+            expected_suite,
+            keys=("suite", "suites", "test_suite", "test_suites"),
+        ):
+            return None
+        return f"tests_pass_suite_mismatch:{expected_suite}"
+    if gate.type == "lint_clean":
+        expected_scopes = tuple(gate.params["scopes"])
+        if _marker_contains_all_strings(
+            marker,
+            expected_scopes,
+            keys=("scope", "scopes", "checked_scopes", "covered_scopes", "lint_scopes"),
+        ):
+            return None
+        return "lint_clean_scope_mismatch:" + ",".join(expected_scopes)
+    return None
+
+
+def _marker_contains_string(
+    marker: dict[str, Any], expected: str, *, keys: tuple[str, ...]
+) -> bool:
+    for key in keys:
+        if _marker_value_contains(marker.get(key), expected):
+            return True
+    return False
+
+
+def _marker_contains_all_strings(
+    marker: dict[str, Any], expected: tuple[str, ...], *, keys: tuple[str, ...]
+) -> bool:
+    observed: set[str] = set()
+    for key in keys:
+        observed.update(_marker_strings(marker.get(key)))
+    return set(expected).issubset(observed)
+
+
+def _marker_value_contains(value: Any, expected: str) -> bool:
+    return expected in _marker_strings(value)
+
+
+def _marker_strings(value: Any) -> set[str]:
+    if isinstance(value, str):
+        stripped = value.strip()
+        return {stripped} if stripped else set()
+    if isinstance(value, (list, tuple, set)):
+        values: set[str] = set()
+        for item in value:
+            values.update(_marker_strings(item))
+        return values
+    return set()
+
+
+def _is_zero(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+
+def _result_marker_reason(value: Any) -> str:
+    if isinstance(value, dict):
+        status = value.get("status")
+        if isinstance(status, str) and _has_explicit_bad_status(value):
+            return status.strip()
+        for key in _EXIT_CODE_KEYS:
+            code = value.get(key)
+            if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+                return f"{key}={code!r}"
+        for key in _FAILURE_COUNT_KEYS:
+            count = value.get(key)
+            if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+                return f"{key}={count!r}"
+        for key in ("error", "message", "summary", "status"):
+            reason = value.get(key)
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip()
+        for key in _EXIT_CODE_KEYS:
+            if key in value:
+                return f"{key}={value[key]!r}"
+    return repr(value)
 
 
 def _iter_code_payload(value: Any, *, root: bool = False) -> Iterable[str]:

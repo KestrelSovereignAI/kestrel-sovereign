@@ -95,6 +95,17 @@ def _action_source(name: str, handler) -> SourceRegistration:
     )
 
 
+def _artifact_source(name: str, handler) -> SourceRegistration:
+    return SourceRegistration(
+        name=name,
+        schema=dict,
+        default_mode=SignalMode.ARTIFACT,
+        allowed_modes=frozenset({SignalMode.ARTIFACT}),
+        artifact_handler=handler,
+        log_redaction=_redaction(),
+    )
+
+
 def _stage(name: str, source: str) -> Stage:
     return Stage(
         name=name,
@@ -562,6 +573,684 @@ async def test_runner_records_failed_gate_when_dispatch_fails(runner_components)
     assert links[0].gate_outcome.value == "fail"
     assert "boom" in links[0].gate_reason
     assert links[0].signal_id is not None
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_accepts_exit_zero_marker(runner_components):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {"exit_code": 0, "summary": "39 passed"}
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads == [{"suite": "unit"}]
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_rejects_lint_count_marker(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"violations": 0, "errors": 0, "suite": payload["suite"]}
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_requires_action_mode_before_signal(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(signal):
+        nonlocal calls
+        calls += 1
+        return "success"
+
+    c.registry.register(_artifact_source("tests.unit", handler))
+    c.registry.register(_action_source("undo.unit", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ARTIFACT,
+                    compensate="undo.unit",
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="requires signal_mode=ACTION"):
+        await c.runner.run_to_completion(name="release")
+
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_accepts_scalar_exit_zero_marker(
+    runner_components,
+):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return 0
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads == [{"suite": "unit"}]
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_fails_wrong_suite_echo(runner_components):
+    c = runner_components
+
+    async def handler(payload):
+        return {"exit_code": 0, "suite": "integration", "summary": "39 passed"}
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "tests_pass_suite_mismatch:unit"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_fails_nonzero_marker(runner_components):
+    c = runner_components
+
+    async def handler(payload):
+        return {"exit_code": 1, "suite": payload["suite"], "summary": "1 failed"}
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "tests_pass_failed:exit_code=1"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_rejects_explicit_failure_count(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"exit_code": 0, "failed": 1, "suite": payload["suite"]}
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "tests_pass_failed:failed=1"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_rejects_nonzero_exit_with_zero_counts(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "exit_code": 5,
+            "failed": 0,
+            "errors": 0,
+            "suite": payload["suite"],
+        }
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "tests_pass_failed:exit_code=5"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_rejects_bad_status_with_zero_counts(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "status": "failed",
+            "failed": 0,
+            "errors": 0,
+            "suite": payload["suite"],
+        }
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "tests_pass_failed:failed"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_accepts_zero_count_aliases(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "failure_count": 0,
+            "error_count": 0,
+            "suite": payload["suite"],
+        }
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_tests_pass_gate_ignores_http_status_code_metadata(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"success": True, "status_code": 200, "suite": payload["suite"]}
+
+    c.registry.register(_action_source("tests.unit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="unit",
+                    signal_source="tests.unit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="tests_pass", params={"suite": "unit"}),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_accepts_zero_violation_marker(
+    runner_components,
+):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {"violations": 0, "errors": 0, "scopes": payload["scopes"]}
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads == [{"scopes": ["kestrel_sovereign/features/workflows"]}]
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_fails_missing_scope_echo(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"violations": 0, "errors": 0, "scopes": ["tests/unit"]}
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == (
+        "lint_clean_scope_mismatch:kestrel_sovereign/features/workflows"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_rejects_explicit_violation_count(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "ok": True,
+            "violations": 3,
+            "errors": 0,
+            "scopes": payload["scopes"],
+        }
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "lint_clean_failed:violations=3"
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_rejects_nonzero_exit_with_zero_counts(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "returncode": 1,
+            "violations": 0,
+            "errors": 0,
+            "scopes": payload["scopes"],
+        }
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "lint_clean_failed:returncode=1"
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_accepts_zero_count_aliases(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "violation_count": 0,
+            "error_count": 0,
+            "scopes": payload["scopes"],
+        }
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_rejects_test_count_marker(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"failed": 0, "errors": 0, "scopes": payload["scopes"]}
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+
+
+@pytest.mark.asyncio
+async def test_runner_lint_clean_gate_fails_missing_marker(runner_components):
+    c = runner_components
+
+    async def handler(payload):
+        return None
+
+    c.registry.register(_action_source("lint.python", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="lint.python",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="lint_clean",
+                        params={"scopes": ["kestrel_sovereign/features/workflows"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "lint_clean_missing_result"
 
 
 @pytest.mark.asyncio
