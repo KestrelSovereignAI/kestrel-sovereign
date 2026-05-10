@@ -32,6 +32,7 @@ Commands:
 
 import argparse
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -857,6 +858,63 @@ def cmd_doctor(args) -> int:
     report = diagnose(project_dir)
     print(format_report(report))
     return 0 if report.ready else 1
+
+
+def cmd_storage(args) -> int:
+    """Dispatch ``kestrel storage`` subcommands."""
+    storage_commands = {
+        "health": cmd_storage_health,
+    }
+    handler = storage_commands.get(args.storage_command)
+    if handler is None:
+        print("Usage: kestrel storage {health}")
+        return 1
+    return handler(args)
+
+
+def cmd_storage_health(args) -> int:
+    """Show Lighthouse deal-lag and GCS fallback health."""
+    from datetime import timedelta
+
+    from kestrel_sovereign.storage.sync.health import (
+        build_storage_health_report,
+        load_env_file,
+    )
+
+    project_dir = _get_project_dir()
+    env = load_env_file(project_dir / ".env")
+    report = asyncio.run(
+        build_storage_health_report(
+            agent_id=args.agent_id,
+            env=env,
+            lighthouse_grace=timedelta(hours=args.lighthouse_grace_hours),
+            gcs_prefix=args.gcs_prefix,
+        )
+    )
+    data = report.to_dict()
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"Storage health: {report.status}")
+        for target in (report.lighthouse, report.gcs):
+            configured = "configured" if target.configured else "not configured"
+            print(f"  {target.name:12} {target.status:14} {configured}")
+            print(f"    {target.message}")
+            if target.details:
+                cid = target.details.get("cid")
+                if cid:
+                    print(f"    cid: {cid}")
+                if target.name == "lighthouse":
+                    deal_count = target.details.get("deal_count")
+                    age_seconds = target.details.get("age_seconds")
+                    if age_seconds is not None:
+                        print(f"    age: {age_seconds // 3600}h")
+                    if deal_count is not None:
+                        print(f"    deals: {deal_count}")
+                if target.name == "gcs":
+                    print(f"    bucket: {target.details.get('bucket')}")
+                    print(f"    latest: {target.details.get('latest_blob')}")
+    return 1 if report.status == "warning" else 0
 
 
 def cmd_constitution(args) -> int:
@@ -1719,6 +1777,35 @@ def build_parser() -> argparse.ArgumentParser:
     # kestrel doctor
     subparsers.add_parser("doctor", help="Diagnose readiness; no changes")
 
+    # kestrel storage {health}
+    storage_p = subparsers.add_parser(
+        "storage", help="Storage health and operations"
+    )
+    storage_sub = storage_p.add_subparsers(dest="storage_command")
+    storage_health_p = storage_sub.add_parser(
+        "health",
+        help="Check Lighthouse deal lag and GCS fallback readiness",
+    )
+    storage_health_p.add_argument(
+        "--agent-id",
+        default="default",
+        help="Agent identifier used by sync targets (default: default)",
+    )
+    storage_health_p.add_argument(
+        "--lighthouse-grace-hours",
+        type=float,
+        default=24.0,
+        help="Hours before no-deal Lighthouse snapshots warn (default: 24)",
+    )
+    storage_health_p.add_argument(
+        "--gcs-prefix",
+        default="kestrel/",
+        help="GCS prefix used by GCSTarget (default: kestrel/)",
+    )
+    storage_health_p.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON"
+    )
+
     # kestrel setup [step]
     setup_p = subparsers.add_parser(
         "setup", help="Run the setup wizard (idempotent, re-runnable)"
@@ -1932,6 +2019,7 @@ def main() -> int:
         "shell": cmd_shell,
         "health": cmd_health,
         "doctor": cmd_doctor,
+        "storage": cmd_storage,
         "setup": cmd_setup,
         "constitution": cmd_constitution,
         "migrate-llm-config": cmd_migrate_llm_config,

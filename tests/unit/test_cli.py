@@ -24,6 +24,7 @@ from kestrel_sovereign.cli import (
     cmd_create,
     cmd_shell,
     cmd_health,
+    cmd_storage,
     cmd_config,
     _get_project_dir,
     _host_pid_file,
@@ -146,6 +147,26 @@ class TestArgumentParsing:
         args = parser.parse_args(["health"])
         assert args.command == "health"
 
+    def test_storage_health(self):
+        """'storage health' should parse successfully."""
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "storage",
+                "health",
+                "--agent-id",
+                "did:example:agent",
+                "--lighthouse-grace-hours",
+                "48",
+                "--json",
+            ]
+        )
+        assert args.command == "storage"
+        assert args.storage_command == "health"
+        assert args.agent_id == "did:example:agent"
+        assert args.lighthouse_grace_hours == 48
+        assert args.json is True
+
     def test_config_with_dir(self):
         """'config <dir>' should parse agent directory."""
         parser = build_parser()
@@ -230,6 +251,13 @@ class TestCommandDispatch:
         """'health' should dispatch to cmd_health."""
         with patch("sys.argv", ["kestrel", "health"]), \
              patch("kestrel_sovereign.cli.cmd_health", return_value=0) as mock:
+            main()
+            mock.assert_called_once()
+
+    def test_dispatch_storage(self):
+        """'storage' should dispatch to cmd_storage."""
+        with patch("sys.argv", ["kestrel", "storage", "health"]), \
+             patch("kestrel_sovereign.cli.cmd_storage", return_value=0) as mock:
             main()
             mock.assert_called_once()
 
@@ -422,6 +450,23 @@ class TestCmdStatus:
         assert "NAME" in output
         assert "STATUS" in output
         assert "PID" in output
+
+
+# -----------------------------------------------------------------------
+# cmd_storage tests
+# -----------------------------------------------------------------------
+
+class TestCmdStorage:
+    """Tests for the 'storage' command group."""
+
+    def test_storage_no_subcommand_prints_usage(self, capsys):
+        parser = build_parser()
+        args = parser.parse_args(["storage"])
+
+        rc = cmd_storage(args)
+
+        assert rc == 1
+        assert "kestrel storage" in capsys.readouterr().out
 
 
 # -----------------------------------------------------------------------
