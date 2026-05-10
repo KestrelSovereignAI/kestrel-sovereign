@@ -154,6 +154,7 @@ class TestMintOpenRouterChild:
         host = HostKeyStorage(db)
         await host.store_key("openrouter", "sk-or-v1-host-master")
         agent_did = "did:test:agent-already-keyed"
+        await _seed_agent_graph_node(db, agent_did)
         agent_storage = ServiceKeyStorage(db, agent_did)
         await agent_storage.store_key("openrouter", "sk-or-v1-existing")
 
@@ -175,9 +176,11 @@ class TestMintOpenRouterChild:
     async def test_mint_raises_when_no_host_master(
         self, db: AsyncDatabase
     ) -> None:
-        # Arrange: NO host master configured. The resolver must refuse
-        # rather than silently falling through to env-var or shared key.
+        # Arrange: graph_nodes row exists but NO host master configured.
+        # The resolver must refuse rather than silently falling through
+        # to env-var or shared key.
         agent_did = "did:test:agent-no-master"
+        await _seed_agent_graph_node(db, agent_did)
         resolver = FoundationPayerResolver(_host_master_policy(), db=db)
         with pytest.raises(PayerPolicyError) as excinfo:
             await resolver.resolve_for(agent_did, ResourceClass.LLM)
@@ -265,15 +268,15 @@ class TestMintOpenRouterChild:
     async def test_mint_raises_when_no_graph_nodes_row(
         self, db: AsyncDatabase
     ) -> None:
-        """Codex Phase 3c round 2 finding: agent_metadata fallback was
-        invisible to retirement_service.get_agent_info() (which reads
-        only from graph_nodes.properties), so a resolver-minted key
-        without a graph_nodes row would leak at retirement.
+        """Codex Phase 3c round 2/3: refuse to mint if no graph_nodes
+        row exists, AND fail BEFORE any side effects so retry doesn't
+        end up with a working local key but no retirement-visible hash.
 
-        The corrected behavior: refuse to mint if no graph_nodes row
-        exists. inception_service creates the row before agent init
-        reaches the resolver, so production paths never hit this; tests
-        that want to exercise mint must seed the row.
+        retirement_service.get_agent_info() reads only from
+        graph_nodes.properties — without a row, the remote OpenRouter
+        child key would leak. inception_service creates the row before
+        agent init reaches the resolver, so production paths never
+        hit this; tests that want to exercise mint must seed the row.
         """
         host = HostKeyStorage(db)
         await host.store_key("openrouter", "sk-or-v1-host-master")
@@ -294,13 +297,14 @@ class TestMintOpenRouterChild:
                 await resolver.resolve_for(agent_did, ResourceClass.LLM)
 
         assert "graph_nodes" in str(excinfo.value).lower()
-        # The remote API was called BEFORE the persist failure (we do
-        # the OpenRouter create before the local persist). That's a
-        # known leak window if precondition is violated; the error
-        # message names the issue so the operator can investigate.
-        # ServiceKeyStorage may have the key locally — that's fine, it
-        # just won't be activated without a graph_nodes row anyway.
-        assert mock_instance.create_agent_key.await_count == 1
+        # CRITICAL: the OpenRouter API was NOT called and no local key
+        # was stored. Pre-flight short-circuited before any side
+        # effects, so a retry has the same starting state and can't
+        # land in an inconsistent partially-provisioned state.
+        assert mock_instance.create_agent_key.await_count == 0
+        # ServiceKeyStorage has no key — confirms no local side effect.
+        agent_storage = ServiceKeyStorage(db, agent_did)
+        assert (await agent_storage.has_key("openrouter")) is False
 
     @pytest.mark.asyncio
     async def test_concurrent_mints_for_same_agent_serialize(

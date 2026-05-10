@@ -248,6 +248,25 @@ class FoundationPayerResolver:
             )
             return
 
+        # PRE-FLIGHT: validate the graph_nodes agent row exists BEFORE
+        # any side effects (mint + local store). Codex Phase 3c round 3
+        # finding: previously the missing-row check ran AFTER mint/store,
+        # so a failed persist left the agent with a working local key
+        # but no retirement-visible hash; subsequent inits would skip
+        # mint entirely (has_key=True) and the hash would never get
+        # written. Pre-flight makes that race impossible.
+        if not await self._agent_graph_node_exists(agent_did):
+            from kestrel_sdk.payer_policy import PayerPolicyError
+            raise PayerPolicyError(
+                f"PayerResolver: cannot mint OpenRouter child key for "
+                f"agent {agent_did[:30]}... — no graph_nodes row exists. "
+                "retirement_service reads openrouter_key_hash from "
+                "graph_nodes.properties only; without a row, the remote "
+                "OpenRouter child key would leak at retirement. Inception "
+                "is expected to create the graph_nodes row before agent "
+                "init reaches this resolver."
+            )
+
         # Per-agent lock prevents two concurrent agent-init paths from
         # both passing has_key() and both calling create_agent_key —
         # which would orphan one of the two remote OpenRouter keys.
@@ -256,6 +275,14 @@ class FoundationPayerResolver:
         lock = self._GLOBAL_MINT_LOCKS.setdefault(agent_did, asyncio.Lock())
         async with lock:
             await self._maybe_mint_openrouter_child_locked(agent_did, spec)
+
+    async def _agent_graph_node_exists(self, agent_did: str) -> bool:
+        """True iff a graph_nodes row exists for this agent_did."""
+        rows = await self._db.fetchall(
+            "SELECT 1 FROM graph_nodes WHERE node_id = ? LIMIT 1",
+            (agent_did,),
+        )
+        return bool(rows)
 
     async def _maybe_mint_openrouter_child_locked(
         self,
@@ -341,42 +368,32 @@ class FoundationPayerResolver:
         agent. Mirrors scripts/provision_agent_openrouter.py:119-138 so
         retirement_service.py can revoke the key on agent retirement.
 
-        graph_nodes.properties is the SOLE retirement-readable location;
-        retirement_service.get_agent_info() reads ONLY from there. An
-        earlier draft fell back to agent_metadata when no graph_nodes
-        agent row existed, but codex round 2 caught that retirement
-        wouldn't see those entries — leaking the remote OpenRouter
-        child key on retirement. Now we fail loudly instead: the
-        precondition (graph_nodes row exists for this agent) is created
-        by inception_service before any agent-init path reaches this
-        resolver, so a missing row indicates a deeper inconsistency.
+        Pre-condition: graph_nodes agent row exists. Validated by
+        _maybe_mint_openrouter_child's pre-flight check before any
+        side effects, so this method never has to reason about the
+        missing-row case.
 
         Idempotent: overwrites if already present.
-
-        Raises:
-            PayerPolicyError: If no graph_nodes agent row exists for
-                this agent_did. The mint call must NOT have been made
-                in that state, but the remote child key was already
-                created — the caller surfaces the error so an operator
-                can investigate.
         """
         import json
 
-        # Look up the agent's graph node and current properties.
         rows = await self._db.fetchall(
             "SELECT properties FROM graph_nodes WHERE node_id = ? LIMIT 1",
             (agent_did,),
         )
+        # Pre-flight in _maybe_mint_openrouter_child guarantees the row
+        # exists by the time we get here. A defensive log if it
+        # vanishes between pre-flight and persist (extremely unlikely
+        # given we hold the per-agent mint lock).
         if not rows:
-            from kestrel_sdk.payer_policy import PayerPolicyError
-            raise PayerPolicyError(
-                f"PayerResolver: cannot persist openrouter_key_hash for "
-                f"agent {agent_did[:30]}... — no graph_nodes row exists. "
-                "retirement_service reads the hash from graph_nodes.properties "
-                "only; without a row, the remote OpenRouter child key would "
-                "leak at retirement. Inception is expected to create the "
-                "graph_nodes row before agent init reaches this resolver."
+            logger.error(
+                f"PayerResolver: graph_nodes row vanished mid-mint for "
+                f"agent {agent_did[:30]}.... openrouter_key_hash NOT "
+                "persisted; retirement_service won't be able to revoke "
+                "the remote key. This indicates a concurrent delete "
+                "during agent init."
             )
+            return
 
         properties_json = rows[0][0]
         properties = json.loads(properties_json) if properties_json else {}
