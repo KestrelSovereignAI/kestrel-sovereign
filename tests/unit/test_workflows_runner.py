@@ -1918,6 +1918,358 @@ async def test_runner_ci_green_gate_requires_action_mode_before_signal(
 
 
 @pytest.mark.asyncio
+async def test_runner_council_approve_gate_accepts_distinct_quorum(
+    runner_components,
+):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {
+            "status": "approved",
+            "approvals": [
+                {"did": "did:web:member1.example", "decision": "approved"},
+                {"did": "did:web:member2.example", "approved": True},
+                {"did": "did:web:member1.example", "decision": "approved"},
+            ],
+        }
+
+    c.registry.register(_action_source("council.release", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 2, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads[0]["quorum"] == 2
+    assert payloads[0]["timeout"] == 60
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_gate_fails_missing_quorum(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "approved_dids": ["did:web:member1.example"],
+            "status": "approved",
+        }
+
+    c.registry.register(_action_source("council.release", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 2, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "council_approve_quorum_not_met:1/2"
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_gate_rejects_count_only_marker(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"approved_count": 2, "status": "approved"}
+
+    c.registry.register(_action_source("council.release", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 2, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "council_approve_missing_approvals"
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_gate_waits_then_resumes(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {
+            "status": "pending",
+            "council_request_id": "council-123",
+        }
+
+    async def council_provider(gate, run, stage, link):
+        return {
+            "status": "approved",
+            "approved_dids": [
+                "did:web:member1.example",
+                "did:web:member2.example",
+            ],
+        }
+
+    c.runner.council_approve_provider = council_provider
+    c.registry.register(_action_source("council.release", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 2, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    resumed = await c.runner.continue_run(result.run_id)
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.WAITING
+    assert resumed.status == RunStatus.COMPLETED
+    assert calls == 1
+    assert len(links) == 1
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_waiting_without_provider_does_not_redispatch(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {"status": "pending", "approval_id": "council-123"}
+
+    c.registry.register(_action_source("council.release", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 2, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    resumed = await c.runner.continue_run(result.run_id)
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.WAITING
+    assert resumed.status == RunStatus.FAILED
+    assert calls == 1
+    assert len(links) == 1
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "council_approve_no_resolver"
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_gate_fails_denial(runner_components):
+    c = runner_components
+
+    async def handler(payload):
+        return {"status": "vetoed", "reason": "scope conflict"}
+
+    c.registry.register(_action_source("council.release", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 2, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "council_approve_denied:scope conflict"
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_gate_accepts_artifact_aggregate(
+    runner_components,
+):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(signal):
+        payloads.append(signal.payload)
+        return {"approved_dids": ["did:web:member1.example"]}
+
+    c.registry.register(_artifact_source("council.release", handler))
+    c.registry.register(_action_source("undo.council", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.ARTIFACT,
+                    compensate="undo.council",
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 1, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads[0]["quorum"] == 1
+    assert payloads[0]["timeout"] == 60
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_council_approve_gate_rejects_cognition_before_signal(
+    runner_components,
+):
+    c = runner_components
+    prompt = c.tmp_path / "council.md"
+    prompt.write_text("payload={payload}", encoding="utf-8")
+    c.registry.register(
+        _cognition_source(
+            "council.release",
+            prompt,
+            require_constitution_echo=True,
+        )
+    )
+    c.registry.register(_action_source("undo.council", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="council-approval",
+                    signal_source="council.release",
+                    signal_mode=SignalMode.COGNITION,
+                    compensate="undo.council",
+                    read_only=True,
+                    gate=Gate(
+                        type="council_approve",
+                        params={"quorum": 1, "timeout": 60},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(
+        WorkflowRunnerError,
+        match="requires signal_mode=ACTION or ARTIFACT",
+    ):
+        await c.runner.run_to_completion(name="release")
+
+
+@pytest.mark.asyncio
 async def test_runner_signature_collected_gate_accepts_matching_signature(
     runner_components,
 ):

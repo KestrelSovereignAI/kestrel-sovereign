@@ -54,6 +54,7 @@ from kestrel_sovereign.features.workflows.models import (
     WorkflowDefinitionError,
     WorkflowRun,
     WorkflowSpec,
+    _DID_RE,
 )
 from kestrel_sovereign.features.workflows.metrics import (
     record_compensation_state,
@@ -81,6 +82,7 @@ _RUNNER_GATE_TYPES = frozenset(
         "tests_pass",
         "ci_green",
         "lint_clean",
+        "council_approve",
         "consent_collect",
         "signature_collected",
         "constitution_echo_verified",
@@ -90,6 +92,10 @@ _RUNNER_GATE_TYPES = frozenset(
 
 CiGreenProvider = Callable[[Gate, Any], Awaitable[Any] | Any]
 ConsentCollectProvider = Callable[
+    [Gate, WorkflowRun, Stage, StageLink],
+    Awaitable[Any] | Any,
+]
+CouncilApproveProvider = Callable[
     [Gate, WorkflowRun, Stage, StageLink],
     Awaitable[Any] | Any,
 ]
@@ -121,6 +127,7 @@ class WorkflowRunner:
         ] = None,
         ci_green_provider: Optional[CiGreenProvider] = None,
         consent_collect_provider: Optional[ConsentCollectProvider] = None,
+        council_approve_provider: Optional[CouncilApproveProvider] = None,
     ) -> None:
         self.store = store
         self.dispatcher = dispatcher
@@ -130,6 +137,7 @@ class WorkflowRunner:
         self.verification_methods_resolver = verification_methods_resolver
         self.ci_green_provider = ci_green_provider or _default_ci_green_provider
         self.consent_collect_provider = consent_collect_provider
+        self.council_approve_provider = council_approve_provider
 
     async def start_run(
         self,
@@ -459,6 +467,14 @@ class WorkflowRunner:
                     "requires signal_mode=ACTION"
                 )
             if (
+                stage.gate.type == "council_approve"
+                and stage.signal_mode not in {SignalMode.ACTION, SignalMode.ARTIFACT}
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} gate {stage.gate.type!r} "
+                    "requires signal_mode=ACTION or ARTIFACT"
+                )
+            if (
                 stage.gate.type == "constitution_echo_verified"
                 and stage.signal_mode != SignalMode.COGNITION
             ):
@@ -639,6 +655,7 @@ class WorkflowRunner:
             "tests_pass",
             "ci_green",
             "lint_clean",
+            "council_approve",
             "consent_collect",
             "signature_collected",
         }:
@@ -719,11 +736,8 @@ class WorkflowRunner:
         link = await self._pending_waiting_link(run.run_id, stage)
         if link is None:
             return None
-        gate_outcome, gate_reason = await self._evaluate_pending_consent_link(
-            stage.gate,
-            run,
-            stage,
-            link,
+        gate_outcome, gate_reason = await self._evaluate_pending_link(
+            stage.gate, run, stage, link
         )
         actor_did, actor_sig = sign_stage_transition(
             run_id=run.run_id,
@@ -755,7 +769,7 @@ class WorkflowRunner:
     async def _pending_waiting_link(
         self, run_id: str, stage: Stage
     ) -> Optional[StageLink]:
-        if stage.gate.type != "consent_collect":
+        if stage.gate.type not in {"consent_collect", "council_approve"}:
             return None
         links = await self.store.list_stage_links(run_id)
         pending = [
@@ -765,6 +779,19 @@ class WorkflowRunner:
             and link.gate_outcome == GateOutcome.PENDING
         ]
         return pending[-1] if pending else None
+
+    async def _evaluate_pending_link(
+        self,
+        gate: Gate,
+        run: WorkflowRun,
+        stage: Stage,
+        link: StageLink,
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if gate.type == "consent_collect":
+            return await self._evaluate_pending_consent_link(gate, run, stage, link)
+        if gate.type == "council_approve":
+            return await self._evaluate_pending_council_link(gate, run, stage, link)
+        return GateOutcome.FAIL, f"gate {gate.type!r} cannot resume from pending"
 
     async def _evaluate_pending_consent_link(
         self,
@@ -782,6 +809,25 @@ class WorkflowRunner:
         except Exception as exc:  # pragma: no cover - defensive boundary
             return GateOutcome.PENDING, f"consent_collect_pending_error:{exc}"
         return _evaluate_consent_collect_marker(gate, marker)
+
+    async def _evaluate_pending_council_link(
+        self,
+        gate: Gate,
+        run: WorkflowRun,
+        stage: Stage,
+        link: StageLink,
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if _stage_link_timed_out(link, gate.params["timeout"]):
+            return GateOutcome.FAIL, "council_approve_timeout"
+        if self.council_approve_provider is None:
+            return GateOutcome.FAIL, "council_approve_no_resolver"
+        try:
+            marker = self.council_approve_provider(gate, run, stage, link)
+            if inspect.isawaitable(marker):
+                marker = await marker
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            return GateOutcome.PENDING, f"council_approve_pending_error:{exc}"
+        return _evaluate_council_approve_marker(gate, marker)
 
     async def _evaluate_gate(
         self,
@@ -801,6 +847,8 @@ class WorkflowRunner:
             return await self._evaluate_ci_green_gate(stage.gate, result)
         if stage.gate.type == "consent_collect":
             return _evaluate_consent_collect_gate(stage.gate, result)
+        if stage.gate.type == "council_approve":
+            return _evaluate_council_approve_gate(stage.gate, result)
         if stage.gate.type == "signature_collected":
             return self._evaluate_signature_collected_gate(
                 stage.gate,
@@ -1149,6 +1197,42 @@ def _evaluate_consent_collect_marker(
     if _consent_marker_approved(marker):
         return GateOutcome.PASS, None
     return GateOutcome.FAIL, "consent_collect_missing_approval"
+
+
+def _evaluate_council_approve_gate(
+    gate: Gate, result: Any
+) -> tuple[GateOutcome, Optional[str]]:
+    if result.mode == SignalMode.ACTION:
+        marker = getattr(result, "action_result", None)
+    elif result.mode == SignalMode.ARTIFACT:
+        marker = getattr(result, "artifact", None)
+    else:
+        return GateOutcome.FAIL, "council_approve_requires_action_or_artifact_result"
+    return _evaluate_council_approve_marker(gate, marker)
+
+
+def _evaluate_council_approve_marker(
+    gate: Gate, marker: Any
+) -> tuple[GateOutcome, Optional[str]]:
+    if not isinstance(marker, dict):
+        return GateOutcome.FAIL, "council_approve_missing_result"
+
+    if _has_explicit_bad_status(marker) or _council_marker_denied(marker):
+        reason = _council_marker_reason(marker)
+        return GateOutcome.FAIL, f"council_approve_denied:{reason}"
+    if _council_marker_pending(marker):
+        return GateOutcome.PENDING, _council_marker_pending_reason(marker)
+
+    quorum = gate.params["quorum"]
+    approved_dids = _council_approved_dids(marker)
+    if not approved_dids:
+        return GateOutcome.FAIL, "council_approve_missing_approvals"
+    if len(approved_dids) < quorum:
+        return (
+            GateOutcome.FAIL,
+            f"council_approve_quorum_not_met:{len(approved_dids)}/{quorum}",
+        )
+    return GateOutcome.PASS, None
 
 
 def _signature_marker_did(marker: dict[str, Any]) -> Optional[str]:
@@ -1724,6 +1808,119 @@ def _consent_marker_pending_reason(value: dict[str, Any]) -> str:
 def _consent_marker_reason(value: dict[str, Any]) -> str:
     reason = _first_marker_string(value, ("reason", "message", "error", "summary"))
     return reason if reason is not None else _result_marker_reason(value)
+
+
+def _council_marker_denied(value: dict[str, Any]) -> bool:
+    if any(value.get(key) is False for key in ("approved", "accepted", "passed")):
+        return True
+    decision = _first_marker_string(value, ("decision", "status", "state", "outcome"))
+    return decision is not None and decision.lower() in {
+        "deny",
+        "denied",
+        "reject",
+        "rejected",
+        "decline",
+        "declined",
+        "veto",
+        "vetoed",
+        "blocked",
+        "cancel",
+        "cancelled",
+        "canceled",
+    }
+
+
+def _council_marker_pending(value: dict[str, Any]) -> bool:
+    decision = _first_marker_string(value, ("decision", "status", "state", "outcome"))
+    return decision is not None and decision.lower() in {
+        "pending",
+        "waiting",
+        "queued",
+        "in_progress",
+        "needs_approval",
+        "needs_review",
+    }
+
+
+def _council_marker_pending_reason(value: dict[str, Any]) -> str:
+    request_id = _first_marker_string(
+        value,
+        (
+            "council_request_id",
+            "approval_id",
+            "approval_request_id",
+            "request_id",
+            "vote_request_id",
+        ),
+    )
+    if request_id is None:
+        return "council_approve_pending"
+    return f"council_approve_pending:{request_id}"
+
+
+def _council_marker_reason(value: dict[str, Any]) -> str:
+    reason = _first_marker_string(value, ("reason", "message", "error", "summary"))
+    return reason if reason is not None else _result_marker_reason(value)
+
+
+def _council_approved_dids(value: dict[str, Any]) -> tuple[str, ...]:
+    approved: list[str] = []
+    for key in ("approved_dids", "approver_dids", "approval_dids"):
+        dids = _marker_did_sequence(value.get(key), require_approval=False)
+        if dids:
+            approved.extend(dids)
+    for key in ("approvals", "votes", "ballots"):
+        dids = _marker_did_sequence(value.get(key), require_approval=True)
+        if dids:
+            approved.extend(dids)
+    return tuple(dict.fromkeys(approved))
+
+
+def _marker_did_sequence(value: Any, *, require_approval: bool) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    dids: list[str] = []
+    for item in value:
+        if isinstance(item, str):
+            did = item.strip()
+            if _DID_RE.fullmatch(did):
+                dids.append(did)
+            continue
+        if not isinstance(item, dict):
+            continue
+        did = _first_marker_string(
+            item,
+            ("did", "approver_did", "voter_did", "member_did", "actor_did"),
+        )
+        if did is None or not _DID_RE.fullmatch(did):
+            continue
+        if require_approval and not _vote_marker_approved(item):
+            continue
+        dids.append(did)
+    return tuple(dids)
+
+
+def _vote_marker_approved(value: dict[str, Any]) -> bool:
+    if any(value.get(key) is True for key in ("approved", "approve", "accepted")):
+        return True
+    decision = _first_marker_string(value, ("decision", "status", "state", "vote"))
+    return decision is not None and decision.lower() in {
+        "approve",
+        "approved",
+        "accept",
+        "accepted",
+        "yes",
+        "y",
+        "aye",
+    }
+
+
+def _stage_link_timed_out(link: StageLink, timeout_seconds: int) -> bool:
+    occurred_at = link.occurred_at
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    elapsed = (datetime.now(timezone.utc) - occurred_at).total_seconds()
+    return elapsed >= timeout_seconds
 
 
 def _has_explicit_nonzero_exit(value: dict[str, Any]) -> bool:
