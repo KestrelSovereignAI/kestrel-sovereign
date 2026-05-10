@@ -22,7 +22,9 @@ import base64
 import hashlib
 import inspect
 import json
+import math
 import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -34,6 +36,8 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion, Version
 
 from kestrel_sdk.signals import (
     CausationFrame,
@@ -75,6 +79,8 @@ from kestrel_sovereign.security.crypto_suite import (
 )
 from kestrel_sovereign.signals import SignalDispatcher, SourceRegistry
 
+_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 _RUNNER_GATE_TYPES = frozenset(
     {
@@ -82,6 +88,7 @@ _RUNNER_GATE_TYPES = frozenset(
         "tests_pass",
         "ci_green",
         "lint_clean",
+        "red_team_clear",
         "council_approve",
         "consent_collect",
         "signature_collected",
@@ -102,6 +109,10 @@ CouncilApproveProvider = Callable[
 ]
 ScriptGateProvider = Callable[[Gate, Any], Awaitable[Any] | Any]
 ScriptArtifactResolver = Callable[[Gate], Awaitable[Any] | Any]
+RedTeamAttestationResolver = Callable[[str], Awaitable[Mapping[str, Any]] | Mapping[str, Any]]
+RedTeamPromptPackResolver = Callable[
+    [str], Awaitable[Mapping[str, Any]] | Mapping[str, Any]
+]
 
 
 class WorkflowRunnerError(RuntimeError):
@@ -133,6 +144,12 @@ class WorkflowRunner:
         council_approve_provider: Optional[CouncilApproveProvider] = None,
         script_gate_provider: Optional[ScriptGateProvider] = None,
         script_artifact_resolver: Optional[ScriptArtifactResolver] = None,
+        red_team_attestation_resolver: Optional[
+            RedTeamAttestationResolver
+        ] = None,
+        red_team_prompt_pack_resolver: Optional[
+            RedTeamPromptPackResolver
+        ] = None,
     ) -> None:
         self.store = store
         self.dispatcher = dispatcher
@@ -145,6 +162,8 @@ class WorkflowRunner:
         self.council_approve_provider = council_approve_provider
         self.script_gate_provider = script_gate_provider
         self.script_artifact_resolver = script_artifact_resolver
+        self.red_team_attestation_resolver = red_team_attestation_resolver
+        self.red_team_prompt_pack_resolver = red_team_prompt_pack_resolver
 
     async def start_run(
         self,
@@ -156,7 +175,7 @@ class WorkflowRunner:
         scheduler_task_id: Optional[str] = None,
     ) -> WorkflowRun:
         spec = await self._load_startable_definition(name, version)
-        self._validate_run_start_contract(spec)
+        await self._validate_run_start_contract(spec)
         run_params = {} if params is None else params
         self._validate_run_params(spec, run_params)
 
@@ -200,7 +219,7 @@ class WorkflowRunner:
                 f"workflow run {run_id} is terminal ({run.status.value})"
             )
         spec = await self._load_pinned_definition(run)
-        self._validate_run_start_contract(spec)
+        await self._validate_run_start_contract(spec)
         if run.status == RunStatus.WAITING or (
             run.status == RunStatus.PAUSED
             and await self._has_pending_waiting_stage(run, spec)
@@ -385,7 +404,7 @@ class WorkflowRunner:
                 f"got {run.status.value}"
             )
         spec = await self._load_pinned_definition(run)
-        self._validate_run_start_contract(spec)
+        await self._validate_run_start_contract(spec)
         failed_stage_name = await self._latest_failed_stage_name(run_id)
         if stage_name != failed_stage_name:
             raise WorkflowRunnerError(
@@ -454,7 +473,7 @@ class WorkflowRunner:
             await self.store.mark_run_signature_post_revocation(run.run_id)
         return spec
 
-    def _validate_run_start_contract(self, spec: WorkflowSpec) -> None:
+    async def _validate_run_start_contract(self, spec: WorkflowSpec) -> None:
         self._validate_phase1_sequential_graph(spec)
         for stage in spec.stages:
             if stage.gate.type not in _RUNNER_GATE_TYPES:
@@ -490,6 +509,14 @@ class WorkflowRunner:
                     "requires signal_mode=ACTION or COGNITION"
                 )
             if (
+                stage.gate.type == "red_team_clear"
+                and stage.signal_mode not in {SignalMode.ACTION, SignalMode.COGNITION}
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} gate {stage.gate.type!r} "
+                    "requires signal_mode=ACTION or COGNITION"
+                )
+            if (
                 stage.gate.type == "constitution_echo_verified"
                 and stage.signal_mode != SignalMode.COGNITION
             ):
@@ -517,6 +544,8 @@ class WorkflowRunner:
                     f"stage {stage.name!r} mode {stage.signal_mode.value!r} "
                     f"is not allowed by source {stage.signal_source!r}"
                 )
+            if stage.gate.type == "red_team_clear":
+                await self._validate_red_team_clear_start(spec, stage)
             if stage.compensate not in (
                 "noop_idempotent",
                 "compensate_record_only",
@@ -532,6 +561,94 @@ class WorkflowRunner:
                         f"stage {stage.name!r} compensation source "
                         f"{stage.compensate!r} must allow ACTION"
                     )
+
+    async def _validate_red_team_clear_start(
+        self, spec: WorkflowSpec, stage: Stage
+    ) -> None:
+        if self.red_team_prompt_pack_resolver is None:
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} gate red_team_clear requires "
+                "a prompt-pack resolver"
+            )
+        if self.red_team_attestation_resolver is None:
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} gate red_team_clear requires "
+                "a reviewer attestation resolver"
+            )
+
+        await self._resolve_red_team_prompt_pack(stage)
+
+        reviewer_pool = _red_team_reviewer_pool(stage.gate)
+        reviewer_ids = tuple(
+            _red_team_reviewer_identity(reviewer) for reviewer in reviewer_pool
+        )
+        if len(set(reviewer_ids)) != len(reviewer_ids):
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} red_team_clear reviewer identities "
+                "must be distinct"
+            )
+        reviewer_set = set(reviewer_ids)
+        forbidden = {self.agent_identity.legacy_did, spec.author_did}
+        if self.agent_identity.is_hybrid:
+            forbidden.add(self.agent_identity.signing_did)
+        overlap = sorted(reviewer_set & {did for did in forbidden if did})
+        if overlap:
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} red_team_clear reviewers must be "
+                f"distinct from proposer/author DIDs: {overlap}"
+            )
+
+        families: set[str] = set()
+        for reviewer in reviewer_pool:
+            reviewer_id = _red_team_reviewer_identity(reviewer)
+            source = _red_team_reviewer_source(reviewer)
+            registration = self.registry.get(source)
+            if registration is None:
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} red_team_clear reviewer source "
+                    f"{source!r} is not registered"
+                )
+            if SignalMode.COGNITION not in registration.allowed_modes:
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} red_team_clear reviewer source "
+                    f"{source!r} must allow COGNITION"
+                )
+            try:
+                attestation = self.red_team_attestation_resolver(reviewer_id)
+                if inspect.isawaitable(attestation):
+                    attestation = await attestation
+            except Exception as exc:
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} red_team_clear reviewer "
+                    f"{reviewer_id!r} attestation could not be resolved: {exc}"
+                ) from exc
+            family = _red_team_attested_family(stage, reviewer_id, attestation)
+            families.add(family)
+
+        if len(families) < 2:
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} red_team_clear requires at least "
+                "two distinct attested model families"
+            )
+
+    async def _resolve_red_team_prompt_pack(self, stage: Stage) -> Mapping[str, Any]:
+        if self.red_team_prompt_pack_resolver is None:
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} gate red_team_clear requires "
+                "a prompt-pack resolver"
+            )
+        constraint = stage.gate.params["prompt_pack_constraint"]
+        try:
+            prompt_pack = self.red_team_prompt_pack_resolver(constraint)
+            if inspect.isawaitable(prompt_pack):
+                prompt_pack = await prompt_pack
+        except Exception as exc:
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} red_team_clear prompt pack "
+                f"could not be resolved: {exc}"
+            ) from exc
+        _validate_red_team_prompt_pack(stage, prompt_pack)
+        return prompt_pack
 
     def _validate_phase1_sequential_graph(self, spec: WorkflowSpec) -> None:
         start = self._start_stage(spec)
@@ -699,6 +816,7 @@ class WorkflowRunner:
             "lint_clean",
             "council_approve",
             "consent_collect",
+            "red_team_clear",
             "signature_collected",
             "script",
         }:
@@ -904,6 +1022,14 @@ class WorkflowRunner:
             return _evaluate_consent_collect_gate(stage.gate, result)
         if stage.gate.type == "council_approve":
             return _evaluate_council_approve_gate(stage.gate, result)
+        if stage.gate.type == "red_team_clear":
+            return await self._evaluate_red_team_clear_gate(
+                stage.gate,
+                result,
+                run=run,
+                stage=stage,
+                attempt_number=attempt_number,
+            )
         if stage.gate.type == "script":
             return await self._evaluate_script_gate(stage.gate, result)
         if stage.gate.type == "signature_collected":
@@ -926,6 +1052,137 @@ class WorkflowRunner:
                 f"gate {stage.gate.type!r} is not implemented in the workflow runner",
             )
         return GateOutcome.FAIL, f"gate {stage.gate.type!r} failed closed"
+
+    async def _evaluate_red_team_clear_gate(
+        self,
+        gate: Gate,
+        result: Any,
+        *,
+        run: WorkflowRun,
+        stage: Stage,
+        attempt_number: int,
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if result.mode not in {SignalMode.ACTION, SignalMode.COGNITION}:
+            return GateOutcome.FAIL, "red_team_clear_requires_action_or_cognition_result"
+        if self.red_team_attestation_resolver is None:
+            return GateOutcome.FAIL, "red_team_clear_no_attestation_resolver"
+        try:
+            prompt_pack = await self._resolve_red_team_prompt_pack(stage)
+        except WorkflowRunnerError as exc:
+            return GateOutcome.FAIL, f"red_team_prompt_pack_error:{exc}"
+
+        canary = _red_team_canary(run, stage, attempt_number)
+        try:
+            stage_output = _red_team_stage_output(result)
+        except (TypeError, ValueError) as exc:
+            return GateOutcome.FAIL, f"red_team_unserializable_output:{exc}"
+        reviewer_results: list[tuple[str, Mapping[str, Any]]] = []
+        for reviewer in _red_team_reviewer_pool(gate):
+            review_outcome, review_reason, marker = await self._dispatch_red_team_reviewer(
+                gate,
+                run=run,
+                stage=stage,
+                attempt_number=attempt_number,
+                reviewer=reviewer,
+                canary=canary,
+                stage_output=stage_output,
+                prompt_pack=prompt_pack,
+            )
+            if review_outcome != GateOutcome.PASS:
+                return review_outcome, review_reason
+            reviewer_results.append((reviewer, marker))
+            budget = _red_team_budget_reason(gate, reviewer_results)
+            if budget is not None:
+                return GateOutcome.FAIL, budget
+
+        return GateOutcome.PASS, None
+
+    async def _dispatch_red_team_reviewer(
+        self,
+        gate: Gate,
+        *,
+        run: WorkflowRun,
+        stage: Stage,
+        attempt_number: int,
+        reviewer: str,
+        canary: str,
+        stage_output: str,
+        prompt_pack: Mapping[str, Any],
+    ) -> tuple[GateOutcome, Optional[str], Mapping[str, Any]]:
+        source = _red_team_reviewer_source(reviewer)
+        reviewer_id = _red_team_reviewer_identity(reviewer)
+        signal = Signal(
+            source=source,
+            kind="workflow.red_team_review",
+            mode=SignalMode.COGNITION,
+            payload={
+                "pr_diff": _fence_untrusted(stage_output),
+                "canary": canary,
+                "rubric": _red_team_rubric(gate, prompt_pack),
+                "reviewer": reviewer_id,
+                "workflow_run_id": run.run_id,
+                "workflow_stage_name": stage.name,
+                "workflow_attempt_number": attempt_number,
+            },
+            target_agent=run.started_by_did,
+            visibility=Visibility.INTERNAL,
+            session_id=run.run_id,
+            urgency=Urgency.NORMAL,
+            dedupe_key=(
+                f"{run.run_id}:{stage.name}:{attempt_number}:"
+                f"red_team:{reviewer_id}"
+            ),
+            causation_chain=[
+                CausationFrame(
+                    agent_id=run.started_by_did,
+                    source=f"workflow.{run.workflow_name}.{stage.name}",
+                    signal_id=run.run_id,
+                    turn_id=None,
+                    depth=0,
+                    emitted_at=datetime.now(timezone.utc),
+                ),
+                CausationFrame(
+                    agent_id=run.started_by_did,
+                    source=f"workflow.red_team_clear.{stage.name}",
+                    signal_id=run.run_id,
+                    turn_id=None,
+                    depth=1,
+                    emitted_at=datetime.now(timezone.utc),
+                ),
+            ],
+        )
+        review_result = await self.dispatcher.dispatch_signal(signal)
+        if review_result.status != Status.OK:
+            return (
+                GateOutcome.FAIL,
+                "red_team_reviewer_failed:"
+                f"{source}:{review_result.error or review_result.status.value}",
+                {},
+            )
+        marker = _red_team_review_marker(review_result.artifact)
+        if marker is None:
+            return GateOutcome.FAIL, f"red_team_malformed_response:{source}", {}
+
+        try:
+            attestation = self.red_team_attestation_resolver(reviewer_id)
+            if inspect.isawaitable(attestation):
+                attestation = await attestation
+        except Exception as exc:
+            return (
+                GateOutcome.FAIL,
+                f"red_team_attestation_error:{reviewer_id}:{exc}",
+                {},
+            )
+        outcome, reason = _evaluate_red_team_marker(
+            reviewer_id,
+            source,
+            marker,
+            canary=canary,
+            attestation=attestation,
+        )
+        if outcome != GateOutcome.PASS:
+            return outcome, reason, {}
+        return GateOutcome.PASS, None, marker
 
     async def _evaluate_ci_green_gate(
         self, gate: Gate, result: Any
@@ -1265,6 +1522,221 @@ def _evaluate_consent_collect_gate(
         return GateOutcome.FAIL, "consent_collect_requires_action_result"
     marker = getattr(result, "action_result", None)
     return _evaluate_consent_collect_marker(gate, marker)
+
+
+def _red_team_reviewer_pool(gate: Gate) -> tuple[str, ...]:
+    return tuple(gate.params["reviewer_pool"])
+
+
+def _red_team_reviewer_source(reviewer: str) -> str:
+    if reviewer.startswith("review."):
+        return reviewer
+    return f"review.{reviewer}"
+
+
+def _red_team_reviewer_identity(reviewer: str) -> str:
+    if reviewer.startswith("review."):
+        return reviewer.removeprefix("review.")
+    return reviewer
+
+
+def _validate_red_team_prompt_pack(stage: Stage, prompt_pack: Any) -> None:
+    if not isinstance(prompt_pack, Mapping):
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear prompt pack resolver "
+            "must return a mapping"
+        )
+    version = prompt_pack.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear prompt pack is missing "
+            "a version"
+        )
+    constraint = stage.gate.params["prompt_pack_constraint"]
+    try:
+        if Version(version) not in SpecifierSet(constraint):
+            raise WorkflowRunnerError(
+                f"stage {stage.name!r} red_team_clear prompt pack version "
+                f"{version!r} does not satisfy {constraint!r}"
+            )
+    except (InvalidSpecifier, InvalidVersion) as exc:
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear prompt pack constraint "
+            f"or version is invalid: {exc}"
+        ) from exc
+    name = prompt_pack.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear prompt pack is missing name"
+        )
+    prompt_hash = prompt_pack.get("prompt_hash")
+    if not isinstance(prompt_hash, str) or not _HASH_RE.match(prompt_hash):
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear prompt pack is missing "
+            "a prompt_hash"
+        )
+
+
+def _red_team_attested_family(
+    stage: Stage, reviewer: str, attestation: Any
+) -> str:
+    if not isinstance(attestation, Mapping):
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear reviewer {reviewer!r} "
+            "attestation resolver must return a mapping"
+        )
+    family = attestation.get("model_family")
+    if not isinstance(family, str) or not family.strip():
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear reviewer {reviewer!r} "
+            "attestation is missing model_family"
+        )
+    constitution_hash = attestation.get("constitution_hash")
+    if not isinstance(constitution_hash, str) or not _HASH_RE.match(
+        constitution_hash
+    ):
+        raise WorkflowRunnerError(
+            f"stage {stage.name!r} red_team_clear reviewer {reviewer!r} "
+            "attestation is missing a constitution_hash"
+        )
+    return family.strip()
+
+
+def _red_team_canary(
+    run: WorkflowRun, stage: Stage, attempt_number: int
+) -> str:
+    seed = "|".join(
+        (
+            run.run_id,
+            stage.name,
+            str(attempt_number),
+            secrets.token_hex(16),
+        )
+    )
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()
+
+
+def _red_team_stage_output(result: Any) -> str:
+    if result.mode == SignalMode.ACTION:
+        payload = getattr(result, "action_result", None)
+    else:
+        payload = getattr(result, "artifact", None)
+    if isinstance(payload, str):
+        return payload
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _fence_untrusted(value: str) -> str:
+    token = secrets.token_hex(16)
+    begin = f"<<<UNTRUSTED_BEGIN:{token}"
+    end = f"UNTRUSTED_END:{token}>>>"
+    while begin in value or end in value:
+        token = secrets.token_hex(16)
+        begin = f"<<<UNTRUSTED_BEGIN:{token}"
+        end = f"UNTRUSTED_END:{token}>>>"
+    return f"{begin}\n{value}\n{end}"
+
+
+def _red_team_rubric(
+    gate: Gate, prompt_pack: Mapping[str, Any]
+) -> dict[str, Any]:
+    return {
+        "blockers": gate.params.get("blockers", "zero"),
+        "prompt_pack_constraint": gate.params["prompt_pack_constraint"],
+        "prompt_pack_name": prompt_pack["name"],
+        "prompt_pack_version": prompt_pack["version"],
+        "prompt_hash": prompt_pack["prompt_hash"],
+        "max_total_cost_usd": gate.params.get("max_total_cost_usd"),
+        "max_total_tokens": gate.params.get("max_total_tokens"),
+    }
+
+
+def _red_team_review_marker(value: Any) -> Optional[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(decoded, Mapping):
+        return None
+    return decoded
+
+
+def _evaluate_red_team_marker(
+    reviewer: str,
+    source: str,
+    marker: Mapping[str, Any],
+    *,
+    canary: str,
+    attestation: Mapping[str, Any],
+) -> tuple[GateOutcome, Optional[str]]:
+    observed_canary = _first_marker_string(marker, ("canary", "echoed_canary"))
+    if observed_canary != canary:
+        return GateOutcome.FAIL, f"red_team_missing_canary:{source}"
+
+    observed_reviewer = _first_marker_string(
+        marker, ("reviewer", "reviewer_did", "did")
+    )
+    if observed_reviewer is not None and observed_reviewer != reviewer:
+        return GateOutcome.FAIL, f"red_team_reviewer_mismatch:{source}"
+
+    family = str(attestation["model_family"]).strip()
+    observed_family = _first_marker_string(marker, ("model_family", "family"))
+    observed_model = _first_marker_string(marker, ("model",))
+    if observed_family is not None:
+        if observed_family != family:
+            return GateOutcome.FAIL, f"red_team_model_family_mismatch:{source}"
+    if observed_model is None or not observed_model.startswith(family):
+        return GateOutcome.FAIL, f"red_team_model_family_mismatch:{source}"
+
+    blockers = marker.get("blockers")
+    if not isinstance(blockers, list):
+        return GateOutcome.FAIL, f"red_team_malformed_blockers:{source}"
+    if blockers:
+        return GateOutcome.FAIL, f"red_team_blockers:{source}:{len(blockers)}"
+    return GateOutcome.PASS, None
+
+
+def _red_team_budget_reason(
+    gate: Gate, reviewer_results: list[tuple[str, Mapping[str, Any]]]
+) -> Optional[str]:
+    token_limit = gate.params.get("max_total_tokens")
+    cost_limit = gate.params.get("max_total_cost_usd")
+    total_tokens = 0
+    total_cost = 0.0
+    for _, marker in reviewer_results:
+        tokens = marker.get("tokens")
+        cost = marker.get("cost_usd")
+        if token_limit is not None and tokens is None:
+            return "red_team_malformed_cost"
+        if cost_limit is not None and cost is None:
+            return "red_team_malformed_cost"
+        if tokens is not None:
+            if (
+                isinstance(tokens, bool)
+                or not isinstance(tokens, int)
+                or tokens < 0
+            ):
+                return "red_team_malformed_cost"
+            total_tokens += tokens
+        if cost is not None:
+            if (
+                isinstance(cost, bool)
+                or not isinstance(cost, (int, float))
+            ):
+                return "red_team_malformed_cost"
+            cost_value = float(cost)
+            if not math.isfinite(cost_value) or cost_value < 0:
+                return "red_team_malformed_cost"
+            total_cost += cost_value
+    if token_limit is not None and total_tokens > token_limit:
+        return "red_team_budget_exhausted:tokens"
+    if cost_limit is not None and total_cost > cost_limit:
+        return "red_team_budget_exhausted:cost"
+    return None
 
 
 def _evaluate_consent_collect_marker(

@@ -197,9 +197,35 @@ def test_gate_council_approve_requires_quorum_and_timeout():
 def test_gate_red_team_clear_requires_prompt_pack_constraint():
     with pytest.raises(WorkflowDefinitionError):
         Gate(type="red_team_clear", params={"reviewer_pool": ["did:web:r1"]})
+    with pytest.raises(WorkflowDefinitionError, match="reviewer_pool"):
+        Gate(
+            type="red_team_clear",
+            params={"prompt_pack_constraint": "==1.2.0"},
+        )
+    with pytest.raises(WorkflowDefinitionError, match="distinct"):
+        Gate(
+            type="red_team_clear",
+            params={
+                "prompt_pack_constraint": "==1.2.0",
+                "reviewer_pool": ["did:web:r1", "did:web:r1"],
+            },
+        )
+    for cost in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(WorkflowDefinitionError, match="max_total_cost_usd"):
+            Gate(
+                type="red_team_clear",
+                params={
+                    "prompt_pack_constraint": "==1.2.0",
+                    "reviewer_pool": ["did:web:r1", "did:web:r2"],
+                    "max_total_cost_usd": cost,
+                },
+            )
     Gate(
         type="red_team_clear",
-        params={"prompt_pack_constraint": "==1.2.0"},
+        params={
+            "prompt_pack_constraint": "==1.2.0",
+            "reviewer_pool": ["did:web:r1", "did:web:r2"],
+        },
     )
 
 
@@ -233,7 +259,13 @@ def test_gate_script_requires_all_security_fields():
 
 
 def test_gate_round_trip_dict():
-    gate = Gate(type="red_team_clear", params={"prompt_pack_constraint": ">=1,<2"})
+    gate = Gate(
+        type="red_team_clear",
+        params={
+            "prompt_pack_constraint": ">=1,<2",
+            "reviewer_pool": ["did:web:r1", "did:web:r2"],
+        },
+    )
     assert Gate.from_dict(gate.to_dict()) == gate
 
 
@@ -552,7 +584,10 @@ def test_stage_round_trip():
     stage = _action_stage(
         gate=Gate(
             type="red_team_clear",
-            params={"prompt_pack_constraint": "==1.0.0"},
+            params={
+                "prompt_pack_constraint": "==1.0.0",
+                "reviewer_pool": ["did:web:r1", "did:web:r2"],
+            },
         ),
     )
     assert Stage.from_dict(stage.to_dict()) == stage
@@ -1332,6 +1367,26 @@ def test_schema_requires_red_team_clear_prompt_pack_constraint():
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 
+    spec["stages"][0]["gate"] = {
+        "type": "red_team_clear",
+        "params": {
+            "prompt_pack_constraint": "==1.0.0",
+            "reviewer_pool": ["did:web:r1"],
+        },
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "red_team_clear",
+        "params": {
+            "prompt_pack_constraint": "==1.0.0",
+            "reviewer_pool": ["did:web:r1", "did:web:r1"],
+        },
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
 def test_schema_requires_constitutional_boundary_clean_forbidden_modules():
@@ -1456,7 +1511,10 @@ def test_schema_rejects_whitespace_only_prompt_pack_constraint():
     spec = _minimal_spec().to_dict()
     spec["stages"][0]["gate"] = {
         "type": "red_team_clear",
-        "params": {"prompt_pack_constraint": "   "},
+        "params": {
+            "prompt_pack_constraint": "   ",
+            "reviewer_pool": ["did:web:r1", "did:web:r2"],
+        },
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)

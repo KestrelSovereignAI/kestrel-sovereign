@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -433,6 +434,52 @@ class Gate:
                 raise WorkflowDefinitionError(
                     "gate red_team_clear requires "
                     "params.prompt_pack_constraint (PEP 440 spec) per §3.4"
+                )
+            reviewer_pool = self.params.get("reviewer_pool")
+            if (
+                not isinstance(reviewer_pool, (list, tuple))
+                or len(reviewer_pool) < 2
+                or not all(
+                    isinstance(reviewer, str) and reviewer.strip() == reviewer
+                    for reviewer in reviewer_pool
+                )
+                or any(not reviewer for reviewer in reviewer_pool)
+            ):
+                raise WorkflowDefinitionError(
+                    "gate red_team_clear requires params.reviewer_pool: "
+                    "at least two non-empty reviewer source aliases/DIDs"
+                )
+            if len(set(reviewer_pool)) != len(reviewer_pool):
+                raise WorkflowDefinitionError(
+                    "gate red_team_clear params.reviewer_pool entries "
+                    "must be distinct"
+                )
+            blockers = self.params.get("blockers", "zero")
+            if blockers != "zero":
+                raise WorkflowDefinitionError(
+                    "gate red_team_clear params.blockers must be 'zero'"
+                )
+            max_total_tokens = self.params.get("max_total_tokens")
+            if max_total_tokens is not None and not _is_strict_positive_int(
+                max_total_tokens
+            ):
+                raise WorkflowDefinitionError(
+                    "gate red_team_clear params.max_total_tokens must be "
+                    "a positive int"
+                )
+            max_total_cost = self.params.get("max_total_cost_usd")
+            if (
+                max_total_cost is not None
+                and (
+                    isinstance(max_total_cost, bool)
+                    or not isinstance(max_total_cost, (int, float))
+                    or not math.isfinite(float(max_total_cost))
+                    or max_total_cost <= 0
+                )
+            ):
+                raise WorkflowDefinitionError(
+                    "gate red_team_clear params.max_total_cost_usd must be "
+                    "a positive number"
                 )
         if self.type == "script":
             # Codex round 6 P2 (chunk B): the ``script`` gate is the

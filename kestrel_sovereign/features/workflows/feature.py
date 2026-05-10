@@ -95,6 +95,16 @@ class WorkflowsFeature(Feature):
                 )
                 else None
             ),
+            red_team_attestation_resolver=(
+                self._red_team_attestation_resolver
+                if hasattr(self.agent, "workflow_red_team_attestation_resolver")
+                else None
+            ),
+            red_team_prompt_pack_resolver=(
+                self._red_team_prompt_pack_resolver
+                if hasattr(self.agent, "workflow_red_team_prompt_pack_resolver")
+                else None
+            ),
         )
 
     def _public_key_resolver(self, did: str) -> bytes:
@@ -272,6 +282,14 @@ class WorkflowsFeature(Feature):
             if _script_artifact_matches_gate(gate, script)
         ]
         return matches[0] if len(matches) == 1 else None
+
+    def _red_team_attestation_resolver(self, reviewer: str) -> dict[str, Any]:
+        external = getattr(self.agent, "workflow_red_team_attestation_resolver")
+        return external(reviewer)
+
+    def _red_team_prompt_pack_resolver(self, constraint: str) -> dict[str, Any]:
+        external = getattr(self.agent, "workflow_red_team_prompt_pack_resolver")
+        return external(constraint)
 
     def _compute_feature(self) -> Any:
         features = getattr(self.agent, "features", None)
