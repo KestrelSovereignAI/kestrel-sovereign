@@ -278,7 +278,12 @@ def _maybe_capture_openrouter_master(ctx: SetupContext) -> None:
         )
         return
 
-    db_path = ctx.project_dir / "agent_data" / "host.db"
+    # host.db lives in agent_data alongside per-agent dbs. The
+    # resolver opens it from the same location at agent-init time
+    # (kestrel_agent.py + open_host_db with agent_data_dir set to
+    # Path(self.storage_path).parent). Wizard and resolver MUST agree
+    # on this path or the configured master is invisible at runtime.
+    db_path = ctx.agent_data_root / "host.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     async def _capture():
@@ -295,7 +300,11 @@ def _maybe_capture_openrouter_master(ctx: SetupContext) -> None:
                 if not rotate:
                     return False
 
-            new_key = ctx.prompter.text(
+            # Mask via prompter.secret — questionary will not echo
+            # the master API key to the terminal. This is the
+            # operator's billing credential; it must not appear in
+            # screenshots, recordings, or scrollback history.
+            new_key = ctx.prompter.secret(
                 "OpenRouter master API key (sk-or-v1-..., from "
                 "https://openrouter.ai/settings/keys with key-management permission)",
                 default="",
@@ -327,6 +336,19 @@ def _maybe_capture_openrouter_master(ctx: SetupContext) -> None:
 
 
 def _persist_policy(ctx: SetupContext, policy: PayerPolicy) -> None:
-    """Write the policy to kestrel.toml [payments]."""
+    """Write the policy to kestrel.toml [payments].
+
+    Uses ``deep_merge=False`` so the entire ``[payments]`` table is
+    replaced rather than merged. Without this, a slot transition like
+    sponsor → host_env would leave a stale ``master_did`` key from the
+    previous spec — to_toml_section omits it (exclude_none=True), but
+    deep-merge preserves it from the on-disk version. The result
+    would be a malformed PayerSpec on the next read (host_env with
+    master_did).
+    """
     section = policy.to_toml_section()
-    write_toml(ctx.kestrel_toml_path, {"payments": section})
+    write_toml(
+        ctx.kestrel_toml_path,
+        {"payments": section},
+        deep_merge=False,
+    )

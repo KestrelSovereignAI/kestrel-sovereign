@@ -99,9 +99,28 @@ class FoundationPayerResolver:
         policy: PayerPolicy,
         *,
         db: Optional["AsyncDatabase"] = None,
+        host_db: Optional["AsyncDatabase"] = None,
     ) -> None:
+        """
+        Args:
+            db: Agent's own database. Used for ServiceKeyStorage
+                (per-agent child credentials) and for graph_nodes
+                metadata writes during minting.
+            host_db: Shared host-level database (one per Kestrel
+                deployment) that holds operator-master credentials in
+                HostKeyStorage. The wizard's payments step persists
+                masters here; the resolver reads them here at mint
+                time. If None, falls back to ``db`` (single-DB tests
+                and standalone deployments where one DB serves both
+                roles).
+        """
         self._policy = policy
         self._db = db
+        # Fall back to db if host_db not explicitly provided. In
+        # production, kestrel_agent.py wires both with distinct DBs
+        # (agent's vs the shared host.db); in tests one db often
+        # serves both roles.
+        self._host_db = host_db if host_db is not None else db
 
     # ------------------------------------------------------------------
     # Public surface — matches kestrel_sdk.payer_policy.PayerResolver
@@ -328,8 +347,11 @@ class FoundationPayerResolver:
             )
             return
 
-        # Look up the host master.
-        host_storage = HostKeyStorage(self._db)
+        # Look up the host master from the shared host_db (set by
+        # kestrel_agent.py to the deployment-wide host.db). Falls back
+        # to the agent's own db when host_db wasn't explicitly given —
+        # only relevant in tests.
+        host_storage = HostKeyStorage(self._host_db)
         if not await host_storage.has_key("openrouter"):
             from kestrel_sdk.payer_policy import PayerPolicyError
             raise PayerPolicyError(
@@ -480,6 +502,42 @@ class FoundationPayerResolver:
 # ----------------------------------------------------------------------
 # Policy loader
 # ----------------------------------------------------------------------
+
+
+async def open_host_db(
+    *,
+    agent_data_dir: "Path | None" = None,
+    project_dir: "Path | None" = None,
+) -> Optional["AsyncDatabase"]:
+    """Open the deployment-wide host database for HostKeyStorage.
+
+    Lives at ``<agent_data_dir>/host.db`` by convention (the same path
+    the wizard's payments step writes to). Returns None if the file
+    doesn't exist — the resolver falls back to the agent's own db,
+    which is the correct behavior for deployments that have never run
+    the payments wizard.
+
+    Args:
+        agent_data_dir: Path to the deployment's agent_data directory.
+            Preferred over project_dir for kestrel_agent.py callers
+            because they have a reliable handle to it via
+            ``Path(self.storage_path).parent``.
+        project_dir: Project root. host.db is then at
+            ``<project_dir>/agent_data/host.db``. Defaults to cwd
+            when neither argument is given.
+    """
+    from pathlib import Path
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    if agent_data_dir is not None:
+        host_db_path = Path(agent_data_dir) / "host.db"
+    else:
+        root = project_dir if project_dir is not None else Path.cwd()
+        host_db_path = root / "agent_data" / "host.db"
+
+    if not host_db_path.exists():
+        return None
+    return await AsyncDatabase.sqlite(str(host_db_path))
 
 
 def load_policy_from_toml() -> PayerPolicy:

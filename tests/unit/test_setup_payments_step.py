@@ -283,6 +283,122 @@ class TestInteractiveFlow:
 # =============================================================================
 
 
+class TestStaleKeysOnKindChange:
+    """Codex Phase 4 round 1: changing a slot from a kind that uses
+    master_did (USER_MASTER_PROVISIONED / SPONSOR) to one that doesn't
+    (HOST_ENV / NONE) must NOT leave the old master_did sitting in the
+    TOML — that produces a malformed PayerSpec on the next read.
+
+    The fix is write_toml(deep_merge=False) on the [payments] table.
+    """
+
+    def test_kind_change_drops_master_did_from_toml(
+        self, tmp_path: Path
+    ) -> None:
+        # Pre-write a policy with sponsor + master_did on LLM.
+        sponsor_policy = PayerPolicy(
+            llm=PayerSpec(
+                vendor="openrouter",
+                kind=PayerKind.SPONSOR,
+                master_did="did:test:original-sponsor",
+            ),
+            storage=PayerSpec(vendor="lighthouse", kind=PayerKind.HOST_ENV),
+            compute=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            tools=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+        )
+        write_toml(
+            tmp_path / "kestrel.toml",
+            {"payments": sponsor_policy.to_toml_section()},
+        )
+        # Sanity: master_did is in the file.
+        before = read_toml(tmp_path / "kestrel.toml")
+        assert before["payments"]["llm"]["master_did"] == "did:test:original-sponsor"
+
+        # Now run the wizard: user changes LLM from sponsor → host_env.
+        prompter = _FakePrompter(
+            select_answers=[
+                # llm
+                "openrouter",
+                "host_env — host env var (today's behavior)",
+                # storage / compute / tools / comms — accept defaults.
+                "lighthouse",
+                "host_env — host env var (today's behavior)",
+                "host_env — host env var (today's behavior)",
+                "host_env — host env var (today's behavior)",
+                "host_env — host env var (today's behavior)",
+            ],
+        )
+        ctx = _make_ctx(tmp_path, Flow.INTERACTIVE, prompter)
+        payments.run(ctx)
+
+        # Post-condition: master_did is gone from kestrel.toml.
+        after = read_toml(tmp_path / "kestrel.toml")
+        assert "master_did" not in after["payments"]["llm"], (
+            "master_did persisted after kind change — deep-merge bug"
+        )
+        # And the policy parses cleanly (no host_env-with-master_did
+        # combination that would fail PayerSpec validation).
+        rebuilt = PayerPolicy.from_toml_section(after["payments"])
+        assert rebuilt.llm.kind is PayerKind.HOST_ENV
+        assert rebuilt.llm.master_did is None
+
+
+class TestMasterKeyMasked:
+    """Codex Phase 4 round 1: the OpenRouter master API key prompt
+    must use Prompter.secret (masked) not Prompter.text (echoed).
+    """
+
+    def test_master_key_uses_secret_prompt(self, tmp_path: Path) -> None:
+        # Track which prompter method got the master-key prompt.
+        secret_calls: list[str] = []
+        text_calls: list[str] = []
+
+        class _Tracking:
+            def text(self, message: str, *, default: str = "") -> str:
+                text_calls.append(message)
+                # Return defaults from a queue if needed.
+                if "DID" in message or "master_did" in message.lower():
+                    return ""
+                return default
+            def secret(self, message: str, *, default: str = "") -> str:
+                secret_calls.append(message)
+                return ""  # decline to enter — wizard handles gracefully
+            def confirm(self, message: str, *, default: bool = True) -> bool:
+                return False  # don't rotate
+            def select(self, message: str, *, choices, default=None) -> str:
+                # Walk select prompts; LLM gets host_master_provisioned.
+                if "vendor" in message:
+                    return "openrouter" if "llm" in message else "lighthouse"
+                if "llm/openrouter" in message and "paid for" in message:
+                    return "host_master_provisioned — host master account, child credential per agent"
+                return next(
+                    c for c in choices if c.startswith("host_env")
+                )
+            def info(self, message: str) -> None:
+                pass
+
+        ctx = SetupContext(
+            project_dir=tmp_path,
+            agent_data_root=tmp_path / "agent_data",
+            flow=Flow.INTERACTIVE,
+            prompter=_Tracking(),
+        )
+        payments.run(ctx)
+
+        # The master API key prompt must have gone through secret().
+        master_prompts = [m for m in secret_calls if "master API key" in m]
+        assert master_prompts, (
+            f"OpenRouter master key was never prompted via secret(). "
+            f"text() calls: {text_calls}; secret() calls: {secret_calls}"
+        )
+        # And it must NOT have been prompted via text().
+        text_master = [m for m in text_calls if "master API key" in m]
+        assert not text_master, (
+            f"OpenRouter master key was prompted via text() (echoed): {text_master}"
+        )
+
+
 class TestSponsorMasterDid:
     def test_user_master_provisioned_prompts_for_master_did(
         self, tmp_path: Path
