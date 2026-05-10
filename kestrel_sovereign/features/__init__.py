@@ -134,8 +134,7 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
     3. Is defined in this module OR is explicitly exported via __all__
 
     The __all__ check allows features to be split across multiple files
-    while still being discoverable (e.g., WalletFeature in wallet_feature.py
-    imported into feature.py).
+    while still being discoverable.
     """
     module_all = getattr(module, '__all__', [])
 

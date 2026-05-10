@@ -154,7 +154,7 @@ async def test_agent_command_integration(temp_db, llm_service, monkeypatch):
         # Add some test data first
         await agent.storage.add_conversation("user", "Test message for export", metadata={"timestamp": "2025-11-21T10:00:00Z"})
 
-        result = await agent.process_input("!export-sovereignty")
+        result = await agent.process_input("!export-sovereignty local")
 
         assert "✅ Sovereignty Export Complete" in result or "Export" in result
         assert "CID:" in result

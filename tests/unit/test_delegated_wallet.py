@@ -2,8 +2,8 @@
 
 import pytest
 from decimal import Decimal
+from enum import Enum
 
-from kestrel_sovereign.features.wallet.feature import Currency, WalletAgent
 from kestrel_sovereign.spawn.delegated_wallet import (
     BudgetAllocation,
     BudgetExceededError,
@@ -11,6 +11,64 @@ from kestrel_sovereign.spawn.delegated_wallet import (
     create_delegated_wallet,
     release_delegated_wallet,
 )
+
+
+class Currency(Enum):
+    FIL = "FIL"
+
+
+class WalletAgent:
+    """Small test double for the extracted wallet package boundary."""
+
+    def __init__(
+        self,
+        agent_id: str,
+        initial_balance: Decimal = Decimal("0"),
+        initial_currency: Currency = Currency.FIL,
+    ):
+        self.agent_id = agent_id
+        self.initial_balance = initial_balance
+        self.initial_currency = initial_currency
+        self._balances = {Currency.FIL: {"main": Decimal("0"), "audit": Decimal("0")}}
+        self.transaction_history = []
+
+    async def initialize(self):
+        self._balances[self.initial_currency]["main"] = (
+            self.initial_balance * Decimal("0.9")
+        )
+        self._balances[self.initial_currency]["audit"] = (
+            self.initial_balance * Decimal("0.1")
+        )
+
+    def get_balance(self, currency: Currency, balance_type: str = "main") -> Decimal:
+        return self._balances[currency][balance_type]
+
+    def can_afford(self, amount: Decimal, currency: Currency) -> bool:
+        return self.get_balance(currency, "main") >= amount
+
+    async def transfer(
+        self,
+        amount: Decimal,
+        memo: str = "",
+        currency: Currency = Currency.FIL,
+    ) -> bool:
+        if not self.can_afford(amount, currency):
+            return False
+        self._balances[currency]["main"] -= amount
+        self.transaction_history.append({"type": "transfer", "memo": memo})
+        return True
+
+    async def deposit(
+        self,
+        amount: Decimal,
+        currency: Currency = Currency.FIL,
+        to_audit: bool = False,
+        memo: str = "",
+    ) -> bool:
+        balance_type = "audit" if to_audit else "main"
+        self._balances[currency][balance_type] += amount
+        self.transaction_history.append({"type": "deposit", "memo": memo})
+        return True
 
 
 # ---------------------------------------------------------------------------

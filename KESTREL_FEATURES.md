@@ -101,7 +101,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
+- Current audited snapshot: `36` discoverable modules and `36` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -136,7 +136,6 @@ The inventory below lists **core features only**. Installed feature packages app
 - `talon`
 - `tasks`
 - `voice`
-- `wallet`
 - `web_search`
 - `webhooks`
 - `wellness`
@@ -176,7 +175,6 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `TalonCoordinatorFeature`
 - `TaskFeature`
 - `VoiceFeature`
-- `WalletFeature`
 - `WebSearchFeature`
 - `WebhookFeature`
 - `WellnessFeature`
@@ -190,7 +188,6 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `GET /api/github/{path:path}`
 - `GET /health`
 - `GET /health/detailed`
-- `POST /webhooks/stripe/crypto`
 
 ### Router families mounted by `kestrel_sovereign/server.py`
 
@@ -353,7 +350,6 @@ The route surface is not just public versus protected. The current live classes 
   - `/health`
   - `/health/detailed`
   - `/favicon.ico`
-  - `/webhooks/stripe/crypto`
 - `Public-Localhost`
   - `/api/auth/key` when bootstrap is enabled
 - `OAuth public entrypoints`

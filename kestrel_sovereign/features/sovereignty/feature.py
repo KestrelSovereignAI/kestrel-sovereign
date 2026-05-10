@@ -29,9 +29,10 @@ class SovereigntyFeature(Feature):
 
     async def initialize(self):
         logger.info("Initializing SovereigntyFeature")
-        # Ensure dependencies are available
-        if not hasattr(self.agent, 'storage') or not hasattr(self.agent, 'wallet'):
-            logger.warning("SovereigntyFeature requires storage and wallet on agent.")
+        # Ensure dependencies are available. Wallet is optional for local
+        # exports, but required for paid non-local storage tiers.
+        if not hasattr(self.agent, 'storage'):
+            logger.warning("SovereigntyFeature requires storage on agent.")
 
     @tool(
         name="export_sovereignty",
@@ -51,8 +52,8 @@ class SovereigntyFeature(Feature):
             ToolResult.ok with CID + tier + size on a clean export, PARTIAL
             when a non-local tier produced no IPFS CID (backup hashed
             locally but not actually pushed to the network), or
-            ToolResult.failed when the wallet cannot afford the storage
-            fee.
+            ToolResult.failed when a paid storage tier cannot be accounted
+            for through a wallet.
         """
         # Map tier string
         tier_map = {
@@ -65,10 +66,22 @@ class SovereigntyFeature(Feature):
         # Don't encrypt for local storage (no point, and complicates retrieval)
         encrypt = encrypt and tier_enum != StorageTier.LOCAL_ONLY
 
-        # Budget check
+        wallet = getattr(self.agent, "wallet", None)
+
+        # Budget check. Wallet is an optional feature package; core-only
+        # agents can export locally, while paid tiers still require it.
         fee_main = Decimal('1.0') if tier_enum != StorageTier.LOCAL_ONLY else Decimal('0.0')
-        if fee_main > 0 and not self.agent.wallet.can_afford(fee_main):
-            return ToolResult.failed(error="Insufficient funds for backup.")
+        if fee_main > 0:
+            if wallet is None:
+                return ToolResult.failed(
+                    error=(
+                        f"{tier_enum.value} sovereignty export requires the "
+                        "wallet feature. Use storage_tier='local' for a "
+                        "core-only export."
+                    )
+                )
+            if not wallet.can_afford(fee_main):
+                return ToolResult.failed(error="Insufficient funds for backup.")
 
         # Create backup blob
         backup_blob = await self.agent.storage.create_backup_blob(include_db=True)
@@ -87,8 +100,8 @@ class SovereigntyFeature(Feature):
         node_id = await self.agent.storage.record_backup_artifact(self.agent.agent_id, result)
 
         # Deduct funds
-        if fee_main > 0:
-            await self.agent.wallet.transfer(fee_main, memo=f"backup:{tier_enum.value}:{node_id}")
+        if fee_main > 0 and wallet is not None:
+            await wallet.transfer(fee_main, memo=f"backup:{tier_enum.value}:{node_id}")
 
         audit_anchors = None
         try:
