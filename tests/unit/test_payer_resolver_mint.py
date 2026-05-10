@@ -208,6 +208,123 @@ class TestMintOpenRouterChild:
         )
 
     @pytest.mark.asyncio
+    async def test_mint_persists_key_hash_to_graph_nodes(
+        self, db: AsyncDatabase
+    ) -> None:
+        """Phase 3c codex round 1 finding: retirement_service reads
+        openrouter_key_hash from graph_nodes.properties (via agent_info
+        merge). Without this persistence, resolver-minted keys leak —
+        ServiceKeyStorage forgets them on retirement, but OpenRouter
+        still bills them."""
+        import json
+
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-hash-persist"
+
+        # Pre-create the agent's graph_nodes row so the resolver writes
+        # into it (rather than the agent_metadata fallback path).
+        await db.execute(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'agent', 'test-agent', ?)",
+            (agent_did, "{}"),
+        )
+
+        mock_class, mock_instance = _mock_provisioning_service(
+            child_key="sk-or-v1-minted-hashtest",
+        )
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        # Verify graph_nodes.properties.openrouter_key_hash now equals
+        # the mocked key_info.key_hash.
+        rows = await db.fetchall(
+            "SELECT properties FROM graph_nodes WHERE node_id = ?",
+            (agent_did,),
+        )
+        assert rows
+        properties = json.loads(rows[0][0])
+        # _mock_provisioning_service builds key_hash as f"hash-{child_key[-8:]}"
+        assert properties["openrouter_key_hash"] == "hash-hashtest"
+
+    @pytest.mark.asyncio
+    async def test_mint_persists_key_hash_to_agent_metadata_fallback(
+        self, db: AsyncDatabase
+    ) -> None:
+        """When no graph_nodes agent row exists (e.g. minimal test
+        fixture), fall back to agent_metadata so retirement still has a
+        place to look."""
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-no-graph-row"
+
+        # Deliberately do NOT create a graph_nodes row.
+
+        mock_class, mock_instance = _mock_provisioning_service(
+            child_key="sk-or-v1-minted-meta",
+        )
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        # Verify agent_metadata fallback received the hash.
+        rows = await db.fetchall(
+            "SELECT value FROM agent_metadata "
+            "WHERE agent_id = ? AND key = 'openrouter_key_hash'",
+            (agent_did,),
+        )
+        assert rows
+        assert rows[0][0] == "hash-ted-meta"  # last 8 chars of "sk-or-v1-minted-meta"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mints_for_same_agent_serialize(
+        self, db: AsyncDatabase
+    ) -> None:
+        """Phase 3c codex round 1 finding: two concurrent agent-init
+        paths for the same DID would both pass has_key() before either
+        store_key() landed, both create remote OpenRouter keys, second
+        store_key replaces the local row → first remote key orphaned.
+        The per-agent asyncio.Lock serializes first-time mints so the
+        second waiter sees the stored key and skips its API call.
+        """
+        import asyncio as _asyncio
+
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-concurrent"
+
+        mock_class, mock_instance = _mock_provisioning_service(
+            child_key="sk-or-v1-only-once"
+        )
+
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            # Fire two concurrent resolves for the same agent.
+            results = await _asyncio.gather(
+                resolver.resolve_for(agent_did, ResourceClass.LLM),
+                resolver.resolve_for(agent_did, ResourceClass.LLM),
+            )
+
+        # Both calls return enabled.
+        assert all(r.enabled for r in results)
+        # OpenRouter API was called exactly ONCE despite two concurrent
+        # resolves — the lock prevented the second from minting.
+        assert mock_instance.create_agent_key.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_mint_skipped_when_no_db(self) -> None:
         # Defensive: no db means no ServiceKeyStorage to write into.
         # Resolver should warn and skip rather than crash.

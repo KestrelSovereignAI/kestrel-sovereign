@@ -936,6 +936,25 @@ class KestrelAgent(
                 # agent.
                 raise
             except Exception as e:
+                # Fail-closed for known policy/provisioning errors:
+                # PayerPolicyError (e.g., HOST_MASTER_PROVISIONED but
+                # no master configured) and OpenRouterProvisioningError
+                # (rate limited, invalid master, network error during
+                # mint) are intentional fail-fast signals. Letting the
+                # agent boot on the shared host key would silently
+                # violate the policy. Re-raise so init fails loudly.
+                _exc_module = type(e).__module__
+                _exc_name = type(e).__qualname__
+                if (
+                    _exc_name == "PayerPolicyError"
+                    or _exc_name == "UnsupportedCombinationError"
+                    or "OpenRouterProvisioning" in _exc_name
+                ):
+                    logging.error(
+                        f"PayerPolicy.llm resolution FAILED CLOSED for agent "
+                        f"{self.did[:30]}... ({_exc_module}.{_exc_name}): {e}"
+                    )
+                    raise
                 logging.warning(
                     f"PayerPolicy.llm resolution failed for agent "
                     f"{self.did[:30]}...: {e}",

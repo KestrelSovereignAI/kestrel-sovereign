@@ -28,8 +28,9 @@ operator never picks a path the resolver cannot honor.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
 from kestrel_sdk.payer_policy import (
     PayerKind,
@@ -75,6 +76,14 @@ class FoundationPayerResolver:
     ) -> None:
         self._policy = policy
         self._db = db
+        # Per-agent locks for first-time mint serialization. Two
+        # concurrent agent-init paths for the same DID would otherwise
+        # both pass has_key() before either store_key() landed, and
+        # both would create remote OpenRouter keys (the later store
+        # then orphans the earlier remote key). The lock is in-memory
+        # per resolver instance, which matches the per-agent
+        # FoundationPayerResolver lifetime in agent-init flows.
+        self._mint_locks: Dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------
     # Public surface — matches kestrel_sdk.payer_policy.PayerResolver
@@ -237,6 +246,19 @@ class FoundationPayerResolver:
             )
             return
 
+        # Per-agent lock prevents two concurrent agent-init paths from
+        # both passing has_key() and both calling create_agent_key —
+        # which would orphan one of the two remote OpenRouter keys.
+        lock = self._mint_locks.setdefault(agent_did, asyncio.Lock())
+        async with lock:
+            await self._maybe_mint_openrouter_child_locked(agent_did, spec)
+
+    async def _maybe_mint_openrouter_child_locked(
+        self,
+        agent_did: str,
+        spec: PayerSpec,
+    ) -> None:
+        """Inside the per-agent mint lock — see _maybe_mint_openrouter_child."""
         # Late imports: keep module-level deps minimal so this resolver
         # is importable even on deployments that haven't installed the
         # OpenRouter provisioning surface (which depends on httpx).
@@ -249,6 +271,8 @@ class FoundationPayerResolver:
         )
 
         # Idempotent: skip if agent already has an OpenRouter key.
+        # Re-checked under the lock so a concurrent path that minted
+        # while we were waiting is honored.
         agent_storage = ServiceKeyStorage(self._db, agent_did)
         if await agent_storage.has_key("openrouter"):
             logger.debug(
@@ -289,10 +313,60 @@ class FoundationPayerResolver:
             provider_id="openrouter",
             api_key=key_info.key,
         )
+
+        # Persist the key_hash to graph_nodes.properties.openrouter_key_hash
+        # so retirement_service.py (which reads from there via
+        # agent_info.get("openrouter_key_hash")) can revoke this child key
+        # when the agent retires. Without this, resolver-minted keys
+        # leak: ServiceKeyStorage forgets them on retirement, but
+        # OpenRouter still bills them.
+        await self._persist_openrouter_key_hash(agent_did, key_info.key_hash)
+
         logger.info(
             f"PayerResolver: minted OpenRouter child key for agent "
             f"{agent_did[:30]}... (hash {key_info.key_hash[:16]}..., "
             f"limit ${limit_usd:.2f}/mo)"
+        )
+
+    async def _persist_openrouter_key_hash(
+        self,
+        agent_did: str,
+        key_hash: str,
+    ) -> None:
+        """Write openrouter_key_hash to graph_nodes.properties for the
+        agent. Mirrors scripts/provision_agent_openrouter.py:119-138 so
+        retirement_service.py can revoke the key on agent retirement.
+
+        Idempotent: overwrites if already present.
+        """
+        import json
+
+        # Look up the agent's graph node and current properties.
+        rows = await self._db.fetchall(
+            "SELECT properties FROM graph_nodes WHERE node_id = ? LIMIT 1",
+            (agent_did,),
+        )
+        if not rows:
+            # Some test fixtures don't construct a graph_nodes agent row;
+            # falling back to agent_metadata keeps retirement workable
+            # for those (retirement_service merges agent_metadata into
+            # agent_info).
+            await self._db.execute(
+                """
+                INSERT OR REPLACE INTO agent_metadata
+                (agent_id, key, value, updated_at)
+                VALUES (?, 'openrouter_key_hash', ?, CURRENT_TIMESTAMP)
+                """,
+                (agent_did, key_hash),
+            )
+            return
+
+        properties_json = rows[0][0]
+        properties = json.loads(properties_json) if properties_json else {}
+        properties["openrouter_key_hash"] = key_hash
+        await self._db.execute(
+            "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
+            (json.dumps(properties), agent_did),
         )
 
     def _spec_for(self, resource_class: ResourceClass) -> PayerSpec:
