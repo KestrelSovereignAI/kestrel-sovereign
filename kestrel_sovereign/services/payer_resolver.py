@@ -519,8 +519,15 @@ def _find_agent_data_root(start: "Path") -> Optional["Path"]:
     """
     from pathlib import Path
 
-    cur = Path(start).resolve()
-    if cur.is_file():
+    # absolute() (not resolve()) so we walk a fully-qualified lexical
+    # path without dereferencing symlinks. If <project>/agent_data is
+    # a symlink to /mnt/data, resolve() would expand it away before
+    # the walk and we'd never find the 'agent_data' segment. The
+    # symlink target may still be valid storage; the wizard wrote
+    # host.db relative to <project>/agent_data, so that's where we
+    # need to look.
+    cur = Path(start).absolute()
+    if cur.is_file() or not cur.exists():
         cur = cur.parent
     while cur != cur.parent:
         if cur.name == "agent_data":

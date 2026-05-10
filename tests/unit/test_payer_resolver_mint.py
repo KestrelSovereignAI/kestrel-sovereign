@@ -540,6 +540,48 @@ class TestMintOpenRouterChild:
         await result.close()
 
     @pytest.mark.asyncio
+    async def test_open_host_db_handles_symlinked_agent_data(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex Phase 4 round 3: when <project>/agent_data is a
+        symlink to a mounted data directory, Path.resolve() would
+        wash the 'agent_data' segment out of the path BEFORE the
+        walk could spot it. The fix uses .absolute() instead, which
+        normalizes without following symlinks.
+        """
+        import os
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+
+        # Real on-disk dir somewhere ELSE.
+        real_data = tmp_path / "real_data_mount"
+        real_data.mkdir()
+        host_db_real = await AsyncDatabase.sqlite(str(real_data / "host.db"))
+        await host_db_real.close()
+
+        # <project>/agent_data is a symlink to that real dir.
+        project = tmp_path / "project"
+        project.mkdir()
+        symlink_root = project / "agent_data"
+        try:
+            os.symlink(real_data, symlink_root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+
+        # An agent's storage path lives THROUGH the symlink. The
+        # lexical path contains 'agent_data'; the resolved path doesn't.
+        agent_storage_path = symlink_root / "test-agent.db"
+        # Create the file on the real side.
+        (real_data / "test-agent.db").write_text("")
+
+        result = await open_host_db(storage_path=agent_storage_path)
+        assert result is not None, (
+            "open_host_db failed to find host.db when agent_data is a symlink "
+            "(this used to fail because Path.resolve() dereferences the symlink "
+            "before the walk-up could spot the 'agent_data' segment)"
+        )
+        await result.close()
+
+    @pytest.mark.asyncio
     async def test_open_host_db_returns_none_when_no_agent_data_ancestor(
         self, tmp_path: Path
     ) -> None:
