@@ -95,6 +95,30 @@ class GitHubCliAdapter(FeatureCliAdapter):
             CliRisk.READ_ONLY,
             ("gh",),
         ),
+        CliCommandDefinition(
+            "github.pr_files",
+            "List changed files for a pull request.",
+            CliRisk.READ_ONLY,
+            ("gh",),
+        ),
+        CliCommandDefinition(
+            "github.pr_checks",
+            "Read check/status rollup for a pull request.",
+            CliRisk.READ_ONLY,
+            ("gh",),
+        ),
+        CliCommandDefinition(
+            "github.read_file_at_pr_head",
+            "Read a repository file at a pull request head commit.",
+            CliRisk.READ_ONLY,
+            ("gh",),
+        ),
+        CliCommandDefinition(
+            "github.pr_review_context",
+            "Build a compact review context from PR metadata, files, checks, and diff.",
+            CliRisk.READ_ONLY,
+            ("gh",),
+        ),
     )
 
     async def auth_status(self, *, hostname: str = "github.com") -> TerminalCommandResult:
@@ -194,6 +218,89 @@ class GitHubCliAdapter(FeatureCliAdapter):
             "content": redact_secrets(decode_github_content_response(payload)),
         }
 
+    async def list_pull_request_files(
+        self, *, repo: str, number: int | str
+    ) -> list[dict[str, Any]]:
+        payload = await self.get_pull_request(repo=repo, number=number)
+        files = payload.get("files", [])
+        if not isinstance(files, list):
+            raise CliAdapterError("pull request files payload was not a list")
+        return files
+
+    async def get_pull_request_checks(
+        self, *, repo: str, number: int | str
+    ) -> list[dict[str, Any]]:
+        payload = await self.get_pull_request(repo=repo, number=number)
+        checks = payload.get("statusCheckRollup", [])
+        if not isinstance(checks, list):
+            raise CliAdapterError("pull request checks payload was not a list")
+        return checks
+
+    async def read_file_at_pull_request_head(
+        self,
+        *,
+        repo: str,
+        number: int | str,
+        path: str,
+    ) -> dict[str, Any]:
+        payload = await self.get_pull_request(repo=repo, number=number)
+        head_ref = payload.get("headRefOid")
+        if not isinstance(head_ref, str) or not head_ref:
+            raise CliAdapterError("pull request head ref is unavailable")
+        return await self.read_file_at_ref(repo=repo, path=path, ref=head_ref)
+
+    async def get_pull_request_review_context(
+        self,
+        *,
+        repo: str,
+        number: int | str,
+        include_file_contents: bool | str = False,
+        max_files: int | str = 10,
+        max_file_bytes: int | str = 20_000,
+    ) -> dict[str, Any]:
+        include_file_contents = _validate_bool(
+            include_file_contents,
+            "include_file_contents",
+        )
+        max_files = _validate_non_negative_int(max_files, "max_files")
+        max_file_bytes = _validate_positive_int(max_file_bytes, "max_file_bytes")
+        pr = await self.get_pull_request(repo=repo, number=number)
+        diff = await self.get_pull_request_diff(repo=repo, number=number)
+
+        file_contents: list[dict[str, Any]] = []
+        if include_file_contents:
+            head_ref = pr.get("headRefOid")
+            if not isinstance(head_ref, str) or not head_ref:
+                raise CliAdapterError("pull request head ref is unavailable")
+            for file_info in _reviewable_files(pr.get("files", []), limit=max_files):
+                content = await self.read_file_at_ref(
+                    repo=repo,
+                    path=file_info["path"],
+                    ref=head_ref,
+                )
+                text = content["content"]
+                encoded = text.encode("utf-8")
+                truncated = len(encoded) > max_file_bytes
+                if truncated:
+                    text = encoded[:max_file_bytes].decode("utf-8", errors="replace")
+                file_contents.append(
+                    {
+                        **content,
+                        "content": text,
+                        "truncated": truncated,
+                    }
+                )
+
+        return {
+            "repo": _validate_repo(repo),
+            "number": _validate_pr_number(number),
+            "pull_request": pr,
+            "files": pr.get("files", []),
+            "checks": pr.get("statusCheckRollup", []),
+            "diff": diff,
+            "file_contents": file_contents,
+        }
+
 
 def _json_or_raise(result: TerminalCommandResult) -> dict[str, Any]:
     if not result.ok:
@@ -237,6 +344,38 @@ def _validate_pr_number(number: int | str) -> int:
     return parsed
 
 
+def _validate_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    raise CliAdapterError(f"{name} must be a boolean")
+
+
+def _validate_positive_int(value: int | str, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CliAdapterError(f"{name} must be a positive integer") from exc
+    if parsed < 1 or str(value).strip() != str(parsed):
+        raise CliAdapterError(f"{name} must be a positive integer")
+    return parsed
+
+
+def _validate_non_negative_int(value: int | str, name: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CliAdapterError(f"{name} must be a non-negative integer") from exc
+    if parsed < 0 or str(value).strip() != str(parsed):
+        raise CliAdapterError(f"{name} must be a non-negative integer")
+    return parsed
+
+
 def _validate_repo_path(path: str) -> str:
     if not isinstance(path, str) or not path or path.startswith("/") or "\x00" in path:
         raise CliAdapterError("path must be a relative repository path")
@@ -260,3 +399,23 @@ def redact_json(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: redact_json(item) for key, item in value.items()}
     return value
+
+
+def _reviewable_files(value: Any, *, limit: int) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise CliAdapterError("pull request files payload was not a list")
+
+    files: list[dict[str, Any]] = []
+    for item in value:
+        if len(files) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path")
+        if not isinstance(path, str):
+            continue
+        status = str(item.get("status") or item.get("changeType") or "").lower()
+        if status in {"removed", "deleted"}:
+            continue
+        files.append({"path": path})
+    return files

@@ -127,6 +127,52 @@ class CliFeature(Feature):
         )
 
     @tool(
+        name="github_pr_files",
+        description="List changed files for a GitHub PR via `gh pr view`.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!gh-pr-files",
+    )
+    async def github_pr_files(self, repo: str, number: int) -> ToolResult:
+        try:
+            files = await self.adapters["github"].list_pull_request_files(
+                repo=repo,
+                number=number,
+            )
+        except CliAdapterError as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read {len(files)} changed file(s) for PR #{number} from {repo}.",
+            data={
+                "repo": repo,
+                "number": number,
+                "files": files,
+            },
+        )
+
+    @tool(
+        name="github_pr_checks",
+        description="Read check/status rollup for a GitHub PR via `gh pr view`.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!gh-pr-checks",
+    )
+    async def github_pr_checks(self, repo: str, number: int) -> ToolResult:
+        try:
+            checks = await self.adapters["github"].get_pull_request_checks(
+                repo=repo,
+                number=number,
+            )
+        except CliAdapterError as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read {len(checks)} check(s) for PR #{number} from {repo}.",
+            data={
+                "repo": repo,
+                "number": number,
+                "checks": checks,
+            },
+        )
+
+    @tool(
         name="github_read_file_at_ref",
         description="Read a GitHub repository file at a branch, tag, or commit ref via `gh api`.",
         category=ToolCategory.DATA_ACCESS,
@@ -140,6 +186,60 @@ class CliFeature(Feature):
         return ToolResult.ok(
             f"Read {path} at {ref} from {repo}.",
             data=payload,
+        )
+
+    @tool(
+        name="github_read_file_at_pr_head",
+        description="Read a GitHub repository file at a pull request head commit.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!gh-read-pr-file",
+    )
+    async def github_read_file_at_pr_head(
+        self,
+        repo: str,
+        number: int,
+        path: str,
+    ) -> ToolResult:
+        try:
+            payload = await self.adapters["github"].read_file_at_pull_request_head(
+                repo=repo,
+                number=number,
+                path=path,
+            )
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read {path} from PR #{number} head in {repo}.",
+            data=payload,
+        )
+
+    @tool(
+        name="github_pr_review_context",
+        description="Build GitHub PR review context with metadata, files, checks, and diff.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!gh-pr-context",
+    )
+    async def github_pr_review_context(
+        self,
+        repo: str,
+        number: int,
+        include_file_contents: bool = False,
+        max_files: int = 10,
+        max_file_bytes: int = 20_000,
+    ) -> ToolResult:
+        try:
+            context = await self.adapters["github"].get_pull_request_review_context(
+                repo=repo,
+                number=number,
+                include_file_contents=include_file_contents,
+                max_files=max_files,
+                max_file_bytes=max_file_bytes,
+            )
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Built review context for PR #{number} from {repo}.",
+            data=context,
         )
 
 

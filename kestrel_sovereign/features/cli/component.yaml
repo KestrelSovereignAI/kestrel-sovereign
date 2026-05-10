@@ -8,7 +8,11 @@ tools:
   - github_cli_auth_status
   - github_pr_view
   - github_pr_diff
+  - github_pr_files
+  - github_pr_checks
   - github_read_file_at_ref
+  - github_read_file_at_pr_head
+  - github_pr_review_context
 
 files:
   - feature.py
