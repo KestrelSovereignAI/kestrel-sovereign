@@ -694,8 +694,7 @@ class KestrelAgent(
                 # rows, surfacing as 'no host master' for delegated kinds.
                 from kestrel_sovereign.services.payer_resolver import open_host_db
                 _host_db = await open_host_db(
-                    agent_data_dir=Path(self.storage_path).parent
-                    if self.storage_path else None
+                    storage_path=self.storage_path,
                 )
                 _resolver = FoundationPayerResolver(
                     _policy,
@@ -898,8 +897,7 @@ class KestrelAgent(
                 _llm_policy = load_policy_from_toml()
                 from kestrel_sovereign.services.payer_resolver import open_host_db
                 _llm_host_db = await open_host_db(
-                    agent_data_dir=Path(self.storage_path).parent
-                    if self.storage_path else None
+                    storage_path=self.storage_path,
                 )
                 _llm_resolver = FoundationPayerResolver(
                     _llm_policy,

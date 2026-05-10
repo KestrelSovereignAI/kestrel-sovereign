@@ -485,6 +485,76 @@ class TestMintOpenRouterChild:
         assert (await agent_storage.has_key("openrouter")) is False
 
     @pytest.mark.asyncio
+    async def test_open_host_db_finds_root_from_multi_agent_layout(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex Phase 4 round 2: open_host_db must locate the
+        agent_data root for both the multi-agent layout
+        (<project>/agent_data/<name>/kestrel_prime.db) and the flat
+        layout (<project>/agent_data/<name>.db).
+
+        Earlier code did Path(storage_path).parent unconditionally,
+        which yields <name>/ for the multi-agent layout — host.db
+        wasn't there. The fix walks up looking for 'agent_data'.
+        """
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+
+        # Multi-agent layout: place a host.db at the agent_data root
+        # and an agent's storage_path two levels deeper.
+        agent_data_root = tmp_path / "agent_data"
+        agent_data_root.mkdir()
+        (agent_data_root / "host.db").write_text("")  # marker; sqlite-readable empty file is fine
+        # Actually create it as a real SQLite file so AsyncDatabase.sqlite can open it.
+        host_db_real = await AsyncDatabase.sqlite(str(agent_data_root / "host.db"))
+        await host_db_real.close()
+
+        agent_dir = agent_data_root / "test-agent"
+        agent_dir.mkdir()
+        agent_storage_path = agent_dir / "kestrel_prime.db"
+        agent_storage_path.write_text("")
+
+        result = await open_host_db(storage_path=agent_storage_path)
+        assert result is not None, (
+            "open_host_db failed to walk up from "
+            f"{agent_storage_path} to {agent_data_root / 'host.db'}"
+        )
+        await result.close()
+
+    @pytest.mark.asyncio
+    async def test_open_host_db_finds_root_from_flat_layout(
+        self, tmp_path: Path
+    ) -> None:
+        """Flat layout: <project>/agent_data/<name>.db (no per-agent dir)."""
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+
+        agent_data_root = tmp_path / "agent_data"
+        agent_data_root.mkdir()
+        host_db_real = await AsyncDatabase.sqlite(str(agent_data_root / "host.db"))
+        await host_db_real.close()
+
+        flat_storage_path = agent_data_root / "test-agent.db"
+        flat_storage_path.write_text("")
+
+        result = await open_host_db(storage_path=flat_storage_path)
+        assert result is not None
+        await result.close()
+
+    @pytest.mark.asyncio
+    async def test_open_host_db_returns_none_when_no_agent_data_ancestor(
+        self, tmp_path: Path
+    ) -> None:
+        """Test setups that don't use agent_data convention: degrade
+        gracefully, return None (resolver falls back to agent's db)."""
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+
+        no_data_root = tmp_path / "test-fixture" / "agent.db"
+        no_data_root.parent.mkdir(parents=True)
+        no_data_root.write_text("")
+
+        result = await open_host_db(storage_path=no_data_root)
+        assert result is None
+
+    @pytest.mark.asyncio
     async def test_mint_skipped_when_no_db(self) -> None:
         # Defensive: no db means no ServiceKeyStorage to write into.
         # Resolver should warn and skip rather than crash.

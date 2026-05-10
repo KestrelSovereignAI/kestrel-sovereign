@@ -504,8 +504,34 @@ class FoundationPayerResolver:
 # ----------------------------------------------------------------------
 
 
+def _find_agent_data_root(start: "Path") -> Optional["Path"]:
+    """Walk up from ``start`` looking for a directory named
+    ``agent_data``. Returns the first match or None.
+
+    Handles both layouts:
+    - Multi-agent: ``<project>/agent_data/<name>/kestrel_prime.db`` →
+      parent is ``<name>``, parent.parent is ``agent_data``.
+    - Flat:       ``<project>/agent_data/<name>.db`` →
+      parent is ``agent_data``.
+
+    Walking up is robust against future layout changes too. Stops at
+    filesystem root.
+    """
+    from pathlib import Path
+
+    cur = Path(start).resolve()
+    if cur.is_file():
+        cur = cur.parent
+    while cur != cur.parent:
+        if cur.name == "agent_data":
+            return cur
+        cur = cur.parent
+    return None
+
+
 async def open_host_db(
     *,
+    storage_path: "Path | str | None" = None,
     agent_data_dir: "Path | None" = None,
     project_dir: "Path | None" = None,
 ) -> Optional["AsyncDatabase"]:
@@ -518,18 +544,28 @@ async def open_host_db(
     the payments wizard.
 
     Args:
-        agent_data_dir: Path to the deployment's agent_data directory.
-            Preferred over project_dir for kestrel_agent.py callers
-            because they have a reliable handle to it via
-            ``Path(self.storage_path).parent``.
-        project_dir: Project root. host.db is then at
-            ``<project_dir>/agent_data/host.db``. Defaults to cwd
-            when neither argument is given.
+        storage_path: An agent's storage path. Preferred when called
+            from KestrelAgent.initialize() — we walk up looking for
+            ``agent_data``, which handles both the multi-agent layout
+            (``<project>/agent_data/<name>/kestrel_prime.db``) and the
+            flat layout (``<project>/agent_data/<name>.db``).
+        agent_data_dir: Explicit path to the deployment's agent_data
+            directory. Used by callers that already know where it is
+            (e.g. SetupContext.agent_data_root).
+        project_dir: Project root; host.db is at ``<project_dir>/agent_data/host.db``.
+            Defaults to cwd when none of the above are given.
     """
     from pathlib import Path
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
-    if agent_data_dir is not None:
+    host_db_path: Path
+    if storage_path is not None:
+        found = _find_agent_data_root(Path(storage_path))
+        if found is None:
+            # No agent_data ancestor — degrade gracefully.
+            return None
+        host_db_path = found / "host.db"
+    elif agent_data_dir is not None:
         host_db_path = Path(agent_data_dir) / "host.db"
     else:
         root = project_dir if project_dir is not None else Path.cwd()
