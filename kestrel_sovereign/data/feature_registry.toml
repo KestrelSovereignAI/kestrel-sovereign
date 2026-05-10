@@ -130,6 +130,22 @@ core = true
 context_status = { description = "Show context window utilization", category = "system", tags = ["context", "tokens"] }
 context_resize = { description = "Adjust context budget allocation", category = "system", tags = ["context", "tokens"] }
 
+[cli]
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["CliFeature"]
+description = "Registered feature-owned CLI workflows using installed tools and existing user authentication"
+tags = ["core", "cli", "tools", "github"]
+icon = "terminal"
+core = true
+
+[cli.skills]
+cli_status = { description = "Show CLI adapter tool availability", category = "system", tags = ["cli", "tools"] }
+github_cli_auth_status = { description = "Check GitHub CLI authentication", category = "system", tags = ["github", "cli"] }
+github_pr_view = { description = "Inspect GitHub PR metadata, files, commits, head ref, and checks", category = "data_access", tags = ["github", "pull-request"] }
+github_pr_diff = { description = "Read a GitHub PR unified diff", category = "data_access", tags = ["github", "pull-request", "diff"] }
+github_read_file_at_ref = { description = "Read a GitHub repository file at a branch, tag, or commit ref", category = "data_access", tags = ["github", "ref"] }
+
 [tasks]
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
