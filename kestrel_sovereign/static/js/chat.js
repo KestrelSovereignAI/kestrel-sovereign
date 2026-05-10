@@ -4,7 +4,7 @@
  */
 
 import API from './api.js';
-import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane } from './ui.js';
+import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
 
 // Shared markdown utilities - loaded via script tag before this module
 const {
@@ -25,6 +25,105 @@ const {
 // first sets it; the other becomes a no-op.
 const REVISE_SENTINEL_PREFIX = '\x1eKESTREL:REVISE:';
 const REVISE_SENTINEL_SUFFIX = '\x1e';
+
+function renderToolActivityLineHtml(line) {
+    const escaped = escapeHtml(line);
+    if (line.startsWith('\u{1F527}')) return `<div class="tool-activity tool-start">${escaped}</div>`;
+    if (line.startsWith('\u2713')) return `<div class="tool-activity tool-done">${escaped}</div>`;
+    if (line.startsWith('\u274C')) return `<div class="tool-activity tool-error">${escaped}</div>`;
+    return `<div class="tool-activity">${escaped}</div>`;
+}
+
+function isToolActivityLine(line) {
+    const text = String(line || '').trim();
+    return (
+        isToolActivityStartLine(text) ||
+        /^\u2713\s+.+\s+(?:complete|done)(?:\s+\(.+\))?$/u.test(text) ||
+        /^\u274C\s+.+\s+failed(?::.*)?$/u.test(text)
+    );
+}
+
+function isToolActivityStartLine(line) {
+    return /^\u{1F527}\s+Calling\s+.+(?:\.\.\.)?$/u.test(String(line || '').trim());
+}
+
+export function splitToolActivity(content) {
+    const text = String(content || '');
+    const parts = text.split('\n---\n');
+    const firstLine = text.split('\n').find((line) => line.trim()) || '';
+    const hasToolIndicators = isToolActivityStartLine(firstLine);
+    if (hasToolIndicators && parts.length > 1) {
+        return {
+            toolActivity: parts[0],
+            response: parts.slice(1).join('\n---\n'),
+            hasToolActivity: !!parts[0].trim(),
+        };
+    }
+    if (hasToolIndicators) {
+        const lines = text.split('\n');
+        const responseStart = lines.findIndex((line) => line.trim() && !isToolActivityLine(line));
+        if (responseStart >= 0) {
+            return {
+                toolActivity: lines.slice(0, responseStart).join('\n'),
+                response: lines.slice(responseStart).join('\n'),
+                hasToolActivity: true,
+            };
+        }
+    }
+    return {
+        toolActivity: hasToolIndicators ? text : '',
+        response: hasToolIndicators ? '' : text,
+        hasToolActivity: hasToolIndicators,
+    };
+}
+
+export function renderToolActivityHtml(activityText) {
+    const lines = String(activityText || '')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+    if (lines.length === 0) return '';
+
+    const toolNames = lines.map((line) => {
+        const startMatch = line.match(/^\u{1F527}\s*(?:Calling\s+)?(.+?)(?:\.\.\.)?$/u);
+        const doneMatch = line.match(/^\u2713\s*(.+?)\s+(?:complete|done)(?:\s+\(.+\))?$/u);
+        const errorMatch = line.match(/^\u274C\s*(.+?)\s+failed(?::.*)?$/u);
+        return startMatch?.[1] || doneMatch?.[1] || errorMatch?.[1] || null;
+    }).filter(Boolean);
+    const uniqueToolNames = [...new Set(toolNames)];
+    const latest = uniqueToolNames[uniqueToolNames.length - 1];
+    const summaryText = uniqueToolNames.length === 1
+        ? `Tool call: ${latest}`
+        : `${uniqueToolNames.length || lines.length} tool call events`;
+    const eventCount = lines.length === 1 ? '1 event' : `${lines.length} events`;
+    const activityHtml = lines.map(renderToolActivityLineHtml).join('');
+
+    return `
+        <details class="tool-activity-container tool-activity-expandable">
+            <summary class="tool-activity-summary">
+                <span>${escapeHtml(summaryText)}</span>
+                <span class="tool-activity-count">${escapeHtml(eventCount)}</span>
+            </summary>
+            <div class="tool-activity-list">${activityHtml}</div>
+        </details>
+    `;
+}
+
+async function finalizeAgentContent(contentDiv, content) {
+    const { toolActivity, response, hasToolActivity } = splitToolActivity(content);
+    if (!hasToolActivity) {
+        await finalizeMarkdown(contentDiv, content);
+        return;
+    }
+
+    contentDiv.innerHTML = renderToolActivityHtml(toolActivity);
+    if (response) {
+        const responseDiv = document.createElement('div');
+        responseDiv.className = 'response-content';
+        contentDiv.appendChild(responseDiv);
+        await finalizeMarkdown(responseDiv, response);
+    }
+}
 
 /**
  * Detect and strip in-band revise sentinels from a chat-stream chunk.
@@ -1029,32 +1128,14 @@ export function addMessageStreaming(role, paneElement = null) {
 export function updateStreamingMessage(msgDiv, content, paneElement = null) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
-        // Split content into tool activity and response at the --- separator
-        const parts = content.split('\n---\n');
-        const toolActivity = parts.length > 1 ? parts[0] : '';
-        const response = parts.length > 1 ? parts.slice(1).join('\n---\n') : content;
+        const { toolActivity, response, hasToolActivity } = splitToolActivity(content);
 
-        // Check if content has tool indicators (before separator or if no separator yet)
-        const hasToolIndicators = /^[🔧✓❌]/.test(content.trim());
-
-        if (hasToolIndicators && !content.includes('\n---\n')) {
-            // Still in tool execution phase - show as activity
-            const activityHtml = content.split('\n').map(line => {
-                if (line.startsWith('🔧')) return `<div class="tool-activity tool-start">${line}</div>`;
-                if (line.startsWith('✓')) return `<div class="tool-activity tool-done">${line}</div>`;
-                if (line.startsWith('❌')) return `<div class="tool-activity tool-error">${line}</div>`;
-                return line;
-            }).join('');
-            contentDiv.innerHTML = `<div class="tool-activity-container">${activityHtml}</div>`;
+        if (hasToolActivity && !response) {
+            // Still in tool execution phase - show as expandable activity.
+            contentDiv.innerHTML = renderToolActivityHtml(content);
         } else if (toolActivity) {
             // Have both tool activity and response
-            const activityHtml = toolActivity.split('\n').map(line => {
-                if (line.startsWith('🔧')) return `<div class="tool-activity tool-start">${line}</div>`;
-                if (line.startsWith('✓')) return `<div class="tool-activity tool-done">${line}</div>`;
-                if (line.startsWith('❌')) return `<div class="tool-activity tool-error">${line}</div>`;
-                return line;
-            }).join('');
-            contentDiv.innerHTML = `<div class="tool-activity-container">${activityHtml}</div><div class="response-content">${renderStreamingMarkdown(response)}</div>`;
+            contentDiv.innerHTML = `${renderToolActivityHtml(toolActivity)}<div class="response-content">${renderStreamingMarkdown(response)}</div>`;
             highlightCodeBlocks(contentDiv, true);
         } else {
             // No tool indicators - regular markdown
@@ -1110,7 +1191,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     const c = getChatContainer();
     const mounted = !!(c && paneEl && paneEl.parentNode === c);
 
-    await finalizeMarkdown(contentDiv, content);
+    await finalizeAgentContent(contentDiv, content);
     if (!mounted && pane && /```mermaid/.test(content)) {
         // Mark the pane so mountChatPane re-runs the mermaid pass.
         pane.hasUnrenderedMermaid = true;
@@ -1138,7 +1219,7 @@ export async function addMessage(role, content, paneElement = null) {
         contentDiv.innerHTML = escaped.replace(/\n/g, '<br>');
     } else {
         // Agent messages: use shared markdown utilities
-        await finalizeMarkdown(contentDiv, content);
+        await finalizeAgentContent(contentDiv, content);
     }
 
     div.appendChild(contentDiv);
