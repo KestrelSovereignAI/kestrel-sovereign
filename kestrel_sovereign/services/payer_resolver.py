@@ -443,10 +443,23 @@ class FoundationPayerResolver:
         properties_json = rows[0][0]
         properties = json.loads(properties_json) if properties_json else {}
         properties["openrouter_key_hash"] = key_hash
-        await self._db.execute(
+        # AsyncDatabase.execute returns cursor.rowcount on both backends.
+        # If the row was deleted between SELECT above and this UPDATE
+        # (concurrent retirement), rowcount is 0 — that's the same leak
+        # shape as the missing-row case codex round 4 closed at the
+        # SELECT, so treat it the same way.
+        rows_affected = await self._db.execute(
             "UPDATE graph_nodes SET properties = ? WHERE node_id = ?",
             (json.dumps(properties), agent_did),
         )
+        if rows_affected == 0:
+            if require_row:
+                raise _GraphNodeVanishedError(agent_did)
+            logger.error(
+                f"PayerResolver: graph_nodes row vanished between SELECT "
+                f"and UPDATE for agent {agent_did[:30]}...; "
+                "openrouter_key_hash NOT persisted."
+            )
 
     def _spec_for(self, resource_class: ResourceClass) -> PayerSpec:
         if resource_class is ResourceClass.LLM:

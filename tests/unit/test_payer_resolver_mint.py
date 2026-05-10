@@ -424,6 +424,67 @@ class TestMintOpenRouterChild:
         assert (await agent_storage.has_key("openrouter")) is False
 
     @pytest.mark.asyncio
+    async def test_mint_revokes_when_row_deleted_between_select_and_update(
+        self, db: AsyncDatabase
+    ) -> None:
+        """Codex Phase 3c round 5: SELECT-then-UPDATE has a tiny race
+        window. Row exists at SELECT, deleted before UPDATE, UPDATE
+        returns rowcount=0 (no exception). Without the rowcount check,
+        persist appeared to succeed and the local key got stored
+        without the retirement hash — same leak shape as round 4.
+
+        Reproduce by patching AsyncDatabase.execute to delete the row
+        BEFORE the UPDATE actually runs. The new rowcount==0 check
+        treats this as _GraphNodeVanishedError, triggering remote
+        revocation and rolling back local store.
+        """
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-update-race"
+        await _seed_agent_graph_node(db, agent_did)
+
+        mock_class = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.close = AsyncMock()
+        mock_instance.delete_key = AsyncMock(return_value=True)
+        mock_instance.create_agent_key = AsyncMock(return_value=MagicMock(
+            key="sk-or-v1-update-race",
+            key_hash="hash-update-race",
+            limit_usd=50.0,
+        ))
+        mock_class.return_value = mock_instance
+
+        # Wrap db.execute so the UPDATE on graph_nodes triggers a
+        # concurrent delete-then-real-update path that returns 0 rows.
+        original_execute = db.execute
+
+        async def _execute_with_race(sql: str, params=()):
+            if "UPDATE graph_nodes" in sql and "node_id" in sql:
+                # Delete the row BEFORE the UPDATE actually runs.
+                # The UPDATE then matches 0 rows and returns 0.
+                await original_execute(
+                    "DELETE FROM graph_nodes WHERE node_id = ?",
+                    (agent_did,),
+                )
+            return await original_execute(sql, params)
+
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ), patch.object(db, "execute", side_effect=_execute_with_race):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            with pytest.raises(PayerPolicyError):
+                await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        # Remote was minted then revoked.
+        assert mock_instance.create_agent_key.await_count == 1
+        mock_instance.delete_key.assert_awaited_once_with("hash-update-race")
+        # No local key stored (rollback).
+        agent_storage = ServiceKeyStorage(db, agent_did)
+        assert (await agent_storage.has_key("openrouter")) is False
+
+    @pytest.mark.asyncio
     async def test_mint_skipped_when_no_db(self) -> None:
         # Defensive: no db means no ServiceKeyStorage to write into.
         # Resolver should warn and skip rather than crash.
