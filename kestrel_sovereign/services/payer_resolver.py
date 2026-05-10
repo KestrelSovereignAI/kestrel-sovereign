@@ -53,6 +53,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _GraphNodeVanishedError(Exception):
+    """Internal sentinel: graph_nodes agent row was present at
+    pre-flight but missing by the time _persist_openrouter_key_hash
+    ran. The caller (mint loop) catches this to revoke the
+    just-minted remote key and surface a PayerPolicyError to the
+    operator.
+    """
+
+    def __init__(self, agent_did: str) -> None:
+        super().__init__(
+            f"graph_nodes row for agent {agent_did[:30]}... "
+            "vanished between pre-flight and persist"
+        )
+        self.agent_did = agent_did
+
+
 class FoundationPayerResolver:
     """Concrete `PayerResolver` for standalone Kestrel deployments.
 
@@ -324,7 +340,9 @@ class FoundationPayerResolver:
             )
         master_key = await host_storage.get_key("openrouter")
 
-        # Mint the child.
+        # Mint the child remotely. Keep the provisioning service open
+        # past create_agent_key so we can revoke if the local persist
+        # fails.
         provisioning = OpenRouterProvisioningService(management_key=master_key)
         try:
             # Per-agent monthly cap from the policy spec; default $100/mo
@@ -335,23 +353,55 @@ class FoundationPayerResolver:
                 limit_usd=limit_usd,
                 limit_reset="monthly",
             )
+
+            # Persist the key_hash to graph_nodes.properties FIRST,
+            # before storing locally. If the graph_nodes row vanished
+            # between pre-flight and now (concurrent delete during
+            # init), we revoke the remote child immediately and raise.
+            # Local store happens only on success — so a failed mint
+            # leaves no inconsistent state: no local key, no remote
+            # key, retry sees has_key=False and starts fresh.
+            try:
+                await self._persist_openrouter_key_hash(
+                    agent_did, key_info.key_hash, require_row=True
+                )
+            except _GraphNodeVanishedError:
+                # Revoke the remote key so it doesn't leak. Use a
+                # narrow except so unexpected exceptions still propagate.
+                logger.error(
+                    f"PayerResolver: graph_nodes row for agent "
+                    f"{agent_did[:30]}... vanished mid-mint; revoking "
+                    f"remote OpenRouter key (hash {key_info.key_hash[:16]}...)"
+                )
+                try:
+                    await provisioning.delete_key(key_info.key_hash)
+                except Exception as revoke_err:
+                    # Revoke failed — the remote key is now orphaned.
+                    # Surface clearly so an operator can clean up via
+                    # scripts/manage_openrouter_keys.py delete --hash ...
+                    logger.error(
+                        f"PayerResolver: revoke FAILED for orphaned key "
+                        f"{key_info.key_hash[:16]}...: {revoke_err}. "
+                        "Manual cleanup required: "
+                        "scripts/manage_openrouter_keys.py delete --hash "
+                        f"{key_info.key_hash}"
+                    )
+                from kestrel_sdk.payer_policy import PayerPolicyError
+                raise PayerPolicyError(
+                    f"PayerResolver: graph_nodes row for agent "
+                    f"{agent_did[:30]}... disappeared mid-mint. Remote "
+                    "child key revoked (or revoke logged for manual "
+                    "cleanup). No local state was changed; retry is safe."
+                )
+
+            # Persist locally. Subsequent use_agent_key calls find it
+            # via key_storage.get_key("openrouter").
+            await agent_storage.store_key(
+                provider_id="openrouter",
+                api_key=key_info.key,
+            )
         finally:
             await provisioning.close()
-
-        # Persist the child in ServiceKeyStorage. Subsequent
-        # use_agent_key calls find it via key_storage.get_key("openrouter").
-        await agent_storage.store_key(
-            provider_id="openrouter",
-            api_key=key_info.key,
-        )
-
-        # Persist the key_hash to graph_nodes.properties.openrouter_key_hash
-        # so retirement_service.py (which reads from there via
-        # agent_info.get("openrouter_key_hash")) can revoke this child key
-        # when the agent retires. Without this, resolver-minted keys
-        # leak: ServiceKeyStorage forgets them on retirement, but
-        # OpenRouter still bills them.
-        await self._persist_openrouter_key_hash(agent_did, key_info.key_hash)
 
         logger.info(
             f"PayerResolver: minted OpenRouter child key for agent "
@@ -363,17 +413,17 @@ class FoundationPayerResolver:
         self,
         agent_did: str,
         key_hash: str,
+        *,
+        require_row: bool = False,
     ) -> None:
-        """Write openrouter_key_hash to graph_nodes.properties for the
-        agent. Mirrors scripts/provision_agent_openrouter.py:119-138 so
-        retirement_service.py can revoke the key on agent retirement.
+        """Write openrouter_key_hash to graph_nodes.properties.
 
-        Pre-condition: graph_nodes agent row exists. Validated by
-        _maybe_mint_openrouter_child's pre-flight check before any
-        side effects, so this method never has to reason about the
-        missing-row case.
-
-        Idempotent: overwrites if already present.
+        Args:
+            require_row: When True, raise _GraphNodeVanishedError if
+                no graph_nodes row exists (treats the missing-row case
+                as a hard failure so the caller can revoke the remote
+                key). When False, log and return (used by callers that
+                are tolerant of the row being absent).
         """
         import json
 
@@ -381,17 +431,12 @@ class FoundationPayerResolver:
             "SELECT properties FROM graph_nodes WHERE node_id = ? LIMIT 1",
             (agent_did,),
         )
-        # Pre-flight in _maybe_mint_openrouter_child guarantees the row
-        # exists by the time we get here. A defensive log if it
-        # vanishes between pre-flight and persist (extremely unlikely
-        # given we hold the per-agent mint lock).
         if not rows:
+            if require_row:
+                raise _GraphNodeVanishedError(agent_did)
             logger.error(
-                f"PayerResolver: graph_nodes row vanished mid-mint for "
-                f"agent {agent_did[:30]}.... openrouter_key_hash NOT "
-                "persisted; retirement_service won't be able to revoke "
-                "the remote key. This indicates a concurrent delete "
-                "during agent init."
+                f"PayerResolver: graph_nodes row not found for agent "
+                f"{agent_did[:30]}...; openrouter_key_hash NOT persisted."
             )
             return
 

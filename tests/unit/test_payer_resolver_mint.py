@@ -354,6 +354,76 @@ class TestMintOpenRouterChild:
         assert mock_instance.create_agent_key.await_count == 1
 
     @pytest.mark.asyncio
+    async def test_mint_revokes_remote_key_when_graph_row_vanishes_mid_mint(
+        self, db: AsyncDatabase
+    ) -> None:
+        """Codex Phase 3c round 4 finding: the vanishingly-rare race
+        where graph_nodes is deleted between pre-flight and persist
+        used to log-and-return after the remote/local mint had already
+        happened. ServiceKeyStorage.has_key() became True; on retry,
+        the resolver skipped mint AND skipped persist — recreating
+        the leak.
+
+        Corrected behavior: persist FIRST (before local store). If the
+        row vanished, revoke the remote child key via
+        OpenRouterProvisioningService.delete_key, raise
+        PayerPolicyError, and DO NOT touch ServiceKeyStorage. Retry
+        sees a clean slate.
+
+        Simulated by: pre-flight succeeds (row exists), then the test
+        deletes the row mid-mint via a side-effect on create_agent_key.
+        """
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-vanish"
+        await _seed_agent_graph_node(db, agent_did)
+
+        mock_class = MagicMock()
+        mock_instance = MagicMock()
+        mock_instance.close = AsyncMock()
+        # Capture revoke calls.
+        mock_instance.delete_key = AsyncMock(return_value=True)
+
+        async def _create_then_delete_row(**_kwargs):
+            # Mid-mint: simulate the row vanishing (e.g. concurrent
+            # agent retirement during init).
+            await db.execute(
+                "DELETE FROM graph_nodes WHERE node_id = ?",
+                (agent_did,),
+            )
+            return MagicMock(
+                key="sk-or-v1-vanished-mid-mint",
+                key_hash="hash-vanish-1234",
+                limit_usd=50.0,
+            )
+
+        mock_instance.create_agent_key = AsyncMock(
+            side_effect=_create_then_delete_row
+        )
+        mock_class.return_value = mock_instance
+
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            with pytest.raises(PayerPolicyError) as excinfo:
+                await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        assert "vanished" in str(excinfo.value).lower() or \
+               "disappeared" in str(excinfo.value).lower()
+
+        # Critical assertions:
+        # 1. The remote key was minted.
+        assert mock_instance.create_agent_key.await_count == 1
+        # 2. The remote key was REVOKED (delete_key called with the hash).
+        mock_instance.delete_key.assert_awaited_once_with("hash-vanish-1234")
+        # 3. NO local key was stored (rollback before store_key).
+        agent_storage = ServiceKeyStorage(db, agent_did)
+        assert (await agent_storage.has_key("openrouter")) is False
+
+    @pytest.mark.asyncio
     async def test_mint_skipped_when_no_db(self) -> None:
         # Defensive: no db means no ServiceKeyStorage to write into.
         # Resolver should warn and skip rather than crash.
