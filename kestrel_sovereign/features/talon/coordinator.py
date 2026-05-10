@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,20 @@ from kestrel_sovereign.features.peers.mesh import (
     MeshMessage,
     MeshMessageType,
     make_assign_message,
+)
+from kestrel_sovereign.features.talon.runtime import (
+    TalonExecution,
+    TalonPolicy,
+    TalonPreference,
+    TalonRuntimeError,
+    TalonRuntimeRequest,
+    build_talon_invocation,
+    load_talon_policy_preference,
+    normalize_auth_lane,
+    normalize_backend,
+    resolve_runtime,
+    sanitize_env_for_backend,
+    write_talon_preference,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,10 +110,14 @@ class TalonCoordinatorFeature(Feature):
         self,
         repo: str,
         issue: int,
-        max_iterations: int = 3,
-        model: str = "opus",
-        skip_clarification: bool = True,
+        max_iterations: Optional[int] = None,
+        max_turns: Optional[int] = None,
+        backend: Optional[str] = None,
+        model: Optional[str] = None,
+        auth_lane: Optional[str] = None,
+        skip_clarification: Optional[bool] = None,
         worktree: bool = True,
+        self_review: Optional[bool] = None,
     ) -> ToolResult:
         """Claim an issue for Talon to implement.
 
@@ -116,12 +135,16 @@ class TalonCoordinatorFeature(Feature):
                 special string ``"self"`` resolves to
                 ``KestrelSovereignAI/kestrel-sovereign``.
             issue: Issue number to claim.
-            max_iterations: Max LLM implementation iterations
-                (default 3 — README recommends 2+ for non-trivial work).
-            model: Claude model: ``opus``, ``sonnet``, or ``haiku``.
-                Default is ``opus`` per ``feedback_kestrel_talon.md``
-                — Sonnet has a track record of reading files and
-                stopping without committing.
+            max_iterations: Max LLM implementation iterations. If unset,
+                uses ``[talon.preference].max_iterations``.
+            max_turns: Max agent turns per Talon iteration. If unset,
+                uses ``[talon.preference].max_turns``.
+            backend: Talon runtime backend: ``claude``, ``codex``, or
+                ``opencode``. This is separate from Kestrel chat LLM routing.
+            model: Backend-specific model. Claude accepts ``opus``,
+                ``sonnet``, or ``haiku``; Codex accepts current Codex model
+                IDs; OpenCode accepts provider/model IDs.
+            auth_lane: ``oauth``, ``api_key``, or ``provider_config``.
             skip_clarification: If True, skip the analysis/clarification
                 phase. Recommended when nobody is watching to answer
                 questions; the issue body should already be specific.
@@ -135,31 +158,75 @@ class TalonCoordinatorFeature(Feature):
             "job_id": ..., "log_path": ..., "pid": ...}`` on success.
             Failure returns ``{"dispatched": False, "error": ...}``.
         """
-        # Mesh dispatch is preserved as a fast-path for environments
-        # where Talon IS a registered multi_agent agent. In the standard
-        # standalone-CLI layout it's not, and this returns dispatched
-        # False quickly so we fall through to the CLI path.
-        mesh_result = await self._dispatch_via_mesh(repo, issue)
-        if mesh_result.get("dispatched"):
-            # Mesh dispatch returns ``message_id`` (not ``job_id``) — that's
-            # the tracking id the agent/user needs to follow up.
-            tracking_id = (
-                mesh_result.get("job_id")
-                or mesh_result.get("message_id")
-                or "?"
+        try:
+            policy, preference = load_talon_policy_preference()
+            runtime_request = TalonRuntimeRequest(
+                backend=normalize_backend(backend),
+                model=model,
+                auth_lane=normalize_auth_lane(auth_lane),
             )
-            return ToolResult.ok(
-                confirmation=(
-                    f"Dispatched {repo}#{issue} to talon via mesh "
-                    f"(message_id={tracking_id})"
-                ),
-                data=mesh_result,
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "dispatched": False,
+                    "state": "invalid_talon_runtime",
+                    "error": str(e),
+                },
             )
+
+        try:
+            resolved_backend, resolved_model, resolved_auth_lane = resolve_runtime(
+                runtime_request,
+                preference,
+                policy,
+            )
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "dispatched": False,
+                    "state": "talon_policy_rejected",
+                    "error": str(e),
+                },
+            )
+
+        # Mesh dispatch only carries repo/issue today, so using it for a
+        # non-default runtime would silently ignore the agent's Talon controls.
+        use_mesh = (
+            resolved_backend == "claude"
+            and resolved_model == "opus"
+            and resolved_auth_lane == "oauth"
+            and backend is None
+            and model is None
+            and auth_lane is None
+        )
+        if use_mesh:
+            mesh_result = await self._dispatch_via_mesh(repo, issue)
+            if mesh_result.get("dispatched"):
+                # Mesh dispatch returns ``message_id`` (not ``job_id``) —
+                # that's the tracking id the agent/user needs to follow up.
+                tracking_id = (
+                    mesh_result.get("job_id")
+                    or mesh_result.get("message_id")
+                    or "?"
+                )
+                return ToolResult.ok(
+                    confirmation=(
+                        f"Dispatched {repo}#{issue} to talon via mesh "
+                        f"(message_id={tracking_id})"
+                    ),
+                    data=mesh_result,
+                )
 
         repo_resolved = self._resolve_repo(repo)
         workspace = self._workspace_path_for(repo_resolved)
 
-        unsafe_reason = self._assert_workspace_safe(workspace)
+        unsafe_reason = (
+            self._assert_workspace_safe(workspace)
+            if policy.require_sandboxed_workspace
+            else None
+        )
         if unsafe_reason:
             return ToolResult.failed(
                 unsafe_reason,
@@ -200,27 +267,59 @@ class TalonCoordinatorFeature(Feature):
             or str(workspace.parent)
         )
 
-        args = [
-            "claim",
-            "--repo", repo_resolved,
-            "--issue", str(issue),
-            "--max-iterations", str(max_iterations),
-            "--model", model,
-            "--repo-dir", str(workspace),
-        ]
-        if worktree:
-            args += ["--worktree", "--worktree-base", worktree_base]
-        if skip_clarification:
-            args.append("--skip-clarification")
+        try:
+            execution = TalonExecution(
+                repo=repo_resolved,
+                issue=issue,
+                repo_dir=workspace,
+                worktree_base=Path(worktree_base),
+                worktree=worktree,
+                max_iterations=(
+                    int(max_iterations)
+                    if max_iterations is not None
+                    else preference.max_iterations
+                ),
+                max_turns=(
+                    int(max_turns)
+                    if max_turns is not None
+                    else preference.max_turns
+                ),
+                skip_clarification=(
+                    bool(skip_clarification)
+                    if skip_clarification is not None
+                    else preference.skip_clarification
+                ),
+                self_review=(
+                    bool(self_review)
+                    if self_review is not None
+                    else preference.self_review
+                ),
+            )
+            invocation = build_talon_invocation(
+                runtime_request,
+                execution,
+                policy=policy,
+                preference=preference,
+            )
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={
+                    "dispatched": False,
+                    "state": "talon_policy_rejected",
+                    "error": str(e),
+                },
+            )
 
         cli_result = await self._dispatch_via_cli_background(
-            args,
+            invocation.argv,
             label=f"claim:{repo_resolved}#{issue}",
+            env=invocation.env,
             extra_meta={
                 "repo": repo_resolved,
                 "issue": issue,
-                "model": model,
                 "workspace": str(workspace),
+                **invocation.metadata(),
             },
         )
 
@@ -236,6 +335,79 @@ class TalonCoordinatorFeature(Feature):
         return ToolResult.failed(
             cli_result.get("error") or "talon CLI dispatch failed",
             data=cli_result,
+        )
+
+    @tool(
+        name="talon_get_config",
+        description=(
+            "Read Talon runtime policy and mutable preference. This is the "
+            "agent's control surface for its coding-agent backend/model, "
+            "separate from normal chat LLM routing."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!talon config",
+    )
+    async def talon_get_config(self) -> ToolResult:
+        """Return effective Talon policy and preference."""
+        try:
+            policy, preference = load_talon_policy_preference()
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={"success": False, "error": str(e)},
+            )
+        return ToolResult.ok(
+            confirmation=(
+                "Talon config loaded "
+                f"(default={preference.default_backend}/{preference.default_model})"
+            ),
+            data={
+                "success": True,
+                "policy": asdict(policy),
+                "preference": asdict(preference),
+            },
+        )
+
+    @tool(
+        name="talon_set_config",
+        description=(
+            "Update mutable Talon preferences only: default backend/model, "
+            "auth lane, iterations, turns, clarification, and self-review. "
+            "Operator policy is not changed by this tool."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon set-config",
+    )
+    async def talon_set_config(
+        self,
+        default_backend: Optional[str] = None,
+        default_model: Optional[str] = None,
+        default_auth_lane: Optional[str] = None,
+        max_iterations: Optional[int] = None,
+        max_turns: Optional[int] = None,
+        skip_clarification: Optional[bool] = None,
+        self_review: Optional[bool] = None,
+    ) -> ToolResult:
+        """Persist Talon preference updates under ``[talon.preference]``."""
+        updates = {
+            "default_backend": default_backend,
+            "default_model": default_model,
+            "default_auth_lane": default_auth_lane,
+            "max_iterations": max_iterations,
+            "max_turns": max_turns,
+            "skip_clarification": skip_clarification,
+            "self_review": self_review,
+        }
+        try:
+            result = write_talon_preference(updates)
+        except TalonRuntimeError as e:
+            return ToolResult.failed(
+                str(e),
+                data={"success": False, "error": str(e)},
+            )
+        return ToolResult.ok(
+            confirmation="Talon preference updated",
+            data={"success": True, **result},
         )
 
     @tool(
@@ -1118,35 +1290,26 @@ class TalonCoordinatorFeature(Feature):
     )
 
     @staticmethod
-    def _build_subprocess_env() -> Dict[str, str]:
+    def _build_subprocess_env(
+        backend: str = "claude",
+        auth_lane: str = "oauth",
+    ) -> Dict[str, str]:
         """Construct the env dict for a kestrel-talon subprocess.
 
-        Removes Anthropic API-key vars so talon falls back to Claude
-        Max OAuth, and verifies a GitHub token is present (talon
-        cannot do anything useful without one). Raises ``RuntimeError``
-        with an actionable message if a required var is missing —
-        callers convert that into a structured ``dispatched=False``
-        response so the agent can surface the actual cause.
+        Backend-specific sanitization keeps Talon from inheriting credentials
+        unrelated to the selected runtime, and verifies a GitHub token is
+        present. Raises ``RuntimeError`` with an actionable message if a
+        required var is missing; callers convert that into a structured
+        ``dispatched=False`` response.
         """
-        env = {**os.environ}
-        for key in TalonCoordinatorFeature._ANTHROPIC_KEYS_TO_STRIP:
-            env.pop(key, None)
-
-        gh_token = (
-            env.get("GH_TOKEN")
-            or env.get("GITHUB_TOKEN")
-            or env.get("GITHUB_PAT")
-        )
-        if not gh_token:
-            raise RuntimeError(
-                "kestrel-talon needs GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT "
-                "in the kestrel-sovereign environment to access GitHub. "
-                "Set one in .env (use `gh auth token --user UncleSaurus`)."
+        try:
+            env, _stripped = sanitize_env_for_backend(
+                normalize_backend(backend) or "claude",
+                normalize_auth_lane(auth_lane) or "oauth",
             )
-        # Mirror to both names talon's downstream tools accept.
-        env.setdefault("GITHUB_TOKEN", gh_token)
-        env.setdefault("GH_TOKEN", gh_token)
-        return env
+            return env
+        except TalonRuntimeError as e:
+            raise RuntimeError(str(e)) from e
 
     def _job_log_dir(self) -> Path:
         """Where job log files live.
@@ -1169,6 +1332,7 @@ class TalonCoordinatorFeature(Feature):
         self,
         args: List[str],
         label: str,
+        env: Optional[Dict[str, str]] = None,
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Launch kestrel-talon as a background subprocess and return.
@@ -1190,10 +1354,11 @@ class TalonCoordinatorFeature(Feature):
                 ),
             }
 
-        try:
-            env = self._build_subprocess_env()
-        except RuntimeError as e:
-            return {"dispatched": False, "error": str(e)}
+        if env is None:
+            try:
+                env = self._build_subprocess_env()
+            except RuntimeError as e:
+                return {"dispatched": False, "error": str(e)}
 
         job_id = uuid.uuid4().hex
         log_path = self._job_log_dir() / f"{job_id}.log"

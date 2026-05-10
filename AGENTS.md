@@ -55,20 +55,30 @@ Autonomous GitHub issue processing is handled by the standalone [`kestrel-talon`
 
 ```bash
 # Process a specific issue
-kestrel-talon claim --repo owner/repo --issue 42
+kestrel-talon claim --repo owner/repo --issue 42 --backend codex --codex-model gpt-5.5
 
 # Multi-iteration for complex issues
-kestrel-talon claim --repo owner/repo --issue 42 --max-iterations 5
+kestrel-talon claim --repo owner/repo --issue 42 --backend codex --codex-model gpt-5.5 --max-iterations 5
 
 # PRD batch mode
 kestrel-talon batch --prd prd.json
 ```
 
+Kestrel's in-agent Talon feature has its own runtime control surface. Use
+`talon_get_config` / `talon_set_config` to manage mutable Talon preferences
+such as default backend/model, while operator policy remains in
+`[talon.policy]`. Talon runtime is intentionally separate from Kestrel chat
+LLM routing: `backend="codex"` uses ChatGPT/Codex OAuth, `backend="claude"`
+uses Claude OAuth or API billing according to `auth_lane`, and
+`backend="opencode"` delegates provider selection to OpenCode config. Omit
+the Codex model unless you need to pin one; Talon/Codex should otherwise use
+its current default model.
+
 ### Environment Variables
 
 ```bash
 GITHUB_TOKEN=ghp_...              # GitHub PAT with repo access
-ANTHROPIC_API_KEY=sk-ant-...      # Claude API key
+ANTHROPIC_API_KEY=sk-ant-...      # Claude API key (only for auth_lane=api_key)
 GITHUB_HUMAN_REVIEWER=username    # Human for blocked issues (optional)
 ```
 

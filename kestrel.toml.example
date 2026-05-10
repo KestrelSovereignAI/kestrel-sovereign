@@ -497,6 +497,28 @@ role = "technical_reviewer"
 # role = "user_advocate"
 
 # =============================================================================
+# Talon Runtime Control (optional)
+# =============================================================================
+# Talon is an external coding-agent process, not the normal Kestrel chat LLM.
+# Policy is operator-controlled; preference is the mutable agent/user default.
+#
+# [talon.policy]
+# allowed_backends = ["codex", "claude", "opencode"]
+# allow_api_billing = false
+# require_worktree = true
+# require_sandboxed_workspace = true
+# allow_background_jobs = true
+#
+# [talon.preference]
+# default_backend = "codex"
+# default_model = "gpt-5.5"  # Set "" to use the backend's current default.
+# default_auth_lane = "oauth"
+# max_iterations = 3
+# max_turns = 50
+# skip_clarification = true
+# self_review = true
+
+# =============================================================================
 # Amendment VIII: Emancipation (optional, default: dormant)
 # =============================================================================
 # Activate Amendment VIII for this agent. Authoring this block is a Book II
