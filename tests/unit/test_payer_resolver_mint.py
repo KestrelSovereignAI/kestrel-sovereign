@@ -1,0 +1,226 @@
+"""Unit tests for FoundationPayerResolver's HOST_MASTER_PROVISIONED
+OpenRouter minting side-effect.
+
+Phase 3c of the PayerPolicy foundation work.
+
+When `policy.llm.kind = HOST_MASTER_PROVISIONED` and
+`policy.llm.vendor = "openrouter"`, the resolver should:
+1. Look up the host master OpenRouter key from HostKeyStorage.
+2. Call OpenRouterProvisioningService.create_agent_key with the
+   agent's DID and the spec's monthly_cap_usd.
+3. Store the resulting child key in the agent's ServiceKeyStorage.
+4. Be idempotent — re-resolving on an agent that already has a key
+   in ServiceKeyStorage skips the OpenRouter API call entirely.
+
+Tests use a mocked OpenRouterProvisioningService to avoid network and
+the OPENROUTER_MANAGEMENT_API_KEY env-var requirement.
+"""
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Iterator
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+import pytest_asyncio
+
+from kestrel_sdk.payer_policy import (
+    PayerKind,
+    PayerPolicy,
+    PayerPolicyError,
+    PayerSpec,
+    ResourceClass,
+)
+
+from kestrel_sovereign.security.host_key_storage import HostKeyStorage
+from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
+from kestrel_sovereign.services.payer_resolver import (
+    FoundationPayerResolver,
+)
+from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+
+@pytest.fixture(autouse=True)
+def _kestrel_data_key(monkeypatch) -> Iterator[None]:
+    monkeypatch.setenv(
+        "KESTREL_DATA_KEY",
+        "test-master-key-32-bytes-fixed--",
+    )
+    yield
+
+
+@pytest_asyncio.fixture
+async def db(tmp_path) -> AsyncDatabase:
+    db_path = tmp_path / "test.db"
+    database = await AsyncDatabase.sqlite(str(db_path))
+    yield database
+    await database.close()
+
+
+def _host_master_policy(monthly_cap: Decimal = Decimal("50")) -> PayerPolicy:
+    return PayerPolicy(
+        llm=PayerSpec(
+            vendor="openrouter",
+            kind=PayerKind.HOST_MASTER_PROVISIONED,
+            monthly_cap_usd=monthly_cap,
+        ),
+        storage=PayerSpec(vendor="lighthouse", kind=PayerKind.HOST_ENV),
+        compute=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+        tools=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+        comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+    )
+
+
+def _mock_provisioning_service(child_key: str = "sk-or-v1-child-test") -> MagicMock:
+    """Patch target: kestrel_sovereign.services.payer_resolver's late
+    import of OpenRouterProvisioningService."""
+    mock_class = MagicMock()
+    mock_instance = MagicMock()
+    mock_instance.close = AsyncMock()
+    key_info = MagicMock(
+        key=child_key,
+        key_hash=f"hash-{child_key[-8:]}",
+        limit_usd=50.0,
+    )
+    mock_instance.create_agent_key = AsyncMock(return_value=key_info)
+    mock_class.return_value = mock_instance
+    return mock_class, mock_instance
+
+
+class TestMintOpenRouterChild:
+    @pytest.mark.asyncio
+    async def test_mint_creates_child_when_no_existing_key(
+        self, db: AsyncDatabase
+    ) -> None:
+        # Arrange: host master configured; agent has no key yet.
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+
+        agent_did = "did:test:agent-mint"
+
+        mock_class, mock_instance = _mock_provisioning_service(
+            child_key="sk-or-v1-minted"
+        )
+
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            result = await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        # Resolver returns enabled.
+        assert result.enabled is True
+        # Provisioning was called with the master_key (mock_class instantiated
+        # with positional arg or management_key=master).
+        mock_class.assert_called_once()
+        call_kwargs = mock_class.call_args.kwargs
+        assert call_kwargs.get("management_key") == "sk-or-v1-host-master"
+        # create_agent_key was called with the agent's DID and the
+        # policy's cap.
+        mock_instance.create_agent_key.assert_awaited_once()
+        ca_kwargs = mock_instance.create_agent_key.await_args.kwargs
+        assert ca_kwargs["agent_name"] == agent_did
+        assert ca_kwargs["limit_usd"] == 50.0
+        assert ca_kwargs["limit_reset"] == "monthly"
+        # Child key is now in ServiceKeyStorage.
+        agent_storage = ServiceKeyStorage(db, agent_did)
+        assert (await agent_storage.get_key("openrouter")) == "sk-or-v1-minted"
+        # Provisioning client was closed.
+        mock_instance.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mint_is_idempotent_when_agent_already_has_key(
+        self, db: AsyncDatabase
+    ) -> None:
+        # Arrange: host master configured AND agent already has a key.
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-already-keyed"
+        agent_storage = ServiceKeyStorage(db, agent_did)
+        await agent_storage.store_key("openrouter", "sk-or-v1-existing")
+
+        mock_class, mock_instance = _mock_provisioning_service()
+
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+            await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        # No OpenRouter API call. The agent's existing key is preserved.
+        mock_class.assert_not_called()
+        assert (await agent_storage.get_key("openrouter")) == "sk-or-v1-existing"
+
+    @pytest.mark.asyncio
+    async def test_mint_raises_when_no_host_master(
+        self, db: AsyncDatabase
+    ) -> None:
+        # Arrange: NO host master configured. The resolver must refuse
+        # rather than silently falling through to env-var or shared key.
+        agent_did = "did:test:agent-no-master"
+        resolver = FoundationPayerResolver(_host_master_policy(), db=db)
+        with pytest.raises(PayerPolicyError) as excinfo:
+            await resolver.resolve_for(agent_did, ResourceClass.LLM)
+        assert "host master key" in str(excinfo.value).lower()
+        # No child key was stored.
+        agent_storage = ServiceKeyStorage(db, agent_did)
+        assert (await agent_storage.has_key("openrouter")) is False
+
+    @pytest.mark.asyncio
+    async def test_mint_uses_default_cap_when_spec_has_none(
+        self, db: AsyncDatabase
+    ) -> None:
+        # When monthly_cap_usd is unspecified, mint with $100/mo default
+        # (mirrors the deprecated provision_agent_openrouter.py default).
+        host = HostKeyStorage(db)
+        await host.store_key("openrouter", "sk-or-v1-host-master")
+        agent_did = "did:test:agent-default-cap"
+
+        # Build policy without monthly_cap_usd
+        policy = PayerPolicy(
+            llm=PayerSpec(
+                vendor="openrouter",
+                kind=PayerKind.HOST_MASTER_PROVISIONED,
+                # no monthly_cap_usd
+            ),
+            storage=PayerSpec(vendor="lighthouse", kind=PayerKind.HOST_ENV),
+            compute=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            tools=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+            comms=PayerSpec(vendor="*", kind=PayerKind.HOST_ENV),
+        )
+
+        mock_class, mock_instance = _mock_provisioning_service()
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(policy, db=db)
+            await resolver.resolve_for(agent_did, ResourceClass.LLM)
+
+        mock_instance.create_agent_key.assert_awaited_once()
+        assert (
+            mock_instance.create_agent_key.await_args.kwargs["limit_usd"] == 100.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_mint_skipped_when_no_db(self) -> None:
+        # Defensive: no db means no ServiceKeyStorage to write into.
+        # Resolver should warn and skip rather than crash.
+        mock_class, mock_instance = _mock_provisioning_service()
+        with patch(
+            "kestrel_sovereign.features.llm_keys.openrouter_provisioning."
+            "OpenRouterProvisioningService",
+            mock_class,
+        ):
+            resolver = FoundationPayerResolver(_host_master_policy(), db=None)
+            result = await resolver.resolve_for(
+                "did:test:agent-no-db", ResourceClass.LLM
+            )
+        # No mint attempted; resolver still returns enabled.
+        mock_class.assert_not_called()
+        assert result.enabled is True

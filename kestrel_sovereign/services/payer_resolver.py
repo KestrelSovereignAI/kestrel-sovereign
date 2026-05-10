@@ -152,6 +152,16 @@ class FoundationPayerResolver:
                 "the SDK pin is too loose."
             )
 
+        # Phase 3c: side-effect for HOST_MASTER_PROVISIONED on OpenRouter.
+        # Mint a per-agent child key against the host's master OpenRouter
+        # key if one doesn't already exist. Idempotent.
+        if (
+            spec.kind is PayerKind.HOST_MASTER_PROVISIONED
+            and resource_class is ResourceClass.LLM
+            and spec.vendor == "openrouter"
+        ):
+            await self._maybe_mint_openrouter_child(agent_did, spec)
+
         if spec.kind is PayerKind.HOST_ENV or spec.kind in delegated_master_kinds:
             logger.debug(
                 f"PayerPolicy.{resource_class.value}: HOST_ENV for agent "
@@ -194,6 +204,96 @@ class FoundationPayerResolver:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    async def _maybe_mint_openrouter_child(
+        self,
+        agent_did: str,
+        spec: PayerSpec,
+    ) -> None:
+        """Mint a per-agent OpenRouter child key under the host master,
+        if the agent doesn't already have one. Idempotent.
+
+        Called from resolve_for on (LLM, openrouter, HOST_MASTER_PROVISIONED).
+        Reads the host master key from HostKeyStorage, calls
+        OpenRouterProvisioningService.create_agent_key with the agent's
+        DID and the policy's monthly_cap_usd, stores the resulting child
+        key in ServiceKeyStorage. Subsequent agent inits and
+        LLMService.use_agent_key calls find it there.
+
+        Raises:
+            PayerPolicyError: If the host master key is not configured
+                (operator must run setup wizard or provision manually
+                via scripts/manage_openrouter_keys.py).
+            OpenRouterProvisioningError: If the OpenRouter API call fails
+                (rate limited, network error, invalid master, etc.).
+        """
+        if self._db is None:
+            # No agent storage to check or write to. Caller (agent-init
+            # layer) should have provided db; skipping here is safer than
+            # silently using the host master directly.
+            logger.warning(
+                "PayerResolver: _maybe_mint_openrouter_child called without "
+                "db; skipping mint. Per-agent key isolation degraded."
+            )
+            return
+
+        # Late imports: keep module-level deps minimal so this resolver
+        # is importable even on deployments that haven't installed the
+        # OpenRouter provisioning surface (which depends on httpx).
+        from kestrel_sovereign.security.host_key_storage import HostKeyStorage
+        from kestrel_sovereign.security.service_key_storage import (
+            ServiceKeyStorage,
+        )
+        from kestrel_sovereign.features.llm_keys.openrouter_provisioning import (
+            OpenRouterProvisioningService,
+        )
+
+        # Idempotent: skip if agent already has an OpenRouter key.
+        agent_storage = ServiceKeyStorage(self._db, agent_did)
+        if await agent_storage.has_key("openrouter"):
+            logger.debug(
+                f"PayerResolver: agent {agent_did[:30]}... already has "
+                "OpenRouter key; skipping mint."
+            )
+            return
+
+        # Look up the host master.
+        host_storage = HostKeyStorage(self._db)
+        if not await host_storage.has_key("openrouter"):
+            from kestrel_sdk.payer_policy import PayerPolicyError
+            raise PayerPolicyError(
+                "PayerPolicy.llm.kind = HOST_MASTER_PROVISIONED for openrouter, "
+                "but no host master key is configured in HostKeyStorage. "
+                "Run the setup wizard or use scripts/manage_openrouter_keys.py "
+                "to provision the operator's master key before agent init."
+            )
+        master_key = await host_storage.get_key("openrouter")
+
+        # Mint the child.
+        provisioning = OpenRouterProvisioningService(management_key=master_key)
+        try:
+            # Per-agent monthly cap from the policy spec; default $100/mo
+            # mirrors the deprecated provision_agent_openrouter.py default.
+            limit_usd = float(spec.monthly_cap_usd) if spec.monthly_cap_usd is not None else 100.0
+            key_info = await provisioning.create_agent_key(
+                agent_name=agent_did,
+                limit_usd=limit_usd,
+                limit_reset="monthly",
+            )
+        finally:
+            await provisioning.close()
+
+        # Persist the child in ServiceKeyStorage. Subsequent
+        # use_agent_key calls find it via key_storage.get_key("openrouter").
+        await agent_storage.store_key(
+            provider_id="openrouter",
+            api_key=key_info.key,
+        )
+        logger.info(
+            f"PayerResolver: minted OpenRouter child key for agent "
+            f"{agent_did[:30]}... (hash {key_info.key_hash[:16]}..., "
+            f"limit ${limit_usd:.2f}/mo)"
+        )
 
     def _spec_for(self, resource_class: ResourceClass) -> PayerSpec:
         if resource_class is ResourceClass.LLM:

@@ -899,39 +899,37 @@ class KestrelAgent(
                         f"LLMService.disabled = True"
                     )
                 else:
-                    # Any enabled kind. If the agent has a previously-
-                    # provisioned key (via the deprecated openrouter_key_hash
-                    # metadata field, or via Phase 3c resolver-driven minting),
-                    # swap the LLMService to use it. Without this branch,
-                    # agents that manually provisioned via
-                    # scripts/provision_agent_openrouter.py would silently
-                    # fall back to the shared host key on no-payments
-                    # deployments (host_env_default). Same logic applies to
-                    # any *_MASTER_PROVISIONED policy.
-                    openrouter_key_hash = agent_node.properties.get(
-                        "openrouter_key_hash"
-                    )
-                    if openrouter_key_hash:
-                        try:
-                            key_activated = await self.llm_service.use_agent_key(
-                                agent_did=self.did,
-                                db=self._raw_storage.db,
-                                provider="openrouter",
+                    # Always try to swap to a per-agent key. use_agent_key
+                    # returns False if no key is in ServiceKeyStorage —
+                    # same end result as today's no-key-hash condition,
+                    # but no longer keyed off the deprecated
+                    # openrouter_key_hash metadata field. Phase 3c's
+                    # resolver may have just minted a child key under
+                    # HOST_MASTER_PROVISIONED policy; this call picks it
+                    # up. Manually-provisioned agents (via
+                    # scripts/provision_agent_openrouter.py) also work
+                    # here because that script writes to the same
+                    # ServiceKeyStorage.
+                    try:
+                        key_activated = await self.llm_service.use_agent_key(
+                            agent_did=self.did,
+                            db=self._raw_storage.db,
+                            provider="openrouter",
+                        )
+                        if key_activated:
+                            logging.info(
+                                f"Agent using own OpenRouter key "
+                                f"(agent={self.did[:30]}...)"
                             )
-                            if key_activated:
-                                logging.info(
-                                    f"Agent using own OpenRouter key "
-                                    f"(hash: {openrouter_key_hash[:16]}...)"
-                                )
-                        except (KeyError, ValueError, AttributeError, ConnectionError) as e:
-                            logging.warning(
-                                f"Could not activate agent OpenRouter key: {e}"
-                            )
-                        except Exception as e:
-                            logging.warning(
-                                f"Could not activate agent OpenRouter key: {e}",
-                                exc_info=True,
-                            )
+                    except (KeyError, ValueError, AttributeError, ConnectionError) as e:
+                        logging.warning(
+                            f"Could not activate agent OpenRouter key: {e}"
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            f"Could not activate agent OpenRouter key: {e}",
+                            exc_info=True,
+                        )
             except NotImplementedError:
                 # SELF_WALLET / phase-deferred kinds. Re-raise so the
                 # operator sees a clear failure rather than a half-init
