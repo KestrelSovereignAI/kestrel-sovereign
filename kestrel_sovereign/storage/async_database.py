@@ -249,6 +249,21 @@ CREATE TABLE IF NOT EXISTS agent_service_keys (
 CREATE INDEX IF NOT EXISTS idx_agent_service_keys_agent ON agent_service_keys(agent_did);
 CREATE INDEX IF NOT EXISTS idx_agent_service_keys_provider ON agent_service_keys(provider_id);
 
+-- Host (operator) master credentials for the HOST_MASTER_PROVISIONED
+-- payer-policy path. Single host per deployment. Sponsor and
+-- user-master variants are modeled separately if/when needed. See
+-- kestrel_sovereign.security.host_key_storage.HostKeyStorage.
+CREATE TABLE IF NOT EXISTS host_service_keys (
+    id TEXT PRIMARY KEY,
+    provider_id TEXT NOT NULL UNIQUE,
+    encrypted_key TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_host_service_keys_provider ON host_service_keys(provider_id);
+
 CREATE TABLE IF NOT EXISTS service_key_usage (
     id TEXT PRIMARY KEY,
     key_id TEXT NOT NULL,

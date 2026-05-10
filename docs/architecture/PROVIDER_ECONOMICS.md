@@ -12,6 +12,40 @@ Kestrel operates as a **provider middleman**, enabling users to either bring the
 1. **Referral Revenue**: Commission from providers when users sign up via our links (Direct Mode)
 2. **Margin Revenue**: Markup on provider costs when we manage infrastructure (Managed Mode)
 
+## PayerPolicy Foundation (2026-05)
+
+Below the two-mode framing sits a foundation primitive — `PayerPolicy` — that names *who pays for which metered resource* per agent. Direct Mode and Managed Mode are user-facing labels; PayerPolicy is the per-agent declarative knob the framework reasons about. See [PAYER_POLICY_FOUNDATION.md](PAYER_POLICY_FOUNDATION.md) for the full plan; the schema lives in the [kestrel-sovereign-sdk repo](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk) at `kestrel_sdk/payer_policy.py`.
+
+### Six funding patterns
+
+| `PayerKind` | Mode framing | Who pays | Implementation |
+|---|---|---|---|
+| `HOST_ENV` | Direct (operator's env) | Operator's env vars | Today's standalone behavior — preserved as a first-class default |
+| `HOST_MASTER_PROVISIONED` | Managed | Operator's master account; child key per agent | Master in `HostKeyStorage`; resolver mints child via OpenRouter Provisioning API |
+| `USER_MASTER_PROVISIONED` | Direct (user-bound) | User's own master account | Same mechanism; `master_did` carries user DID |
+| `SPONSOR` | Managed (third-party) | Third party (family member, employer, etc.) | Same mechanism; `master_did` carries sponsor DID |
+| `SELF_WALLET` | Sovereign-pays | Agent's own crypto wallet (e.g. x402) | **Deferred (matrix `NOT_IMPLEMENTED`)** — Phase 3.5 of the plan ships the Lighthouse wallet-signed key flow; LLM `x402` deferred indefinitely until the standard matures. The wizard refuses to offer this kind for any resource until Phase 3.5 lands. |
+| `NONE` | (none) | Resource is unavailable to this agent | `LLMService.disabled = True`; storage provider not constructed |
+
+### Resource classes
+
+A `PayerPolicy` carries one `PayerSpec(vendor, kind, master_did?, monthly_cap_usd?)` per resource class:
+
+- **llm** — LLM inference (OpenRouter, local Ollama, …)
+- **storage** — IPFS/file storage (Lighthouse, local-disk)
+- **compute** — GPU rentals (host_env-only in v1; Phase 3.5+ for delegated kinds)
+- **tools** — third-party API calls (Tavily, Exa, ElevenLabs, …)
+- **comms** — email/SMS (Twilio, Resend, …)
+
+The wizard step (`kestrel setup payments`) only offers `(resource, vendor, kind)` triples that the SDK `SUPPORT_MATRIX` marks `READY` — operators cannot select a path the resolver cannot honor at runtime.
+
+### Source of truth + safety
+
+- The SDK's `SUPPORT_MATRIX` is the single source of truth that the wizard, resolver, and verify-step all consult.
+- The resolver also keeps a defense-in-depth gate that refuses delegated-master kinds for non-LLM resources, in case a future SDK release accidentally regresses the matrix.
+- The mint flow is **atomic-with-rollback**: on `HOST_MASTER_PROVISIONED` first use, the resolver mints a remote child key, persists `openrouter_key_hash` to `graph_nodes.properties` (so retirement can revoke), and only then stores the key locally. If persist fails (graph_nodes vanished mid-mint), the remote key is revoked before the resolver returns.
+- Per-agent `asyncio.Lock` (class-level on the resolver) prevents concurrent agent inits from minting two remote keys for the same DID.
+
 ## Architecture: Two Modes
 
 ```

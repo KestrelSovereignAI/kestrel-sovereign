@@ -229,21 +229,29 @@ class TestCrossUserIsolation:
         db_a = list(agent_a_dir.glob("*.db"))[0]
         db_b = list(agent_b_dir.glob("*.db"))[0]
 
-        llm_service = LLMService()
+        # Distinct LLMService instances per agent. Sharing one instance
+        # across two KestrelAgents is now rejected by attach_to_agent
+        # (LLMServiceAlreadyAttachedError) — `use_agent_key()` mutates
+        # `self.providers` in place, so a shared instance would silently
+        # leak the last-loaded agent's OpenRouter client to the other
+        # agent. This adversarial test was inadvertently exercising the
+        # forbidden shape; use distinct services here.
+        llm_service_a = LLMService()
+        llm_service_b = LLMService()
 
         try:
             # Create agents
             agent_a = KestrelAgent(
                 did="did:test:user_a",
                 storage_path=str(db_a),
-                llm_service=llm_service
+                llm_service=llm_service_a
             )
             await agent_a.initialize()
 
             agent_b = KestrelAgent(
                 did="did:test:user_b",
                 storage_path=str(db_b),
-                llm_service=llm_service
+                llm_service=llm_service_b
             )
             await agent_b.initialize()
 

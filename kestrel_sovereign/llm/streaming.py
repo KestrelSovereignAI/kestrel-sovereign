@@ -161,6 +161,7 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive
         """
+        self._check_policy()
         providers_to_use, target_model = self.resolve_provider_routing(
             model_override=model_override,
             force_local_only=force_local_only,
@@ -268,6 +269,7 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive (JSON chunks if response_format provided)
         """
+        self._check_policy()
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.
@@ -327,6 +329,7 @@ class StreamingMixin:
         Yields:
             Text chunks as they arrive from the LLM
         """
+        self._check_policy()
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.
@@ -475,6 +478,7 @@ class StreamingMixin:
                 for tc in tool_response.tool_calls:
                     result = await execute_tool(tc)
         """
+        self._check_policy()
         from .remote_backend import BackendType
 
         # Try remote GPU first when active AND routing isn't pinned — #734.

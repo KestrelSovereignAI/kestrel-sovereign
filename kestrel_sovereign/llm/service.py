@@ -107,6 +107,38 @@ class LLMServiceError(LLMError):
     """Raised when LLM service cannot fulfill a request."""
 
 
+class PolicyDeniedError(LLMServiceError):
+    """Raised when a generation call is attempted on an LLMService whose
+    PayerPolicy slot is `PayerKind.NONE`.
+
+    The agent-init layer sets `LLMService.disabled = True` when the
+    agent's policy says "no LLM at all" for this agent. Every public
+    generation entry point on `LLMService` (and its mixins) calls
+    `_check_policy()` at the top, which raises this error when
+    `disabled` is True. Callers (chat endpoints, reflection loops,
+    audit pipelines) treat this the same way they treat
+    `KeyNotConfiguredError` today: the agent has no LLM available;
+    surface a structured error rather than silently falling through to
+    a shared host key.
+    """
+
+
+class LLMServiceAlreadyAttachedError(LLMServiceError):
+    """Raised when a second agent tries to claim an LLMService that is
+    already attached to a different agent.
+
+    The PayerPolicy work in #1156's follow-up requires that each
+    `KestrelAgent` instance holds its own `LLMService` instance —
+    `LLMService.use_agent_key()` mutates `self.providers` in place, so a
+    shared instance would silently leak the last-loaded agent's
+    OpenRouter client to every other agent. Production code already
+    constructs one service per agent (see
+    `kestrel_sovereign/multi_agent/agent_manager.py:90-91`), but the
+    invariant is now enforced at construction time so it cannot
+    silently regress.
+    """
+
+
 class ModelNotAvailableForRoute(LLMError):
     """Raised by _try_single_provider when the target model isn't in the
     route's vendor catalog.
@@ -219,6 +251,21 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         self._storage_cache = None
         self._storage_cache_timestamp = None
         self._storage_cache_ttl = STORAGE_CACHE_TTL_SECONDS
+
+        # Per-agent claim. None until `attach_to_agent(agent_did)` is called;
+        # set thereafter. Subsequent `attach_to_agent` calls with the SAME
+        # DID are idempotent; calls with a DIFFERENT DID raise
+        # LLMServiceAlreadyAttachedError. See `attach_to_agent` for the
+        # invariant rationale.
+        self._owner_agent_did: Optional[str] = None
+
+        # PayerPolicy NONE flag. Set to True by the agent-init layer when
+        # the agent's policy slot for LLM is `PayerKind.NONE`. Phase 3b
+        # adds the `_check_policy()` guard on every generation entry point
+        # that raises PolicyDeniedError when this is True. Phase 3a only
+        # plumbs the flag; generation calls still go through (consistent
+        # with HOST_ENV behavior) until 3b lands the guard.
+        self.disabled: bool = False
 
         # Database for model usage tracking (uses abstract data layer)
         self._init_usage_tracking(database_url)
@@ -787,6 +834,68 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             logger.error(f"Failed to initialize providers: {e}")
             return []
 
+    def _check_policy(self) -> None:
+        """Guard called at the top of every public generation entry point.
+
+        When `PayerPolicy.llm.kind == PayerKind.NONE`, the agent-init
+        layer sets `self.disabled = True`. This method raises
+        `PolicyDeniedError` in that case, preventing every documented
+        generation method (`generate`, `get_response`, the streaming
+        variants, `get_audit_response`, etc.) from silently falling
+        through to a shared host key.
+
+        Centralized here so adding a new generation entry point in the
+        future means one line at the top of the new method instead of
+        re-implementing the gate. The Phase 3b reflection test asserts
+        every async-coroutine and async-generator method whose name
+        matches a generation pattern calls this guard.
+        """
+        if getattr(self, "disabled", False):
+            raise PolicyDeniedError(
+                "LLMService is disabled by PayerPolicy "
+                "(llm.kind = NONE). The agent has no LLM available; "
+                "callers should treat this the same as 'no key configured'."
+            )
+
+    def attach_to_agent(self, agent_did: str) -> None:
+        """Claim this LLMService instance for a specific agent.
+
+        Required invariant for the PayerPolicy work: each KestrelAgent
+        gets its own LLMService instance because `use_agent_key()`
+        mutates `self.providers` in place. Sharing a service across
+        agents would let the last-loaded agent silently steal every
+        other agent's OpenRouter client.
+
+        Production code already constructs one service per agent. This
+        method enforces that contract at construction time so the
+        invariant cannot silently regress (e.g. by a future test or a
+        well-meaning refactor that reuses an instance).
+
+        Args:
+            agent_did: The agent's DID. Must be non-empty.
+
+        Raises:
+            ValueError: If agent_did is empty.
+            LLMServiceAlreadyAttachedError: If this service is already
+                attached to a different agent.
+
+        Idempotent for repeated attach with the same DID, so a code path
+        that re-enters agent init (re-anchor flows, test reset, etc.)
+        does not double-fail.
+        """
+        if not agent_did:
+            raise ValueError("agent_did is required for attach_to_agent")
+        if self._owner_agent_did is None:
+            self._owner_agent_did = agent_did
+            return
+        if self._owner_agent_did == agent_did:
+            return
+        raise LLMServiceAlreadyAttachedError(
+            f"LLMService is already attached to agent {self._owner_agent_did[:30]}...; "
+            f"cannot re-attach to {agent_did[:30]}.... Construct a fresh LLMService "
+            "per agent (each agent's OpenRouter client mutation must be isolated)."
+        )
+
     async def use_agent_key(
         self,
         agent_did: str,
@@ -1207,6 +1316,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
     async def get_audit_response(self, text_to_audit: str) -> Dict[str, Any]:
         """Get a structured audit response from the normal provider chain."""
+        self._check_policy()
         if not self.providers:
             return {"risk_level": 1, "reasoning": "Audit skipped - no providers available."}
 
@@ -1330,6 +1440,7 @@ No other text or formatting.
         Returns:
             String content or LLMResponse (if tools provided or structured output)
         """
+        self._check_policy()
         start_time = time.time()
 
         if not self.providers:
@@ -1415,6 +1526,7 @@ No other text or formatting.
         auto_pull: bool = True
     ) -> str:
         """Get a response using a specific model."""
+        self._check_policy()
         provider_for_model = None
         for provider in self.providers:
             if provider["model"] == model_id or model_id in provider["model"]:
@@ -1558,6 +1670,7 @@ No other text or formatting.
         Returns:
             String content or LLMResponse (if tools/structured output)
         """
+        self._check_policy()
         with optional_span("agent.llm_call", {
             "llm.method": "generate",
             "llm.model": model_override or "",
@@ -1646,6 +1759,7 @@ No other text or formatting.
         Returns:
             String content or LLMResponse
         """
+        self._check_policy()
         # Try remote GPU first when active AND routing isn't pinned — #734.
         if (
             self._backend == BackendType.REMOTE_GPU

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-Rotate Emma's encryption key from temp passphrase to a secure passphrase.
+Rotate an agent's AEAD encryption-master passphrase.
 
 Usage:
-    python scripts/rotate_emma_key.py --old-pass "THIS IS A TEMP KEY FOR TESTING" --new-pass "your-secure-passphrase"
+    python scripts/rotate_agent_key.py --db agent_data/<agent>.db \\
+        --old-pass "OLD PASSPHRASE" --new-pass "NEW SECURE PASSPHRASE"
+
+The script re-encrypts all rows in the agent's database from the old
+passphrase to the new one, in a single transaction. Use --dry-run to
+preview without writing.
 """
 import asyncio
 import argparse
@@ -140,10 +145,10 @@ async def rotate_conversation_keys(db_path: str, old_pass: str, new_pass: str) -
 
 async def main():
     parser = argparse.ArgumentParser(
-        description="Rotate Emma's encryption key from old passphrase to new passphrase"
+        description="Rotate an agent's AEAD encryption-master passphrase"
     )
-    parser.add_argument("--db", default="agent_data/kestrel_prime.db",
-                        help="Path to agent database")
+    parser.add_argument("--db", required=True,
+                        help="Path to agent database (e.g. agent_data/<agent>.db)")
     parser.add_argument("--old-pass", required=True,
                         help="Old passphrase (the one used to encrypt)")
     parser.add_argument("--new-pass", required=True,
@@ -158,7 +163,7 @@ async def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("EMMA KEY ROTATION")
+    print("AGENT KEY ROTATION")
     print("=" * 60)
     print(f"Database: {args.db}")
     print(f"Old passphrase: {args.old_pass[:20]}...")
