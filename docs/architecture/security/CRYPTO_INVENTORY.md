@@ -47,8 +47,8 @@ None in use. ML-DSA, ML-KEM, SLH-DSA, hybrid combiners — all unimplemented.
 | Surface | File:Line | Key derivation |
 |---|---|---|
 | Private-key keystore | [`security/key_storage.py:31-37`, constants `48-53`](../../../kestrel_sovereign/security/key_storage.py#L48-L53) | PBKDF2-HMAC-SHA256, 600,000 iterations, 16-byte salt, 12-byte nonce, 32-byte key |
-| User API key storage | [`security/user_key_storage.py`](../../../kestrel_sovereign/security/user_key_storage.py) | Same pattern |
-| Platform API key storage | [`security/platform_key_storage.py`](../../../kestrel_sovereign/security/platform_key_storage.py) | Same pattern |
+| User API key storage *(Frinz)* | `frinz/security/user_key_storage.py` (Frinz repo) | Same pattern. Relocated out of `kestrel_sovereign/security/` in 2026-05 (kestrel-sovereign#1156, frinz#156); was Frinz product code in foundation. |
+| Platform API key storage *(Frinz)* | `frinz/security/platform_key_storage.py` (Frinz repo) | Same pattern. Relocated alongside `user_key_storage.py`. |
 | CAR keyring (per-shard data keys) | [`storage/sovereign_adapter.py:233-246`](../../../kestrel_sovereign/storage/sovereign_adapter.py#L233-L246) | `derive_key(b"KESTREL_KEYRING_V2")` from `KESTREL_DATA_KEY` master. 12-byte nonce, AES-GCM with no AAD. |
 
 ### Fernet (AES-128-CBC + HMAC-SHA256) — legacy path (Wave 0C kill target)
@@ -104,7 +104,7 @@ Six unit test files reference `Fernet` to exercise the production crypto: [`test
 | Constitution anchor stored on graph | [`agent/constitution.py:71`](../../../kestrel_sovereign/agent/constitution.py#L71) |
 | Constitution US-content hash for inception | [`inception_service.py:262-267`](../../../kestrel_sovereign/inception_service.py#L262-L267) |
 | Script content hash (signing input) | [`features/compute/script_signer.py:151`](../../../kestrel_sovereign/features/compute/script_signer.py#L151) |
-| API-key identifier hash | [`security/user_key_storage.py`](../../../kestrel_sovereign/security/user_key_storage.py) |
+| API-key identifier hash *(Frinz)* | `frinz/security/user_key_storage.py` (Frinz repo) |
 
 ### Keccak-256 — Ethereum address derivation only
 

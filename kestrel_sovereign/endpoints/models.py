@@ -828,7 +828,10 @@ async def get_available_key_sources(
     pool = _get_postgres_pool(agent)
     if pool is not None:
         try:
-            from kestrel_sovereign.services.layered_key_resolver import LayeredKeyResolver
+            # Frinz-side primitive (relocated 2026-05; see kestrel-sovereign#1156).
+            # ImportError on a foundation-only deployment lands in the
+            # outer except below and is logged at debug; sources stay False.
+            from frinz.services.layered_key_resolver import LayeredKeyResolver
             resolver = LayeredKeyResolver(pool)
             user_id = getattr(request.state, "user_id", None)
             agent_did = getattr(agent, "agent_id", None)
@@ -869,7 +872,14 @@ async def list_user_keys(request: Request):
         return {"keys": [], "count": 0, "available": False}
 
     try:
-        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        # Frinz-side primitive (relocated 2026-05; see kestrel-sovereign#1156).
+        from frinz.security.user_key_storage import UserKeyStorage
+    except ImportError:
+        # Foundation-only deployment (no Frinz installed). Same response
+        # as the no-pool path — multi-user BYOK requires Frinz.
+        return {"keys": [], "count": 0, "available": False}
+
+    try:
         user_storage = UserKeyStorage(pool, user_id)
         keys = await user_storage.list_keys()
         return {
@@ -921,7 +931,14 @@ async def add_user_key(request: Request):
         raise HTTPException(status_code=400, detail="passphrase must be at least 8 characters")
 
     try:
-        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        from frinz.security.user_key_storage import UserKeyStorage
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="User BYOK is only available on Frinz-platform deployments.",
+        )
+
+    try:
         user_storage = UserKeyStorage(pool, user_id)
         key_id = await user_storage.store_key(
             provider_id=provider_id,
@@ -958,7 +975,11 @@ async def verify_user_passphrase(request: Request):
         raise HTTPException(status_code=400, detail="passphrase is required")
 
     try:
-        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        from frinz.security.user_key_storage import UserKeyStorage
+    except ImportError:
+        return {"valid": False, "available": False}
+
+    try:
         user_storage = UserKeyStorage(pool, user_id)
         keys = await user_storage.list_keys()
         if not keys:
@@ -988,7 +1009,14 @@ async def delete_user_key(request: Request, provider: str):
         )
 
     try:
-        from kestrel_sovereign.security.user_key_storage import UserKeyStorage
+        from frinz.security.user_key_storage import UserKeyStorage
+    except ImportError:
+        raise HTTPException(
+            status_code=503,
+            detail="User BYOK is only available on Frinz-platform deployments.",
+        )
+
+    try:
         user_storage = UserKeyStorage(pool, user_id)
         deleted = await user_storage.delete_key(provider.lower())
         if not deleted:
@@ -1018,7 +1046,11 @@ async def get_platform_access(request: Request):
         return {"providers": [], "available": False}
 
     try:
-        from kestrel_sovereign.security.platform_key_storage import PlatformKeyStorage
+        from frinz.security.platform_key_storage import PlatformKeyStorage
+    except ImportError:
+        return {"providers": [], "available": False}
+
+    try:
         platform_storage = PlatformKeyStorage(pool)
         keys = await platform_storage.list_keys()
         providers = []
