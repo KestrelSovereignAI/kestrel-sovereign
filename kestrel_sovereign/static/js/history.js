@@ -263,6 +263,7 @@ window.loadConversation = async function(sessionId) {
         data.messages.forEach(msg => {
             if (msg.role !== 'system') {
                 let toolHtml = '';
+                let preludeContent = '';
                 let content = msg.content;
                 if (msg.role === 'assistant' && msg.metadata?.tool_events?.length > 0) {
                     const toolActivityText = msg.metadata.tool_events.map(ev => {
@@ -277,10 +278,18 @@ window.loadConversation = async function(sessionId) {
                     const split = splitToolActivity(content);
                     if (split.hasToolActivity) {
                         if (!toolHtml) toolHtml = renderToolActivityHtml(split.toolActivity);
+                        preludeContent = split.prelude;
                         content = split.response;
                     }
                 }
-                addMessageToChat(msg.role, content, msg.encrypted && !state.showDecrypted, msg.id, toolHtml);
+                addMessageToChat(
+                    msg.role,
+                    content,
+                    msg.encrypted && !state.showDecrypted,
+                    msg.id,
+                    toolHtml,
+                    preludeContent,
+                );
             }
         });
 
@@ -407,7 +416,14 @@ window.purgeMessage = async function(messageId, messageDiv) {
     }
 };
 
-function addMessageToChat(role, content, isEncrypted = false, messageId = null, toolActivityHtml = '') {
+function addMessageToChat(
+    role,
+    content,
+    isEncrypted = false,
+    messageId = null,
+    toolActivityHtml = '',
+    preludeContent = '',
+) {
     // Append into the visible (mounted) agent's pane element — the
     // viewport (#chat-container) is now the scroll host and panes are
     // its children, so writing directly to the viewport would orphan
@@ -446,7 +462,18 @@ function addMessageToChat(role, content, isEncrypted = false, messageId = null, 
         messageDiv.appendChild(purgeBtn);
     }
 
-    // Render tool activity above the message content
+    if (preludeContent) {
+        const preludeDiv = document.createElement('div');
+        preludeDiv.className = 'message-content response-prelude';
+        if (role === 'assistant' && window.marked) {
+            preludeDiv.innerHTML = marked.parse(preludeContent);
+        } else {
+            preludeDiv.textContent = preludeContent;
+        }
+        messageDiv.appendChild(preludeDiv);
+    }
+
+    // Render tool activity above the final message content
     if (toolActivityHtml) {
         messageDiv.insertAdjacentHTML('beforeend', toolActivityHtml);
     }

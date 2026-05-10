@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 globalThis.window = globalThis.window || {};
 globalThis.window.SharedMarkdown = {
-    renderMarkdown: () => '',
+    renderMarkdown: (s) => `<p>${s}</p>`,
     renderStreamingMarkdown: (s) => `<p>${s}</p>`,
     highlightCodeBlocks: () => {},
     renderMermaidDiagrams: () => {},
@@ -113,17 +113,34 @@ const {
     '../../kestrel_sovereign/static/js/chat.js'
 );
 
-test('renderToolActivityHtml returns a collapsed details block for tool calls', () => {
+test('renderToolActivityHtml returns a collapsed details block per tool call', () => {
     const html = renderToolActivityHtml([
         '\u{1F527} Calling save_fact...',
         '\u2713 save_fact complete (12ms)',
     ].join('\n'));
 
-    assert.match(html, /<details class="tool-activity-container tool-activity-expandable">/);
+    assert.match(html, /<div class="tool-activity-container">/);
+    assert.match(html, /<details class="tool-activity-expandable tool-activity-call">/);
     assert.match(html, /<summary class="tool-activity-summary">/);
     assert.match(html, /Tool call: save_fact/);
+    assert.match(html, /complete · 12ms · 2 events/);
     assert.match(html, /2 events/);
     assert.doesNotMatch(html, /<details[^>]*\sopen[\s>]/);
+});
+
+test('renderToolActivityHtml renders multiple tool calls as separate details blocks', () => {
+    const html = renderToolActivityHtml([
+        '\u{1F527} Calling first_tool...',
+        '\u{1F527} Calling second_tool...',
+        '\u2713 first_tool complete (3ms)',
+        '\u274C second_tool failed: denied',
+    ].join('\n'));
+
+    assert.equal((html.match(/<details class="tool-activity-expandable tool-activity-call">/g) || []).length, 2);
+    assert.match(html, /Tool call: first_tool/);
+    assert.match(html, /complete · 3ms · 2 events/);
+    assert.match(html, /Tool call: second_tool/);
+    assert.match(html, /error · denied · 2 events/);
 });
 
 test('renderToolActivityHtml escapes tool names and errors before inserting HTML', () => {
@@ -165,11 +182,31 @@ test('finalizeStreamingMessage preserves expandable tool activity after stream c
     );
 
     assert.match(contentDiv.innerHTML, /tool-activity-expandable/);
-    assert.match(contentDiv.innerHTML, /2 tool call events/);
+    assert.equal((contentDiv.innerHTML.match(/tool-activity-call/g) || []).length, 2);
     assert.match(contentDiv.innerHTML, /Calling memory_agency_feature/);
     const responseDiv = contentDiv.children.find((child) => child.classList?.contains('response-content'));
     assert.ok(responseDiv, 'final renderer must append a response-content child');
     assert.match(responseDiv.innerHTML, /I tried to save it\./);
+});
+
+test('finalizeStreamingMessage keeps pre-tool prose outside tool calls', async () => {
+    const msgDiv = makeNode();
+    const contentDiv = makeNode();
+    contentDiv.className = 'message-content streaming';
+    msgDiv.appendChild(contentDiv);
+
+    await finalizeStreamingMessage(
+        msgDiv,
+        'I will check that now.\n\u{1F527} Calling lookup...\n\u2713 lookup complete (7ms)\n---\nThe lookup finished.',
+    );
+
+    assert.match(contentDiv.innerHTML, /response-prelude/);
+    assert.match(contentDiv.innerHTML, /I will check that now\./);
+    assert.match(contentDiv.innerHTML, /tool-activity-container/);
+    assert.match(contentDiv.innerHTML, /Tool call: lookup/);
+    const responseDiv = contentDiv.children.find((child) => child.classList?.contains('response-content'));
+    assert.ok(responseDiv, 'final renderer must append final response content');
+    assert.match(responseDiv.innerHTML, /The lookup finished\./);
 });
 
 test('splitToolActivity leaves normal markdown horizontal rules alone', () => {
@@ -194,6 +231,21 @@ test('splitToolActivity preserves final text when no separator is emitted', () =
         '\u{1F527} Calling search_memory...\n\u2713 search_memory complete (11ms)',
     );
     assert.equal(split.response, 'Error: Maximum tool call iterations exceeded');
+});
+
+test('splitToolActivity keeps prose before the first tool call as prelude', () => {
+    const split = splitToolActivity([
+        'I will check that now.',
+        '\u{1F527} Calling lookup...',
+        '\u2713 lookup complete (7ms)',
+        '---',
+        'The lookup finished.',
+    ].join('\n'));
+
+    assert.equal(split.hasToolActivity, true);
+    assert.equal(split.prelude, 'I will check that now.');
+    assert.equal(split.toolActivity, '\u{1F527} Calling lookup...\n\u2713 lookup complete (7ms)');
+    assert.equal(split.response, 'The lookup finished.');
 });
 
 test('splitToolActivity does not collapse ordinary checkmark replies', () => {
