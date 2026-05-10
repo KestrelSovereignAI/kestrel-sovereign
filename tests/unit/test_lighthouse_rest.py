@@ -119,6 +119,41 @@ class TestLighthouseRestClient:
         assert result["data"]["dataLimit"] == "5000000000"
 
     @pytest.mark.asyncio
+    async def test_get_auth_message(self, client, mock_response):
+        resp = mock_response(json_data={"data": {"message": "Sign this"}})
+
+        with patch.object(client, "_get_client") as mock_get:
+            mock_http = AsyncMock()
+            mock_http.get = AsyncMock(return_value=resp)
+            mock_get.return_value = mock_http
+
+            result = await client.get_auth_message("0xabc")
+
+        assert result == "Sign this"
+        mock_http.get.assert_awaited_once_with(
+            f"{client.API_URL}/api/auth/get_message",
+            params={"publicKey": "0xabc"},
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_api_key(self, client, mock_response):
+        resp = mock_response(json_data={"data": {"apiKey": "lh-key"}})
+
+        with patch.object(client, "_get_client") as mock_get:
+            mock_http = AsyncMock()
+            mock_http.post = AsyncMock(return_value=resp)
+            mock_get.return_value = mock_http
+
+            result = await client.create_api_key("0xabc", "0xsig")
+
+        assert result == "lh-key"
+        mock_http.post.assert_awaited_once_with(
+            f"{client.API_URL}/api/auth/create_api_key",
+            params={"publicKey": "0xabc", "signature": "0xsig"},
+            headers={"Accept": "application/json"},
+        )
+
+    @pytest.mark.asyncio
     async def test_upload_error_handling(self, client, mock_response):
         resp = mock_response(status_code=401, json_data={"error": "Unauthorized"})
 

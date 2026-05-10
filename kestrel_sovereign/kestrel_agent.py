@@ -670,7 +670,8 @@ class KestrelAgent(
             #   NONE     → do not construct LighthouseProvider at all
             #   HOST_ENV → construct with the resolver as the single credential
             #              source (no constructor-time env-var bleed-through)
-            # HOST_MASTER_PROVISIONED + SELF_WALLET land in Phase 3.5.
+            #   SELF_WALLET → mint/store a Lighthouse key by signing the
+            #                 auth challenge with the agent's secp256k1 key
             #
             # Cold-start restore above (line ~488) is intentionally policy-
             # unaware: it runs before the agent's DB exists and so cannot
@@ -700,6 +701,7 @@ class KestrelAgent(
                     _policy,
                     db=self._raw_storage.db if self._raw_storage else None,
                     host_db=_host_db,
+                    wallet_private_key=self._private_key,
                 )
                 _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
                 if _resolved.enabled:
@@ -718,8 +720,8 @@ class KestrelAgent(
                         self.lighthouse_provider = None
                 # else: NONE policy — leave self.lighthouse_provider as None
             except NotImplementedError:
-                # PayerKind values that Phase 3.5 will fill in (Lighthouse
-                # HOST_MASTER_PROVISIONED, SELF_WALLET) raise here. Surface
+                # Deferred PayerKind values (for example Lighthouse
+                # HOST_MASTER_PROVISIONED) raise here. Surface
                 # explicitly rather than degrading silently.
                 raise
             except Exception as e:
