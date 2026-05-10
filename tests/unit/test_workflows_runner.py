@@ -802,6 +802,239 @@ async def test_runner_red_team_clear_stops_dispatching_after_budget_exhausted(
 
 
 @pytest.mark.asyncio
+async def test_runner_red_team_clear_rejects_definition_budget_above_operator(
+    runner_components,
+):
+    c = runner_components
+    prompt_path = c.tmp_path / "red_team_prompt.txt"
+    prompt_path.write_text("{source} {payload}", encoding="utf-8")
+    c.runner.red_team_max_total_tokens = 500
+    c.runner.red_team_max_total_cost_usd = 0.50
+    c.runner.red_team_prompt_pack_resolver = _red_team_prompt_pack
+    c.runner.red_team_attestation_resolver = _red_team_attestations(
+        {"codex": "gpt", "claude": "claude"}
+    )
+
+    async def handler(payload):
+        return {"diff": "x"}
+
+    c.registry.register(_action_source("agent.review", handler))
+    _register_red_team_reviewers(c, prompt_path)
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="publish",
+                    signal_source="agent.review",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="red_team_clear",
+                        params={
+                            "prompt_pack_constraint": ">=1,<2",
+                            "reviewer_pool": ["codex", "claude"],
+                            "max_total_tokens": 1000,
+                            "max_total_cost_usd": 1.0,
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="exceeds operator ceiling"):
+        await c.runner.run_to_completion(name="release")
+
+
+@pytest.mark.asyncio
+async def test_runner_red_team_clear_definition_budget_below_operator_passes(
+    runner_components,
+):
+    c = runner_components
+    prompt_path = c.tmp_path / "red_team_prompt.txt"
+    prompt_path.write_text("{source} {payload}", encoding="utf-8")
+    c.agent.process_input = _red_team_review_handler({}, cost_usd=0.01)
+    c.runner.red_team_max_total_tokens = 1000
+    c.runner.red_team_max_total_cost_usd = 1.0
+    c.runner.red_team_prompt_pack_resolver = _red_team_prompt_pack
+    c.runner.red_team_attestation_resolver = _red_team_attestations(
+        {"codex": "gpt", "claude": "claude"}
+    )
+
+    async def handler(payload):
+        return {"diff": "x"}
+
+    c.registry.register(_action_source("agent.review", handler))
+    _register_red_team_reviewers(c, prompt_path)
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="publish",
+                    signal_source="agent.review",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="red_team_clear",
+                        params={
+                            "prompt_pack_constraint": ">=1,<2",
+                            "reviewer_pool": ["codex", "claude"],
+                            "max_total_tokens": 100,
+                            "max_total_cost_usd": 0.5,
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_runner_red_team_clear_uses_operator_budget_when_definition_omits(
+    runner_components,
+):
+    c = runner_components
+    prompt_path = c.tmp_path / "red_team_prompt.txt"
+    prompt_path.write_text("{source} {payload}", encoding="utf-8")
+    reviewers_seen: list[str] = []
+
+    async def process_input(prompt: str, **kwargs):
+        match = re.search(r"'canary': '([0-9a-f]{64})'", prompt)
+        assert match is not None
+        reviewer = (
+            "codex"
+            if "review.codex" in prompt
+            else "claude"
+            if "review.claude" in prompt
+            else "gemini"
+        )
+        reviewers_seen.append(reviewer)
+        family = {"codex": "gpt", "claude": "claude", "gemini": "gemini"}[
+            reviewer
+        ]
+        return json.dumps(
+            {
+                "canary": match.group(1),
+                "reviewer": reviewer,
+                "model_family": family,
+                "model": f"{family}-test",
+                "blockers": [],
+                "tokens": 10,
+                "cost_usd": 0.01,
+            }
+        )
+
+    c.agent.process_input = process_input
+    c.runner.red_team_max_total_tokens = 15
+    c.runner.red_team_prompt_pack_resolver = _red_team_prompt_pack
+    c.runner.red_team_attestation_resolver = _red_team_attestations(
+        {"codex": "gpt", "claude": "claude", "gemini": "gemini"}
+    )
+
+    async def handler(payload):
+        return {"diff": "x"}
+
+    c.registry.register(_action_source("agent.review", handler))
+    _register_red_team_reviewers(c, prompt_path)
+    c.registry.register(
+        _cognition_source(
+            "review.gemini",
+            prompt_path,
+            require_constitution_echo=False,
+        )
+    )
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="publish",
+                    signal_source="agent.review",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="red_team_clear",
+                        params={
+                            "prompt_pack_constraint": ">=1,<2",
+                            "reviewer_pool": [
+                                "codex",
+                                "claude",
+                                "gemini",
+                            ],
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    assert reviewers_seen == ["codex", "claude"]
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_reason == "red_team_budget_exhausted:tokens"
+
+
+@pytest.mark.asyncio
+async def test_runner_red_team_clear_no_operator_or_definition_budget_allows_missing_usage(
+    runner_components,
+):
+    c = runner_components
+    prompt_path = c.tmp_path / "red_team_prompt.txt"
+    prompt_path.write_text("{source} {payload}", encoding="utf-8")
+    c.agent.process_input = _red_team_review_handler({}, include_usage=False)
+    c.runner.red_team_prompt_pack_resolver = _red_team_prompt_pack
+    c.runner.red_team_attestation_resolver = _red_team_attestations(
+        {"codex": "gpt", "claude": "claude"}
+    )
+
+    async def handler(payload):
+        return {"diff": "x"}
+
+    c.registry.register(_action_source("agent.review", handler))
+    _register_red_team_reviewers(c, prompt_path)
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="publish",
+                    signal_source="agent.review",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="red_team_clear",
+                        params={
+                            "prompt_pack_constraint": ">=1,<2",
+                            "reviewer_pool": ["codex", "claude"],
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_runner_red_team_clear_fails_unserializable_stage_output(
     runner_components,
 ):

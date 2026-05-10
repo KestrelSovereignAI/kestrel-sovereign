@@ -10,6 +10,7 @@ import pytest
 from kestrel_sdk.signals import RedactionPolicy, SignalMode, SourceRegistration
 from kestrel_sdk.tools.result import ToolResult
 
+import kestrel_sovereign.features.workflows.feature as workflow_feature_module
 from kestrel_sovereign.features.compute.models import ComputeScript
 from kestrel_sovereign.features.workflows.feature import WorkflowsFeature
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue
@@ -222,6 +223,32 @@ async def test_runner_uses_compute_feature_for_script_gates(feature_components):
     assert marker["src_hash"] == gate.params["src_hash"]
     assert marker["exit_code"] == 0
     assert calls == [("script-1", "uv")]
+
+
+@pytest.mark.asyncio
+async def test_runner_loads_red_team_operator_budget_from_workflows_config(
+    feature_components,
+    monkeypatch,
+):
+    c = feature_components
+    monkeypatch.setattr(
+        workflow_feature_module,
+        "load_section",
+        lambda section: {
+            "red_team": {
+                "max_total_tokens": 250,
+                "max_total_cost_usd": 0.75,
+            }
+        }
+        if section == "workflows"
+        else {},
+    )
+
+    c.feature._build_runner()
+
+    assert c.feature.runner is not None
+    assert c.feature.runner.red_team_max_total_tokens == 250
+    assert c.feature.runner.red_team_max_total_cost_usd == 0.75
 
 
 @pytest.mark.asyncio

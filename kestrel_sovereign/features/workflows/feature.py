@@ -9,6 +9,7 @@ from typing import Any, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
+from kestrel_sovereign.config import load_section
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.features.workflows.models import (
@@ -70,6 +71,7 @@ class WorkflowsFeature(Feature):
                 registry is not None,
             )
             return
+        red_team_budget = _red_team_operator_budget(self.agent)
         self.runner = WorkflowRunner(
             store=self.store,
             dispatcher=dispatcher,
@@ -104,6 +106,10 @@ class WorkflowsFeature(Feature):
                 self._red_team_prompt_pack_resolver
                 if hasattr(self.agent, "workflow_red_team_prompt_pack_resolver")
                 else None
+            ),
+            red_team_max_total_tokens=red_team_budget.get("max_total_tokens"),
+            red_team_max_total_cost_usd=red_team_budget.get(
+                "max_total_cost_usd"
             ),
         )
 
@@ -664,6 +670,41 @@ def _script_artifact_content_address(script: Any) -> Optional[str]:
         return None
     canonical = f"{name}|{language}|{content}|{purpose}"
     return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
+
+
+def _red_team_operator_budget(agent: Any) -> dict[str, Any]:
+    external = getattr(agent, "workflow_red_team_budget", None)
+    if external is not None:
+        budget = external() if callable(external) else external
+        if isinstance(budget, dict):
+            return {
+                key: budget[key]
+                for key in ("max_total_tokens", "max_total_cost_usd")
+                if key in budget
+            }
+
+    workflows = load_section("workflows")
+    red_team = workflows.get("red_team", {}) if isinstance(workflows, dict) else {}
+    if not isinstance(red_team, dict):
+        red_team = {}
+    return {
+        key: value
+        for key, value in {
+            "max_total_tokens": red_team.get(
+                "max_total_tokens",
+                workflows.get("red_team_max_total_tokens")
+                if isinstance(workflows, dict)
+                else None,
+            ),
+            "max_total_cost_usd": red_team.get(
+                "max_total_cost_usd",
+                workflows.get("red_team_max_total_cost_usd")
+                if isinstance(workflows, dict)
+                else None,
+            ),
+        }.items()
+        if value is not None
+    }
 
 
 def _approval_request_matches_scope(request: Any, scope: str) -> bool:
