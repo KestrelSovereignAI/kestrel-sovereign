@@ -101,7 +101,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `35` discoverable modules and `35` exported `Feature` subclasses.
+- Current audited snapshot: `36` discoverable modules and `36` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -138,6 +138,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `web_search`
 - `webhooks`
 - `wellness`
+- `workflows`
 
 The currently exported `Feature` subclasses discovered from those modules include:
 
@@ -176,6 +177,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `WebSearchFeature`
 - `WebhookFeature`
 - `WellnessFeature`
+- `WorkflowsFeature`
 
 ## Public HTTP Surface
 
