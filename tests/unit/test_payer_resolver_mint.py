@@ -582,6 +582,49 @@ class TestMintOpenRouterChild:
         await result.close()
 
     @pytest.mark.asyncio
+    async def test_open_host_db_handles_storage_path_symlink_alias(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex Phase 4 round 4: symmetric to round 3. If
+        storage_path is a symlink OUTSIDE agent_data that points INTO
+        agent_data, the lexical walk fails (no 'agent_data' segment
+        in the lexical path) but the resolved walk succeeds. Two-pass
+        walk: lexical first, resolved fallback.
+        """
+        import os
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+
+        # Real agent_data layout.
+        project = tmp_path / "project"
+        project.mkdir()
+        agent_data = project / "agent_data"
+        agent_data.mkdir()
+        host_db_real = await AsyncDatabase.sqlite(str(agent_data / "host.db"))
+        await host_db_real.close()
+        real_agent_db = agent_data / "test-agent.db"
+        real_agent_db.write_text("")
+
+        # User puts a symlink at <home>/current pointing at the agent's
+        # real db inside agent_data.
+        alias_dir = tmp_path / "elsewhere"
+        alias_dir.mkdir()
+        alias_path = alias_dir / "agent.db"
+        try:
+            os.symlink(real_agent_db, alias_path)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks not supported on this filesystem")
+
+        # The lexical path of alias_path doesn't contain 'agent_data',
+        # but the resolved path does. Two-pass walk-up should find it.
+        result = await open_host_db(storage_path=alias_path)
+        assert result is not None, (
+            "open_host_db failed to find host.db when storage_path is "
+            "a symlink alias outside agent_data; the resolved-walk "
+            "fallback didn't fire"
+        )
+        await result.close()
+
+    @pytest.mark.asyncio
     async def test_open_host_db_returns_none_when_no_agent_data_ancestor(
         self, tmp_path: Path
     ) -> None:

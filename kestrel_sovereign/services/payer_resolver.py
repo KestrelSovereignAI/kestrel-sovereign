@@ -519,20 +519,36 @@ def _find_agent_data_root(start: "Path") -> Optional["Path"]:
     """
     from pathlib import Path
 
-    # absolute() (not resolve()) so we walk a fully-qualified lexical
-    # path without dereferencing symlinks. If <project>/agent_data is
-    # a symlink to /mnt/data, resolve() would expand it away before
-    # the walk and we'd never find the 'agent_data' segment. The
-    # symlink target may still be valid storage; the wizard wrote
-    # host.db relative to <project>/agent_data, so that's where we
-    # need to look.
-    cur = Path(start).absolute()
-    if cur.is_file() or not cur.exists():
-        cur = cur.parent
-    while cur != cur.parent:
-        if cur.name == "agent_data":
-            return cur
-        cur = cur.parent
+    # Two-pass walk to handle two symmetric symlink edge cases:
+    #
+    # 1. <project>/agent_data is a symlink to /mnt/data — lexical
+    #    walk works (segment 'agent_data' is in the path), resolved
+    #    walk fails (resolve() expands the symlink away).
+    #
+    # 2. storage_path is itself a symlink alias outside agent_data
+    #    that points into <project>/agent_data — lexical walk fails
+    #    (no 'agent_data' segment), resolved walk works.
+    #
+    # Try lexical first (covers case 1 and the common no-symlink case);
+    # fall back to resolved (covers case 2). Both passes terminate at
+    # filesystem root.
+    candidates = [Path(start).absolute()]
+    try:
+        resolved = Path(start).resolve()
+        if resolved != candidates[0]:
+            candidates.append(resolved)
+    except (OSError, RuntimeError):
+        # resolve() can raise on broken symlinks or recursion. Skip
+        # the resolved fallback rather than failing the whole walk.
+        pass
+
+    for cur in candidates:
+        if cur.is_file() or not cur.exists():
+            cur = cur.parent
+        while cur != cur.parent:
+            if cur.name == "agent_data":
+                return cur
+            cur = cur.parent
     return None
 
 
