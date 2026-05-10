@@ -85,6 +85,28 @@ async def test_github_pr_view_uses_registered_read_only_gh_command():
 
 
 @pytest.mark.asyncio
+async def test_github_pr_files_and_checks_project_pr_payload_lists():
+    payload = {
+        "number": 1161,
+        "headRefOid": "abc123",
+        "files": [{"path": "app.py", "additions": 3, "deletions": 1}],
+        "statusCheckRollup": [{"name": "unit-tests", "conclusion": "SUCCESS"}],
+    }
+    terminal = FakeTerminal(
+        [_result(stdout=json.dumps(payload)), _result(stdout=json.dumps(payload))]
+    )
+    adapter = GitHubCliAdapter(terminal)  # type: ignore[arg-type]
+
+    files = await adapter.list_pull_request_files(repo="owner/repo", number=1161)
+    checks = await adapter.get_pull_request_checks(repo="owner/repo", number=1161)
+
+    assert files == payload["files"]
+    assert checks == payload["statusCheckRollup"]
+    assert terminal.requests[0].command_id == "github.pr_view"
+    assert terminal.requests[1].command_id == "github.pr_view"
+
+
+@pytest.mark.asyncio
 async def test_github_read_file_at_ref_decodes_contents_response():
     encoded = base64.b64encode(b"hello sk-ant-api03-secretsecretsecret from branch").decode(
         "ascii"
@@ -117,6 +139,115 @@ async def test_github_read_file_at_ref_decodes_contents_response():
         "gh",
         "api",
         "repos/owner/repo/contents/dir/file%20name.txt?ref=feature%2Fbranch",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_github_read_file_at_pr_head_uses_head_oid_ref():
+    pr_payload = {
+        "number": 42,
+        "headRefOid": "headsha",
+        "files": [],
+        "statusCheckRollup": [],
+    }
+    encoded = base64.b64encode(b"head content").decode("ascii")
+    file_payload = {
+        "sha": "filesha",
+        "size": 12,
+        "encoding": "base64",
+        "content": encoded,
+    }
+    terminal = FakeTerminal([
+        _result(stdout=json.dumps(pr_payload)),
+        _result(stdout=json.dumps(file_payload)),
+    ])
+    adapter = GitHubCliAdapter(terminal)  # type: ignore[arg-type]
+
+    parsed = await adapter.read_file_at_pull_request_head(
+        repo="owner/repo",
+        number=42,
+        path="src/app.py",
+    )
+
+    assert parsed["content"] == "head content"
+    assert parsed["ref"] == "headsha"
+    assert terminal.requests[1].argv == [
+        "gh",
+        "api",
+        "repos/owner/repo/contents/src/app.py?ref=headsha",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_github_pr_review_context_can_include_bounded_file_contents():
+    pr_payload = {
+        "number": 7,
+        "headRefOid": "headsha",
+        "files": [
+            {"path": "a.py", "status": "modified"},
+            {"path": "b.py", "status": "removed"},
+            {"path": "c.py", "status": "added"},
+        ],
+        "statusCheckRollup": [{"name": "unit-tests", "conclusion": "SUCCESS"}],
+    }
+    file_payload = {
+        "sha": "filesha",
+        "size": 100,
+        "encoding": "base64",
+        "content": base64.b64encode(b"0123456789abcdef").decode("ascii"),
+    }
+    terminal = FakeTerminal(
+        [
+            _result(stdout=json.dumps(pr_payload)),
+            _result(stdout="diff --git a/a.py b/a.py\n"),
+            _result(stdout=json.dumps(file_payload)),
+        ]
+    )
+    adapter = GitHubCliAdapter(terminal)  # type: ignore[arg-type]
+
+    context = await adapter.get_pull_request_review_context(
+        repo="owner/repo",
+        number=7,
+        include_file_contents=True,
+        max_files=1,
+        max_file_bytes=8,
+    )
+
+    assert context["pull_request"]["number"] == 7
+    assert context["checks"] == pr_payload["statusCheckRollup"]
+    assert context["diff"].startswith("diff --git")
+    assert len(context["file_contents"]) == 1
+    assert context["file_contents"][0]["path"] == "a.py"
+    assert context["file_contents"][0]["content"] == "01234567"
+    assert context["file_contents"][0]["truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_github_pr_review_context_coerces_string_boolean_false():
+    pr_payload = {
+        "number": 7,
+        "headRefOid": "headsha",
+        "files": [{"path": "a.py", "status": "modified"}],
+        "statusCheckRollup": [],
+    }
+    terminal = FakeTerminal(
+        [
+            _result(stdout=json.dumps(pr_payload)),
+            _result(stdout="diff --git a/a.py b/a.py\n"),
+        ]
+    )
+    adapter = GitHubCliAdapter(terminal)  # type: ignore[arg-type]
+
+    context = await adapter.get_pull_request_review_context(
+        repo="owner/repo",
+        number=7,
+        include_file_contents="false",  # type: ignore[arg-type]
+    )
+
+    assert context["file_contents"] == []
+    assert [request.command_id for request in terminal.requests] == [
+        "github.pr_view",
+        "github.pr_diff",
     ]
 
 
@@ -219,6 +350,38 @@ async def test_cli_feature_exposes_status_and_github_pr_tool():
 
 
 @pytest.mark.asyncio
+async def test_cli_feature_exposes_pr_review_helper_tools():
+    pr_payload = {
+        "number": 42,
+        "headRefOid": "abc123",
+        "files": [{"path": "tests/test_x.py"}],
+        "statusCheckRollup": [{"name": "unit-tests", "conclusion": "SUCCESS"}],
+    }
+    feature = CliFeature(Mock())
+    terminal = FakeTerminal(
+        [
+            _result(stdout=json.dumps(pr_payload)),
+            _result(stdout=json.dumps(pr_payload)),
+            _result(stdout=json.dumps(pr_payload)),
+            _result(stdout="diff --git a/tests/test_x.py b/tests/test_x.py\n"),
+        ]
+    )
+    feature.terminal = terminal  # type: ignore[assignment]
+    feature.adapters = {"github": GitHubCliAdapter(terminal)}  # type: ignore[arg-type]
+
+    files = await feature.github_pr_files(repo="owner/repo", number=42)
+    checks = await feature.github_pr_checks(repo="owner/repo", number=42)
+    context = await feature.github_pr_review_context(repo="owner/repo", number=42)
+
+    assert files.status is ToolResultStatus.OK
+    assert files.data["files"] == pr_payload["files"]
+    assert checks.status is ToolResultStatus.OK
+    assert checks.data["checks"] == pr_payload["statusCheckRollup"]
+    assert context.status is ToolResultStatus.OK
+    assert context.data["diff"].startswith("diff --git")
+
+
+@pytest.mark.asyncio
 async def test_cli_feature_redacts_auth_status_partial_error():
     feature = CliFeature(Mock())
     terminal = FakeTerminal(
@@ -266,6 +429,42 @@ def test_cli_command_prefixes_parse_positional_args():
         "path": "README.md",
         "ref": "main",
     }
+    assert tools["github_pr_files"].parse_command_args("!gh-pr-files owner/repo 42") == {
+        "repo": "owner/repo",
+        "number": "42",
+    }
+    assert tools["github_pr_checks"].parse_command_args("!gh-pr-checks owner/repo 42") == {
+        "repo": "owner/repo",
+        "number": "42",
+    }
+    assert tools["github_read_file_at_pr_head"].parse_command_args(
+        "!gh-read-pr-file owner/repo 42 README.md"
+    ) == {
+        "repo": "owner/repo",
+        "number": "42",
+        "path": "README.md",
+    }
+    assert tools["github_pr_review_context"].parse_command_args(
+        "!gh-pr-context owner/repo 42 true 3 1000"
+    ) == {
+        "repo": "owner/repo",
+        "number": "42",
+        "include_file_contents": "true",
+        "max_files": "3",
+        "max_file_bytes": "1000",
+    }
+
+
+def test_cli_status_lists_pr_review_helper_commands():
+    feature = CliFeature(Mock())
+    github_commands = {
+        command.command_id for command in feature.adapters["github"].commands
+    }
+
+    assert "github.pr_files" in github_commands
+    assert "github.pr_checks" in github_commands
+    assert "github.read_file_at_pr_head" in github_commands
+    assert "github.pr_review_context" in github_commands
 
 
 def test_cli_feature_is_discoverable():
