@@ -161,6 +161,7 @@ _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")
 # prevent control-char garbage at the start).
 _SOURCE_NAME_RE = re.compile(r"^[a-zA-Z0-9_][a-zA-Z0-9_.\-:@~+%/=]*$")
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_DID_RE = re.compile(r"^did:[a-z0-9]+:\S+$")
 
 # Lowercase hex sha256 digest, 64 chars; mirrors signing-side helpers and the
 # JSON Schema `_HASH_PATTERN`.
@@ -371,6 +372,17 @@ class Gate:
                 raise WorkflowDefinitionError(
                     "gate lint_clean requires params.scopes: "
                     "non-empty list[str] per design §3.3"
+                )
+        if self.type == "signature_collected":
+            did = self.params.get("did")
+            if not isinstance(did, str) or not did.strip():
+                raise WorkflowDefinitionError(
+                    "gate signature_collected requires non-empty params.did "
+                    "per design §3.3"
+                )
+            if not _DID_RE.fullmatch(did):
+                raise WorkflowDefinitionError(
+                    "gate signature_collected params.did must be a DID string"
                 )
         if self.type == "constitutional_boundary_clean":
             forbidden = self.params.get("forbidden_modules")

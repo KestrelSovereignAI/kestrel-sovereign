@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import base64
 import hashlib
 import inspect
 import json
@@ -26,7 +27,7 @@ import secrets
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -66,6 +67,11 @@ from kestrel_sovereign.features.workflows.signing import (
 )
 from kestrel_sovereign.features.workflows.store import WorkflowStore
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+from kestrel_sovereign.security.crypto_suite import (
+    ALG_ECDSA_SECP256K1_SHA256,
+    CryptoSuiteError,
+    get_suite,
+)
 from kestrel_sovereign.signals import SignalDispatcher, SourceRegistry
 
 
@@ -75,6 +81,7 @@ _RUNNER_GATE_TYPES = frozenset(
         "tests_pass",
         "ci_green",
         "lint_clean",
+        "signature_collected",
         "constitutional_boundary_clean",
     }
 )
@@ -349,6 +356,7 @@ class WorkflowRunner:
                 "tests_pass",
                 "ci_green",
                 "lint_clean",
+                "signature_collected",
             } and stage.signal_mode != SignalMode.ACTION:
                 raise WorkflowRunnerError(
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
@@ -514,8 +522,27 @@ class WorkflowRunner:
         await self.store.insert_stage_link(link)
 
         payload = {**stage.to_dict()["params"], **run.to_dict()["params"]}
-        if stage.gate.type in {"tests_pass", "ci_green", "lint_clean"}:
+        if stage.gate.type in {
+            "tests_pass",
+            "ci_green",
+            "lint_clean",
+            "signature_collected",
+        }:
             payload.update(stage.gate.to_dict()["params"])
+        if stage.gate.type == "signature_collected":
+            payload.update(
+                {
+                    "workflow_run_id": run.run_id,
+                    "workflow_stage_name": stage.name,
+                    "workflow_attempt_number": attempt_number,
+                    "signature_payload": canonical_signature_ack_payload(
+                        run_id=run.run_id,
+                        stage_name=stage.name,
+                        attempt_number=attempt_number,
+                        did=stage.gate.params["did"],
+                    ).decode("utf-8"),
+                }
+            )
 
         signal = Signal(
             source=stage.signal_source,
@@ -539,7 +566,12 @@ class WorkflowRunner:
             ],
         )
         result = await self.dispatcher.dispatch_signal(signal)
-        gate_outcome, gate_reason = await self._evaluate_gate(stage, result)
+        gate_outcome, gate_reason = await self._evaluate_gate(
+            stage,
+            result,
+            run=run,
+            attempt_number=attempt_number,
+        )
         actor_did, actor_sig = sign_stage_transition(
             run_id=run.run_id,
             stage_name=stage.name,
@@ -568,7 +600,12 @@ class WorkflowRunner:
         return gate_outcome
 
     async def _evaluate_gate(
-        self, stage: Stage, result
+        self,
+        stage: Stage,
+        result,
+        *,
+        run: WorkflowRun,
+        attempt_number: int,
     ) -> tuple[GateOutcome, Optional[str]]:
         if result.status != Status.OK:
             return GateOutcome.FAIL, result.error or result.status.value
@@ -578,6 +615,14 @@ class WorkflowRunner:
             return _evaluate_exit_marker_gate(stage.gate, result)
         if stage.gate.type == "ci_green":
             return await self._evaluate_ci_green_gate(stage.gate, result)
+        if stage.gate.type == "signature_collected":
+            return self._evaluate_signature_collected_gate(
+                stage.gate,
+                result,
+                run_id=run.run_id,
+                stage_name=stage.name,
+                attempt_number=attempt_number,
+            )
         if stage.gate.type == "constitutional_boundary_clean":
             return self._evaluate_constitutional_boundary_gate(stage, result)
         if stage.gate.type not in _RUNNER_GATE_TYPES:
@@ -601,6 +646,25 @@ class WorkflowRunner:
         if _ci_marker_green(gate, marker):
             return GateOutcome.PASS, None
         return GateOutcome.FAIL, f"ci_green_failed:{_ci_marker_reason(gate, marker)}"
+
+    def _evaluate_signature_collected_gate(
+        self,
+        gate: Gate,
+        result: Any,
+        *,
+        run_id: str,
+        stage_name: str,
+        attempt_number: int,
+    ) -> tuple[GateOutcome, Optional[str]]:
+        return _evaluate_signature_collected_gate(
+            gate,
+            result,
+            run_id=run_id,
+            stage_name=stage_name,
+            attempt_number=attempt_number,
+            public_key_resolver=self.public_key_resolver,
+            verification_methods_resolver=self.verification_methods_resolver,
+        )
 
     def _evaluate_constitutional_boundary_gate(
         self, stage: Stage, result
@@ -816,6 +880,183 @@ def _evaluate_exit_marker_gate(
         return GateOutcome.PASS, None
     reason = _result_marker_reason(marker)
     return GateOutcome.FAIL, f"{gate.type}_failed:{reason}"
+
+
+def _evaluate_signature_collected_gate(
+    gate: Gate,
+    result: Any,
+    *,
+    run_id: str,
+    stage_name: str,
+    attempt_number: int,
+    public_key_resolver: PublicKeyResolver,
+    verification_methods_resolver: Optional[VerificationMethodsResolver],
+) -> tuple[GateOutcome, Optional[str]]:
+    if result.mode != SignalMode.ACTION:
+        return GateOutcome.FAIL, "signature_collected_requires_action_result"
+    marker = getattr(result, "action_result", None)
+    if not isinstance(marker, dict):
+        return GateOutcome.FAIL, "signature_collected_missing_result"
+
+    expected_did = gate.params["did"].strip()
+    observed_did = _signature_marker_did(marker)
+    if observed_did is None:
+        return GateOutcome.FAIL, "signature_collected_missing_did"
+    if observed_did != expected_did:
+        return GateOutcome.FAIL, f"signature_collected_did_mismatch:{expected_did}"
+    if _has_explicit_bad_status(marker):
+        reason = _result_marker_reason(marker)
+        return GateOutcome.FAIL, f"signature_collected_failed:{reason}"
+    signatures = _signature_marker_signatures(marker)
+    if signatures is None:
+        return GateOutcome.FAIL, "signature_collected_missing_signature"
+    payload = canonical_signature_ack_payload(
+        run_id=run_id,
+        stage_name=stage_name,
+        attempt_number=attempt_number,
+        did=expected_did,
+    )
+    if not _verify_signature_collected_marker(
+        did=expected_did,
+        signatures=signatures,
+        payload=payload,
+        public_key_resolver=public_key_resolver,
+        verification_methods_resolver=verification_methods_resolver,
+    ):
+        return GateOutcome.FAIL, "signature_collected_invalid_signature"
+    return GateOutcome.PASS, None
+
+
+def _signature_marker_did(marker: dict[str, Any]) -> Optional[str]:
+    for key in ("did", "signer_did", "signed_by", "author_did", "actor_did"):
+        value = marker.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    signer = marker.get("signer")
+    if isinstance(signer, dict):
+        for key in ("did", "id"):
+            value = signer.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _signature_marker_signatures(
+    marker: dict[str, Any],
+) -> Optional[str | list[Mapping[str, str]]]:
+    for key in ("signature", "sig"):
+        value = marker.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    for key in ("proof", "receipt"):
+        value = marker.get(key)
+        if isinstance(value, dict):
+            nested = value.get("signature") or value.get("sig")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+            signatures = value.get("signatures")
+            if isinstance(signatures, list) and signatures:
+                return signatures
+    signatures = marker.get("signatures")
+    if isinstance(signatures, list):
+        if signatures and all(isinstance(item, dict) for item in signatures):
+            return signatures
+        for item in signatures:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+            if isinstance(item, dict):
+                nested = item.get("signature") or item.get("sig")
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+    return None
+
+
+def canonical_signature_ack_payload(
+    *, run_id: str, stage_name: str, attempt_number: int, did: str
+) -> bytes:
+    body = json.dumps(
+        {
+            "run_id": run_id,
+            "stage_name": stage_name,
+            "attempt_number": attempt_number,
+            "did": did,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return f"workflow.signature_collected.v1\n{body}".encode("utf-8")
+
+
+def _verify_signature_collected_marker(
+    *,
+    did: str,
+    signatures: str | list[Mapping[str, str]],
+    payload: bytes,
+    public_key_resolver: PublicKeyResolver,
+    verification_methods_resolver: Optional[VerificationMethodsResolver],
+) -> bool:
+    if isinstance(signatures, list):
+        return _verify_signature_collected_hybrid(
+            did=did,
+            signatures=signatures,
+            payload=payload,
+            verification_methods_resolver=verification_methods_resolver,
+        )
+    signature = signatures
+    if signature.startswith("hybrid:"):
+        try:
+            decoded = base64.b64decode(signature[len("hybrid:") :]).decode()
+            decoded_signatures = json.loads(decoded)
+        except Exception:
+            return False
+        if not isinstance(decoded_signatures, list):
+            return False
+        return _verify_signature_collected_hybrid(
+            did=did,
+            signatures=decoded_signatures,
+            payload=payload,
+            verification_methods_resolver=verification_methods_resolver,
+        )
+    if signature.startswith("ecdsa:"):
+        signature = signature[len("ecdsa:") :]
+    try:
+        public_key_bytes = public_key_resolver(did)
+        public_key = get_suite(
+            ALG_ECDSA_SECP256K1_SHA256
+        ).deserialize_public_key(public_key_bytes)
+        signature_bytes = bytes.fromhex(signature)
+    except Exception:
+        return False
+    try:
+        return get_suite(ALG_ECDSA_SECP256K1_SHA256).verify(
+            payload,
+            signature_bytes,
+            public_key,
+        )
+    except CryptoSuiteError:
+        return False
+
+
+def _verify_signature_collected_hybrid(
+    *,
+    did: str,
+    signatures: list[Mapping[str, str]],
+    payload: bytes,
+    verification_methods_resolver: Optional[VerificationMethodsResolver],
+) -> bool:
+    if verification_methods_resolver is None:
+        return False
+    try:
+        from kestrel_sovereign.identity.hybrid_keypair import verify_hybrid
+
+        return verify_hybrid(
+            payload,
+            signatures,
+            verification_methods_resolver(did),
+        ).ok
+    except Exception:
+        return False
 
 
 async def _default_ci_green_provider(gate: Gate, result: Any) -> Any:
