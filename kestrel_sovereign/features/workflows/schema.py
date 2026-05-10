@@ -228,7 +228,10 @@ def _gate_schema() -> dict[str, Any]:
                     "properties": {
                         "params": {
                             "type": "object",
-                            "required": ["prompt_pack_constraint"],
+                            "required": [
+                                "prompt_pack_constraint",
+                                "reviewer_pool",
+                            ],
                             "properties": {
                                 "prompt_pack_constraint": {
                                     "type": "string",
@@ -237,6 +240,25 @@ def _gate_schema() -> dict[str, Any]:
                                     # the schema matches Gate's
                                     # ``not constraint.strip()`` check.
                                     "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                                "reviewer_pool": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "minLength": 1,
+                                        "pattern": _TRIMMED_NON_EMPTY_PATTERN,
+                                    },
+                                    "minItems": 2,
+                                    "uniqueItems": True,
+                                },
+                                "blockers": {"const": "zero"},
+                                "max_total_tokens": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                },
+                                "max_total_cost_usd": {
+                                    "type": "number",
+                                    "exclusiveMinimum": 0,
                                 },
                             },
                         },
