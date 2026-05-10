@@ -1,7 +1,6 @@
 """Regression test for the security-feature-lookup bug.
 
-Six features (code_edit (extracted), keys, computer_use, reflection's
-ticket_handler / self_model_handler / approval) historically asked
+Features including code_edit (extracted), keys, and computer_use historically asked
 ``self.agent.features.get("security")``, but ``KestrelAgent`` stores
 features keyed by class name (``"SecurityFeature"``). The lowercase
 key always missed → tools emitted ``"Security feature not available"``
@@ -160,35 +159,3 @@ def test_feature_security_lookup_finds_registered_security_feature(
         f"{handler_attr}._get_security_feature() returned {found!r}, "
         "expected the registered SecurityFeature"
     )
-
-
-def test_reflection_ticket_handler_finds_security():
-    """TicketHandler builds ``Security feature not available`` errors
-    when the lookup misses. Confirm it now resolves.
-    """
-    from kestrel_sovereign.features.reflection.ticket_handler import TicketHandler
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-
-    agent, sec = _agent_with_security()
-    agent.get_feature = lambda name: KestrelAgent.get_feature(agent, name)
-
-    handler = TicketHandler(
-        ticket_creator=MagicMock(),
-        economic_gate=None,
-        db_helper=None,
-        agent=agent,
-    )
-
-    assert handler._get_security_feature() is sec
-
-
-def test_reflection_approval_handler_finds_security():
-    from kestrel_sovereign.features.reflection.approval import ApprovalHandler
-    from kestrel_sovereign.kestrel_agent import KestrelAgent
-
-    agent, sec = _agent_with_security()
-    agent.get_feature = lambda name: KestrelAgent.get_feature(agent, name)
-
-    handler = ApprovalHandler(agent=agent, db_helper=None)
-
-    assert handler._get_security_feature() is sec

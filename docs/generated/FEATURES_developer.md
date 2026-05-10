@@ -104,7 +104,7 @@ Features are discovered from two sources:
 
 ### Core Feature Inventory
 
-Audited snapshot: **35** discoverable modules · **35** exported `Feature` subclasses.
+Audited snapshot: **34** discoverable modules · **34** exported `Feature` subclasses.
 
 | Module | Exported class |
 |---|---|
@@ -116,7 +116,6 @@ Audited snapshot: **35** discoverable modules · **35** exported `Feature` subcl
 | `consent` | `ConsentFeature` |
 | `constitution` | `ConstitutionFeature` |
 | `context` | `ContextFeature` |
-| `council` | `CouncilFeature` |
 | `delivery` | `DeliveryFeature` |
 | `deploy` | `DeployFeature` |
 | `github_app` | `GitHubAppFeature` |
@@ -127,7 +126,6 @@ Audited snapshot: **35** discoverable modules · **35** exported `Feature` subcl
 | `memory_agency` | `MemoryAgencyFeature` |
 | `model` | `ModelAgent` |
 | `peers` | `PeersFeature` |
-| `reflection` | `ReflectionFeature` |
 | `response_audit` | `ResponseAuditFeature` |
 | `save` | `SaveFeature` |
 | `scheduler` | `SchedulerFeature` |
@@ -142,6 +140,7 @@ Audited snapshot: **35** discoverable modules · **35** exported `Feature` subcl
 | `web_search` | `WebSearchFeature` |
 | `webhooks` | `WebhookFeature` |
 | `wellness` | `WellnessFeature` |
+| `workflows` | `WorkflowsFeature` |
 
 ---
 

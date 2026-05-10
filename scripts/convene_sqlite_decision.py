@@ -27,10 +27,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from kestrel_sovereign.features.council.models import Evidence, CouncilConfig, CouncilMember, ConsensusRule
-from kestrel_sovereign.features.council.deliberation import convene_council
-from kestrel_sovereign.features.council.costing import print_token_usage_summary
-from kestrel_sovereign.features.council.storage import get_storage
+from _council_feature_package import load_council_exports
+
+_council = load_council_exports()
+Evidence = _council.Evidence
+CouncilConfig = _council.CouncilConfig
+CouncilMember = _council.CouncilMember
+ConsensusRule = _council.ConsensusRule
+convene_council = _council.convene_council
+print_token_usage_summary = _council.print_token_usage_summary
+get_storage = _council.get_storage
 
 logging.basicConfig(
     level=logging.INFO,

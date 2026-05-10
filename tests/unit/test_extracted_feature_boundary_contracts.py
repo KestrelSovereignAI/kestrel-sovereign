@@ -65,3 +65,39 @@ def test_github_feature_is_external_to_core():
         if path.is_file() and "__pycache__" not in path.parts
     ] if feature_dir.exists() else []
     assert source_files == []
+
+
+def test_reflection_feature_is_external_to_core():
+    registry = (PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml").read_text()
+    feature_dir = PROJECT_ROOT / "kestrel_sovereign/features/reflection"
+
+    assert 'package = "kestrel-feature-reflection"' in registry
+    assert "[reflection]" in registry
+    assert "`reflection` | `kestrel-feature-reflection`" in (
+        PROJECT_ROOT / "docs/audit/FEATURE_PROOF_MATRIX.md"
+    ).read_text()
+    reflection_block = registry.split("[reflection]", 1)[1].split("\n[", 1)[0]
+    assert "core = false" in reflection_block
+    source_files = [
+        path for path in feature_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if feature_dir.exists() else []
+    assert source_files == []
+
+
+def test_council_feature_is_external_to_core():
+    registry = (PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml").read_text()
+    feature_dir = PROJECT_ROOT / "kestrel_sovereign/features/council"
+
+    assert 'package = "kestrel-feature-council"' in registry
+    assert "[council]" in registry
+    assert "`council` | `kestrel-feature-council`" in (
+        PROJECT_ROOT / "docs/audit/FEATURE_PROOF_MATRIX.md"
+    ).read_text()
+    council_block = registry.split("[council]", 1)[1].split("\n[", 1)[0]
+    assert "core = false" in council_block
+    source_files = [
+        path for path in feature_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if feature_dir.exists() else []
+    assert source_files == []
