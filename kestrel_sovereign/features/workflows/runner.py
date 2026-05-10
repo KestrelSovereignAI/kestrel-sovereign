@@ -16,12 +16,13 @@ contract established here.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Iterable, Optional
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
@@ -58,6 +59,14 @@ from kestrel_sovereign.features.workflows.signing import (
 from kestrel_sovereign.features.workflows.store import WorkflowStore
 from kestrel_sovereign.identity.runtime_identity import AgentIdentity
 from kestrel_sovereign.signals import SignalDispatcher, SourceRegistry
+
+
+_RUNNER_GATE_TYPES = frozenset(
+    {
+        "signal_status_ok",
+        "constitutional_boundary_clean",
+    }
+)
 
 
 class WorkflowRunnerError(RuntimeError):
@@ -316,10 +325,10 @@ class WorkflowRunner:
     def _validate_run_start_contract(self, spec: WorkflowSpec) -> None:
         self._validate_phase1_sequential_graph(spec)
         for stage in spec.stages:
-            if stage.gate.type != "signal_status_ok":
+            if stage.gate.type not in _RUNNER_GATE_TYPES:
                 raise WorkflowRunnerError(
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
-                    "is not implemented in Phase 1 foundation"
+                    "is not implemented in the workflow runner"
                 )
             registration = self.registry.get(stage.signal_source)
             if registration is None:
@@ -531,14 +540,48 @@ class WorkflowRunner:
         return gate_outcome
 
     def _evaluate_gate(self, stage: Stage, result) -> tuple[GateOutcome, Optional[str]]:
-        if stage.gate.type != "signal_status_ok":
+        if result.status != Status.OK:
+            return GateOutcome.FAIL, result.error or result.status.value
+        if stage.gate.type == "signal_status_ok":
+            return GateOutcome.PASS, None
+        if stage.gate.type == "constitutional_boundary_clean":
+            return self._evaluate_constitutional_boundary_gate(stage, result)
+        if stage.gate.type not in _RUNNER_GATE_TYPES:
             return (
                 GateOutcome.FAIL,
-                f"gate {stage.gate.type!r} is not implemented in Phase 1 foundation",
+                f"gate {stage.gate.type!r} is not implemented in the workflow runner",
             )
-        if result.status == Status.OK:
-            return GateOutcome.PASS, None
-        return GateOutcome.FAIL, result.error or result.status.value
+        return GateOutcome.FAIL, f"gate {stage.gate.type!r} failed closed"
+
+    def _evaluate_constitutional_boundary_gate(
+        self, stage: Stage, result
+    ) -> tuple[GateOutcome, Optional[str]]:
+        forbidden = tuple(
+            dict.fromkeys(
+                _normalize_module_path(item)
+                for item in (
+                    *stage.forbidden_modules,
+                    *stage.gate.params["forbidden_modules"],
+                )
+            )
+        )
+        for source in _iter_emitted_code(result):
+            try:
+                tree = ast.parse(source)
+            except SyntaxError as exc:
+                return (
+                    GateOutcome.FAIL,
+                    f"constitutional_boundary_unparseable:{exc.msg}",
+                )
+            for imported in _iter_imported_modules(tree):
+                normalized = _normalize_module_path(imported)
+                violation = _matching_forbidden_module(normalized, forbidden)
+                if violation is not None:
+                    return (
+                        GateOutcome.FAIL,
+                        f"constitutional_boundary_violation:{normalized}",
+                    )
+        return GateOutcome.PASS, None
 
     async def _compensate(
         self,
@@ -665,6 +708,143 @@ class WorkflowRunner:
             if stage.name == name:
                 return stage
         raise WorkflowDefinitionError(f"stage {name!r} not found in spec")
+
+
+_CODE_RESULT_KEYS = frozenset(
+    {
+        "code",
+        "source",
+        "source_code",
+        "content",
+        "text",
+    }
+)
+_PATCH_RESULT_KEYS = frozenset({"patch", "diff"})
+_CONTAINER_RESULT_KEYS = frozenset(
+    {
+        "artifact",
+        "artifacts",
+        "file",
+        "files",
+        "output",
+        "outputs",
+        "result",
+        "results",
+    }
+)
+
+
+def _iter_emitted_code(result: Any) -> Iterable[str]:
+    for payload in (
+        getattr(result, "action_result", None),
+        getattr(result, "artifact", None),
+    ):
+        yield from _iter_code_payload(payload, root=True)
+
+
+def _iter_code_payload(value: Any, *, root: bool = False) -> Iterable[str]:
+    if isinstance(value, str):
+        if root:
+            if _looks_like_patch_source(value):
+                yield _python_source_from_patch(value)
+                return
+            if not _looks_like_python_source(value):
+                return
+        yield value
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = key if isinstance(key, str) else ""
+            normalized_key = key_text.lower()
+            if normalized_key in _CODE_RESULT_KEYS:
+                yield from _iter_code_payload(item)
+            elif normalized_key in _PATCH_RESULT_KEYS and isinstance(item, str):
+                yield _python_source_from_patch(item)
+            elif normalized_key in _CONTAINER_RESULT_KEYS:
+                yield from _iter_code_payload(item, root=True)
+            elif key_text.endswith(".py") and isinstance(item, str):
+                yield item
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_code_payload(item, root=True)
+
+
+def _looks_like_python_source(value: str) -> bool:
+    return any(
+        line.lstrip().startswith(("import ", "from "))
+        for line in value.splitlines()
+    )
+
+
+def _looks_like_patch_source(value: str) -> bool:
+    return any(
+        line.startswith("+")
+        and not line.startswith("+++")
+        and line[1:].lstrip().startswith(("import ", "from "))
+        for line in value.splitlines()
+    )
+
+
+def _python_source_from_patch(value: str) -> str:
+    added_imports = [
+        code
+        for line in value.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+        for code in (line[1:].lstrip(),)
+        if code.startswith("import ") or code.startswith("from ")
+    ]
+    return "\n".join(added_imports)
+
+
+def _iter_imported_modules(tree: ast.AST) -> Iterable[str]:
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                yield alias.name
+        elif isinstance(node, ast.ImportFrom):
+            module = "" if node.module is None else node.module
+            prefix = "." * node.level
+            base = f"{prefix}{module}"
+            if module:
+                yield base
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                separator = "" if base in ("", prefix) else "."
+                yield f"{base}{separator}{alias.name}"
+
+
+def _normalize_module_path(value: str) -> str:
+    normalized = value.strip().replace("/", ".")
+    if normalized.endswith(".py"):
+        normalized = normalized[:-3]
+    if normalized.startswith("."):
+        return normalized.rstrip(".")
+    return normalized.strip(".")
+
+
+def _matching_forbidden_module(
+    imported: str, forbidden_modules: Iterable[str]
+) -> Optional[str]:
+    for forbidden in forbidden_modules:
+        relative_imported = imported.lstrip(".") if imported.startswith(".") else None
+        if (
+            imported == forbidden
+            or imported.startswith(f"{forbidden}.")
+            or imported.endswith(f".{forbidden}")
+            or f".{forbidden}." in imported
+            or (
+                relative_imported is not None
+                and (
+                    relative_imported == forbidden
+                    or forbidden.endswith(f".{relative_imported}")
+                    or f".{relative_imported}." in forbidden
+                )
+            )
+        ):
+            return forbidden
+    return None
 
 
 def derive_stage_idempotency_key(
