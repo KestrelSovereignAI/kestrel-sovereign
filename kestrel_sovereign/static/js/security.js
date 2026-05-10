@@ -53,6 +53,10 @@ export const Security = {
             }
         }
 
+        if (permsOn) {
+            this.loadAutoMode();
+        }
+
         this._initialized = true;
         console.log('Security module initialized');
     },
@@ -251,7 +255,15 @@ export const Security = {
                         }
                     },
                     {
-                        label: `${kicon('shield')} Enable Auto`,
+                        label: `${kicon('checkmark')} Always`,
+                        type: 'primary',
+                        onClick: () => {
+                            Modal.hide();
+                            wrappedResolve({ approved: true, scope: 'always' });
+                        }
+                    },
+                    {
+                        label: `${kicon('shield')} Enable Auto Mode`,
                         type: 'primary',
                         onClick: async () => {
                             try {
@@ -263,14 +275,6 @@ export const Security = {
                                 console.error('Failed to enable Auto mode from approval modal:', error);
                                 Toast.error('Failed to enable Auto mode');
                             }
-                        }
-                    },
-                    {
-                        label: `${kicon('checkmark')} Always`,
-                        type: 'primary',
-                        onClick: () => {
-                            Modal.hide();
-                            wrappedResolve({ approved: true, scope: 'always' });
                         }
                     }
                 ],
@@ -754,17 +758,16 @@ export const Security = {
     },
 
     renderAutoModeButton() {
-        const button = document.getElementById('security-auto-mode-btn');
-        if (!button) return;
-
-        button.classList.toggle('btn-primary', this.globalAutoMode);
-        button.classList.toggle('btn-secondary', !this.globalAutoMode);
-        button.innerHTML = this.globalAutoMode
-            ? `${kicon('shield')} Auto Mode: On`
-            : `${kicon('shield')} Auto Mode: Off`;
-        button.title = this.globalAutoMode
-            ? 'Global Auto is on for this session. Explicit Deny still blocks.'
-            : 'Turn on session-scoped global Auto for non-denied tools.';
+        document.querySelectorAll('.security-auto-mode-toggle').forEach((button) => {
+            button.classList.toggle('btn-primary', this.globalAutoMode);
+            button.classList.toggle('btn-secondary', !this.globalAutoMode);
+            button.innerHTML = this.globalAutoMode
+                ? `${kicon('shield')} Auto Mode: On`
+                : `${kicon('shield')} Auto Mode: Off`;
+            button.title = this.globalAutoMode
+                ? 'Global Auto is on for this session. Explicit Deny still blocks.'
+                : 'Turn on session-scoped global Auto for non-denied tools.';
+        });
     },
 
     async toggleGlobalAutoMode() {
