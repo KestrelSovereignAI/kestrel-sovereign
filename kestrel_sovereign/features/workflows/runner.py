@@ -168,6 +168,12 @@ class WorkflowRunner:
 
             stage = self._stage_by_name(spec, current.pop(0))
             gate = await self._dispatch_stage(run_snapshot, spec, stage)
+            post_dispatch_run = await self.store.get_run(run.run_id)
+            if post_dispatch_run is None:
+                raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
+            if post_dispatch_run.cancel_barrier_at is not None:
+                status = await self._compensate(post_dispatch_run, spec)
+                return WorkflowRunResult(run.run_id, status)
             if gate != GateOutcome.PASS:
                 status = await self._compensate(
                     run_snapshot,
@@ -175,13 +181,6 @@ class WorkflowRunner:
                     success_status=RunStatus.FAILED,
                     residue_status=RunStatus.FAILED,
                 )
-                return WorkflowRunResult(run.run_id, status)
-
-            post_dispatch_run = await self.store.get_run(run.run_id)
-            if post_dispatch_run is None:
-                raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
-            if post_dispatch_run.cancel_barrier_at is not None:
-                status = await self._compensate(post_dispatch_run, spec)
                 return WorkflowRunResult(run.run_id, status)
 
             next_current = [*current, *self._next_stages(spec, stage.name)]
@@ -252,6 +251,7 @@ class WorkflowRunner:
                 f"workflow run {run_id} failed at stage {failed_stage_name!r}; "
                 f"cannot retry {stage_name!r}"
             )
+        await self._ensure_retry_has_no_compensation_residue(run_id)
         await self.store.update_run_status(
             run_id,
             RunStatus.RUNNING,
@@ -408,6 +408,24 @@ class WorkflowRunner:
                 f"workflow run {run_id} has no failed stage to retry"
             )
         return failed_links[-1].stage_name
+
+    async def _ensure_retry_has_no_compensation_residue(
+        self, run_id: str
+    ) -> None:
+        links = await self.store.list_stage_links(run_id)
+        residue = [
+            (link.stage_name, link.compensate_state)
+            for link in links
+            if link.compensate_state in {"record_only", "failed"}
+        ]
+        if residue:
+            stage_list = ", ".join(
+                f"{stage!r} ({state})" for stage, state in residue
+            )
+            raise WorkflowRunnerError(
+                f"workflow run {run_id} cannot be retried because "
+                f"compensation residue remains: {stage_list}"
+            )
 
     @staticmethod
     def _validate_run_params(spec: WorkflowSpec, params: object) -> None:

@@ -48,7 +48,8 @@ class WorkflowsFeature(Feature):
             logger.warning("WorkflowsFeature: database not available")
             return
 
-        self.store = WorkflowStore(self._db)
+        backend = getattr(self._db, "_backend", self._db)
+        self.store = WorkflowStore(backend)
         await self.store.initialize()
         self._build_runner()
         logger.info("WorkflowsFeature initialized")

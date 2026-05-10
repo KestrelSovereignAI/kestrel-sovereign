@@ -785,6 +785,50 @@ async def test_runner_cancel_during_final_stage_compensates(runner_components):
 
 
 @pytest.mark.asyncio
+async def test_runner_cancel_during_failing_stage_honors_cancel_barrier(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+    run_id = None
+
+    async def do_one(payload):
+        events.append("do_one")
+        await c.runner.cancel_run(run_id)
+        raise RuntimeError("post-cancel failure")
+
+    c.registry.register(_action_source("do.one", do_one))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                )
+            ],
+        ),
+    )
+
+    run = await c.runner.start_run(name="release")
+    run_id = run.run_id
+    result = await c.runner.continue_run(run.run_id)
+
+    assert result.status == RunStatus.CANCELLED
+    assert events == ["do_one"]
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    links = await c.store.list_stage_links(run.run_id)
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].post_cancel is True
+
+
+@pytest.mark.asyncio
 async def test_runner_pause_during_stage_stops_at_boundary(runner_components):
     c = runner_components
     events: list[str] = []
@@ -1081,6 +1125,114 @@ async def test_runner_retry_reruns_compensated_prerequisites(
         "create",
         "configure",
     ]
+
+
+@pytest.mark.asyncio
+async def test_runner_retry_refuses_irreversible_residue(runner_components):
+    c = runner_components
+    events: list[str] = []
+
+    async def publish(payload):
+        events.append("publish")
+        return {"ok": True}
+
+    async def verify(payload):
+        events.append("verify")
+        raise RuntimeError("verify failed")
+
+    c.registry.register(_action_source("release.publish", publish))
+    c.registry.register(_action_source("release.verify", verify))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="publish",
+                    signal_source="release.publish",
+                    signal_mode=SignalMode.ACTION,
+                    irreversible=True,
+                    compensate="compensate_record_only",
+                ),
+                _stage("verify", "release.verify"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="publish",
+                    to_stage="verify",
+                )
+            ],
+        ),
+    )
+    failed = await c.runner.run_to_completion(name="release")
+    assert failed.status == RunStatus.FAILED
+
+    with pytest.raises(WorkflowRunnerError, match="compensation residue"):
+        await c.runner.retry_stage(failed.run_id, "verify")
+
+    assert events == ["publish", "verify"]
+    links = await c.store.list_stage_links(failed.run_id)
+    assert [link.stage_name for link in links] == ["publish", "verify"]
+    assert links[0].compensate_state == "record_only"
+
+
+@pytest.mark.asyncio
+async def test_runner_retry_refuses_failed_compensation_residue(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def create(payload):
+        events.append("create")
+        return {"ok": True}
+
+    async def configure(payload):
+        events.append("configure")
+        raise RuntimeError("configure failed")
+
+    async def undo_create(payload):
+        events.append("undo_create")
+        raise RuntimeError("undo failed")
+
+    c.registry.register(_action_source("resource.create", create))
+    c.registry.register(_action_source("resource.configure", configure))
+    c.registry.register(_action_source("resource.undo_create", undo_create))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="resource",
+            version=1,
+            stages=[
+                Stage(
+                    name="create",
+                    signal_source="resource.create",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="resource.undo_create",
+                ),
+                _stage("configure", "resource.configure"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="create",
+                    to_stage="configure",
+                )
+            ],
+        ),
+    )
+    failed = await c.runner.run_to_completion(name="resource")
+    assert failed.status == RunStatus.FAILED
+
+    with pytest.raises(WorkflowRunnerError, match="compensation residue"):
+        await c.runner.retry_stage(failed.run_id, "configure")
+
+    assert events == ["create", "configure", "undo_create"]
+    links = await c.store.list_stage_links(failed.run_id)
+    assert [link.stage_name for link in links] == ["create", "configure"]
+    assert links[0].compensate_state == "failed"
 
 
 @pytest.mark.asyncio
