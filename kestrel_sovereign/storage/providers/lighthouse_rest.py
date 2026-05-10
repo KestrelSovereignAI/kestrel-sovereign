@@ -237,6 +237,8 @@ class LighthouseRestClient:
         response.raise_for_status()
 
         data = response.json()
+        if isinstance(data, str) and data:
+            return data
         if isinstance(data, dict):
             if isinstance(data.get("data"), dict) and data["data"].get("message"):
                 return str(data["data"]["message"])
@@ -251,13 +253,13 @@ class LighthouseRestClient:
             return str(data[0]["message"])
         raise ValueError("Lighthouse auth message response did not include a message")
 
-    async def create_api_key(self, public_key: str, signature: str) -> str:
+    async def create_api_key(self, public_key: str, signed_message: str) -> str:
         """
         Create a Lighthouse API key from a signed wallet-auth challenge.
 
         Args:
             public_key: EVM address (0x...) that signed the challenge
-            signature: Ethereum personal_sign signature for the challenge
+            signed_message: Ethereum personal_sign signature for the challenge
 
         Returns:
             Lighthouse API key.
@@ -265,12 +267,14 @@ class LighthouseRestClient:
         client = await self._get_client()
         response = await client.post(
             f"{self.API_URL}/api/auth/create_api_key",
-            params={"publicKey": public_key, "signature": signature},
+            json={"publicKey": public_key, "signedMessage": signed_message},
             headers={"Accept": "application/json"},
         )
         response.raise_for_status()
 
         data = response.json()
+        if isinstance(data, str) and data:
+            return data
         candidates = []
         if isinstance(data, dict):
             candidates.append(data)
