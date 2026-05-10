@@ -130,6 +130,7 @@ class ApprovalQueue:
                              old responsibility of persisting scope themselves.
         """
         self._pending: Dict[str, ApprovalRequest] = {}
+        self._resolved: Dict[str, ApprovalRequest] = {}
         self._on_request_added = on_request_added
         self._on_request_withdrawn = on_request_withdrawn
         self._permission_store = permission_store
@@ -434,6 +435,10 @@ class ApprovalQueue:
 
         request.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.DENIED
         request.user_decision = scope
+        self._resolved[request_id] = request
+        if len(self._resolved) > 512:
+            oldest = next(iter(self._resolved))
+            self._resolved.pop(oldest, None)
         request.resume_event.set()  # Unblock the waiting coroutine
 
         logger.info(
@@ -453,7 +458,7 @@ class ApprovalQueue:
         Returns:
             ApprovalRequest if found, None otherwise
         """
-        return self._pending.get(request_id)
+        return self._pending.get(request_id) or self._resolved.get(request_id)
 
     def cancel_request(self, request_id: str) -> bool:
         """

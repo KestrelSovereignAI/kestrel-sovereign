@@ -81,6 +81,7 @@ _RUNNER_GATE_TYPES = frozenset(
         "tests_pass",
         "ci_green",
         "lint_clean",
+        "consent_collect",
         "signature_collected",
         "constitution_echo_verified",
         "constitutional_boundary_clean",
@@ -88,6 +89,10 @@ _RUNNER_GATE_TYPES = frozenset(
 )
 
 CiGreenProvider = Callable[[Gate, Any], Awaitable[Any] | Any]
+ConsentCollectProvider = Callable[
+    [Gate, WorkflowRun, Stage, StageLink],
+    Awaitable[Any] | Any,
+]
 
 
 class WorkflowRunnerError(RuntimeError):
@@ -115,6 +120,7 @@ class WorkflowRunner:
             VerificationMethodsResolver
         ] = None,
         ci_green_provider: Optional[CiGreenProvider] = None,
+        consent_collect_provider: Optional[ConsentCollectProvider] = None,
     ) -> None:
         self.store = store
         self.dispatcher = dispatcher
@@ -123,6 +129,7 @@ class WorkflowRunner:
         self.public_key_resolver = public_key_resolver
         self.verification_methods_resolver = verification_methods_resolver
         self.ci_green_provider = ci_green_provider or _default_ci_green_provider
+        self.consent_collect_provider = consent_collect_provider
 
     async def start_run(
         self,
@@ -179,12 +186,92 @@ class WorkflowRunner:
             )
         spec = await self._load_pinned_definition(run)
         self._validate_run_start_contract(spec)
+        if run.status == RunStatus.WAITING or (
+            run.status == RunStatus.PAUSED
+            and await self._has_pending_waiting_stage(run, spec)
+        ):
+            await self.store.update_run_status(run_id, RunStatus.RUNNING)
+            run = await self.store.get_run(run_id)
+            if run is None:
+                raise WorkflowRunnerError(f"workflow run missing: {run_id}")
+            return await self._continue_waiting_run(run, spec)
         if run.status == RunStatus.PAUSED:
             await self.store.update_run_status(run_id, RunStatus.RUNNING)
             run = await self.store.get_run(run_id)
             if run is None:
                 raise WorkflowRunnerError(f"workflow run missing: {run_id}")
         return await self._continue_run(run, spec)
+
+    async def _continue_waiting_run(
+        self, run: WorkflowRun, spec: WorkflowSpec
+    ) -> WorkflowRunResult:
+        if run.cancel_barrier_at is not None:
+            status = await self._compensate(run, spec)
+            return WorkflowRunResult(run.run_id, status)
+        current = list(run.current_stages)
+        if not current:
+            return await self._continue_run(run, spec)
+
+        stage = self._stage_by_name(spec, current.pop(0))
+        gate = await self._evaluate_waiting_stage(run, spec, stage)
+        if gate is None:
+            return await self._continue_run(run, spec)
+        latest = await self.store.get_run(run.run_id)
+        if latest is None:
+            raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
+        if latest.cancel_barrier_at is not None:
+            status = await self._compensate(latest, spec)
+            return WorkflowRunResult(run.run_id, status)
+        if latest.status == RunStatus.PAUSED:
+            if gate == GateOutcome.PENDING:
+                await self.store.update_run_status(
+                    run.run_id,
+                    RunStatus.PAUSED,
+                    current_stages=[stage.name, *current],
+                )
+                return WorkflowRunResult(run.run_id, RunStatus.PAUSED)
+            if gate == GateOutcome.PASS:
+                await self.store.update_run_status(
+                    run.run_id,
+                    RunStatus.PAUSED,
+                    current_stages=[*current, *self._next_stages(spec, stage.name)],
+                )
+                return WorkflowRunResult(run.run_id, RunStatus.PAUSED)
+        if gate == GateOutcome.PENDING:
+            await self.store.update_run_status(
+                run.run_id,
+                RunStatus.WAITING,
+                current_stages=[stage.name, *current],
+            )
+            return WorkflowRunResult(run.run_id, RunStatus.WAITING)
+        if gate != GateOutcome.PASS:
+            status = await self._compensate(
+                latest,
+                spec,
+                success_status=RunStatus.FAILED,
+                residue_status=RunStatus.FAILED,
+            )
+            return WorkflowRunResult(run.run_id, status)
+
+        next_current = [*current, *self._next_stages(spec, stage.name)]
+        await self.store.update_run_status(
+            run.run_id,
+            RunStatus.RUNNING,
+            current_stages=next_current,
+        )
+        resumed = await self.store.get_run(run.run_id)
+        if resumed is None:
+            raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
+        return await self._continue_run(resumed, spec)
+
+    async def _has_pending_waiting_stage(
+        self, run: WorkflowRun, spec: WorkflowSpec
+    ) -> bool:
+        current = list(run.current_stages)
+        if not current:
+            return False
+        stage = self._stage_by_name(spec, current[0])
+        return (await self._pending_waiting_link(run.run_id, stage)) is not None
 
     async def _continue_run(
         self, run: WorkflowRun, spec: WorkflowSpec
@@ -206,6 +293,13 @@ class WorkflowRunner:
             if post_dispatch_run.cancel_barrier_at is not None:
                 status = await self._compensate(post_dispatch_run, spec)
                 return WorkflowRunResult(run.run_id, status)
+            if gate == GateOutcome.PENDING:
+                await self.store.update_run_status(
+                    run.run_id,
+                    RunStatus.WAITING,
+                    current_stages=[stage.name, *current],
+                )
+                return WorkflowRunResult(run.run_id, RunStatus.WAITING)
             if gate != GateOutcome.PASS:
                 status = await self._compensate(
                     run_snapshot,
@@ -357,6 +451,7 @@ class WorkflowRunner:
                 "tests_pass",
                 "ci_green",
                 "lint_clean",
+                "consent_collect",
                 "signature_collected",
             } and stage.signal_mode != SignalMode.ACTION:
                 raise WorkflowRunnerError(
@@ -544,6 +639,7 @@ class WorkflowRunner:
             "tests_pass",
             "ci_green",
             "lint_clean",
+            "consent_collect",
             "signature_collected",
         }:
             payload.update(stage.gate.to_dict()["params"])
@@ -617,6 +713,76 @@ class WorkflowRunner:
         record_gate_outcome(spec.name, stage.name, gate_outcome.value)
         return gate_outcome
 
+    async def _evaluate_waiting_stage(
+        self, run: WorkflowRun, spec: WorkflowSpec, stage: Stage
+    ) -> Optional[GateOutcome]:
+        link = await self._pending_waiting_link(run.run_id, stage)
+        if link is None:
+            return None
+        gate_outcome, gate_reason = await self._evaluate_pending_consent_link(
+            stage.gate,
+            run,
+            stage,
+            link,
+        )
+        actor_did, actor_sig = sign_stage_transition(
+            run_id=run.run_id,
+            stage_name=stage.name,
+            attempt_number=link.attempt_number,
+            signal_id=link.signal_id,
+            gate_outcome=gate_outcome.value,
+            agent_identity=self.agent_identity,
+            use_hybrid=True,
+        )
+        latest_run = await self.store.get_run(run.run_id)
+        post_cancel = (
+            latest_run is not None and latest_run.cancel_barrier_at is not None
+        )
+        await self.store.update_stage_link_transition(
+            link.link_id,
+            signal_id=link.signal_id,
+            gate_outcome=gate_outcome,
+            gate_reason=gate_reason,
+            actor_did=actor_did,
+            actor_sig=actor_sig,
+            post_cancel=post_cancel,
+        )
+        if gate_outcome == GateOutcome.PASS and stage.compensate == "noop_idempotent":
+            await self.store.update_compensate_state(link.link_id, "not_required")
+        record_gate_outcome(spec.name, stage.name, gate_outcome.value)
+        return gate_outcome
+
+    async def _pending_waiting_link(
+        self, run_id: str, stage: Stage
+    ) -> Optional[StageLink]:
+        if stage.gate.type != "consent_collect":
+            return None
+        links = await self.store.list_stage_links(run_id)
+        pending = [
+            link
+            for link in links
+            if link.stage_name == stage.name
+            and link.gate_outcome == GateOutcome.PENDING
+        ]
+        return pending[-1] if pending else None
+
+    async def _evaluate_pending_consent_link(
+        self,
+        gate: Gate,
+        run: WorkflowRun,
+        stage: Stage,
+        link: StageLink,
+    ) -> tuple[GateOutcome, Optional[str]]:
+        if self.consent_collect_provider is None:
+            return GateOutcome.FAIL, "consent_collect_no_resolver"
+        try:
+            marker = self.consent_collect_provider(gate, run, stage, link)
+            if inspect.isawaitable(marker):
+                marker = await marker
+        except Exception as exc:  # pragma: no cover - defensive boundary
+            return GateOutcome.PENDING, f"consent_collect_pending_error:{exc}"
+        return _evaluate_consent_collect_marker(gate, marker)
+
     async def _evaluate_gate(
         self,
         stage: Stage,
@@ -633,6 +799,8 @@ class WorkflowRunner:
             return _evaluate_exit_marker_gate(stage.gate, result)
         if stage.gate.type == "ci_green":
             return await self._evaluate_ci_green_gate(stage.gate, result)
+        if stage.gate.type == "consent_collect":
+            return _evaluate_consent_collect_gate(stage.gate, result)
         if stage.gate.type == "signature_collected":
             return self._evaluate_signature_collected_gate(
                 stage.gate,
@@ -947,6 +1115,40 @@ def _evaluate_signature_collected_gate(
     ):
         return GateOutcome.FAIL, "signature_collected_invalid_signature"
     return GateOutcome.PASS, None
+
+
+def _evaluate_consent_collect_gate(
+    gate: Gate, result: Any
+) -> tuple[GateOutcome, Optional[str]]:
+    if result.mode != SignalMode.ACTION:
+        return GateOutcome.FAIL, "consent_collect_requires_action_result"
+    marker = getattr(result, "action_result", None)
+    return _evaluate_consent_collect_marker(gate, marker)
+
+
+def _evaluate_consent_collect_marker(
+    gate: Gate, marker: Any
+) -> tuple[GateOutcome, Optional[str]]:
+    if not isinstance(marker, dict):
+        return GateOutcome.FAIL, "consent_collect_missing_result"
+
+    expected_scope = gate.params["scope"]
+    observed_scope = _first_marker_string(
+        marker, ("scope", "consent_scope", "requested_scope")
+    )
+    if observed_scope is None:
+        return GateOutcome.FAIL, "consent_collect_missing_scope"
+    if observed_scope != expected_scope:
+        return GateOutcome.FAIL, f"consent_collect_scope_mismatch:{expected_scope}"
+
+    if _consent_marker_pending(marker):
+        return GateOutcome.PENDING, _consent_marker_pending_reason(marker)
+    if _consent_marker_denied(marker):
+        reason = _consent_marker_reason(marker)
+        return GateOutcome.FAIL, f"consent_collect_denied:{reason}"
+    if _consent_marker_approved(marker):
+        return GateOutcome.PASS, None
+    return GateOutcome.FAIL, "consent_collect_missing_approval"
 
 
 def _signature_marker_did(marker: dict[str, Any]) -> Optional[str]:
@@ -1448,6 +1650,80 @@ def _has_explicit_bad_status(value: dict[str, Any]) -> bool:
         "timeout",
         "timed_out",
     }
+
+
+def _first_marker_string(
+    value: dict[str, Any], keys: tuple[str, ...]
+) -> Optional[str]:
+    for key in keys:
+        item = value.get(key)
+        if isinstance(item, str) and item.strip():
+            return item.strip()
+    return None
+
+
+def _consent_marker_approved(value: dict[str, Any]) -> bool:
+    if any(value.get(key) is True for key in ("approved", "consent", "accepted")):
+        return True
+    decision = _first_marker_string(value, ("decision", "status", "state", "outcome"))
+    return decision is not None and decision.lower() in {
+        "allow",
+        "allowed",
+        "approve",
+        "approved",
+        "accept",
+        "accepted",
+    }
+
+
+def _consent_marker_denied(value: dict[str, Any]) -> bool:
+    if any(value.get(key) is False for key in ("approved", "consent", "accepted")):
+        return True
+    if _has_explicit_bad_status(value):
+        return True
+    decision = _first_marker_string(value, ("decision", "status", "state", "outcome"))
+    return decision is not None and decision.lower() in {
+        "deny",
+        "denied",
+        "reject",
+        "rejected",
+        "decline",
+        "declined",
+        "cancel",
+        "cancelled",
+        "canceled",
+    }
+
+
+def _consent_marker_pending(value: dict[str, Any]) -> bool:
+    decision = _first_marker_string(value, ("decision", "status", "state", "outcome"))
+    return decision is not None and decision.lower() in {
+        "pending",
+        "waiting",
+        "queued",
+        "needs_approval",
+        "needs_review",
+    }
+
+
+def _consent_marker_pending_reason(value: dict[str, Any]) -> str:
+    request_id = _first_marker_string(
+        value,
+        (
+            "approval_id",
+            "approval_request_id",
+            "request_id",
+            "consent_request_id",
+        ),
+    )
+    if request_id is None:
+        return "consent_collect_pending"
+    return f"consent_collect_pending:{request_id}"
+
+
+def _consent_marker_reason(value: dict[str, Any]) -> str:
+    reason = _first_marker_string(value, ("reason", "message", "error", "summary"))
+    return reason if reason is not None else _result_marker_reason(value)
 
 
 def _has_explicit_nonzero_exit(value: dict[str, Any]) -> bool:

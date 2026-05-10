@@ -334,6 +334,481 @@ async def test_runner_refuses_unsupported_gate_before_signal(runner_components):
 
 
 @pytest.mark.asyncio
+async def test_runner_consent_collect_gate_accepts_approved_scope(runner_components):
+    c = runner_components
+    seen_payloads: list[dict] = []
+
+    async def handler(payload):
+        seen_payloads.append(payload)
+        return {
+            "scope": payload["scope"],
+            "approved": True,
+            "approved_by": "did:web:human.example",
+        }
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+    assert seen_payloads == [{"scope": "publish_pr"}]
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+    assert links[0].compensate_state == "not_required"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_gate_fails_denial(runner_components):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "scope": payload["scope"],
+            "approved": False,
+            "reason": "human denied",
+        }
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "consent_collect_denied:human denied"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_gate_fails_scope_mismatch(runner_components):
+    c = runner_components
+
+    async def handler(payload):
+        return {"scope": "delete_prod", "approved": True}
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "consent_collect_scope_mismatch:publish_pr"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_gate_rejects_generic_success(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"scope": payload["scope"], "status": "success"}
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "consent_collect_missing_approval"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_gate_waits_then_resumes(runner_components):
+    c = runner_components
+    seen_payloads: list[dict] = []
+
+    async def handler(payload):
+        seen_payloads.append(payload)
+        return {
+            "scope": "publish_pr",
+            "status": "pending",
+            "approval_id": "approval-123",
+        }
+
+    async def consent_provider(gate, run, stage, link):
+        assert gate.params["scope"] == "publish_pr"
+        assert stage.name == "approve"
+        assert link.gate_outcome.value == "pending"
+        assert run.status == RunStatus.RUNNING
+        return {"scope": "publish_pr", "decision": "approved"}
+
+    c.runner.consent_collect_provider = consent_provider
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.WAITING
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.status == RunStatus.WAITING
+    assert run.current_stages == ("approve",)
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome.value == "pending"
+    assert links[0].gate_reason == "consent_collect_pending:approval-123"
+    assert links[0].compensate_state == "pending"
+
+    resumed = await c.runner.continue_run(result.run_id)
+
+    assert resumed.status == RunStatus.COMPLETED
+    assert seen_payloads == [{"scope": "publish_pr"}]
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.status == RunStatus.COMPLETED
+    links = await c.store.list_stage_links(result.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_waiting_without_provider_does_not_redispatch(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {"scope": payload["scope"], "status": "pending"}
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    resumed = await c.runner.continue_run(result.run_id)
+
+    assert result.status == RunStatus.WAITING
+    assert resumed.status == RunStatus.FAILED
+    assert calls == 1
+    links = await c.store.list_stage_links(result.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "consent_collect_no_resolver"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_resumes_paused_wait_without_redispatch(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {"scope": payload["scope"], "status": "pending"}
+
+    async def consent_provider(gate, run, stage, link):
+        return {"scope": gate.params["scope"], "decision": "approved"}
+
+    c.runner.consent_collect_provider = consent_provider
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    await c.store.update_run_status(result.run_id, RunStatus.PAUSED)
+    resumed = await c.runner.continue_run(result.run_id)
+
+    assert result.status == RunStatus.WAITING
+    assert resumed.status == RunStatus.COMPLETED
+    assert calls == 1
+    links = await c.store.list_stage_links(result.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_cancel_during_pending_resume_wins(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"scope": payload["scope"], "status": "pending"}
+
+    async def consent_provider(gate, run, stage, link):
+        status = await c.runner.cancel_run(run.run_id)
+        assert status == RunStatus.COMPENSATING
+        return {"scope": gate.params["scope"], "decision": "approved"}
+
+    c.runner.consent_collect_provider = consent_provider
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    resumed = await c.runner.continue_run(result.run_id)
+
+    assert result.status == RunStatus.WAITING
+    assert resumed.status == RunStatus.CANCELLED
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.status == RunStatus.CANCELLED
+    links = await c.store.list_stage_links(result.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].post_cancel is True
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_pause_during_pending_resume_wins(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def consent_handler(payload):
+        events.append("consent")
+        return {"scope": payload["scope"], "status": "pending"}
+
+    async def publish_handler(payload):
+        events.append("publish")
+        return {"ok": True}
+
+    async def consent_provider(gate, run, stage, link):
+        await c.store.update_run_status(run.run_id, RunStatus.PAUSED)
+        return {"scope": gate.params["scope"], "decision": "approved"}
+
+    c.runner.consent_collect_provider = consent_provider
+    c.registry.register(_action_source("hooks.consent", consent_handler))
+    c.registry.register(_action_source("release.publish", publish_handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                ),
+                _stage("publish", "release.publish"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="approve",
+                    to_stage="publish",
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    paused = await c.runner.continue_run(result.run_id)
+
+    assert result.status == RunStatus.WAITING
+    assert paused.status == RunStatus.PAUSED
+    assert events == ["consent"]
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.status == RunStatus.PAUSED
+    assert run.current_stages == ("publish",)
+
+
+@pytest.mark.asyncio
+async def test_runner_consent_collect_requires_action_before_signal(
+    runner_components,
+):
+    c = runner_components
+    prompt = c.tmp_path / "consent.md"
+    prompt.write_text("payload={payload}", encoding="utf-8")
+    c.registry.register(
+        _cognition_source(
+            "hooks.consent",
+            prompt,
+            require_constitution_echo=True,
+        )
+    )
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.COGNITION,
+                    read_only=True,
+                    compensate="comp.review",
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="requires signal_mode=ACTION"):
+        await c.runner.run_to_completion(name="release")
+
+    assert c.agent.process_input_calls == []
+    rows = await c.backend.fetch_all(
+        f"SELECT run_id FROM {c.store.RUNS_TABLE}"
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
 async def test_runner_constitution_echo_verified_gate_accepts_verified_canary(
     runner_components,
 ):

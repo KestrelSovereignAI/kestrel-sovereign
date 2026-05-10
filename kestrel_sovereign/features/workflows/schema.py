@@ -45,6 +45,7 @@ _DID_PATTERN = r"^did:[a-z0-9]+:\S+$"
 # rejects whitespace-only via ``.strip()`` — round-10 P2 schema/model
 # parity. Use this wherever the dataclass strips before checking length.
 _NON_WHITESPACE_PATTERN = r"\S"
+_TRIMMED_NON_EMPTY_PATTERN = r"^(?!\s)(?!.*\s$)(?!.*[\r\n])[\s\S]+$"
 
 
 def _gate_schema() -> dict[str, Any]:
@@ -143,6 +144,27 @@ def _gate_schema() -> dict[str, Any]:
                                 "max_wait_seconds": {
                                     "type": "integer",
                                     "minimum": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "if": {
+                    "properties": {"type": {"const": "consent_collect"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["scope"],
+                            "properties": {
+                                "scope": {
+                                    "type": "string",
+                                    "pattern": _TRIMMED_NON_EMPTY_PATTERN,
                                 },
                             },
                         },
