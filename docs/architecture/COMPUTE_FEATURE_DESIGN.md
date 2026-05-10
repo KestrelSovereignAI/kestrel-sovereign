@@ -1186,7 +1186,7 @@ Uses the **existing** SecurityFeature permission tree with standard icons:
   ☑ restore_from_trash         # ALLOW - Can restore from trash
   ☐ empty_trash                # ASK - Permanent deletion requires approval
 
-Legend: ☑=Allow ☒=Deny ☐=Ask ◑=Session ◐=Mixed
+Legend: ☑=Allow ◆=Auto ☒=Deny ☐=Ask ◑=Session ◐=Mixed
 ```
 
 **Key Security Points:**

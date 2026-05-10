@@ -65,6 +65,9 @@ def _make_security_feature():
     )
     permission_store.set_permission = AsyncMock()
     permission_store.set_feature_permission = AsyncMock()
+    permission_store.get_global_auto_mode = MagicMock(return_value=False)
+    permission_store.set_global_auto_mode = MagicMock()
+    permission_store.log_decision = AsyncMock()
     permission_store.clear_session_overrides = MagicMock()
     approval_queue = MagicMock(
         pending_requests=[
@@ -120,6 +123,11 @@ def test_security_permission_mutation_endpoints_validate_levels_and_scope():
                     headers=_api_headers(),
                     json={"feature": "files", "tool": "write", "level": "allow"},
                 )
+                auto_response = client.post(
+                    "/api/security/permissions",
+                    headers=_api_headers(),
+                    json={"feature": "files", "tool": "read", "level": "auto"},
+                )
                 feature_response = client.post(
                     "/api/security/permissions/feature",
                     headers={
@@ -142,12 +150,14 @@ def test_security_permission_mutation_endpoints_validate_levels_and_scope():
                     json={"approval_id": "req-1", "approved": True, "scope": "forever"},
                 )
         assert tool_response.status_code == 200
+        assert auto_response.status_code == 200
+        assert "constitutional" in auto_response.json()["warning"]
         assert feature_response.status_code == 200
         assert invalid_level.status_code == 400
         assert "Invalid level" in invalid_level.json()["detail"]
         assert invalid_scope.status_code == 400
         assert "Invalid scope" in invalid_scope.json()["detail"]
-        assert security_feature.permission_store.set_permission.await_count == 1
+        assert security_feature.permission_store.set_permission.await_count == 2
         assert security_feature.permission_store.set_feature_permission.await_count == 1
     finally:
         _restore_app(app, original)
@@ -189,6 +199,35 @@ def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()
         assert cancel_all_response.json()["cancelled"] == 3
         assert reset_response.status_code == 200
         security_feature.permission_store.clear_session_overrides.assert_called_once_with()
+    finally:
+        _restore_app(app, original)
+
+
+def test_security_global_auto_mode_endpoints_are_session_scoped():
+    security_feature = _make_security_feature()
+    security_feature.permission_store.get_global_auto_mode.side_effect = [False, True]
+    agent = MagicMock(features={"SecurityFeature": security_feature})
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                status_response = client.get(
+                    "/api/security/auto-mode",
+                    headers=_api_headers(),
+                )
+                enable_response = client.post(
+                    "/api/security/auto-mode",
+                    headers=_api_headers(),
+                    json={"enabled": True},
+                )
+        assert status_response.status_code == 200
+        assert status_response.json()["enabled"] is False
+        assert enable_response.status_code == 200
+        assert enable_response.json()["enabled"] is True
+        assert "non-DENY tools" in enable_response.json()["warning"]
+        security_feature.permission_store.set_global_auto_mode.assert_called_once_with(True)
+        security_feature.permission_store.log_decision.assert_awaited_once()
     finally:
         _restore_app(app, original)
 
