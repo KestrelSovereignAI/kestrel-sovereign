@@ -44,7 +44,7 @@ audit in issue `#624`, focused on maintained runtime surfaces.
   - Fixed by replacing it with `time.monotonic()`.
 - `local_mps_adapter.py` still performed local filesystem and process work directly inside async training/generation methods.
   - Fixed by offloading training setup, process launch/termination, log reads, output scans, LoRA reads, cleanup, generation artifact checks, and artifact reads/writes via `asyncio.to_thread()`.
-- `GitHubAppFeature` accepted webhooks and launched event handlers with bare `asyncio.create_task()`, leaving in-flight tasks unowned during shutdown.
+- The Kestrel GitHub bot accepted webhooks and launched event handlers with bare `asyncio.create_task()`, leaving in-flight tasks unowned during shutdown.
   - Fixed by tracking webhook event tasks, removing completed tasks from the set, and cancelling/awaiting any in-flight handlers during feature shutdown.
 - `KestrelAgent._post_response_pipeline()` launched post-response memory enrichment as an unowned background task, which could still be touching storage while shutdown closed storage.
   - Fixed by adding agent-owned background task tracking and cancelling/awaiting those tasks before sync and storage shutdown.
@@ -87,7 +87,7 @@ audit in issue `#624`, focused on maintained runtime surfaces.
 - `tests/unit/test_local_mps_adapter_async_contracts.py`
 - `tests/unit/test_strategic_memory_async_contracts.py`
 - `tests/unit/test_sovereignty_endpoint_contracts.py`
-- `tests/unit/test_github_app_feature.py`
+- GitHub bot webhook lifecycle tests
 - `tests/unit/test_security_feature.py`
 - `tests/unit/test_context_builder.py`
 - `tests/unit/test_kestrel_agent.py`
@@ -108,7 +108,7 @@ The sync/async boundary audit is complete for the maintained core runtime surfac
 - Remaining maintained `create_task()` sites have been classified as owned lifecycle tasks or request-scoped tasks.
 
 Accepted task-spawn patterns:
-- Owned lifecycle loops: `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, scheduler runner, GitHub App event handling, memory access updates, key rotation, A2A background execution, and LLM preference persistence.
+- Owned lifecycle loops: `TaskWorker`, storage sync service, delivery queue, spawn lifecycle TTL, heartbeat, scheduler runner, GitHub bot event handling, memory access updates, key rotation, A2A background execution, and LLM preference persistence.
 - Request-scoped concurrency: voice websocket VAD processing, which is cancelled and awaited by the websocket cleanup path.
 
 Deferred/extracted workflow code:

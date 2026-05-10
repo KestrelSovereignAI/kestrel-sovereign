@@ -113,12 +113,12 @@ Audited snapshot: **34** discoverable modules · **34** exported `Feature` subcl
 | `bridge` | `BridgeFeature` |
 | `channels` | `ChannelFeature` |
 | `compute` | `ComputeFeature` |
+| `computer_use` | `ComputerUseFeature` |
 | `consent` | `ConsentFeature` |
 | `constitution` | `ConstitutionFeature` |
 | `context` | `ContextFeature` |
 | `delivery` | `DeliveryFeature` |
 | `deploy` | `DeployFeature` |
-| `github_app` | `GitHubAppFeature` |
 | `health` | `HealthFeature` |
 | `identity` | `IdentityFeature` |
 | `keys` | `KeyManagementFeature` |

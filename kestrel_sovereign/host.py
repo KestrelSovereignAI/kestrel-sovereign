@@ -626,7 +626,7 @@ async def rasa_webhook_proxy(request: Request):
 
 
 # --- GitHub App Webhook Proxy ---
-# Forward GitHub App webhooks to the first agent (which has GitHubAppFeature)
+# Forward GitHub bot webhooks to the first agent.
 
 @app.post("/webhooks/github-app")
 async def github_app_webhook_proxy(request: Request):
