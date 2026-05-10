@@ -42,7 +42,7 @@
 | Class | File | Role | Notes |
 |-------|------|------|-------|
 | MemoryHealthCalculator | `features/wellness/metrics.py` | Memory health scoring | Read-only observer, no memory ownership |
-| MemoryChecker | `features/reflection/checks/memory.py` | Constitution/conversation/KG/RAG health checks | Health checks, not memory operations |
+| MemoryChecker | `kestrel-feature-reflection` optional package | Constitution/conversation/KG/RAG health checks | Health checks, not memory operations |
 
 ## Call Chain (after consolidation)
 

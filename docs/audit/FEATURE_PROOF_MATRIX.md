@@ -19,7 +19,7 @@ Status meanings:
 | `consent` | `kestrel_sovereign/features/consent.py` | `tests/unit/test_consent_feature.py`, `tests/unit/test_consent_timeout.py` | Direct |
 | `constitution` | `kestrel_sovereign/features/constitution.py` | `tests/unit/test_constitution_audit.py`, `tests/integration/test_constitution_adversarial.py`, `tests/integration/test_constitution_real_llm.py` | Direct |
 | `context` | `kestrel_sovereign/features/context.py` | `tests/unit/test_context_builder.py`, `tests/unit/test_context_management.py`, `tests/integration/test_context_e2e.py` | Direct |
-| `council` | `kestrel_sovereign/features/council/` | `tests/unit/test_council_resolution_contracts.py`, `tests/unit/test_council_costing_contracts.py` | Direct |
+| `council` | `kestrel-feature-council` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-council` | Boundary |
 | `delivery` | `kestrel_sovereign/features/delivery.py` | `tests/unit/test_delivery_feature.py` | Direct |
 | `deploy` | `kestrel_sovereign/features/deploy/` | `tests/unit/test_deploy_feature.py`, `tests/unit/test_deploy_models.py`, `tests/integration/test_deploy_e2e.py` | Direct |
 | `gcp_compute` | `kestrel_sovereign/features/gcp_compute/` | `tests/unit/test_gcp_compute_feature_contracts.py`, `tests/integration/test_gcp_compute_e2e.py`, `tests/unit/test_cloud_launcher_contracts.py` | Direct |
@@ -33,7 +33,7 @@ Status meanings:
 | `model` | `kestrel_sovereign/features/model/feature.py` | `tests/unit/test_model_selection_contracts.py`, `tests/unit/test_model_set_openrouter.py`, `tests/integration/test_model_set_routing_e2e.py` | Direct |
 | `observability` | `kestrel-feature-observability` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-observability` | Boundary |
 | `peers` | `kestrel_sovereign/features/peers/` | `tests/unit/test_peers_feature.py` | Direct |
-| `reflection` | `kestrel_sovereign/features/reflection/` | `tests/integration/test_reflection_e2e.py` | Direct |
+| `reflection` | `kestrel-feature-reflection` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-reflection` | Boundary |
 | `runpod` | `kestrel_sovereign/features/runpod/` | `tests/unit/test_runpod_model_contracts.py`, `tests/unit/test_runpod_logs.py`, `tests/integration/test_runpod_feature.py` | Direct |
 | `save` | `kestrel_sovereign/features/save.py` | `tests/unit/test_saved_items.py`, `tests/unit/test_commands_conversations_endpoint_contracts.py`, `tests/integration/test_sovereignty_guarantees.py` | Direct |
 | `scheduler` | `kestrel_sovereign/features/scheduler.py` | `tests/unit/test_scheduler_feature.py` | Direct |

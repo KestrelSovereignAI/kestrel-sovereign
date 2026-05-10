@@ -70,8 +70,8 @@ None in use. ML-DSA, ML-KEM, SLH-DSA, hybrid combiners — all unimplemented.
 | Filecoin adapter | [`kestrel_sovereign/filecoin_adapter.py`](../../../kestrel_sovereign/filecoin_adapter.py) |
 | Key rotation tooling | [`kestrel_sovereign/security/key_rotation.py`](../../../kestrel_sovereign/security/key_rotation.py) |
 | Conversations endpoint | [`endpoints/conversations.py`](../../../endpoints/conversations.py) |
-| Reflection — memory check | [`kestrel_sovereign/features/reflection/checks/memory.py`](../../../kestrel_sovereign/features/reflection/checks/memory.py) |
-| Reflection — arms check | [`kestrel_sovereign/features/reflection/checks/arms.py`](../../../kestrel_sovereign/features/reflection/checks/arms.py) |
+| Reflection — memory check | `kestrel-feature-reflection` optional package |
+| Reflection — arms check | `kestrel-feature-reflection` optional package |
 
 #### Tooling and examples (3 files)
 

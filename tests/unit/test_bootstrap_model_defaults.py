@@ -2,10 +2,8 @@
 
 from pathlib import Path
 
-import pytest
 import tomllib
 
-from kestrel_sovereign.features.council.feature import CouncilFeature
 from scripts.setup_demo_agent import build_demo_kestrel_toml
 
 
@@ -30,22 +28,6 @@ def test_demo_kestrel_toml_uses_auto_selection_with_hints():
     rendered = build_demo_kestrel_toml()
     assert "claude-opus-4-6" not in rendered
     assert "llama3.2:latest" not in rendered
-
-
-@pytest.mark.asyncio
-async def test_council_members_help_uses_auto_model_example():
-    from kestrel_sdk.tools.result import ToolResultStatus
-
-    feature = CouncilFeature(agent=None)
-    feature.config = None
-
-    result = await feature.list_members()
-
-    # Empty config → OK with the help text and structured member_count=0
-    assert result.status is ToolResultStatus.OK
-    assert 'model = "auto"' in result.confirmation
-    assert "claude-opus-4-5-20251101" not in result.confirmation
-    assert result.data["member_count"] == 0
 
 
 def test_run_docker_remote_does_not_inject_hidden_default_model():
