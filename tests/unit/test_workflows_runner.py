@@ -45,6 +45,7 @@ from kestrel_sovereign.signals import (
     SignalLogStore,
     SourceRegistry,
 )
+from kestrel_sovereign.signals.constitution_canary import CanaryStatus
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
@@ -52,18 +53,49 @@ class _FakeAgent:
     def __init__(self, did: str):
         self._did = did
         self.background_tasks: list[asyncio.Task] = []
+        self.process_input_calls: list[dict] = []
+        self.verify_calls: list[dict] = []
+        self.echo_status = CanaryStatus.VERIFIED
 
     @property
     def did(self) -> str:
         return self._did
 
-    async def process_input(self, prompt: str):
+    async def process_input(self, prompt: str, **kwargs):
+        self.process_input_calls.append({"prompt": prompt, "kwargs": kwargs})
         return "ok"
 
     def _track_background_task(self, coro, *, name: str):
         task = asyncio.create_task(coro, name=name)
         self.background_tasks.append(task)
         return task
+
+    def get_constitution_hash(self) -> str:
+        return "a" * 64
+
+    def _get_governing_constitution(self) -> str:
+        return "Article I. Test constitution."
+
+    def get_anchored_doctrine_files(self) -> dict:
+        return {}
+
+    def verify_constitution_echo(
+        self,
+        *,
+        canary: str,
+        prompt_template_format: str,
+        signal_id: str,
+        response=None,
+    ) -> CanaryStatus:
+        self.verify_calls.append(
+            {
+                "canary": canary,
+                "prompt_template_format": prompt_template_format,
+                "signal_id": signal_id,
+                "response": response,
+            }
+        )
+        return self.echo_status
 
 
 def _identity(did: str = "did:web:k.example") -> AgentIdentity:
@@ -110,6 +142,26 @@ def _artifact_source(name: str, handler) -> SourceRegistration:
         allowed_modes=frozenset({SignalMode.ARTIFACT}),
         artifact_handler=handler,
         log_redaction=_redaction(),
+    )
+
+
+def _cognition_source(
+    name: str,
+    prompt_template,
+    *,
+    require_constitution_echo: bool,
+) -> SourceRegistration:
+    prompt_template_format = "codex" if require_constitution_echo else "claude_code"
+    return SourceRegistration(
+        name=name,
+        schema=dict,
+        default_mode=SignalMode.COGNITION,
+        allowed_modes=frozenset({SignalMode.COGNITION}),
+        prompt_template=prompt_template,
+        log_redaction=_redaction(),
+        require_constitution_echo=require_constitution_echo,
+        prompt_template_format=prompt_template_format,
+        constitution_injection="full",
     )
 
 
@@ -160,6 +212,8 @@ async def runner_components(tmp_path):
         identity=identity,
         registry=registry,
         runner=runner,
+        agent=agent,
+        tmp_path=tmp_path,
         store=workflow_store,
     )
     pending = [task for task in agent.background_tasks if not task.done()]
@@ -273,6 +327,183 @@ async def test_runner_refuses_unsupported_gate_before_signal(runner_components):
         await c.runner.run_to_completion(name="release")
 
     assert calls == 0
+    rows = await c.backend.fetch_all(
+        f"SELECT run_id FROM {c.store.RUNS_TABLE}"
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_runner_constitution_echo_verified_gate_accepts_verified_canary(
+    runner_components,
+):
+    c = runner_components
+    prompt = c.tmp_path / "reviewer.md"
+    prompt.write_text("payload={payload}", encoding="utf-8")
+    c.registry.register(
+        _cognition_source(
+            "review.echo",
+            prompt,
+            require_constitution_echo=True,
+        )
+    )
+    c.registry.register(_action_source("comp.review", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="review",
+                    signal_source="review.echo",
+                    signal_mode=SignalMode.COGNITION,
+                    read_only=True,
+                    compensate="comp.review",
+                    gate=Gate(type="constitution_echo_verified"),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+    assert len(c.agent.verify_calls) == 1
+    assert c.agent.verify_calls[0]["prompt_template_format"] == "codex"
+    assert c.agent.verify_calls[0]["response"] == "ok"
+    addendum = c.agent.process_input_calls[0]["kwargs"]["system_prompt_addendum"]
+    assert c.agent.verify_calls[0]["canary"] in addendum
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome.value == "pass"
+    if c.agent.background_tasks:
+        await asyncio.gather(*c.agent.background_tasks, return_exceptions=True)
+    rows = await c.backend.fetch_all(
+        "SELECT echo_canary_status FROM signal_log WHERE id = ?",
+        (links[0].signal_id,),
+    )
+    assert [row[0] for row in rows] == ["verified"]
+
+
+@pytest.mark.asyncio
+async def test_runner_constitution_echo_verified_gate_fails_missing_canary(
+    runner_components,
+):
+    c = runner_components
+    c.agent.echo_status = CanaryStatus.MISSING
+    prompt = c.tmp_path / "reviewer.md"
+    prompt.write_text("payload={payload}", encoding="utf-8")
+    c.registry.register(
+        _cognition_source(
+            "review.echo",
+            prompt,
+            require_constitution_echo=True,
+        )
+    )
+    c.registry.register(_action_source("comp.review", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="review",
+                    signal_source="review.echo",
+                    signal_mode=SignalMode.COGNITION,
+                    read_only=True,
+                    compensate="comp.review",
+                    gate=Gate(type="constitution_echo_verified"),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome == "fail"
+    assert links[0].gate_reason == "constitution_not_received"
+
+
+@pytest.mark.asyncio
+async def test_runner_constitution_echo_verified_requires_cognition_before_signal(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {"ok": True}
+
+    c.registry.register(_action_source("review.echo", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="review",
+                    signal_source="review.echo",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(type="constitution_echo_verified"),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="requires signal_mode=COGNITION"):
+        await c.runner.run_to_completion(name="release")
+
+    assert calls == 0
+    rows = await c.backend.fetch_all(
+        f"SELECT run_id FROM {c.store.RUNS_TABLE}"
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_runner_constitution_echo_verified_requires_echo_source_before_signal(
+    runner_components,
+):
+    c = runner_components
+    prompt = c.tmp_path / "reviewer.md"
+    prompt.write_text("payload={payload}", encoding="utf-8")
+    c.registry.register(
+        _cognition_source(
+            "review.echo",
+            prompt,
+            require_constitution_echo=False,
+        )
+    )
+    c.registry.register(_action_source("comp.review", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="review",
+                    signal_source="review.echo",
+                    signal_mode=SignalMode.COGNITION,
+                    read_only=True,
+                    compensate="comp.review",
+                    gate=Gate(type="constitution_echo_verified"),
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="require_constitution_echo=True"):
+        await c.runner.run_to_completion(name="release")
+
+    assert c.agent.process_input_calls == []
     rows = await c.backend.fetch_all(
         f"SELECT run_id FROM {c.store.RUNS_TABLE}"
     )
