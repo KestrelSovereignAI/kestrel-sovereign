@@ -9,11 +9,10 @@ approval queue.
 import logging
 import os
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING
+from typing import Optional, Protocol, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .models import ImprovementProposal  # noqa: F401
-    from kestrel_sovereign.features.github.client import GitHubClient
     from kestrel_sovereign.features.security.feature import SecurityFeature
     from .models import Insight
 
@@ -23,6 +22,21 @@ logger = logging.getLogger(__name__)
 class ConfigurationError(Exception):
     """Raised when required configuration is missing."""
     pass
+
+
+class GitHubIssueClient(Protocol):
+    """Subset of the GitHub feature client used by reflection tickets."""
+
+    _configured: bool
+
+    async def create_issue(
+        self,
+        repo: str,
+        title: str,
+        body: str,
+        labels: list[str],
+    ) -> dict:
+        ...
 
 
 class TicketCreator:
@@ -37,7 +51,7 @@ class TicketCreator:
 
     DEFAULT_REPO = "KestrelSovereignAI/kestrel-sovereign"
 
-    def __init__(self, github_client: "GitHubClient"):
+    def __init__(self, github_client: GitHubIssueClient):
         """Initialize the ticket creator.
 
         Args:
@@ -327,7 +341,7 @@ class TicketCreator:
         return labels
 
 
-async def create_ticket_creator(github_client: "GitHubClient") -> TicketCreator:
+async def create_ticket_creator(github_client: GitHubIssueClient) -> TicketCreator:
     """Factory function to create a TicketCreator.
 
     Args:

@@ -23,11 +23,14 @@ class PermissionLevel(Enum):
     Permission levels for tools.
 
     - ALLOW: Always allow the tool to execute
+    - AUTO: Auto-approve after earlier constitutional/honesty/security hooks
+      have not blocked the call
     - DENY: Always deny the tool execution
     - ASK: Ask for user approval each time (default for new tools)
     - SESSION: Allow for the current session only (not persisted)
     """
     ALLOW = "allow"
+    AUTO = "auto"
     DENY = "deny"
     ASK = "ask"
     SESSION = "session"
@@ -62,6 +65,7 @@ class FeaturePermissions:
 
         Returns:
             - "allow_all": All tools are ALLOW
+            - "auto_all": All tools are AUTO
             - "deny_all": All tools are DENY
             - "ask_all": All tools are ASK
             - "session_all": All tools are SESSION
@@ -113,6 +117,7 @@ class PermissionStore:
         """
         self.db_path = db_path
         self._session_overrides: Dict[str, PermissionLevel] = {}
+        self._global_auto_mode = False
         self._initialized = False
 
     async def initialize(self) -> None:
@@ -186,9 +191,13 @@ class PermissionStore:
         """
         key = f"{feature_name}.{tool_name}"
 
-        # Session override takes priority
+        # Session override takes priority. In global Auto mode, an explicit
+        # DENY remains a hard stop; everything else can flow through Auto.
         if key in self._session_overrides:
-            return self._session_overrides[key]
+            level = self._session_overrides[key]
+            if self._global_auto_mode and level != PermissionLevel.DENY:
+                return PermissionLevel.AUTO
+            return level
 
         # Check persistent storage
         async with aiosqlite.connect(self.db_path) as db:
@@ -199,7 +208,10 @@ class PermissionStore:
             )
             row = await cursor.fetchone()
             if row:
-                return PermissionLevel(row[0])
+                level = PermissionLevel(row[0])
+                if self._global_auto_mode and level != PermissionLevel.DENY:
+                    return PermissionLevel.AUTO
+                return level
 
         # Default for unregistered tools.
         # Demo servers (KESTREL_DEMO_SERVER=1) auto-allow — _register_all_tools
@@ -211,6 +223,8 @@ class PermissionStore:
         import os as _os
         if _os.environ.get("KESTREL_DEMO_SERVER", "").lower() in ("1", "true", "yes"):
             return PermissionLevel.ALLOW
+        if self._global_auto_mode:
+            return PermissionLevel.AUTO
         return PermissionLevel.ASK
 
     async def set_permission(
@@ -418,10 +432,27 @@ class PermissionStore:
         ]
 
     def clear_session_overrides(self) -> None:
-        """Clear all session-scoped permission overrides."""
+        """Clear all session-scoped permission overrides and global Auto."""
         count = len(self._session_overrides)
         self._session_overrides.clear()
-        logger.info(f"Cleared {count} session overrides")
+        self._global_auto_mode = False
+        logger.info(f"Cleared {count} session overrides and disabled global Auto")
+
+    def set_global_auto_mode(self, enabled: bool) -> None:
+        """Enable or disable session-scoped global Auto mode."""
+        self._global_auto_mode = bool(enabled)
+        logger.warning(
+            "Global security Auto mode %s",
+            "enabled" if self._global_auto_mode else "disabled",
+        )
+
+    def get_global_auto_mode(self) -> bool:
+        """Return whether session-scoped global Auto mode is enabled."""
+        return self._global_auto_mode
 
     def __repr__(self) -> str:
-        return f"PermissionStore(db={self.db_path}, session_overrides={len(self._session_overrides)})"
+        return (
+            f"PermissionStore(db={self.db_path}, "
+            f"session_overrides={len(self._session_overrides)}, "
+            f"global_auto_mode={self._global_auto_mode})"
+        )

@@ -251,7 +251,7 @@ features = ["GitHubFeature"]
 description = "GitHub integration for issues, PRs, and repository management"
 tags = ["integration", "github", "devtools"]
 icon = "github"
-core = true
+core = false
 
 [github.skills]
 list_issues = { description = "List GitHub issues", category = "data_access", tags = ["github", "issues"] }

@@ -9,6 +9,7 @@ import { subscribeSSE } from './chat.js';
 export const Security = {
     pendingApprovals: new Map(),
     permissionTree: [],
+    globalAutoMode: false,
     _initialized: false,
     // Modal is a singleton — if two approval_request events arrive in quick
     // succession, showing both concurrently would stack overlays in the DOM
@@ -307,6 +308,7 @@ export const Security = {
         // gating UI for permission grants), so they ride along with it.
         const tasks = [];
         if (API.hasCapability('permissions')) {
+            tasks.push(this.loadAutoMode());
             tasks.push(this.loadPermissionTree());
             tasks.push(this.loadPendingApprovals());
         }
@@ -399,6 +401,7 @@ export const Security = {
                                         cursor: pointer;
                                     ">
                                 <option value="allow" ${tool.level === 'allow' ? 'selected' : ''}>${kicon('check-box')} Allow</option>
+                                <option value="auto" ${tool.level === 'auto' ? 'selected' : ''}>${kicon('shield')} Auto</option>
                                 <option value="ask" ${tool.level === 'ask' ? 'selected' : ''}>${kicon('empty-box')} Ask</option>
                                 <option value="deny" ${tool.level === 'deny' ? 'selected' : ''}>${kicon('x-box')} Deny</option>
                             </select>
@@ -413,6 +416,7 @@ export const Security = {
         const state = feature.rollup_state;
         const icons = {
             'allow_all': kicon('check-box'),
+            'auto_all': kicon('shield'),
             'deny_all': kicon('x-box'),
             'ask_all': kicon('empty-box'),
             'session_all': kicon('half-circle'),
@@ -420,6 +424,7 @@ export const Security = {
         };
         const labels = {
             'allow_all': 'Allow All',
+            'auto_all': 'Auto All',
             'deny_all': 'Deny All',
             'ask_all': 'Ask All',
             'session_all': 'Session All',
@@ -451,7 +456,7 @@ export const Security = {
             const headers = level === 'deny'
                 ? { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui-deny' }
                 : {};
-            await API.request('/api/security/permissions', {
+            const response = await API.request('/api/security/permissions', {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
@@ -461,7 +466,11 @@ export const Security = {
                 })
             });
 
-            Toast.success(`Set ${toolName} to ${level}`);
+            if (response.warning) {
+                Toast.warning(response.warning);
+            } else {
+                Toast.success(`Set ${toolName} to ${level}`);
+            }
             await this.loadPermissionTree(); // Refresh to update rollup
         } catch (error) {
             console.error('Failed to set permission:', error);
@@ -470,10 +479,11 @@ export const Security = {
     },
 
     async cycleFeaturePermission(featureName, currentState) {
-        // Cycle: mixed → ask → allow → deny → ask
+        // Cycle: mixed -> ask -> auto -> allow -> deny -> ask
         const nextLevel = {
             'mixed': 'ask',
-            'ask_all': 'allow',
+            'ask_all': 'auto',
+            'auto_all': 'allow',
             'allow_all': 'deny',
             'deny_all': 'ask',
             'session_all': 'ask'
@@ -484,7 +494,7 @@ export const Security = {
             const headers = nextLevel === 'deny'
                 ? { 'X-Kestrel-Allow-Destructive': 'user-initiated-ui-deny' }
                 : {};
-            await API.request('/api/security/permissions/feature', {
+            const response = await API.request('/api/security/permissions/feature', {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({
@@ -493,7 +503,11 @@ export const Security = {
                 })
             });
 
-            Toast.success(`Set ${featureName} to ${nextLevel}`);
+            if (response.warning) {
+                Toast.warning(response.warning);
+            } else {
+                Toast.success(`Set ${featureName} to ${nextLevel}`);
+            }
             await this.loadPermissionTree();
         } catch (error) {
             console.error('Failed to set feature permission:', error);
@@ -644,6 +658,7 @@ export const Security = {
     _renderDecisionBadge(decision, userChoice) {
         const badges = {
             'auto_allowed': { icon: kicon('check-box'), color: 'var(--success)', text: 'Auto-allowed' },
+            'auto_mode_allowed': { icon: kicon('shield'), color: 'var(--warning)', text: 'Auto mode' },
             'auto_denied': { icon: kicon('x-box'), color: 'var(--error)', text: 'Auto-denied' },
             'user_approved': { icon: kicon('checkmark'), color: 'var(--success)', text: `Approved${userChoice ? ` (${userChoice})` : ''}` },
             'user_denied': { icon: kicon('x-mark'), color: 'var(--error)', text: 'Denied' },
@@ -698,6 +713,73 @@ export const Security = {
 
     // === Session Control Methods ===
 
+    async loadAutoMode() {
+        if (!API.hasCapability('permissions')) return;
+        try {
+            const response = await API.request('/api/security/auto-mode');
+            this.globalAutoMode = Boolean(response.enabled);
+            this.renderAutoModeButton();
+        } catch (error) {
+            console.error('Failed to load Auto mode:', error);
+        }
+    },
+
+    renderAutoModeButton() {
+        const button = document.getElementById('security-auto-mode-btn');
+        if (!button) return;
+
+        button.classList.toggle('btn-primary', this.globalAutoMode);
+        button.classList.toggle('btn-secondary', !this.globalAutoMode);
+        button.innerHTML = this.globalAutoMode
+            ? `${kicon('shield')} Auto Mode: On`
+            : `${kicon('shield')} Auto Mode: Off`;
+        button.title = this.globalAutoMode
+            ? 'Global Auto is on for this session. Explicit Deny still blocks.'
+            : 'Turn on session-scoped global Auto for non-denied tools.';
+    },
+
+    async toggleGlobalAutoMode() {
+        try {
+            const nextEnabled = !this.globalAutoMode;
+            if (nextEnabled) {
+                const confirmed = await new Promise((resolve) => {
+                    Modal.show({
+                        title: 'Enable Global Auto Mode',
+                        content: `
+                            <p style="margin: 0 0 0.75rem 0; color: var(--text-secondary);">
+                                Auto Mode skips approval popups for every non-denied tool while this session is active.
+                            </p>
+                            <p style="margin: 0; color: var(--warning); font-size: 0.875rem;">
+                                Constitutional, honesty, and security hooks still get the first chance to flag or block.
+                                This is not a guarantee that every risk has been detected.
+                            </p>
+                        `,
+                        buttons: [
+                            { label: 'Cancel', type: 'secondary', onClick: () => { Modal.hide(); resolve(false); } },
+                            { label: `${kicon('shield')} Enable Auto`, type: 'primary', onClick: () => { Modal.hide(); resolve(true); } }
+                        ],
+                        onClose: () => resolve(false)
+                    });
+                });
+                if (!confirmed) return;
+            }
+
+            const response = await API.request('/api/security/auto-mode', {
+                method: 'POST',
+                body: JSON.stringify({ enabled: nextEnabled })
+            });
+            this.globalAutoMode = Boolean(response.enabled);
+            this.renderAutoModeButton();
+            Toast[this.globalAutoMode ? 'warning' : 'success'](
+                this.globalAutoMode ? response.warning : 'Global Auto mode disabled'
+            );
+            await this.loadPermissionTree();
+        } catch (error) {
+            console.error('Failed to toggle Auto mode:', error);
+            Toast.error('Failed to toggle Auto mode');
+        }
+    },
+
     async resetSession() {
         try {
             const confirmed = await new Promise((resolve) => {
@@ -720,6 +802,8 @@ export const Security = {
             if (!confirmed) return;
 
             await API.request('/api/security/reset-session', { method: 'POST' });
+            this.globalAutoMode = false;
+            this.renderAutoModeButton();
             Toast.success('Session permissions cleared');
             await this.loadPermissionTree();
         } catch (error) {

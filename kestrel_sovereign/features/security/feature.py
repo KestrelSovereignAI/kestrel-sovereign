@@ -253,6 +253,7 @@ class SecurityFeature(Feature):
         # Format as hierarchical tree
         state_icon = {
             "allow_all": "☑",
+            "auto_all": "◆",
             "deny_all": "☒",
             "ask_all": "☐",
             "session_all": "◑",
@@ -260,6 +261,7 @@ class SecurityFeature(Feature):
         }
         level_icon = {
             "allow": "☑",
+            "auto": "◆",
             "deny": "☒",
             "ask": "☐",
             "session": "◑",
@@ -287,7 +289,7 @@ class SecurityFeature(Feature):
             })
 
         lines.append(
-            "\nLegend: ☑=Allow ☒=Deny ☐=Ask ◑=Session ◐=Mixed"
+            "\nLegend: ☑=Allow ◆=Auto ☒=Deny ☐=Ask ◑=Session ◐=Mixed"
         )
         return ToolResult.ok(
             confirmation="\n".join(lines),
@@ -316,13 +318,13 @@ class SecurityFeature(Feature):
         Args:
             feature_name: Name of the feature (e.g., "WalletAgent")
             tool_name: Name of the tool (optional, sets all if omitted)
-            level: Permission level - "allow", "deny", "ask", or "session"
+            level: Permission level - "allow", "auto", "deny", "ask", or "session"
         """
         try:
             perm_level = PermissionLevel(level)
         except ValueError:
             return ToolResult.failed(
-                f"Invalid level '{level}'. Use: allow, deny, ask, session"
+                f"Invalid level '{level}'. Use: allow, auto, deny, ask, session"
             )
 
         try:
@@ -331,7 +333,9 @@ class SecurityFeature(Feature):
                     feature_name, tool_name, perm_level
                 )
                 return ToolResult.ok(
-                    confirmation=f"Set {feature_name}.{tool_name} to {level}",
+                    confirmation=self._format_permission_confirmation(
+                        feature_name, tool_name, level
+                    ),
                     data={
                         "feature_name": feature_name,
                         "tool_name": tool_name,
@@ -343,7 +347,9 @@ class SecurityFeature(Feature):
                 feature_name, perm_level
             )
             return ToolResult.ok(
-                confirmation=f"Set all tools in {feature_name} to {level}",
+                confirmation=self._format_permission_confirmation(
+                    feature_name, None, level
+                ),
                 data={
                     "feature_name": feature_name,
                     "tool_name": None,
@@ -558,6 +564,7 @@ class SecurityFeature(Feature):
         for entry in logs:
             decision_icon = {
                 "auto_allowed": "☑",
+                "auto_mode_allowed": "◆",
                 "auto_denied": "☒",
                 "user_approved": "✓",
                 "user_denied": "✗",
@@ -583,6 +590,26 @@ class SecurityFeature(Feature):
                 "entries": safe_entries,
             },
         )
+
+    def _format_permission_confirmation(
+        self,
+        feature_name: str,
+        tool_name: Optional[str],
+        level: str,
+    ) -> str:
+        target = (
+            f"{feature_name}.{tool_name}"
+            if tool_name
+            else f"all tools in {feature_name}"
+        )
+        confirmation = f"Set {target} to {level}"
+        if level == PermissionLevel.AUTO.value:
+            confirmation += (
+                "\n\nWarning: Auto mode skips human approval when earlier "
+                "constitutional, honesty, and security hooks do not flag the "
+                "call. It is not a guarantee that every risk has been detected."
+            )
+        return confirmation
 
     def _find_request_id(self, partial_id: str) -> Optional[str]:
         """

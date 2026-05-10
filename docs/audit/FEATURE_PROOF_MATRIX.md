@@ -23,7 +23,7 @@ Status meanings:
 | `delivery` | `kestrel_sovereign/features/delivery.py` | `tests/unit/test_delivery_feature.py` | Direct |
 | `deploy` | `kestrel_sovereign/features/deploy/` | `tests/unit/test_deploy_feature.py`, `tests/unit/test_deploy_models.py`, `tests/integration/test_deploy_e2e.py` | Direct |
 | `gcp_compute` | `kestrel_sovereign/features/gcp_compute/` | `tests/unit/test_gcp_compute_feature_contracts.py`, `tests/integration/test_gcp_compute_e2e.py`, `tests/unit/test_cloud_launcher_contracts.py` | Direct |
-| `github` | `kestrel_sovereign/features/github/` | `tests/unit/test_github_feature.py`, `tests/unit/test_github_processor.py` | Direct |
+| `github` | `kestrel-feature-github` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-github` | Boundary |
 | `health` | `kestrel_sovereign/features/health/` | `tests/unit/test_health_feature.py`, `tests/unit/test_heartbeat.py` | Direct |
 | `identity` | `kestrel_sovereign/features/identity/` | `tests/unit/test_identity_package.py`, `tests/unit/test_identity_constitution_endpoint_contracts.py`, `tests/integration/test_identity_export_import.py` | Direct |
 | `keys` | `kestrel_sovereign/features/keys.py` | `tests/unit/test_key_resolution_security.py`, `tests/integration/test_key_management.py` | Direct |

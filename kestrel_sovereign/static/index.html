@@ -842,7 +842,10 @@
                         </p>
                     </div>
                     <p style="color: var(--text-tertiary); font-size: 0.75rem; margin-top: 0.75rem;">
-                        <span data-label-key="security_legend_label">Legend:</span> <span class="ki ki-check-box"></span> <span data-label-key="security_legend_allow">Allow</span> | <span class="ki ki-empty-box"></span> <span data-label-key="security_legend_ask">Ask</span> | <span class="ki ki-x-box"></span> <span data-label-key="security_legend_deny">Deny</span> | <span class="ki ki-half-circle"></span> <span data-label-key="security_legend_mixed">Mixed</span>
+                        <span data-label-key="security_legend_label">Legend:</span> <span class="ki ki-check-box"></span> <span data-label-key="security_legend_allow">Allow</span> | <span class="ki ki-shield"></span> <span data-label-key="security_legend_auto">Auto</span> | <span class="ki ki-empty-box"></span> <span data-label-key="security_legend_ask">Ask</span> | <span class="ki ki-x-box"></span> <span data-label-key="security_legend_deny">Deny</span> | <span class="ki ki-half-circle"></span> <span data-label-key="security_legend_mixed">Mixed</span>
+                    </p>
+                    <p style="color: var(--warning); font-size: 0.75rem; margin-top: 0.5rem;" data-label-key="security_auto_warning">
+                        Auto skips human approval only when constitutional, honesty, and security checks do not flag the call.
                     </p>
                 </div>
 
@@ -850,6 +853,9 @@
                 <div class="mb-5 section-divider">
                     <h3 style="margin: 0 0 1rem 0;"><span class="ki ki-gear"></span> <span data-label-key="security_session_controls">Session Controls</span></h3>
                     <div style="display: flex; gap: 0.75rem; flex-wrap: wrap;">
+                        <button id="security-auto-mode-btn" onclick="Security.toggleGlobalAutoMode()" class="btn btn-secondary text-sm" data-label-key="btn_auto_mode">
+                            Auto Mode: Off
+                        </button>
                         <button onclick="Security.resetSession()" class="btn btn-secondary text-sm" data-label-key="btn_reset_session">
                             Reset Session Permissions
                         </button>

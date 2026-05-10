@@ -966,6 +966,48 @@ nav {
     border-left: 3px solid var(--accent-color);
 }
 
+.tool-activity-expandable {
+    display: block;
+}
+
+.tool-activity-summary {
+    align-items: center;
+    cursor: pointer;
+    display: flex;
+    gap: 0.75rem;
+    justify-content: space-between;
+    list-style: none;
+    user-select: none;
+}
+
+.tool-activity-summary::-webkit-details-marker {
+    display: none;
+}
+
+.tool-activity-summary::before {
+    content: '\25B8';
+    color: var(--text-secondary);
+    flex: 0 0 auto;
+    font-size: 0.75rem;
+    transition: transform 0.15s ease;
+}
+
+.tool-activity-expandable[open] .tool-activity-summary::before {
+    transform: rotate(90deg);
+}
+
+.tool-activity-count {
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    margin-left: auto;
+}
+
+.tool-activity-list {
+    border-top: 1px solid var(--border-color);
+    margin-top: 0.5rem;
+    padding-top: 0.35rem;
+}
+
 .tool-activity {
     font-family: var(--font-mono);
     padding: 0.15rem 0;

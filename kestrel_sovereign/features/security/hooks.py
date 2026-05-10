@@ -97,6 +97,25 @@ class SecurityHook(Hook):
             logger.debug(f"Auto-allowed: {feature_name}.{tool_name}")
             return HookOutput.allow(f"Auto-approved: {feature_name}.{tool_name}")
 
+        if level == PermissionLevel.AUTO:
+            await self.permission_store.log_decision(
+                feature_name=feature_name,
+                tool_name=tool_name,
+                action="tool_execution",
+                decision="auto_mode_allowed",
+                user_choice="constitutional_honesty_unflagged",
+                args_summary=args_summary,
+            )
+            logger.info(
+                "Auto mode approved %s.%s after earlier policy hooks did not block",
+                feature_name,
+                tool_name,
+            )
+            return HookOutput.allow(
+                "Auto mode approved after constitutional/honesty checks did not flag: "
+                f"{feature_name}.{tool_name}"
+            )
+
         if level == PermissionLevel.DENY:
             await self.permission_store.log_decision(
                 feature_name=feature_name,
