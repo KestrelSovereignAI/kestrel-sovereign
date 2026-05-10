@@ -155,13 +155,70 @@ test('pendingRevise flag pinned on pane shape (initial value + reset on wipe)', 
     const pane = getOrCreateChatPane('shape-test');
     assert.equal(pane.pendingRevise, false,
         'getOrCreateChatPane must initialize pendingRevise=false');
+    assert.deepEqual(pane.thinkingItems, [],
+        'getOrCreateChatPane must initialize empty thinkingItems');
 
     // Simulate a server-fired revise mid-stream
     pane.pendingRevise = true;
+    pane.thinkingItems = [{ content: 'old thought' }];
     chatModule.wipeAgentChatPane('shape-test');
     assert.equal(pane.pendingRevise, false,
         'wipeAgentChatPane must reset pendingRevise so a stale flag from '
         + 'the wiped conversation can\'t bleed into the next dispatch');
+    assert.deepEqual(pane.thinkingItems, [],
+        'wipeAgentChatPane must reset stale thought bubbles');
+});
+
+test('streaming renderer shows expandable thought bubbles outside answer text', async () => {
+    renderCalls.length = 0;
+    const pane = getOrCreateChatPane('thinking-render');
+    const msgDiv = chatModule.addMessageStreaming('agent', pane.element);
+    pane.thinkingItems = [{ content: 'The user wants diagnosis.', provider: 'openai' }];
+
+    chatModule.updateStreamingMessage(
+        msgDiv,
+        'Visible answer.',
+        pane.element,
+        pane.thinkingItems,
+    );
+
+    const contentDiv = msgDiv.querySelector('.message-content');
+    assert.match(contentDiv.innerHTML, /thinking-bubble/);
+    assert.match(contentDiv.innerHTML, /<summary>Thinking 1 · openai<\/summary>/);
+    assert.deepEqual(renderCalls, ['The user wants diagnosis.', 'Visible answer.'],
+        'thought markdown should be rendered separately from answer markdown');
+});
+
+test('streaming loop coalesces thinking deltas into one bubble per provider', async () => {
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('thinking-deltas');
+    apiModule.default.setHostAgent('thinking-deltas');
+    mountChatPane('thinking-deltas');
+    pane.sessionId = 'sess-thinking-deltas';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'think';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('\x1eKESTREL:THINK:{"content":"The user ","provider":"openai"}\x1e');
+    ctrl.push('\x1eKESTREL:THINK:{"content":"asked for help.","provider":"openai"}\x1e');
+    ctrl.push('Visible answer.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    assert.equal(pane.thinkingItems.length, 1);
+    assert.deepEqual(pane.thinkingItems[0], {
+        content: 'The user asked for help.',
+        provider: 'openai',
+    });
 });
 
 test('streaming loop preserves visible pre-tool prose when pane.pendingRevise is set', async () => {

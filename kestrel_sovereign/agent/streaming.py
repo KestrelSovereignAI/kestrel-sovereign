@@ -7,7 +7,7 @@ from typing import Dict, Any, Optional
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
 from kestrel_sdk.llm import ToolCallStarted
-from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
@@ -40,6 +40,8 @@ from kestrel_sovereign.telemetry import start_span, end_span
 # ``pane.pendingRevise``; the other is a no-op.
 REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
 REVISE_SENTINEL_SUFFIX = "\x1e"
+THINKING_SENTINEL_PREFIX = "\x1eKESTREL:THINK:"
+THINKING_SENTINEL_SUFFIX = "\x1e"
 
 
 def _build_revise_sentinel(marker: ToolCallStarted) -> str:
@@ -52,8 +54,17 @@ def _build_revise_sentinel(marker: ToolCallStarted) -> str:
     return f"{REVISE_SENTINEL_PREFIX}{payload}{REVISE_SENTINEL_SUFFIX}"
 
 
+def _build_thinking_sentinel(delta: ThinkingDelta) -> str:
+    """Construct an in-band thinking sentinel for chat thought bubbles."""
+    payload = json.dumps({
+        "content": delta.content,
+        "provider": delta.provider,
+    }, separators=(",", ":"))
+    return f"{THINKING_SENTINEL_PREFIX}{payload}{THINKING_SENTINEL_SUFFIX}"
+
+
 def strip_revise_sentinels(chunk: str) -> str:
-    """Strip all complete in-band revise sentinels from a chunk.
+    """Strip all complete in-band stream-control sentinels from a chunk.
 
     Server-side helper for non-chat consumers of
     ``process_input_streaming`` — voice/TTS, bridge stream, anything
@@ -69,19 +80,26 @@ def strip_revise_sentinels(chunk: str) -> str:
     In practice the server emits the sentinel as a single Python
     yield, so single-chunk delivery is the overwhelming common case.
     """
-    if REVISE_SENTINEL_PREFIX not in chunk:
+    prefixes = (REVISE_SENTINEL_PREFIX, THINKING_SENTINEL_PREFIX)
+    if not any(prefix in chunk for prefix in prefixes):
         return chunk
     out = []
     i = 0
     while i < len(chunk):
-        prefix_idx = chunk.find(REVISE_SENTINEL_PREFIX, i)
-        if prefix_idx < 0:
+        matches = [
+            (idx, prefix)
+            for prefix in prefixes
+            for idx in [chunk.find(prefix, i)]
+            if idx >= 0
+        ]
+        if not matches:
             out.append(chunk[i:])
             break
+        prefix_idx, prefix = min(matches, key=lambda pair: pair[0])
         out.append(chunk[i:prefix_idx])
         close_idx = chunk.find(
             REVISE_SENTINEL_SUFFIX,
-            prefix_idx + len(REVISE_SENTINEL_PREFIX),
+            prefix_idx + len(prefix),
         )
         if close_idx < 0:
             # Split sentinel — no close in this chunk. Drop everything
@@ -328,6 +346,8 @@ class StreamingMixin:
                 # Text chunk - yield immediately for real-time streaming
                 full_response.append(item)
                 yield item
+            elif isinstance(item, ThinkingDelta):
+                yield _build_thinking_sentinel(item)
             elif isinstance(item, ToolCallStarted):
                 # Honesty-layer signal (#1042 layer 2 / #1045): the LLM
                 # has just begun emitting a tool call. Any pre-tool prose
@@ -401,6 +421,9 @@ class StreamingMixin:
                 tool_results=tool_results,
                 session_id=session_id,
             ):
+                if isinstance(chunk, ThinkingDelta):
+                    yield _build_thinking_sentinel(chunk)
+                    continue
                 tool_response_chunks.append(chunk)
                 yield chunk
             # Persist the FULL visible assistant text — pre-tool reasoning

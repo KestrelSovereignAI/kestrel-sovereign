@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
 
-from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
 from .retry import with_retry
@@ -105,10 +105,11 @@ def _mark_message_content(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Return a copy of *msg* with ``cache_control`` attached to its content.
     Handles plain-string and content-block-array forms. Returns the input
     unchanged when content is empty/None so the caller never emits a
-    malformed request.
+    malformed request. Thinking-only turns can leave empty assistant text in
+    history, and Anthropic rejects cache_control on empty text blocks.
     """
     content = msg.get("content")
-    if isinstance(content, str):
+    if isinstance(content, str) and content:
         marked = dict(msg)
         marked["content"] = [
             {
@@ -119,9 +120,16 @@ def _mark_message_content(msg: Dict[str, Any]) -> Dict[str, Any]:
         ]
         return marked
     if isinstance(content, list) and content:
+        last = content[-1]
+        if (
+            isinstance(last, dict)
+            and last.get("type") == "text"
+            and not last.get("text")
+        ):
+            return msg
         marked = dict(msg)
         blocks = list(content[:-1])
-        blocks.append(_attach_cache_control(content[-1]))
+        blocks.append(_attach_cache_control(last))
         marked["content"] = blocks
         return marked
     return msg
@@ -552,7 +560,7 @@ class AnthropicAdapter(LLMAdapter):
         response_format: Optional[Type[BaseModel]] = None,
         system_prompt: Optional[str] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         """
         Get streaming response from Anthropic Claude.
 
@@ -657,10 +665,31 @@ class AnthropicAdapter(LLMAdapter):
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
+            splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with client.messages.stream(**api_params) as stream:
-                async for text in stream.text_stream:
-                    yield text
+                async for event in stream:
+                    event_type = getattr(event, 'type', None)
+                    if event_type != 'content_block_delta' or not hasattr(event, 'delta'):
+                        logger.debug("Ignoring unsupported Anthropic stream event: %s", event_type)
+                        continue
+                    delta = event.delta
+                    delta_type = getattr(delta, 'type', None)
+                    if delta_type == 'text_delta':
+                        text = getattr(delta, 'text', '')
+                        if text:
+                            for item in splitter.feed(text):
+                                yield item
+                    elif delta_type == 'thinking_delta':
+                        thinking = getattr(delta, 'thinking', None)
+                        if thinking is None:
+                            thinking = getattr(delta, 'text', None)
+                        if thinking:
+                            yield ThinkingDelta(thinking, provider="anthropic")
+                    elif delta_type:
+                        logger.debug("Ignoring unsupported Anthropic delta type: %s", delta_type)
+                for item in splitter.flush():
+                    yield item
 
         except Exception as e:
             logger.error(f"Anthropic streaming error: {e}", exc_info=True)
@@ -675,7 +704,7 @@ class AnthropicAdapter(LLMAdapter):
         response_format: Optional[Type[BaseModel]] = None,
         system_prompt: Optional[str] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, LLMResponse]]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
         """
         Stream response with tool call detection.
 
@@ -813,6 +842,7 @@ class AnthropicAdapter(LLMAdapter):
             chunk_count = 0
             input_tokens = None
             output_tokens = None
+            splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with client.messages.stream(**api_params) as stream:
                 async for event in stream:
@@ -872,8 +902,17 @@ class AnthropicAdapter(LLMAdapter):
                                 text = getattr(delta, 'text', '')
                                 if text:
                                     chunk_count += 1
-                                    text_content += text
-                                    yield text
+                                    for item in splitter.feed(text):
+                                        if isinstance(item, str):
+                                            text_content += item
+                                        yield item
+
+                            elif delta_type == 'thinking_delta':
+                                thinking = getattr(delta, 'thinking', None)
+                                if thinking is None:
+                                    thinking = getattr(delta, 'text', None)
+                                if thinking:
+                                    yield ThinkingDelta(thinking, provider="anthropic")
 
                             elif delta_type == 'input_json_delta':
                                 # Tool input JSON chunk - accumulate
@@ -888,6 +927,10 @@ class AnthropicAdapter(LLMAdapter):
                         current_tool_block_index = None
 
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
+            for item in splitter.flush():
+                if isinstance(item, str):
+                    text_content += item
+                yield item
 
             # If we have tool calls, yield a final LLMResponse with assembled tool calls
             if tool_calls_accumulator:

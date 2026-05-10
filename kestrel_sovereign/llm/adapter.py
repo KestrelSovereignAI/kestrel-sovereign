@@ -22,6 +22,8 @@ SDK's pydantic-only-by-default discipline allows, so it stays
 framework-side.
 """
 
+from dataclasses import dataclass
+import re
 from typing import Any, Dict, List, Optional, Union
 
 from kestrel_sdk.llm import LLMResponse, ToolCall
@@ -29,7 +31,196 @@ from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
 from .image_utils import process_images
 
-__all__ = ["LLMAdapter", "LLMResponse", "ToolCall", "build_messages", "messages_for"]
+@dataclass(frozen=True)
+class ThinkingDelta:
+    """Provider-separated model reasoning emitted during a stream.
+
+    ``content`` is intentionally not assistant answer text. Agent
+    streaming turns it into chat-only UI metadata so storage and
+    follow-up context keep the visible response clean.
+    """
+
+    content: str
+    provider: Optional[str] = None
+
+
+REASONING_MARKERS = (
+    'The user', 'I should', 'I need to', 'Let me',
+    'I\'ll ', 'I will ', 'This is a', 'Since ',
+    'Looking at', 'Based on', 'I can see',
+    'Overall,', 'Now I', 'I have', 'Wait,',
+    'Constraints:', 'The constraints',
+)
+
+
+def looks_like_plain_reasoning(paragraph: str) -> bool:
+    stripped = paragraph.strip()
+    if stripped.startswith(('Constraints:', 'The constraints')):
+        return True
+    return (
+        any(stripped.startswith(m) for m in REASONING_MARKERS)
+        and not any(c in stripped for c in ['#', '|', '- ', '* ', '**'])
+    )
+
+
+def split_thinking_from_content(
+    content: Optional[str],
+    reasoning_content: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(thinking, final_content)`` from provider output."""
+    thinking_parts = []
+    has_separate_reasoning = isinstance(reasoning_content, str) and bool(reasoning_content)
+    if has_separate_reasoning:
+        thinking_parts.append(reasoning_content)
+    if not content:
+        return ("\n\n".join(thinking_parts).strip() or None), content
+
+    def collect_think(match: re.Match) -> str:
+        thinking_parts.append(match.group(1).strip())
+        return ""
+
+    clean = re.sub(
+        r'<think>(.*?)</think>\s*',
+        collect_think,
+        content,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    paragraphs = clean.split('\n\n')
+    if not has_separate_reasoning and len(paragraphs) >= 2:
+        visible = []
+        for paragraph in paragraphs:
+            if looks_like_plain_reasoning(paragraph):
+                thinking_parts.append(paragraph.strip())
+            else:
+                visible.append(paragraph)
+        if visible:
+            clean = '\n\n'.join(visible).strip()
+
+    return ("\n\n".join(p for p in thinking_parts if p).strip() or None), clean
+
+
+def should_split_plain_reasoning(model: str) -> bool:
+    # These families are known to leak reasoning as plain visible paragraphs
+    # on some local/OpenAI-compatible servers, without native reasoning fields
+    # or <think> tags. Keep this narrowly family-scoped so normal prose from
+    # other models is not accidentally hidden in the UI.
+    model_l = (model or "").lower()
+    return (
+        "kimi" in model_l
+        or "deepseek-r1" in model_l
+        or "deepseek-reasoner" in model_l
+        or "qwen3" in model_l
+        or "qwq" in model_l
+    )
+
+
+class ThinkingContentSplitter:
+    """Streaming parser for provider reasoning channels and tag fallbacks."""
+
+    def __init__(self, *, provider: str, split_plain_reasoning: bool = False):
+        self.provider = provider
+        self.split_plain_reasoning = split_plain_reasoning
+        self.in_think = False
+        self.tag_buffer = ""
+        self.plain_buffer = ""
+
+    def feed(self, text: str):
+        if not text:
+            return []
+        events = []
+        self.tag_buffer += text
+
+        while self.tag_buffer:
+            lower = self.tag_buffer.lower()
+            if self.in_think:
+                end = lower.find("</think>")
+                if end < 0:
+                    keep = 0
+                    closing = "</think>"
+                    max_check = min(len(self.tag_buffer), len(closing) - 1)
+                    for i in range(max_check, 0, -1):
+                        if closing.startswith(lower[-i:]):
+                            keep = i
+                            break
+                    thinking = self.tag_buffer[:-keep] if keep else self.tag_buffer
+                    if thinking:
+                        events.append(ThinkingDelta(thinking, provider=self.provider))
+                    self.tag_buffer = self.tag_buffer[-keep:] if keep else ""
+                    return events
+                thinking = self.tag_buffer[:end]
+                if thinking:
+                    events.append(ThinkingDelta(thinking, provider=self.provider))
+                self.tag_buffer = self.tag_buffer[end + len("</think>"):]
+                self.in_think = False
+                continue
+
+            start = lower.find("<think>")
+            if start < 0:
+                keep = 0
+                max_check = min(len(self.tag_buffer), len("<think>") - 1)
+                for i in range(max_check, 0, -1):
+                    if "<think>".startswith(lower[-i:]):
+                        keep = i
+                        break
+                plain = self.tag_buffer[:-keep] if keep else self.tag_buffer
+                self.tag_buffer = self.tag_buffer[-keep:] if keep else ""
+                events.extend(self._feed_plain(plain))
+                return events
+
+            plain = self.tag_buffer[:start]
+            events.extend(self._feed_plain(plain))
+            self.tag_buffer = self.tag_buffer[start + len("<think>"):]
+            self.in_think = True
+
+        return events
+
+    def flush(self):
+        events = []
+        if self.tag_buffer:
+            if self.in_think:
+                events.append(ThinkingDelta(self.tag_buffer, provider=self.provider))
+            else:
+                events.extend(self._feed_plain(self.tag_buffer))
+            self.tag_buffer = ""
+        if self.plain_buffer:
+            events.extend(self._emit_plain_paragraph(self.plain_buffer))
+            self.plain_buffer = ""
+        return events
+
+    def _feed_plain(self, text: str):
+        if not text:
+            return []
+        if not self.split_plain_reasoning:
+            return [text]
+
+        events = []
+        self.plain_buffer += text
+        while "\n\n" in self.plain_buffer:
+            paragraph, self.plain_buffer = self.plain_buffer.split("\n\n", 1)
+            events.extend(self._emit_plain_paragraph(paragraph + "\n\n"))
+        return events
+
+    def _emit_plain_paragraph(self, paragraph: str):
+        if not paragraph:
+            return []
+        if looks_like_plain_reasoning(paragraph):
+            return [ThinkingDelta(paragraph.strip(), provider=self.provider)]
+        return [paragraph]
+
+
+__all__ = [
+    "LLMAdapter",
+    "LLMResponse",
+    "ThinkingDelta",
+    "ThinkingContentSplitter",
+    "ToolCall",
+    "build_messages",
+    "looks_like_plain_reasoning",
+    "messages_for",
+    "should_split_plain_reasoning",
+    "split_thinking_from_content",
+]
 
 
 def build_messages(

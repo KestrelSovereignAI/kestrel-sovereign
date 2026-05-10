@@ -98,7 +98,11 @@ async def _run_openai_and_capture(messages: List[Dict[str, Any]]) -> Dict[str, A
         return_value=MagicMock(
             choices=[
                 MagicMock(
-                    message=MagicMock(content="ok", tool_calls=None),
+                    message=MagicMock(
+                        content="ok",
+                        tool_calls=None,
+                        reasoning_content=None,
+                    ),
                     finish_reason="stop",
                 )
             ],

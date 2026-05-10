@@ -24,8 +24,13 @@ from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.agent.streaming import (
     REVISE_SENTINEL_PREFIX,
     REVISE_SENTINEL_SUFFIX,
+    THINKING_SENTINEL_PREFIX,
+    THINKING_SENTINEL_SUFFIX,
     _build_revise_sentinel,
+    _build_thinking_sentinel,
+    strip_revise_sentinels,
 )
+from kestrel_sovereign.llm.adapter import ThinkingDelta
 
 
 class TestSentinelConstruction:
@@ -76,6 +81,27 @@ class TestSentinelConstruction:
         # Exactly two \\x1e: open + close. Inner \\x1e from the name
         # got JSON-escaped to \\u001e.
         assert s.count("\x1e") == 2
+
+    def test_thinking_sentinel_round_trip(self):
+        s = _build_thinking_sentinel(
+            ThinkingDelta("The user is asking a routing question.", provider="openai")
+        )
+        assert s.startswith(THINKING_SENTINEL_PREFIX)
+        assert s.endswith(THINKING_SENTINEL_SUFFIX)
+        payload_str = s[len(THINKING_SENTINEL_PREFIX):-len(THINKING_SENTINEL_SUFFIX)]
+        payload = json.loads(payload_str)
+        assert payload == {
+            "content": "The user is asking a routing question.",
+            "provider": "openai",
+        }
+
+    def test_strip_revise_sentinels_also_strips_thinking_sentinels(self):
+        chunk = (
+            "visible "
+            + _build_thinking_sentinel(ThinkingDelta("hidden", provider="llama_cpp"))
+            + "answer"
+        )
+        assert strip_revise_sentinels(chunk) == "visible answer"
 
 
 @asynccontextmanager
@@ -253,6 +279,82 @@ async def test_no_sentinel_when_no_marker_fires():
     async for c in agent.process_input_streaming("hi", session_id="s"):
         chunks.append(c)
     assert all(REVISE_SENTINEL_PREFIX not in c for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted():
+    """Provider-separated reasoning should render as UI metadata only."""
+    agent = _build_mock_agent()
+    persisted = []
+    agent.privacy_agent.add_conversation = AsyncMock(
+        side_effect=lambda role, content, **kw: persisted.append({"role": role, "content": content}),
+    )
+
+    async def stream():
+        yield ThinkingDelta("The user wants a concise answer.", provider="openai")
+        yield "Final answer."
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
+
+    chunks = []
+    async for c in agent.process_input_streaming("hi", session_id="s"):
+        chunks.append(c)
+
+    thinking_chunks = [c for c in chunks if THINKING_SENTINEL_PREFIX in c]
+    assert len(thinking_chunks) == 1
+    assert "Final answer." in "".join(chunks)
+
+    assistant_rows = [r for r in persisted if r["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["content"] == "Final answer."
+    assert THINKING_SENTINEL_PREFIX not in assistant_rows[0]["content"]
+    assert "The user wants" not in assistant_rows[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
+    """Post-tool final synthesis can also emit provider thinking metadata."""
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    agent = _build_mock_agent()
+    persisted = []
+    agent.privacy_agent.add_conversation = AsyncMock(
+        side_effect=lambda role, content, **kw: persisted.append({"role": role, "content": content}),
+    )
+
+    async def stream():
+        yield "Checking that now."
+        yield ToolCallStarted(index=0, id="tc1", name="github")
+        yield LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="github", arguments={})],
+        )
+
+    async def post_tool(*, tool_results=None, **kw):
+        if tool_results is not None:
+            tool_results.append({
+                "tool_call_id": "tc1", "name": "github",
+                "result": {"status": "ok"},
+            })
+        yield ThinkingDelta("Now synthesize from the tool result.", provider="openai")
+        yield "Final post-tool answer."
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
+    agent._handle_orchestrator_response_streaming = post_tool
+
+    chunks = []
+    async for c in agent.process_input_streaming("save", session_id="s"):
+        chunks.append(c)
+
+    assert any(THINKING_SENTINEL_PREFIX in c for c in chunks)
+    assert "Final post-tool answer." in "".join(chunks)
+
+    assistant_rows = [r for r in persisted if r["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["content"] == "Checking that now.Final post-tool answer."
+    assert THINKING_SENTINEL_PREFIX not in assistant_rows[0]["content"]
+    assert "Now synthesize" not in assistant_rows[0]["content"]
 
 
 @pytest.mark.asyncio
