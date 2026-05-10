@@ -116,6 +116,24 @@ def test_gate_constitutional_boundary_clean_requires_forbidden_modules():
     )
 
 
+def test_gate_tests_pass_requires_suite():
+    with pytest.raises(WorkflowDefinitionError, match="params.suite"):
+        Gate(type="tests_pass")
+    with pytest.raises(WorkflowDefinitionError, match="params.suite"):
+        Gate(type="tests_pass", params={"suite": "   "})
+    Gate(type="tests_pass", params={"suite": "unit"})
+
+
+def test_gate_lint_clean_requires_scopes():
+    with pytest.raises(WorkflowDefinitionError, match="params.scopes"):
+        Gate(type="lint_clean")
+    with pytest.raises(WorkflowDefinitionError, match="params.scopes"):
+        Gate(type="lint_clean", params={"scopes": []})
+    with pytest.raises(WorkflowDefinitionError, match="params.scopes"):
+        Gate(type="lint_clean", params={"scopes": [""]})
+    Gate(type="lint_clean", params={"scopes": ["kestrel_sovereign/features/workflows"]})
+
+
 def test_gate_red_team_clear_requires_prompt_pack_constraint():
     with pytest.raises(WorkflowDefinitionError):
         Gate(type="red_team_clear", params={"reviewer_pool": ["did:web:r1"]})
@@ -1134,6 +1152,22 @@ def test_schema_accepts_noop_idempotent_with_consent_gate():
         }
     )
     jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_tests_pass_suite():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {"type": "tests_pass", "params": {}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_lint_clean_scopes():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {"type": "lint_clean", "params": {"scopes": []}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
 
 
 @pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")

@@ -48,8 +48,9 @@ _NON_WHITESPACE_PATTERN = r"\S"
 def _gate_schema() -> dict[str, Any]:
     # Codex round 2 P2: mirror the dataclass's per-type required-params
     # rules into the schema so the wire contract doesn't accept gates
-    # that ``Gate.__post_init__`` would reject. Two gate types require
-    # specific params today (the rest accept any object).
+    # that ``Gate.__post_init__`` would reject. Gate-specific fields
+    # are load-bearing because signed specs must validate the same way
+    # whether they enter through dataclasses or JSON Schema.
     return {
         "type": "object",
         "additionalProperties": False,
@@ -59,6 +60,52 @@ def _gate_schema() -> dict[str, Any]:
             "params": {"type": "object"},
         },
         "allOf": [
+            {
+                "if": {
+                    "properties": {"type": {"const": "tests_pass"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["suite"],
+                            "properties": {
+                                "suite": {
+                                    "type": "string",
+                                    "pattern": _NON_WHITESPACE_PATTERN,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "if": {
+                    "properties": {"type": {"const": "lint_clean"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["scopes"],
+                            "properties": {
+                                "scopes": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "pattern": _NON_WHITESPACE_PATTERN,
+                                    },
+                                    "minItems": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
             {
                 "if": {
                     "properties": {"type": {"const": "red_team_clear"}},
