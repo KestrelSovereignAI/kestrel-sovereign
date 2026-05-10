@@ -204,7 +204,16 @@ async def create_tickets_from_actions(
     if created_titles is None:
         created_titles = set()
 
-    from kestrel_sovereign.features.github.client import GitHubClient
+    try:
+        from kestrel_feature_github.client import GitHubClient
+    except ModuleNotFoundError as exc:
+        if exc.name != "kestrel_feature_github":
+            raise
+        raise RuntimeError(
+            "GitHub ticket creation requires the extracted "
+            "kestrel-feature-github package. Install it with: "
+            "uv pip install kestrel-feature-github"
+        ) from exc
 
     client = GitHubClient(token=github_token)
     created_urls = []

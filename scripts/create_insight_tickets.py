@@ -54,7 +54,17 @@ async def main():
 
     # Import required modules
     import aiosqlite
-    from kestrel_sovereign.features.github.client import GitHubClient
+    try:
+        from kestrel_feature_github.client import GitHubClient
+    except ModuleNotFoundError as exc:
+        if exc.name != "kestrel_feature_github":
+            raise
+        print(
+            "ERROR: GitHub ticket creation requires the extracted "
+            "kestrel-feature-github package. Install it with: "
+            "uv pip install kestrel-feature-github"
+        )
+        sys.exit(1)
 
     # Initialize GitHub client
     client = GitHubClient(token=github_token)

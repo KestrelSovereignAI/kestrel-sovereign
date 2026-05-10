@@ -1,8 +1,8 @@
 # GitHub Feature Design
 
-> **Implementation status (last verified 2026-04-25):** the GitHub feature ships at `features/github/` with 48 unit tests. Roughly half of the design below is implemented — enough for "read a file, search code, get a definition, query issues" — but the deeper static-analysis surface is not.
+> **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-point registry. Roughly half of the design below is implemented — enough for "read a file, search code, get a definition, query issues" — but the deeper static-analysis surface is not.
 >
-> **Shipped:** `read_github_file`, `list_github_files`, `search_github_code`, `get_code_definition`, `list_code_definitions`, `get_self_repo_info`, `list_source_components`, `get_component_source`, `invalidate_github_cache`, plus a bonus issue-access tool family (`list_github_issues`, `get_github_issue`, `get_github_issue_comments`). Caching via SQLite (`features/github/cache.py`) and basic AST extraction (`features/github/ast_analyzer.py`) work.
+> **Shipped:** `read_github_file`, `list_github_files`, `search_github_code`, `get_code_definition`, `list_code_definitions`, `get_self_repo_info`, `list_source_components`, `get_component_source`, `invalidate_github_cache`, plus a bonus issue-access tool family (`list_github_issues`, `get_github_issue`, `get_github_issue_comments`). Caching via SQLite (`kestrel_feature_github/cache.py`) and basic AST extraction (`kestrel_feature_github/ast_analyzer.py`) work.
 >
 > **Not shipped (still aspirational):** `find_usages`, `get_call_graph`, `get_inheritance_tree`, `analyze_dependencies`, and the deeper symbol-resolution / call-graph tooling described under "Advanced Features" below. The current AST analyzer extracts function and class definitions; it does not resolve cross-file symbol usage or build dependency graphs.
 >
@@ -545,19 +545,14 @@ async def get_github_cache_status(self) -> Dict[str, Any]:
 ## File Structure
 
 ```
-features/github/
+kestrel_feature_github/
 ├── __init__.py
+├── SKILL.md
 ├── models.py              # SymbolInfo, FunctionInfo, ClassInfo, etc.
 ├── client.py              # GitHub API client with rate limiting
 ├── cache.py               # SQLite cache for files and symbols (per-repo)
 ├── ast_analyzer.py        # Python AST analysis
-├── symbol_index.py        # Symbol indexing and lookup
-├── feature.py             # GitHubFeature with all tools
-└── tests/
-    ├── test_client.py
-    ├── test_cache.py
-    ├── test_ast_analyzer.py
-    └── test_github_feature.py
+└── feature.py             # GitHubFeature with all tools
 ```
 
 ## Configuration
