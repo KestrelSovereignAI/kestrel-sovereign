@@ -104,7 +104,7 @@ Features are discovered from two sources:
 
 ### Core Feature Inventory
 
-Audited snapshot: **38** discoverable modules · **38** exported `Feature` subclasses.
+Audited snapshot: **37** discoverable modules · **37** exported `Feature` subclasses.
 
 | Module | Exported class |
 |---|---|
@@ -127,7 +127,6 @@ Audited snapshot: **38** discoverable modules · **38** exported `Feature` subcl
 | `memory` | `MemoryFeature` |
 | `memory_agency` | `MemoryAgencyFeature` |
 | `model` | `ModelAgent` |
-| `observability` | `ObservabilityFeature` |
 | `peers` | `PeersFeature` |
 | `reflection` | `ReflectionFeature` |
 | `response_audit` | `ResponseAuditFeature` |

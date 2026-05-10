@@ -5,15 +5,13 @@ Covers:
 1. Metric definitions exist and are correct types
 2. /metrics endpoint returns Prometheus text format
 3. /metrics returns 404 when prometheus-client not installed
-4. ObservabilityHook increments Prometheus counters
-5. LLM service increments Prometheus counters
-6. Labels have bounded cardinality (no user data)
-7. Metrics survive without prometheus-client (graceful degradation)
-8. Request middleware records metrics
+4. LLM service increments Prometheus counters
+5. Labels have bounded cardinality (no user data)
+6. Metrics survive without prometheus-client (graceful degradation)
+7. Request middleware records metrics
 """
 
-import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -125,126 +123,7 @@ class TestMetricsEndpoint:
 
 
 # ---------------------------------------------------------------------------
-# 4. ObservabilityHook increments Prometheus counters
-# ---------------------------------------------------------------------------
-
-@requires_prometheus
-class TestObservabilityHookPrometheus:
-    def _make_agent(self):
-        agent = MagicMock()
-        agent.agent_name = "test-agent"
-        store = AsyncMock()
-        store.log_metric = AsyncMock(return_value="event-id")
-        agent.observability_store = store
-        return agent
-
-    def _make_input(self, event_name="PostToolUse", **overrides):
-        from kestrel_sdk.hooks.base import HookInput
-        defaults = {
-            "session_id": "sess-1",
-            "hook_event_name": event_name,
-        }
-        defaults.update(overrides)
-        return HookInput(**defaults)
-
-    @pytest.mark.asyncio
-    async def test_hook_events_counter_incremented(self):
-        from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sdk.metrics import HOOK_EVENTS, REGISTRY
-
-        agent = self._make_agent()
-        hook = ObservabilityHook(agent=agent)
-
-        # Get baseline
-        before = REGISTRY.get_sample_value(
-            "kestrel_hook_events_total",
-            {"event_type": "PreToolUse"},
-        ) or 0.0
-
-        inp = self._make_input("PreToolUse")
-        await hook.execute(inp)
-
-        after = REGISTRY.get_sample_value(
-            "kestrel_hook_events_total",
-            {"event_type": "PreToolUse"},
-        )
-        assert after == before + 1
-
-    @pytest.mark.asyncio
-    async def test_tool_calls_counter_on_post_tool_use(self):
-        from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sdk.metrics import TOOL_CALLS, REGISTRY
-
-        agent = self._make_agent()
-        hook = ObservabilityHook(agent=agent)
-
-        before = REGISTRY.get_sample_value(
-            "kestrel_tool_calls_total",
-            {"tool_name": "test_tool", "success": "True"},
-        ) or 0.0
-
-        inp = self._make_input(
-            "PostToolUse",
-            tool_name="test_tool",
-            tool_response={"success": True, "result": "ok"},
-            execution_time_ms=150.0,
-        )
-        await hook.execute(inp)
-
-        after = REGISTRY.get_sample_value(
-            "kestrel_tool_calls_total",
-            {"tool_name": "test_tool", "success": "True"},
-        )
-        assert after == before + 1
-
-    @pytest.mark.asyncio
-    async def test_tool_duration_recorded(self):
-        from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sdk.metrics import TOOL_DURATION, REGISTRY
-
-        agent = self._make_agent()
-        hook = ObservabilityHook(agent=agent)
-
-        inp = self._make_input(
-            "PostToolUse",
-            tool_name="duration_tool",
-            execution_time_ms=500.0,
-        )
-        await hook.execute(inp)
-
-        # Histogram _count should be >= 1
-        count = REGISTRY.get_sample_value(
-            "kestrel_tool_duration_seconds_count",
-            {"tool_name": "duration_tool"},
-        )
-        assert count is not None and count >= 1
-
-    @pytest.mark.asyncio
-    async def test_non_tool_event_does_not_increment_tool_calls(self):
-        from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sdk.metrics import REGISTRY
-
-        agent = self._make_agent()
-        hook = ObservabilityHook(agent=agent)
-
-        before = REGISTRY.get_sample_value(
-            "kestrel_tool_calls_total",
-            {"tool_name": "not_a_tool", "success": "True"},
-        )
-
-        inp = self._make_input("UserPromptSubmit", tool_name="not_a_tool")
-        await hook.execute(inp)
-
-        after = REGISTRY.get_sample_value(
-            "kestrel_tool_calls_total",
-            {"tool_name": "not_a_tool", "success": "True"},
-        )
-        # Should not have been incremented (UserPromptSubmit != PostToolUse)
-        assert after == before
-
-
-# ---------------------------------------------------------------------------
-# 5. LLM service Prometheus instrumentation
+# 4. LLM service Prometheus instrumentation
 # ---------------------------------------------------------------------------
 
 @requires_prometheus
@@ -343,7 +222,7 @@ class TestLLMServicePrometheus:
 
 
 # ---------------------------------------------------------------------------
-# 6. Graceful degradation (no prometheus-client)
+# 5. Graceful degradation (no prometheus-client)
 # ---------------------------------------------------------------------------
 
 class TestGracefulDegradation:
@@ -357,28 +236,8 @@ class TestGracefulDegradation:
         else:
             assert m.REQUEST_COUNT is None
 
-    @pytest.mark.asyncio
-    async def test_hook_works_without_prometheus(self):
-        """ObservabilityHook works when PROMETHEUS_AVAILABLE is False."""
-        from kestrel_sovereign.features.observability.hook import ObservabilityHook
-        from kestrel_sdk.hooks.base import HookInput
-
-        agent = MagicMock()
-        agent.agent_name = "test"
-        store = AsyncMock()
-        store.log_metric = AsyncMock(return_value="id")
-        agent.observability_store = store
-
-        hook = ObservabilityHook(agent=agent)
-
-        with patch("kestrel_sovereign.features.observability.hook.PROMETHEUS_AVAILABLE", False):
-            inp = HookInput(session_id="s", hook_event_name="Stop")
-            result = await hook.execute(inp)
-            assert result.continue_execution is True
-
-
 # ---------------------------------------------------------------------------
-# 7. Label cardinality
+# 6. Label cardinality
 # ---------------------------------------------------------------------------
 
 @requires_prometheus
