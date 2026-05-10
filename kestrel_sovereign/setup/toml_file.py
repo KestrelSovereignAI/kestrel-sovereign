@@ -49,6 +49,7 @@ def write_toml(
     updates: Mapping[str, Any],
     *,
     deep_merge: bool = True,
+    backup: bool = True,
 ) -> TomlWriteResult:
     """Merge ``updates`` into the toml file at ``path``.
 
@@ -68,7 +69,7 @@ def write_toml(
         return TomlWriteResult(path=path, backup_path=None, changed=False)
 
     backup_path: Path | None = None
-    if path.exists():
+    if backup and path.exists():
         backup_path = _backup_path(path)
         shutil.copy2(path, backup_path)
 

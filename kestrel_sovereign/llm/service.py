@@ -850,7 +850,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         every async-coroutine and async-generator method whose name
         matches a generation pattern calls this guard.
         """
-        if self.disabled:
+        if getattr(self, "disabled", False):
             raise PolicyDeniedError(
                 "LLMService is disabled by PayerPolicy "
                 "(llm.kind = NONE). The agent has no LLM available; "

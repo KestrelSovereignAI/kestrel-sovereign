@@ -204,8 +204,11 @@ def run(ctx: SetupContext) -> None:
             ctx.record(f"Updated {key} in .env")
 
     if toml_updates:
+        backup_toml = not _is_default_payments_only_config(existing_toml)
         toml_result = write_toml(
-            ctx.kestrel_toml_path, {"llm": toml_updates}
+            ctx.kestrel_toml_path,
+            {"llm": toml_updates},
+            backup=backup_toml,
         )
         if toml_result.backup_path is not None:
             ctx.record(
@@ -214,6 +217,25 @@ def run(ctx: SetupContext) -> None:
         if toml_result.changed:
             labels = ", ".join(v.key for v in selected)
             ctx.record(f"Wrote [llm] in kestrel.toml ({labels})")
+
+
+def _is_default_payments_only_config(config: dict[str, object]) -> bool:
+    """True for a clean quickstart's just-created default payments file.
+
+    The payments step runs before the LLM step. On a brand-new project
+    it writes only the default [payments] table, then the LLM step
+    writes [llm]. Backing up that intermediate file creates noise and
+    breaks the wizard's idempotency contract. User-authored files with
+    any other top-level key still get the normal backup.
+    """
+    if set(config) != {"payments"}:
+        return False
+    try:
+        from kestrel_sdk.payer_policy import PayerPolicy
+
+        return config["payments"] == PayerPolicy.host_env_default().to_toml_section()
+    except Exception:
+        return False
 
 
 def _detect_available_vendors(existing_keys: dict[str, str]) -> list[_Vendor]:
