@@ -95,6 +95,10 @@ feedback/
 *.db
 *.sqlite
 *.capsule
+.workflow-cassettes/
+tests/cassettes/
+*.workflow-cassette.enc
+*.workflow-cassette.json
 
 # Runtime
 *.pid
