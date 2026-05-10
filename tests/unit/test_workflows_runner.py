@@ -565,6 +565,427 @@ async def test_runner_records_failed_gate_when_dispatch_fails(runner_components)
 
 
 @pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_passes_clean_source(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "source": (
+                "import math\n\n"
+                "def release_score(value: int) -> int:\n"
+                "    return math.ceil(value / 2)\n"
+            )
+        }
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features.security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+    assert links[0].gate_reason is None
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_fails_for_forbidden_import(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "source": (
+                "from kestrel_sovereign.features.security "
+                "import PermissionStore\n"
+            )
+        }
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    stored = await c.store.get_run(result.run_id)
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert stored.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason.startswith("constitutional_boundary_violation")
+    assert "kestrel_sovereign.features.security" in links[0].gate_reason
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_uses_stage_forbidden_modules(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "source": (
+                "from kestrel_sovereign.features.security "
+                "import PermissionStore\n"
+            )
+        }
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    forbidden_modules=["features/security"],
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features.identity"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason.startswith("constitutional_boundary_violation")
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_fails_relative_import(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"source": "from .security import PermissionStore\n"}
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "constitutional_boundary_violation:.security"
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_fails_imported_submodule(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"source": "from kestrel_sovereign.features import security\n"}
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert (
+        links[0].gate_reason
+        == "constitutional_boundary_violation:kestrel_sovereign.features.security"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_fails_indented_raw_import(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return (
+            "def load_store():\n"
+            "    import kestrel_sovereign.features.security\n"
+            "    return kestrel_sovereign.features.security.PermissionStore\n"
+        )
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert (
+        links[0].gate_reason
+        == "constitutional_boundary_violation:kestrel_sovereign.features.security"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_fails_relative_submodule_import(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"source": "from . import security\n"}
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason == "constitutional_boundary_violation:.security"
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_allows_clean_indented_patch(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {"patch": "@@\n def f():\n+    return 1\n"}
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.COMPLETED
+    assert links[0].gate_outcome.value == "pass"
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_scans_patch_imports(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "patch": (
+                "@@\n"
+                " def f():\n"
+                "+    from kestrel_sovereign.features import security\n"
+                "+    return security.PermissionStore\n"
+            )
+        }
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason.startswith("constitutional_boundary_violation")
+
+
+@pytest.mark.asyncio
+async def test_runner_constitutional_boundary_clean_scans_raw_patch_imports(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return (
+            "@@\n"
+            " def f():\n"
+            "+    from kestrel_sovereign.features import security\n"
+            "+    return security.PermissionStore\n"
+        )
+
+    c.registry.register(_action_source("code.emit", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="generate",
+                    signal_source="code.emit",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="constitutional_boundary_clean",
+                        params={"forbidden_modules": ["features/security"]},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert links[0].gate_outcome.value == "fail"
+    assert links[0].gate_reason.startswith("constitutional_boundary_violation")
+
+
+@pytest.mark.asyncio
 async def test_runner_compensates_passed_stages_when_later_gate_fails(
     runner_components,
 ):
