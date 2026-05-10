@@ -13,12 +13,13 @@ Usage:
 
     python scripts/talon_daemon.py
     python scripts/talon_daemon.py --config scripts/talon_daemon.toml
+    python scripts/talon_daemon.py --backend codex --model gpt-5.5
     python scripts/talon_daemon.py --backend opencode --opencode-model kimi-local/kimi-k2.5
     python scripts/talon_daemon.py --dry-run
 
 Environment Variables:
     GITHUB_TOKEN                    Required (or uses `gh auth token --user <gh_user>`)
-    ANTHROPIC_API_KEY               Not used (Claude Max OAuth)
+    ANTHROPIC_API_KEY               Used only with backend=claude and auth_lane=api_key
     KESTREL_TALON_DIR               Override location of the kestrel-talon checkout
                                     (default: sibling of this repo)
     KESTREL_TALON_WORKTREE_BASE     Override worktree base directory
@@ -39,6 +40,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from kestrel_sovereign.features.talon.runtime import (
+    TalonExecution,
+    TalonPolicy,
+    TalonPreference,
+    TalonRuntimeError,
+    TalonRuntimeRequest,
+    build_talon_invocation,
+    normalize_auth_lane,
+    normalize_backend,
+)
+
 try:
     import tomllib
 except ImportError:
@@ -51,10 +67,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("talon_daemon")
 
-# Paths
 # Defaults assume kestrel-talon is checked out as a sibling of this repo and
 # worktrees live alongside it. Override with env vars on other layouts.
-_REPO_ROOT = Path(__file__).resolve().parent.parent
 _PROJECTS_DIR = _REPO_ROOT.parent
 TALON_DIR = Path(os.environ.get("KESTREL_TALON_DIR", _PROJECTS_DIR / "kestrel-talon"))
 WORKTREE_BASE = Path(os.environ.get("KESTREL_TALON_WORKTREE_BASE", _PROJECTS_DIR))
@@ -80,9 +94,10 @@ class DaemonConfig:
     repos: list[RepoConfig] = field(default_factory=list)
     poll_interval: int = 300  # seconds between polls
     cooldown: int = 60  # seconds between issue processing
-    backend: str = "claude"  # "claude" or "opencode"
-    opencode_model: str = "kimi-local/kimi-k2.5"
-    model: str = "opus"  # Claude model when using claude backend
+    backend: str = "claude"  # "claude", "codex", or "opencode"
+    model: str = "opus"  # Backend-specific model.
+    auth_lane: str = "oauth"  # oauth, api_key, or provider_config
+    opencode_model: str = "kimi-local/kimi-k2.5"  # Legacy CLI/config alias
     gh_user: str = "UncleSaurus"
     pause_file: str = "/tmp/talon-daemon-pause"
     max_daily_issues: int = 50
@@ -138,8 +153,9 @@ def load_config(path: Path, overrides: argparse.Namespace) -> DaemonConfig:
         config.poll_interval = daemon.get("poll_interval", config.poll_interval)
         config.cooldown = daemon.get("cooldown", config.cooldown)
         config.backend = daemon.get("backend", config.backend)
-        config.opencode_model = daemon.get("opencode_model", config.opencode_model)
         config.model = daemon.get("model", config.model)
+        config.auth_lane = daemon.get("auth_lane", config.auth_lane)
+        config.opencode_model = daemon.get("opencode_model", config.opencode_model)
         config.gh_user = daemon.get("gh_user", config.gh_user)
         config.max_daily_issues = daemon.get("max_daily_issues", config.max_daily_issues)
         config.worktree = daemon.get("worktree", config.worktree)
@@ -176,8 +192,12 @@ def load_config(path: Path, overrides: argparse.Namespace) -> DaemonConfig:
         config.backend = overrides.backend
     if overrides.opencode_model:
         config.opencode_model = overrides.opencode_model
+        if (overrides.backend or config.backend) == "opencode":
+            config.model = overrides.opencode_model
     if overrides.model:
         config.model = overrides.model
+    if getattr(overrides, "auth_lane", None):
+        config.auth_lane = overrides.auth_lane
     if overrides.verbose:
         config.verbose = True
     if overrides.poll_interval:
@@ -247,39 +267,56 @@ def build_talon_command(
     daemon_config: DaemonConfig,
 ) -> list[str]:
     """Build the kestrel-talon claim command."""
-    cmd = [
-        "uv", "run", "kestrel-talon", "claim",
-        "--repo", repo_config.repo,
-        "--issue", str(issue_number),
-    ]
-
-    if daemon_config.backend == "opencode":
-        cmd.extend(["--backend", "opencode"])
-        cmd.extend(["--opencode-model", daemon_config.opencode_model])
-    else:
-        cmd.extend(["--model", daemon_config.model])
-
-    if daemon_config.worktree:
-        cmd.extend(["--worktree", "--worktree-base", str(WORKTREE_BASE)])
-
-    if repo_config.repo_dir:
-        cmd.extend(["--repo-dir", repo_config.repo_dir])
-
-    if daemon_config.skip_clarification:
-        cmd.append("--skip-clarification")
-
-    if daemon_config.self_review:
-        cmd.append("--self-review")
-
+    backend = normalize_backend(daemon_config.backend)
+    if backend is None:
+        raise TalonRuntimeError("Talon daemon backend is required")
+    auth_lane = normalize_auth_lane(daemon_config.auth_lane)
+    model = (
+        daemon_config.opencode_model
+        if backend == "opencode" and daemon_config.opencode_model
+        else daemon_config.model
+    )
+    execution = TalonExecution(
+        repo=repo_config.repo,
+        issue=issue_number,
+        repo_dir=Path(repo_config.repo_dir) if repo_config.repo_dir else Path.cwd(),
+        worktree_base=WORKTREE_BASE,
+        worktree=daemon_config.worktree,
+        max_iterations=repo_config.max_iterations,
+        max_turns=repo_config.max_turns,
+        skip_clarification=daemon_config.skip_clarification,
+        self_review=daemon_config.self_review,
+        quality_checks=tuple(repo_config.quality_checks),
+    )
+    preference = TalonPreference(
+        default_backend=backend,
+        default_model=model,
+        default_auth_lane=auth_lane,
+        max_iterations=repo_config.max_iterations,
+        max_turns=repo_config.max_turns,
+        skip_clarification=daemon_config.skip_clarification,
+        self_review=daemon_config.self_review,
+    )
+    invocation = build_talon_invocation(
+        TalonRuntimeRequest(backend=backend, model=model, auth_lane=auth_lane),
+        execution,
+        policy=TalonPolicy(
+            require_worktree=daemon_config.worktree,
+            allow_api_billing=(auth_lane == "api_key"),
+        ),
+        preference=preference,
+        base_env={
+            "GITHUB_TOKEN": "placeholder-for-command-build",
+            **(
+                {"ANTHROPIC_API_KEY": "placeholder-for-command-build"}
+                if auth_lane == "api_key"
+                else {}
+            ),
+        },
+    )
+    cmd = ["uv", "run", "kestrel-talon"] + invocation.argv
     if daemon_config.verbose:
         cmd.append("--verbose")
-
-    cmd.extend(["--max-iterations", str(repo_config.max_iterations)])
-    cmd.extend(["--max-turns", str(repo_config.max_turns)])
-
-    for check in repo_config.quality_checks:
-        cmd.extend(["--quality-check", check])
-
     return cmd
 
 
@@ -294,14 +331,51 @@ async def process_issue(
     issue_title = issue["title"]
     logger.info(f"Processing {repo_config.repo}#{issue_num}: {issue_title}")
 
-    cmd = build_talon_command(repo_config, issue_num, daemon_config)
     env = {
         **os.environ,
         "GH_TOKEN": gh_token,
         "GITHUB_TOKEN": gh_token,
     }
-    # Strip API key — we use Claude Max OAuth
-    env.pop("ANTHROPIC_API_KEY", None)
+    try:
+        cmd = build_talon_command(repo_config, issue_num, daemon_config)
+        backend = normalize_backend(daemon_config.backend) or "claude"
+        auth_lane = normalize_auth_lane(daemon_config.auth_lane) or "oauth"
+        invocation_env = build_talon_invocation(
+            TalonRuntimeRequest(
+                backend=backend,
+                model=(
+                    daemon_config.opencode_model
+                    if backend == "opencode" and daemon_config.opencode_model
+                    else daemon_config.model
+                ),
+                auth_lane=auth_lane,
+            ),
+            TalonExecution(
+                repo=repo_config.repo,
+                issue=issue_num,
+                repo_dir=Path(repo_config.repo_dir) if repo_config.repo_dir else Path.cwd(),
+                worktree_base=WORKTREE_BASE,
+                worktree=daemon_config.worktree,
+                max_iterations=repo_config.max_iterations,
+                max_turns=repo_config.max_turns,
+                skip_clarification=daemon_config.skip_clarification,
+                self_review=daemon_config.self_review,
+                quality_checks=tuple(repo_config.quality_checks),
+            ),
+            policy=TalonPolicy(
+                require_worktree=daemon_config.worktree,
+                allow_api_billing=(auth_lane == "api_key"),
+            ),
+            preference=TalonPreference(
+                default_backend=backend,
+                default_model=daemon_config.model,
+                default_auth_lane=auth_lane,
+            ),
+            base_env=env,
+        ).env
+    except TalonRuntimeError as e:
+        logger.error(f"Invalid Talon runtime for {repo_config.repo}#{issue_num}: {e}")
+        return False
 
     logger.info(f"Command: cd {TALON_DIR} && {' '.join(cmd)}")
 
@@ -309,7 +383,7 @@ async def process_issue(
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=TALON_DIR,
-            env=env,
+            env=invocation_env,
             stdout=asyncio.subprocess.PIPE if not daemon_config.verbose else None,
             stderr=asyncio.subprocess.PIPE if not daemon_config.verbose else None,
         )
@@ -465,9 +539,10 @@ async def daemon_loop(config: DaemonConfig):
 def main():
     parser = argparse.ArgumentParser(description="Talon Daemon - Continuous Issue Processing")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Config file path")
-    parser.add_argument("--backend", choices=["claude", "opencode"], help="Override backend")
+    parser.add_argument("--backend", choices=["claude", "opencode", "codex"], help="Override backend")
     parser.add_argument("--opencode-model", help="Override opencode model")
-    parser.add_argument("--model", help="Override Claude model")
+    parser.add_argument("--model", help="Override backend model")
+    parser.add_argument("--auth-lane", choices=["oauth", "api_key", "provider_config"], help="Override auth lane")
     parser.add_argument("--verbose", action="store_true", help="Stream agent output")
     parser.add_argument("--poll-interval", type=int, help="Override poll interval (seconds)")
     parser.add_argument("--dry-run", action="store_true", help="List issues without processing")

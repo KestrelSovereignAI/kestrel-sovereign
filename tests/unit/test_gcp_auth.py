@@ -27,11 +27,13 @@ def test_setup_gcp_auth_clears_stale_credentials_env_var(
     monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(missing_path))
     monkeypatch.delenv("GCP_SERVICE_ACCOUNT_KEY", raising=False)
 
-    # No project-local creds either — force the ADC fallback path.
-    # The function uses the real project root, but the test runs in a
-    # fresh checkout where credentials/kestrel-agent-admin.json doesn't
-    # exist. If it ever does, this test would need a guard; for now we
-    # simply assert the env-var clearing behavior, which is independent.
+    # No project-local creds either — force the ADC fallback path. This
+    # must be isolated explicitly because developer checkouts may have
+    # credentials/kestrel-agent-admin.json present.
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.deploy._gcp_auth._project_local_creds_path",
+        lambda: tmp_path / "no-project-local-creds.json",
+    )
 
     with caplog.at_level("WARNING", logger="kestrel_sovereign.features.deploy._gcp_auth"):
         setup_gcp_auth()
