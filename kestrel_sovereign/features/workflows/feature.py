@@ -77,6 +77,7 @@ class WorkflowsFeature(Feature):
             public_key_resolver=self._public_key_resolver,
             verification_methods_resolver=self._verification_methods_resolver,
             consent_collect_provider=self._consent_collect_provider,
+            council_approve_provider=self._council_approve_provider,
         )
 
     def _public_key_resolver(self, did: str) -> bytes:
@@ -174,6 +175,24 @@ class WorkflowsFeature(Feature):
             "approved": False,
             "reason": status or "approval request denied",
         }
+
+    async def _council_approve_provider(
+        self,
+        gate: Any,
+        run: Any,
+        stage: Any,
+        link: Any,
+    ) -> dict[str, Any]:
+        external = getattr(self.agent, "workflow_council_approve_provider", None)
+        if external is None:
+            return {
+                "status": "failed",
+                "reason": "council resolver unavailable",
+            }
+        result = external(gate, run, stage, link)
+        if hasattr(result, "__await__"):
+            result = await result
+        return result
 
     def _require_store(self) -> WorkflowStore:
         if self.store is None:

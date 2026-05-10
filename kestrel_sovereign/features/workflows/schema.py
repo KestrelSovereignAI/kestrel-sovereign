@@ -194,6 +194,31 @@ def _gate_schema() -> dict[str, Any]:
             },
             {
                 "if": {
+                    "properties": {"type": {"const": "council_approve"}},
+                    "required": ["type"],
+                },
+                "then": {
+                    "required": ["params"],
+                    "properties": {
+                        "params": {
+                            "type": "object",
+                            "required": ["quorum", "timeout"],
+                            "properties": {
+                                "quorum": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                },
+                                "timeout": {
+                                    "type": "integer",
+                                    "minimum": 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "if": {
                     "properties": {"type": {"const": "red_team_clear"}},
                     "required": ["type"],
                 },

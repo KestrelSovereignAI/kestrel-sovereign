@@ -396,6 +396,19 @@ class Gate:
                 raise WorkflowDefinitionError(
                     "gate signature_collected params.did must be a DID string"
                 )
+        if self.type == "council_approve":
+            quorum = self.params.get("quorum")
+            if not _is_strict_positive_int(quorum):
+                raise WorkflowDefinitionError(
+                    "gate council_approve requires params.quorum: "
+                    "positive integer per design §3.3"
+                )
+            timeout = self.params.get("timeout")
+            if not _is_strict_positive_int(timeout):
+                raise WorkflowDefinitionError(
+                    "gate council_approve requires params.timeout: "
+                    "positive integer per design §3.3"
+                )
         if self.type == "constitutional_boundary_clean":
             forbidden = self.params.get("forbidden_modules")
             # Round 6 P2: ``all([]) is True`` so an explicit empty list

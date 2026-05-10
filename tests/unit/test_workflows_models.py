@@ -184,6 +184,16 @@ def test_gate_signature_collected_requires_did():
     Gate(type="signature_collected", params={"did": "did:web:k.example"})
 
 
+def test_gate_council_approve_requires_quorum_and_timeout():
+    with pytest.raises(WorkflowDefinitionError, match="params.quorum"):
+        Gate(type="council_approve")
+    with pytest.raises(WorkflowDefinitionError, match="params.quorum"):
+        Gate(type="council_approve", params={"quorum": True, "timeout": 60})
+    with pytest.raises(WorkflowDefinitionError, match="params.timeout"):
+        Gate(type="council_approve", params={"quorum": 2, "timeout": False})
+    Gate(type="council_approve", params={"quorum": 2, "timeout": 60})
+
+
 def test_gate_red_team_clear_requires_prompt_pack_constraint():
     with pytest.raises(WorkflowDefinitionError):
         Gate(type="red_team_clear", params={"reviewer_pool": ["did:web:r1"]})
@@ -1281,6 +1291,24 @@ def test_schema_requires_consent_collect_scope():
     spec["stages"][0]["gate"] = {
         "type": "consent_collect",
         "params": {"scope": "   "},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+
+@pytest.mark.skipif(jsonschema is None, reason="jsonschema not installed")
+def test_schema_requires_council_approve_quorum_and_timeout():
+    spec = _minimal_spec().to_dict()
+    spec["stages"][0]["gate"] = {
+        "type": "council_approve",
+        "params": {"quorum": 2},
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
+
+    spec["stages"][0]["gate"] = {
+        "type": "council_approve",
+        "params": {"quorum": True, "timeout": 60},
     }
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(instance=spec, schema=WORKFLOW_SPEC_SCHEMA)
