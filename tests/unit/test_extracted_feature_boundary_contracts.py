@@ -29,3 +29,21 @@ def test_observability_feature_is_external_to_core():
         if path.is_file() and "__pycache__" not in path.parts
     ] if feature_dir.exists() else []
     assert source_files == []
+
+
+def test_wallet_feature_is_external_to_core():
+    registry = (PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml").read_text()
+    feature_dir = PROJECT_ROOT / "kestrel_sovereign/features/wallet"
+
+    assert 'package = "kestrel-feature-wallet"' in registry
+    assert "[wallet]" in registry
+    assert "`wallet` | `kestrel-feature-wallet`" in (
+        PROJECT_ROOT / "docs/audit/FEATURE_PROOF_MATRIX.md"
+    ).read_text()
+    wallet_block = registry.split("[wallet]", 1)[1].split("\n[", 1)[0]
+    assert "core = false" in wallet_block
+    source_files = [
+        path for path in feature_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if feature_dir.exists() else []
+    assert source_files == []

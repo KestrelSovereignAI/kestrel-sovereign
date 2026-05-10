@@ -104,7 +104,7 @@ Features are discovered from two sources:
 
 ### Core Feature Inventory
 
-Audited snapshot: **37** discoverable modules · **37** exported `Feature` subclasses.
+Audited snapshot: **36** discoverable modules · **36** exported `Feature` subclasses.
 
 | Module | Exported class |
 |---|---|
@@ -140,7 +140,6 @@ Audited snapshot: **37** discoverable modules · **37** exported `Feature` subcl
 | `talon` | `TalonCoordinatorFeature` |
 | `tasks` | `TaskFeature` |
 | `voice` | `VoiceFeature` |
-| `wallet` | `WalletFeature` |
 | `web_search` | `WebSearchFeature` |
 | `webhooks` | `WebhookFeature` |
 | `wellness` | `WellnessFeature` |
@@ -158,7 +157,6 @@ Audited snapshot: **37** discoverable modules · **37** exported `Feature` subcl
 | `GET` | `/api/github/{path:path}` |
 | `GET` | `/health` |
 | `GET` | `/health/detailed` |
-| `POST` | `/webhooks/stripe/crypto` |
 
 ### Router Families
 
@@ -364,7 +362,7 @@ Auth is enforced by middleware in `server.py`. The live auth classes are:
 
 | Auth class | Applies to |
 |---|---|
-| `Public` | `/health`, `/health/detailed`, `/favicon.ico`, `/webhooks/stripe/crypto` |
+| `Public` | `/health`, `/health/detailed`, `/favicon.ico` |
 | `Public-Localhost` | `/api/auth/key` (when bootstrap is enabled) |
 | `OAuth public entrypoints` | `/auth/login`, `/auth/callback`, `/auth/logout` |
 | `APIKeyOrSession` | Most protected `/agent/*` and `/api/*` routes |
