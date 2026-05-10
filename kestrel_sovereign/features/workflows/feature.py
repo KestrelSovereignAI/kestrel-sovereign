@@ -13,6 +13,7 @@ from kestrel_sovereign.config import load_section
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 from kestrel_sovereign.features.workflows.models import (
+    RevocationReason,
     RunStatus,
     WorkflowSpec,
 )
@@ -441,6 +442,50 @@ class WorkflowsFeature(Feature):
             return ToolResult.ok(
                 f"Workflow run {run_id} cancelled with status {status.value}.",
                 data={"run_id": run_id, "status": status.value},
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult.failed(str(exc))
+
+    @tool(
+        name="workflow_revoke_definition",
+        description="Revoke a workflow definition with a typed signed reason.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!workflow-revoke-definition",
+    )
+    async def workflow_revoke_definition(
+        self,
+        name: str,
+        version: int,
+        reason: str,
+    ) -> ToolResult:
+        """
+        Revoke a workflow definition.
+
+        Args:
+            name: Workflow definition name.
+            version: Workflow definition version.
+            reason: compromised, retired, or rotated.
+        """
+        try:
+            result = await self._require_runner().revoke_definition(
+                name,
+                version,
+                reason=RevocationReason(reason),
+            )
+            if not result.changed and not result.force_revoked_run_ids:
+                return ToolResult.failed(
+                    f"Workflow definition {name} v{version} was not revoked."
+                )
+            data = {
+                "name": name,
+                "version": version,
+                "reason": result.reason.value,
+                "force_revoked_run_ids": list(result.force_revoked_run_ids),
+            }
+            return ToolResult.ok(
+                f"Workflow definition {name} v{version} revoked "
+                f"({result.reason.value}).",
+                data=data,
             )
         except Exception as exc:  # noqa: BLE001
             return ToolResult.failed(str(exc))

@@ -162,6 +162,25 @@ async def test_workflow_run_status_history_and_list_runs(feature_components):
 
 
 @pytest.mark.asyncio
+async def test_workflow_revoke_definition_records_typed_reason(feature_components):
+    c = feature_components
+    await c.feature.workflow_define(_spec())
+
+    revoked = await c.feature.workflow_revoke_definition(
+        "release",
+        1,
+        "retired",
+    )
+
+    assert revoked.status.value == "ok"
+    assert revoked.data["reason"] == "retired"
+    assert revoked.data["force_revoked_run_ids"] == []
+    run_result = await c.feature.workflow_run("release")
+    assert run_result.status.value == "error"
+    assert "not found" in run_result.error
+
+
+@pytest.mark.asyncio
 async def test_runner_preserves_missing_script_provider_for_preflight(
     feature_components,
 ):

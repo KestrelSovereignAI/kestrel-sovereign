@@ -22,6 +22,7 @@ from kestrel_sdk.signals import SignalMode
 from kestrel_sovereign.features.workflows import (
     Edge,
     EdgeKind,
+    RevocationReason,
     Stage,
     WorkflowSpec,
 )
@@ -119,9 +120,92 @@ async def test_definition_round_trip(store: WorkflowStore):
     assert row["retention_days"] == 30
     assert isinstance(row["created_at"], datetime)
     assert row["deleted_at"] is None
+    assert row["revocation_reason"] is None
+    assert row["revocation_authority_did"] is None
+    assert row["revocation_authority_sig"] is None
     parsed = json.loads(row["spec_json"])
     # Canonical payload survives storage exactly.
     assert WorkflowSpec.from_dict(parsed).spec_hash == spec.spec_hash
+
+
+async def test_revoke_definition_records_typed_signed_reason(
+    store: WorkflowStore,
+):
+    spec = _signed_spec()
+    await store.insert_definition_for_test(spec)
+
+    assert await store.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.RETIRED,
+        authority_did="did:web:ops.example",
+        authority_sig="sig-retired",
+    )
+
+    row = await store.get_definition_row("release", 1)
+    assert row["deleted_at"] is not None
+    assert row["revocation_reason"] == "retired"
+    assert row["revocation_authority_did"] == "did:web:ops.example"
+    assert row["revocation_authority_sig"] == "sig-retired"
+
+
+async def test_revoke_definition_allows_compromise_escalation(
+    store: WorkflowStore,
+):
+    spec = _signed_spec()
+    await store.insert_definition_for_test(spec)
+    assert await store.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.RETIRED,
+        authority_did="did:web:ops.example",
+        authority_sig="sig-retired",
+    )
+
+    assert await store.revoke_definition(
+        "release",
+        1,
+        reason=RevocationReason.COMPROMISED,
+        authority_did="did:web:security.example",
+        authority_sig="sig-compromised",
+    )
+
+    row = await store.get_definition_row("release", 1)
+    assert row["revocation_reason"] == "compromised"
+    assert row["revocation_authority_did"] == "did:web:security.example"
+    assert row["revocation_authority_sig"] == "sig-compromised"
+
+
+async def test_revoke_definition_rejects_unknown_reason(
+    store: WorkflowStore,
+):
+    spec = _signed_spec()
+    await store.insert_definition_for_test(spec)
+
+    with pytest.raises(ValueError):
+        await store.revoke_definition(
+            "release",
+            1,
+            reason="oops",
+            authority_did="did:web:ops.example",
+            authority_sig="sig",
+        )
+
+
+async def test_revoke_definition_requires_authority_signature(
+    store: WorkflowStore,
+):
+    spec = _signed_spec()
+    await store.insert_definition_for_test(spec)
+
+    with pytest.raises(ValueError, match="authority signature"):
+        await store.revoke_definition(
+            "release",
+            1,
+            reason="retired",
+            authority_did="did:web:ops.example",
+            authority_sig="",
+        )
 
 
 async def test_unsigned_spec_rejected(store: WorkflowStore):

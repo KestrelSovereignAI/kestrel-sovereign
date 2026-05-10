@@ -34,10 +34,12 @@ from typing import Any, Optional
 from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.features.workflows.models import (
     GateOutcome,
+    RevocationReason,
     RunStatus,
     StageLink,
     WorkflowRun,
     WorkflowSpec,
+    _DID_RE,
 )
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
@@ -123,9 +125,25 @@ class WorkflowStore(UnifiedStoreBase):
                 created_at        {ts_type} NOT NULL {ts_default},
                 deleted_at        {ts_type},
                 revocation_reason TEXT,
+                revocation_authority_did TEXT,
+                revocation_authority_sig TEXT,
                 PRIMARY KEY (name, version)
             )
         """)
+        for ddl in (
+            f"ALTER TABLE {self.DEFINITIONS_TABLE} "
+            "ADD COLUMN revocation_authority_did TEXT",
+            f"ALTER TABLE {self.DEFINITIONS_TABLE} "
+            "ADD COLUMN revocation_authority_sig TEXT",
+        ):
+            try:
+                await self._backend.execute(ddl)
+            except Exception as exc:  # noqa: BLE001 - duplicate column is benign
+                if (
+                    "duplicate" not in str(exc).lower()
+                    and "exists" not in str(exc).lower()
+                ):
+                    raise
         await self._backend.execute(
             f"CREATE INDEX IF NOT EXISTS idx_{self.DEFINITIONS_TABLE}_author "
             f"ON {self.DEFINITIONS_TABLE}(author_did, created_at)"
@@ -336,7 +354,8 @@ class WorkflowStore(UnifiedStoreBase):
             f"""
             SELECT name, version, spec_json, spec_hash, author_did,
                    author_sig, retention_days, created_at, deleted_at,
-                   revocation_reason
+                   revocation_reason, revocation_authority_did,
+                   revocation_authority_sig
             FROM {self.DEFINITIONS_TABLE}
             WHERE name = ? AND version = ?
             """,
@@ -355,6 +374,8 @@ class WorkflowStore(UnifiedStoreBase):
             "created_at": self.from_timestamp_field(row[7]),
             "deleted_at": self.from_timestamp_field(row[8]),
             "revocation_reason": row[9],
+            "revocation_authority_did": row[10],
+            "revocation_authority_sig": row[11],
         }
 
     async def put_definition(self, spec: WorkflowSpec) -> None:
@@ -393,7 +414,8 @@ class WorkflowStore(UnifiedStoreBase):
         rows = await self._backend.fetch_all(
             f"""
             SELECT name, version, spec_hash, author_did, retention_days,
-                   created_at, deleted_at, revocation_reason
+                   created_at, deleted_at, revocation_reason,
+                   revocation_authority_did, revocation_authority_sig
             FROM {self.DEFINITIONS_TABLE}
             ORDER BY name, version DESC
             """
@@ -408,28 +430,96 @@ class WorkflowStore(UnifiedStoreBase):
                 "created_at": self.from_timestamp_field(row[5]),
                 "deleted_at": self.from_timestamp_field(row[6]),
                 "revocation_reason": row[7],
+                "revocation_authority_did": row[8],
+                "revocation_authority_sig": row[9],
             }
             for row in rows
         ]
+
+    def _validate_revocation_authority(
+        self,
+        authority_did: str,
+        authority_sig: str,
+    ) -> None:
+        if not isinstance(authority_did, str) or not _DID_RE.fullmatch(
+            authority_did
+        ):
+            raise ValueError("revocation authority DID must be a valid DID")
+        if not isinstance(authority_sig, str) or not authority_sig:
+            raise ValueError("revocation authority signature must be a non-empty string")
 
     async def revoke_definition(
         self,
         name: str,
         version: int,
         *,
-        reason: str,
+        reason: RevocationReason | str,
+        authority_did: str,
+        authority_sig: str,
         revoked_at: Optional[datetime] = None,
     ) -> bool:
+        reason_value = RevocationReason(reason).value
+        self._validate_revocation_authority(authority_did, authority_sig)
         when = revoked_at or datetime.now(timezone.utc)
         changed = await self._backend.execute(
             f"""
             UPDATE {self.DEFINITIONS_TABLE}
-            SET deleted_at = ?, revocation_reason = ?
-            WHERE name = ? AND version = ? AND deleted_at IS NULL
+            SET deleted_at = ?,
+                revocation_reason = ?,
+                revocation_authority_did = ?,
+                revocation_authority_sig = ?
+            WHERE name = ? AND version = ?
+              AND (
+                deleted_at IS NULL
+                OR (
+                  ? = 'compromised'
+                  AND (
+                    revocation_reason IS NULL
+                    OR revocation_reason != 'compromised'
+                  )
+                )
+              )
             """,
-            (self.to_timestamp_param(when), reason, name, version),
+            (
+                self.to_timestamp_param(when),
+                reason_value,
+                authority_did,
+                authority_sig,
+                name,
+                version,
+                reason_value,
+            ),
         )
         return changed > 0
+
+    async def list_runs_for_definition(
+        self,
+        name: str,
+        version: int,
+        *,
+        statuses: Optional[set[RunStatus] | tuple[RunStatus, ...]] = None,
+    ) -> list[WorkflowRun]:
+        filters = ["workflow_name = ?", "workflow_ver = ?"]
+        params: list[Any] = [name, version]
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            filters.append(f"status IN ({placeholders})")
+            params.extend(status.value for status in statuses)
+        rows = await self._backend.fetch_all(
+            f"""
+            SELECT run_id
+            FROM {self.RUNS_TABLE}
+            WHERE {' AND '.join(filters)}
+            ORDER BY started_at ASC
+            """,
+            tuple(params),
+        )
+        runs: list[WorkflowRun] = []
+        for row in rows:
+            run = await self.get_run(row[0])
+            if run is not None:
+                runs.append(run)
+        return runs
 
     async def insert_run(self, run: WorkflowRun) -> None:
         await self._backend.execute(

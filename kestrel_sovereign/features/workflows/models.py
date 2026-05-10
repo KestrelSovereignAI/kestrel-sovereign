@@ -101,6 +101,10 @@ _COMPENSATE_STATES: frozenset[str] = frozenset(
     {"not_required", "pending", "complete", "record_only", "failed"}
 )
 
+_REVOCATION_REASONS: frozenset[str] = frozenset(
+    {"compromised", "retired", "rotated"}
+)
+
 
 class EdgeKind(str, Enum):
     """Closed vocabulary for stage-to-stage connections (design §3.1)."""
@@ -143,11 +147,20 @@ class RunStatus(str, Enum):
     CANCELLED_WITH_IRREVERSIBLE_RESIDUE = "cancelled_with_irreversible_residue"
 
 
+class RevocationReason(str, Enum):
+    """Typed workflow definition revocation reasons (design §3.6)."""
+
+    COMPROMISED = "compromised"
+    RETIRED = "retired"
+    ROTATED = "rotated"
+
+
 # Sanity check: enum values must match the lower-level frozensets so
 # storage parsing never disagrees with dataclass validation. A drift
 # here is the kind of bug only an end-to-end test catches.
 assert {s.value for s in RunStatus} == _RUN_STATUSES
 assert {s.value for s in GateOutcome} == _GATE_OUTCOMES
+assert {r.value for r in RevocationReason} == _REVOCATION_REASONS
 
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.\-]*$")

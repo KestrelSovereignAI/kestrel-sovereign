@@ -52,6 +52,7 @@ from kestrel_sovereign.features.workflows.models import (
     EdgeKind,
     Gate,
     GateOutcome,
+    RevocationReason,
     RunStatus,
     Stage,
     StageLink,
@@ -68,6 +69,7 @@ from kestrel_sovereign.features.workflows.signing import (
     PublicKeyResolver,
     VerificationMethodsResolver,
     sign_stage_transition,
+    sign_definition_revocation,
     verify_workflow_spec,
 )
 from kestrel_sovereign.features.workflows.store import WorkflowStore
@@ -123,6 +125,23 @@ class WorkflowRunnerError(RuntimeError):
 class WorkflowRunResult:
     run_id: str
     status: RunStatus
+
+
+@dataclass(frozen=True)
+class WorkflowRevocationResult:
+    changed: bool
+    reason: RevocationReason
+    force_revoked_run_ids: tuple[str, ...] = ()
+
+
+_TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE,
+    }
+)
 
 
 class WorkflowRunner:
@@ -217,16 +236,14 @@ class WorkflowRunner:
         run = await self.store.get_run(run_id)
         if run is None:
             raise WorkflowRunnerError(f"unknown workflow run: {run_id}")
-        if run.status in (
-            RunStatus.COMPLETED,
-            RunStatus.FAILED,
-            RunStatus.CANCELLED,
-            RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE,
-        ):
+        if run.status in _TERMINAL_RUN_STATUSES:
             raise WorkflowRunnerError(
                 f"workflow run {run_id} is terminal ({run.status.value})"
             )
         spec = await self._load_pinned_definition(run)
+        run = await self.store.get_run(run_id)
+        if run is None:
+            raise WorkflowRunnerError(f"workflow run missing: {run_id}")
         await self._validate_run_start_contract(spec)
         if run.status == RunStatus.WAITING or (
             run.status == RunStatus.PAUSED
@@ -379,12 +396,7 @@ class WorkflowRunner:
         run = await self.store.get_run(run_id)
         if run is None:
             raise WorkflowRunnerError(f"unknown workflow run: {run_id}")
-        if run.status in (
-            RunStatus.COMPLETED,
-            RunStatus.FAILED,
-            RunStatus.CANCELLED,
-            RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE,
-        ):
+        if run.status in _TERMINAL_RUN_STATUSES:
             raise WorkflowRunnerError(
                 f"workflow run {run_id} is terminal ({run.status.value})"
             )
@@ -400,6 +412,88 @@ class WorkflowRunner:
             raise WorkflowRunnerError(f"workflow run missing after cancel: {run_id}")
         if not immediate_compensation:
             return RunStatus.COMPENSATING
+        return await self._compensate(run, spec)
+
+    async def revoke_definition(
+        self,
+        name: str,
+        version: int,
+        *,
+        reason: RevocationReason | str,
+    ) -> WorkflowRevocationResult:
+        reason_value = RevocationReason(reason)
+        revoked_at = datetime.now(timezone.utc)
+        revoked_at_wire = revoked_at.isoformat()
+        authority_did, authority_sig = sign_definition_revocation(
+            name=name,
+            version=version,
+            reason=reason_value,
+            revoked_at=revoked_at_wire,
+            agent_identity=self.agent_identity,
+        )
+        changed = await self.store.revoke_definition(
+            name,
+            version,
+            reason=reason_value,
+            authority_did=authority_did,
+            authority_sig=authority_sig,
+            revoked_at=revoked_at,
+        )
+        if reason_value is not RevocationReason.COMPROMISED:
+            return WorkflowRevocationResult(changed=changed, reason=reason_value)
+
+        if not changed:
+            row = await self.store.get_definition_row(name, version)
+            if (
+                row is None
+                or row["revocation_reason"] != RevocationReason.COMPROMISED.value
+            ):
+                return WorkflowRevocationResult(
+                    changed=False,
+                    reason=reason_value,
+                )
+
+        runs = await self.store.list_runs_for_definition(
+            name,
+            version,
+            statuses=set(RunStatus) - set(_TERMINAL_RUN_STATUSES),
+        )
+        force_revoked: list[str] = []
+        for run in runs:
+            status = await self._force_cancel_run(run.run_id)
+            if status is None:
+                continue
+            force_revoked.append(run.run_id)
+        return WorkflowRevocationResult(
+            changed=changed,
+            reason=reason_value,
+            force_revoked_run_ids=tuple(force_revoked),
+        )
+
+    async def _force_cancel_run(self, run_id: str) -> RunStatus | None:
+        run = await self.store.get_run(run_id)
+        if run is None:
+            raise WorkflowRunnerError(f"unknown workflow run: {run_id}")
+        if run.status in _TERMINAL_RUN_STATUSES:
+            return None
+        try:
+            status = await self.cancel_run(run_id)
+        except WorkflowRunnerError:
+            run = await self.store.get_run(run_id)
+            if run is not None and run.status in _TERMINAL_RUN_STATUSES:
+                return None
+            raise
+        if status != RunStatus.COMPENSATING:
+            return status
+        run = await self.store.get_run(run_id)
+        if run is None:
+            raise WorkflowRunnerError(f"workflow run missing after cancel: {run_id}")
+        if run.status in _TERMINAL_RUN_STATUSES:
+            return run.status
+        spec = await self._load_pinned_definition(run)
+        run = await self.store.get_run(run_id)
+        if run is None:
+            raise WorkflowRunnerError(f"workflow run missing after cancel: {run_id}")
         return await self._compensate(run, spec)
 
     async def retry_stage(self, run_id: str, stage_name: str) -> WorkflowRunResult:
@@ -477,8 +571,24 @@ class WorkflowRunner:
             )
         spec = WorkflowSpec.from_dict(json.loads(row["spec_json"]))
         self._verify_workflow_spec(spec)
-        if row["deleted_at"] is not None and not run.signature_post_revocation:
-            await self.store.mark_run_signature_post_revocation(run.run_id)
+        if row["deleted_at"] is not None:
+            if (
+                row["revocation_reason"] == RevocationReason.COMPROMISED.value
+                and run.cancel_barrier_at is None
+                and run.status not in _TERMINAL_RUN_STATUSES
+            ):
+                await self.store.set_cancel_barrier(run.run_id)
+            if (
+                row["revocation_reason"] in {reason.value for reason in RevocationReason}
+                and run.status == RunStatus.FAILED
+            ):
+                raise WorkflowRunnerError(
+                    f"workflow definition is revoked "
+                    f"({row['revocation_reason']}): "
+                    f"{run.workflow_name} v{run.workflow_ver}"
+                )
+            if not run.signature_post_revocation:
+                await self.store.mark_run_signature_post_revocation(run.run_id)
         return spec
 
     async def _validate_run_start_contract(self, spec: WorkflowSpec) -> None:
