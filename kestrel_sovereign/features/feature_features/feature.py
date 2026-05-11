@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import json
+import os
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +89,18 @@ class FeatureFeaturesFeature(Feature):
                 self.agent,
                 "feature_feature_assign_talon_chunks_requires_talon",
                 True,
+            )
+        if getattr(self.agent, "feature_feature_tests_pass", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_tests_pass",
+                self._feature_feature_tests_pass,
+            )
+        if getattr(self.agent, "feature_feature_lint_clean", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_lint_clean",
+                self._feature_feature_lint_clean,
             )
 
     async def _feature_feature_file_github_epic(self, payload: dict) -> dict[str, Any]:
@@ -173,6 +188,59 @@ class FeatureFeaturesFeature(Feature):
             "repository": repository,
             "issues": issue_numbers,
             "dispatches": dispatches,
+        }
+
+    async def _feature_feature_tests_pass(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Run the FeatureFeature tests_pass quality gate."""
+
+        suite = _payload_string(payload, "suite") or "unit"
+        command = _quality_command(
+            payload,
+            keys=("test_command", "tests_command", "command"),
+            default=_default_test_command(suite),
+        )
+        marker = await _run_quality_command(self.agent, payload, command)
+        passed = marker["exit_code"] == 0
+        return {
+            **marker,
+            "status": "ok" if passed else "failed",
+            "suite": suite,
+            "failed": 0 if passed else 1,
+            "errors": 0 if passed else 1,
+        }
+
+    async def _feature_feature_lint_clean(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Run the FeatureFeature lint_clean quality gate."""
+
+        scopes = _payload_string_list(payload, "scopes") or ["changed"]
+        command = _quality_command(
+            payload,
+            keys=("lint_command", "command"),
+            default=[
+                "uv",
+                "run",
+                "--no-sync",
+                "python",
+                "run_tests.py",
+                "--kestrel",
+                "--skip-check",
+                "--validate-only",
+            ],
+        )
+        marker = await _run_quality_command(self.agent, payload, command)
+        passed = marker["exit_code"] == 0
+        return {
+            **marker,
+            "status": "ok" if passed else "failed",
+            "scopes": scopes,
+            "violations": 0 if passed else 1,
+            "errors": 0 if passed else 1,
         }
 
     @tool(
@@ -1446,6 +1514,177 @@ def _payload_optional_bool(
 ) -> bool | None:
     value = payload.get(key, default)
     return value if isinstance(value, bool) else default
+
+
+def _payload_string_list(payload: dict[str, Any], key: str) -> list[str]:
+    value = payload.get(key)
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_value = value.strip()
+        if not raw_value:
+            return []
+        if raw_value.startswith("["):
+            try:
+                decoded = json.loads(raw_value)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, list):
+                value = decoded
+            else:
+                value = raw_value.split(",")
+        else:
+            value = raw_value.split(",")
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _quality_command(
+    payload: dict[str, Any],
+    *,
+    keys: tuple[str, ...],
+    default: list[str],
+) -> list[str]:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return shlex.split(value)
+        if isinstance(value, (list, tuple)) and value:
+            command = [str(item) for item in value if str(item)]
+            if command:
+                return command
+    return default
+
+
+def _default_test_command(suite: str) -> list[str]:
+    suite_paths = {
+        "unit": "tests/unit/",
+        "integration": "tests/integration/",
+        "llm": "tests/llm/",
+    }
+    target = suite_paths.get(suite, suite)
+    return ["uv", "run", "--no-sync", "pytest", target, "-q"]
+
+
+async def _run_quality_command(
+    agent: Any,
+    payload: dict[str, Any],
+    command: list[str],
+) -> dict[str, Any]:
+    cwd = _quality_command_cwd(payload)
+    timeout_seconds = _quality_timeout_seconds(payload)
+    runner = getattr(agent, "feature_feature_command_runner", None)
+    if callable(runner):
+        result = runner(command=command, cwd=str(cwd), timeout=timeout_seconds)
+        if inspect.isawaitable(result):
+            result = await result
+        return _quality_command_marker(command, cwd, result)
+
+    env = dict(os.environ)
+    env.setdefault("KESTREL_AUDIT_MODE", "skip")
+    process = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=str(cwd),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            process.communicate(),
+            timeout=timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        return _quality_command_marker(
+            command,
+            cwd,
+            {
+                "exit_code": 127,
+                "stdout": "",
+                "stderr": str(exc),
+            },
+        )
+    except asyncio.TimeoutError:
+        if process is not None:
+            try:
+                process.kill()
+                await process.communicate()
+            except ProcessLookupError:
+                pass
+        return _quality_command_marker(
+            command,
+            cwd,
+            {
+                "exit_code": 124,
+                "stdout": "",
+                "stderr": f"timed out after {timeout_seconds:g}s",
+            },
+        )
+
+    return _quality_command_marker(
+        command,
+        cwd,
+        {
+            "exit_code": process.returncode,
+            "stdout": stdout_bytes.decode(errors="replace"),
+            "stderr": stderr_bytes.decode(errors="replace"),
+        },
+    )
+
+
+def _quality_command_marker(
+    command: list[str],
+    cwd: Path,
+    result: Any,
+) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        result = {"exit_code": 1, "stdout": "", "stderr": str(result)}
+    exit_code = result.get(
+        "exit_code",
+        result.get("returncode", result.get("return_code")),
+    )
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        exit_code = 1
+    return {
+        "command": command,
+        "cwd": str(cwd),
+        "exit_code": exit_code,
+        "stdout": _truncate_output(result.get("stdout")),
+        "stderr": _truncate_output(result.get("stderr")),
+    }
+
+
+def _quality_command_cwd(payload: dict[str, Any]) -> Path:
+    for key in ("cwd", "worktree_path", "repository_path"):
+        value = _payload_string(payload, key)
+        if value is not None:
+            return Path(value).expanduser().resolve()
+    return Path.cwd()
+
+
+def _quality_timeout_seconds(payload: dict[str, Any]) -> float:
+    value = payload.get("timeout_seconds", payload.get("quality_timeout_seconds"))
+    if isinstance(value, bool):
+        return 600.0
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    if isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return 600.0
+        if parsed > 0:
+            return parsed
+    return 600.0
+
+
+def _truncate_output(value: Any, *, limit: int = 4000) -> str:
+    text = value if isinstance(value, str) else ""
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n<truncated>"
 
 
 def _talon_issue_numbers(payload: dict[str, Any]) -> list[int]:

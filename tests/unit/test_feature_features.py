@@ -1220,6 +1220,91 @@ async def test_feature_features_assign_talon_provider_requires_issue_and_talon()
 
 
 @pytest.mark.asyncio
+async def test_feature_features_installs_quality_gate_providers():
+    commands = []
+
+    async def command_runner(**kwargs):
+        commands.append(kwargs)
+        return {
+            "exit_code": 0,
+            "stdout": "ok",
+            "stderr": "",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    tests = await agent.feature_feature_tests_pass(
+        {
+            "suite": "unit",
+            "test_command": ["uv", "run", "--no-sync", "pytest", "tests/unit", "-q"],
+            "cwd": "/tmp",
+        }
+    )
+    lint = await agent.feature_feature_lint_clean(
+        {
+            "scopes": ["changed"],
+            "lint_command": "uv run --no-sync python run_tests.py --kestrel --skip-check --validate-only",
+            "cwd": "/tmp",
+        }
+    )
+
+    assert tests["status"] == "ok"
+    assert tests["suite"] == "unit"
+    assert tests["failed"] == 0
+    assert tests["errors"] == 0
+    assert lint["status"] == "ok"
+    assert lint["scopes"] == ["changed"]
+    assert lint["violations"] == 0
+    assert lint["errors"] == 0
+    assert commands[0]["command"] == [
+        "uv",
+        "run",
+        "--no-sync",
+        "pytest",
+        "tests/unit",
+        "-q",
+    ]
+    assert commands[1]["command"] == [
+        "uv",
+        "run",
+        "--no-sync",
+        "python",
+        "run_tests.py",
+        "--kestrel",
+        "--skip-check",
+        "--validate-only",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_quality_gate_providers_report_failures():
+    async def command_runner(**kwargs):
+        return {
+            "exit_code": 1,
+            "stdout": "failed",
+            "stderr": "boom",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    tests = await agent.feature_feature_tests_pass({"suite": "unit"})
+    lint = await agent.feature_feature_lint_clean({"scopes": "changed,package"})
+
+    assert tests["status"] == "failed"
+    assert tests["exit_code"] == 1
+    assert tests["failed"] == 1
+    assert tests["errors"] == 1
+    assert lint["status"] == "failed"
+    assert lint["scopes"] == ["changed", "package"]
+    assert lint["violations"] == 1
+    assert lint["errors"] == 1
+
+
+@pytest.mark.asyncio
 async def test_feature_feature_runtime_status_passes_with_registered_providers():
     registry = SourceRegistry()
     agent = SimpleNamespace(signal_registry=registry)
