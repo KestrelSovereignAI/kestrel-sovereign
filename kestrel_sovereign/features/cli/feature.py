@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -10,7 +11,23 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 
 from .adapters import CliAdapterError, GitCliAdapter, GitHubCliAdapter
-from .terminal import CliRisk, TerminalExecutionService
+from .terminal import CliRisk, TerminalExecutionService, redact_secrets
+
+_APPROVAL_TIMEOUT = 300
+_SENSITIVE_OPTION_PARTS = (
+    "api-key",
+    "apikey",
+    "auth",
+    "credential",
+    "key",
+    "password",
+    "passwd",
+    "private-key",
+    "pwd",
+    "refresh-token",
+    "secret",
+    "token",
+)
 
 
 class CliFeature(Feature):
@@ -20,7 +37,9 @@ class CliFeature(Feature):
 
     def __init__(self, agent=None):
         super().__init__(agent)
-        self.terminal = TerminalExecutionService()
+        self.terminal = TerminalExecutionService(
+            approval_callback=self._approve_cli_command,
+        )
         self.adapters = {
             "github": GitHubCliAdapter(self.terminal),
             "git": GitCliAdapter(self.terminal),
@@ -35,6 +54,50 @@ class CliFeature(Feature):
 
     async def initialize(self) -> None:
         return None
+
+    def _get_security_feature(self) -> Any:
+        if hasattr(self.agent, "get_feature"):
+            security = self.agent.get_feature("security")
+            if security is not None:
+                return security
+            security = self.agent.get_feature("SecurityFeature")
+            if security is not None:
+                return security
+        features = getattr(self.agent, "features", None)
+        if isinstance(features, dict):
+            return features.get("security") or features.get("SecurityFeature")
+        return None
+
+    async def _approve_cli_command(self, request: Any) -> bool:
+        security = self._get_security_feature()
+        queue = getattr(security, "approval_queue", None) if security else None
+        if queue is None:
+            return False
+
+        try:
+            approved, _scope = await queue.request_approval(
+                feature_name="cli",
+                tool_name=request.command_id or request.argv[0],
+                tool_args={
+                    "command_id": request.command_id,
+                    "risk": (
+                        request.risk.value
+                        if isinstance(request.risk, CliRisk)
+                        else str(request.risk)
+                    ),
+                    "argv": _approval_argv_summary(request.argv),
+                    "argc": len(request.argv),
+                    "cwd": str(request.cwd) if request.cwd else None,
+                    "env_keys": sorted((request.env or {}).keys()),
+                    "timeout": request.timeout,
+                },
+                timeout=_APPROVAL_TIMEOUT,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return False
+        except Exception:
+            return False
+        return bool(approved)
 
     @tool(
         name="cli_status",
@@ -364,3 +427,52 @@ def _command_data(result: Any) -> dict[str, Any]:
         "duration_ms": result.duration_ms,
         "timed_out": result.timed_out,
     }
+
+
+def _approval_argv_summary(argv: list[Any]) -> list[str]:
+    """Return an approval-safe argv preview without positional values."""
+
+    summary: list[str] = []
+    redact_next = False
+    for index, raw_arg in enumerate(argv):
+        arg = redact_secrets(str(raw_arg))
+        if index == 0:
+            summary.append(arg)
+            continue
+        if redact_next:
+            summary.append("[REDACTED]")
+            redact_next = False
+            continue
+        if arg.startswith("--"):
+            name, separator, _value = arg.partition("=")
+            if _is_sensitive_option(name):
+                if separator:
+                    summary.append(f"{name}=[REDACTED]")
+                else:
+                    summary.append(name)
+                    redact_next = True
+            elif separator:
+                summary.append(f"{name}=[ARG]")
+            else:
+                summary.append(name)
+            continue
+        if arg.startswith("-") and len(arg) > 1:
+            summary.append(_short_option_summary(arg))
+            if _is_sensitive_option(arg):
+                redact_next = True
+            continue
+        summary.append("[ARG]")
+    return summary
+
+
+def _is_sensitive_option(option: str) -> bool:
+    normalized = option.lstrip("-").lower().replace("_", "-")
+    return any(part in normalized for part in _SENSITIVE_OPTION_PARTS)
+
+
+def _short_option_summary(option: str) -> str:
+    if len(option) <= 2:
+        return option
+    if "=" in option:
+        return f"{option[:2]}=[ARG]"
+    return f"{option[:2]}[ARG]"
