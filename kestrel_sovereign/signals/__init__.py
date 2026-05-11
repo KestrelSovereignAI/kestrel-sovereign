@@ -43,6 +43,10 @@ from kestrel_sovereign.signals.dispatcher import (
 )
 from kestrel_sovereign.signals.handlers import template_artifact_handler
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
+from kestrel_sovereign.signals.prompt_overrides import (
+    SignalWithPromptTemplateOverride,
+    SourceRegistrationWithPromptOverride,
+)
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
 from kestrel_sovereign.signals.store import SignalLogStore
 
@@ -59,7 +63,9 @@ __all__ = [
     "SignalHandle",
     "SignalMode",
     "SignalResult",
+    "SignalWithPromptTemplateOverride",
     "SourceRegistration",
+    "SourceRegistrationWithPromptOverride",
     "Status",
     "Trust",
     "Urgency",

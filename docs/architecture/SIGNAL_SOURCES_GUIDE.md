@@ -73,6 +73,7 @@ class SourceRegistration:
     allow_self_loops: bool = False
     retention_days: int = 30
     result_summary: Optional[Callable[[Any], str]] = None
+    allow_prompt_override: bool = False  # COGNITION-only; opt-in explicitly
 ```
 
 The registry validator (in
@@ -80,6 +81,17 @@ The registry validator (in
 rejects a registration that misses a conditionally-required field.
 You'll get a `RegistrationError` at agent init time, not at first
 dispatch.
+
+`allow_prompt_override` defaults to `False`. Until the SDK dataclasses
+grow constructor fields for #1146, use
+`kestrel_sovereign.signals.SourceRegistrationWithPromptOverride` for
+sources that opt in and
+`kestrel_sovereign.signals.SignalWithPromptTemplateOverride` for
+signals that carry `prompt_template_override`. The dispatcher uses the
+override only for sources that opted in; otherwise it falls back to the
+registered `prompt_template`. The chosen template body hash is recorded
+in `signal_log.prompt_template_hash` for audit without storing the
+template text.
 
 ---
 

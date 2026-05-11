@@ -27,7 +27,11 @@ from kestrel_sdk.signals import (
     Urgency,
     Visibility,
 )
-from kestrel_sovereign.signals import RegistrationError, SourceRegistry
+from kestrel_sovereign.signals import (
+    RegistrationError,
+    SourceRegistrationWithPromptOverride,
+    SourceRegistry,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +336,26 @@ def test_registry_iter_and_require():
     assert reg.require("a").name == "a"
     with pytest.raises(RegistrationError, match="Unknown source"):
         reg.require("missing")
+
+
+def test_register_accepts_boolean_prompt_override_opt_in():
+    reg = SourceRegistry()
+    source = SourceRegistrationWithPromptOverride(
+        **_valid_cognition_reg("prompt_override").__dict__,
+        allow_prompt_override=True,
+    )
+    reg.register(source)
+    assert getattr(reg.get("prompt_override"), "allow_prompt_override") is True
+
+
+def test_register_rejects_non_boolean_prompt_override_opt_in():
+    reg = SourceRegistry()
+    source = SourceRegistrationWithPromptOverride(
+        **_valid_cognition_reg("bad_prompt_override").__dict__,
+        allow_prompt_override="yes",
+    )
+    with pytest.raises(RegistrationError, match="allow_prompt_override must be a bool"):
+        reg.register(source)
 
 
 # ---------------------------------------------------------------------------
