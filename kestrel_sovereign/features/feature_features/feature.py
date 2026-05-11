@@ -223,6 +223,83 @@ class FeatureFeaturesFeature(Feature):
             version=version,
         )
 
+    @tool(
+        name="feature_feature_runtime_status",
+        description="Check FeatureFeature workflow signal-source readiness.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-runtime-status",
+    )
+    async def feature_feature_runtime_status(self) -> ToolResult:
+        """Report whether FeatureFeature workflow sources are registered.
+
+        ACTION sources also report whether a callable provider is available.
+        """
+
+        registry = getattr(self.agent, "signal_registry", None)
+        rows = []
+        missing_registered: list[str] = []
+        missing_action_providers: list[str] = []
+        missing_cognition_prompts: list[str] = []
+        for registration in build_feature_feature_registrations(self.agent):
+            actual_registration = (
+                registry.get(registration.name) if registry is not None else None
+            )
+            active_registration = actual_registration or registration
+            registered = actual_registration is not None
+            if not registered:
+                missing_registered.append(registration.name)
+            mode = active_registration.default_mode.value
+            provider_name = _resolve_provider_name(self.agent, registration.name)
+            registered_handler_ready = _registered_handler_ready(
+                actual_registration
+            )
+            action_provider_ready = (
+                mode != "action"
+                or registered_handler_ready
+                or provider_name is not None
+            )
+            prompt_ready = (
+                mode != "cognition"
+                or (
+                    active_registration.prompt_template is not None
+                    and active_registration.prompt_template.exists()
+                )
+            )
+            if mode == "action" and not action_provider_ready:
+                missing_action_providers.append(registration.name)
+            if mode == "cognition" and not prompt_ready:
+                missing_cognition_prompts.append(registration.name)
+            rows.append(
+                {
+                    "name": registration.name,
+                    "mode": mode,
+                    "registered": registered,
+                    "provider": provider_name,
+                    "registered_handler": registered_handler_ready,
+                    "prompt_template_exists": prompt_ready,
+                    "ready": registered and action_provider_ready and prompt_ready,
+                }
+            )
+
+        ok = (
+            not missing_registered
+            and not missing_action_providers
+            and not missing_cognition_prompts
+        )
+        data = {
+            "sources": rows,
+            "missing_registered": missing_registered,
+            "missing_action_providers": missing_action_providers,
+            "missing_cognition_prompts": missing_cognition_prompts,
+            "ready": ok,
+        }
+        if not ok:
+            return ToolResult.failed(
+                "FeatureFeature runtime is not ready.",
+                data=data,
+            )
+        return ToolResult.ok("FeatureFeature runtime is ready.", data=data)
+
     def _workflow_feature(self) -> Any:
         features = getattr(self.agent, "features", None)
         if not isinstance(features, dict):
@@ -271,6 +348,26 @@ def _workflow_name_for_kind(kind: str) -> str:
     if kind == "package":
         return FEATURE_PROPOSE_PACKAGE_WORKFLOW_NAME
     raise ValueError("kind must be one of: tool, package")
+
+
+def _resolve_provider_name(agent: Any, source: str) -> str | None:
+    stage = source.split(".")[-1]
+    for name in (
+        f"feature_feature_{stage}",
+        f"feature_feature_handle_{stage}",
+    ):
+        if callable(getattr(agent, name, None)):
+            return name
+    return None
+
+
+def _registered_handler_ready(registration: Any) -> bool:
+    if registration is None:
+        return False
+    handler = getattr(registration, "handler", None)
+    return callable(handler) and not bool(
+        getattr(handler, "_feature_feature_requires_agent_provider", False)
+    )
 
 
 __all__ = ["FeatureFeaturesFeature"]
