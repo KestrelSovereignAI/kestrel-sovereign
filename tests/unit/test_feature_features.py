@@ -722,11 +722,18 @@ async def test_feature_feature_runtime_status_reports_missing_action_providers()
     feature = FeatureFeaturesFeature(agent)
     await feature.initialize()
 
-    result = await feature.feature_feature_runtime_status()
+    with patch(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        return_value="gh-test",
+    ):
+        result = await feature.feature_feature_runtime_status()
 
     assert result.status is ToolResultStatus.ERROR
     assert result.data["missing_registered"] == []
-    assert "feature_features.file_github_epic" in (
+    assert "feature_features.file_github_epic" not in (
+        result.data["missing_action_providers"]
+    )
+    assert "feature_features.assign_talon_chunks" in (
         result.data["missing_action_providers"]
     )
     explore = next(
@@ -735,6 +742,122 @@ async def test_feature_feature_runtime_status_reports_missing_action_providers()
         if row["name"] == "feature_features.explore"
     )
     assert explore["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_requires_github_token_for_default_epic_provider():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with patch(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        return_value=None,
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "feature_features.file_github_epic" in (
+        result.data["missing_action_providers"]
+    )
+    row = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.file_github_epic"
+    )
+    assert row["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_rejects_empty_github_token():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with patch(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        return_value="",
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "feature_features.file_github_epic" in (
+        result.data["missing_action_providers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_installs_github_epic_provider():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    feature = FeatureFeaturesFeature(agent)
+
+    await feature.initialize()
+
+    assert callable(agent.feature_feature_file_github_epic)
+    with patch(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        return_value="",
+    ):
+        with pytest.raises(RuntimeError, match="GITHUB_TOKEN"):
+            await agent.feature_feature_file_github_epic(
+                {"repository": "Org/repo", "feature_name": "DemoFeature"}
+            )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_github_epic_provider_creates_issue():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+    created = {}
+
+    async def fake_create(repository, token, body):
+        created.update({"repository": repository, "token": token, "body": body})
+        return {"number": 42, "html_url": "https://github.test/org/repo/issues/42"}
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_create_issue",
+            side_effect=fake_create,
+        ),
+    ):
+        result = await agent.feature_feature_file_github_epic(
+            {
+                "repository": "Org/repo",
+                "feature_name": "DemoFeature",
+                "target_tool_name": "demo_tool",
+                "summary": "Add a demo tool",
+                "api_token": "do-not-log",
+                "password": "no-password",
+                "credential_ref": "no-credential",
+                "provider": {"secret_key": "nested-secret"},
+                "chunks": [{"token": "chunk-secret", "auth_header": "no-auth"}],
+            }
+        )
+
+    assert result["status"] == "ok"
+    assert result["issue_number"] == 42
+    assert created["repository"] == "Org/repo"
+    assert created["token"] == "gh-test"
+    assert created["body"]["title"] == (
+        "[EPIC] Feature proposal: DemoFeature: demo_tool"
+    )
+    assert "labels" not in created["body"]
+    assert "<redacted>" in created["body"]["body"]
+    assert "do-not-log" not in created["body"]["body"]
+    assert "no-password" not in created["body"]["body"]
+    assert "no-credential" not in created["body"]["body"]
+    assert "nested-secret" not in created["body"]["body"]
+    assert "chunk-secret" not in created["body"]["body"]
+    assert "no-auth" not in created["body"]["body"]
 
 
 @pytest.mark.asyncio

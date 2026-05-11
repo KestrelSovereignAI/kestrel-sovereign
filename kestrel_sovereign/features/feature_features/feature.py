@@ -43,6 +43,7 @@ class FeatureFeaturesFeature(Feature):
 
     async def initialize(self) -> None:
         self._register_signal_sources()
+        self._register_default_providers()
         return None
 
     def _register_signal_sources(self) -> None:
@@ -53,6 +54,49 @@ class FeatureFeaturesFeature(Feature):
             if registry.get(registration.name) is not None:
                 continue
             registry.register(registration)
+
+    def _register_default_providers(self) -> None:
+        if getattr(self.agent, "feature_feature_file_github_epic", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_file_github_epic",
+                self._feature_feature_file_github_epic,
+            )
+            setattr(
+                self.agent,
+                "feature_feature_file_github_epic_requires_github_token",
+                True,
+            )
+
+    async def _feature_feature_file_github_epic(self, payload: dict) -> dict[str, Any]:
+        """Create the FeatureFeature GitHub epic for a proposed feature change."""
+
+        repository = _payload_string(payload, "repository")
+        if repository is None or "/" not in repository:
+            raise RuntimeError("repository must be owner/repo")
+        token = _github_token()
+        if not token:
+            raise RuntimeError("GITHUB_TOKEN or .env GITHUB_TOKEN is required")
+
+        title = _github_epic_title(payload)
+        body = _github_epic_body(payload)
+        issue = await _github_create_issue(
+            repository,
+            token,
+            {
+                "title": title,
+                "body": body,
+            },
+        )
+        if not isinstance(issue, dict):
+            raise RuntimeError(f"failed to create GitHub issue in {repository}")
+        return {
+            "status": "ok",
+            "repository": repository,
+            "issue_number": issue.get("number"),
+            "issue_url": issue.get("html_url"),
+            "title": title,
+        }
 
     @tool(
         name="feature_explore",
@@ -556,7 +600,10 @@ class FeatureFeaturesFeature(Feature):
             action_provider_ready = (
                 mode != "action"
                 or registered_handler_ready
-                or provider_name is not None
+                or (
+                    provider_name is not None
+                    and _provider_requirements_ready(self.agent, provider_name)
+                )
             )
             prompt_ready = (
                 mode != "cognition"
@@ -894,6 +941,102 @@ def _workflow_name_for_kind(kind: str) -> str:
     raise ValueError("kind must be one of: tool, package")
 
 
+def _github_epic_title(payload: dict[str, Any]) -> str:
+    feature_name = _payload_string(payload, "feature_name")
+    package_name = _payload_string(payload, "package_name")
+    target_tool_name = _payload_string(payload, "target_tool_name")
+    subject = feature_name or package_name or target_tool_name or "feature proposal"
+    if target_tool_name and target_tool_name != subject:
+        subject = f"{subject}: {target_tool_name}"
+    return f"[EPIC] Feature proposal: {subject}"
+
+
+def _github_epic_body(payload: dict[str, Any]) -> str:
+    summary = _payload_string(payload, "summary") or "No summary provided."
+    lines = [
+        "## FeatureFeature Proposal",
+        "",
+        summary,
+        "",
+        "## Proposal Parameters",
+        "",
+        "```json",
+        json.dumps(_redacted_payload(payload), indent=2, sort_keys=True),
+        "```",
+        "",
+        "## Workflow",
+        "",
+        "Created by the FeatureFeature `file_github_epic` provider.",
+    ]
+    return "\n".join(lines)
+
+
+def _redacted_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        str(key): _redacted_value(str(key), value)
+        for key, value in payload.items()
+    }
+
+
+def _redacted_value(key_text: str, value: Any) -> Any:
+    if _secretish_key(key_text):
+        return "<redacted>"
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            child_key = str(key)
+            redacted[child_key] = _redacted_value(child_key, item)
+        return redacted
+    if isinstance(value, list):
+        return [_redacted_value("", item) for item in value]
+    if isinstance(value, tuple):
+        return [_redacted_value("", item) for item in value]
+    return value
+
+
+def _secretish_key(key_text: str) -> bool:
+    return any(
+        secret in key_text.lower()
+        for secret in (
+            "auth",
+            "credential",
+            "key",
+            "password",
+            "passwd",
+            "private",
+            "secret",
+            "token",
+        )
+    )
+
+
+def _payload_string(payload: dict[str, Any], key: str) -> str | None:
+    value = payload.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _github_token() -> str | None:
+    from kestrel_sovereign.features.strategic_memory.github_integration import (
+        get_github_token,
+    )
+
+    return get_github_token()
+
+
+async def _github_create_issue(
+    repository: str,
+    token: str,
+    body: dict[str, Any],
+) -> Any:
+    from kestrel_sovereign.features.strategic_memory.github_integration import (
+        github_api_post,
+    )
+
+    return await github_api_post(f"/repos/{repository}/issues", token, body)
+
+
 def _resolve_provider_name(agent: Any, source: str) -> str | None:
     stage = source.split(".")[-1]
     for name in (
@@ -912,6 +1055,12 @@ def _registered_handler_ready(registration: Any) -> bool:
     return callable(handler) and not bool(
         getattr(handler, "_feature_feature_requires_agent_provider", False)
     )
+
+
+def _provider_requirements_ready(agent: Any, provider_name: str) -> bool:
+    if not bool(getattr(agent, f"{provider_name}_requires_github_token", False)):
+        return True
+    return bool(_github_token())
 
 
 __all__ = ["FeatureFeaturesFeature"]
