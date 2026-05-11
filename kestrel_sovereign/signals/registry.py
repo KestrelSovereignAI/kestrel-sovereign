@@ -174,6 +174,12 @@ class SourceRegistry:
         # Constitutional injection — kestrel-sovereign#1137 chunk 1D.
         # See CONSTITUTION_INJECTION.md §"`SourceRegistration` additions".
         SourceRegistry._validate_constitution_injection(reg)
+        allow_prompt_override = getattr(reg, "allow_prompt_override", False)
+        if not isinstance(allow_prompt_override, bool):
+            raise RegistrationError(
+                f"Source '{reg.name}': allow_prompt_override must be a bool "
+                f"when declared, got {type(allow_prompt_override).__name__}."
+            )
 
     @staticmethod
     def _validate_constitution_injection(reg: SourceRegistration) -> None:

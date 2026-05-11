@@ -14,6 +14,7 @@ Covers each pipeline step:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import tempfile
 from datetime import datetime, time, timedelta, timezone
@@ -41,7 +42,9 @@ from kestrel_sovereign.signals import (
     OrderedLockManager,
     SignalDispatcher,
     SignalLogStore,
+    SignalWithPromptTemplateOverride,
     SourceRegistry,
+    SourceRegistrationWithPromptOverride,
 )
 from kestrel_sovereign.storage.db import SQLiteBackend
 
@@ -679,6 +682,80 @@ async def test_cognition_routes_through_agent_process_input(
     assert result.artifact == "agent-said"
     assert "source=cog" in c.agent.process_input_calls[0]
     assert "payload={'k': 'v'}" in c.agent.process_input_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_cognition_uses_allowed_signal_prompt_template_override(
+    dispatcher_components, tmp_path
+):
+    c = dispatcher_components
+    base = tmp_path / "base.md"
+    override = tmp_path / "override.md"
+    base.write_text("base payload={payload}")
+    override.write_text("override payload={payload}")
+    reg = SourceRegistrationWithPromptOverride(
+        **_cognition_reg(base, name="override_cog").__dict__,
+        allow_prompt_override=True,
+    )
+    c.registry.register(reg)
+    c.agent.process_input_return = "agent-said"
+
+    signal = SignalWithPromptTemplateOverride(
+        source="override_cog",
+        kind="tick",
+        mode=SignalMode.COGNITION,
+        payload={"k": "v"},
+        target_agent="agent-test",
+        urgency=Urgency.NORMAL,
+        prompt_template_override=override,
+    )
+    result = await c.dispatcher.dispatch_signal(signal)
+    assert result.status == Status.OK
+    assert c.agent.process_input_calls == ["override payload={'k': 'v'}"]
+
+    pending = [t for t in c.agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending)
+    rows = await c.backend.fetch_all(
+        "SELECT prompt_template_hash FROM signal_log WHERE source='override_cog'"
+    )
+    expected = hashlib.sha256(override.read_bytes()).hexdigest()
+    assert rows == [(expected,)]
+
+
+@pytest.mark.asyncio
+async def test_cognition_ignores_prompt_template_override_without_opt_in(
+    dispatcher_components, tmp_path
+):
+    c = dispatcher_components
+    base = tmp_path / "base.md"
+    override = tmp_path / "override.md"
+    base.write_text("base payload={payload}")
+    override.write_text("override payload={payload}")
+    c.registry.register(_cognition_reg(base, name="no_override_cog"))
+    c.agent.process_input_return = "agent-said"
+
+    signal = SignalWithPromptTemplateOverride(
+        source="no_override_cog",
+        kind="tick",
+        mode=SignalMode.COGNITION,
+        payload={"k": "v"},
+        target_agent="agent-test",
+        urgency=Urgency.NORMAL,
+        prompt_template_override=override,
+    )
+    result = await c.dispatcher.dispatch_signal(signal)
+    assert result.status == Status.OK
+    assert c.agent.process_input_calls == ["base payload={'k': 'v'}"]
+
+    pending = [t for t in c.agent.background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending)
+    rows = await c.backend.fetch_all(
+        "SELECT prompt_template_hash FROM signal_log WHERE source='no_override_cog'"
+    )
+    expected = hashlib.sha256(base.read_bytes()).hexdigest()
+    assert rows == [(expected,)]
 
 
 @pytest.mark.asyncio

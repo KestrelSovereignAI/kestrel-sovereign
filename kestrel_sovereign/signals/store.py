@@ -172,6 +172,11 @@ class SignalLogStore(UnifiedStoreBase):
         # write time) for SQLite/Postgres parity.
         await self._additive_alter("injected_clauses_json TEXT")
         await self._additive_alter("dropped_clauses_json TEXT")
+        # Per-signal prompt-template override provenance (#1146).
+        # NULL for ACTION/ARTIFACT and for COGNITION rows that failed
+        # before prompt render. When present, this is the sha256 of the
+        # exact template body chosen for the dispatch.
+        await self._additive_alter("prompt_template_hash TEXT")
 
         # Indexes for the queries we expect: by source, by target_agent,
         # by status (for failure dashboards), and by retention_until (sweep).
@@ -239,6 +244,7 @@ class SignalLogStore(UnifiedStoreBase):
         echo_canary_status: Optional[str] = None,
         injected_clauses: Optional[list[str]] = None,
         dropped_clauses: Optional[list[str]] = None,
+        prompt_template_hash: Optional[str] = None,
     ) -> Optional[str]:
         """Persist a dispatch outcome. Payload redaction runs HERE
         (the dispatcher does not see the redacted form before this
@@ -261,6 +267,9 @@ class SignalLogStore(UnifiedStoreBase):
             dropped_clauses: list of clause names dropped by the
                 priority-ordered truncation (NULL when no truncation
                 happened or no system prompt path).
+            prompt_template_hash: sha256 of the prompt template body
+                selected for this dispatch. NULL for non-COGNITION
+                sources and failures that never rendered a prompt.
 
         Returns the `result_summary` text the source produced (or None
         when the source didn't set `result_summary` on its
@@ -361,8 +370,9 @@ class SignalLogStore(UnifiedStoreBase):
                 result_summary,
                 causation_chain_digest, error, retention_until,
                 constitution_hash, doctrine_bundle_hash, echo_canary_status,
-                injected_clauses_json, dropped_clauses_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                injected_clauses_json, dropped_clauses_json,
+                prompt_template_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 signal.id,
@@ -394,6 +404,7 @@ class SignalLogStore(UnifiedStoreBase):
                 echo_canary_status,
                 injected_clauses_json,
                 dropped_clauses_json,
+                prompt_template_hash,
             ),
         )
 

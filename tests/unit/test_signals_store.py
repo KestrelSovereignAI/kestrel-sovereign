@@ -159,9 +159,21 @@ async def test_constitution_columns_default_to_null(store):
 
     rows = await store.backend.fetch_all(
         "SELECT constitution_hash, doctrine_bundle_hash, echo_canary_status, "
-        "injected_clauses_json, dropped_clauses_json FROM signal_log"
+        "injected_clauses_json, dropped_clauses_json, prompt_template_hash "
+        "FROM signal_log"
     )
-    assert rows[0] == (None, None, None, None, None)
+    assert rows[0] == (None, None, None, None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_prompt_template_hash_persists_supplied_value(store):
+    sig = _signal()
+    reg = _registration()
+    await store.append(sig, reg, _ok_result(sig), prompt_template_hash="abc123")
+    rows = await store.backend.fetch_all(
+        "SELECT prompt_template_hash FROM signal_log"
+    )
+    assert rows[0][0] == "abc123"
 
 
 @pytest.mark.asyncio

@@ -413,7 +413,7 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 
 Two findings, both spec bugs where v4 referenced SignalDispatcher contract fields that don't exist:
 
-- **§3.1 Stage `prompt_template_override` removed.** SignalDispatcher renders `registration.prompt_template` only; per-signal overrides require a contract change. Stages that need a different prompt for a COGNITION source register a new SourceRegistration. Per-signal prompt-override is a follow-up coordinated with #1137.
+- **§3.1 Stage `prompt_template_override` removed.** SignalDispatcher now supports per-signal prompt-template overrides only for sources that explicitly opt in via `allow_prompt_override`; workflows can consume that platform contract in a later schema revision without changing Phase 0 signed-spec hashes.
 - **§3.5 `noop_idempotent` eligibility re-grounded on Stage fields.** v4 said "`signal_source.mode == ACTION` AND `read_only=True`" but `SourceRegistration` has `allowed_modes`/`default_mode` (no `mode`) and no `read_only` field. v4.1 evaluates against `stage.signal_mode == ACTION` AND `stage.read_only == True`; added explicit `read_only: bool` field to the Stage model in §3.1.
 
 ### v3.4 → v4 changelog (platform-survey reframing)

@@ -76,13 +76,16 @@ enforces this for the whole repo.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import logging
+import os
 import secrets
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Coroutine, List, Optional, Protocol
 from zoneinfo import ZoneInfo
 
@@ -120,6 +123,9 @@ from kestrel_sovereign.storage.db.write_audit import (
 from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
+
+
+_PROMPT_TEMPLATE_HASH_ATTR = "_kestrel_prompt_template_hash"
 
 
 # ---------------------------------------------------------------------------
@@ -1303,9 +1309,14 @@ class SignalDispatcher:
         # for `constitution_injection="full"` sources (see
         # `_run_cognition_with_audit`). This avoids the
         # template-forgot-the-placeholder bypass codex round-5 caught.
-        template_path = registration.prompt_template
+        template_path = self._select_prompt_template(signal, registration)
         assert template_path is not None
         template = template_path.read_text(encoding="utf-8")
+        setattr(
+            signal,
+            _PROMPT_TEMPLATE_HASH_ATTR,
+            hashlib.sha256(template.encode("utf-8")).hexdigest(),
+        )
         return template.format(
             source=signal.source,
             kind=signal.kind,
@@ -1314,6 +1325,25 @@ class SignalDispatcher:
             urgency=signal.urgency.value,
             arrived_at=signal.arrived_at.isoformat(),
             constitution="",
+        )
+
+    @staticmethod
+    def _select_prompt_template(
+        signal: Signal,
+        registration: SourceRegistration,
+    ) -> Optional[Path]:
+        template_path = registration.prompt_template
+        override = getattr(signal, "prompt_template_override", None)
+        if override is None:
+            return template_path
+        if not getattr(registration, "allow_prompt_override", False):
+            return template_path
+        if isinstance(override, Path):
+            return override
+        if isinstance(override, os.PathLike):
+            return Path(override)
+        raise TypeError(
+            "Signal.prompt_template_override must be pathlib.Path or os.PathLike"
         )
 
     # ------------------------------------------------------------------
@@ -1386,7 +1416,13 @@ class SignalDispatcher:
         try:
             with suppress_write_audit():
                 result_summary = await self._store.append(
-                    signal, registration, result, **_audit_to_log_kwargs(audit)
+                    signal,
+                    registration,
+                    result,
+                    prompt_template_hash=getattr(
+                        signal, _PROMPT_TEMPLATE_HASH_ATTR, None
+                    ),
+                    **_audit_to_log_kwargs(audit),
                 )
         except Exception:
             logger.exception(

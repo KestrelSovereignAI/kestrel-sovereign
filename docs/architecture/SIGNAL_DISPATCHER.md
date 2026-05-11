@@ -134,9 +134,17 @@ class SourceRegistration:
     # Privacy & audit
     log_redaction: RedactionPolicy    # required; no defaults
     retention_days: int               # per-source signal_log retention
+
+    # Prompt selection
+    allow_prompt_override: bool = False  # opt-in for per-signal COGNITION templates
 ```
 
 A source not in the registry cannot dispatch. Registration is an explicit code change reviewable as a unit, not a one-liner from inside a feature.
+
+`allow_prompt_override` is available via
+`kestrel_sovereign.signals.SourceRegistrationWithPromptOverride` while
+the upstream SDK dataclass catches up; ordinary SDK registrations keep
+the safe default of `False`.
 
 ## The Signal envelope
 
@@ -160,6 +168,7 @@ class Signal:
     urgency: Urgency             # LOW | NORMAL | HIGH
     dedupe_key: str | None
     origin_trust: Trust          # inherited from source registration
+    prompt_template_override: Path | None  # honored only when registration opts in
 
     # Causation
     causation_chain: list[CausationFrame]
@@ -167,6 +176,11 @@ class Signal:
     # Audit
     arrived_at: datetime
 ```
+
+`prompt_template_override` is available via
+`kestrel_sovereign.signals.SignalWithPromptTemplateOverride` while the
+upstream SDK dataclass catches up. The dispatcher still treats it as a
+normal `Signal` envelope.
 
 ```python
 @dataclass(frozen=True)
@@ -219,7 +233,7 @@ The dispatcher pipeline:
 6. **Route**:
    - ACTION → `await registration.handler(payload)`
    - ARTIFACT → `await registration.artifact_handler(signal)`
-   - COGNITION → render `prompt_template` with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
+   - COGNITION → select the registration `prompt_template`, or the signal's `prompt_template_override` only when the registration has `allow_prompt_override=True`; render with the signal envelope → `await agent.process_input_or_streaming(prompt, ...)`. The entry point itself acquires `CONVERSATION` at the shared turn lifecycle (Concern #1) — the dispatcher does not pre-acquire it. Streaming vs non-streaming is selected by the calling context; both share the same lifecycle boundary.
 7. **Release locks** in reverse acquisition order.
 8. **Log** per the source's redaction policy.
 
@@ -239,6 +253,7 @@ signal_log
   payload_digest          -- sha256(payload) regardless of trust
   payload_redacted        -- per-source RedactionPolicy applied
   causation_chain_digest  -- sha256 of chain for audit
+  prompt_template_hash    -- sha256 of chosen template body for COGNITION
   retention_until         -- computed from registration.retention_days
 ```
 
@@ -249,6 +264,7 @@ signal_log
 - **Retention** is per-source; a retention sweep runs as an ACTION signal.
 - **Caller identity** redacted by default to role/scope; opt-in for full identifier.
 - **Causation chain** stored as digest; full chain reconstructible from individual entries.
+- **Prompt-template provenance** is stored for COGNITION dispatches after prompt render. The hash covers the exact template body chosen for that dispatch, including per-signal overrides.
 
 If a registration doesn't specify a redaction policy, the dispatcher refuses to register the source. No defaults; this is too important to default.
 
