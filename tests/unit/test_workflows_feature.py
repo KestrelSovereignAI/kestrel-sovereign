@@ -162,6 +162,44 @@ async def test_workflow_run_status_history_and_list_runs(feature_components):
 
 
 @pytest.mark.asyncio
+async def test_workflow_run_accepts_json_string_params_and_latest_version_string(
+    feature_components,
+):
+    c = feature_components
+    calls: list[dict] = []
+    c.agent.signal_registry.register(_action_source("ci.lint", calls))
+    await c.feature.workflow_define(_spec())
+
+    result = await c.feature.workflow_run(
+        "release",
+        params='{"branch": "main"}',
+        version="0",
+    )
+
+    assert result.status.value == "ok"
+    assert result.data["status"] == "completed"
+    assert calls == [{"branch": "main"}]
+
+
+@pytest.mark.asyncio
+async def test_workflow_list_runs_accepts_string_limit(feature_components):
+    c = feature_components
+    calls: list[dict] = []
+    c.agent.signal_registry.register(_action_source("ci.lint", calls))
+    await c.feature.workflow_define(_spec())
+    run_result = await c.feature.workflow_run("release", params={"branch": "main"})
+
+    runs = await c.feature.workflow_list_runs(
+        workflow_name="release",
+        limit="10",
+    )
+
+    assert run_result.status.value == "ok"
+    assert runs.status.value == "ok"
+    assert runs.data["runs"][0]["run_id"] == run_result.data["run_id"]
+
+
+@pytest.mark.asyncio
 async def test_workflow_revoke_definition_records_typed_reason(feature_components):
     c = feature_components
     await c.feature.workflow_define(_spec())

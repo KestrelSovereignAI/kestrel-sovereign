@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -954,6 +955,49 @@ async def test_feature_features_run_delegates_to_workflows_feature():
 
 
 @pytest.mark.asyncio
+async def test_feature_features_run_accepts_json_string_params_and_version():
+    class StubWorkflowsFeature:
+        def __init__(self):
+            self.calls = []
+
+        async def workflow_run(self, name, params=None, version=0):
+            self.calls.append((name, params, version))
+            return ToolResult.ok("ran", data={"run_id": "run-1"})
+
+    workflows = StubWorkflowsFeature()
+    feature = FeatureFeaturesFeature(
+        SimpleNamespace(features={"WorkflowsFeature": workflows})
+    )
+
+    result = await feature.feature_feature_run(
+        "tool",
+        params=json.dumps(
+            {
+                "feature_name": "demo",
+                "target_tool_name": "demo_tool",
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+            }
+        ),
+        version="0",
+    )
+
+    assert result.status is ToolResultStatus.OK
+    assert workflows.calls == [
+        (
+            FEATURE_PROPOSE_TOOL_WORKFLOW_NAME,
+            {
+                "feature_name": "demo",
+                "target_tool_name": "demo_tool",
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+            },
+            0,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_feature_features_run_rejects_unknown_kind_and_non_object_params():
     feature = FeatureFeaturesFeature(
         SimpleNamespace(features={"WorkflowsFeature": SimpleNamespace()})
@@ -964,6 +1008,7 @@ async def test_feature_features_run_rejects_unknown_kind_and_non_object_params()
 
     assert bad_kind.status is ToolResultStatus.ERROR
     assert bad_params.status is ToolResultStatus.ERROR
+    assert "object" in bad_params.error
 
 
 @pytest.mark.asyncio
@@ -973,9 +1018,15 @@ async def test_feature_feature_runtime_status_reports_missing_action_providers()
     feature = FeatureFeaturesFeature(agent)
     await feature.initialize()
 
-    with patch(
-        "kestrel_sovereign.features.feature_features.feature._github_token",
-        return_value="gh-test",
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
     ):
         result = await feature.feature_feature_runtime_status()
 
@@ -987,6 +1038,14 @@ async def test_feature_feature_runtime_status_reports_missing_action_providers()
     assert "feature_features.assign_talon_chunks" in (
         result.data["missing_action_providers"]
     )
+    assert {
+        "source": "feature_features.red_team_review",
+        "prerequisite": "workflow_red_team_prompt_pack_resolver",
+    } in result.data["missing_workflow_prerequisites"]
+    assert {
+        "source": "feature_features.red_team_review",
+        "prerequisite": "workflow_red_team_attestation_resolver",
+    } in result.data["missing_workflow_prerequisites"]
     explore = next(
         row
         for row in result.data["sources"]
@@ -1002,14 +1061,23 @@ async def test_feature_feature_runtime_status_requires_github_token_for_default_
     feature = FeatureFeaturesFeature(agent)
     await feature.initialize()
 
-    with patch(
-        "kestrel_sovereign.features.feature_features.feature._github_token",
-        return_value=None,
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value=None,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value=None,
+        ),
     ):
         result = await feature.feature_feature_runtime_status()
 
     assert result.status is ToolResultStatus.ERROR
     assert "feature_features.file_github_epic" in (
+        result.data["missing_action_providers"]
+    )
+    assert "feature_features.ci_green" in (
         result.data["missing_action_providers"]
     )
     row = next(
@@ -1021,20 +1089,70 @@ async def test_feature_feature_runtime_status_requires_github_token_for_default_
 
 
 @pytest.mark.asyncio
+async def test_feature_feature_runtime_status_requires_github_token_for_default_ci_provider():
+    async def file_github_epic(_payload):
+        return {"status": "ok"}
+
+    registry = SourceRegistry()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        feature_feature_file_github_epic=file_github_epic,
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value=None,
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "feature_features.file_github_epic" not in (
+        result.data["missing_action_providers"]
+    )
+    assert "feature_features.ci_green" in (
+        result.data["missing_action_providers"]
+    )
+    row = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.ci_green"
+    )
+    assert row["action_provider_ready"] is False
+    assert row["ready"] is False
+
+
+@pytest.mark.asyncio
 async def test_feature_feature_runtime_status_rejects_empty_github_token():
     registry = SourceRegistry()
     agent = SimpleNamespace(signal_registry=registry)
     feature = FeatureFeaturesFeature(agent)
     await feature.initialize()
 
-    with patch(
-        "kestrel_sovereign.features.feature_features.feature._github_token",
-        return_value="",
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="",
+        ),
     ):
         result = await feature.feature_feature_runtime_status()
 
     assert result.status is ToolResultStatus.ERROR
     assert "feature_features.file_github_epic" in (
+        result.data["missing_action_providers"]
+    )
+    assert "feature_features.ci_green" in (
         result.data["missing_action_providers"]
     )
 
@@ -1052,15 +1170,136 @@ async def test_feature_feature_runtime_status_marks_talon_provider_ready_when_lo
     feature = FeatureFeaturesFeature(agent)
     await feature.initialize()
 
-    with patch(
-        "kestrel_sovereign.features.feature_features.feature._github_token",
-        return_value="gh-test",
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
     ):
         result = await feature.feature_feature_runtime_status()
 
     assert result.status is ToolResultStatus.ERROR
     assert "feature_features.assign_talon_chunks" not in (
         result.data["missing_action_providers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_reports_missing_prompt_pack_resolver():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    red_team = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.red_team_review"
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert red_team["workflow_prerequisites_ready"] is False
+    assert {
+        "source": "feature_features.red_team_review",
+        "prerequisite": "workflow_red_team_prompt_pack_resolver",
+    } in result.data["missing_workflow_prerequisites"]
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_reports_missing_attestation_resolver():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        workflow_red_team_prompt_pack_resolver=lambda _constraint: {
+            "name": "kestrel-red-team-prompts",
+            "version": "1.0.0",
+            "prompt_hash": "a" * 64,
+            "prompt": "review",
+        },
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    red_team = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.red_team_review"
+    )
+    assert {
+        "source": "feature_features.red_team_review",
+        "prerequisite": "workflow_red_team_prompt_pack_resolver",
+    } not in result.data["missing_workflow_prerequisites"]
+    assert red_team["workflow_prerequisites_ready"] is False
+    assert {
+        "source": "feature_features.red_team_review",
+        "prerequisite": "workflow_red_team_attestation_resolver",
+    } in result.data["missing_workflow_prerequisites"]
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_accepts_red_team_resolvers():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        workflow_red_team_prompt_pack_resolver=lambda _constraint: {
+            "name": "kestrel-red-team-prompts",
+            "version": "1.0.0",
+            "prompt_hash": "a" * 64,
+            "prompt": "review",
+        },
+        workflow_red_team_attestation_resolver=lambda _reviewers: {},
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    red_team = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.red_team_review"
+    )
+    assert red_team["workflow_prerequisites_ready"] is True
+    assert not any(
+        item["source"] == "feature_features.red_team_review"
+        for item in result.data["missing_workflow_prerequisites"]
     )
 
 
@@ -1418,6 +1657,93 @@ async def test_feature_features_installs_review_diff_providers():
 
 
 @pytest.mark.asyncio
+async def test_feature_features_installs_ci_green_passthrough_provider():
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+
+    await feature.initialize()
+
+    result = await agent.feature_feature_ci_green(
+        {
+            "repository": "Org/repo",
+            "branch": "codex/demo",
+            "workflow_run_id": "run-1",
+            "workflow_stage_name": "ci_green",
+        }
+    )
+
+    assert result == {
+        "status": "ok",
+        "repository": "Org/repo",
+        "branch": "codex/demo",
+        "workflow_run_id": "run-1",
+        "workflow_stage_name": "ci_green",
+    }
+
+
+@pytest.mark.asyncio
+async def test_feature_features_audit_anchor_provider_delegates_to_feature():
+    class StubAuditAnchor:
+        def __init__(self):
+            self.called = 0
+
+        async def anchor_audit(self):
+            self.called += 1
+            return ToolResult.ok(
+                "anchored",
+                data={"anchor_id": "anchor-1", "entries_count": 3},
+            )
+
+    audit_anchor = StubAuditAnchor()
+    agent = SimpleNamespace(features={"AuditAnchorFeature": audit_anchor})
+    feature = FeatureFeaturesFeature(agent)
+
+    await feature.initialize()
+    result = await agent.feature_feature_audit_anchor(
+        {
+            "workflow_run_id": "run-1",
+            "workflow_stage_name": "audit_anchor",
+        }
+    )
+
+    assert audit_anchor.called == 1
+    assert result["status"] == "ok"
+    assert result["audit_anchor_status"] == "ok"
+    assert result["audit_anchor"]["anchor_id"] == "anchor-1"
+    assert result["workflow_run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_feature_features_audit_anchor_provider_requires_loaded_feature():
+    agent = SimpleNamespace(features={})
+    feature = FeatureFeaturesFeature(agent)
+
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="AuditAnchorFeature"):
+        await agent.feature_feature_audit_anchor({})
+
+
+@pytest.mark.asyncio
+async def test_feature_features_audit_anchor_provider_rejects_partial_anchor():
+    class PartialAuditAnchor:
+        async def anchor_audit(self):
+            return ToolResult.partial(
+                "anchored hash only",
+                error="file storage failed",
+                data={"anchor_id": "anchor-1"},
+            )
+
+    agent = SimpleNamespace(features={"AuditAnchorFeature": PartialAuditAnchor()})
+    feature = FeatureFeaturesFeature(agent)
+
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="file storage failed"):
+        await agent.feature_feature_audit_anchor({})
+
+
+@pytest.mark.asyncio
 async def test_feature_features_review_diff_providers_fail_closed():
     async def command_runner(**kwargs):
         return {
@@ -1547,7 +1873,16 @@ async def test_feature_features_review_diff_provider_reports_deleted_files():
 @pytest.mark.asyncio
 async def test_feature_feature_runtime_status_passes_with_registered_providers():
     registry = SourceRegistry()
-    agent = SimpleNamespace(signal_registry=registry)
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        workflow_red_team_prompt_pack_resolver=lambda _constraint: {
+            "name": "kestrel-red-team-prompts",
+            "version": "1.0.0",
+            "prompt_hash": "a" * 64,
+            "prompt": "review",
+        },
+        workflow_red_team_attestation_resolver=lambda _reviewers: {},
+    )
     for source in (
         *FEATURE_FEATURES_STAGE_SOURCES.values(),
         *FEATURE_FEATURES_COMPENSATION_SOURCES.values(),

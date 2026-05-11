@@ -122,6 +122,28 @@ class FeatureFeaturesFeature(Feature):
                 "feature_feature_red_team_review",
                 self._feature_feature_red_team_review,
             )
+        if getattr(self.agent, "feature_feature_ci_green", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_ci_green",
+                self._feature_feature_ci_green,
+            )
+            setattr(
+                self.agent,
+                "feature_feature_ci_green_requires_ci_token",
+                True,
+            )
+        if getattr(self.agent, "feature_feature_audit_anchor", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_audit_anchor",
+                self._feature_feature_audit_anchor,
+            )
+            setattr(
+                self.agent,
+                "feature_feature_audit_anchor_requires_audit_anchor",
+                True,
+            )
 
     async def _feature_feature_file_github_epic(self, payload: dict) -> dict[str, Any]:
         """Create the FeatureFeature GitHub epic for a proposed feature change."""
@@ -287,6 +309,49 @@ class FeatureFeaturesFeature(Feature):
             **snapshot,
             "status": "ok",
             "review": "red_team",
+        }
+
+    async def _feature_feature_ci_green(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Acknowledge the ci_green stage before the runner polls GitHub checks."""
+
+        return {
+            "status": "ok",
+            "repository": _payload_string(payload, "repository"),
+            "branch": _payload_string(payload, "branch"),
+            "workflow_run_id": _payload_string(payload, "workflow_run_id"),
+            "workflow_stage_name": _payload_string(payload, "workflow_stage_name"),
+        }
+
+    async def _feature_feature_audit_anchor(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Anchor audit logs after an irreversible FeatureFeature publish."""
+
+        audit_anchor = _audit_anchor_feature(self.agent)
+        if audit_anchor is None or not callable(
+            getattr(audit_anchor, "anchor_audit", None)
+        ):
+            raise RuntimeError("AuditAnchorFeature is not available")
+
+        result = await audit_anchor.anchor_audit()
+        status = getattr(result, "status", None)
+        data = getattr(result, "data", None)
+        if status is not ToolResultStatus.OK:
+            raise RuntimeError(
+                getattr(result, "error", None)
+                or getattr(result, "confirmation", None)
+                or "audit anchor failed"
+            )
+        return {
+            "status": "ok",
+            "audit_anchor_status": getattr(status, "value", str(status)),
+            "audit_anchor": data if isinstance(data, dict) else {},
+            "workflow_run_id": _payload_string(payload, "workflow_run_id"),
+            "workflow_stage_name": _payload_string(payload, "workflow_stage_name"),
         }
 
     @tool(
@@ -827,8 +892,11 @@ class FeatureFeaturesFeature(Feature):
         workflow_feature = self._workflow_feature()
         if workflow_feature is None:
             return ToolResult.failed("WorkflowsFeature is not available")
-        if not isinstance(params, dict):
-            return ToolResult.failed("FeatureFeature run params must be an object")
+        try:
+            run_params = _coerce_object_params(params, "FeatureFeature run params")
+            run_version = _coerce_nonnegative_int(version, "version")
+        except ValueError as exc:
+            return ToolResult.failed(str(exc))
 
         try:
             workflow_name = _workflow_name_for_kind(kind)
@@ -837,8 +905,8 @@ class FeatureFeaturesFeature(Feature):
 
         return await workflow_feature.workflow_run(
             workflow_name,
-            params=params,
-            version=version,
+            params=run_params,
+            version=run_version,
         )
 
     @tool(
@@ -858,6 +926,7 @@ class FeatureFeaturesFeature(Feature):
         missing_registered: list[str] = []
         missing_action_providers: list[str] = []
         missing_cognition_prompts: list[str] = []
+        missing_workflow_prerequisites: list[dict[str, Any]] = []
         for registration in build_feature_feature_registrations(self.agent):
             actual_registration = (
                 registry.get(registration.name) if registry is not None else None
@@ -886,10 +955,25 @@ class FeatureFeaturesFeature(Feature):
                     and active_registration.prompt_template.exists()
                 )
             )
+            workflow_prerequisites = _workflow_prerequisite_status(
+                self.agent,
+                registration.name,
+            )
+            workflow_prerequisites_ready = all(
+                item["ready"] for item in workflow_prerequisites
+            )
             if mode == "action" and not action_provider_ready:
                 missing_action_providers.append(registration.name)
             if mode == "cognition" and not prompt_ready:
                 missing_cognition_prompts.append(registration.name)
+            for prerequisite in workflow_prerequisites:
+                if not prerequisite["ready"]:
+                    missing_workflow_prerequisites.append(
+                        {
+                            "source": registration.name,
+                            "prerequisite": prerequisite["name"],
+                        }
+                    )
             rows.append(
                 {
                     "name": registration.name,
@@ -897,8 +981,16 @@ class FeatureFeaturesFeature(Feature):
                     "registered": registered,
                     "provider": provider_name,
                     "registered_handler": registered_handler_ready,
+                    "action_provider_ready": action_provider_ready,
                     "prompt_template_exists": prompt_ready,
-                    "ready": registered and action_provider_ready and prompt_ready,
+                    "workflow_prerequisites": workflow_prerequisites,
+                    "workflow_prerequisites_ready": workflow_prerequisites_ready,
+                    "ready": (
+                        registered
+                        and action_provider_ready
+                        and prompt_ready
+                        and workflow_prerequisites_ready
+                    ),
                 }
             )
 
@@ -906,12 +998,14 @@ class FeatureFeaturesFeature(Feature):
             not missing_registered
             and not missing_action_providers
             and not missing_cognition_prompts
+            and not missing_workflow_prerequisites
         )
         data = {
             "sources": rows,
             "missing_registered": missing_registered,
             "missing_action_providers": missing_action_providers,
             "missing_cognition_prompts": missing_cognition_prompts,
+            "missing_workflow_prerequisites": missing_workflow_prerequisites,
             "ready": ok,
         }
         if not ok:
@@ -1551,6 +1645,42 @@ def _coerce_positive_int(value: Any) -> int | None:
     return None
 
 
+def _coerce_nonnegative_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    else:
+        raise ValueError(f"{name} must be an integer")
+    if parsed < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return parsed
+
+
+def _coerce_object_params(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw_value = value.strip()
+        if not raw_value:
+            return {}
+        try:
+            decoded = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} must be a JSON object") from exc
+        if isinstance(decoded, dict):
+            return decoded
+        raise ValueError(f"{name} must be a JSON object")
+    raise ValueError(f"{name} must be an object")
+
+
 def _control_feature_names(agent: Any) -> set[str]:
     controls = {"FeatureFeaturesFeature", "feature_features_feature"}
     for feature in _agent_features(agent).values():
@@ -2028,7 +2158,11 @@ def _github_token() -> str | None:
         get_github_token,
     )
 
-    return get_github_token()
+    return get_github_token() or os.environ.get("GH_TOKEN")
+
+
+def _ci_green_token() -> str | None:
+    return os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
 
 
 async def _github_create_issue(
@@ -2066,9 +2200,63 @@ def _registered_handler_ready(registration: Any) -> bool:
 def _provider_requirements_ready(agent: Any, provider_name: str) -> bool:
     if bool(getattr(agent, f"{provider_name}_requires_github_token", False)):
         return bool(_github_token())
+    if bool(getattr(agent, f"{provider_name}_requires_ci_token", False)):
+        return bool(_ci_green_token())
     if bool(getattr(agent, f"{provider_name}_requires_talon", False)):
         return _talon_feature(agent) is not None
+    if bool(getattr(agent, f"{provider_name}_requires_audit_anchor", False)):
+        return _audit_anchor_feature(agent) is not None
     return True
+
+
+def _workflow_prerequisite_status(
+    agent: Any,
+    source: str,
+) -> list[dict[str, Any]]:
+    if source != "feature_features.red_team_review":
+        return []
+    return [
+        {
+            "name": "workflow_red_team_prompt_pack_resolver",
+            "ready": _red_team_prompt_pack_resolver_ready(agent),
+        },
+        {
+            "name": "workflow_red_team_attestation_resolver",
+            "ready": _red_team_attestation_resolver_ready(agent),
+        },
+    ]
+
+
+def _red_team_prompt_pack_resolver_ready(agent: Any) -> bool:
+    if callable(getattr(agent, "workflow_red_team_prompt_pack_resolver", None)):
+        return True
+    features = getattr(agent, "features", None)
+    if not isinstance(features, dict):
+        return False
+    workflow = features.get("WorkflowsFeature")
+    if workflow is None:
+        for feature in features.values():
+            if feature.__class__.__name__ == "WorkflowsFeature":
+                workflow = feature
+                break
+    runner = getattr(workflow, "runner", None)
+    return callable(getattr(runner, "red_team_prompt_pack_resolver", None))
+
+
+def _red_team_attestation_resolver_ready(agent: Any) -> bool:
+    if callable(getattr(agent, "workflow_red_team_attestation_resolver", None)):
+        return True
+    features = getattr(agent, "features", None)
+    if not isinstance(features, dict):
+        return False
+    workflow = features.get("WorkflowsFeature")
+    if workflow is None:
+        for feature in features.values():
+            if feature.__class__.__name__ == "WorkflowsFeature":
+                workflow = feature
+                break
+    runner = getattr(workflow, "runner", None)
+    return callable(getattr(runner, "red_team_attestation_resolver", None))
 
 
 def _talon_feature(agent: Any) -> Any | None:
@@ -2082,6 +2270,21 @@ def _talon_feature(agent: Any) -> Any | None:
         if feature.__class__.__name__ == "TalonCoordinatorFeature":
             return feature
         if callable(getattr(feature, "talon_claim", None)):
+            return feature
+    return None
+
+
+def _audit_anchor_feature(agent: Any) -> Any | None:
+    features = getattr(agent, "features", None)
+    if not isinstance(features, dict):
+        return None
+    audit_anchor = features.get("AuditAnchorFeature") or features.get("audit_anchor")
+    if audit_anchor is not None:
+        return audit_anchor
+    for feature in features.values():
+        if feature.__class__.__name__ == "AuditAnchorFeature":
+            return feature
+        if callable(getattr(feature, "anchor_audit", None)):
             return feature
     return None
 

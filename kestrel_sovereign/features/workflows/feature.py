@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from typing import Any, Optional
 
@@ -386,10 +387,12 @@ class WorkflowsFeature(Feature):
             version: Specific definition version, or latest active.
         """
         try:
+            run_params = _coerce_tool_object(params, "params")
+            run_version = _coerce_tool_int(version, "version", minimum=0)
             result = await self._require_runner().run_to_completion(
                 name=name,
-                params={} if params is None else params,
-                version=version or None,
+                params=run_params,
+                version=run_version or None,
             )
             return ToolResult.ok(
                 f"Workflow run {result.run_id} finished with {result.status.value}.",
@@ -689,10 +692,11 @@ class WorkflowsFeature(Feature):
             limit: Maximum rows to return.
         """
         try:
+            limit_value = _coerce_tool_int(limit, "limit", minimum=1)
             runs = await self._require_store().list_runs(
                 workflow_name=workflow_name or None,
                 status=status or None,
-                limit=limit,
+                limit=limit_value,
             )
             return ToolResult.ok(
                 f"{len(runs)} workflow run(s) found.",
@@ -710,6 +714,42 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_ready(v) for v in value]
     return value
+
+
+def _coerce_tool_object(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        raw_value = value.strip()
+        if not raw_value:
+            return {}
+        try:
+            decoded = json.loads(raw_value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} must be a JSON object") from exc
+        if isinstance(decoded, dict):
+            return decoded
+        raise ValueError(f"{name} must be a JSON object")
+    raise ValueError(f"{name} must be an object")
+
+
+def _coerce_tool_int(value: Any, name: str, *, minimum: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{name} must be an integer") from exc
+    else:
+        raise ValueError(f"{name} must be an integer")
+    if parsed < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return parsed
 
 
 def _pending_consent_request_id(reason: Any) -> Optional[str]:
