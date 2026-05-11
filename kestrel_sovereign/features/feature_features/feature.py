@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
+from pathlib import Path
 from typing import Any
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -45,6 +47,13 @@ class FeatureFeaturesFeature(Feature):
         self._register_signal_sources()
         self._register_default_providers()
         return None
+
+    def get_tools(self) -> list[Any]:
+        tools = super().get_tools()
+        for agent_tool in tools:
+            if agent_tool.name == "feature_discover":
+                agent_tool.parse_command_args = _parse_feature_discover_command
+        return tools
 
     def _register_signal_sources(self) -> None:
         registry = getattr(self.agent, "signal_registry", None)
@@ -206,6 +215,89 @@ class FeatureFeaturesFeature(Feature):
                     "core": len(core),
                     "entrypoints": len(entrypoints),
                     "loaded": len(loaded_features),
+                },
+            },
+        )
+
+    @tool(
+        name="feature_discover",
+        description=(
+            "Search the feature catalog with provenance, load state, and context visibility."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!feature-discover",
+    )
+    async def feature_discover(
+        self,
+        include_entrypoints: bool = True,
+        include_loaded: bool = True,
+        include_tools: bool = False,
+        loaded_only: bool = False,
+        limit: int = 50,
+        query: str = "",
+    ) -> ToolResult:
+        """Return a searchable feature catalog for runtime feature selection.
+
+        Args:
+            include_entrypoints: Include installed package entry-point features.
+            include_loaded: Include active runtime-only features that are not discoverable.
+            include_tools: Include tool rows for loaded features.
+            loaded_only: Return only features that are active in this agent runtime.
+            limit: Maximum number of catalog rows to return.
+            query: Optional text matched against class/module/tool names and docs.
+        """
+
+        include_entrypoints_requested = _coerce_bool(include_entrypoints)
+        include_loaded_requested = _coerce_bool(include_loaded)
+        include_tools_requested = _coerce_bool(include_tools)
+        loaded_only_requested = _coerce_bool(loaded_only)
+        if (
+            include_entrypoints_requested is None
+            or include_loaded_requested is None
+            or include_tools_requested is None
+            or loaded_only_requested is None
+        ):
+            return ToolResult.failed(
+                "include_entrypoints, include_loaded, include_tools, and loaded_only must be booleans."
+            )
+        limit_value = _coerce_positive_int(limit)
+        if limit_value is None:
+            return ToolResult.failed("limit must be a positive integer.")
+
+        catalog = _feature_catalog(
+            self.agent,
+            include_entrypoints=include_entrypoints_requested,
+            include_loaded=include_loaded_requested,
+            include_tools=True,
+        )
+        if loaded_only_requested:
+            catalog = [row for row in catalog if row["loaded"]]
+        filtered = _filter_feature_catalog(catalog, query)[:limit_value]
+        response_features = (
+            filtered
+            if include_tools_requested
+            else [_without_catalog_tools(row) for row in filtered]
+        )
+        loaded_count = sum(1 for row in filtered if row["loaded"])
+        visible_count = sum(1 for row in filtered if row["visible_in_context"])
+        return ToolResult.ok(
+            f"Discovered {len(filtered)} matching feature(s).",
+            data={
+                "query": str(query or ""),
+                "features": response_features,
+                "counts": {
+                    "matched": len(filtered),
+                    "loaded": loaded_count,
+                    "visible_in_context": visible_count,
+                    "hidden_from_context": loaded_count - visible_count,
+                    "total_catalog": len(catalog),
+                },
+                "actions": {
+                    "load": "feature_add",
+                    "unload": "feature_remove",
+                    "focus_context": "feature_focus",
+                    "hide_context": "feature_unfocus",
+                    "context_status": "feature_context_status",
                 },
             },
         )
@@ -751,6 +843,246 @@ def _core_feature_inventory() -> list[dict[str, Any]]:
     return rows
 
 
+def _parse_feature_discover_command(user_input: str) -> dict[str, Any]:
+    parts = user_input.strip().split()
+    if not parts or parts[0].lower() != "!feature-discover":
+        return {}
+
+    args: dict[str, Any] = {}
+    query_parts: list[str] = []
+    for token in parts[1:]:
+        if "=" in token:
+            key, value = token.split("=", 1)
+            key = key.strip("-")
+            if key in {
+                "include_entrypoints",
+                "include_loaded",
+                "include_tools",
+                "loaded_only",
+            }:
+                parsed_bool = _coerce_bool(value)
+                args[key] = value if parsed_bool is None else parsed_bool
+            elif key == "limit":
+                try:
+                    args[key] = int(value)
+                except ValueError:
+                    args[key] = value
+            elif key == "query":
+                args[key] = value
+            else:
+                query_parts.append(token)
+        elif token == "--include-tools":
+            args["include_tools"] = True
+        elif token == "--no-entrypoints":
+            args["include_entrypoints"] = False
+        elif token == "--loaded-only":
+            args["loaded_only"] = True
+        else:
+            query_parts.append(token)
+
+    if query_parts and "query" not in args:
+        args["query"] = " ".join(query_parts)
+    return args
+
+
+def _feature_catalog(
+    agent: Any,
+    *,
+    include_entrypoints: bool,
+    include_loaded: bool,
+    include_tools: bool,
+) -> list[dict[str, Any]]:
+    loaded_rows = _loaded_feature_inventory(agent)
+    loaded_by_class = {row["class"]: row for row in loaded_rows}
+    loaded_by_module = {row["module"]: row for row in loaded_rows}
+    catalog: list[dict[str, Any]] = []
+    seen_classes: set[str] = set()
+    allowed_features = getattr(agent, "_allowed_features", None)
+    allowed_set = set(allowed_features) if allowed_features is not None else None
+    disabled = get_disabled_features()
+
+    for module_path in sorted(discover_feature_modules()):
+        module = importlib.import_module(module_path)
+        feature_class = find_feature_class(module)
+        if feature_class is None:
+            continue
+        loaded = loaded_by_class.get(feature_class.__name__) or loaded_by_module.get(
+            module_path
+        )
+        catalog.append(
+            _feature_catalog_row(
+                feature_class,
+                source="core",
+                provenance=module_path,
+                loaded=loaded,
+                disabled=feature_class.__name__ in disabled,
+                allowed=_feature_allowed(feature_class.__name__, allowed_set),
+                include_tools=include_tools,
+            )
+        )
+        seen_classes.add(feature_class.__name__)
+
+    if include_entrypoints:
+        for entrypoint_name, feature_class in sorted(
+            discover_entrypoint_feature_classes().items()
+        ):
+            if feature_class.__name__ in seen_classes:
+                continue
+            loaded = loaded_by_class.get(feature_class.__name__) or loaded_by_module.get(
+                feature_class.__module__
+            )
+            catalog.append(
+                _feature_catalog_row(
+                    feature_class,
+                    source="entrypoint",
+                    provenance=entrypoint_name,
+                    loaded=loaded,
+                    disabled=feature_class.__name__ in disabled,
+                    allowed=_feature_allowed(feature_class.__name__, allowed_set),
+                    include_tools=include_tools,
+                )
+            )
+            seen_classes.add(feature_class.__name__)
+
+    if include_loaded:
+        for loaded in loaded_rows:
+            if loaded["class"] in seen_classes:
+                continue
+            catalog.append(
+                {
+                    "name": _feature_module_name(loaded["module"]),
+                    "class": loaded["class"],
+                    "module": loaded["module"],
+                    "source": "runtime",
+                    "provenance": loaded["registry_key"],
+                    "summary": None,
+                    "docs": [],
+                    "source_path": None,
+                    "loaded": True,
+                    "visible_in_context": loaded["visible_in_context"],
+                    "tool_name": loaded["tool_name"],
+                    "tool_count": loaded["tool_count"],
+                    "tools": loaded["tools"] if include_tools else [],
+                    "disabled": loaded["class"] in disabled,
+                    "allowed": _feature_allowed(loaded["class"], allowed_set),
+                }
+            )
+            seen_classes.add(loaded["class"])
+
+    return sorted(catalog, key=lambda row: (not row["loaded"], row["class"].lower()))
+
+
+def _feature_catalog_row(
+    feature_class: type,
+    *,
+    source: str,
+    provenance: str,
+    loaded: dict[str, Any] | None,
+    disabled: bool,
+    allowed: bool,
+    include_tools: bool,
+) -> dict[str, Any]:
+    module = inspect.getmodule(feature_class)
+    module_name = feature_class.__module__
+    source_path = _feature_source_path(feature_class)
+    return {
+        "name": _feature_module_name(module_name),
+        "class": feature_class.__name__,
+        "module": module_name,
+        "source": source,
+        "provenance": provenance,
+        "summary": _feature_summary(feature_class),
+        "docs": _feature_docs(module, source_path),
+        "source_path": str(source_path) if source_path is not None else None,
+        "loaded": loaded is not None,
+        "visible_in_context": (
+            bool(loaded["visible_in_context"]) if loaded is not None else False
+        ),
+        "tool_name": loaded["tool_name"] if loaded is not None else None,
+        "tool_count": loaded["tool_count"] if loaded is not None else 0,
+        "tools": loaded["tools"] if include_tools and loaded is not None else [],
+        "disabled": disabled,
+        "allowed": allowed,
+    }
+
+
+def _feature_allowed(class_name: str, allowed_features: set[str] | None) -> bool:
+    if allowed_features is None:
+        return True
+    from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+    return class_name in allowed_features or class_name in MANDATORY_FEATURES
+
+
+def _feature_source_path(feature_class: type) -> Path | None:
+    try:
+        path = Path(inspect.getfile(feature_class))
+    except (OSError, TypeError):
+        return None
+    return path
+
+
+def _feature_summary(feature_class: type) -> str | None:
+    doc = inspect.getdoc(feature_class)
+    if not doc:
+        return None
+    return doc.split("\n\n", 1)[0]
+
+
+def _feature_docs(module: Any, source_path: Path | None) -> list[str]:
+    docs: list[str] = []
+    module_doc = inspect.getdoc(module) if module is not None else None
+    if module_doc:
+        docs.append(module_doc.split("\n\n", 1)[0])
+    if source_path is not None:
+        for name in ("README.md", "README.rst", "SKILL.md"):
+            candidate = source_path.parent / name
+            if candidate.exists():
+                docs.append(str(candidate))
+    return docs
+
+
+def _filter_feature_catalog(
+    catalog: list[dict[str, Any]],
+    query: Any,
+) -> list[dict[str, Any]]:
+    text = str(query or "").strip().lower()
+    if not text:
+        return catalog
+    terms = [term for term in text.replace(",", " ").split() if term]
+    if not terms:
+        return catalog
+
+    def haystack(row: dict[str, Any]) -> str:
+        values = [
+            row.get("name"),
+            row.get("class"),
+            row.get("module"),
+            row.get("source"),
+            row.get("provenance"),
+            row.get("summary"),
+            row.get("tool_name"),
+            *(row.get("docs") or []),
+        ]
+        for tool_row in row.get("tools") or []:
+            values.extend(
+                [
+                    tool_row.get("name"),
+                    tool_row.get("description"),
+                    tool_row.get("category"),
+                ]
+            )
+        return " ".join(str(value).lower() for value in values if value)
+
+    return [row for row in catalog if all(term in haystack(row) for term in terms)]
+
+
+def _without_catalog_tools(row: dict[str, Any]) -> dict[str, Any]:
+    response_row = dict(row)
+    response_row["tools"] = []
+    return response_row
+
+
 def _loaded_feature_inventory(agent: Any) -> list[dict[str, Any]]:
     rows = []
     hidden_features = _hidden_features(agent)
@@ -980,6 +1312,20 @@ def _coerce_bool(value: Any) -> bool | None:
             return False
         return None
     return bool(value)
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError:
+            return None
+        return parsed if parsed >= 1 else None
+    return None
 
 
 def _control_feature_names(agent: Any) -> set[str]:
