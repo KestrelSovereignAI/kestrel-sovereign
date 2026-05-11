@@ -96,6 +96,18 @@ class GitHubCliAdapter(FeatureCliAdapter):
             ("gh",),
         ),
         CliCommandDefinition(
+            "github.issue_view",
+            "Read issue metadata, labels, assignees, and state.",
+            CliRisk.READ_ONLY,
+            ("gh",),
+        ),
+        CliCommandDefinition(
+            "github.issue_comments",
+            "Read issue comments.",
+            CliRisk.READ_ONLY,
+            ("gh",),
+        ),
+        CliCommandDefinition(
             "github.pr_diff",
             "Read a pull request unified diff.",
             CliRisk.READ_ONLY,
@@ -183,6 +195,53 @@ class GitHubCliAdapter(FeatureCliAdapter):
             )
         )
         return redact_json(_json_or_raise(result))
+
+    async def get_issue(self, *, repo: str, number: int | str) -> dict[str, Any]:
+        repo = _validate_repo(repo)
+        number = _validate_issue_number(number)
+        fields = [
+            "assignees",
+            "author",
+            "body",
+            "closed",
+            "closedAt",
+            "comments",
+            "createdAt",
+            "labels",
+            "milestone",
+            "number",
+            "state",
+            "title",
+            "updatedAt",
+            "url",
+        ]
+        result = await self.terminal.run(
+            TerminalCommandRequest(
+                argv=[
+                    "gh",
+                    "issue",
+                    "view",
+                    "--repo",
+                    repo,
+                    str(number),
+                    "--json",
+                    ",".join(fields),
+                ],
+                timeout=60,
+                risk=CliRisk.READ_ONLY,
+                command_id="github.issue_view",
+            )
+        )
+        return redact_json(_json_or_raise(result))
+
+    async def list_issue_comments(
+        self, *, repo: str, number: int | str
+    ) -> list[dict[str, Any]]:
+        issue = await self.get_issue(repo=repo, number=number)
+        comments = issue.get("comments", [])
+        if not isinstance(comments, list):
+            raise CliAdapterError("issue comments payload was not a list")
+        return comments
 
     async def get_pull_request_diff(self, *, repo: str, number: int | str) -> str:
         repo = _validate_repo(repo)
@@ -525,6 +584,18 @@ def _validate_pr_number(number: int | str) -> int:
         raise CliAdapterError("pull request number must be a positive integer") from exc
     if parsed < 1 or str(number).strip() != str(parsed):
         raise CliAdapterError("pull request number must be a positive integer")
+    return parsed
+
+
+def _validate_issue_number(number: int | str) -> int:
+    if isinstance(number, bool):
+        raise CliAdapterError("issue number must be a positive integer")
+    try:
+        parsed = int(number)
+    except (TypeError, ValueError) as exc:
+        raise CliAdapterError("issue number must be a positive integer") from exc
+    if parsed < 1 or str(number).strip() != str(parsed):
+        raise CliAdapterError("issue number must be a positive integer")
     return parsed
 
 

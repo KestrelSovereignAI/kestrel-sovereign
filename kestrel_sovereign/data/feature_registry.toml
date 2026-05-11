@@ -143,6 +143,8 @@ core = true
 cli_status = { description = "Show CLI adapter tool availability", category = "system", tags = ["cli", "tools"] }
 github_cli_auth_status = { description = "Check GitHub CLI authentication", category = "system", tags = ["github", "cli"] }
 github_pr_view = { description = "Inspect GitHub PR metadata, files, commits, head ref, and checks", category = "data_access", tags = ["github", "pull-request"] }
+github_issue_view = { description = "Inspect GitHub issue metadata, labels, assignees, state, and comments", category = "data_access", tags = ["github", "issue"] }
+github_issue_comments = { description = "Read comments for a GitHub issue", category = "data_access", tags = ["github", "issue", "comments"] }
 github_pr_diff = { description = "Read a GitHub PR unified diff", category = "data_access", tags = ["github", "pull-request", "diff"] }
 github_pr_files = { description = "List changed files for a GitHub PR", category = "data_access", tags = ["github", "pull-request", "files"] }
 github_pr_checks = { description = "Read check/status rollup for a GitHub PR", category = "data_access", tags = ["github", "pull-request", "checks"] }

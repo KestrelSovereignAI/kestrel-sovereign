@@ -171,6 +171,45 @@ class CliFeature(Feature):
         )
 
     @tool(
+        name="github_issue_view",
+        description="Inspect GitHub issue metadata, labels, assignees, state, and comments.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!gh-issue-view",
+    )
+    async def github_issue_view(self, repo: str, number: int) -> ToolResult:
+        try:
+            payload = await self.adapters["github"].get_issue(repo=repo, number=number)
+        except CliAdapterError as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read issue #{number} from {repo}.",
+            data=payload,
+        )
+
+    @tool(
+        name="github_issue_comments",
+        description="Read comments for a GitHub issue.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!gh-issue-comments",
+    )
+    async def github_issue_comments(self, repo: str, number: int) -> ToolResult:
+        try:
+            comments = await self.adapters["github"].list_issue_comments(
+                repo=repo,
+                number=number,
+            )
+        except CliAdapterError as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read {len(comments)} comment(s) for issue #{number} from {repo}.",
+            data={
+                "repo": repo,
+                "number": number,
+                "comments": comments,
+            },
+        )
+
+    @tool(
         name="github_pr_diff",
         description="Read a GitHub PR unified diff via `gh pr diff`.",
         category=ToolCategory.DATA_ACCESS,

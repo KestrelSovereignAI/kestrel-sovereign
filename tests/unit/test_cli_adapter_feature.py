@@ -99,6 +99,35 @@ async def test_github_pr_view_uses_registered_read_only_gh_command():
 
 
 @pytest.mark.asyncio
+async def test_github_issue_view_uses_registered_read_only_gh_command():
+    payload = {
+        "number": 885,
+        "title": "Hardcoded session id",
+        "state": "CLOSED",
+        "body": "token: ghp_abcdefghijklmnopqrstuvwxyz123456",
+        "comments": [{"body": "fixed"}],
+    }
+    terminal = FakeTerminal([_result(stdout=json.dumps(payload))])
+    adapter = GitHubCliAdapter(terminal)  # type: ignore[arg-type]
+
+    parsed = await adapter.get_issue(
+        repo="KestrelSovereignAI/kestrel-sovereign",
+        number=885,
+    )
+
+    assert parsed["number"] == payload["number"]
+    assert parsed["state"] == "CLOSED"
+    assert parsed["body"] == "token: [REDACTED]"
+    request = terminal.requests[0]
+    assert request.risk is CliRisk.READ_ONLY
+    assert request.command_id == "github.issue_view"
+    assert request.argv[:4] == ["gh", "issue", "view", "--repo"]
+    assert "--json" in request.argv
+    assert "comments" in request.argv[-1]
+    assert "closedAt" in request.argv[-1]
+
+
+@pytest.mark.asyncio
 async def test_terminal_execution_blocks_non_read_only_without_approval_callback():
     terminal = TerminalExecutionService()
 
@@ -438,6 +467,23 @@ async def test_github_pr_files_and_checks_project_pr_payload_lists():
 
 
 @pytest.mark.asyncio
+async def test_github_issue_comments_project_issue_payload_list():
+    payload = {
+        "number": 885,
+        "comments": [
+            {"author": {"login": "octo"}, "body": "linked to PR #900"},
+        ],
+    }
+    terminal = FakeTerminal([_result(stdout=json.dumps(payload))])
+    adapter = GitHubCliAdapter(terminal)  # type: ignore[arg-type]
+
+    comments = await adapter.list_issue_comments(repo="owner/repo", number=885)
+
+    assert comments == payload["comments"]
+    assert terminal.requests[0].command_id == "github.issue_view"
+
+
+@pytest.mark.asyncio
 async def test_github_read_file_at_ref_decodes_contents_response():
     encoded = base64.b64encode(b"hello sk-ant-api03-secretsecretsecret from branch").decode(
         "ascii"
@@ -610,6 +656,9 @@ async def test_github_pr_number_rejects_option_like_values():
     with pytest.raises(Exception, match="positive integer"):
         await adapter.get_pull_request(repo="owner/repo", number="--web")
 
+    with pytest.raises(Exception, match="positive integer"):
+        await adapter.get_issue(repo="owner/repo", number="--web")
+
 
 @pytest.mark.asyncio
 async def test_github_adapter_reports_nonzero_invalid_json_and_truncation():
@@ -678,6 +727,33 @@ async def test_cli_feature_exposes_status_and_github_pr_tool():
     assert status.data["adapters"]["github"]["commands"][0]["risk"] == "read_only"
     assert pr.status is ToolResultStatus.OK
     assert pr.data["headRefOid"] == "abc123"
+
+
+@pytest.mark.asyncio
+async def test_cli_feature_exposes_github_issue_tools():
+    issue_payload = {
+        "number": 885,
+        "title": "Hardcoded session id",
+        "state": "CLOSED",
+        "comments": [{"body": "fixed by broader restructure"}],
+    }
+    feature = CliFeature(Mock())
+    terminal = FakeTerminal(
+        [
+            _result(stdout=json.dumps(issue_payload)),
+            _result(stdout=json.dumps(issue_payload)),
+        ]
+    )
+    feature.terminal = terminal  # type: ignore[assignment]
+    feature.adapters = {"github": GitHubCliAdapter(terminal)}  # type: ignore[arg-type]
+
+    issue = await feature.github_issue_view(repo="owner/repo", number=885)
+    comments = await feature.github_issue_comments(repo="owner/repo", number=885)
+
+    assert issue.status is ToolResultStatus.OK
+    assert issue.data["title"] == "Hardcoded session id"
+    assert comments.status is ToolResultStatus.OK
+    assert comments.data["comments"] == issue_payload["comments"]
 
 
 @pytest.mark.asyncio
@@ -793,6 +869,18 @@ def test_cli_command_prefixes_parse_positional_args():
         "repo": "owner/repo",
         "number": "42",
     }
+    assert tools["github_issue_view"].parse_command_args(
+        "!gh-issue-view owner/repo 885"
+    ) == {
+        "repo": "owner/repo",
+        "number": "885",
+    }
+    assert tools["github_issue_comments"].parse_command_args(
+        "!gh-issue-comments owner/repo 885"
+    ) == {
+        "repo": "owner/repo",
+        "number": "885",
+    }
     assert tools["github_read_file_at_ref"].parse_command_args(
         "!gh-read-file owner/repo README.md main"
     ) == {
@@ -858,6 +946,8 @@ def test_cli_status_lists_pr_review_helper_commands():
         command.command_id for command in feature.adapters["github"].commands
     }
 
+    assert "github.issue_view" in github_commands
+    assert "github.issue_comments" in github_commands
     assert "github.pr_files" in github_commands
     assert "github.pr_checks" in github_commands
     assert "github.read_file_at_pr_head" in github_commands
