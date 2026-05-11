@@ -3216,6 +3216,131 @@ async def test_runner_ci_green_gate_accepts_required_checks(runner_components):
 
 
 @pytest.mark.asyncio
+async def test_runner_ci_green_gate_can_use_run_param_branch(runner_components):
+    c = runner_components
+    payloads: list[dict] = []
+    provider_calls: list[tuple[str, str]] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {"queued": True}
+
+    async def provider(gate, result):
+        provider_calls.append((gate.params["repo"], gate.params["branch"]))
+        return {
+            "check_runs": [
+                {
+                    "name": "unit-tests",
+                    "status": "completed",
+                    "conclusion": "success",
+                },
+            ],
+            "required_checks": ["unit-tests"],
+        }
+
+    c.runner.ci_green_provider = provider
+    c.registry.register(_action_source("ci.github", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="ci",
+                    signal_source="ci.github",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="ci_green",
+                        params={
+                            "repo": "KestrelSovereignAI/kestrel-sovereign",
+                            "branch": "feature-proposal-branch-required",
+                            "repo_param": "repository",
+                            "branch_param": "branch",
+                            "required_checks": ["unit-tests"],
+                        },
+                    ),
+                )
+            ],
+            params_schema={
+                "type": "object",
+                "required": ["repository", "branch"],
+                "properties": {
+                    "repository": {"type": "string", "minLength": 1},
+                    "branch": {"type": "string", "minLength": 1},
+                },
+            },
+        ),
+    )
+
+    result = await c.runner.run_to_completion(
+        name="release",
+        params={"repository": "ExampleOrg/example-repo", "branch": "codex/proposal"},
+    )
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads == [
+        {
+            "repo": "ExampleOrg/example-repo",
+            "repository": "ExampleOrg/example-repo",
+            "branch": "codex/proposal",
+            "repo_param": "repository",
+            "branch_param": "branch",
+            "required_checks": ["unit-tests"],
+        }
+    ]
+    assert provider_calls == [("ExampleOrg/example-repo", "codex/proposal")]
+
+
+@pytest.mark.asyncio
+async def test_runner_ci_green_gate_missing_run_param_fails_before_dispatch(
+    runner_components,
+):
+    c = runner_components
+    calls = 0
+
+    async def handler(payload):
+        nonlocal calls
+        calls += 1
+        return {"queued": True}
+
+    c.registry.register(_action_source("ci.github", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="ci",
+                    signal_source="ci.github",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="ci_green",
+                        params={
+                            "repo": "KestrelSovereignAI/kestrel-sovereign",
+                            "branch": "feature-proposal-branch-required",
+                            "branch_param": "branch",
+                            "required_checks": ["unit-tests"],
+                        },
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    links = await c.store.list_stage_links(result.run_id)
+
+    assert result.status == RunStatus.FAILED
+    assert calls == 0
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "ci_green_missing_run_param:branch"
+
+
+@pytest.mark.asyncio
 async def test_runner_ci_green_gate_fails_missing_required_check(
     runner_components,
 ):
