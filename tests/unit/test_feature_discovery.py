@@ -7,6 +7,7 @@ import os
 from unittest.mock import Mock, patch, MagicMock
 from kestrel_sovereign.features import (
     discover_features,
+    discover_feature_class_by_name,
     discover_feature_modules,
     discover_entrypoint_feature_classes,
     get_disabled_features,
@@ -73,6 +74,13 @@ class TestDiscoverFeatureModules:
         
         assert found_mcp or found_model or found_sovereignty, \
             f"Expected to find known features. Found: {modules}"
+
+    def test_resolves_feature_class_by_shorthand(self):
+        """Runtime lifecycle tools can resolve installed features by shorthand."""
+        feature_class = discover_feature_class_by_name("bootstrap")
+
+        assert feature_class is not None
+        assert feature_class.__name__ == "BootstrapFeature"
 
 
 class TestDiscoverFeatures:

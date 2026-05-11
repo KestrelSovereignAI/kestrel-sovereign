@@ -1342,14 +1342,21 @@ class KestrelAgent(
                 feature.set_task_manager(self.task_manager)
 
     async def _disable_feature(self, feature_name: str):
-        """Disable a feature: call on_disable, unregister its hooks, remove from features dict."""
-        feature = self.features.get(feature_name)
+        """Disable a feature and remove its runtime registrations."""
+        feature = self.get_feature(feature_name)
         if not feature:
             logging.warning(f"Cannot disable unknown feature: {feature_name}")
             return
 
+        feature_key = next(
+            (key for key, value in self.features.items() if value is feature),
+            feature.name,
+        )
+        feature_tool_name = getattr(feature, "tool_name", feature_key)
+
         # Call on_disable lifecycle hook
         await feature.on_disable()
+        await feature.shutdown()
 
         # Auto-unregister hooks from get_hooks()
         if self.hooks_manager:
@@ -1357,7 +1364,38 @@ class KestrelAgent(
                 self.hooks_manager.unregister(hook)
                 logging.info(f"Auto-unregistered hook '{hook.name}' from feature '{feature_name}'")
 
-        logging.info(f"Feature '{feature_name}' disabled")
+        if self.task_manager:
+            try:
+                self.task_manager.unregister_agent(feature.get_agent_card().name)
+            except Exception as exc:
+                logging.warning(
+                    "Failed to unregister feature '%s' from task manager: %s",
+                    feature_key,
+                    exc,
+                )
+
+        self.features.pop(feature_key, None)
+        self._explored_features.pop(feature_tool_name, None)
+        to_remove = [
+            name for name, owner in self._tool_to_feature.items()
+            if owner == feature_tool_name
+        ]
+        for name in to_remove:
+            self._direct_tools.pop(name, None)
+            self._tool_to_feature.pop(name, None)
+        self._direct_tool_defs = [
+            tool_def for tool_def in self._direct_tool_defs
+            if tool_def.get("function", {}).get("name") not in to_remove
+        ]
+        if isinstance(getattr(self, "_tool_context_hidden_features", None), set):
+            self._tool_context_hidden_features.discard(feature_tool_name)
+            self._tool_context_hidden_features.discard(feature_key)
+            self._tool_context_hidden_features.discard(feature.__class__.__name__)
+        if isinstance(getattr(self, "_tool_context_hidden_tools", None), set):
+            self._tool_context_hidden_tools.difference_update(to_remove)
+        self._cached_features_prompt = self._build_features_prompt_section()
+
+        logging.info(f"Feature '{feature_key}' disabled and removed")
 
     # Solvency State
     _current_model_preference: Optional[str] = None

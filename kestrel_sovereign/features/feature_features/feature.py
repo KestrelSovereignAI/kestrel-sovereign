@@ -7,12 +7,15 @@ import json
 from typing import Any
 
 from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.features.base import Feature as SDKBaseFeature
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.features import (
     discover_entrypoint_feature_classes,
+    discover_feature_class_by_name,
     discover_feature_modules,
     find_feature_class,
+    get_disabled_features,
 )
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.feature_features.workflows import (
@@ -247,6 +250,142 @@ class FeatureFeaturesFeature(Feature):
         setattr(self.agent, "_tool_context_hidden_tools", hidden_tools)
         _refresh_cached_features_prompt(self.agent)
         return await self.feature_context_status()
+
+    @tool(
+        name="feature_add",
+        description="Load an installed/discoverable feature into this agent runtime.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-add",
+    )
+    async def feature_add(
+        self,
+        feature: str,
+        pre_explore: bool = False,
+    ) -> ToolResult:
+        """Load an installed feature class into the active agent.
+
+        Args:
+            feature: Feature class, module, or shorthand name.
+            pre_explore: Promote the feature's direct tools immediately.
+        """
+
+        feature_name = str(feature).strip()
+        if not feature_name:
+            return ToolResult.failed("feature is required.")
+        pre_explore_requested = _coerce_bool(pre_explore)
+        if pre_explore_requested is None:
+            return ToolResult.failed("pre_explore must be a boolean.")
+
+        existing = _resolve_loaded_feature(self.agent, feature_name)
+        if existing is not None:
+            return ToolResult.ok(
+                f"Feature {existing.name} is already loaded.",
+                data={"feature": _loaded_feature_row(self.agent, existing)},
+            )
+
+        feature_class = discover_feature_class_by_name(feature_name)
+        if feature_class is None:
+            return ToolResult.failed(f"No discoverable feature matches {feature_name!r}.")
+        if feature_class.__name__ in get_disabled_features():
+            return ToolResult.failed(
+                f"Feature {feature_class.__name__} is disabled by configuration."
+            )
+        allowed_features = getattr(self.agent, "_allowed_features", None)
+        if allowed_features is not None:
+            from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+            if (
+                feature_class.__name__ not in set(allowed_features)
+                and feature_class.__name__ not in MANDATORY_FEATURES
+            ):
+                return ToolResult.failed(
+                    f"Feature {feature_class.__name__} is not allowed by this agent profile."
+                )
+
+        instance = None
+        try:
+            instance = feature_class(self.agent)
+            if _has_runtime_router(instance):
+                return ToolResult.failed(
+                    f"Feature {feature_class.__name__} exposes HTTP routes and "
+                    "cannot be added at runtime yet."
+                )
+            register_feature = getattr(self.agent, "_register_feature", None)
+            if callable(register_feature):
+                await register_feature(instance)
+            else:
+                await _register_feature_fallback(self.agent, instance)
+            await _notify_features_loaded(self.agent)
+            if pre_explore_requested:
+                register_direct_tools = getattr(
+                    self.agent, "_register_explored_feature_tools", None
+                )
+                if callable(register_direct_tools):
+                    register_direct_tools(instance)
+            _refresh_cached_features_prompt(self.agent)
+        except Exception as exc:
+            if instance is not None:
+                try:
+                    await _rollback_runtime_feature(self.agent, instance)
+                except Exception as rollback_exc:
+                    return ToolResult.failed(
+                        f"Failed to load feature {feature_class.__name__}: {exc}; "
+                        f"rollback also failed: {rollback_exc}"
+                    )
+            return ToolResult.failed(
+                f"Failed to load feature {feature_class.__name__}: {exc}"
+            )
+
+        return ToolResult.ok(
+            f"Loaded feature {feature_class.__name__}.",
+            data={"feature": _loaded_feature_row(self.agent, instance)},
+        )
+
+    @tool(
+        name="feature_remove",
+        description="Unload a non-mandatory feature from this agent runtime.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-remove",
+    )
+    async def feature_remove(self, feature: str) -> ToolResult:
+        """Unload a runtime feature and remove its promoted direct tools.
+
+        Args:
+            feature: Feature class, dispatcher tool, registry key, or shorthand name.
+        """
+
+        feature_name = str(feature).strip()
+        if not feature_name:
+            return ToolResult.failed("feature is required.")
+        loaded = _resolve_loaded_feature(self.agent, feature_name)
+        if loaded is None:
+            return ToolResult.failed(f"Feature {feature_name!r} is not loaded.")
+
+        from kestrel_sovereign.multi_agent.config import MANDATORY_FEATURES
+
+        if loaded.__class__.__name__ in MANDATORY_FEATURES:
+            return ToolResult.failed(
+                f"Feature {loaded.__class__.__name__} is mandatory and cannot be removed."
+            )
+        if loaded.__class__.__name__ == "FeatureFeaturesFeature":
+            return ToolResult.failed("FeatureFeaturesFeature cannot remove itself.")
+        if _has_runtime_router(loaded):
+            return ToolResult.failed(
+                f"Feature {loaded.__class__.__name__} exposes HTTP routes and "
+                "cannot be removed at runtime yet."
+            )
+
+        disable_feature = getattr(self.agent, "_disable_feature", None)
+        if callable(disable_feature):
+            await disable_feature(loaded.name)
+        else:
+            await _disable_feature_fallback(self.agent, loaded)
+        _refresh_cached_features_prompt(self.agent)
+
+        return ToolResult.ok(
+            f"Removed feature {loaded.__class__.__name__}.",
+            data={"removed": loaded.__class__.__name__},
+        )
 
     @tool(
         name="feature_feature_workflows",
@@ -534,6 +673,80 @@ def _loaded_feature_inventory(agent: Any) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _loaded_feature_row(agent: Any, feature: Any) -> dict[str, Any]:
+    for row in _loaded_feature_inventory(agent):
+        if row["class"] == feature.__class__.__name__:
+            return row
+    return {
+        "registry_key": getattr(feature, "name", feature.__class__.__name__),
+        "class": feature.__class__.__name__,
+        "tool_name": getattr(feature, "tool_name", None),
+        "module": feature.__class__.__module__,
+        "tool_count": 0,
+        "visible_in_context": True,
+        "tools": [],
+    }
+
+
+def _resolve_loaded_feature(agent: Any, name: str) -> Any | None:
+    target = _normalize_lookup(name)
+    if not target:
+        return None
+    for key, feature in _agent_features(agent).items():
+        aliases = {
+            _normalize_lookup(key),
+            _normalize_lookup(getattr(feature, "name", "")),
+            _normalize_lookup(feature.__class__.__name__),
+            _normalize_lookup(feature.__class__.__name__.removesuffix("Feature")),
+            _normalize_lookup(getattr(feature, "tool_name", "")),
+        }
+        if target in aliases:
+            return feature
+    return None
+
+
+async def _register_feature_fallback(agent: Any, feature: Any) -> None:
+    await feature.initialize()
+    if not isinstance(getattr(agent, "features", None), dict):
+        setattr(agent, "features", {})
+    _agent_features(agent)[feature.name] = feature
+    await feature.on_enable()
+
+
+async def _disable_feature_fallback(agent: Any, feature: Any) -> None:
+    await feature.on_disable()
+    await feature.shutdown()
+    features = _agent_features(agent)
+    for key, value in list(features.items()):
+        if value is feature:
+            del features[key]
+
+
+async def _rollback_runtime_feature(agent: Any, feature: Any) -> None:
+    if feature not in _agent_features(agent).values():
+        return
+    disable_feature = getattr(agent, "_disable_feature", None)
+    if callable(disable_feature):
+        await disable_feature(getattr(feature, "name", feature.__class__.__name__))
+    else:
+        await _disable_feature_fallback(agent, feature)
+    _refresh_cached_features_prompt(agent)
+
+
+def _has_runtime_router(feature: Any) -> bool:
+    get_router = getattr(feature.__class__, "get_router", None)
+    return get_router not in (Feature.get_router, SDKBaseFeature.get_router, None)
+
+
+async def _notify_features_loaded(agent: Any) -> None:
+    for feature in list(_agent_features(agent).values()):
+        await feature.post_all_features_loaded(agent)
+
+
+def _normalize_lookup(name: Any) -> str:
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
 
 
 def _direct_tool_inventory(agent: Any) -> list[dict[str, Any]]:
