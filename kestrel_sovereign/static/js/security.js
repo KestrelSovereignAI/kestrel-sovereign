@@ -163,7 +163,9 @@ export const Security = {
                 // resolver flagged this with ``_withdrawn: true``. #877.
                 if (!decision._withdrawn) {
                     try {
-                        await this.submitApproval(data.id, decision.approved, decision.scope);
+                        await this.submitApproval(data.id, decision.approved, decision.scope, {
+                            suppressToast: decision.suppressToast
+                        });
                     } catch (err) {
                         console.error('Failed to submit approval:', err);
                     }
@@ -270,7 +272,11 @@ export const Security = {
                                 const response = await this.setGlobalAutoMode(true);
                                 Modal.hide();
                                 Toast.warning(response.warning);
-                                wrappedResolve({ approved: true, scope: 'once' });
+                                wrappedResolve({
+                                    approved: true,
+                                    scope: 'once',
+                                    suppressToast: true
+                                });
                             } catch (error) {
                                 console.error('Failed to enable Auto mode from approval modal:', error);
                                 Toast.error('Failed to enable Auto mode');
@@ -283,7 +289,7 @@ export const Security = {
         });
     },
 
-    async submitApproval(approvalId, approved, scope) {
+    async submitApproval(approvalId, approved, scope, options = {}) {
         try {
             const response = await API.request('/api/security/approve', {
                 method: 'POST',
@@ -294,7 +300,7 @@ export const Security = {
                 })
             });
 
-            if (response.success) {
+            if (response.success && !options.suppressToast) {
                 Toast.success(approved
                     ? `Approved (${scope})`
                     : 'Denied'
@@ -770,10 +776,11 @@ export const Security = {
         });
     },
 
-    async toggleGlobalAutoMode() {
+    async toggleGlobalAutoMode(options = {}) {
         try {
             const nextEnabled = !this.globalAutoMode;
-            if (nextEnabled) {
+            const confirmEnable = options.confirmEnable !== false;
+            if (nextEnabled && confirmEnable) {
                 const confirmed = await new Promise((resolve) => {
                     Modal.show({
                         title: 'Enable Global Auto Mode',
