@@ -458,6 +458,57 @@ async def test_runner_persists_feature_feature_talon_jobs_for_implementation(
 
 
 @pytest.mark.asyncio
+async def test_runner_persists_feature_feature_ci_publish_head_for_publish(
+    runner_components,
+):
+    c = runner_components
+    publish_payloads: list[dict] = []
+
+    async def ci_green(payload):
+        return {
+            "status": "ok",
+            "publish_pr_number": 17,
+            "publish_pr_head_sha": "head-abc",
+            "publish_pr_url": "https://github.example/pr/17",
+        }
+
+    async def publish(payload):
+        publish_payloads.append(payload)
+        return {"status": "ok"}
+
+    c.registry.register(_action_source("feature_features.ci_green", ci_green))
+    c.registry.register(_action_source("feature_features.publish", publish))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="feature-flow",
+            version=1,
+            stages=[
+                _stage("ci_green", "feature_features.ci_green"),
+                _stage("publish", "feature_features.publish"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="ci_green",
+                    to_stage="publish",
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="feature-flow")
+
+    assert result.status == RunStatus.COMPLETED
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.params["publish_pr_number"] == 17
+    assert run.params["publish_pr_head_sha"] == "head-abc"
+    assert publish_payloads[0]["publish_pr_head_sha"] == "head-abc"
+    assert publish_payloads[0]["publish_pr_url"] == "https://github.example/pr/17"
+
+
+@pytest.mark.asyncio
 async def test_runner_rejects_noop_idempotent_after_read_only_write(
     runner_components,
 ):

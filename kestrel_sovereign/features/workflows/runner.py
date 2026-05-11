@@ -3736,6 +3736,8 @@ def _stage_output_run_params(stage: Stage, result: Any) -> dict[str, Any]:
         return {}
     if stage.signal_source == "feature_features.assign_talon_chunks":
         return _feature_feature_talon_output_params(action_result)
+    if stage.signal_source == "feature_features.ci_green":
+        return _feature_feature_ci_output_params(action_result)
     if stage.signal_source != "feature_features.file_github_epic":
         return {}
     output: dict[str, Any] = {}
@@ -3775,6 +3777,18 @@ def _feature_feature_talon_output_params(
         ]
         if clean_issues:
             output["talon_issue_numbers"] = clean_issues
+    return output
+
+
+def _feature_feature_ci_output_params(action_result: Mapping[str, Any]) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    pr_number = action_result.get("publish_pr_number")
+    if isinstance(pr_number, int) and not isinstance(pr_number, bool):
+        output["publish_pr_number"] = pr_number
+    for key in ("publish_pr_head_sha", "publish_pr_url"):
+        value = action_result.get(key)
+        if isinstance(value, str) and value.strip():
+            output[key] = value.strip()
     return output
 
 

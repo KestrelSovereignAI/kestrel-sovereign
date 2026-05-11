@@ -11,6 +11,7 @@ import os
 import shlex
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.features.base import Feature as SDKBaseFeature
@@ -143,6 +144,17 @@ class FeatureFeaturesFeature(Feature):
             setattr(
                 self.agent,
                 "feature_feature_ci_green_requires_ci_token",
+                True,
+            )
+        if getattr(self.agent, "feature_feature_publish", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_publish",
+                self._feature_feature_publish,
+            )
+            setattr(
+                self.agent,
+                "feature_feature_publish_requires_github_token",
                 True,
             )
         if getattr(self.agent, "feature_feature_audit_anchor", None) is None:
@@ -394,10 +406,88 @@ class FeatureFeaturesFeature(Feature):
     ) -> dict[str, Any]:
         """Acknowledge the ci_green stage before the runner polls GitHub checks."""
 
-        return {
+        result: dict[str, Any] = {
             "status": "ok",
             "repository": _payload_string(payload, "repository"),
             "branch": _payload_string(payload, "branch"),
+            "workflow_run_id": _payload_string(payload, "workflow_run_id"),
+            "workflow_stage_name": _payload_string(payload, "workflow_stage_name"),
+        }
+        repository = result["repository"]
+        branch = result["branch"]
+        token = _github_token()
+        if repository is not None and branch is not None and token:
+            pull_request = await _github_find_open_pull_request_for_branch(
+                repository,
+                branch,
+                token,
+            )
+            pr_number = pull_request.get("number")
+            head = pull_request.get("head")
+            head_sha = head.get("sha") if isinstance(head, dict) else None
+            if _is_strict_positive_int(pr_number):
+                result["publish_pr_number"] = pr_number
+            if isinstance(head_sha, str) and head_sha.strip():
+                result["publish_pr_head_sha"] = head_sha.strip()
+            if isinstance(pull_request.get("html_url"), str):
+                result["publish_pr_url"] = pull_request["html_url"]
+        return result
+
+    async def _feature_feature_publish(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Merge the approved FeatureFeature pull request."""
+
+        repository = _payload_string(payload, "repository")
+        branch = _payload_string(payload, "branch")
+        if repository is None or "/" not in repository:
+            raise RuntimeError("repository must be owner/repo")
+        if branch is None:
+            raise RuntimeError("branch is required to publish FeatureFeature")
+        token = _github_token()
+        if not token:
+            raise RuntimeError("GITHUB_TOKEN or .env GITHUB_TOKEN is required")
+
+        expected_pr_number = _publish_expected_pr_number(payload)
+        pull_request = await _github_find_open_pull_request_for_branch(
+            repository,
+            branch,
+            token,
+        )
+        pr_number = pull_request.get("number")
+        if not _is_strict_positive_int(pr_number):
+            raise RuntimeError(
+                f"GitHub pull request response missing number for {repository}:{branch}"
+            )
+        if pr_number != expected_pr_number:
+            raise RuntimeError(
+                "publish_pr_number does not match open pull request "
+                f"for {repository}:{branch}"
+            )
+        expected_sha = _publish_expected_sha(payload)
+        merge_result = await _github_merge_pull_request(
+            repository,
+            pr_number,
+            token,
+            _publish_merge_body(payload, expected_sha=expected_sha),
+        )
+        if not isinstance(merge_result, dict) or merge_result.get("merged") is not True:
+            message = (
+                merge_result.get("message")
+                if isinstance(merge_result, dict)
+                else None
+            )
+            raise RuntimeError(message or f"failed to merge {repository}#{pr_number}")
+
+        return {
+            "status": "ok",
+            "repository": repository,
+            "branch": branch,
+            "pull_request_number": pr_number,
+            "pull_request_url": pull_request.get("html_url"),
+            "merge_sha": merge_result.get("sha"),
+            "merged": True,
             "workflow_run_id": _payload_string(payload, "workflow_run_id"),
             "workflow_stage_name": _payload_string(payload, "workflow_stage_name"),
         }
@@ -2486,6 +2576,117 @@ async def _github_create_issue(
     )
 
     return await github_api_post(f"/repos/{repository}/issues", token, body)
+
+
+async def _github_find_open_pull_request_for_branch(
+    repository: str,
+    branch: str,
+    token: str,
+) -> dict[str, Any]:
+    from kestrel_sovereign.features.strategic_memory.github_integration import (
+        github_api_get,
+    )
+
+    owner = repository.split("/", 1)[0]
+    head = quote(f"{owner}:{branch}", safe="")
+    pulls = await github_api_get(
+        f"/repos/{repository}/pulls?state=open&head={head}",
+        token,
+    )
+    if not isinstance(pulls, list):
+        raise RuntimeError(f"failed to list open pull requests for {repository}:{branch}")
+    if not pulls:
+        raise RuntimeError(f"no open pull request found for {repository}:{branch}")
+    if len(pulls) > 1:
+        raise RuntimeError(
+            f"multiple open pull requests found for {repository}:{branch}"
+        )
+    pull_request = pulls[0]
+    if not isinstance(pull_request, dict):
+        raise RuntimeError(
+            f"GitHub pull request response malformed for {repository}:{branch}"
+        )
+    return pull_request
+
+
+async def _github_merge_pull_request(
+    repository: str,
+    pr_number: int,
+    token: str,
+    body: dict[str, Any],
+) -> Any:
+    import urllib.error
+    import urllib.request
+
+    url = f"https://api.github.com/repos/{repository}/pulls/{pr_number}/merge"
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "Content-Type": "application/json",
+            "User-Agent": "kestrel-agent",
+        },
+    )
+    try:
+        resp = await asyncio.to_thread(
+            lambda: urllib.request.urlopen(req, timeout=10).read()
+        )
+        return json.loads(resp)
+    except urllib.error.HTTPError as exc:
+        body_text = await asyncio.to_thread(exc.read)
+        try:
+            return json.loads(body_text)
+        except json.JSONDecodeError:
+            return {"message": body_text.decode(errors="replace")}
+    except (urllib.error.URLError, Exception) as exc:
+        return {"message": str(exc)}
+
+
+def _publish_expected_sha(payload: dict[str, Any]) -> str:
+    expected_sha = _payload_string(payload, "publish_pr_head_sha")
+    if expected_sha is None:
+        expected_sha = _payload_string(payload, "head_sha")
+    if expected_sha is None:
+        raise RuntimeError(
+            "publish_pr_head_sha is required to publish FeatureFeature"
+        )
+    return expected_sha
+
+
+def _publish_expected_pr_number(payload: dict[str, Any]) -> int:
+    pr_number = _payload_positive_int(payload, "publish_pr_number")
+    if pr_number is None:
+        pr_number = _payload_positive_int(payload, "pull_request_number")
+    if pr_number is None:
+        raise RuntimeError(
+            "publish_pr_number is required to publish FeatureFeature"
+        )
+    return pr_number
+
+
+def _publish_merge_body(
+    payload: dict[str, Any],
+    *,
+    expected_sha: str,
+) -> dict[str, Any]:
+    method = _payload_string(payload, "merge_method") or _payload_string(
+        payload,
+        "publish_merge_method",
+    )
+    if method not in {"merge", "squash", "rebase"}:
+        method = "merge"
+    body: dict[str, Any] = {"merge_method": method, "sha": expected_sha}
+    commit_title = _payload_string(payload, "merge_commit_title")
+    commit_message = _payload_string(payload, "merge_commit_message")
+    if commit_title is not None:
+        body["commit_title"] = commit_title
+    if commit_message is not None:
+        body["commit_message"] = commit_message
+    return body
 
 
 def _resolve_provider_name(agent: Any, source: str) -> str | None:
