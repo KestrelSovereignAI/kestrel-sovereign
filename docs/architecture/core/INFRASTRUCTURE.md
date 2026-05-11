@@ -47,21 +47,6 @@ Workflow automation:
 | `/privacy-test` | Test all 5 privacy modes |
 | `/merge-features` | Integrate feature branches safely |
 
-### 🎯 Skills (`.claude/skills/`)
-
-Auto-detection triggers:
-
-| Skill | Triggers On | Delegates To |
-|-------|-------------|--------------|
-| **llm-refactoring** | LLM service work | llm-service-specialist |
-| **constitution-work** | Constitution/DID work | constitution-verifier |
-| **privacy-implementation** | Privacy mode work | privacy-architect |
-
-**How it works:**
-- Skills automatically detect when you're working on specific areas
-- They suggest the appropriate subagent
-- They provide quick reference guidance
-
 ## Parallel Development Workflow
 
 ### 1. Setup Phase
@@ -127,13 +112,6 @@ Safely merges all feature branches with:
 
 ### LLM Service Work
 
-**Auto-detection:**
-```
-"Let's add streaming support to the LLM service"
-# → llm-refactoring skill activates
-# → Suggests llm-service-specialist subagent
-```
-
 **Manual:**
 ```
 "Use the llm-service-specialist subagent to implement structured output"
@@ -144,13 +122,6 @@ Safely merges all feature branches with:
 - Test: Parameterized tests with real providers
 
 ### Constitution Work
-
-**Auto-detection:**
-```
-"Need to verify the inception service stores the constitution"
-# → constitution-work skill activates
-# → Suggests constitution-verifier subagent
-```
 
 **Manual:**
 ```
@@ -165,13 +136,6 @@ Safely merges all feature branches with:
 - DID format valid ✓
 
 ### Privacy Work
-
-**Auto-detection:**
-```
-"Let's implement the EPHEMERAL privacy mode"
-# → privacy-implementation skill activates
-# → Suggests privacy-architect subagent
-```
 
 **Manual:**
 ```
@@ -222,12 +186,6 @@ Safely merges all feature branches with:
 - **Documented**: Usage examples provided
 - **Chained**: Can be combined in workflows
 
-### Skill Design
-- **Lightweight**: <2KB, quick reference only
-- **Triggerable**: Clear keywords in description
-- **Delegating**: Points to appropriate subagent
-- **Referenced**: Links to detailed docs
-
 ## Integration with Existing Tools
 
 ### Git Worktrees
@@ -275,11 +233,6 @@ Safely merges all feature branches with:
 - Use explicit invocation: "Use the [agent-name] subagent to..."
 - Check worktree exists and is on correct branch
 
-**Skill not triggering?**
-- Skills auto-trigger based on keywords
-- Use them for suggestions, not required for workflow
-- Can always invoke subagents directly
-
 **Tests failing?**
 - Each subagent reports its test results
 - Use pytest -x for fail-fast debugging
@@ -306,10 +259,6 @@ kestrel/
 │   │   ├── constitution-check.md         (NEW)
 │   │   ├── privacy-test.md               (NEW)
 │   │   └── worktree-create.md            (NEW)
-│   └── skills/
-│       ├── llm-refactoring/SKILL.md      (NEW)
-│       ├── constitution-work/SKILL.md    (NEW)
-│       └── privacy-implementation/SKILL.md (NEW)
 ├── INFRASTRUCTURE.md                      (THIS FILE)
 └── AGENTS.md                              (REFERENCE DOC)
 ```
