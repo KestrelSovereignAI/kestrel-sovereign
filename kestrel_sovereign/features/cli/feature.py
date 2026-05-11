@@ -9,7 +9,7 @@ from kestrel_sdk.tools.result import ToolResult
 
 from kestrel_sovereign.features.base import Feature, tool
 
-from .adapters import CliAdapterError, GitHubCliAdapter
+from .adapters import CliAdapterError, GitCliAdapter, GitHubCliAdapter
 from .terminal import CliRisk, TerminalExecutionService
 
 
@@ -23,6 +23,7 @@ class CliFeature(Feature):
         self.terminal = TerminalExecutionService()
         self.adapters = {
             "github": GitHubCliAdapter(self.terminal),
+            "git": GitCliAdapter(self.terminal),
         }
 
     @property
@@ -240,6 +241,116 @@ class CliFeature(Feature):
         return ToolResult.ok(
             f"Built review context for PR #{number} from {repo}.",
             data=context,
+        )
+
+    @tool(
+        name="git_status",
+        description="Read local repository status via `git status --short --branch`.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!git-status",
+    )
+    async def git_status(self, repo_path: str = ".") -> ToolResult:
+        try:
+            payload = await self.adapters["git"].status(repo_path=repo_path)
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read git status for {payload['repo_path']}.",
+            data=payload,
+        )
+
+    @tool(
+        name="git_diff",
+        description="Read local repository diff via `git diff`.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!git-diff",
+    )
+    async def git_diff(
+        self,
+        ref: str = "",
+        path: str = "",
+        repo_path: str = ".",
+    ) -> ToolResult:
+        try:
+            payload = await self.adapters["git"].diff(
+                repo_path=repo_path,
+                ref=ref,
+                path=path,
+            )
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read git diff for {payload['repo_path']}.",
+            data=payload,
+        )
+
+    @tool(
+        name="git_log",
+        description="Read recent local repository commits via `git log`.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!git-log",
+    )
+    async def git_log(self, max_count: int = 20, repo_path: str = ".") -> ToolResult:
+        try:
+            payload = await self.adapters["git"].log(
+                repo_path=repo_path,
+                max_count=max_count,
+            )
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read git log for {payload['repo_path']}.",
+            data=payload,
+        )
+
+    @tool(
+        name="git_show_file",
+        description="Read a local repository file from a git ref via `git show`.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!git-show-file",
+    )
+    async def git_show_file(
+        self,
+        ref: str,
+        path: str,
+        repo_path: str = ".",
+    ) -> ToolResult:
+        try:
+            payload = await self.adapters["git"].show_file(
+                repo_path=repo_path,
+                ref=ref,
+                path=path,
+            )
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read {path} at {ref} from {payload['repo_path']}.",
+            data=payload,
+        )
+
+    @tool(
+        name="git_merge_base",
+        description="Read the merge-base for two local git refs.",
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!git-merge-base",
+    )
+    async def git_merge_base(
+        self,
+        left_ref: str,
+        right_ref: str,
+        repo_path: str = ".",
+    ) -> ToolResult:
+        try:
+            payload = await self.adapters["git"].merge_base(
+                repo_path=repo_path,
+                left_ref=left_ref,
+                right_ref=right_ref,
+            )
+        except (CliAdapterError, ValueError) as exc:
+            return ToolResult.failed(error=str(exc))
+        return ToolResult.ok(
+            f"Read git merge-base for {payload['repo_path']}.",
+            data=payload,
         )
 
 

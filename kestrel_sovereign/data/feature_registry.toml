@@ -135,7 +135,7 @@ package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["CliFeature"]
 description = "Registered feature-owned CLI workflows using installed tools and existing user authentication"
-tags = ["core", "cli", "tools", "github"]
+tags = ["core", "cli", "tools", "github", "git"]
 icon = "terminal"
 core = true
 
@@ -149,6 +149,11 @@ github_pr_checks = { description = "Read check/status rollup for a GitHub PR", c
 github_read_file_at_ref = { description = "Read a GitHub repository file at a branch, tag, or commit ref", category = "data_access", tags = ["github", "ref"] }
 github_read_file_at_pr_head = { description = "Read a GitHub repository file at a PR head commit", category = "data_access", tags = ["github", "pull-request", "ref"] }
 github_pr_review_context = { description = "Build GitHub PR review context with metadata, files, checks, and diff", category = "data_access", tags = ["github", "pull-request", "review"] }
+git_status = { description = "Read local repository status", category = "data_access", tags = ["git", "local"] }
+git_diff = { description = "Read local repository diff", category = "data_access", tags = ["git", "local", "diff"] }
+git_log = { description = "Read recent local repository commits", category = "data_access", tags = ["git", "local", "history"] }
+git_show_file = { description = "Read a local repository file from a git ref", category = "data_access", tags = ["git", "local", "ref"] }
+git_merge_base = { description = "Read the merge-base for two local git refs", category = "data_access", tags = ["git", "local", "ref"] }
 
 [tasks]
 package = "kestrel-sovereign"

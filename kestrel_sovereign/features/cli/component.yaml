@@ -13,6 +13,11 @@ tools:
   - github_read_file_at_ref
   - github_read_file_at_pr_head
   - github_pr_review_context
+  - git_status
+  - git_diff
+  - git_log
+  - git_show_file
+  - git_merge_base
 
 files:
   - feature.py
