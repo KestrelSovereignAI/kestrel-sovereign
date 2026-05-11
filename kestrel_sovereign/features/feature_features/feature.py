@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from typing import Any
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -59,11 +60,13 @@ class FeatureFeaturesFeature(Feature):
     async def feature_explore(
         self,
         include_entrypoints: bool = False,
+        include_loaded_tools: bool = False,
     ) -> ToolResult:
         """List installed core features and optionally entry-point features.
 
         Args:
             include_entrypoints: Include installed package entry points.
+            include_loaded_tools: Include active runtime features and tool metadata.
         """
 
         core = _core_feature_inventory()
@@ -75,17 +78,175 @@ class FeatureFeaturesFeature(Feature):
                     discover_entrypoint_feature_classes().items()
                 )
             ]
+        loaded_features = []
+        if include_loaded_tools:
+            loaded_features = _loaded_feature_inventory(self.agent)
         return ToolResult.ok(
             f"Discovered {len(core)} core feature module(s).",
             data={
                 "core_features": core,
                 "entrypoint_features": entrypoints,
+                "loaded_features": loaded_features,
                 "counts": {
                     "core": len(core),
                     "entrypoints": len(entrypoints),
+                    "loaded": len(loaded_features),
                 },
             },
         )
+
+    @tool(
+        name="feature_context_status",
+        description="Show which feature and direct tools are visible to the LLM.",
+        category=ToolCategory.UTILITY,
+        command_prefix="!feature-context-status",
+    )
+    async def feature_context_status(self) -> ToolResult:
+        """Report the current context-visibility profile."""
+
+        profile = _context_profile(self.agent)
+        loaded_features = _loaded_feature_inventory(self.agent)
+        direct_tools = _direct_tool_inventory(self.agent)
+        visible_features = [
+            row for row in loaded_features if row["visible_in_context"]
+        ]
+        visible_direct_tools = [
+            row for row in direct_tools if row["visible_in_context"]
+        ]
+        return ToolResult.ok(
+            (
+                f"{len(visible_features)} feature dispatcher(s) and "
+                f"{len(visible_direct_tools)} direct tool(s) visible."
+            ),
+            data={
+                "profile": profile,
+                "features": loaded_features,
+                "direct_tools": direct_tools,
+                "counts": {
+                    "visible_features": len(visible_features),
+                    "hidden_features": len(loaded_features) - len(visible_features),
+                    "visible_direct_tools": len(visible_direct_tools),
+                    "hidden_direct_tools": len(direct_tools)
+                    - len(visible_direct_tools),
+                },
+            },
+        )
+
+    @tool(
+        name="feature_focus",
+        description=(
+            "Persistently focus LLM context on selected features/tools without changing permissions."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-focus",
+    )
+    async def feature_focus(
+        self,
+        features: list[str] | None = None,
+        tools: list[str] | None = None,
+    ) -> ToolResult:
+        """Hide non-selected feature dispatchers/direct tools until reset.
+
+        Args:
+            features: Feature class names or dispatcher tool names to keep visible.
+            tools: Direct tool names to keep visible.
+        """
+
+        keep_features = _clean_name_set(features)
+        keep_tools = _clean_name_set(tools)
+        if not keep_features and not keep_tools:
+            return ToolResult.failed("Provide at least one feature or tool to focus.")
+
+        _ensure_context_profile(self.agent)
+        loaded_features = _loaded_feature_inventory(self.agent)
+        direct_tools = _direct_tool_inventory(self.agent)
+        control_features = _control_feature_names(self.agent)
+        selected_tool_features = {
+            row["feature_tool_name"]
+            for row in direct_tools
+            if row["name"] in keep_tools and row["feature_tool_name"] is not None
+        }
+
+        hidden_features = {
+            row["tool_name"]
+            for row in loaded_features
+            if row["tool_name"] not in control_features
+            and row["class"] not in keep_features
+            and row["tool_name"] not in keep_features
+            and row["tool_name"] not in selected_tool_features
+        }
+        if keep_features:
+            hidden_tools = {
+                row["name"]
+                for row in direct_tools
+                if row["feature_tool_name"] not in keep_features
+                and row["feature_class"] not in keep_features
+                and row["name"] not in keep_tools
+                and row["feature_tool_name"] not in control_features
+            }
+        else:
+            hidden_tools = {
+                row["name"]
+                for row in direct_tools
+                if row["name"] not in keep_tools
+                and row["feature_tool_name"] not in control_features
+            }
+
+        setattr(self.agent, "_tool_context_hidden_features", hidden_features)
+        setattr(self.agent, "_tool_context_hidden_tools", hidden_tools)
+        _refresh_cached_features_prompt(self.agent)
+        return await self.feature_context_status()
+
+    @tool(
+        name="feature_unfocus",
+        description=(
+            "Persistently hide selected features/tools from LLM context without denying access."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-unfocus",
+    )
+    async def feature_unfocus(
+        self,
+        features: list[str] | None = None,
+        tools: list[str] | None = None,
+        reset: bool = False,
+    ) -> ToolResult:
+        """Collapse selected tools out of context until reset.
+
+        Args:
+            features: Feature class names or dispatcher tool names to hide.
+            tools: Direct tool names to hide.
+            reset: Clear all context-hidden features/tools.
+        """
+
+        _ensure_context_profile(self.agent)
+        reset_requested = _coerce_bool(reset)
+        if reset_requested is None:
+            return ToolResult.failed("reset must be a boolean.")
+        if reset_requested:
+            setattr(self.agent, "_tool_context_hidden_features", set())
+            setattr(self.agent, "_tool_context_hidden_tools", set())
+            _refresh_cached_features_prompt(self.agent)
+            return await self.feature_context_status()
+
+        hide_features = _clean_name_set(features)
+        hide_tools = _clean_name_set(tools)
+        if not hide_features and not hide_tools:
+            return ToolResult.failed("Provide features/tools to hide, or reset=True.")
+
+        control_features = _control_feature_names(self.agent)
+        hidden_features = set(getattr(self.agent, "_tool_context_hidden_features"))
+        for row in _loaded_feature_inventory(self.agent):
+            if row["tool_name"] in control_features:
+                continue
+            if row["tool_name"] in hide_features or row["class"] in hide_features:
+                hidden_features.add(row["tool_name"])
+        hidden_tools = set(getattr(self.agent, "_tool_context_hidden_tools"))
+        hidden_tools.update(hide_tools)
+        setattr(self.agent, "_tool_context_hidden_features", hidden_features)
+        setattr(self.agent, "_tool_context_hidden_tools", hidden_tools)
+        _refresh_cached_features_prompt(self.agent)
+        return await self.feature_context_status()
 
     @tool(
         name="feature_feature_workflows",
@@ -334,6 +495,176 @@ def _core_feature_inventory() -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def _loaded_feature_inventory(agent: Any) -> list[dict[str, Any]]:
+    rows = []
+    hidden_features = _hidden_features(agent)
+    for key, feature in sorted(_agent_features(agent).items()):
+        tool_name = getattr(feature, "tool_name", key)
+        class_name = feature.__class__.__name__
+        tools = []
+        for agent_tool in _safe_feature_tools(feature):
+            tools.append(
+                {
+                    "name": agent_tool.name,
+                    "description": agent_tool.schema.description,
+                    "category": (
+                        agent_tool.schema.category.value
+                        if agent_tool.schema.category
+                        else None
+                    ),
+                    "estimated_context_tokens": _estimate_tool_tokens(
+                        agent_tool.schema.to_openai_format()
+                    ),
+                }
+            )
+        rows.append(
+            {
+                "registry_key": key,
+                "class": class_name,
+                "tool_name": tool_name,
+                "module": feature.__class__.__module__,
+                "tool_count": len(tools),
+                "visible_in_context": (
+                    tool_name not in hidden_features
+                    and class_name not in hidden_features
+                ),
+                "tools": tools,
+            }
+        )
+    return rows
+
+
+def _direct_tool_inventory(agent: Any) -> list[dict[str, Any]]:
+    hidden_tools = _hidden_tools(agent)
+    hidden_features = _hidden_features(agent)
+    direct_tools = getattr(agent, "_direct_tools", {})
+    tool_to_feature = getattr(agent, "_tool_to_feature", {})
+    if not isinstance(direct_tools, dict):
+        return []
+    rows = []
+    features_by_tool_name = {
+        getattr(feature, "tool_name", key): feature
+        for key, feature in _agent_features(agent).items()
+    }
+    for name, agent_tool in sorted(direct_tools.items()):
+        feature_tool_name = tool_to_feature.get(name)
+        feature = features_by_tool_name.get(feature_tool_name)
+        feature_class = feature.__class__.__name__ if feature is not None else None
+        rows.append(
+            {
+                "name": name,
+                "feature_tool_name": feature_tool_name,
+                "feature_class": feature_class,
+                "visible_in_context": (
+                    name not in hidden_tools
+                    and feature_tool_name not in hidden_features
+                    and feature_class not in hidden_features
+                ),
+                "estimated_context_tokens": _estimate_tool_tokens(
+                    agent_tool.schema.to_openai_format()
+                ),
+            }
+        )
+    return rows
+
+
+def _agent_features(agent: Any) -> dict[str, Any]:
+    features = getattr(agent, "features", None)
+    return features if isinstance(features, dict) else {}
+
+
+def _safe_feature_tools(feature: Any) -> list[Any]:
+    get_tools = getattr(feature, "get_tools", None)
+    if not callable(get_tools):
+        return []
+    try:
+        return list(get_tools())
+    except Exception:
+        return []
+
+
+def _context_profile(agent: Any) -> dict[str, list[str]]:
+    _ensure_context_profile(agent)
+    return {
+        "hidden_features": sorted(_hidden_features(agent)),
+        "hidden_tools": sorted(_hidden_tools(agent)),
+    }
+
+
+def _ensure_context_profile(agent: Any) -> None:
+    if not isinstance(getattr(agent, "_tool_context_hidden_features", None), set):
+        setattr(agent, "_tool_context_hidden_features", set())
+    if not isinstance(getattr(agent, "_tool_context_hidden_tools", None), set):
+        setattr(agent, "_tool_context_hidden_tools", set())
+
+
+def _refresh_cached_features_prompt(agent: Any) -> None:
+    build_prompt = getattr(agent, "_build_features_prompt_section", None)
+    if callable(build_prompt) and hasattr(agent, "_cached_features_prompt"):
+        setattr(agent, "_cached_features_prompt", build_prompt())
+
+
+def _hidden_features(agent: Any) -> set[str]:
+    _ensure_context_profile(agent)
+    return {str(item) for item in getattr(agent, "_tool_context_hidden_features")}
+
+
+def _hidden_tools(agent: Any) -> set[str]:
+    _ensure_context_profile(agent)
+    return {str(item) for item in getattr(agent, "_tool_context_hidden_tools")}
+
+
+def _clean_name_set(values: Any) -> set[str]:
+    if values is None:
+        return set()
+    if isinstance(values, str):
+        raw_value = values.strip()
+        if not raw_value:
+            return set()
+        if raw_value.startswith("["):
+            try:
+                decoded = json.loads(raw_value)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, list):
+                values = decoded
+            else:
+                values = [raw_value]
+        else:
+            values = raw_value.split(",")
+    elif not isinstance(values, (list, tuple, set)):
+        return {str(values).strip()} if str(values).strip() else set()
+    return {str(item).strip() for item in values if str(item).strip()}
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off", ""}:
+            return False
+        return None
+    return bool(value)
+
+
+def _control_feature_names(agent: Any) -> set[str]:
+    controls = {"FeatureFeaturesFeature", "feature_features_feature"}
+    for feature in _agent_features(agent).values():
+        if feature.__class__.__name__ == "FeatureFeaturesFeature":
+            controls.add(feature.tool_name)
+    return controls
+
+
+def _estimate_tool_tokens(openai_tool: dict[str, Any]) -> int:
+    body = json.dumps(openai_tool, sort_keys=True, separators=(",", ":"))
+    return max(1, (len(body) + 3) // 4)
 
 
 def _feature_module_name(module_path: str) -> str:

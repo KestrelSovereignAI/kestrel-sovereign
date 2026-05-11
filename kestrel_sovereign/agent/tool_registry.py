@@ -33,6 +33,8 @@ class ToolRegistryMixin:
 
         for feature in self.features.values():
             try:
+                if self._feature_hidden_from_context(feature):
+                    continue
                 # Skip subagent dispatcher for pre-explored features
                 # (their individual tools are already in the direct tool list)
                 if feature.tool_name in self._explored_features:
@@ -57,8 +59,47 @@ class ToolRegistryMixin:
     def _build_all_tools(self) -> list:
         """Build combined tool list: feature dispatchers + explored individual tools."""
         tools = self._build_feature_tools()
-        tools.extend(self._direct_tool_defs)
+        hidden_tools = self._hidden_context_tools()
+        hidden_features = self._hidden_context_features()
+        tools.extend(
+            tool_def
+            for tool_def in self._direct_tool_defs
+            if not self._direct_tool_hidden_from_context(
+                tool_def,
+                hidden_tools=hidden_tools,
+                hidden_features=hidden_features,
+            )
+        )
         return tools
+
+    def _visible_features_by_tool_name(self) -> Dict[str, Any]:
+        """Return feature dispatch targets currently visible to the LLM."""
+        return {
+            feature.tool_name: feature
+            for feature in self.features.values()
+            if not self._feature_hidden_from_context(feature)
+        }
+
+    def _visible_known_tool_names(self) -> set[str]:
+        """Return tool names the LLM may call under the active context profile."""
+        hidden_tools = self._hidden_context_tools()
+        names = {
+            tool_def["function"]["name"]
+            for tool_def in self._build_all_tools()
+            if isinstance(tool_def.get("function", {}).get("name"), str)
+        }
+        for feature in self.features.values():
+            if self._feature_hidden_from_context(feature):
+                continue
+            if not hasattr(feature, "get_tools"):
+                continue
+            try:
+                for tool in feature.get_tools():
+                    if tool.name not in hidden_tools:
+                        names.add(tool.name)
+            except Exception:
+                pass
+        return names
 
     def _register_explored_feature_tools(self, feature) -> None:
         """Register a feature's individual tools for direct calling.
@@ -127,8 +168,11 @@ class ToolRegistryMixin:
         sections = ["\n\n## LOADED FEATURES (Active Subagents)\n"]
         sections.append("These are your ACTIVE subagents. They are loaded and ready to use RIGHT NOW:\n")
 
+        hidden_tools = self._hidden_context_tools()
         for feature in self.features.values():
             try:
+                if self._feature_hidden_from_context(feature):
+                    continue
                 # Feature name and description
                 sections.append(f"\n### {feature.name}")
                 sections.append(f"**Capabilities:** {feature.tool_description}")
@@ -138,6 +182,8 @@ class ToolRegistryMixin:
                 if tools:
                     sections.append("\n**Available commands:**")
                     for tool in tools:
+                        if tool.name in hidden_tools:
+                            continue
                         cmd_prefix = tool.schema.command_prefix or ""
                         if cmd_prefix:
                             sections.append(f"- `{cmd_prefix}` - {tool.schema.description}")
@@ -150,3 +196,30 @@ class ToolRegistryMixin:
 
         sections.append("\n\n**CRITICAL:** When asked about your subagents, capabilities, or available tools, LIST the features above by name. They ARE your active subagents. Never say 'no active subagents' - that is incorrect.")
         return "\n".join(sections)
+
+    def _hidden_context_features(self) -> set[str]:
+        hidden = getattr(self, "_tool_context_hidden_features", set())
+        return {str(item) for item in hidden}
+
+    def _hidden_context_tools(self) -> set[str]:
+        hidden = getattr(self, "_tool_context_hidden_tools", set())
+        return {str(item) for item in hidden}
+
+    def _feature_hidden_from_context(self, feature: Any) -> bool:
+        hidden = self._hidden_context_features()
+        return feature.tool_name in hidden or feature.name in hidden
+
+    def _direct_tool_hidden_from_context(
+        self,
+        tool_def: Dict[str, Any],
+        *,
+        hidden_tools: set[str],
+        hidden_features: set[str],
+    ) -> bool:
+        name = tool_def.get("function", {}).get("name")
+        if not isinstance(name, str):
+            return False
+        if name in hidden_tools:
+            return True
+        feature_name = self._tool_to_feature.get(name)
+        return feature_name in hidden_features

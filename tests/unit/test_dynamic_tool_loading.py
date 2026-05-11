@@ -209,6 +209,78 @@ class TestBuildAllTools:
         assert len(all_tools) == 1
         assert all_tools[0]["function"]["name"] == "model_agent"
 
+    def test_context_hidden_feature_dispatcher_is_not_exposed(self, agent):
+        """Context profile can hide a feature dispatcher without unloading it."""
+        feature = _make_mock_feature("model_agent", [])
+        agent.features = {"ModelAgent": feature}
+        agent._tool_context_hidden_features = {"model_agent"}
+
+        assert agent._build_all_tools() == []
+
+    def test_context_hidden_direct_tool_is_not_exposed(self, agent):
+        """Context profile can hide direct tools without deleting registry state."""
+        feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
+        agent.features = {"ModelAgent": feature}
+        agent._register_explored_feature_tools(feature)
+        agent._tool_context_hidden_tools = {"list_models"}
+
+        all_tools = agent._build_all_tools()
+
+        assert all_tools == []
+        assert "list_models" in agent._direct_tools
+
+    def test_context_hidden_feature_hides_its_direct_tools(self, agent):
+        """Hiding a feature also hides its promoted direct tools from context."""
+        feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
+        agent.features = {"ModelAgent": feature}
+        agent._register_explored_feature_tools(feature)
+        agent._tool_context_hidden_features = {"model_agent"}
+
+        assert agent._build_all_tools() == []
+
+    def test_context_hidden_direct_tool_is_not_listed_in_prompt(self, agent):
+        """Hidden direct tools are removed from loaded-feature prompt text too."""
+        feature = _make_mock_feature(
+            "model_agent",
+            [
+                _make_mock_tool("list_models"),
+                _make_mock_tool("get_current_model"),
+            ],
+        )
+        agent.features = {"ModelAgent": feature}
+        agent._tool_context_hidden_tools = {"get_current_model"}
+
+        prompt = agent._build_features_prompt_section()
+
+        assert "list_models" in prompt
+        assert "get_current_model" not in prompt
+
+    def test_visible_known_tool_names_excludes_hidden_context_tools(self, agent):
+        """Orchestrator guardrails use only currently visible context tools."""
+        feature = _make_mock_feature(
+            "model_agent",
+            [
+                _make_mock_tool("list_models"),
+                _make_mock_tool("get_current_model"),
+            ],
+        )
+        agent.features = {"ModelAgent": feature}
+        agent._register_explored_feature_tools(feature)
+        agent._tool_context_hidden_tools = {"get_current_model"}
+
+        known_tools = agent._visible_known_tool_names()
+
+        assert "list_models" in known_tools
+        assert "get_current_model" not in known_tools
+
+    def test_visible_features_by_tool_name_excludes_hidden_features(self, agent):
+        """Hidden feature dispatchers are not valid orchestrator targets."""
+        feature = _make_mock_feature("model_agent", [])
+        agent.features = {"ModelAgent": feature}
+        agent._tool_context_hidden_features = {"model_agent"}
+
+        assert agent._visible_features_by_tool_name() == {}
+
 
 # =============================================================================
 # Direct tool execution
