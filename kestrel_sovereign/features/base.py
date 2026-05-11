@@ -193,6 +193,16 @@ class Feature(_SdkFeature):
         """
         return None
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        """Whether this feature's individual tools should be direct at startup.
+
+        Most features start as a single dispatcher tool and promote their
+        individual tools after first use. Features with meta-orchestration or
+        agent-management tools can opt in here so startup remains generic.
+        """
+        return False
+
     async def post_all_features_loaded(self, agent):
         """Called after ALL features are discovered and initialized.
 

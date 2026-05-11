@@ -1040,13 +1040,11 @@ class KestrelAgent(
             # Cache the features prompt (built once at session start)
             self._cached_features_prompt = self._build_features_prompt_section()
 
-            # Pre-explore features whose tools should be direct from turn one.
-            # TaskFeature: run_workflow, list_available_skills (meta-tools)
-            # PeersFeature: ask_agent, list_peers (inter-agent communication)
-            for feature_name in ("TaskFeature", "PeersFeature"):
-                feature = self.features.get(feature_name)
-                if feature:
-                    self._register_explored_feature_tools(feature)
+            # Pre-explore features whose descriptors request direct tools
+            # from turn one. This keeps startup generic: individual features
+            # decide whether they are meta-orchestration / agent-management
+            # surfaces that should bypass the first subagent dispatch.
+            self._promote_startup_feature_tools()
 
             # Initialize heartbeat system (periodic agent self-checks).
             # Registers the heartbeat source with the dispatcher so its
@@ -1340,6 +1338,12 @@ class KestrelAgent(
             # Wire task_manager into features that need it
             if hasattr(feature, 'set_task_manager'):
                 feature.set_task_manager(self.task_manager)
+
+    def _promote_startup_feature_tools(self) -> None:
+        """Promote direct tools for features that opt into startup exposure."""
+        for feature in self.features.values():
+            if getattr(feature, "promote_tools_on_startup", False):
+                self._register_explored_feature_tools(feature)
 
     async def _disable_feature(self, feature_name: str):
         """Disable a feature and remove its runtime registrations."""
