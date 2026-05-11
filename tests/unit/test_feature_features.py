@@ -286,6 +286,166 @@ async def test_feature_explore_can_include_loaded_tool_inventory():
 
 
 @pytest.mark.asyncio
+async def test_feature_discover_returns_searchable_catalog_with_provenance():
+    module_path = RuntimeDemoFeature.__module__
+    agent = SimpleNamespace(features={"RuntimeDemoFeature": RuntimeDemoFeature(None)})
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[module_path],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.find_feature_class",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(query="runtime demo")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["actions"]["load"] == "feature_add"
+    assert result.data["counts"]["matched"] == 1
+    row = result.data["features"][0]
+    assert row["class"] == "RuntimeDemoFeature"
+    assert row["source"] == "core"
+    assert row["provenance"] == module_path
+    assert row["loaded"] is True
+    assert row["visible_in_context"] is True
+    assert row["allowed"] is True
+    assert row["disabled"] is False
+    assert row["docs"]
+
+
+@pytest.mark.asyncio
+async def test_feature_discover_includes_runtime_context_and_tool_rows():
+    model_feature = _mock_feature(
+        "ModelFeature",
+        "model_feature",
+        [_mock_agent_tool("list_models", "List available LLM models")],
+    )
+    agent = SimpleNamespace(
+        features={"ModelFeature": model_feature},
+        _tool_context_hidden_features={"model_feature"},
+        _tool_context_hidden_tools=set(),
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(query="list_models", include_tools=True)
+
+    assert result.status is ToolResultStatus.OK
+    row = result.data["features"][0]
+    assert row["source"] == "runtime"
+    assert row["loaded"] is True
+    assert row["visible_in_context"] is False
+    assert row["tools"][0]["name"] == "list_models"
+    assert result.data["counts"]["hidden_from_context"] == 1
+
+
+@pytest.mark.asyncio
+async def test_feature_discover_searches_tools_without_returning_tool_rows_by_default():
+    model_feature = _mock_feature(
+        "ModelFeature",
+        "model_feature",
+        [_mock_agent_tool("list_models", "List available LLM models")],
+    )
+    agent = SimpleNamespace(features={"ModelFeature": model_feature})
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(query="list_models")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["counts"]["matched"] == 1
+    assert result.data["features"][0]["class"] == "ModelFeature"
+    assert result.data["features"][0]["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_feature_discover_accepts_string_limit_from_tool_schema():
+    agent = SimpleNamespace(features={})
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(limit="10")
+
+    assert result.status is ToolResultStatus.OK
+
+
+@pytest.mark.asyncio
+async def test_feature_discover_loaded_only_filters_unloaded_core_features():
+    module_path = RuntimeDemoFeature.__module__
+    feature = FeatureFeaturesFeature(SimpleNamespace(features={}))
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[module_path],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.find_feature_class",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(loaded_only="true")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["features"] == []
+
+
+def test_feature_discover_command_parser_keeps_multi_word_query():
+    feature = FeatureFeaturesFeature(SimpleNamespace())
+    tools = {tool.name: tool for tool in feature.get_tools()}
+
+    args = tools["feature_discover"].parse_command_args(
+        "!feature-discover runtime demo include_tools=true limit=3 --loaded-only"
+    )
+
+    assert args == {
+        "query": "runtime demo",
+        "include_tools": True,
+        "limit": 3,
+        "loaded_only": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_feature_context_status_reports_hidden_direct_tools():
     agent = SimpleNamespace(
         features={},
