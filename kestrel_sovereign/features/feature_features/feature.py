@@ -56,6 +56,14 @@ class FeatureFeaturesFeature(Feature):
         for agent_tool in tools:
             if agent_tool.name == "feature_discover":
                 agent_tool.parse_command_args = _parse_feature_discover_command
+            elif agent_tool.name == "feature_add":
+                agent_tool.parse_command_args = _parse_feature_add_command
+            elif agent_tool.name == "feature_remove":
+                agent_tool.parse_command_args = _parse_feature_remove_command
+            elif agent_tool.name == "feature_focus":
+                agent_tool.parse_command_args = _parse_feature_focus_command
+            elif agent_tool.name == "feature_unfocus":
+                agent_tool.parse_command_args = _parse_feature_unfocus_command
         return tools
 
     def _register_signal_sources(self) -> None:
@@ -950,7 +958,7 @@ def _core_feature_inventory() -> list[dict[str, Any]]:
 
 
 def _parse_feature_discover_command(user_input: str) -> dict[str, Any]:
-    parts = user_input.strip().split()
+    parts = _split_command(user_input)
     if not parts or parts[0].lower() != "!feature-discover":
         return {}
 
@@ -989,6 +997,115 @@ def _parse_feature_discover_command(user_input: str) -> dict[str, Any]:
     if query_parts and "query" not in args:
         args["query"] = " ".join(query_parts)
     return args
+
+
+def _parse_feature_add_command(user_input: str) -> dict[str, Any]:
+    parts = _split_command(user_input)
+    if not parts or parts[0].lower() != "!feature-add":
+        return {}
+
+    args: dict[str, Any] = {}
+    feature_parts: list[str] = []
+    for token in parts[1:]:
+        if token in {"--pre-explore", "--pre_explore"}:
+            args["pre_explore"] = True
+        elif token in {"--no-pre-explore", "--no-pre_explore"}:
+            args["pre_explore"] = False
+        elif _option_key(token) in {"pre_explore", "pre-explore"}:
+            value = token.split("=", 1)[1]
+            parsed = _coerce_bool(value)
+            args["pre_explore"] = value if parsed is None else parsed
+        elif _option_key(token) == "feature":
+            args["feature"] = token.split("=", 1)[1]
+        else:
+            feature_parts.append(token)
+    if feature_parts and "feature" not in args:
+        args["feature"] = " ".join(feature_parts)
+    return args
+
+
+def _parse_feature_remove_command(user_input: str) -> dict[str, Any]:
+    parts = _split_command(user_input)
+    if not parts or parts[0].lower() != "!feature-remove":
+        return {}
+    if len(parts) <= 1:
+        return {}
+    if _option_key(parts[1]) == "feature":
+        return {"feature": parts[1].split("=", 1)[1]}
+    return {"feature": " ".join(parts[1:])}
+
+
+def _parse_feature_focus_command(user_input: str) -> dict[str, Any]:
+    parts = _split_command(user_input)
+    if not parts or parts[0].lower() != "!feature-focus":
+        return {}
+    return _parse_feature_context_selection(parts[1:])
+
+
+def _parse_feature_unfocus_command(user_input: str) -> dict[str, Any]:
+    parts = _split_command(user_input)
+    if not parts or parts[0].lower() != "!feature-unfocus":
+        return {}
+    return _parse_feature_context_selection(parts[1:], allow_reset=True)
+
+
+def _parse_feature_context_selection(
+    tokens: list[str],
+    *,
+    allow_reset: bool = False,
+) -> dict[str, Any]:
+    args: dict[str, Any] = {}
+    positional_features: list[str] = []
+    feature_names: list[str] = []
+    tool_names: list[str] = []
+    active_bucket = "features"
+
+    for token in tokens:
+        if allow_reset and token == "--reset":
+            args["reset"] = True
+            continue
+        if allow_reset and _option_key(token) == "reset":
+            value = token.split("=", 1)[1]
+            parsed = _coerce_bool(value)
+            args["reset"] = value if parsed is None else parsed
+            continue
+        if token in {"--feature", "--features"}:
+            active_bucket = "features"
+            continue
+        if token in {"--tool", "--tools"}:
+            active_bucket = "tools"
+            continue
+        if _option_key(token) in {"feature", "features"}:
+            feature_names.extend(sorted(_clean_name_set(token.split("=", 1)[1])))
+            continue
+        if _option_key(token) in {"tool", "tools"}:
+            tool_names.extend(sorted(_clean_name_set(token.split("=", 1)[1])))
+            continue
+        if active_bucket == "tools":
+            tool_names.append(token)
+        else:
+            positional_features.append(token)
+
+    feature_names.extend(positional_features)
+    if feature_names:
+        args["features"] = feature_names
+    if tool_names:
+        args["tools"] = tool_names
+    return args
+
+
+def _split_command(user_input: str) -> list[str]:
+    try:
+        return shlex.split(user_input.strip())
+    except ValueError:
+        return user_input.strip().split()
+
+
+def _option_key(token: str) -> str | None:
+    if "=" not in token:
+        return None
+    key = token.split("=", 1)[0].strip()
+    return key.lstrip("-") or None
 
 
 def _feature_catalog(

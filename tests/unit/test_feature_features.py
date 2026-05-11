@@ -445,6 +445,52 @@ def test_feature_discover_command_parser_keeps_multi_word_query():
     }
 
 
+def test_feature_lifecycle_command_parsers_accept_agent_friendly_forms():
+    feature = FeatureFeaturesFeature(SimpleNamespace())
+    tools = {tool.name: tool for tool in feature.get_tools()}
+
+    add_args = tools["feature_add"].parse_command_args(
+        '!feature-add "Runtime Demo Feature" --pre-explore'
+    )
+    remove_args = tools["feature_remove"].parse_command_args(
+        "!feature-remove feature=RuntimeDemoFeature"
+    )
+    focus_args = tools["feature_focus"].parse_command_args(
+        "!feature-focus --feature ModelFeature MemoryFeature --tool list_models"
+    )
+    unfocus_args = tools["feature_unfocus"].parse_command_args(
+        "!feature-unfocus features=model_feature,memory_feature --reset"
+    )
+    dashed_add_args = tools["feature_add"].parse_command_args(
+        "!feature-add RuntimeDemoFeature --pre-explore=true"
+    )
+    dashed_focus_args = tools["feature_focus"].parse_command_args(
+        "!feature-focus --features=ModelFeature --tools=list_models"
+    )
+
+    assert add_args == {
+        "feature": "Runtime Demo Feature",
+        "pre_explore": True,
+    }
+    assert remove_args == {"feature": "RuntimeDemoFeature"}
+    assert focus_args == {
+        "features": ["ModelFeature", "MemoryFeature"],
+        "tools": ["list_models"],
+    }
+    assert unfocus_args == {
+        "features": ["memory_feature", "model_feature"],
+        "reset": True,
+    }
+    assert dashed_add_args == {
+        "feature": "RuntimeDemoFeature",
+        "pre_explore": True,
+    }
+    assert dashed_focus_args == {
+        "features": ["ModelFeature"],
+        "tools": ["list_models"],
+    }
+
+
 @pytest.mark.asyncio
 async def test_feature_context_status_reports_hidden_direct_tools():
     agent = SimpleNamespace(
