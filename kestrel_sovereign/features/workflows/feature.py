@@ -447,6 +447,50 @@ class WorkflowsFeature(Feature):
             return ToolResult.failed(str(exc))
 
     @tool(
+        name="workflow_force_abort",
+        description=(
+            "Emergency-abort a workflow run by cancelling in-flight stage dispatch "
+            "without compensation guarantees."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!workflow-force-abort",
+    )
+    async def workflow_force_abort(
+        self,
+        run_id: str,
+        reason: str,
+        authority_did: str,
+        authority_sig: str,
+    ) -> ToolResult:
+        """
+        Force-abort a workflow run.
+
+        Args:
+            run_id: Workflow run id.
+            reason: Human-readable emergency abort reason.
+            authority_did: Sovereign DID authorizing the abort.
+            authority_sig: Signature over the force-abort payload.
+        """
+        try:
+            status = await self._require_runner().force_abort_run(
+                run_id,
+                reason,
+                authority_did=authority_did,
+                authority_sig=authority_sig,
+            )
+            return ToolResult.ok(
+                f"Workflow run {run_id} force-aborted with status {status.value}.",
+                data={
+                    "run_id": run_id,
+                    "status": status.value,
+                    "forced": True,
+                    "reason": reason,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult.failed(str(exc))
+
+    @tool(
         name="workflow_revoke_definition",
         description="Revoke a workflow definition with a typed signed reason.",
         category=ToolCategory.SYSTEM,

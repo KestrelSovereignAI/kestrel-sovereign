@@ -6,9 +6,10 @@
 
 The Workflows feature explicitly does NOT define its own runtime; it composes onto the existing `SignalDispatcher`. That means:
 
-- Every stage execution = one `dispatch_signal(...)` call against a registered `SourceRegistration`.
+- Every stage execution = one `dispatch_signal(...)`/`enqueue_signal(...)` call against a registered `SourceRegistration`.
 - Every gate evaluation runs over the `SignalResult` the dispatcher returns.
 - Every compensation = another `dispatch_signal(...)` against a different registered source.
+- Emergency abort cancels the supervised dispatch task for the in-flight stage; graceful cancel never does.
 
 The mapping is small, but the wrong default in any column would either silently bypass the dispatcher's safety rails or block legitimate flows. Phase 0 nails it down before Phase 1 builds the runner.
 
@@ -29,6 +30,8 @@ A `Stage` (see `kestrel_sovereign/features/workflows/models.py`) carries:
 | `irreversible`        | (workflow-only)                  | Affects compensation routing only. |
 | `non_deterministic`   | (workflow-only)                  | Salts the idempotency key per attempt so legitimate retries don't collapse. |
 | `read_only`           | (workflow-only)                  | Eligibility for `noop_idempotent` compensation. |
+
+`Stage.params.timeout_seconds` is reserved by the runner as a per-stage dispatch ceiling. If absent, the runner uses the per-mode defaults from the design doc; on timeout it cancels the supervised dispatch task, records a failed gate reason `stage_timeout:<mode>:<seconds>`, and then follows the normal compensation path.
 
 ### Fields the runner SETS on every Signal
 
@@ -90,6 +93,8 @@ When a workflow run is cancelled, the runner walks the completed stages in rever
 **Compensation signal mode is always `ACTION`.** Even if the original stage was `COGNITION`, its compensation is by definition a side-effect-reversing action. Registrar (Phase 1) refuses to register a workflow whose compensation source's `allowed_modes` doesn't include `ACTION`.
 
 **`read_only=True` enforcement:** the Phase 1 runner uses a backend-portable write-counter shim around the registered ACTION handler. A `noop_idempotent` stage that writes any non-`workflow_*` table during that handler window fails its gate with `read_only_violation:<table>` and does not receive `compensate_state="not_required"`. Handler child tasks inherit the audit callback; after the handler returns, late non-`workflow_*` writes are rejected before execution so asynchronous side effects cannot bypass the stage decision. Dispatcher-owned logging happens outside the handler window, so normal `signal_log` audit writes do not make every read-only stage fail.
+
+**Force abort:** `workflow_force_abort(run_id, reason, authority_did, authority_sig)` is not compensation. The runner verifies a sovereign DID signature over the force-abort payload, cancels the in-flight supervised dispatch task (stage or active compensator), records `forced=True` and `gate_reason="force_abort:<reason>"` on the in-flight or pending stage link, clears current stages, and terminalizes the run without dispatching compensators. Completed irreversible / `compensate_record_only` stages are still marked `record_only` so residue appears in run status.
 
 ## 5. `forbidden_modules` enforcement
 

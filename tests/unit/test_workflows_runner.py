@@ -25,6 +25,7 @@ from kestrel_sovereign.features.workflows import (
     Edge,
     EdgeKind,
     Gate,
+    GateOutcome,
     RevocationReason,
     RunStatus,
     Stage,
@@ -33,7 +34,10 @@ from kestrel_sovereign.features.workflows import (
     WorkflowSpec,
     derive_stage_idempotency_key,
 )
-from kestrel_sovereign.features.workflows.signing import sign_workflow_spec
+from kestrel_sovereign.features.workflows.signing import (
+    canonical_force_abort_payload,
+    sign_workflow_spec,
+)
 from kestrel_sovereign.features.workflows.store import WorkflowStore
 from kestrel_sovereign.identity.did_web import build_verification_methods
 from kestrel_sovereign.identity.hybrid_keypair import (
@@ -201,6 +205,14 @@ def _sign_payload(identity: AgentIdentity, payload: str) -> str:
     suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
     return suite.sign(
         payload.encode("utf-8"),
+        identity.legacy_keypair.private_key,
+    ).hex()
+
+
+def _force_abort_sig(identity: AgentIdentity, run_id: str, reason: str) -> str:
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    return suite.sign(
+        canonical_force_abort_payload(run_id=run_id, reason=reason),
         identity.legacy_keypair.private_key,
     ).hex()
 
@@ -5856,6 +5868,971 @@ async def test_runner_cancel_active_run_sets_barrier_without_compensating_twice(
 
     assert result.status == RunStatus.CANCELLED
     assert events == ["do_one", "undo_one"]
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_cancels_in_flight_dispatch_without_compensation(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def do_one(payload):
+        events.append("do_one")
+        return {"ok": True}
+
+    async def do_two(payload):
+        events.append("do_two")
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def undo_one(payload):
+        events.append("undo_one")
+        return {"ok": True}
+
+    async def undo_two(payload):
+        events.append("undo_two")
+        return {"ok": True}
+
+    c.registry.register(_action_source("do.one", do_one))
+    c.registry.register(_action_source("do.two", do_two))
+    c.registry.register(_action_source("undo.one", undo_one))
+    c.registry.register(_action_source("undo.two", undo_two))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.one",
+                ),
+                Stage(
+                    name="two",
+                    signal_source="do.two",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.two",
+                ),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="one",
+                    to_stage="two",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    continue_task = asyncio.create_task(c.runner.continue_run(run.run_id))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    status = await c.runner.force_abort_run(
+        run.run_id,
+        "operator emergency",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            run.run_id,
+            "operator emergency",
+        ),
+    )
+
+    assert status == RunStatus.CANCELLED
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    with pytest.raises(WorkflowRunnerError, match="force-aborted"):
+        await continue_task
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    assert stored.finished_at is not None
+    assert stored.cancel_barrier_at is None
+    assert events == ["do_one", "do_two"]
+    links = await c.store.list_stage_links(run.run_id)
+    assert [link.stage_name for link in links] == ["one", "two"]
+    assert links[0].forced is False
+    assert links[0].compensate_state == "pending"
+    assert links[1].forced is True
+    assert links[1].post_cancel is True
+    assert links[1].gate_outcome == GateOutcome.FAIL
+    assert links[1].gate_reason == "force_abort:operator emergency"
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_wakes_waiter_when_dispatch_ignores_cancel(
+    runner_components,
+):
+    c = runner_components
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stubborn_action(payload):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+            return {"ok": True}
+
+    c.registry.register(_action_source("ci.stubborn", stubborn_action))
+    c.registry.register(_action_source("undo.stubborn", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="stubborn",
+                    signal_source="ci.stubborn",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.stubborn",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    continue_task = asyncio.create_task(c.runner.continue_run(run.run_id))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    status = await c.runner.force_abort_run(
+        run.run_id,
+        "operator emergency",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            run.run_id,
+            "operator emergency",
+        ),
+    )
+
+    assert status == RunStatus.CANCELLED
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    with pytest.raises(WorkflowRunnerError, match="force-aborted"):
+        await asyncio.wait_for(continue_task, timeout=1)
+    release.set()
+    while run.run_id in c.runner._in_flight_dispatches:
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_requires_sovereign_signature(
+    runner_components,
+):
+    c = runner_components
+    c.registry.register(_action_source("ci.lint", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+
+    with pytest.raises(WorkflowRunnerError, match="sovereign DID authority"):
+        await c.runner.force_abort_run(
+            run.run_id,
+            "bad actor",
+            authority_did="did:web:other.example",
+            authority_sig=_force_abort_sig(c.identity, run.run_id, "bad actor"),
+        )
+    with pytest.raises(WorkflowRunnerError, match="signature failed"):
+        await c.runner.force_abort_run(
+            run.run_id,
+            "bad signature",
+            authority_did=c.identity.legacy_did,
+            authority_sig=_force_abort_sig(c.identity, run.run_id, "other reason"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_preserves_irreversible_residue_status(
+    runner_components,
+):
+    c = runner_components
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def deploy(payload):
+        return {"ok": True}
+
+    async def wait_forever(payload):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    c.registry.register(_action_source("deploy.prod", deploy))
+    c.registry.register(_action_source("ci.wait", wait_forever))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="deploy",
+                    signal_source="deploy.prod",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="compensate_record_only",
+                    irreversible=True,
+                ),
+                _stage("wait", "ci.wait"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="deploy",
+                    to_stage="wait",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    continue_task = asyncio.create_task(c.runner.continue_run(run.run_id))
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    status = await c.runner.force_abort_run(
+        run.run_id,
+        "deploy rollback unsafe",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            run.run_id,
+            "deploy rollback unsafe",
+        ),
+    )
+
+    assert status == RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    with pytest.raises(WorkflowRunnerError, match="force-aborted"):
+        await continue_task
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE
+    links = await c.store.list_stage_links(run.run_id)
+    assert links[0].compensate_state == "record_only"
+    assert links[1].forced is True
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_accounts_for_just_finished_in_flight_stage(
+    runner_components,
+):
+    c = runner_components
+    gate_started = asyncio.Event()
+    release_gate = asyncio.Event()
+
+    async def publish(payload):
+        return {"ok": True}
+
+    c.registry.register(_action_source("publish.package", publish))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="publish",
+                    signal_source="publish.package",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="compensate_record_only",
+                    irreversible=True,
+                )
+            ],
+        ),
+    )
+    original_evaluate_gate = c.runner._evaluate_gate
+
+    async def blocking_gate(*args, **kwargs):
+        gate_started.set()
+        await release_gate.wait()
+        return await original_evaluate_gate(*args, **kwargs)
+
+    c.runner._evaluate_gate = blocking_gate
+    run = await c.runner.start_run(name="release")
+    continue_task = asyncio.create_task(c.runner.continue_run(run.run_id))
+    await asyncio.wait_for(gate_started.wait(), timeout=1)
+    in_flight = c.runner._in_flight_dispatches[run.run_id]
+    assert in_flight.task.done()
+
+    status = await c.runner.force_abort_run(
+        run.run_id,
+        "side effect committed",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            run.run_id,
+            "side effect committed",
+        ),
+    )
+    release_gate.set()
+
+    assert status == RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE
+    with pytest.raises(WorkflowRunnerError, match="force-aborted"):
+        await continue_task
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE
+    links = await c.store.list_stage_links(run.run_id)
+    assert links[0].forced is True
+    assert links[0].signal_id is not None
+    assert links[0].compensate_state == "record_only"
+    assert links[0].gate_reason == "force_abort:side effect committed"
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_cancels_in_flight_compensation(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+    undo_started = asyncio.Event()
+    undo_cancelled = asyncio.Event()
+
+    async def do_one(payload):
+        events.append("do_one")
+        return {"ok": True}
+
+    async def fail_two(payload):
+        events.append("fail_two")
+        raise RuntimeError("boom")
+
+    async def undo_one(payload):
+        events.append("undo_one")
+        undo_started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            undo_cancelled.set()
+            raise
+
+    c.registry.register(_action_source("do.one", do_one))
+    c.registry.register(_action_source("do.two", fail_two))
+    c.registry.register(_action_source("undo.one", undo_one))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.one",
+                ),
+                _stage("two", "do.two"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="one",
+                    to_stage="two",
+                )
+            ],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    continue_task = asyncio.create_task(c.runner.continue_run(run.run_id))
+    await asyncio.wait_for(undo_started.wait(), timeout=1)
+
+    status = await c.runner.force_abort_run(
+        run.run_id,
+        "stop rollback",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            run.run_id,
+            "stop rollback",
+        ),
+    )
+
+    assert status == RunStatus.CANCELLED
+    await asyncio.wait_for(undo_cancelled.wait(), timeout=1)
+    continued = await continue_task
+    assert continued.status == RunStatus.CANCELLED
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    links = await c.store.list_stage_links(run.run_id)
+    assert [link.stage_name for link in links] == ["one", "two"]
+    assert links[0].compensate_state == "failed"
+    assert links[0].forced is True
+    assert links[0].post_cancel is True
+    assert links[0].gate_outcome == GateOutcome.PASS
+    assert links[0].gate_reason == "force_abort:stop rollback"
+    assert links[1].gate_outcome == GateOutcome.FAIL
+    assert events == ["do_one", "fail_two", "undo_one"]
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_before_compensation_start_skips_compensator(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def do_one(payload):
+        events.append("do_one")
+        return {"ok": True}
+
+    async def fail_two(payload):
+        events.append("fail_two")
+        raise RuntimeError("boom")
+
+    async def undo_one(payload):
+        events.append("undo_one")
+        return {"ok": True}
+
+    c.registry.register(_action_source("do.one", do_one))
+    c.registry.register(_action_source("do.two", fail_two))
+    c.registry.register(_action_source("undo.one", undo_one))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="one",
+                    signal_source="do.one",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="undo.one",
+                ),
+                _stage("two", "do.two"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="one",
+                    to_stage="two",
+                )
+            ],
+        ),
+    )
+    original_update_run_status = c.store.update_run_status
+
+    async def terminalize_before_compensation(run_id, status, **kwargs):
+        if status == RunStatus.COMPENSATING:
+            await original_update_run_status(
+                run_id,
+                RunStatus.CANCELLED,
+                current_stages=[],
+                finished_at=datetime.now(timezone.utc),
+                if_not_terminal=True,
+            )
+            return False
+        return await original_update_run_status(run_id, status, **kwargs)
+
+    c.store.update_run_status = terminalize_before_compensation
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.CANCELLED
+    assert events == ["do_one", "fail_two"]
+    stored = await c.store.get_run(result.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    links = await c.store.list_stage_links(result.run_id)
+    assert [link.compensate_state for link in links] == ["pending", "pending"]
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_marks_pending_waiting_link(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(payload):
+        return {
+            "scope": "publish_pr",
+            "status": "pending",
+            "approval_id": "approval-123",
+        }
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=False,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+    waiting = await c.runner.run_to_completion(name="release")
+    assert waiting.status == RunStatus.WAITING
+
+    status = await c.runner.force_abort_run(
+        waiting.run_id,
+        "approval revoked",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            waiting.run_id,
+            "approval revoked",
+        ),
+    )
+
+    assert status == RunStatus.CANCELLED
+    stored = await c.store.get_run(waiting.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    assert stored.current_stages == ()
+    links = await c.store.list_stage_links(waiting.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "force_abort:approval revoked"
+    assert links[0].forced is True
+    assert links[0].post_cancel is True
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_after_link_insert_does_not_enqueue_signal(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def action(payload):
+        events.append("action")
+        return {"ok": True}
+
+    c.registry.register(_action_source("danger.deploy", action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="deploy",
+                    signal_source="danger.deploy",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                )
+            ],
+        ),
+    )
+    original_insert = c.store.insert_stage_link
+
+    async def abort_after_link_insert(link):
+        await original_insert(link)
+        await c.runner.force_abort_run(
+            link.run_id,
+            "pre-enqueue abort",
+            authority_did=c.identity.legacy_did,
+            authority_sig=_force_abort_sig(
+                c.identity,
+                link.run_id,
+                "pre-enqueue abort",
+            ),
+        )
+
+    c.store.insert_stage_link = abort_after_link_insert
+    run = await c.runner.start_run(name="release")
+
+    with pytest.raises(WorkflowRunnerError, match="force-aborted"):
+        await c.runner.continue_run(run.run_id)
+
+    assert events == []
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    links = await c.store.list_stage_links(run.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "force_abort:pre-enqueue abort"
+    assert links[0].forced is True
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_before_link_insert_marks_inserted_link(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def action(payload):
+        events.append("action")
+        return {"ok": True}
+
+    c.registry.register(_action_source("danger.deploy", action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="deploy",
+                    signal_source="danger.deploy",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                )
+            ],
+        ),
+    )
+    original_insert = c.store.insert_stage_link
+
+    async def abort_before_link_insert(link):
+        await c.runner.force_abort_run(
+            link.run_id,
+            "pre-insert abort",
+            authority_did=c.identity.legacy_did,
+            authority_sig=_force_abort_sig(
+                c.identity,
+                link.run_id,
+                "pre-insert abort",
+            ),
+        )
+        await original_insert(link)
+
+    c.store.insert_stage_link = abort_before_link_insert
+    run = await c.runner.start_run(name="release")
+
+    with pytest.raises(WorkflowRunnerError, match="force-aborted"):
+        await c.runner.continue_run(run.run_id)
+
+    assert events == []
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.CANCELLED
+    links = await c.store.list_stage_links(run.run_id)
+    assert len(links) == 1
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "force_abort:pre-insert abort"
+    assert links[0].forced is True
+    assert links[0].post_cancel is True
+
+
+@pytest.mark.asyncio
+async def test_runner_force_abort_does_not_overwrite_terminal_race(
+    runner_components,
+):
+    c = runner_components
+    c.registry.register(_action_source("ci.lint", lambda payload: {"ok": True}))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+    run = await c.runner.start_run(name="release")
+    original_force_abort_status = c.runner._force_abort_status
+
+    async def terminalize_before_abort_write(*args, **kwargs):
+        await c.store.update_run_status(
+            run.run_id,
+            RunStatus.COMPLETED,
+            current_stages=[],
+            finished_at=datetime.now(timezone.utc),
+            if_not_terminal=True,
+        )
+        return await original_force_abort_status(*args, **kwargs)
+
+    c.runner._force_abort_status = terminalize_before_abort_write
+
+    status = await c.runner.force_abort_run(
+        run.run_id,
+        "completion won",
+        authority_did=c.identity.legacy_did,
+        authority_sig=_force_abort_sig(
+            c.identity,
+            run.run_id,
+            "completion won",
+        ),
+    )
+
+    assert status == RunStatus.COMPLETED
+    stored = await c.store.get_run(run.run_id)
+    assert stored.status == RunStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_runner_stage_timeout_fails_and_compensates(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def slow_action(payload):
+        events.append("slow")
+        await asyncio.sleep(60)
+
+    c.registry.register(_action_source("ci.slow", slow_action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="slow",
+                    signal_source="ci.slow",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                    params={"timeout_seconds": 0.01},
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    assert events == ["slow"]
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].forced is False
+    assert links[0].post_cancel is False
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "stage_timeout:action:0.01"
+
+
+@pytest.mark.asyncio
+async def test_runner_stage_timeout_awaits_suppressed_cancellation(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def stubborn_action(payload):
+        events.append("start")
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            events.append("suppressed")
+            await asyncio.sleep(0.05)
+            events.append("late")
+            return {"ok": True}
+
+    c.registry.register(_action_source("ci.stubborn", stubborn_action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="stubborn",
+                    signal_source="ci.stubborn",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                    params={"timeout_seconds": 0.01},
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    assert events == ["start", "suppressed", "late"]
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "stage_timeout:action:0.01"
+
+
+@pytest.mark.asyncio
+async def test_runner_stage_timeout_does_not_wait_forever_on_ignored_cancel(
+    runner_components,
+):
+    c = runner_components
+    cancelled = asyncio.Event()
+
+    async def stubborn_action(payload):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            await asyncio.Event().wait()
+
+    c.registry.register(_action_source("ci.ignores_cancel", stubborn_action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="stubborn",
+                    signal_source="ci.ignores_cancel",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                    params={"timeout_seconds": 0.01},
+                )
+            ],
+        ),
+    )
+
+    result = await asyncio.wait_for(
+        c.runner.run_to_completion(name="release"),
+        timeout=1,
+    )
+
+    assert result.status == RunStatus.FAILED
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    in_flight = c.runner._in_flight_dispatches[result.run_id]
+    assert not in_flight.task.done()
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "stage_timeout:action:0.01"
+
+    in_flight.task.cancel()
+    await asyncio.gather(in_flight.task, return_exceptions=True)
+    assert result.run_id not in c.runner._in_flight_dispatches
+
+
+@pytest.mark.asyncio
+async def test_runner_stage_timeout_control_does_not_reach_signal_schema(
+    runner_components,
+):
+    c = runner_components
+    seen_payloads: list[dict] = []
+
+    def strict_schema(payload):
+        unexpected = set(payload) - {"target"}
+        if unexpected:
+            raise ValueError(f"unexpected keys: {sorted(unexpected)}")
+        return payload
+
+    async def action(payload):
+        seen_payloads.append(payload)
+        return {"ok": True}
+
+    c.registry.register(
+        SourceRegistration(
+            name="ci.strict_timeout",
+            schema=strict_schema,
+            default_mode=SignalMode.ACTION,
+            allowed_modes=frozenset({SignalMode.ACTION}),
+            handler=action,
+            log_redaction=_redaction(),
+        )
+    )
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="deploy",
+                    signal_source="ci.strict_timeout",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                    params={
+                        "target": "prod",
+                        "timeout_seconds": 60,
+                        "workflow_timeout_seconds": 120,
+                    },
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+    assert seen_payloads == [{"target": "prod"}]
+
+
+@pytest.mark.asyncio
+async def test_runner_invalid_stage_timeout_does_not_enqueue_signal(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def action(payload):
+        events.append("action")
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.invalid_timeout", action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="deploy",
+                    signal_source="ci.invalid_timeout",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                    params={"timeout_seconds": "0.01"},
+                )
+            ],
+        ),
+    )
+
+    with pytest.raises(WorkflowRunnerError, match="timeout_seconds"):
+        await c.runner.start_run(name="release")
+    assert events == []
+    assert await c.store.list_runs() == []
+
+
+@pytest.mark.asyncio
+async def test_runner_oversized_stage_timeout_does_not_enqueue_signal(
+    runner_components,
+):
+    c = runner_components
+    events: list[str] = []
+
+    async def action(payload):
+        events.append("action")
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.oversized_timeout", action))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="deploy",
+                    signal_source="ci.oversized_timeout",
+                    signal_mode=SignalMode.ACTION,
+                    compensate="noop_idempotent",
+                    read_only=True,
+                    params={"timeout_seconds": (4 * 60 * 60) + 1},
+                )
+            ],
+        ),
+    )
+    with pytest.raises(WorkflowRunnerError, match="must not exceed"):
+        await c.runner.start_run(name="release")
+    assert events == []
+    assert await c.store.list_runs() == []
 
 
 @pytest.mark.asyncio

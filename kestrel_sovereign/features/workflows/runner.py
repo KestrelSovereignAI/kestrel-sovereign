@@ -68,6 +68,7 @@ from kestrel_sovereign.features.workflows.metrics import (
 from kestrel_sovereign.features.workflows.signing import (
     PublicKeyResolver,
     VerificationMethodsResolver,
+    canonical_force_abort_payload,
     sign_stage_transition,
     sign_definition_revocation,
     verify_workflow_spec,
@@ -221,6 +222,23 @@ class WorkflowRunResult:
 
 
 @dataclass(frozen=True)
+class _InFlightStageDispatch:
+    run_id: str
+    stage_name: str
+    attempt_number: int
+    link_id: str
+    task: asyncio.Task
+    force_abort_event: asyncio.Event
+
+
+@dataclass(frozen=True)
+class _InFlightCompensationDispatch:
+    run_id: str
+    link_id: str
+    task: asyncio.Task
+
+
+@dataclass(frozen=True)
 class WorkflowRevocationResult:
     changed: bool
     reason: RevocationReason
@@ -287,6 +305,15 @@ _TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(
         RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE,
     }
 )
+_DEFAULT_STAGE_TIMEOUT_SECONDS: dict[SignalMode, float] = {
+    SignalMode.ACTION: 4 * 60 * 60,
+    SignalMode.ARTIFACT: 4 * 60 * 60,
+    SignalMode.COGNITION: 30 * 60,
+}
+_STAGE_RUNNER_CONTROL_PARAM_KEYS: frozenset[str] = frozenset(
+    {"timeout_seconds", "workflow_timeout_seconds"}
+)
+_STAGE_TIMEOUT_CANCEL_GRACE_SECONDS = 0.25
 
 
 class WorkflowRunner:
@@ -336,6 +363,10 @@ class WorkflowRunner:
         self.red_team_max_total_cost_usd = _validate_red_team_operator_cost(
             red_team_max_total_cost_usd
         )
+        self._in_flight_dispatches: dict[str, _InFlightStageDispatch] = {}
+        self._in_flight_compensations: dict[str, _InFlightCompensationDispatch] = {}
+        self._force_aborting_run_ids: set[str] = set()
+        self._force_abort_reasons: dict[str, str] = {}
 
     async def start_run(
         self,
@@ -394,13 +425,17 @@ class WorkflowRunner:
             run.status == RunStatus.PAUSED
             and await self._has_pending_waiting_stage(run, spec)
         ):
-            await self.store.update_run_status(run_id, RunStatus.RUNNING)
+            await self.store.update_run_status(
+                run_id, RunStatus.RUNNING, if_not_terminal=True
+            )
             run = await self.store.get_run(run_id)
             if run is None:
                 raise WorkflowRunnerError(f"workflow run missing: {run_id}")
             return await self._continue_waiting_run(run, spec)
         if run.status == RunStatus.PAUSED:
-            await self.store.update_run_status(run_id, RunStatus.RUNNING)
+            await self.store.update_run_status(
+                run_id, RunStatus.RUNNING, if_not_terminal=True
+            )
             run = await self.store.get_run(run_id)
             if run is None:
                 raise WorkflowRunnerError(f"workflow run missing: {run_id}")
@@ -423,6 +458,8 @@ class WorkflowRunner:
         latest = await self.store.get_run(run.run_id)
         if latest is None:
             raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
+        if latest.status in _TERMINAL_RUN_STATUSES:
+            return WorkflowRunResult(run.run_id, latest.status)
         if latest.cancel_barrier_at is not None:
             status = await self._compensate(latest, spec)
             return WorkflowRunResult(run.run_id, status)
@@ -432,6 +469,7 @@ class WorkflowRunner:
                     run.run_id,
                     RunStatus.PAUSED,
                     current_stages=[stage.name, *current],
+                    if_not_terminal=True,
                 )
                 return WorkflowRunResult(run.run_id, RunStatus.PAUSED)
             if gate == GateOutcome.PASS:
@@ -439,6 +477,7 @@ class WorkflowRunner:
                     run.run_id,
                     RunStatus.PAUSED,
                     current_stages=[*current, *self._next_stages(spec, stage.name)],
+                    if_not_terminal=True,
                 )
                 return WorkflowRunResult(run.run_id, RunStatus.PAUSED)
         if gate == GateOutcome.PENDING:
@@ -446,6 +485,7 @@ class WorkflowRunner:
                 run.run_id,
                 RunStatus.WAITING,
                 current_stages=[stage.name, *current],
+                if_not_terminal=True,
             )
             return WorkflowRunResult(run.run_id, RunStatus.WAITING)
         if gate != GateOutcome.PASS:
@@ -462,6 +502,7 @@ class WorkflowRunner:
             run.run_id,
             RunStatus.RUNNING,
             current_stages=next_current,
+            if_not_terminal=True,
         )
         resumed = await self.store.get_run(run.run_id)
         if resumed is None:
@@ -485,6 +526,8 @@ class WorkflowRunner:
             run_snapshot = await self.store.get_run(run.run_id)
             if run_snapshot is None:
                 raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
+            if run_snapshot.status in _TERMINAL_RUN_STATUSES:
+                return WorkflowRunResult(run.run_id, run_snapshot.status)
             if run_snapshot.cancel_barrier_at is not None:
                 status = await self._compensate(run_snapshot, spec)
                 return WorkflowRunResult(run.run_id, status)
@@ -494,6 +537,8 @@ class WorkflowRunner:
             post_dispatch_run = await self.store.get_run(run.run_id)
             if post_dispatch_run is None:
                 raise WorkflowRunnerError(f"workflow run missing: {run.run_id}")
+            if post_dispatch_run.status in _TERMINAL_RUN_STATUSES:
+                return WorkflowRunResult(run.run_id, post_dispatch_run.status)
             if post_dispatch_run.cancel_barrier_at is not None:
                 status = await self._compensate(post_dispatch_run, spec)
                 return WorkflowRunResult(run.run_id, status)
@@ -502,6 +547,7 @@ class WorkflowRunner:
                     run.run_id,
                     RunStatus.WAITING,
                     current_stages=[stage.name, *current],
+                    if_not_terminal=True,
                 )
                 return WorkflowRunResult(run.run_id, RunStatus.WAITING)
             if gate != GateOutcome.PASS:
@@ -519,6 +565,7 @@ class WorkflowRunner:
                     run.run_id,
                     RunStatus.PAUSED,
                     current_stages=next_current,
+                    if_not_terminal=True,
                 )
                 return WorkflowRunResult(run.run_id, RunStatus.PAUSED)
 
@@ -527,14 +574,20 @@ class WorkflowRunner:
                 run.run_id,
                 RunStatus.RUNNING,
                 current_stages=current,
+                if_not_terminal=True,
             )
 
-        await self.store.update_run_status(
+        completed = await self.store.update_run_status(
             run.run_id,
             RunStatus.COMPLETED,
             current_stages=[],
             finished_at=datetime.now(timezone.utc),
+            if_not_terminal=True,
         )
+        if not completed:
+            latest = await self.store.get_run(run.run_id)
+            if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+                return WorkflowRunResult(run.run_id, latest.status)
         return WorkflowRunResult(run.run_id, RunStatus.COMPLETED)
 
     async def cancel_run(self, run_id: str) -> RunStatus:
@@ -558,6 +611,139 @@ class WorkflowRunner:
         if not immediate_compensation:
             return RunStatus.COMPENSATING
         return await self._compensate(run, spec)
+
+    async def force_abort_run(
+        self,
+        run_id: str,
+        reason: str,
+        *,
+        authority_did: str,
+        authority_sig: str,
+    ) -> RunStatus:
+        if not isinstance(reason, str) or not reason.strip():
+            raise WorkflowRunnerError("force_abort reason must be a non-empty string")
+        reason = reason.strip()
+        self._verify_force_abort_authority(
+            run_id=run_id,
+            reason=reason,
+            authority_did=authority_did,
+            authority_sig=authority_sig,
+        )
+        run = await self.store.get_run(run_id)
+        if run is None:
+            raise WorkflowRunnerError(f"unknown workflow run: {run_id}")
+        if run.status in _TERMINAL_RUN_STATUSES:
+            raise WorkflowRunnerError(
+                f"workflow run {run_id} is terminal ({run.status.value})"
+            )
+
+        self._force_aborting_run_ids.add(run_id)
+        self._force_abort_reasons[run_id] = reason
+        in_flight = self._in_flight_dispatches.get(run_id)
+        in_flight_compensation = self._in_flight_compensations.get(run_id)
+        spec = await self._load_pinned_definition(run)
+        if in_flight is not None:
+            in_flight.force_abort_event.set()
+            if not in_flight.task.done():
+                in_flight.task.cancel()
+                in_flight.task.add_done_callback(_discard_task_result)
+                await asyncio.sleep(0)
+        if (
+            in_flight_compensation is not None
+            and not in_flight_compensation.task.done()
+        ):
+            in_flight_compensation.task.cancel()
+            in_flight_compensation.task.add_done_callback(_discard_task_result)
+            await asyncio.sleep(0)
+        forced_signal_id: Optional[str] = None
+        forced_completed_stage: Optional[str] = None
+        if in_flight is not None and in_flight.task.done():
+            try:
+                result = in_flight.task.result()
+            except BaseException:
+                result = None
+            if result is not None:
+                forced_signal_id = result.signal_id
+                if result.status == Status.OK:
+                    forced_completed_stage = in_flight.stage_name
+
+        latest = await self.store.get_run(run_id)
+        if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+            self._force_aborting_run_ids.discard(run_id)
+            self._force_abort_reasons.pop(run_id, None)
+            return latest.status
+        status = await self._force_abort_status(
+            run,
+            spec,
+            forced_completed_stage=forced_completed_stage,
+        )
+        terminalized = await self.store.update_run_status(
+            run_id,
+            status,
+            current_stages=[],
+            finished_at=datetime.now(timezone.utc),
+            if_not_terminal=True,
+        )
+        if not terminalized:
+            latest = await self.store.get_run(run_id)
+            if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+                self._force_aborting_run_ids.discard(run_id)
+                self._force_abort_reasons.pop(run_id, None)
+                return latest.status
+
+        if in_flight is not None:
+            await self._mark_stage_link_aborted(
+                in_flight,
+                reason=f"force_abort:{reason}",
+                signal_id=forced_signal_id,
+                forced=True,
+                post_cancel=True,
+            )
+        if in_flight_compensation is not None:
+            await self._mark_compensation_link_force_aborted(
+                in_flight_compensation,
+                reason=f"force_abort:{reason}",
+            )
+        await self._mark_open_stage_links_force_aborted(
+            run,
+            reason=f"force_abort:{reason}",
+        )
+        return status
+
+    def _verify_force_abort_authority(
+        self,
+        *,
+        run_id: str,
+        reason: str,
+        authority_did: str,
+        authority_sig: str,
+    ) -> None:
+        if authority_did != self.agent_identity.legacy_did:
+            raise WorkflowRunnerError(
+                "workflow_force_abort requires sovereign DID authority"
+            )
+        if not isinstance(authority_sig, str) or not authority_sig:
+            raise WorkflowRunnerError(
+                "workflow_force_abort requires authority_sig"
+            )
+        suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+        try:
+            public_key_bytes = self.public_key_resolver(authority_did)
+            public_key = suite.deserialize_public_key(public_key_bytes)
+            sig = bytes.fromhex(authority_sig)
+        except Exception as exc:  # noqa: BLE001
+            raise WorkflowRunnerError(
+                "workflow_force_abort authority signature is invalid"
+            ) from exc
+        ok = suite.verify(
+            canonical_force_abort_payload(run_id=run_id, reason=reason),
+            sig,
+            public_key,
+        )
+        if not ok:
+            raise WorkflowRunnerError(
+                "workflow_force_abort authority signature failed verification"
+            )
 
     async def revoke_definition(
         self,
@@ -739,6 +925,7 @@ class WorkflowRunner:
     async def _validate_run_start_contract(self, spec: WorkflowSpec) -> None:
         self._validate_phase1_sequential_graph(spec)
         for stage in spec.stages:
+            self._stage_timeout_seconds(stage)
             if stage.gate.type not in _RUNNER_GATE_TYPES:
                 raise WorkflowRunnerError(
                     f"stage {stage.name!r} gate {stage.gate.type!r} "
@@ -1049,6 +1236,22 @@ class WorkflowRunner:
             occurred_at=datetime.now(timezone.utc),
         )
         await self.store.insert_stage_link(link)
+        latest = await self.store.get_run(run.run_id)
+        if (
+            run.run_id in self._force_aborting_run_ids
+            or (latest is not None and latest.status in _TERMINAL_RUN_STATUSES)
+        ):
+            await self._mark_stage_link_force_aborted(
+                run_id=run.run_id,
+                stage_name=stage.name,
+                attempt_number=attempt_number,
+                link_id=link.link_id,
+                signal_id=None,
+                reason=self._force_abort_gate_reason(run.run_id),
+            )
+            raise WorkflowRunnerError(
+                f"workflow run {run.run_id} was force-aborted"
+            )
 
         preflight_outcome, preflight_reason = await self._preflight_stage_gate(stage)
         if preflight_outcome is not None:
@@ -1077,7 +1280,7 @@ class WorkflowRunner:
             record_gate_outcome(spec.name, stage.name, preflight_outcome.value)
             return preflight_outcome
 
-        payload = {**stage.to_dict()["params"], **run.to_dict()["params"]}
+        payload = {**_stage_signal_params(stage), **run.to_dict()["params"]}
         if stage.gate.type in {
             "tests_pass",
             "ci_green",
@@ -1125,14 +1328,141 @@ class WorkflowRunner:
                 )
             ],
         )
-        with self._read_only_write_counter(stage) as write_violations:
-            result = await self.dispatcher.dispatch_signal(signal)
+        timeout_seconds = self._stage_timeout_seconds(stage)
+        in_flight: Optional[_InFlightStageDispatch] = None
+        try:
+            latest = await self.store.get_run(run.run_id)
+            if (
+                run.run_id in self._force_aborting_run_ids
+                or (
+                    latest is not None
+                    and latest.status in _TERMINAL_RUN_STATUSES
+                )
+            ):
+                raise WorkflowRunnerError(
+                    f"workflow run {run.run_id} was force-aborted"
+                )
+            with self._read_only_write_counter(stage) as write_violations:
+                handle = await self.dispatcher.enqueue_signal(signal)
+                in_flight = _InFlightStageDispatch(
+                    run_id=run.run_id,
+                    stage_name=stage.name,
+                    attempt_number=attempt_number,
+                    link_id=link.link_id,
+                    task=handle.task,
+                    force_abort_event=asyncio.Event(),
+                )
+                self._in_flight_dispatches[run.run_id] = in_flight
+                force_abort_waiter = asyncio.create_task(
+                    in_flight.force_abort_event.wait()
+                )
+                done, _pending = await asyncio.wait(
+                    {handle.task, force_abort_waiter},
+                    timeout=timeout_seconds,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if force_abort_waiter not in done:
+                    force_abort_waiter.cancel()
+                    force_abort_waiter.add_done_callback(_discard_task_result)
+                if force_abort_waiter in done:
+                    if not handle.task.done():
+                        handle.task.cancel()
+
+                        def _cleanup_force_aborted_task(
+                            task: asyncio.Task,
+                        ) -> None:
+                            _discard_task_result(task)
+                            self._clear_in_flight_dispatch(
+                                run.run_id,
+                                in_flight,
+                            )
+
+                        handle.task.add_done_callback(_cleanup_force_aborted_task)
+                    raise WorkflowRunnerError(
+                        f"workflow run {run.run_id} was force-aborted"
+                    )
+                if not done:
+                    handle.task.cancel()
+                    settled, _pending = await asyncio.wait(
+                        {handle.task},
+                        timeout=_STAGE_TIMEOUT_CANCEL_GRACE_SECONDS,
+                    )
+                    if settled:
+                        _discard_task_result(handle.task)
+                    else:
+                        def _cleanup_timed_out_task(task: asyncio.Task) -> None:
+                            _discard_task_result(task)
+                            if in_flight is not None:
+                                self._clear_in_flight_dispatch(
+                                    run.run_id,
+                                    in_flight,
+                                )
+
+                        handle.task.add_done_callback(_cleanup_timed_out_task)
+                    raise asyncio.TimeoutError
+                result = handle.task.result()
+                latest = await self.store.get_run(run.run_id)
+                if (
+                    run.run_id in self._force_aborting_run_ids
+                    or (
+                        latest is not None
+                        and latest.status in _TERMINAL_RUN_STATUSES
+                    )
+                ):
+                    raise WorkflowRunnerError(
+                        f"workflow run {run.run_id} was force-aborted"
+                    )
+        except asyncio.TimeoutError:
+            if in_flight is not None:
+                await self._mark_stage_link_aborted(
+                    in_flight,
+                    reason=(
+                        "stage_timeout:"
+                        f"{stage.signal_mode.value}:"
+                        f"{timeout_seconds:g}"
+                    ),
+                    signal_id=None,
+                    forced=False,
+                    post_cancel=False,
+                )
+                if in_flight.task.done():
+                    self._clear_in_flight_dispatch(run.run_id, in_flight)
+            record_gate_outcome(spec.name, stage.name, GateOutcome.FAIL.value)
+            return GateOutcome.FAIL
+        except asyncio.CancelledError:
+            latest = await self.store.get_run(run.run_id)
+            if in_flight is not None:
+                self._clear_in_flight_dispatch(run.run_id, in_flight)
+            if (
+                run.run_id in self._force_aborting_run_ids
+                or (
+                    latest is not None
+                    and latest.status in _TERMINAL_RUN_STATUSES
+                )
+            ):
+                raise WorkflowRunnerError(
+                    f"workflow run {run.run_id} was force-aborted"
+                ) from None
+            raise
         gate_outcome, gate_reason = await self._evaluate_gate(
             stage,
             result,
             run=run,
             attempt_number=attempt_number,
         )
+        latest = await self.store.get_run(run.run_id)
+        if (
+            run.run_id in self._force_aborting_run_ids
+            or (
+                latest is not None
+                and latest.status in _TERMINAL_RUN_STATUSES
+            )
+        ):
+            if in_flight is not None:
+                self._clear_in_flight_dispatch(run.run_id, in_flight)
+            raise WorkflowRunnerError(
+                f"workflow run {run.run_id} was force-aborted"
+            )
         if (
             stage.compensate == "noop_idempotent"
             and write_violations
@@ -1170,7 +1500,166 @@ class WorkflowRunner:
         if gate_outcome == GateOutcome.PASS and stage.compensate == "noop_idempotent":
             await self.store.update_compensate_state(link.link_id, "not_required")
         record_gate_outcome(spec.name, stage.name, gate_outcome.value)
+        if in_flight is not None:
+            self._clear_in_flight_dispatch(run.run_id, in_flight)
         return gate_outcome
+
+    def _clear_in_flight_dispatch(
+        self,
+        run_id: str,
+        dispatch: _InFlightStageDispatch,
+    ) -> None:
+        if self._in_flight_dispatches.get(run_id) is dispatch:
+            self._in_flight_dispatches.pop(run_id, None)
+
+    def _clear_in_flight_compensation(
+        self,
+        run_id: str,
+        dispatch: _InFlightCompensationDispatch,
+    ) -> None:
+        if self._in_flight_compensations.get(run_id) is dispatch:
+            self._in_flight_compensations.pop(run_id, None)
+
+    async def _mark_stage_link_aborted(
+        self,
+        dispatch: _InFlightStageDispatch,
+        *,
+        reason: str,
+        signal_id: Optional[str],
+        forced: bool,
+        post_cancel: bool,
+    ) -> None:
+        await self._mark_stage_link_force_aborted(
+            run_id=dispatch.run_id,
+            stage_name=dispatch.stage_name,
+            attempt_number=dispatch.attempt_number,
+            link_id=dispatch.link_id,
+            signal_id=signal_id,
+            reason=reason,
+            forced=forced,
+            post_cancel=post_cancel,
+        )
+
+    async def _mark_stage_link_force_aborted(
+        self,
+        *,
+        run_id: str,
+        stage_name: str,
+        attempt_number: int,
+        link_id: str,
+        signal_id: Optional[str],
+        reason: str,
+        forced: bool = True,
+        post_cancel: bool = True,
+    ) -> None:
+        actor_did, actor_sig = sign_stage_transition(
+            run_id=run_id,
+            stage_name=stage_name,
+            attempt_number=attempt_number,
+            signal_id=signal_id,
+            gate_outcome=GateOutcome.FAIL.value,
+            agent_identity=self.agent_identity,
+            use_hybrid=True,
+        )
+        await self.store.update_stage_link_transition(
+            link_id,
+            signal_id=signal_id,
+            gate_outcome=GateOutcome.FAIL,
+            gate_reason=reason,
+            actor_did=actor_did,
+            actor_sig=actor_sig,
+            post_cancel=post_cancel,
+            forced=forced,
+        )
+
+    def _force_abort_gate_reason(self, run_id: str) -> str:
+        reason = self._force_abort_reasons.get(run_id)
+        return f"force_abort:{reason}" if reason else "force_abort"
+
+    async def _mark_open_stage_links_force_aborted(
+        self,
+        run: WorkflowRun,
+        *,
+        reason: str,
+    ) -> None:
+        links = await self.store.list_stage_links(run.run_id)
+        for link in links:
+            if link.gate_outcome not in (None, GateOutcome.PENDING):
+                continue
+            actor_did, actor_sig = sign_stage_transition(
+                run_id=run.run_id,
+                stage_name=link.stage_name,
+                attempt_number=link.attempt_number,
+                signal_id=link.signal_id,
+                gate_outcome=GateOutcome.FAIL.value,
+                agent_identity=self.agent_identity,
+                use_hybrid=True,
+            )
+            await self.store.update_stage_link_transition(
+                link.link_id,
+                signal_id=link.signal_id,
+                gate_outcome=GateOutcome.FAIL,
+                gate_reason=reason,
+                actor_did=actor_did,
+                actor_sig=actor_sig,
+                post_cancel=True,
+                forced=True,
+            )
+
+    async def _mark_compensation_link_force_aborted(
+        self,
+        dispatch: _InFlightCompensationDispatch,
+        *,
+        reason: str,
+    ) -> None:
+        links = await self.store.list_stage_links(dispatch.run_id)
+        link = next((item for item in links if item.link_id == dispatch.link_id), None)
+        if link is None:
+            return
+        gate_outcome = link.gate_outcome or GateOutcome.FAIL
+        actor_did, actor_sig = sign_stage_transition(
+            run_id=dispatch.run_id,
+            stage_name=link.stage_name,
+            attempt_number=link.attempt_number,
+            signal_id=link.signal_id,
+            gate_outcome=gate_outcome.value,
+            agent_identity=self.agent_identity,
+            use_hybrid=True,
+        )
+        await self.store.update_stage_link_transition(
+            link.link_id,
+            signal_id=link.signal_id,
+            gate_outcome=gate_outcome,
+            gate_reason=reason,
+            actor_did=actor_did,
+            actor_sig=actor_sig,
+            post_cancel=True,
+            forced=True,
+        )
+        await self.store.update_compensate_state(link.link_id, "failed")
+
+    def _stage_timeout_seconds(self, stage: Stage) -> float:
+        configured = stage.params.get("timeout_seconds")
+        if configured is None:
+            configured = stage.params.get("workflow_timeout_seconds")
+        if configured is not None:
+            if (
+                isinstance(configured, bool)
+                or not isinstance(configured, (int, float))
+                or not math.isfinite(configured)
+                or configured <= 0
+            ):
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} timeout_seconds must be a positive number"
+                )
+            ceiling = _DEFAULT_STAGE_TIMEOUT_SECONDS[stage.signal_mode]
+            if configured > ceiling:
+                raise WorkflowRunnerError(
+                    f"stage {stage.name!r} timeout_seconds must not exceed "
+                    f"the {stage.signal_mode.value} ceiling ({ceiling:g}s)"
+                )
+            return float(configured)
+        return _DEFAULT_STAGE_TIMEOUT_SECONDS[stage.signal_mode]
 
     def _read_only_write_counter(self, stage: Stage):
         if not (
@@ -1598,11 +2087,18 @@ class WorkflowRunner:
         success_status: RunStatus = RunStatus.CANCELLED,
         residue_status: RunStatus = RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE,
     ) -> RunStatus:
-        await self.store.update_run_status(
+        compensating = await self.store.update_run_status(
             run.run_id,
             RunStatus.COMPENSATING,
             current_stages=[],
+            if_not_terminal=True,
         )
+        if not compensating:
+            latest = await self.store.get_run(run.run_id)
+            if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+                return latest.status
+            if run.run_id in self._force_aborting_run_ids:
+                return RunStatus.CANCELLED
         residue = False
         failed = False
         links = await self.store.list_stage_links(run.run_id)
@@ -1636,13 +2132,13 @@ class WorkflowRunner:
                 )
                 record_compensation_state(spec.name, stage.name, "record_only")
                 continue
-            result = await self.dispatcher.dispatch_signal(
+            handle = await self.dispatcher.enqueue_signal(
                 Signal(
                     source=stage.compensate,
                     kind="workflow.compensate",
                     mode=SignalMode.ACTION,
                     payload={
-                        **stage.to_dict()["params"],
+                        **_stage_signal_params(stage),
                         **run.to_dict()["params"],
                         "compensate": True,
                     },
@@ -1653,6 +2149,40 @@ class WorkflowRunner:
                     dedupe_key=f"{link.idempotency_key}:compensate",
                 )
             )
+            in_flight = _InFlightCompensationDispatch(
+                run_id=run.run_id,
+                link_id=link.link_id,
+                task=handle.task,
+            )
+            self._in_flight_compensations[run.run_id] = in_flight
+            try:
+                result = await handle.task
+            except asyncio.CancelledError:
+                latest = await self.store.get_run(run.run_id)
+                if (
+                    run.run_id in self._force_aborting_run_ids
+                    or (
+                        latest is not None
+                        and latest.status in _TERMINAL_RUN_STATUSES
+                    )
+                ):
+                    if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+                        return latest.status
+                    return await self._force_abort_status(run, spec)
+                raise
+            finally:
+                self._clear_in_flight_compensation(run.run_id, in_flight)
+            latest = await self.store.get_run(run.run_id)
+            if (
+                run.run_id in self._force_aborting_run_ids
+                or (
+                    latest is not None
+                    and latest.status in _TERMINAL_RUN_STATUSES
+                )
+            ):
+                if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+                    return latest.status
+                return await self._force_abort_status(run, spec)
             state = "complete" if result.status == Status.OK else "failed"
             failed = failed or state == "failed"
             await self.store.update_compensate_state(link.link_id, state)
@@ -1665,13 +2195,57 @@ class WorkflowRunner:
             if residue
             else success_status
         )
-        await self.store.update_run_status(
+        terminalized = await self.store.update_run_status(
             run.run_id,
             status,
             current_stages=[],
             finished_at=datetime.now(timezone.utc),
+            if_not_terminal=True,
         )
+        if not terminalized:
+            latest = await self.store.get_run(run.run_id)
+            if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
+                return latest.status
         return status
+
+    async def _force_abort_status(
+        self,
+        run: WorkflowRun,
+        spec: WorkflowSpec,
+        *,
+        forced_completed_stage: Optional[str] = None,
+    ) -> RunStatus:
+        links = await self.store.list_stage_links(run.run_id)
+        residue = False
+        for link in links:
+            if link.gate_outcome != GateOutcome.PASS:
+                continue
+            stage = self._stage_by_name(spec, link.stage_name)
+            if stage.irreversible or stage.compensate == "compensate_record_only":
+                residue = True
+                if link.compensate_state != "record_only":
+                    await self.store.update_compensate_state(
+                        link.link_id, "record_only"
+                    )
+                    record_compensation_state(spec.name, stage.name, "record_only")
+        if forced_completed_stage is not None:
+            stage = self._stage_by_name(spec, forced_completed_stage)
+            if stage.irreversible or stage.compensate == "compensate_record_only":
+                residue = True
+                for link in links:
+                    if link.stage_name == forced_completed_stage:
+                        await self.store.update_compensate_state(
+                            link.link_id, "record_only"
+                        )
+                        record_compensation_state(
+                            spec.name,
+                            stage.name,
+                            "record_only",
+                        )
+                        break
+        if residue:
+            return RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE
+        return RunStatus.CANCELLED
 
     def _start_stage(self, spec: WorkflowSpec) -> Stage:
         incoming = set()
@@ -3042,6 +3616,20 @@ def _stage_link_timed_out(link: StageLink, timeout_seconds: int) -> bool:
         occurred_at = occurred_at.replace(tzinfo=timezone.utc)
     elapsed = (datetime.now(timezone.utc) - occurred_at).total_seconds()
     return elapsed >= timeout_seconds
+
+
+def _stage_signal_params(stage: Stage) -> dict[str, Any]:
+    params = stage.to_dict()["params"]
+    for key in _STAGE_RUNNER_CONTROL_PARAM_KEYS:
+        params.pop(key, None)
+    return params
+
+
+def _discard_task_result(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
 
 
 def _has_explicit_nonzero_exit(value: dict[str, Any]) -> bool:
