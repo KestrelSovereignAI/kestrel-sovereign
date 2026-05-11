@@ -56,6 +56,18 @@ def _make_mock_feature(tool_name: str, tools: list):
     return feature
 
 
+class ToolOnlyFeature:
+    name = "ToolOnlyFeature"
+    tool_name = "tool_only_feature"
+    tool_description = "SDK-only tool feature"
+
+    def __init__(self, tools):
+        self._tools = tools
+
+    def get_tools(self):
+        return self._tools
+
+
 @pytest.fixture
 def agent():
     """Create a KestrelAgent with mocked dependencies for testing."""
@@ -209,6 +221,15 @@ class TestBuildAllTools:
         assert len(all_tools) == 1
         assert all_tools[0]["function"]["name"] == "model_agent"
 
+    def test_sdk_tool_only_feature_is_not_exposed_as_subagent(self, agent):
+        """SDK-only features with direct tools are not advertised as dispatchers."""
+        feature = ToolOnlyFeature([_make_mock_tool("fetch_issue")])
+        agent.features = {"ToolOnlyFeature": feature}
+
+        assert agent._build_all_tools() == []
+        assert agent._visible_features_by_tool_name() == {}
+        assert agent._visible_known_tool_names() == set()
+
     def test_context_hidden_feature_dispatcher_is_not_exposed(self, agent):
         """Context profile can hide a feature dispatcher without unloading it."""
         feature = _make_mock_feature("model_agent", [])
@@ -254,6 +275,17 @@ class TestBuildAllTools:
 
         assert "list_models" in prompt
         assert "get_current_model" not in prompt
+
+    def test_sdk_tool_only_feature_is_not_listed_as_active_subagent(self, agent):
+        """Loaded SDK-only tool features are not described as subagents."""
+        feature = ToolOnlyFeature([_make_mock_tool("fetch_issue")])
+        agent.features = {"ToolOnlyFeature": feature}
+
+        prompt = agent._build_features_prompt_section()
+
+        assert prompt == ""
+        assert "ToolOnlyFeature" not in prompt
+        assert "fetch_issue" not in prompt
 
     def test_visible_known_tool_names_excludes_hidden_context_tools(self, agent):
         """Orchestrator guardrails use only currently visible context tools."""
