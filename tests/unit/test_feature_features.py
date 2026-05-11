@@ -2002,7 +2002,11 @@ async def test_feature_features_installs_review_diff_providers():
 
 
 @pytest.mark.asyncio
-async def test_feature_features_installs_ci_green_passthrough_provider():
+async def test_feature_features_installs_ci_green_passthrough_provider(monkeypatch):
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: None,
+    )
     agent = SimpleNamespace()
     feature = FeatureFeaturesFeature(agent)
 
@@ -2024,6 +2028,207 @@ async def test_feature_features_installs_ci_green_passthrough_provider():
         "workflow_run_id": "run-1",
         "workflow_stage_name": "ci_green",
     }
+
+
+@pytest.mark.asyncio
+async def test_feature_features_publish_provider_merges_branch_pr(monkeypatch):
+    find_calls = []
+    merge_calls = []
+
+    async def find_pr(repository, branch, token):
+        find_calls.append((repository, branch, token))
+        return {
+            "number": 17,
+            "html_url": "https://github.example/pr/17",
+        }
+
+    async def merge_pr(repository, pr_number, token, body):
+        merge_calls.append((repository, pr_number, token, body))
+        return {"merged": True, "sha": "abc123"}
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_find_open_pull_request_for_branch",
+        find_pr,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_merge_pull_request",
+        merge_pr,
+    )
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_publish(
+        {
+            "repository": "Org/repo",
+            "branch": "codex/demo",
+            "publish_pr_number": 17,
+            "publish_pr_head_sha": "head-abc",
+            "workflow_run_id": "run-1",
+            "workflow_stage_name": "publish",
+        }
+    )
+
+    assert find_calls == [("Org/repo", "codex/demo", "token-1")]
+    assert merge_calls == [
+        (
+            "Org/repo",
+            17,
+            "token-1",
+            {"merge_method": "merge", "sha": "head-abc"},
+        )
+    ]
+    assert result["status"] == "ok"
+    assert result["merged"] is True
+    assert result["pull_request_number"] == 17
+    assert result["pull_request_url"] == "https://github.example/pr/17"
+    assert result["merge_sha"] == "abc123"
+    assert result["workflow_run_id"] == "run-1"
+
+
+@pytest.mark.asyncio
+async def test_feature_features_ci_green_provider_captures_publish_sha(
+    monkeypatch,
+):
+    async def find_pr(repository, branch, token):
+        return {
+            "number": 17,
+            "html_url": "https://github.example/pr/17",
+            "head": {"sha": "head-abc"},
+        }
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_find_open_pull_request_for_branch",
+        find_pr,
+    )
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_ci_green(
+        {"repository": "Org/repo", "branch": "codex/demo"}
+    )
+
+    assert result["publish_pr_number"] == 17
+    assert result["publish_pr_head_sha"] == "head-abc"
+    assert result["publish_pr_url"] == "https://github.example/pr/17"
+
+
+@pytest.mark.asyncio
+async def test_feature_features_publish_provider_requires_reviewed_sha(
+    monkeypatch,
+):
+    async def find_pr(repository, branch, token):
+        return {"number": 17, "head": {"sha": "new-head"}}
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_find_open_pull_request_for_branch",
+        find_pr,
+    )
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="publish_pr_head_sha"):
+        await agent.feature_feature_publish(
+            {
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+                "publish_pr_number": 17,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_publish_provider_requires_reviewed_pr_number(
+    monkeypatch,
+):
+    async def find_pr(repository, branch, token):
+        return {"number": 18, "head": {"sha": "head-abc"}}
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_find_open_pull_request_for_branch",
+        find_pr,
+    )
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="publish_pr_number"):
+        await agent.feature_feature_publish(
+            {
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+                "publish_pr_number": 17,
+                "publish_pr_head_sha": "head-abc",
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_publish_provider_requires_github_token(
+    monkeypatch,
+):
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: None,
+    )
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="GITHUB_TOKEN"):
+        await agent.feature_feature_publish(
+            {"repository": "Org/repo", "branch": "codex/demo"}
+        )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_publish_provider_fails_ambiguous_pr(
+    monkeypatch,
+):
+    async def find_pr(repository, branch, token):
+        raise RuntimeError("multiple open pull requests found for Org/repo:codex/demo")
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_find_open_pull_request_for_branch",
+        find_pr,
+    )
+    agent = SimpleNamespace()
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="multiple open pull requests"):
+        await agent.feature_feature_publish(
+            {
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+                "publish_pr_number": 17,
+                "publish_pr_head_sha": "head-abc",
+            }
+        )
 
 
 @pytest.mark.asyncio
