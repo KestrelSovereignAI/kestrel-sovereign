@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,8 +38,21 @@ from kestrel_sovereign.features.workflows.models import (
     TriggerKind,
     WorkflowSpec,
 )
+from kestrel_sovereign.features.workflows.feature import WorkflowsFeature
 from kestrel_sovereign.features.workflows.schema import validate_spec_payload
+from kestrel_sovereign.identity.runtime_identity import AgentIdentity
+from kestrel_sovereign.security.crypto_suite import (
+    ALG_ECDSA_SECP256K1_SHA256,
+    get_suite,
+)
+from kestrel_sovereign.signals import (
+    OrderedLockManager,
+    SignalDispatcher,
+    SignalLogStore,
+)
+from kestrel_sovereign.signals.constitution_canary import CanaryStatus
 from kestrel_sovereign.signals.registry import SourceRegistry
+from kestrel_sovereign.storage.db import SQLiteBackend
 
 
 def _mock_agent_tool(name: str, description: str = "mock tool"):
@@ -113,6 +128,142 @@ class ExternalSdkToolOnlyFeature(SDKBaseFeature):
 
     def get_tools(self):
         return [_mock_agent_tool("github_issue_fetch", "Fetch a GitHub issue")]
+
+
+def _identity(did: str = "did:web:feature-feature.example") -> AgentIdentity:
+    suite = get_suite(ALG_ECDSA_SECP256K1_SHA256)
+    return AgentIdentity(
+        legacy_did=did,
+        legacy_keypair=suite.generate_keypair(),
+        legacy_did_document={},
+    )
+
+
+class _FeatureFeatureSmokeAgent:
+    def __init__(self, backend: SQLiteBackend):
+        self.identity = _identity()
+        self.did = self.identity.legacy_did
+        self.storage = SimpleNamespace(db=backend)
+        self.background_tasks: list[asyncio.Task] = []
+        self.signal_registry = SourceRegistry()
+        self.dispatcher = None
+        self.process_input_prompts: list[str] = []
+
+    async def process_input(self, prompt: str, **kwargs):
+        del kwargs
+        self.process_input_prompts.append(prompt)
+        reviewer = _reviewer_from_prompt(prompt)
+        if reviewer is None:
+            return "ok"
+        canary = _red_team_canary_from_prompt(prompt)
+        family = reviewer
+        return json.dumps(
+            {
+                "canary": canary,
+                "reviewer": reviewer,
+                "model_family": family,
+                "model": f"{family}-review-model",
+                "blockers": [],
+                "tokens": 1,
+                "cost_usd": 0.0,
+            }
+        )
+
+    def _track_background_task(self, coro, *, name: str):
+        task = asyncio.create_task(coro, name=name)
+        self.background_tasks.append(task)
+        return task
+
+    def get_constitution_hash(self) -> str:
+        return "a" * 64
+
+    def _get_governing_constitution(self) -> str:
+        return "Article I. Test constitution."
+
+    def get_anchored_doctrine_files(self) -> dict:
+        return {}
+
+    def verify_constitution_echo(self, **kwargs) -> CanaryStatus:
+        del kwargs
+        return CanaryStatus.VERIFIED
+
+
+class _SmokeTalonFeature:
+    def __init__(self):
+        self.claims: list[dict] = []
+
+    async def talon_claim(self, **kwargs):
+        self.claims.append(kwargs)
+        return ToolResult.ok(
+            "claimed",
+            data={
+                "job_id": "talon-job-1",
+                "issue_number": kwargs["issue"],
+                "status": "dispatched",
+            },
+        )
+
+    async def talon_status(self):
+        return ToolResult.ok(
+            "status",
+            data={
+                "jobs": [
+                    {
+                        "id": "talon-job-1",
+                        "status": "complete",
+                    }
+                ]
+            },
+        )
+
+
+class _SmokeAuditAnchorFeature:
+    def __init__(self):
+        self.calls = 0
+
+    async def anchor_audit(self):
+        self.calls += 1
+        return ToolResult.ok(
+            "anchored",
+            data={"anchor_id": "anchor-1", "root_hash": "b" * 64},
+        )
+
+
+def _reviewer_from_prompt(prompt: str) -> str | None:
+    match = re.search(r"'reviewer': '([^']+)'", prompt)
+    if match is None:
+        return None
+    return match.group(1)
+
+
+def _red_team_canary_from_prompt(prompt: str) -> str:
+    match = re.search(r"'canary': '([a-f0-9]{64})'", prompt)
+    assert match is not None
+    return match.group(1)
+
+
+async def _smoke_command_runner(command, cwd, timeout):
+    del cwd, timeout
+    if command[:2] == ["git", "merge-base"]:
+        return {"exit_code": 0, "stdout": "base-sha\n", "stderr": ""}
+    if command[:3] == ["git", "diff", "--no-ext-diff"]:
+        return {
+            "exit_code": 0,
+            "stdout": (
+                "diff --git a/kestrel_sovereign/features/demo.py "
+                "b/kestrel_sovereign/features/demo.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/kestrel_sovereign/features/demo.py\n"
+                "@@ -0,0 +1,2 @@\n"
+                "+def demo_tool():\n"
+                "+    return 'ok'\n"
+            ),
+            "stderr": "",
+        }
+    if command[:3] == ["git", "ls-files", "--others"]:
+        return {"exit_code": 0, "stdout": "", "stderr": ""}
+    return {"exit_code": 0, "stdout": "ok\n", "stderr": ""}
 
 
 @pytest.mark.parametrize(
@@ -1092,6 +1243,169 @@ async def test_feature_features_run_rejects_unknown_kind_and_non_object_params()
     assert bad_kind.status is ToolResultStatus.ERROR
     assert bad_params.status is ToolResultStatus.ERROR
     assert "object" in bad_params.error
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_workflow_runs_end_to_end_with_default_providers(
+    tmp_path,
+    monkeypatch,
+):
+    backend = SQLiteBackend(str(tmp_path / "feature-feature-smoke.db"))
+    await backend.connect()
+    agent = _FeatureFeatureSmokeAgent(backend)
+    talon = _SmokeTalonFeature()
+    audit_anchor = _SmokeAuditAnchorFeature()
+    agent.workflow_red_team_prompt_pack_resolver = lambda _constraint: {
+        "name": "kestrel-red-team-prompts",
+        "version": "1.0.0",
+        "prompt_hash": "c" * 64,
+    }
+    agent.workflow_red_team_attestation_resolver = lambda reviewer: {
+        "model_family": reviewer,
+        "constitution_hash": agent.get_constitution_hash(),
+    }
+    agent.workflow_council_approve_provider = lambda *args: {
+        "approved_dids": ["did:kestrel:one", "did:kestrel:two"]
+    }
+    agent.feature_feature_command_runner = _smoke_command_runner
+
+    signal_store = SignalLogStore(backend)
+    await signal_store.initialize()
+    agent.dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=agent.signal_registry,
+        lock_manager=OrderedLockManager(),
+        store=signal_store,
+    )
+    workflows = WorkflowsFeature(agent)
+    feature = FeatureFeaturesFeature(agent)
+    agent.features = {
+        "WorkflowsFeature": workflows,
+        "FeatureFeaturesFeature": feature,
+        "TalonCoordinatorFeature": talon,
+        "AuditAnchorFeature": audit_anchor,
+    }
+
+    created_issues: list[dict] = []
+    merged_prs: list[dict] = []
+
+    async def create_issue(repository, token, body):
+        created_issues.append(
+            {"repository": repository, "token": token, "body": body}
+        )
+        return {
+            "number": 42,
+            "html_url": "https://github.com/Org/repo/issues/42",
+        }
+
+    async def find_open_pr(repository, branch, token):
+        return {
+            "number": 17,
+            "html_url": f"https://github.com/{repository}/pull/17",
+            "head": {"sha": "head-sha-1", "ref": branch},
+        }
+
+    async def merge_pr(repository, pr_number, token, body):
+        merged_prs.append(
+            {
+                "repository": repository,
+                "pr_number": pr_number,
+                "token": token,
+                "body": body,
+            }
+        )
+        return {"merged": True, "sha": "merge-sha-1"}
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+        lambda: "token-1",
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature._github_create_issue",
+        create_issue,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature."
+        "_github_find_open_pull_request_for_branch",
+        find_open_pr,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.feature_features.feature."
+        "_github_merge_pull_request",
+        merge_pr,
+    )
+
+    try:
+        await workflows.initialize()
+        await feature.initialize()
+        assert workflows.runner is not None
+        workflows.runner.ci_green_provider = lambda gate, result: {
+            "check_runs": [
+                {
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+                for name in gate.params["required_checks"]
+            ],
+            "required_checks": list(gate.params["required_checks"]),
+        }
+
+        defined = await feature.feature_feature_define_workflows(kind="tool")
+        assert defined.status is ToolResultStatus.OK
+
+        run = await feature.feature_feature_run(
+            "tool",
+            params={
+                "feature_name": "demo feature",
+                "target_tool_name": "demo_tool",
+                "summary": "Add a demo tool",
+                "repository": "Org/repo",
+                "branch": "codex/demo-tool",
+            },
+        )
+
+        assert run.status is ToolResultStatus.OK
+        assert run.data["status"] == "waiting"
+        resumed = await workflows.workflow_resume(run.data["run_id"])
+        assert resumed.status is ToolResultStatus.OK
+        assert resumed.data["status"] == "completed"
+        assert created_issues[0]["body"]["title"] == (
+            "[EPIC] Feature proposal: demo feature: demo_tool"
+        )
+        assert talon.claims[0]["issue"] == 42
+        assert merged_prs == [
+            {
+                "repository": "Org/repo",
+                "pr_number": 17,
+                "token": "token-1",
+                "body": {"merge_method": "merge", "sha": "head-sha-1"},
+            }
+        ]
+        assert audit_anchor.calls == 1
+
+        status = await workflows.workflow_status(run.data["run_id"])
+        assert status.status is ToolResultStatus.OK
+        assert status.data["params"]["issue_number"] == 42
+        assert status.data["params"]["talon_job_ids"] == ["talon-job-1"]
+        assert status.data["params"]["publish_pr_number"] == 17
+        assert status.data["params"]["publish_pr_head_sha"] == "head-sha-1"
+
+        history = await workflows.workflow_history(run.data["run_id"])
+        assert history.status is ToolResultStatus.OK
+        assert [link["stage_name"] for link in history.data["links"]] == list(
+            FEATURE_FEATURES_STAGE_ORDER
+        )
+        assert all(link["gate_outcome"] == "pass" for link in history.data["links"])
+    finally:
+        pending = [task for task in agent.background_tasks if not task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await backend.close()
 
 
 @pytest.mark.asyncio
