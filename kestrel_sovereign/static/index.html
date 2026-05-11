@@ -173,7 +173,7 @@
 
                         <!-- Right: Global security mode + Privacy Mode -->
                         <div style="display: flex; gap: 0.5rem; align-items: center;">
-                            <button id="chat-auto-mode-btn" onclick="Security.toggleGlobalAutoMode()" class="btn btn-secondary text-sm security-auto-mode-toggle" data-label-key="btn_auto_mode" title="Turn on session-scoped global Auto for non-denied tools.">
+                            <button id="chat-auto-mode-btn" onclick="Security.toggleGlobalAutoMode({ confirmEnable: false })" class="btn btn-secondary text-sm security-auto-mode-toggle" data-label-key="btn_auto_mode" title="Turn on session-scoped global Auto for non-denied tools.">
                                 Auto Mode: Off
                             </button>
                             <div id="chat-privacy-indicator"></div>

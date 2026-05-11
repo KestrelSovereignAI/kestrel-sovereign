@@ -189,6 +189,53 @@ test.describe('#748 security approval popup', () => {
 
         await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
         await expect(page.locator('.toast-item').filter({ hasText: 'Auto Mode enabled' })).toBeVisible();
+        await expect(page.locator('.toast-item').filter({ hasText: 'Approved (once)' })).toHaveCount(0);
+    });
+
+    test('chat header Auto toggle enables mode without a second confirmation popup', async ({ page }) => {
+        await page.route('**/agent/notifications/sse**', async (route) => {
+            await route.fulfill({
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                },
+                body: sseBody([{ event: 'connected', data: { status: 'connected' } }]),
+            });
+        });
+
+        const autoModeCalls = [];
+        let autoEnabled = false;
+        await page.route('**/api/security/auto-mode', async (route, request) => {
+            if (request.method() === 'POST') {
+                const body = JSON.parse(request.postData() || '{}');
+                autoModeCalls.push(body);
+                autoEnabled = Boolean(body.enabled);
+            }
+
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    enabled: autoEnabled,
+                    warning: autoEnabled
+                        ? 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.'
+                        : 'Auto Mode is off.',
+                }),
+            });
+        });
+
+        await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
+        await page.getByRole('button', { name: 'Chat' }).click();
+
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: Off');
+        await page.click('#chat-auto-mode-btn');
+
+        await expect.poll(() => autoModeCalls.length, { timeout: 5000 }).toBe(1);
+        expect(autoModeCalls[0]).toMatchObject({ enabled: true });
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+        await expect(page.locator('#modal-overlay')).not.toBeVisible();
     });
 
     test('multiple approval events are serialized — one modal at a time, no stacking', async ({ page }) => {
