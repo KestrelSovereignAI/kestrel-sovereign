@@ -122,5 +122,4 @@ Audit test suite for quality, consistency, and best practices:
 ## Related Tools
 
 - **Subagents**: Specialized agents in `.claude/agents/`
-- **Skills**: Auto-triggered capabilities in `.claude/skills/`
 - **Hooks**: Event-driven automation in `.claude/settings.json`
