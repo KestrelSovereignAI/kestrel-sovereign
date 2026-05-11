@@ -84,6 +84,10 @@ class PeersFeature(Feature):
             "send messages to peer agents and list available peers"
         )
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        return True
+
     async def initialize(self):
         self._host_url = _discover_host_url()
         self._api_key = os.environ.get("KESTREL_API_KEY", "")

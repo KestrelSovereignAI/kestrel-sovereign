@@ -39,6 +39,10 @@ class SpawnFeature(Feature):
             "delegate tasks, retrieve results, and terminate children"
         )
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        return True
+
     async def initialize(self):
         self._agent_manager = None
         self._lifecycle = None
@@ -54,12 +58,6 @@ class SpawnFeature(Feature):
         """
         from kestrel_sovereign.endpoints.spawn import router
         return router
-
-    async def post_all_features_loaded(self, agent):
-        """Pre-explore spawn tools so they are immediately available to the orchestrator."""
-        if hasattr(agent, '_register_explored_feature_tools'):
-            agent._register_explored_feature_tools(self)
-            logger.info("SpawnFeature tools pre-explored for direct calling")
 
     def _get_agent_manager(self):
         """Lazily resolve or create an AgentManager.

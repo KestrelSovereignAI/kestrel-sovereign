@@ -66,6 +66,10 @@ class TaskFeature(Feature):
             "run plans across features, check task status, get results"
         )
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        return True
+
     async def initialize(self):
         """Initialize with task manager reference."""
         # Task manager will be set by server startup if available
