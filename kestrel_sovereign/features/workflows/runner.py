@@ -1299,6 +1299,39 @@ class WorkflowRunner:
             record_gate_outcome(spec.name, stage.name, preflight_outcome.value)
             return preflight_outcome
 
+        materialized_gate: Optional[Gate] = None
+        if stage.gate.type == "ci_green":
+            materialized_gate, materialized_reason = _materialize_ci_gate(
+                stage.gate, run.params
+            )
+            if materialized_reason is not None or materialized_gate is None:
+                actor_did, actor_sig = sign_stage_transition(
+                    run_id=run.run_id,
+                    stage_name=stage.name,
+                    attempt_number=attempt_number,
+                    signal_id=None,
+                    gate_outcome=GateOutcome.FAIL.value,
+                    agent_identity=self.agent_identity,
+                    use_hybrid=True,
+                )
+                await self.store.update_stage_link_transition(
+                    link.link_id,
+                    signal_id=None,
+                    gate_outcome=GateOutcome.FAIL,
+                    gate_reason=(
+                        materialized_reason or "ci_green_invalid_runtime_params"
+                    ),
+                    actor_did=actor_did,
+                    actor_sig=actor_sig,
+                    post_cancel=False,
+                )
+                if stage.compensate == "noop_idempotent":
+                    await self.store.update_compensate_state(
+                        link.link_id, "not_required"
+                    )
+                record_gate_outcome(spec.name, stage.name, GateOutcome.FAIL.value)
+                return GateOutcome.FAIL
+
         payload = {**_stage_signal_params(stage), **run.to_dict()["params"]}
         if stage.gate.type in {
             "tests_pass",
@@ -1310,7 +1343,10 @@ class WorkflowRunner:
             "signature_collected",
             "script",
         }:
-            payload.update(stage.gate.to_dict()["params"])
+            gate_params = stage.gate.to_dict()["params"]
+            if materialized_gate is not None:
+                gate_params = materialized_gate.to_dict()["params"]
+            payload.update(gate_params)
         if stage.gate.type == "signature_collected":
             payload.update(
                 {
@@ -1817,7 +1853,10 @@ class WorkflowRunner:
         if stage.gate.type in {"tests_pass", "lint_clean"}:
             return _evaluate_exit_marker_gate(stage.gate, result)
         if stage.gate.type == "ci_green":
-            return await self._evaluate_ci_green_gate(stage.gate, result)
+            gate, reason = _materialize_ci_gate(stage.gate, run.params)
+            if reason is not None or gate is None:
+                return GateOutcome.FAIL, reason or "ci_green_invalid_runtime_params"
+            return await self._evaluate_ci_green_gate(gate, result)
         if stage.gate.type == "consent_collect":
             return _evaluate_consent_collect_gate(stage.gate, result)
         if stage.gate.type == "council_approve":
@@ -3669,6 +3708,27 @@ def _stage_signal_params(stage: Stage) -> dict[str, Any]:
     for key in _STAGE_RUNNER_CONTROL_PARAM_KEYS:
         params.pop(key, None)
     return params
+
+
+def _materialize_ci_gate(
+    gate: Gate, run_params: Mapping[str, Any]
+) -> tuple[Optional[Gate], Optional[str]]:
+    params = gate.to_dict()["params"]
+    for field in ("repo", "branch"):
+        param_key = f"{field}_param"
+        param_name = params.get(param_key)
+        if param_name is None:
+            continue
+        if not isinstance(param_name, str) or not param_name.strip():
+            return None, f"ci_green_invalid_{param_key}"
+        value = run_params.get(param_name)
+        if not isinstance(value, str) or not value.strip():
+            return None, f"ci_green_missing_run_param:{param_name}"
+        params[field] = value
+    try:
+        return Gate(type=gate.type, params=params), None
+    except WorkflowDefinitionError as exc:
+        return None, f"ci_green_invalid_runtime_params:{exc}"
 
 
 def _discard_task_result(task: asyncio.Task) -> None:
