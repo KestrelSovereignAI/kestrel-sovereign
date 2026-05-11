@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.signals import SignalMode
-from kestrel_sdk.tools.result import ToolResultStatus
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.features.feature_features.feature import (
     FeatureFeaturesFeature,
@@ -124,6 +124,111 @@ async def test_feature_features_tool_returns_workflow_payloads():
     assert sorted(result.data["workflows"]) == [
         FEATURE_PROPOSE_PACKAGE_WORKFLOW_NAME
     ]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_define_workflows_uses_workflows_feature():
+    class StubWorkflowsFeature:
+        def __init__(self):
+            self.defined = []
+
+        async def workflow_define(self, spec):
+            self.defined.append(spec)
+            return ToolResult.ok(
+                "defined",
+                data={"name": spec["name"], "version": spec["version"]},
+            )
+
+    workflows = StubWorkflowsFeature()
+    feature = FeatureFeaturesFeature(
+        SimpleNamespace(features={"WorkflowsFeature": workflows})
+    )
+
+    result = await feature.feature_feature_define_workflows(kind="tool")
+
+    assert result.status is ToolResultStatus.OK
+    assert [spec["name"] for spec in workflows.defined] == [
+        FEATURE_PROPOSE_TOOL_WORKFLOW_NAME
+    ]
+    assert result.data["defined"][0]["data"]["name"] == (
+        FEATURE_PROPOSE_TOOL_WORKFLOW_NAME
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_define_workflows_stops_on_define_failure():
+    class StubWorkflowsFeature:
+        async def workflow_define(self, spec):
+            return SimpleNamespace(
+                status=ToolResultStatus.ERROR,
+                data=None,
+                error=f"boom:{spec['name']}",
+            )
+
+    feature = FeatureFeaturesFeature(
+        SimpleNamespace(features={"WorkflowsFeature": StubWorkflowsFeature()})
+    )
+
+    result = await feature.feature_feature_define_workflows(kind="tool")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["defined"][0]["error"] == (
+        f"boom:{FEATURE_PROPOSE_TOOL_WORKFLOW_NAME}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_run_delegates_to_workflows_feature():
+    class StubWorkflowsFeature:
+        def __init__(self):
+            self.calls = []
+
+        async def workflow_run(self, name, params=None, version=0):
+            self.calls.append((name, params, version))
+            return ToolResult.ok("ran", data={"run_id": "run-1"})
+
+    workflows = StubWorkflowsFeature()
+    feature = FeatureFeaturesFeature(
+        SimpleNamespace(features={"WorkflowsFeature": workflows})
+    )
+
+    result = await feature.feature_feature_run(
+        "package",
+        params={
+            "feature_name": "demo",
+            "package_name": "kestrel-demo",
+            "repository": "Org/repo",
+            "branch": "codex/demo",
+        },
+        version=2,
+    )
+
+    assert result.status is ToolResultStatus.OK
+    assert workflows.calls == [
+        (
+            FEATURE_PROPOSE_PACKAGE_WORKFLOW_NAME,
+            {
+                "feature_name": "demo",
+                "package_name": "kestrel-demo",
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+            },
+            2,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_run_rejects_unknown_kind_and_non_object_params():
+    feature = FeatureFeaturesFeature(
+        SimpleNamespace(features={"WorkflowsFeature": SimpleNamespace()})
+    )
+
+    bad_kind = await feature.feature_feature_run("all", params={})
+    bad_params = await feature.feature_feature_run("tool", params=[])
+
+    assert bad_kind.status is ToolResultStatus.ERROR
+    assert bad_params.status is ToolResultStatus.ERROR
 
 
 @pytest.mark.asyncio

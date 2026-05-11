@@ -6,7 +6,7 @@ import importlib
 from typing import Any
 
 from kestrel_sdk.tools.base import ToolCategory
-from kestrel_sdk.tools.result import ToolResult
+from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.features import (
     discover_entrypoint_feature_classes,
@@ -18,6 +18,8 @@ from kestrel_sovereign.features.feature_features.workflows import (
     DEFAULT_BRANCH,
     DEFAULT_PROMPT_PACK_CONSTRAINT,
     DEFAULT_REPOSITORY,
+    FEATURE_PROPOSE_PACKAGE_WORKFLOW_NAME,
+    FEATURE_PROPOSE_TOOL_WORKFLOW_NAME,
     feature_feature_workflow_payloads,
 )
 from kestrel_sovereign.features.feature_features.signals import (
@@ -124,6 +126,121 @@ class FeatureFeaturesFeature(Feature):
             data={"workflows": payloads},
         )
 
+    @tool(
+        name="feature_feature_define_workflows",
+        description=(
+            "Define and sign FeatureFeature workflow specs through WorkflowsFeature."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-define-workflows",
+    )
+    async def feature_feature_define_workflows(
+        self,
+        kind: str = "all",
+        repository: str = DEFAULT_REPOSITORY,
+        branch: str = DEFAULT_BRANCH,
+        prompt_pack_constraint: str = DEFAULT_PROMPT_PACK_CONSTRAINT,
+    ) -> ToolResult:
+        """Register FeatureFeature workflow definitions.
+
+        Args:
+            kind: all, tool, or package.
+            repository: GitHub repository used by the ci_green gate.
+            branch: Git branch used by the ci_green gate.
+            prompt_pack_constraint: Red-team prompt package version range.
+        """
+
+        workflow_feature = self._workflow_feature()
+        if workflow_feature is None:
+            return ToolResult.failed("WorkflowsFeature is not available")
+        try:
+            payloads = feature_feature_workflow_payloads(
+                kind=kind,  # type: ignore[arg-type]
+                repository=repository,
+                branch=branch,
+                prompt_pack_constraint=prompt_pack_constraint,
+            )
+        except ValueError as exc:
+            return ToolResult.failed(str(exc))
+
+        defined: list[dict[str, Any]] = []
+        for name, payload in payloads.items():
+            result = await workflow_feature.workflow_define(payload)
+            defined.append(
+                {
+                    "name": name,
+                    "status": result.status.value,
+                    "data": result.data,
+                    "error": result.error,
+                }
+            )
+            if result.status is not ToolResultStatus.OK:
+                return ToolResult.failed(
+                    f"Failed to define FeatureFeature workflow {name!r}: "
+                    f"{result.error}",
+                    data={"defined": defined},
+                )
+
+        return ToolResult.ok(
+            f"Defined {len(defined)} FeatureFeature workflow definition(s).",
+            data={"defined": defined},
+        )
+
+    @tool(
+        name="feature_feature_run",
+        description="Run a FeatureFeature workflow through WorkflowsFeature.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!feature-run",
+    )
+    async def feature_feature_run(
+        self,
+        kind: str,
+        params: dict,
+        version: int = 0,
+    ) -> ToolResult:
+        """Start a FeatureFeature workflow run.
+
+        Args:
+            kind: tool or package.
+            params: Workflow run parameters.
+            version: Specific workflow definition version, or latest active.
+        """
+
+        workflow_feature = self._workflow_feature()
+        if workflow_feature is None:
+            return ToolResult.failed("WorkflowsFeature is not available")
+        if not isinstance(params, dict):
+            return ToolResult.failed("FeatureFeature run params must be an object")
+
+        try:
+            workflow_name = _workflow_name_for_kind(kind)
+        except ValueError as exc:
+            return ToolResult.failed(str(exc))
+
+        return await workflow_feature.workflow_run(
+            workflow_name,
+            params=params,
+            version=version,
+        )
+
+    def _workflow_feature(self) -> Any:
+        features = getattr(self.agent, "features", None)
+        if not isinstance(features, dict):
+            return None
+        workflow = features.get("WorkflowsFeature")
+        if workflow is not None:
+            return workflow
+        for feature in features.values():
+            if (
+                feature.__class__.__name__ == "WorkflowsFeature"
+                or (
+                    hasattr(feature, "workflow_define")
+                    and hasattr(feature, "workflow_run")
+                )
+            ):
+                return feature
+        return None
+
 
 def _core_feature_inventory() -> list[dict[str, Any]]:
     rows = []
@@ -146,6 +263,14 @@ def _feature_module_name(module_path: str) -> str:
     if module_path.endswith(".feature"):
         return module_path.split(".")[-2]
     return module_path.split(".")[-1]
+
+
+def _workflow_name_for_kind(kind: str) -> str:
+    if kind == "tool":
+        return FEATURE_PROPOSE_TOOL_WORKFLOW_NAME
+    if kind == "package":
+        return FEATURE_PROPOSE_PACKAGE_WORKFLOW_NAME
+    raise ValueError("kind must be one of: tool, package")
 
 
 __all__ = ["FeatureFeaturesFeature"]
