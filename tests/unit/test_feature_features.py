@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from kestrel_sdk.signals import SignalMode
+from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
 from kestrel_sovereign.features.feature_features.feature import (
@@ -32,6 +33,34 @@ from kestrel_sovereign.features.workflows.models import (
 )
 from kestrel_sovereign.features.workflows.schema import validate_spec_payload
 from kestrel_sovereign.signals.registry import SourceRegistry
+
+
+def _mock_agent_tool(name: str, description: str = "mock tool"):
+    return SimpleNamespace(
+        name=name,
+        schema=ToolSchema(
+            name=name,
+            description=description,
+            category=ToolCategory.UTILITY,
+            parameters=[
+                ToolParameter(
+                    name="query",
+                    type="string",
+                    description="query",
+                )
+            ],
+        ),
+    )
+
+
+def _mock_feature(class_name: str, tool_name: str, tools: list):
+    cls = type(class_name, (), {})
+    feature = cls()
+    feature.name = class_name
+    feature.tool_name = tool_name
+    feature.tool_description = f"{class_name} description"
+    feature.get_tools = lambda: tools
+    return feature
 
 
 @pytest.mark.parametrize(
@@ -155,6 +184,159 @@ async def test_feature_features_define_workflows_uses_workflows_feature():
     assert result.data["defined"][0]["data"]["name"] == (
         FEATURE_PROPOSE_TOOL_WORKFLOW_NAME
     )
+
+
+@pytest.mark.asyncio
+async def test_feature_explore_can_include_loaded_tool_inventory():
+    model_feature = _mock_feature(
+        "ModelFeature",
+        "model_feature",
+        [_mock_agent_tool("list_models")],
+    )
+    agent = SimpleNamespace(features={"ModelFeature": model_feature})
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_explore(include_loaded_tools=True)
+
+    assert result.status is ToolResultStatus.OK
+    loaded = result.data["loaded_features"]
+    assert loaded[0]["class"] == "ModelFeature"
+    assert loaded[0]["tools"][0]["name"] == "list_models"
+    assert loaded[0]["tools"][0]["estimated_context_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_feature_context_status_reports_hidden_direct_tools():
+    agent = SimpleNamespace(
+        features={},
+        _direct_tools={"list_models": _mock_agent_tool("list_models")},
+        _tool_to_feature={"list_models": "model_feature"},
+        _tool_context_hidden_tools={"list_models"},
+        _tool_context_hidden_features=set(),
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_context_status()
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["counts"]["hidden_direct_tools"] == 1
+    assert result.data["direct_tools"][0]["visible_in_context"] is False
+
+
+@pytest.mark.asyncio
+async def test_feature_focus_keeps_selected_feature_and_control_surface():
+    model_feature = _mock_feature("ModelFeature", "model_feature", [])
+    memory_feature = _mock_feature("MemoryFeature", "memory_feature", [])
+    feature_feature_tool = _mock_agent_tool("feature_unfocus")
+    agent = SimpleNamespace(
+        features={
+            "FeatureFeaturesFeature": None,
+            "ModelFeature": model_feature,
+            "MemoryFeature": memory_feature,
+        },
+        _direct_tools={"feature_unfocus": feature_feature_tool},
+        _tool_to_feature={"feature_unfocus": "feature_features_feature"},
+    )
+    feature = FeatureFeaturesFeature(agent)
+    agent.features["FeatureFeaturesFeature"] = feature
+
+    result = await feature.feature_focus(features=["ModelFeature"])
+
+    assert result.status is ToolResultStatus.OK
+    hidden = set(result.data["profile"]["hidden_features"])
+    assert "memory_feature" in hidden
+    assert "model_feature" not in hidden
+    assert "feature_features_feature" not in hidden
+    assert "feature_unfocus" not in result.data["profile"]["hidden_tools"]
+
+
+@pytest.mark.asyncio
+async def test_feature_focus_accepts_schema_advertised_string_targets():
+    model_feature = _mock_feature("ModelFeature", "model_feature", [])
+    memory_feature = _mock_feature("MemoryFeature", "memory_feature", [])
+    agent = SimpleNamespace(
+        features={
+            "ModelFeature": model_feature,
+            "MemoryFeature": memory_feature,
+        }
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_focus(features="ModelFeature")
+
+    assert result.status is ToolResultStatus.OK
+    hidden = set(result.data["profile"]["hidden_features"])
+    assert "memory_feature" in hidden
+    assert "model_feature" not in hidden
+
+
+@pytest.mark.asyncio
+async def test_feature_focus_on_tool_keeps_owning_feature_unhidden():
+    model_feature = _mock_feature("ModelFeature", "model_feature", [])
+    memory_feature = _mock_feature("MemoryFeature", "memory_feature", [])
+    agent = SimpleNamespace(
+        features={
+            "ModelFeature": model_feature,
+            "MemoryFeature": memory_feature,
+        },
+        _direct_tools={"list_models": _mock_agent_tool("list_models")},
+        _tool_to_feature={"list_models": "model_feature"},
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_focus(tools=["list_models"])
+
+    hidden = set(result.data["profile"]["hidden_features"])
+    assert "model_feature" not in hidden
+    assert "memory_feature" in hidden
+    assert result.data["direct_tools"][0]["visible_in_context"] is True
+
+
+@pytest.mark.asyncio
+async def test_feature_unfocus_hides_and_resets_context_profile():
+    model_feature = _mock_feature("ModelFeature", "model_feature", [])
+    agent = SimpleNamespace(features={"ModelFeature": model_feature})
+    feature = FeatureFeaturesFeature(agent)
+
+    hidden = await feature.feature_unfocus(features=["ModelFeature"])
+    reset = await feature.feature_unfocus(reset=True)
+
+    assert hidden.status is ToolResultStatus.OK
+    assert hidden.data["profile"]["hidden_features"] == ["model_feature"]
+    assert reset.status is ToolResultStatus.OK
+    assert reset.data["profile"]["hidden_features"] == []
+
+
+@pytest.mark.asyncio
+async def test_feature_unfocus_parses_schema_advertised_reset_string():
+    model_feature = _mock_feature("ModelFeature", "model_feature", [])
+    agent = SimpleNamespace(features={"ModelFeature": model_feature})
+    feature = FeatureFeaturesFeature(agent)
+
+    false_reset = await feature.feature_unfocus(reset="false")
+    await feature.feature_unfocus(features="ModelFeature")
+    true_reset = await feature.feature_unfocus(reset="true")
+
+    assert false_reset.status is ToolResultStatus.ERROR
+    assert false_reset.error == "Provide features/tools to hide, or reset=True."
+    assert true_reset.status is ToolResultStatus.OK
+    assert true_reset.data["profile"]["hidden_features"] == []
+
+
+@pytest.mark.asyncio
+async def test_feature_focus_refreshes_cached_feature_prompt():
+    model_feature = _mock_feature("ModelFeature", "model_feature", [])
+    agent = SimpleNamespace(
+        features={"ModelFeature": model_feature},
+        _cached_features_prompt="stale",
+    )
+    agent._build_features_prompt_section = lambda: "fresh"
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_focus(features="ModelFeature")
+
+    assert result.status is ToolResultStatus.OK
+    assert agent._cached_features_prompt == "fresh"
 
 
 @pytest.mark.asyncio

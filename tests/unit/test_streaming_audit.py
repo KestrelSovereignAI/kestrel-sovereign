@@ -150,6 +150,12 @@ class TestRealStreaming:
             '_prune_orchestrator_messages',
             '_build_all_tools',
             '_build_feature_tools',
+            '_visible_features_by_tool_name',
+            '_visible_known_tool_names',
+            '_hidden_context_features',
+            '_hidden_context_tools',
+            '_feature_hidden_from_context',
+            '_direct_tool_hidden_from_context',
         ):
             setattr(mock_agent, method_name,
                     getattr(KestrelAgent, method_name).__get__(mock_agent))

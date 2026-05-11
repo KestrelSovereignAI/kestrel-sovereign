@@ -948,31 +948,17 @@ class OrchestratorEngineMixin:
             assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
         messages.append(assistant_msg)
 
-        features_by_tool_name = {f.tool_name: f for f in self.features.values()}
-        known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
-        # Also accept direct calls to each feature's @tool-decorated sub-tools
-        # (e.g. ``get_current_model`` under the ModelAgent feature). Without
-        # this, the top-level LLM sees a sub-tool in the exposed tool list,
-        # emits a call by that name, the guardrail silently rejects it, and
-        # the agent hallucinates a "result" from training data.
-        for _feat in self.features.values():
-            if hasattr(_feat, "get_tools"):
-                try:
-                    for _t in _feat.get_tools():
-                        known_tools.add(_t.name)
-                except Exception:
-                    pass
-
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
             max_low_delta=KESTREL_MAX_LOW_DELTA,
             budget_stop_pct=KESTREL_BUDGET_STOP_PCT,
         )
-
         for iteration in range(max_iterations):
             if iteration >= max_iterations * 0.8:
                 logging.warning(f"[ORCHESTRATOR] Approaching max iterations: {iteration + 1}/{max_iterations}")
 
+            features_by_tool_name = self._visible_features_by_tool_name()
+            known_tools = self._visible_known_tool_names()
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
@@ -1138,32 +1124,18 @@ class OrchestratorEngineMixin:
             assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
         messages.append(assistant_msg)
 
-        features_by_tool_name = {f.tool_name: f for f in self.features.values()}
-        known_tools = set(features_by_tool_name.keys()) | set(self._direct_tools.keys())
-        # Also accept direct calls to each feature's @tool-decorated sub-tools
-        # (e.g. ``get_current_model`` under the ModelAgent feature). Without
-        # this, the top-level LLM sees a sub-tool in the exposed tool list,
-        # emits a call by that name, the guardrail silently rejects it, and
-        # the agent hallucinates a "result" from training data.
-        for _feat in self.features.values():
-            if hasattr(_feat, "get_tools"):
-                try:
-                    for _t in _feat.get_tools():
-                        known_tools.add(_t.name)
-                except Exception:
-                    pass
-
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
             max_low_delta=KESTREL_MAX_LOW_DELTA,
             budget_stop_pct=KESTREL_BUDGET_STOP_PCT,
         )
-
         for iteration in range(max_iterations):
             # Stream tool names for user visibility
             for tc in response.tool_calls:
                 yield f"\U0001f527 Calling {tc.name}...\n"
 
+            features_by_tool_name = self._visible_features_by_tool_name()
+            known_tools = self._visible_known_tool_names()
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
