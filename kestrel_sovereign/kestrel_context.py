@@ -10,7 +10,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -28,16 +28,33 @@ class KestrelContextLoader:
     # Essential docs referenced in AGENTS.md
     ESSENTIAL_DOCS = [
         "docs/PROJECT_VISION.md",
-        "docs/principles/KESTREL_CONSTITUTION.md", 
+        "docs/principles/KESTREL_CONSTITUTION.md",
         "docs/principles/US_CONSTITUTION.md",
-        "docs/architecture/FEATURE_AGENT_FRAMEWORK.md",
-        "docs/architecture/PRIVACY_MODES.md",
-        "docs/architecture/CRYPTOGRAPHIC_ANCHORING.md",
+        "docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md",
+        "docs/architecture/security/PRIVACY_MODES.md",
+        "docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md",
         "docs/GETTING_STARTED.md",
     ]
-def __init__(self, project_path: str = "."):
+
+    # Historical "platform extension" support was present in the initial
+    # import, but its condition and document list were missing. Keep the mode
+    # explicit so callers can opt in with a concrete list instead of relying on
+    # accidental path detection.
+    EXTENSION_DOCS: Sequence[str] = ()
+
+    def __init__(
+        self,
+        project_path: str = ".",
+        *,
+        platform_extension: bool = False,
+        extension_docs: Optional[Sequence[str]] = None,
+    ):
         self.project_path = Path(project_path).resolve()
-                self.context = {}
+        self.platform_extension = platform_extension
+        self.extension_docs = tuple(
+            self.EXTENSION_DOCS if extension_docs is None else extension_docs
+        )
+        self.context = {}
         self.files_loaded = []
         
     def load_file(self, filepath: str) -> Optional[str]:
@@ -70,9 +87,12 @@ def __init__(self, project_path: str = "."):
                 self.context[doc_path] = content
                 print(f"✅ Loaded {doc_path} ({len(content)} chars)", file=sys.stderr)
         
-        # Load extension docs if working on platform extension
-            print("🎯 Detected platform extension context - loading extension documentation", file=sys.stderr)
-            for doc_path in self.EXTENSION_DOCS:
+        if self.platform_extension:
+            print(
+                "🎯 Platform extension context enabled - loading extension documentation",
+                file=sys.stderr,
+            )
+            for doc_path in self.extension_docs:
                 content = self.load_file(doc_path)
                 if content:
                     self.context[doc_path] = content
@@ -117,6 +137,7 @@ def __init__(self, project_path: str = "."):
         prompt_parts.append("# Kestrel Project Context")
         prompt_parts.append(f"## Session Started: {datetime.now().isoformat()}")
         prompt_parts.append(f"## Working Directory: {self.project_path}")
+        if self.platform_extension:
             prompt_parts.append("## Mode: Platform Extension")
         
         prompt_parts.append("")
@@ -148,6 +169,7 @@ def __init__(self, project_path: str = "."):
         prompt_parts.append("- PROJECT_STATUS.md contains current dynamic state and issues")
         prompt_parts.append("- The constitutional documents provide governance principles")
         prompt_parts.append("- Architecture docs explain the technical implementation")
+        if self.platform_extension:
             prompt_parts.append("- You are working on the platform extension")
             prompt_parts.append("- Extension PRD and database schema have been loaded")
         
@@ -223,9 +245,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  kestrel-claude                    # Launch with full context
-  kestrel-claude --dry-run          # Preview what would be loaded
-  kestrel-claude "fix the bug in storage.py"  # Launch with specific task
+  python kestrel_sovereign/kestrel_context.py
+  python kestrel_sovereign/kestrel_context.py --dry-run
+  python kestrel_sovereign/kestrel_context.py "fix the bug in storage.py"
         """
     )
     
@@ -246,14 +268,29 @@ Examples:
         default=".",
         help="Project path (default: current directory)"
     )
-    
+
+    parser.add_argument(
+        "--platform-extension",
+        action="store_true",
+        help="Include platform-extension mode markers and extension docs"
+    )
+
+    parser.add_argument(
+        "--extension-doc",
+        action="append",
+        default=[],
+        help="Extension documentation path to include; may be repeated"
+    )
+
     args = parser.parse_args()
-    
+
     # Create loader
-    loader = KestrelContextLoader(args.path)
-    
-    # Override extension detection if requested
-    
+    loader = KestrelContextLoader(
+        args.path,
+        platform_extension=args.platform_extension,
+        extension_docs=args.extension_doc,
+    )
+
     # Launch Claude
     loader.launch_claude(task=args.task, dry_run=args.dry_run)
 

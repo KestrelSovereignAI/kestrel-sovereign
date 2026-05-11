@@ -590,7 +590,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/kestrel_config/constants.py** — Kestrel Configuration Constants.
 - **kestrel_sovereign/kestrel_config/defaults.py** — Default configuration values for Kestrel.
 - **kestrel_sovereign/kestrel_config/timeouts.py** — Timeout and interval configuration for Kestrel.
-- **kestrel_sovereign/kestrel_context.py** — (unparseable Python source)
+- **kestrel_sovereign/kestrel_context.py** — Kestrel Context Loader for Claude Code.
 - **kestrel_sovereign/kestrel_types/__init__.py** — Type definitions and protocols for Kestrel.
 - **kestrel_sovereign/kestrel_types/agent_types.py** — Agent Protocol definitions.
   - `class AgentProtocol`
