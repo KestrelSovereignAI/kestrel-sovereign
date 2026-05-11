@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from kestrel_sovereign.features.feature_features.workflows import (
     FEATURE_FEATURES_COMPENSATION_SOURCES,
     FEATURE_FEATURES_REVIEWER_SOURCES,
     FEATURE_FEATURES_STAGE_ORDER,
+    FEATURE_FEATURES_STAGE_SOURCES,
     FEATURE_PROPOSE_PACKAGE_WORKFLOW_NAME,
     FEATURE_PROPOSE_TOOL_WORKFLOW_NAME,
     feature_feature_workflow_payloads,
@@ -229,6 +231,133 @@ async def test_feature_features_run_rejects_unknown_kind_and_non_object_params()
 
     assert bad_kind.status is ToolResultStatus.ERROR
     assert bad_params.status is ToolResultStatus.ERROR
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_reports_missing_action_providers():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["missing_registered"] == []
+    assert "feature_features.file_github_epic" in (
+        result.data["missing_action_providers"]
+    )
+    explore = next(
+        row
+        for row in result.data["sources"]
+        if row["name"] == "feature_features.explore"
+    )
+    assert explore["ready"] is True
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_passes_with_registered_providers():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    for source in (
+        *FEATURE_FEATURES_STAGE_SOURCES.values(),
+        *FEATURE_FEATURES_COMPENSATION_SOURCES.values(),
+    ):
+        stage = source.split(".")[-1]
+        if stage in {"explore", "design_plan", "constitutional_review"}:
+            continue
+
+        async def provider(payload, *, stage=stage):
+            return {"status": "ok", "stage": stage, "payload": payload}
+
+        setattr(agent, f"feature_feature_{stage}", provider)
+
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["ready"] is True
+    assert result.data["missing_action_providers"] == []
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_accepts_pre_registered_handler():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    registration = next(
+        reg
+        for reg in build_feature_feature_registrations(agent)
+        if reg.name == "feature_features.file_github_epic"
+    )
+
+    async def handler(payload):
+        return {"status": "ok", "payload": payload}
+
+    registry.register(replace(registration, handler=handler))
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await feature.feature_feature_runtime_status()
+
+    row = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.file_github_epic"
+    )
+    assert row["registered_handler"] is True
+    assert "feature_features.file_github_epic" not in (
+        result.data["missing_action_providers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_rejects_required_explore_handler():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    registration = next(
+        reg
+        for reg in build_feature_feature_registrations(agent)
+        if reg.name == "feature_features.explore"
+    )
+
+    async def handler(payload):
+        return {"status": "ok", "payload": payload}
+
+    setattr(handler, "_feature_feature_requires_agent_provider", True)
+    registry.register(replace(registration, handler=handler))
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await feature.feature_feature_runtime_status()
+
+    assert "feature_features.explore" in (
+        result.data["missing_action_providers"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_reports_missing_prompt(tmp_path):
+    registry = SourceRegistry()
+    agent = SimpleNamespace(signal_registry=registry)
+    registration = next(
+        reg
+        for reg in build_feature_feature_registrations(agent)
+        if reg.name == "feature_features.design_plan"
+    )
+    registry.register(
+        replace(registration, prompt_template=tmp_path / "missing.md")
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "feature_features.design_plan" in (
+        result.data["missing_cognition_prompts"]
+    )
 
 
 @pytest.mark.asyncio

@@ -154,6 +154,7 @@ def _agent_handler(
             result = await result
         return result
 
+    setattr(handler, "_feature_feature_requires_agent_provider", required)
     return handler
 
 
@@ -175,6 +176,7 @@ def _explore_handler(agent: Any) -> ActionHandler:
             "payload": dict(payload),
         }
 
+    setattr(handler, "_feature_feature_default_handler", True)
     return handler
 
 
