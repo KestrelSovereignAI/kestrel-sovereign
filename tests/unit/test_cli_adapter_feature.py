@@ -11,7 +11,7 @@ import pytest
 from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.features import discover_feature_modules
-from kestrel_sovereign.features.cli.adapters import GitHubCliAdapter
+from kestrel_sovereign.features.cli.adapters import GitCliAdapter, GitHubCliAdapter
 from kestrel_sovereign.features.cli.feature import CliFeature
 from kestrel_sovereign.features.cli.terminal import (
     CliRisk,
@@ -56,6 +56,10 @@ def _result(stdout: str = "", stderr: str = "", returncode: int = 0) -> Terminal
     )
 
 
+def _allow_repo_root(monkeypatch: pytest.MonkeyPatch, path) -> None:
+    monkeypatch.setenv("KESTREL_CLI_ALLOWED_REPO_ROOTS", str(path))
+
+
 @pytest.mark.asyncio
 async def test_github_pr_view_uses_registered_read_only_gh_command():
     payload = {
@@ -82,6 +86,172 @@ async def test_github_pr_view_uses_registered_read_only_gh_command():
     assert "--json" in request.argv
     assert "headRefOid" in request.argv[-1]
     assert "statusCheckRollup" in request.argv[-1]
+
+
+@pytest.mark.asyncio
+async def test_git_status_uses_registered_read_only_git_command(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    terminal = FakeTerminal([_result(stdout="## main...origin/main\n M app.py\n")])
+    adapter = GitCliAdapter(terminal)  # type: ignore[arg-type]
+
+    parsed = await adapter.status(repo_path=str(tmp_path))
+
+    assert parsed["status"].startswith("## main")
+    request = terminal.requests[0]
+    assert request.risk is CliRisk.READ_ONLY
+    assert request.command_id == "git.status"
+    assert request.argv == [
+        "git",
+        "--no-optional-locks",
+        "-C",
+        str(tmp_path.resolve()),
+        "status",
+        "--short",
+        "--branch",
+    ]
+    assert request.env["GIT_OPTIONAL_LOCKS"] == "0"
+    assert request.env["GIT_EXTERNAL_DIFF"] == ""
+
+
+@pytest.mark.asyncio
+async def test_git_diff_validates_ref_and_path_before_argv(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    terminal = FakeTerminal([_result(stdout="diff --git a/app.py b/app.py\n")])
+    adapter = GitCliAdapter(terminal)  # type: ignore[arg-type]
+
+    parsed = await adapter.diff(
+        repo_path=str(tmp_path),
+        ref="HEAD~1",
+        path="src/app.py",
+    )
+
+    assert parsed["diff"].startswith("diff --git")
+    assert terminal.requests[0].argv == [
+        "git",
+        "--no-optional-locks",
+        "-C",
+        str(tmp_path.resolve()),
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "HEAD~1",
+        "--",
+        "src/app.py",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_git_log_caps_max_count(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    terminal = FakeTerminal([_result(stdout="abc1234 subject\n")])
+    adapter = GitCliAdapter(terminal)  # type: ignore[arg-type]
+
+    parsed = await adapter.log(repo_path=str(tmp_path), max_count="500")
+
+    assert parsed["max_count"] == 100
+    assert terminal.requests[0].argv[-2:] == ["--max-count", "100"]
+
+
+@pytest.mark.asyncio
+async def test_git_show_file_and_merge_base_build_safe_argv(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    terminal = FakeTerminal(
+        [_result(stdout="file content\n"), _result(stdout="abc123\n")]
+    )
+    adapter = GitCliAdapter(terminal)  # type: ignore[arg-type]
+
+    file_payload = await adapter.show_file(
+        repo_path=str(tmp_path),
+        ref="HEAD",
+        path="docs/readme.md",
+    )
+    merge_payload = await adapter.merge_base(
+        repo_path=str(tmp_path),
+        left_ref="main",
+        right_ref="feature/test",
+    )
+
+    assert file_payload["content"] == "file content\n"
+    assert merge_payload["merge_base"] == "abc123"
+    assert terminal.requests[0].argv == [
+        "git",
+        "--no-optional-locks",
+        "-C",
+        str(tmp_path.resolve()),
+        "show",
+        "HEAD:docs/readme.md",
+    ]
+    assert terminal.requests[1].argv == [
+        "git",
+        "--no-optional-locks",
+        "-C",
+        str(tmp_path.resolve()),
+        "merge-base",
+        "main",
+        "feature/test",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_git_adapter_rejects_unsafe_refs_paths_and_missing_repo(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    adapter = GitCliAdapter(FakeTerminal())  # type: ignore[arg-type]
+
+    with pytest.raises(Exception, match="revision ranges"):
+        await adapter.diff(repo_path=str(tmp_path), ref="main..feature")
+
+    with pytest.raises(Exception, match="safe git ref"):
+        await adapter.diff(repo_path=str(tmp_path), ref="--cached")
+
+    with pytest.raises(Exception, match="path"):
+        await adapter.show_file(repo_path=str(tmp_path), ref="HEAD", path="../secret")
+
+    with pytest.raises(Exception, match="existing local directory"):
+        await adapter.status(repo_path=str(tmp_path / "missing"))
+
+
+@pytest.mark.asyncio
+async def test_git_adapter_rejects_repos_outside_allowed_roots(tmp_path, monkeypatch):
+    allowed = tmp_path / "allowed"
+    other = tmp_path / "other"
+    allowed.mkdir()
+    other.mkdir()
+    _allow_repo_root(monkeypatch, allowed)
+    adapter = GitCliAdapter(FakeTerminal())  # type: ignore[arg-type]
+
+    with pytest.raises(Exception, match="allowed root"):
+        await adapter.status(repo_path=str(other))
+
+
+@pytest.mark.asyncio
+async def test_git_adapter_redacts_failures_and_rejects_truncation(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    nonzero = GitCliAdapter(
+        FakeTerminal(
+            [_result(stderr="token: ghp_abcdefghijklmnopqrstuvwxyz123456", returncode=1)]
+        )
+    )  # type: ignore[arg-type]
+    truncated = GitCliAdapter(
+        FakeTerminal(
+            [
+                TerminalCommandResult(
+                    argv=["git"],
+                    returncode=0,
+                    stdout="partial diff",
+                    stderr="",
+                    duration_ms=1,
+                    truncated_stdout=True,
+                )
+            ]
+        )
+    )  # type: ignore[arg-type]
+
+    with pytest.raises(Exception) as nonzero_exc:
+        await nonzero.status(repo_path=str(tmp_path))
+    assert "ghp_abcdefghijklmnopqrstuvwxyz123456" not in str(nonzero_exc.value)
+
+    with pytest.raises(Exception, match="capture limit"):
+        await truncated.diff(repo_path=str(tmp_path))
 
 
 @pytest.mark.asyncio
@@ -350,6 +520,46 @@ async def test_cli_feature_exposes_status_and_github_pr_tool():
 
 
 @pytest.mark.asyncio
+async def test_cli_feature_exposes_git_helper_tools(tmp_path, monkeypatch):
+    _allow_repo_root(monkeypatch, tmp_path)
+    feature = CliFeature(Mock())
+    terminal = FakeTerminal(
+        [
+            _result(stdout="## main\n"),
+            _result(stdout="diff --git a/app.py b/app.py\n"),
+            _result(stdout="abc123 subject\n"),
+            _result(stdout="file content\n"),
+            _result(stdout="abc123\n"),
+        ]
+    )
+    feature.terminal = terminal  # type: ignore[assignment]
+    feature.adapters = {"git": GitCliAdapter(terminal)}  # type: ignore[arg-type]
+
+    status = await feature.git_status(repo_path=str(tmp_path))
+    diff = await feature.git_diff(repo_path=str(tmp_path))
+    log = await feature.git_log(repo_path=str(tmp_path), max_count=3)
+    file_payload = await feature.git_show_file(
+        repo_path=str(tmp_path),
+        ref="HEAD",
+        path="README.md",
+    )
+    merge_base = await feature.git_merge_base(
+        repo_path=str(tmp_path),
+        left_ref="main",
+        right_ref="feature/test",
+    )
+
+    assert status.status is ToolResultStatus.OK
+    assert diff.status is ToolResultStatus.OK
+    assert log.status is ToolResultStatus.OK
+    assert file_payload.status is ToolResultStatus.OK
+    assert merge_base.status is ToolResultStatus.OK
+    assert status.data["status"] == "## main\n"
+    assert file_payload.data["content"] == "file content\n"
+    assert merge_base.data["merge_base"] == "abc123"
+
+
+@pytest.mark.asyncio
 async def test_cli_feature_exposes_pr_review_helper_tools():
     pr_payload = {
         "number": 42,
@@ -453,6 +663,32 @@ def test_cli_command_prefixes_parse_positional_args():
         "max_files": "3",
         "max_file_bytes": "1000",
     }
+    assert tools["git_status"].parse_command_args("!git-status") == {
+        "repo_path": ".",
+    }
+    assert tools["git_diff"].parse_command_args("!git-diff HEAD src/app.py") == {
+        "ref": "HEAD",
+        "path": "src/app.py",
+        "repo_path": ".",
+    }
+    assert tools["git_log"].parse_command_args("!git-log 5") == {
+        "max_count": "5",
+        "repo_path": ".",
+    }
+    assert tools["git_show_file"].parse_command_args(
+        "!git-show-file HEAD README.md"
+    ) == {
+        "ref": "HEAD",
+        "path": "README.md",
+        "repo_path": ".",
+    }
+    assert tools["git_merge_base"].parse_command_args(
+        "!git-merge-base main feature/test"
+    ) == {
+        "left_ref": "main",
+        "right_ref": "feature/test",
+        "repo_path": ".",
+    }
 
 
 def test_cli_status_lists_pr_review_helper_commands():
@@ -465,6 +701,17 @@ def test_cli_status_lists_pr_review_helper_commands():
     assert "github.pr_checks" in github_commands
     assert "github.read_file_at_pr_head" in github_commands
     assert "github.pr_review_context" in github_commands
+
+
+def test_cli_status_lists_git_helper_commands():
+    feature = CliFeature(Mock())
+    git_commands = {command.command_id for command in feature.adapters["git"].commands}
+
+    assert "git.status" in git_commands
+    assert "git.diff" in git_commands
+    assert "git.log" in git_commands
+    assert "git.show_file" in git_commands
+    assert "git.merge_base" in git_commands
 
 
 def test_cli_feature_is_discoverable():

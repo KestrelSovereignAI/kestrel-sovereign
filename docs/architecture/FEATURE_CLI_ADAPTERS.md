@@ -1,13 +1,15 @@
 # Feature-Owned CLI Adapters
 
-> Status: **Active**. Introduced by [#1185](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1185)
-> and extended by [#1192](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1192).
+> Status: **Active**. Introduced by [#1185](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1185),
+> extended by [#1192](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1192),
+> and piloted for local `git` inspection after [#1206](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1206).
 
 Feature-owned CLI adapters let Kestrel features use installed command-line
 tools through a shared terminal substrate while reusing the user's existing
-CLI authentication. GitHub PR review through `gh` is the reference adapter,
-but the pattern is intentionally broader: `git`, cloud CLIs, package-manager
-CLIs, and coding CLIs can all use the same contract.
+CLI authentication. GitHub PR review through `gh` and local repository
+inspection through `git` are the reference adapters, but the pattern is
+intentionally broader: cloud CLIs, package-manager CLIs, and coding CLIs can
+all use the same contract.
 
 This is not arbitrary shell access. A feature exposes explicit adapter
 methods, each method builds an argument vector for a known command, and tools
@@ -195,7 +197,7 @@ Every adapter should cover:
 - command-prefix positional parsing works for every exposed `!command`
 - missing or malformed CLI payloads fail closed
 
-## Reference GitHub Adapter
+## Reference Adapters
 
 The GitHub adapter exposes the current reference pattern:
 
@@ -213,15 +215,24 @@ rollups, and bounded file contents through the user's authenticated `gh`
 session. That closes the original PR-review gap without giving the model a
 general-purpose terminal.
 
+The local `git` adapter pilots the same pattern for read-only repository
+inspection:
+
+- `git_status`
+- `git_diff`
+- `git_log`
+- `git_show_file`
+- `git_merge_base`
+
+These tools validate local repository paths, refs, and pathspecs before
+constructing argv. Pathspecs are separated with `--` where the command grammar
+allows it, and revision ranges are rejected for the initial read-only surface.
+The adapter also disables optional git locks and external diff/textconv hooks
+for diff reads. Local repository paths are constrained to the current process
+working directory plus any roots configured through
+`KESTREL_CLI_ALLOWED_REPO_ROOTS`.
+
 ## Future Work
-
-The next read-only adapter should probably be local `git`:
-
-- `git status --short --branch`
-- `git diff`
-- `git log`
-- `git show <ref>:<path>`
-- `git merge-base`
 
 Before adding mutating commands such as `git fetch`, `gh pr merge`, cloud
 deploys, or package publishes, add an explicit approval and audit path for
