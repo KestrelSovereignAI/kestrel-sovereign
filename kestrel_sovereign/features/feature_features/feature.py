@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import inspect
 import json
+import math
 import os
 import shlex
 from pathlib import Path
@@ -96,6 +97,17 @@ class FeatureFeaturesFeature(Feature):
             setattr(
                 self.agent,
                 "feature_feature_assign_talon_chunks_requires_talon",
+                True,
+            )
+        if getattr(self.agent, "feature_feature_implement_chunks", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_implement_chunks",
+                self._feature_feature_implement_chunks,
+            )
+            setattr(
+                self.agent,
+                "feature_feature_implement_chunks_requires_talon",
                 True,
             )
         if getattr(self.agent, "feature_feature_tests_pass", None) is None:
@@ -230,6 +242,71 @@ class FeatureFeaturesFeature(Feature):
             "repository": repository,
             "issues": issue_numbers,
             "dispatches": dispatches,
+        }
+
+    async def _feature_feature_implement_chunks(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Verify Talon-dispatched implementation chunks have finished."""
+
+        talon = _talon_feature(self.agent)
+        if talon is None or not callable(getattr(talon, "talon_status", None)):
+            raise RuntimeError("TalonCoordinatorFeature.talon_status is not available")
+
+        expected_job_ids = _talon_job_ids(payload)
+        if not expected_job_ids:
+            raise RuntimeError(
+                "talon_job_ids or talon_dispatches is required to verify chunks"
+            )
+
+        wait_seconds = _talon_wait_seconds(payload)
+        poll_seconds = _talon_poll_seconds(payload)
+        deadline = asyncio.get_running_loop().time() + wait_seconds
+        while True:
+            status_result = await talon.talon_status()
+            if getattr(status_result, "status", None) is not ToolResultStatus.OK:
+                raise RuntimeError(
+                    getattr(status_result, "error", None)
+                    or getattr(status_result, "confirmation", None)
+                    or "talon_status failed"
+                )
+            status_data = getattr(status_result, "data", None)
+            jobs = status_data.get("jobs") if isinstance(status_data, dict) else None
+            if not isinstance(jobs, list):
+                raise RuntimeError("talon_status response missing jobs list")
+
+            matching_jobs, missing, running, failed, complete = _talon_job_state(
+                jobs,
+                expected_job_ids,
+            )
+            if failed:
+                raise RuntimeError(
+                    "Talon chunks failed "
+                    f"(complete={len(complete)}/{len(expected_job_ids)}, "
+                    f"running={len(running)}, failed={len(failed)}, "
+                    f"missing={len(missing)})"
+                )
+            if not missing and not running and len(complete) == len(expected_job_ids):
+                break
+            now = asyncio.get_running_loop().time()
+            if now >= deadline:
+                raise RuntimeError(
+                    "Timed out waiting for Talon chunks "
+                    f"(complete={len(complete)}/{len(expected_job_ids)}, "
+                    f"running={len(running)}, failed={len(failed)}, "
+                    f"missing={len(missing)})"
+                )
+            await asyncio.sleep(min(poll_seconds, max(0.0, deadline - now)))
+
+        return {
+            "status": "ok",
+            "talon_job_ids": expected_job_ids,
+            "completed": len(complete),
+            "running": 0,
+            "failed": 0,
+            "missing": [],
+            "jobs": matching_jobs,
         }
 
     async def _feature_feature_tests_pass(
@@ -2249,6 +2326,117 @@ def _talon_issue_numbers(payload: dict[str, Any]) -> list[int]:
                 numbers.append(value)
                 break
     return list(dict.fromkeys(numbers))
+
+
+def _talon_job_ids(payload: dict[str, Any]) -> list[str]:
+    job_ids: list[str] = []
+    for key in ("talon_job_id", "job_id", "message_id"):
+        value = _payload_string(payload, key)
+        if value is not None:
+            job_ids.append(value)
+    for key in ("talon_job_ids", "job_ids"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            value = [item.strip() for item in value.split(",")]
+        if not isinstance(value, (list, tuple)):
+            continue
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                job_ids.append(item.strip())
+    for dispatch in _talon_dispatches(payload):
+        for key in ("job_id", "message_id"):
+            value = dispatch.get(key)
+            if isinstance(value, str) and value.strip():
+                job_ids.append(value.strip())
+                break
+    return list(dict.fromkeys(job_ids))
+
+
+def _talon_dispatches(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    dispatches = payload.get("talon_dispatches", payload.get("dispatches"))
+    if not isinstance(dispatches, list):
+        return []
+    return [item for item in dispatches if isinstance(item, dict)]
+
+
+def _talon_wait_seconds(payload: dict[str, Any]) -> float:
+    value = payload.get("talon_wait_seconds")
+    if value is None:
+        value = payload.get("talon_timeout_seconds")
+    if value is None:
+        value = os.environ.get("KESTREL_FEATURE_FEATURE_TALON_WAIT_SECONDS")
+    return _bounded_float(value, default=1800.0, minimum=0.0, maximum=86400.0)
+
+
+def _talon_poll_seconds(payload: dict[str, Any]) -> float:
+    value = payload.get("talon_poll_seconds")
+    if value is None:
+        value = payload.get("talon_poll_interval_seconds")
+    if value is None:
+        value = os.environ.get("KESTREL_FEATURE_FEATURE_TALON_POLL_SECONDS")
+    return _bounded_float(value, default=15.0, minimum=0.1, maximum=3600.0)
+
+
+def _bounded_float(
+    value: Any,
+    *,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            candidate = float(value)
+        except ValueError:
+            return default
+    else:
+        return default
+    if not math.isfinite(candidate):
+        return default
+    return max(minimum, min(maximum, candidate))
+
+
+def _talon_job_state(
+    jobs: list[Any],
+    expected_job_ids: list[str],
+) -> tuple[
+    list[dict[str, Any]],
+    list[str],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    jobs_by_id = {
+        str(job["id"]): job
+        for job in jobs
+        if isinstance(job, dict) and isinstance(job.get("id"), str)
+    }
+    matching_jobs = [
+        jobs_by_id[job_id]
+        for job_id in expected_job_ids
+        if job_id in jobs_by_id
+    ]
+    missing = [job_id for job_id in expected_job_ids if job_id not in jobs_by_id]
+    running = [
+        job
+        for job in matching_jobs
+        if str(job.get("status")) in {"dispatched", "running"}
+    ]
+    failed = [
+        job
+        for job in matching_jobs
+        if str(job.get("status")) in {"failed", "reject"}
+    ]
+    complete = [
+        job
+        for job in matching_jobs
+        if str(job.get("status")) == "complete"
+    ]
+    return matching_jobs, missing, running, failed, complete
 
 
 def _iter_issue_candidates(value: Any) -> list[Any]:

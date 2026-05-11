@@ -3731,10 +3731,12 @@ def _stage_payload_includes_workflow_metadata(stage: Stage) -> bool:
 
 
 def _stage_output_run_params(stage: Stage, result: Any) -> dict[str, Any]:
-    if stage.signal_source != "feature_features.file_github_epic":
-        return {}
     action_result = getattr(result, "action_result", None)
     if not isinstance(action_result, dict):
+        return {}
+    if stage.signal_source == "feature_features.assign_talon_chunks":
+        return _feature_feature_talon_output_params(action_result)
+    if stage.signal_source != "feature_features.file_github_epic":
         return {}
     output: dict[str, Any] = {}
     issue_number = action_result.get("issue_number")
@@ -3743,6 +3745,36 @@ def _stage_output_run_params(stage: Stage, result: Any) -> dict[str, Any]:
     issue_url = action_result.get("issue_url")
     if isinstance(issue_url, str) and issue_url.strip():
         output["issue_url"] = issue_url.strip()
+    return output
+
+
+def _feature_feature_talon_output_params(
+    action_result: Mapping[str, Any]
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    dispatches = action_result.get("dispatches")
+    if isinstance(dispatches, list):
+        clean_dispatches = [item for item in dispatches if isinstance(item, dict)]
+        if clean_dispatches:
+            output["talon_dispatches"] = clean_dispatches
+            job_ids: list[str] = []
+            for dispatch in clean_dispatches:
+                for key in ("job_id", "message_id"):
+                    value = dispatch.get(key)
+                    if isinstance(value, str) and value.strip():
+                        job_ids.append(value.strip())
+                        break
+            if job_ids:
+                output["talon_job_ids"] = list(dict.fromkeys(job_ids))
+    issues = action_result.get("issues")
+    if isinstance(issues, list):
+        clean_issues = [
+            issue
+            for issue in issues
+            if isinstance(issue, int) and not isinstance(issue, bool)
+        ]
+        if clean_issues:
+            output["talon_issue_numbers"] = clean_issues
     return output
 
 

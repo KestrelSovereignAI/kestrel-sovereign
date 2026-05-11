@@ -395,6 +395,69 @@ async def test_runner_persists_feature_feature_epic_issue_for_next_stage(
 
 
 @pytest.mark.asyncio
+async def test_runner_persists_feature_feature_talon_jobs_for_implementation(
+    runner_components,
+):
+    c = runner_components
+    implement_payloads: list[dict] = []
+
+    async def assign_talon(payload):
+        return {
+            "status": "ok",
+            "issues": [7, 8],
+            "dispatches": [
+                {"job_id": "job-1", "issue": 7},
+                {"message_id": "job-2", "issue": 8},
+            ],
+        }
+
+    async def implement_chunks(payload):
+        implement_payloads.append(payload)
+        return {"status": "ok"}
+
+    c.registry.register(
+        _action_source("feature_features.assign_talon_chunks", assign_talon)
+    )
+    c.registry.register(
+        _action_source("feature_features.implement_chunks", implement_chunks)
+    )
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="feature-flow",
+            version=1,
+            stages=[
+                _stage(
+                    "assign_talon_chunks",
+                    "feature_features.assign_talon_chunks",
+                ),
+                _stage("implement_chunks", "feature_features.implement_chunks"),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="assign_talon_chunks",
+                    to_stage="implement_chunks",
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="feature-flow")
+
+    assert result.status == RunStatus.COMPLETED
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert list(run.params["talon_job_ids"]) == ["job-1", "job-2"]
+    assert list(run.params["talon_issue_numbers"]) == [7, 8]
+    assert implement_payloads[0]["talon_job_ids"] == ["job-1", "job-2"]
+    assert implement_payloads[0]["talon_dispatches"] == [
+        {"job_id": "job-1", "issue": 7},
+        {"message_id": "job-2", "issue": 8},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runner_rejects_noop_idempotent_after_read_only_write(
     runner_components,
 ):

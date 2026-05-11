@@ -1747,6 +1747,109 @@ async def test_feature_features_assign_talon_provider_requires_issue_and_talon()
 
 
 @pytest.mark.asyncio
+async def test_feature_features_implement_chunks_provider_passes_completed_jobs():
+    class StubTalon:
+        async def talon_status(self):
+            return ToolResult.ok(
+                "status",
+                data={
+                    "jobs": [
+                        {"id": "job-1", "status": "complete", "issue": 7},
+                        {"id": "job-2", "status": "complete", "issue": 8},
+                    ]
+                },
+            )
+
+    agent = SimpleNamespace(features={"TalonCoordinatorFeature": StubTalon()})
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_implement_chunks(
+        {
+            "talon_dispatches": [
+                {"job_id": "job-1", "issue": 7},
+                {"message_id": "job-2", "issue": 8},
+            ]
+        }
+    )
+
+    assert result["status"] == "ok"
+    assert result["talon_job_ids"] == ["job-1", "job-2"]
+    assert result["completed"] == 2
+    assert result["jobs"][0]["issue"] == 7
+
+
+@pytest.mark.asyncio
+async def test_feature_features_implement_chunks_provider_fails_running_jobs():
+    class StubTalon:
+        async def talon_status(self):
+            return ToolResult.ok(
+                "status",
+                data={
+                    "jobs": [
+                        {"id": "job-1", "status": "complete"},
+                        {"id": "job-2", "status": "running"},
+                    ]
+                },
+            )
+
+    agent = SimpleNamespace(features={"talon": StubTalon()})
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="running=1"):
+        await agent.feature_feature_implement_chunks(
+            {"talon_job_ids": ["job-1", "job-2"], "talon_wait_seconds": 0}
+        )
+
+
+@pytest.mark.asyncio
+async def test_feature_features_implement_chunks_provider_polls_running_jobs():
+    class StubTalon:
+        def __init__(self):
+            self.calls = 0
+
+        async def talon_status(self):
+            self.calls += 1
+            status = "running" if self.calls == 1 else "complete"
+            return ToolResult.ok(
+                "status",
+                data={"jobs": [{"id": "job-1", "status": status}]},
+            )
+
+    talon = StubTalon()
+    agent = SimpleNamespace(features={"talon": talon})
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_implement_chunks(
+        {
+            "talon_job_ids": ["job-1"],
+            "talon_wait_seconds": 1,
+            "talon_poll_seconds": 0.01,
+        }
+    )
+
+    assert result["status"] == "ok"
+    assert result["completed"] == 1
+    assert talon.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_feature_features_implement_chunks_provider_requires_job_ids():
+    class StubTalon:
+        async def talon_status(self):
+            return ToolResult.ok("status", data={"jobs": []})
+
+    agent = SimpleNamespace(features={"talon": StubTalon()})
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="talon_job_ids"):
+        await agent.feature_feature_implement_chunks({})
+
+
+@pytest.mark.asyncio
 async def test_feature_features_installs_quality_gate_providers():
     commands = []
 
