@@ -389,6 +389,7 @@ def _tool_params_schema() -> dict[str, Any]:
             "repository": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
             "branch": {"type": "string", "minLength": 1},
             "operator_did": {"type": "string"},
+            **_talon_assignment_params_schema(),
         },
     }
 
@@ -408,7 +409,56 @@ def _package_params_schema() -> dict[str, Any]:
             "repository": {"type": "string", "pattern": "^[^/]+/[^/]+$"},
             "branch": {"type": "string", "minLength": 1},
             "operator_did": {"type": "string"},
+            **_talon_assignment_params_schema(),
         },
+    }
+
+
+def _talon_assignment_params_schema() -> dict[str, Any]:
+    positive_int = {"type": "integer", "minimum": 1}
+    issue_ref = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "number": positive_int,
+            "issue": positive_int,
+            "issue_number": positive_int,
+            "talon_issue_number": positive_int,
+            "github_issue_number": positive_int,
+        },
+    }
+    return {
+        "issue_number": positive_int,
+        "talon_issue_number": positive_int,
+        "github_issue_number": positive_int,
+        "talon_issue_numbers": {
+            "type": "array",
+            "items": positive_int,
+            "minItems": 1,
+        },
+        "issues": {
+            "type": "array",
+            "items": {
+                "anyOf": [
+                    positive_int,
+                    issue_ref,
+                ]
+            },
+            "minItems": 1,
+        },
+        "chunks": {
+            "type": "array",
+            "items": issue_ref,
+            "minItems": 1,
+        },
+        "talon_backend": {"type": "string", "minLength": 1},
+        "talon_model": {"type": "string", "minLength": 1},
+        "talon_auth_lane": {"type": "string", "minLength": 1},
+        "max_iterations": positive_int,
+        "max_turns": positive_int,
+        "skip_clarification": {"type": "boolean"},
+        "worktree": {"type": "boolean"},
+        "self_review": {"type": "boolean"},
     }
 
 

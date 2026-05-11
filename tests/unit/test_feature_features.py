@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from jsonschema import Draft202012Validator, ValidationError
 from kestrel_sdk.features.base import Feature as SDKBaseFeature
 from kestrel_sdk.signals import SignalMode
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
@@ -141,6 +142,8 @@ def test_feature_feature_workflow_gates_pin_required_review_path():
     assert stages["ci_green"].gate.params["branch_param"] == "branch"
     assert "repository" in spec.params_schema["required"]
     assert "branch" in spec.params_schema["required"]
+    assert "issue_number" in spec.params_schema["properties"]
+    assert "talon_issue_numbers" in spec.params_schema["properties"]
     assert stages["constitutional_boundary_scan"].gate.type == (
         "constitutional_boundary_clean"
     )
@@ -157,6 +160,48 @@ def test_feature_feature_workflow_gates_pin_required_review_path():
     ]
     assert "kestrel_sovereign.constitution" in forbidden
     assert "kestrel_sovereign.features.constitution" in forbidden
+
+
+def test_feature_feature_workflow_params_allow_talon_assignment_inputs():
+    tool = WorkflowSpec.from_dict(feature_propose_tool_spec_payload())
+    package = WorkflowSpec.from_dict(feature_propose_package_spec_payload())
+
+    Draft202012Validator(tool.params_schema).validate(
+        {
+            "feature_name": "DemoFeature",
+            "target_tool_name": "demo_tool",
+            "repository": "Org/repo",
+            "branch": "codex/demo",
+            "talon_issue_numbers": [7, 8],
+            "issues": [{"issue": 10}],
+            "chunks": [{"number": 9}],
+            "talon_backend": "codex",
+            "talon_model": "gpt-5.5",
+            "skip_clarification": True,
+            "worktree": True,
+            "self_review": False,
+        }
+    )
+    Draft202012Validator(package.params_schema).validate(
+        {
+            "package_name": "kestrel-demo",
+            "repository": "Org/repo",
+            "branch": "codex/demo",
+            "issue_number": 7,
+            "max_iterations": 3,
+            "max_turns": 5,
+        }
+    )
+    with pytest.raises(ValidationError):
+        Draft202012Validator(tool.params_schema).validate(
+            {
+                "feature_name": "DemoFeature",
+                "target_tool_name": "demo_tool",
+                "repository": "Org/repo",
+                "branch": "codex/demo",
+                "issue_number": True,
+            }
+        )
 
 
 def test_feature_feature_workflow_edges_are_sequential():
@@ -789,6 +834,31 @@ async def test_feature_feature_runtime_status_rejects_empty_github_token():
 
 
 @pytest.mark.asyncio
+async def test_feature_feature_runtime_status_marks_talon_provider_ready_when_loaded():
+    async def talon_claim(**kwargs):
+        return ToolResult.ok("dispatched", data={"kwargs": kwargs})
+
+    registry = SourceRegistry()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        features={"TalonCoordinatorFeature": SimpleNamespace(talon_claim=talon_claim)},
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with patch(
+        "kestrel_sovereign.features.feature_features.feature._github_token",
+        return_value="gh-test",
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "feature_features.assign_talon_chunks" not in (
+        result.data["missing_action_providers"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_feature_features_installs_github_epic_provider():
     registry = SourceRegistry()
     agent = SimpleNamespace(signal_registry=registry)
@@ -858,6 +928,135 @@ async def test_feature_features_github_epic_provider_creates_issue():
     assert "nested-secret" not in created["body"]["body"]
     assert "chunk-secret" not in created["body"]["body"]
     assert "no-auth" not in created["body"]["body"]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_assign_talon_provider_uses_explicit_issue():
+    class StubTalon:
+        def __init__(self):
+            self.calls = []
+
+        async def talon_claim(self, **kwargs):
+            self.calls.append(kwargs)
+            return ToolResult.ok(
+                "dispatched",
+                data={"dispatched": True, "job_id": "job-1"},
+            )
+
+    registry = SourceRegistry()
+    talon = StubTalon()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        features={"TalonCoordinatorFeature": talon},
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    async def fake_create(repository, token, body):
+        return {"number": 42, "html_url": "https://github.test/org/repo/issues/42"}
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_create_issue",
+            side_effect=fake_create,
+        ),
+    ):
+        epic = await agent.feature_feature_file_github_epic(
+            {
+                "repository": "Org/repo",
+                "feature_name": "DemoFeature",
+            }
+        )
+        result = await agent.feature_feature_assign_talon_chunks(
+            {
+                "repository": "Org/repo",
+                "issue_number": epic["issue_number"],
+                "talon_backend": "codex",
+                "talon_model": "gpt-5.5",
+                "skip_clarification": True,
+                "self_review": False,
+            }
+        )
+
+    assert epic["issue_number"] == 42
+    assert result["status"] == "ok"
+    assert result["issues"] == [42]
+    assert result["dispatches"][0]["job_id"] == "job-1"
+    assert talon.calls == [
+        {
+            "repo": "Org/repo",
+            "issue": 42,
+            "max_iterations": None,
+            "max_turns": None,
+            "backend": "codex",
+            "model": "gpt-5.5",
+            "auth_lane": None,
+            "skip_clarification": True,
+            "worktree": True,
+            "self_review": False,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_assign_talon_provider_dispatches_issue_list():
+    class StubTalon:
+        def __init__(self):
+            self.issues = []
+
+        async def talon_claim(self, repo, issue, **kwargs):
+            self.issues.append((repo, issue, kwargs))
+            return ToolResult.ok("dispatched", data={"issue": issue})
+
+    talon = StubTalon()
+    agent = SimpleNamespace(features={"talon": talon})
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_assign_talon_chunks(
+        {
+            "repository": "Org/repo",
+            "talon_issue_numbers": [7, 8],
+            "chunks": [{"issue_number": 9}, {"issue_number": 8}],
+            "max_iterations": 3,
+            "worktree": False,
+        }
+    )
+
+    assert result["status"] == "ok"
+    assert result["issues"] == [7, 8, 9]
+    assert [(repo, issue) for repo, issue, _ in talon.issues] == [
+        ("Org/repo", 7),
+        ("Org/repo", 8),
+        ("Org/repo", 9),
+    ]
+    assert talon.issues[0][2]["max_iterations"] == 3
+    assert talon.issues[0][2]["worktree"] is False
+
+
+@pytest.mark.asyncio
+async def test_feature_features_assign_talon_provider_requires_issue_and_talon():
+    feature = FeatureFeaturesFeature(SimpleNamespace(features={}))
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="TalonCoordinatorFeature"):
+        await feature.agent.feature_feature_assign_talon_chunks(
+            {"repository": "Org/repo", "issue_number": 1}
+        )
+
+    talon = SimpleNamespace(
+        talon_claim=lambda **kwargs: ToolResult.ok("not awaited")
+    )
+    agent = SimpleNamespace(features={"talon": talon})
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="issue_number"):
+        await agent.feature_feature_assign_talon_chunks({"repository": "Org/repo"})
 
 
 @pytest.mark.asyncio

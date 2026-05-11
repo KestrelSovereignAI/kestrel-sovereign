@@ -674,6 +674,37 @@ class WorkflowStore(UnifiedStoreBase):
         )
         return changed > 0
 
+    async def merge_run_params(
+        self,
+        run_id: str,
+        updates: dict[str, Any],
+        *,
+        if_not_terminal: bool = False,
+    ) -> bool:
+        if not isinstance(updates, dict):
+            raise ValueError("workflow run param updates must be an object")
+        run = await self.get_run(run_id)
+        if run is None:
+            return False
+        merged = {**run.to_dict()["params"], **updates}
+        where_clause = "WHERE run_id = ?"
+        params: list[Any] = [json.dumps(merged, sort_keys=True), run_id]
+        if if_not_terminal:
+            where_clause += " AND status NOT IN (?, ?, ?, ?)"
+            params.extend(
+                [
+                    RunStatus.COMPLETED.value,
+                    RunStatus.FAILED.value,
+                    RunStatus.CANCELLED.value,
+                    RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE.value,
+                ]
+            )
+        changed = await self._backend.execute(
+            f"UPDATE {self.RUNS_TABLE} SET params_json = ? {where_clause}",
+            tuple(params),
+        )
+        return changed > 0
+
     async def mark_run_signature_post_revocation(self, run_id: str) -> None:
         await self._backend.execute(
             f"""

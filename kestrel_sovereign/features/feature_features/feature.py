@@ -67,6 +67,17 @@ class FeatureFeaturesFeature(Feature):
                 "feature_feature_file_github_epic_requires_github_token",
                 True,
             )
+        if getattr(self.agent, "feature_feature_assign_talon_chunks", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_assign_talon_chunks",
+                self._feature_feature_assign_talon_chunks,
+            )
+            setattr(
+                self.agent,
+                "feature_feature_assign_talon_chunks_requires_talon",
+                True,
+            )
 
     async def _feature_feature_file_github_epic(self, payload: dict) -> dict[str, Any]:
         """Create the FeatureFeature GitHub epic for a proposed feature change."""
@@ -90,12 +101,69 @@ class FeatureFeaturesFeature(Feature):
         )
         if not isinstance(issue, dict):
             raise RuntimeError(f"failed to create GitHub issue in {repository}")
+        issue_number = issue.get("number")
+        if not _is_strict_positive_int(issue_number):
+            raise RuntimeError(f"GitHub issue response missing number in {repository}")
         return {
             "status": "ok",
             "repository": repository,
-            "issue_number": issue.get("number"),
+            "issue_number": issue_number,
             "issue_url": issue.get("html_url"),
             "title": title,
+        }
+
+    async def _feature_feature_assign_talon_chunks(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Dispatch FeatureFeature implementation work to Talon."""
+
+        repository = _payload_string(payload, "repository")
+        if repository is None or "/" not in repository:
+            raise RuntimeError("repository must be owner/repo")
+        talon = _talon_feature(self.agent)
+        if talon is None or not callable(getattr(talon, "talon_claim", None)):
+            raise RuntimeError("TalonCoordinatorFeature is not available")
+
+        issue_numbers = _talon_issue_numbers(payload)
+        if not issue_numbers:
+            raise RuntimeError(
+                "issue_number or talon_issue_numbers is required to assign Talon"
+            )
+
+        dispatches: list[dict[str, Any]] = []
+        for issue_number in issue_numbers:
+            result = await talon.talon_claim(
+                repo=repository,
+                issue=issue_number,
+                max_iterations=_payload_positive_int(payload, "max_iterations"),
+                max_turns=_payload_positive_int(payload, "max_turns"),
+                backend=_payload_string(payload, "talon_backend"),
+                model=_payload_string(payload, "talon_model"),
+                auth_lane=_payload_string(payload, "talon_auth_lane"),
+                skip_clarification=_payload_optional_bool(
+                    payload, "skip_clarification"
+                ),
+                worktree=_payload_optional_bool(payload, "worktree", default=True),
+                self_review=_payload_optional_bool(payload, "self_review"),
+            )
+            if getattr(result, "status", None) is not ToolResultStatus.OK:
+                error = getattr(result, "error", None) or getattr(
+                    result, "confirmation", None
+                )
+                raise RuntimeError(
+                    error or f"talon_claim failed for {repository}#{issue_number}"
+                )
+            data = getattr(result, "data", None)
+            dispatches.append(
+                data if isinstance(data, dict) else {"issue_number": issue_number}
+            )
+
+        return {
+            "status": "ok",
+            "repository": repository,
+            "issues": issue_numbers,
+            "dispatches": dispatches,
         }
 
     @tool(
@@ -1017,6 +1085,71 @@ def _payload_string(payload: dict[str, Any], key: str) -> str | None:
     return None
 
 
+def _payload_positive_int(payload: dict[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if _is_strict_positive_int(value):
+        return value
+    return None
+
+
+def _payload_optional_bool(
+    payload: dict[str, Any],
+    key: str,
+    *,
+    default: bool | None = None,
+) -> bool | None:
+    value = payload.get(key, default)
+    return value if isinstance(value, bool) else default
+
+
+def _talon_issue_numbers(payload: dict[str, Any]) -> list[int]:
+    numbers: list[int] = []
+    for key in ("issue_number", "talon_issue_number", "github_issue_number"):
+        value = payload.get(key)
+        if _is_strict_positive_int(value):
+            numbers.append(value)
+    for item in _iter_issue_candidates(payload.get("talon_issue_numbers")):
+        if _is_strict_positive_int(item):
+            numbers.append(item)
+    for item in _iter_issue_candidates(payload.get("issues")):
+        if _is_strict_positive_int(item):
+            numbers.append(item)
+    for chunk in payload.get("chunks", []):
+        if not isinstance(chunk, dict):
+            continue
+        for key in ("issue_number", "talon_issue_number", "github_issue_number"):
+            value = chunk.get(key)
+            if _is_strict_positive_int(value):
+                numbers.append(value)
+                break
+    return list(dict.fromkeys(numbers))
+
+
+def _iter_issue_candidates(value: Any) -> list[Any]:
+    if isinstance(value, (list, tuple)):
+        candidates = []
+        for item in value:
+            if isinstance(item, dict):
+                candidates.extend(
+                    item.get(key)
+                    for key in (
+                        "number",
+                        "issue",
+                        "issue_number",
+                        "talon_issue_number",
+                        "github_issue_number",
+                    )
+                )
+            else:
+                candidates.append(item)
+        return candidates
+    return [value]
+
+
+def _is_strict_positive_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _github_token() -> str | None:
     from kestrel_sovereign.features.strategic_memory.github_integration import (
         get_github_token,
@@ -1058,9 +1191,26 @@ def _registered_handler_ready(registration: Any) -> bool:
 
 
 def _provider_requirements_ready(agent: Any, provider_name: str) -> bool:
-    if not bool(getattr(agent, f"{provider_name}_requires_github_token", False)):
-        return True
-    return bool(_github_token())
+    if bool(getattr(agent, f"{provider_name}_requires_github_token", False)):
+        return bool(_github_token())
+    if bool(getattr(agent, f"{provider_name}_requires_talon", False)):
+        return _talon_feature(agent) is not None
+    return True
+
+
+def _talon_feature(agent: Any) -> Any | None:
+    features = getattr(agent, "features", None)
+    if not isinstance(features, dict):
+        return None
+    talon = features.get("TalonCoordinatorFeature") or features.get("talon")
+    if talon is not None:
+        return talon
+    for feature in features.values():
+        if feature.__class__.__name__ == "TalonCoordinatorFeature":
+            return feature
+        if callable(getattr(feature, "talon_claim", None)):
+            return feature
+    return None
 
 
 __all__ = ["FeatureFeaturesFeature"]
