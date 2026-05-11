@@ -18,6 +18,7 @@ Foundational documents defining the agent's existence and runtime.
 - **[AGENT_IDENTITY_CONTRACT.md](AGENT_IDENTITY_CONTRACT.md)** — DID as the single source of truth; `agent_id` as a property derived from the DID. *Active.*
 - **[LLM_SERVICE_ARCHITECTURE.md](LLM_SERVICE_ARCHITECTURE.md)** — Vendor / route / model architecture; retry, structured output, vision, streaming. *Active (canonical).*
 - **[DYNAMIC_TOOL_LOADING.md](DYNAMIC_TOOL_LOADING.md)** — Direct tool registration after subagent dispatch. *Active.*
+- **[FEATURE_CLI_ADAPTERS.md](FEATURE_CLI_ADAPTERS.md)** — Feature-owned CLI adapter contract for authenticated local command-line tools. *Active.*
 - **[USER_LIFECYCLE_MANAGEMENT.md](USER_LIFECYCLE_MANAGEMENT.md)** — Soft / hard delete strategies and cryo storage. *Active.*
 - **[core/AGENT_ECOSYSTEM.md](core/AGENT_ECOSYSTEM.md)** — Agent creation and the Genesis factory. *Active.*
 - **[core/FEATURE_AGENT_FRAMEWORK.md](core/FEATURE_AGENT_FRAMEWORK.md)** — The "Society of Agents" architecture; Feature base class and `@tool` decorators. *Active.*
