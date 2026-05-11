@@ -26,6 +26,16 @@ from kestrel_sovereign.features.workflows.models import (
     WorkflowRun,
     WorkflowSpec,
 )
+from kestrel_sovereign.features.workflows.reflection_cycle import (
+    REFLECTION_CYCLE_COMPENSATION_SOURCES,
+    REFLECTION_CYCLE_CRON,
+    REFLECTION_CYCLE_STAGE_SOURCES,
+    REFLECTION_CYCLE_WORKFLOW_NAME,
+    normalize_reflection_output,
+    reflection_cycle_spec_payload,
+    reflection_outputs_match,
+    reflection_shadow_report,
+)
 from kestrel_sovereign.features.workflows.runner import (
     WorkflowRevocationResult,
     WorkflowRunResult,
@@ -42,6 +52,10 @@ __all__ = [
     "EdgeKind",
     "Gate",
     "GateOutcome",
+    "REFLECTION_CYCLE_COMPENSATION_SOURCES",
+    "REFLECTION_CYCLE_CRON",
+    "REFLECTION_CYCLE_STAGE_SOURCES",
+    "REFLECTION_CYCLE_WORKFLOW_NAME",
     "RevocationReason",
     "RunStatus",
     "Stage",
@@ -57,4 +71,8 @@ __all__ = [
     "WorkflowSpec",
     "WorkflowsFeature",
     "derive_stage_idempotency_key",
+    "normalize_reflection_output",
+    "reflection_cycle_spec_payload",
+    "reflection_outputs_match",
+    "reflection_shadow_report",
 ]

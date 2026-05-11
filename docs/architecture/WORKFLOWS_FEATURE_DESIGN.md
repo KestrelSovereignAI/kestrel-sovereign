@@ -337,7 +337,7 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 
 **Pilot 1: FeatureFeature workflows.** Active-pain consumer; exercises every gate type and trigger. FeatureFeature → Workflows is sequencing, not a cycle.
 
-**Pilot 2: reflection cycle.** The `cron.reflect` ARTIFACT signal already runs a multi-step flow internally (gather → analyze → propose → constitutional review → apply). Lifting it to a Workflow definition with explicit stages exposes the gates and saga compensation that today are imperative inside the artifact_handler.
+**Pilot 2: reflection cycle.** The `cron.reflect` ARTIFACT signal already runs a multi-step flow internally (gather → analyze → propose → constitutional review → apply). Lifting it to a Workflow definition with explicit stages exposes the gates and saga compensation that today are imperative inside the artifact_handler. The core migration contract lives in `WORKFLOWS_REFLECTION_CYCLE_MIGRATION.md`; the optional `kestrel-feature-reflection` package owns the source registrations and final handler cutover.
 
 - [ ] FeatureFeature `feature_propose_tool` workflow definition
 - [ ] FeatureFeature `feature_propose_package` workflow definition
