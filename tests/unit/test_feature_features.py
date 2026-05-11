@@ -1337,6 +1337,9 @@ async def test_feature_feature_runtime_status_reports_missing_attestation_resolv
     registry = SourceRegistry()
     agent = SimpleNamespace(
         signal_registry=registry,
+        workflow_council_approve_provider=lambda *args: {
+            "approved_dids": ["did:kestrel:one", "did:kestrel:two"]
+        },
         workflow_red_team_prompt_pack_resolver=lambda _constraint: {
             "name": "kestrel-red-team-prompts",
             "version": "1.0.0",
@@ -1411,6 +1414,133 @@ async def test_feature_feature_runtime_status_accepts_red_team_resolvers():
     assert red_team["workflow_prerequisites_ready"] is True
     assert not any(
         item["source"] == "feature_features.red_team_review"
+        for item in result.data["missing_workflow_prerequisites"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_reports_missing_council_provider():
+    registry = SourceRegistry()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        workflow_red_team_prompt_pack_resolver=lambda _constraint: {
+            "name": "kestrel-red-team-prompts",
+            "version": "1.0.0",
+            "prompt_hash": "a" * 64,
+            "prompt": "review",
+        },
+        workflow_red_team_attestation_resolver=lambda _reviewers: {},
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    council = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.council_review"
+    )
+    assert council["workflow_prerequisites_ready"] is False
+    assert {
+        "source": "feature_features.council_review",
+        "prerequisite": "workflow_council_approve_provider",
+    } in result.data["missing_workflow_prerequisites"]
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_rejects_workflows_wrapper_without_resolver():
+    class WorkflowsFeature:
+        def __init__(self, agent):
+            self.agent = agent
+            self.runner = SimpleNamespace(
+                council_approve_provider=self._council_approve_provider
+            )
+
+        async def _council_approve_provider(self, gate, run, stage, link):
+            return {"status": "failed", "reason": "council resolver unavailable"}
+
+    registry = SourceRegistry()
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        workflow_red_team_prompt_pack_resolver=lambda _constraint: {
+            "name": "kestrel-red-team-prompts",
+            "version": "1.0.0",
+            "prompt_hash": "a" * 64,
+            "prompt": "review",
+        },
+        workflow_red_team_attestation_resolver=lambda _reviewers: {},
+    )
+    agent.features = {"WorkflowsFeature": WorkflowsFeature(agent)}
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    assert {
+        "source": "feature_features.council_review",
+        "prerequisite": "workflow_council_approve_provider",
+    } in result.data["missing_workflow_prerequisites"]
+
+
+@pytest.mark.asyncio
+async def test_feature_feature_runtime_status_accepts_workflows_council_provider():
+    registry = SourceRegistry()
+    runner = SimpleNamespace(council_approve_provider=lambda *args: None)
+    agent = SimpleNamespace(
+        signal_registry=registry,
+        features={"WorkflowsFeature": SimpleNamespace(runner=runner)},
+        workflow_red_team_prompt_pack_resolver=lambda _constraint: {
+            "name": "kestrel-red-team-prompts",
+            "version": "1.0.0",
+            "prompt_hash": "a" * 64,
+            "prompt": "review",
+        },
+        workflow_red_team_attestation_resolver=lambda _reviewers: {},
+    )
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._github_token",
+            return_value="gh-test",
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._ci_green_token",
+            return_value="gh-test",
+        ),
+    ):
+        result = await feature.feature_feature_runtime_status()
+
+    council = next(
+        item
+        for item in result.data["sources"]
+        if item["name"] == "feature_features.council_review"
+    )
+    assert council["workflow_prerequisites_ready"] is True
+    assert not any(
+        item["source"] == "feature_features.council_review"
         for item in result.data["missing_workflow_prerequisites"]
     )
 
@@ -1987,6 +2117,9 @@ async def test_feature_feature_runtime_status_passes_with_registered_providers()
     registry = SourceRegistry()
     agent = SimpleNamespace(
         signal_registry=registry,
+        workflow_council_approve_provider=lambda *args: {
+            "approved_dids": ["did:kestrel:one", "did:kestrel:two"]
+        },
         workflow_red_team_prompt_pack_resolver=lambda _constraint: {
             "name": "kestrel-red-team-prompts",
             "version": "1.0.0",
