@@ -1,0 +1,44 @@
+groups:
+  - name: kestrel-workflows
+    rules:
+      - record: workflow_compensate_failed_total
+        expr: sum(kestrel_workflow_compensate_failed_total) or vector(0)
+
+      - record: workflow_cancelled_with_irreversible_residue_total
+        expr: sum(kestrel_workflow_cancelled_with_irreversible_residue_total) or vector(0)
+
+      - alert: KestrelWorkflowCompensateFailedPage
+        expr: >
+          (
+            (sum(increase(kestrel_workflow_compensate_failed_total[5m])) or vector(0))
+            +
+            (sum(kestrel_workflow_compensate_failed_total unless kestrel_workflow_compensate_failed_total offset 5m) or vector(0))
+          ) > 0
+        for: 1m
+        labels:
+          severity: page
+          pages: "true"
+        annotations:
+          summary: Workflow compensation failed
+          description: >
+            A workflow compensator failed. This is the paging condition:
+            an attempted rollback did not complete and operator intervention
+            is required.
+
+      - alert: KestrelWorkflowIrreversibleResidueDashboardOnly
+        expr: >
+          (
+            (sum(increase(kestrel_workflow_cancelled_with_irreversible_residue_total[15m])) or vector(0))
+            +
+            (sum(kestrel_workflow_cancelled_with_irreversible_residue_total unless kestrel_workflow_cancelled_with_irreversible_residue_total offset 15m) or vector(0))
+          ) > 0
+        for: 1m
+        labels:
+          severity: info
+          pages: "false"
+        annotations:
+          summary: Workflow cancelled with irreversible residue
+          description: >
+            A workflow was cancelled after an irreversible stage had already
+            committed. This is expected for compensate_record_only stages:
+            surface it in dashboards and structured logs, but do not page.

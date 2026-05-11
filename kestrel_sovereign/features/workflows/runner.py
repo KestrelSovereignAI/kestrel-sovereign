@@ -22,6 +22,7 @@ import base64
 import hashlib
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -62,8 +63,10 @@ from kestrel_sovereign.features.workflows.models import (
     _DID_RE,
 )
 from kestrel_sovereign.features.workflows.metrics import (
+    record_compensation_failed,
     record_compensation_state,
     record_gate_outcome,
+    record_irreversible_residue,
 )
 from kestrel_sovereign.features.workflows.signing import (
     PublicKeyResolver,
@@ -82,6 +85,8 @@ from kestrel_sovereign.security.crypto_suite import (
 )
 from kestrel_sovereign.signals import SignalDispatcher, SourceRegistry
 from kestrel_sovereign.storage.db.write_audit import request_handler_write_audit
+
+logger = logging.getLogger(__name__)
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _SQL_WRITE_TARGET = r'(?:"[^"]+"|[\w]+)(?:\s*\.\s*(?:"[^"]+"|[\w]+))*'
@@ -690,6 +695,20 @@ class WorkflowRunner:
                 self._force_aborting_run_ids.discard(run_id)
                 self._force_abort_reasons.pop(run_id, None)
                 return latest.status
+        if status == RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE:
+            record_irreversible_residue(spec.name)
+            logger.info(
+                "workflow_cancelled_with_irreversible_residue",
+                extra={
+                    "workflow_event": (
+                        "workflow_cancelled_with_irreversible_residue"
+                    ),
+                    "workflow_name": spec.name,
+                    "workflow_version": spec.version,
+                    "workflow_run_id": run_id,
+                    "alert_tier": "dashboard_only",
+                },
+            )
 
         if in_flight is not None:
             await self._mark_stage_link_aborted(
@@ -2187,6 +2206,19 @@ class WorkflowRunner:
             failed = failed or state == "failed"
             await self.store.update_compensate_state(link.link_id, state)
             record_compensation_state(spec.name, stage.name, state)
+            if state == "failed":
+                record_compensation_failed(spec.name, stage.name)
+                logger.error(
+                    "workflow_compensation_failed",
+                    extra={
+                        "workflow_event": "workflow_compensation_failed",
+                        "workflow_name": spec.name,
+                        "workflow_version": spec.version,
+                        "workflow_run_id": run.run_id,
+                        "stage_name": stage.name,
+                        "signal_id": result.signal_id,
+                    },
+                )
 
         status = (
             RunStatus.FAILED
@@ -2206,6 +2238,20 @@ class WorkflowRunner:
             latest = await self.store.get_run(run.run_id)
             if latest is not None and latest.status in _TERMINAL_RUN_STATUSES:
                 return latest.status
+        if status == RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE:
+            record_irreversible_residue(spec.name)
+            logger.info(
+                "workflow_cancelled_with_irreversible_residue",
+                extra={
+                    "workflow_event": (
+                        "workflow_cancelled_with_irreversible_residue"
+                    ),
+                    "workflow_name": spec.name,
+                    "workflow_version": spec.version,
+                    "workflow_run_id": run.run_id,
+                    "alert_tier": "dashboard_only",
+                },
+            )
         return status
 
     async def _force_abort_status(
