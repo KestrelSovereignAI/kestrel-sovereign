@@ -307,6 +307,94 @@ async def test_runner_walks_sequential_signal_status_ok_flow(runner_components):
 
 
 @pytest.mark.asyncio
+async def test_runner_adds_metadata_to_feature_feature_stage_payloads(
+    runner_components,
+):
+    c = runner_components
+    payloads: list[dict] = []
+
+    async def handler(payload):
+        payloads.append(payload)
+        return {"ok": True}
+
+    c.registry.register(_action_source("feature_features.file_github_epic", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="feature-flow",
+            version=1,
+            stages=[
+                _stage("file_github_epic", "feature_features.file_github_epic"),
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="feature-flow")
+
+    assert result.status == RunStatus.COMPLETED
+    assert payloads == [
+        {
+            "workflow_run_id": result.run_id,
+            "workflow_stage_name": "file_github_epic",
+            "workflow_attempt_number": 1,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_persists_feature_feature_epic_issue_for_next_stage(
+    runner_components,
+):
+    c = runner_components
+    assign_payloads: list[dict] = []
+
+    async def file_epic(payload):
+        return {"status": "ok", "issue_number": 42, "issue_url": "https://g/i/42"}
+
+    async def assign_talon(payload):
+        assign_payloads.append(payload)
+        return {"status": "ok"}
+
+    c.registry.register(
+        _action_source("feature_features.file_github_epic", file_epic)
+    )
+    c.registry.register(
+        _action_source("feature_features.assign_talon_chunks", assign_talon)
+    )
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="feature-flow",
+            version=1,
+            stages=[
+                _stage("file_github_epic", "feature_features.file_github_epic"),
+                _stage(
+                    "assign_talon_chunks",
+                    "feature_features.assign_talon_chunks",
+                ),
+            ],
+            edges=[
+                Edge(
+                    kind=EdgeKind.SEQUENTIAL,
+                    from_stage="file_github_epic",
+                    to_stage="assign_talon_chunks",
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="feature-flow")
+
+    assert result.status == RunStatus.COMPLETED
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.params["issue_number"] == 42
+    assert run.params["issue_url"] == "https://g/i/42"
+    assert assign_payloads[0]["issue_number"] == 42
+    assert assign_payloads[0]["issue_url"] == "https://g/i/42"
+
+
+@pytest.mark.asyncio
 async def test_runner_rejects_noop_idempotent_after_read_only_write(
     runner_components,
 ):

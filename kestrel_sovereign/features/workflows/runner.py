@@ -1333,6 +1333,14 @@ class WorkflowRunner:
                 return GateOutcome.FAIL
 
         payload = {**_stage_signal_params(stage), **run.to_dict()["params"]}
+        if _stage_payload_includes_workflow_metadata(stage):
+            payload.update(
+                {
+                    "workflow_run_id": run.run_id,
+                    "workflow_stage_name": stage.name,
+                    "workflow_attempt_number": attempt_number,
+                }
+            )
         if stage.gate.type in {
             "tests_pass",
             "ci_green",
@@ -1552,6 +1560,14 @@ class WorkflowRunner:
             actor_sig=actor_sig,
             post_cancel=post_cancel,
         )
+        if gate_outcome == GateOutcome.PASS:
+            output_params = _stage_output_run_params(stage, result)
+            if output_params:
+                await self.store.merge_run_params(
+                    run.run_id,
+                    output_params,
+                    if_not_terminal=True,
+                )
         if gate_outcome == GateOutcome.PASS and stage.compensate == "noop_idempotent":
             await self.store.update_compensate_state(link.link_id, "not_required")
         record_gate_outcome(spec.name, stage.name, gate_outcome.value)
@@ -3708,6 +3724,26 @@ def _stage_signal_params(stage: Stage) -> dict[str, Any]:
     for key in _STAGE_RUNNER_CONTROL_PARAM_KEYS:
         params.pop(key, None)
     return params
+
+
+def _stage_payload_includes_workflow_metadata(stage: Stage) -> bool:
+    return stage.signal_source.startswith("feature_features.")
+
+
+def _stage_output_run_params(stage: Stage, result: Any) -> dict[str, Any]:
+    if stage.signal_source != "feature_features.file_github_epic":
+        return {}
+    action_result = getattr(result, "action_result", None)
+    if not isinstance(action_result, dict):
+        return {}
+    output: dict[str, Any] = {}
+    issue_number = action_result.get("issue_number")
+    if isinstance(issue_number, int) and not isinstance(issue_number, bool):
+        output["issue_number"] = issue_number
+    issue_url = action_result.get("issue_url")
+    if isinstance(issue_url, str) and issue_url.strip():
+        output["issue_url"] = issue_url.strip()
+    return output
 
 
 def _materialize_ci_gate(
