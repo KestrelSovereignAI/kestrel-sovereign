@@ -146,9 +146,14 @@ class ModelPreferenceMixin:
         ETH, MATIC, or other non-FIL assets are correctly classified as solvent.
         FIL balance is checked as a fallback for FIL-only wallets.
         """
+        wallet = getattr(self, "wallet", None)
+        if wallet is None:
+            logging.debug("Solvency check skipped: wallet feature is not available.")
+            return None
+
         try:
-            fil_balance = self.wallet.get_balance()
-            usd_balance = self.wallet.get_total_balance_usd()
+            fil_balance = wallet.get_balance()
+            usd_balance = wallet.get_total_balance_usd()
 
             # Green Zone: > $5 USD equivalent (or > 10 FIL for FIL-only wallets)
             if usd_balance > Decimal("5.0") or fil_balance > Decimal("10.0"):
