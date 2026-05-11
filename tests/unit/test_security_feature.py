@@ -831,6 +831,69 @@ class TestApprovalQueueScopePersistence:
         return ApprovalQueue()
 
     @pytest.mark.asyncio
+    async def test_global_auto_mode_direct_request_approval_does_not_prompt(
+        self, store
+    ):
+        """Direct ApprovalQueue callers must honor global Auto too.
+
+        Several features call ``request_approval`` directly instead of going
+        through SecurityHook. Global Auto is only global if this path bypasses
+        the human queue as well.
+        """
+        request_added = False
+
+        async def on_request_added(_request):
+            nonlocal request_added
+            request_added = True
+
+        queue = ApprovalQueue(
+            on_request_added=on_request_added,
+            permission_store=store,
+        )
+        await store.register_tool("ComputeFeature", "run_script", PermissionLevel.ASK)
+        store.set_global_auto_mode(True)
+
+        approved, scope = await queue.request_approval(
+            feature_name="ComputeFeature",
+            tool_name="run_script",
+            tool_args={"script_id": "s-auto"},
+        )
+
+        assert approved is True
+        assert scope == "auto"
+        assert request_added is False
+        assert queue.pending_requests == []
+
+        logs = await store.get_audit_log(limit=1)
+        assert logs[0]["decision"] == "auto_mode_allowed"
+        assert logs[0]["user_choice"] == "constitutional_honesty_unflagged"
+
+    @pytest.mark.asyncio
+    async def test_global_auto_mode_direct_request_approval_respects_deny(
+        self, store
+    ):
+        queue = ApprovalQueue(permission_store=store)
+        await store.register_tool(
+            "WalletAgent",
+            "delete_everything",
+            PermissionLevel.DENY,
+        )
+        store.set_global_auto_mode(True)
+
+        approved, scope = await queue.request_approval(
+            feature_name="WalletAgent",
+            tool_name="delete_everything",
+            tool_args={},
+        )
+
+        assert approved is False
+        assert scope == "denied"
+        assert queue.pending_requests == []
+
+        logs = await store.get_audit_log(limit=1)
+        assert logs[0]["decision"] == "auto_denied"
+
+    @pytest.mark.asyncio
     async def test_session_scope_persists_via_direct_caller(self, queue_with_store, store):
         """A direct ``request_approval`` call (the path used by code_edit,
         compute, keys, reflection.*) with scope='session' must produce a

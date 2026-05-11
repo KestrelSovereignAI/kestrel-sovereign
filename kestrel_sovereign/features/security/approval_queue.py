@@ -174,6 +174,53 @@ class ApprovalQueue:
             - approved: True if user approved, False if denied or timeout
             - scope: "once", "session", "always", or "timeout"
         """
+        if self._permission_store is not None:
+            try:
+                from .permissions import PermissionLevel
+
+                level = await self._permission_store.get_permission(
+                    feature_name,
+                    tool_name,
+                )
+                if level == PermissionLevel.DENY:
+                    await self._permission_store.log_decision(
+                        feature_name=feature_name,
+                        tool_name=tool_name,
+                        action="tool_execution",
+                        decision="auto_denied",
+                        args_summary=self._summarize_args(tool_args),
+                    )
+                    logger.info(
+                        "ApprovalQueue denied %s.%s from explicit policy",
+                        feature_name,
+                        tool_name,
+                    )
+                    return (False, "denied")
+                if (
+                    self._permission_store.get_global_auto_mode()
+                    and level == PermissionLevel.AUTO
+                ):
+                    await self._permission_store.log_decision(
+                        feature_name=feature_name,
+                        tool_name=tool_name,
+                        action="tool_execution",
+                        decision="auto_mode_allowed",
+                        user_choice="constitutional_honesty_unflagged",
+                        args_summary=self._summarize_args(tool_args),
+                    )
+                    logger.info(
+                        "ApprovalQueue auto-mode approved %s.%s without prompting",
+                        feature_name,
+                        tool_name,
+                    )
+                    return (True, "auto")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "ApprovalQueue: failed to evaluate pre-approval policy for "
+                    f"{feature_name}.{tool_name}: {e}",
+                    exc_info=True,
+                )
+
         request = ApprovalRequest(
             id=str(uuid4()),
             feature_name=feature_name,

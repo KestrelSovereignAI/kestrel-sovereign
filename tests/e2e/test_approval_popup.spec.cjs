@@ -190,6 +190,122 @@ test.describe('#748 security approval popup', () => {
         await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
         await expect(page.locator('.toast-item').filter({ hasText: 'Auto Mode enabled' })).toBeVisible();
         await expect(page.locator('.toast-item').filter({ hasText: 'Approved (once)' })).toHaveCount(0);
+        await expect(page.locator('.toast-item').filter({ hasText: 'Failed to submit decision' })).toHaveCount(0);
+    });
+
+    test('Enable Auto keeps approval-submit failure toast silent after mode is enabled', async ({ page }) => {
+        let sseCallCount = 0;
+        await page.route('**/agent/notifications/sse**', async (route) => {
+            sseCallCount += 1;
+            const events =
+                sseCallCount === 1
+                    ? [
+                          { event: 'connected', data: { status: 'connected' } },
+                          { event: 'approval_request', data: { ...APPROVAL_PAYLOAD, id: 'auto-submit-fails' } },
+                      ]
+                    : [{ event: 'connected', data: { status: 'connected' } }];
+            await route.fulfill({
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                },
+                body: sseBody(events),
+            });
+        });
+
+        await page.route('**/api/security/approve', async (route) => {
+            await route.fulfill({
+                status: 500,
+                contentType: 'application/json',
+                body: JSON.stringify({ detail: 'synthetic approval submit failure' }),
+            });
+        });
+
+        await page.route('**/api/security/auto-mode', async (route, request) => {
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    enabled: request.method() === 'POST',
+                    warning: 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.',
+                }),
+            });
+        });
+
+        await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
+
+        await expect(page.locator('#modal-overlay')).toBeVisible({ timeout: 10000 });
+        await page.click('.modal-btn:has-text("Enable Auto Mode")');
+
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+        await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
+        await expect(page.locator('.toast-item').filter({ hasText: 'Auto Mode enabled' })).toBeVisible();
+        await expect(page.locator('.toast-item').filter({ hasText: 'Failed to submit decision' })).toHaveCount(0);
+        await expect(page.locator('.toast-item').filter({ hasText: 'Approval was withdrawn' })).toHaveCount(0);
+    });
+
+    test('Auto mode silently approves later approval requests without another popup', async ({ page }) => {
+        await page.route('**/agent/notifications/sse**', async (route) => {
+            await route.fulfill({
+                status: 200,
+                headers: {
+                    'Content-Type': 'text/event-stream',
+                    'Cache-Control': 'no-cache',
+                    Connection: 'keep-alive',
+                },
+                body: sseBody([{ event: 'connected', data: { status: 'connected' } }]),
+            });
+        });
+
+        const approveCalls = [];
+        await page.route('**/api/security/approve', async (route, request) => {
+            approveCalls.push(JSON.parse(request.postData() || '{}'));
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, approved: true, scope: 'once' }),
+            });
+        });
+
+        let autoEnabled = false;
+        await page.route('**/api/security/auto-mode', async (route, request) => {
+            if (request.method() === 'POST') {
+                autoEnabled = Boolean(JSON.parse(request.postData() || '{}').enabled);
+            }
+
+            await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({
+                    enabled: autoEnabled,
+                    warning: autoEnabled
+                        ? 'Auto Mode enabled for this session. Constitutional and honesty checks still run first.'
+                        : 'Auto Mode is off.',
+                }),
+            });
+        });
+
+        await page.goto(`${KESTREL_URL}/?key=${encodeURIComponent(API_KEY)}`);
+        await page.getByRole('button', { name: 'Chat' }).click();
+        await page.click('#chat-auto-mode-btn');
+        await expect(page.locator('#chat-auto-mode-btn')).toContainText('Auto Mode: On');
+
+        await page.evaluate((payload) => {
+            window.Security.handleApprovalRequest(payload);
+        }, { ...APPROVAL_PAYLOAD, id: 'auto-later-1' });
+
+        await expect.poll(() => approveCalls.length, { timeout: 5000 }).toBe(1);
+        expect(approveCalls[0]).toMatchObject({
+            approval_id: 'auto-later-1',
+            approved: true,
+            scope: 'once',
+        });
+        await expect(page.locator('#modal-overlay')).not.toBeVisible({ timeout: 5000 });
+        await expect(page.locator('.toast-item').filter({ hasText: 'Permission Required' })).toHaveCount(0);
+        await expect(page.locator('.toast-item').filter({ hasText: 'Approved (once)' })).toHaveCount(0);
+        await expect(page.locator('.toast-item').filter({ hasText: 'Failed to submit decision' })).toHaveCount(0);
     });
 
     test('chat header Auto toggle enables mode without a second confirmation popup', async ({ page }) => {

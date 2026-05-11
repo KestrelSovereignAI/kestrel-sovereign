@@ -104,6 +104,12 @@ export const Security = {
         }
         this._seenApprovalIds.add(data.id);
 
+        if (this.globalAutoMode) {
+            this.submitApproval(data.id, true, 'once', { suppressToast: true })
+                .catch((err) => console.error('Failed to auto-submit approval:', err));
+            return;
+        }
+
         this.pendingApprovals.set(data.id, data);
         this.updatePendingBadge(this.pendingApprovals.size);
 
@@ -300,13 +306,17 @@ export const Security = {
                 })
             });
 
-            if (response.success && !options.suppressToast) {
-                Toast.success(approved
-                    ? `Approved (${scope})`
-                    : 'Denied'
-                );
+            if (response.success) {
+                if (!options.suppressToast) {
+                    Toast.success(approved
+                        ? `Approved (${scope})`
+                        : 'Denied'
+                    );
+                }
             } else {
-                Toast.error('Failed to submit decision');
+                if (!options.suppressToast) {
+                    Toast.error('Failed to submit decision');
+                }
             }
 
             return response;
@@ -319,11 +329,15 @@ export const Security = {
             // only fires when the SSE didn't beat the user's click.
             const msg = (error && error.message) || '';
             if (msg.includes('not found') || msg.includes('expired')) {
-                Toast.warning('Approval was withdrawn by the agent before you could decide.');
+                if (!options.suppressToast) {
+                    Toast.warning('Approval was withdrawn by the agent before you could decide.');
+                }
                 console.warn('Approval withdrawn by agent before decision submitted:', approvalId);
             } else {
                 console.error('Failed to submit approval:', error);
-                Toast.error('Failed to submit decision');
+                if (!options.suppressToast) {
+                    Toast.error('Failed to submit decision');
+                }
             }
             return { success: false };
         }
