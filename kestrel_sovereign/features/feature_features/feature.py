@@ -102,6 +102,18 @@ class FeatureFeaturesFeature(Feature):
                 "feature_feature_lint_clean",
                 self._feature_feature_lint_clean,
             )
+        if getattr(self.agent, "feature_feature_boundary_scan", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_boundary_scan",
+                self._feature_feature_boundary_scan,
+            )
+        if getattr(self.agent, "feature_feature_red_team_review", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_red_team_review",
+                self._feature_feature_red_team_review,
+            )
 
     async def _feature_feature_file_github_epic(self, payload: dict) -> dict[str, Any]:
         """Create the FeatureFeature GitHub epic for a proposed feature change."""
@@ -241,6 +253,32 @@ class FeatureFeaturesFeature(Feature):
             "scopes": scopes,
             "violations": 0 if passed else 1,
             "errors": 0 if passed else 1,
+        }
+
+    async def _feature_feature_boundary_scan(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Emit the changed patch for the constitutional boundary gate."""
+
+        snapshot = await _feature_change_snapshot(self.agent, payload)
+        return {
+            **snapshot,
+            "status": "ok",
+            "scan": "constitutional_boundary",
+        }
+
+    async def _feature_feature_red_team_review(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Emit the changed patch for the red-team review gate."""
+
+        snapshot = await _feature_change_snapshot(self.agent, payload)
+        return {
+            **snapshot,
+            "status": "ok",
+            "review": "red_team",
         }
 
     @tool(
@@ -1546,6 +1584,15 @@ def _quality_command(
     keys: tuple[str, ...],
     default: list[str],
 ) -> list[str]:
+    command = _custom_quality_command(payload, keys=keys)
+    return default if command is None else command
+
+
+def _custom_quality_command(
+    payload: dict[str, Any],
+    *,
+    keys: tuple[str, ...],
+) -> list[str] | None:
     for key in keys:
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
@@ -1554,7 +1601,7 @@ def _quality_command(
             command = [str(item) for item in value if str(item)]
             if command:
                 return command
-    return default
+    return None
 
 
 def _default_test_command(suite: str) -> list[str]:
@@ -1571,6 +1618,8 @@ async def _run_quality_command(
     agent: Any,
     payload: dict[str, Any],
     command: list[str],
+    *,
+    output_limit: int | None = 4000,
 ) -> dict[str, Any]:
     cwd = _quality_command_cwd(payload)
     timeout_seconds = _quality_timeout_seconds(payload)
@@ -1579,7 +1628,7 @@ async def _run_quality_command(
         result = runner(command=command, cwd=str(cwd), timeout=timeout_seconds)
         if inspect.isawaitable(result):
             result = await result
-        return _quality_command_marker(command, cwd, result)
+        return _quality_command_marker(command, cwd, result, output_limit=output_limit)
 
     env = dict(os.environ)
     env.setdefault("KESTREL_AUDIT_MODE", "skip")
@@ -1605,6 +1654,7 @@ async def _run_quality_command(
                 "stdout": "",
                 "stderr": str(exc),
             },
+            output_limit=output_limit,
         )
     except asyncio.TimeoutError:
         if process is not None:
@@ -1621,6 +1671,7 @@ async def _run_quality_command(
                 "stdout": "",
                 "stderr": f"timed out after {timeout_seconds:g}s",
             },
+            output_limit=output_limit,
         )
 
     return _quality_command_marker(
@@ -1631,13 +1682,111 @@ async def _run_quality_command(
             "stdout": stdout_bytes.decode(errors="replace"),
             "stderr": stderr_bytes.decode(errors="replace"),
         },
+        output_limit=output_limit,
     )
+
+
+async def _feature_change_snapshot(
+    agent: Any,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    base_ref = _payload_string(payload, "base_ref")
+    if base_ref is None:
+        base_ref = _payload_string(payload, "base_branch") or "origin/main"
+
+    merge_base: str | None = None
+    command = _custom_quality_command(payload, keys=("diff_command", "patch_command"))
+    if command is None:
+        merge_base_marker = await _run_quality_command(
+            agent,
+            payload,
+            ["git", "merge-base", base_ref, "HEAD"],
+        )
+        if merge_base_marker["exit_code"] != 0:
+            stderr = (
+                merge_base_marker["stderr"]
+                or merge_base_marker["stdout"]
+                or "merge-base command failed"
+            )
+            raise RuntimeError(f"feature change snapshot failed: {stderr}")
+        merge_base_lines = merge_base_marker["stdout"].strip().splitlines()
+        if not merge_base_lines:
+            raise RuntimeError("feature change snapshot failed: empty merge-base")
+        merge_base = merge_base_lines[0]
+        command = ["git", "diff", "--no-ext-diff", merge_base]
+
+    marker = await _run_quality_command(agent, payload, command, output_limit=None)
+    if marker["exit_code"] != 0:
+        stderr = marker["stderr"] or marker["stdout"] or "diff command failed"
+        raise RuntimeError(f"feature change snapshot failed: {stderr}")
+
+    untracked_patch = await _untracked_files_patch(agent, payload)
+    patch = marker["stdout"]
+    if untracked_patch:
+        patch = f"{patch.rstrip()}\n{untracked_patch}" if patch else untracked_patch
+    changed_files = _changed_files_from_patch(patch)
+    return {
+        "command": marker["command"],
+        "cwd": marker["cwd"],
+        "base_ref": base_ref,
+        "merge_base": merge_base,
+        "patch": patch,
+        "changed_files": changed_files,
+        "changed_file_count": len(changed_files),
+    }
+
+
+async def _untracked_files_patch(agent: Any, payload: dict[str, Any]) -> str:
+    include_untracked = _payload_optional_bool(
+        payload,
+        "include_untracked",
+        default=True,
+    )
+    if not include_untracked:
+        return ""
+    marker = await _run_quality_command(
+        agent,
+        payload,
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        output_limit=None,
+    )
+    if marker["exit_code"] != 0:
+        stderr = marker["stderr"] or marker["stdout"] or "ls-files command failed"
+        raise RuntimeError(f"feature change snapshot failed: {stderr}")
+
+    cwd = Path(marker["cwd"])
+    chunks: list[str] = []
+    for file_name in marker["stdout"].splitlines():
+        if not file_name.strip():
+            continue
+        path = (cwd / file_name).resolve()
+        if not path.is_relative_to(cwd) or not path.is_file():
+            continue
+        chunks.append(_new_file_patch(file_name, path))
+    return "\n".join(chunk for chunk in chunks if chunk)
+
+
+def _new_file_patch(file_name: str, path: Path) -> str:
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    patch = (
+        f"diff --git a/{file_name} b/{file_name}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{file_name}"
+    )
+    if not lines:
+        return patch
+    added = "\n".join(f"+{line}" for line in lines)
+    return f"{patch}\n@@ -0,0 +1,{len(lines)} @@\n{added}"
 
 
 def _quality_command_marker(
     command: list[str],
     cwd: Path,
     result: Any,
+    *,
+    output_limit: int | None = 4000,
 ) -> dict[str, Any]:
     if not isinstance(result, dict):
         result = {"exit_code": 1, "stdout": "", "stderr": str(result)}
@@ -1651,8 +1800,8 @@ def _quality_command_marker(
         "command": command,
         "cwd": str(cwd),
         "exit_code": exit_code,
-        "stdout": _truncate_output(result.get("stdout")),
-        "stderr": _truncate_output(result.get("stderr")),
+        "stdout": _truncate_output(result.get("stdout"), limit=output_limit),
+        "stderr": _truncate_output(result.get("stderr"), limit=output_limit),
     }
 
 
@@ -1680,11 +1829,33 @@ def _quality_timeout_seconds(payload: dict[str, Any]) -> float:
     return 600.0
 
 
-def _truncate_output(value: Any, *, limit: int = 4000) -> str:
+def _truncate_output(value: Any, *, limit: int | None = 4000) -> str:
     text = value if isinstance(value, str) else ""
+    if limit is None:
+        return text
     if len(text) <= limit:
         return text
     return text[:limit] + "\n<truncated>"
+
+
+def _changed_files_from_patch(patch: str) -> list[str]:
+    files: list[str] = []
+    current_path: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            current_path = None
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                current_path = parts[3].removeprefix("b/")
+            continue
+        if not line.startswith("+++ b/"):
+            if line == "+++ /dev/null" and current_path:
+                files.append(current_path)
+            continue
+        path = line.removeprefix("+++ b/").strip()
+        if path and path != "/dev/null":
+            files.append(path)
+    return list(dict.fromkeys(files))
 
 
 def _talon_issue_numbers(payload: dict[str, Any]) -> list[int]:

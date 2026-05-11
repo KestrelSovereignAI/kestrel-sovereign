@@ -1305,6 +1305,200 @@ async def test_feature_features_quality_gate_providers_report_failures():
 
 
 @pytest.mark.asyncio
+async def test_feature_features_installs_review_diff_providers():
+    commands = []
+
+    async def command_runner(**kwargs):
+        commands.append(kwargs)
+        if kwargs["command"][:2] == ["git", "merge-base"]:
+            return {
+                "exit_code": 0,
+                "stdout": "abc123\n",
+                "stderr": "",
+            }
+        if kwargs["command"][:2] == ["git", "ls-files"]:
+            return {
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }
+        return {
+            "exit_code": 0,
+            "stdout": (
+                "diff --git a/demo.py b/demo.py\n"
+                "+++ b/demo.py\n"
+                "@@\n"
+                "+import math\n"
+            ),
+            "stderr": "",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    boundary = await agent.feature_feature_boundary_scan(
+        {
+            "base_ref": "origin/main",
+            "cwd": "/tmp",
+        }
+    )
+    red_team = await agent.feature_feature_red_team_review(
+        {
+            "base_ref": "origin/main",
+            "cwd": "/tmp",
+        }
+    )
+
+    assert boundary["status"] == "ok"
+    assert boundary["scan"] == "constitutional_boundary"
+    assert boundary["patch"].startswith("diff --git")
+    assert boundary["changed_files"] == ["demo.py"]
+    assert red_team["status"] == "ok"
+    assert red_team["review"] == "red_team"
+    assert red_team["patch"] == boundary["patch"]
+    assert commands[0]["command"] == [
+        "git",
+        "merge-base",
+        "origin/main",
+        "HEAD",
+    ]
+    assert commands[1]["command"] == [
+        "git",
+        "diff",
+        "--no-ext-diff",
+        "abc123",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_review_diff_providers_fail_closed():
+    async def command_runner(**kwargs):
+        return {
+            "exit_code": 128,
+            "stdout": "",
+            "stderr": "fatal: bad revision",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    with pytest.raises(RuntimeError, match="feature change snapshot failed"):
+        await agent.feature_feature_boundary_scan({"base_ref": "missing/main"})
+
+
+@pytest.mark.asyncio
+async def test_feature_features_review_diff_provider_does_not_truncate_patch():
+    long_patch = "+++ b/demo.py\n" + ("+value = 1\n" * 500) + "+import math\n"
+
+    async def command_runner(**kwargs):
+        if kwargs["command"][:2] == ["git", "merge-base"]:
+            return {
+                "exit_code": 0,
+                "stdout": "abc123\n",
+                "stderr": "",
+            }
+        if kwargs["command"][:2] == ["git", "ls-files"]:
+            return {
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }
+        return {
+            "exit_code": 0,
+            "stdout": long_patch,
+            "stderr": "",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_boundary_scan({})
+
+    assert result["patch"] == long_patch
+    assert "<truncated>" not in result["patch"]
+    assert result["patch"].endswith("+import math\n")
+
+
+@pytest.mark.asyncio
+async def test_feature_features_review_diff_provider_includes_untracked_files(
+    tmp_path,
+):
+    untracked = tmp_path / "new_feature.py"
+    untracked.write_text("from kestrel_sovereign.constitution import guard\n")
+
+    async def command_runner(**kwargs):
+        if kwargs["command"][:2] == ["git", "merge-base"]:
+            return {
+                "exit_code": 0,
+                "stdout": "abc123\n",
+                "stderr": "",
+            }
+        if kwargs["command"][:2] == ["git", "ls-files"]:
+            return {
+                "exit_code": 0,
+                "stdout": "new_feature.py\n",
+                "stderr": "",
+            }
+        return {
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_boundary_scan({"cwd": str(tmp_path)})
+
+    assert "+++ b/new_feature.py" in result["patch"]
+    assert "@@ -0,0 +1,1 @@" in result["patch"]
+    assert "+from kestrel_sovereign.constitution import guard" in result["patch"]
+    assert result["changed_files"] == ["new_feature.py"]
+
+
+@pytest.mark.asyncio
+async def test_feature_features_review_diff_provider_reports_deleted_files():
+    async def command_runner(**kwargs):
+        if kwargs["command"][:2] == ["git", "merge-base"]:
+            return {
+                "exit_code": 0,
+                "stdout": "abc123\n",
+                "stderr": "",
+            }
+        if kwargs["command"][:2] == ["git", "ls-files"]:
+            return {
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }
+        return {
+            "exit_code": 0,
+            "stdout": (
+                "diff --git a/removed.py b/removed.py\n"
+                "deleted file mode 100644\n"
+                "--- a/removed.py\n"
+                "+++ /dev/null\n"
+                "@@ -1 +0,0 @@\n"
+                "-import math\n"
+            ),
+            "stderr": "",
+        }
+
+    agent = SimpleNamespace(feature_feature_command_runner=command_runner)
+    feature = FeatureFeaturesFeature(agent)
+    await feature.initialize()
+
+    result = await agent.feature_feature_boundary_scan({})
+
+    assert result["changed_files"] == ["removed.py"]
+    assert result["changed_file_count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_feature_feature_runtime_status_passes_with_registered_providers():
     registry = SourceRegistry()
     agent = SimpleNamespace(signal_registry=registry)
