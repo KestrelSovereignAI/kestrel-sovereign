@@ -1039,6 +1039,11 @@ async def test_feature_feature_runtime_status_reports_missing_action_providers()
         result.data["missing_action_providers"]
     )
     assert {
+        "source": "feature_features.assign_talon_chunks",
+        "provider": "feature_feature_assign_talon_chunks",
+        "requirement": "TalonCoordinatorFeature",
+    } in result.data["missing_provider_requirements"]
+    assert {
         "source": "feature_features.red_team_review",
         "prerequisite": "workflow_red_team_prompt_pack_resolver",
     } in result.data["missing_workflow_prerequisites"]
@@ -1052,6 +1057,20 @@ async def test_feature_feature_runtime_status_reports_missing_action_providers()
         if row["name"] == "feature_features.explore"
     )
     assert explore["ready"] is True
+    assign = next(
+        row
+        for row in result.data["sources"]
+        if row["name"] == "feature_features.assign_talon_chunks"
+    )
+    assert assign["stage"] == "assign_talon_chunks"
+    assert assign["provider_requirements"] == [
+        {"name": "TalonCoordinatorFeature", "ready": False}
+    ]
+    assert assign["provider_requirements_ready"] is False
+    assert any(
+        row["name"] == "feature_features.assign_talon_chunks"
+        for row in result.data["blocking_sources"]
+    )
 
 
 @pytest.mark.asyncio
@@ -1080,6 +1099,16 @@ async def test_feature_feature_runtime_status_requires_github_token_for_default_
     assert "feature_features.ci_green" in (
         result.data["missing_action_providers"]
     )
+    assert {
+        "source": "feature_features.file_github_epic",
+        "provider": "feature_feature_file_github_epic",
+        "requirement": "github_token",
+    } in result.data["missing_provider_requirements"]
+    assert {
+        "source": "feature_features.ci_green",
+        "provider": "feature_feature_ci_green",
+        "requirement": "ci_token",
+    } in result.data["missing_provider_requirements"]
     row = next(
         item
         for item in result.data["sources"]
@@ -1931,8 +1960,13 @@ async def test_feature_feature_runtime_status_accepts_pre_registered_handler():
         if item["name"] == "feature_features.file_github_epic"
     )
     assert row["registered_handler"] is True
+    assert row["ready"] is True
     assert "feature_features.file_github_epic" not in (
         result.data["missing_action_providers"]
+    )
+    assert not any(
+        item["source"] == "feature_features.file_github_epic"
+        for item in result.data["missing_provider_requirements"]
     )
 
 

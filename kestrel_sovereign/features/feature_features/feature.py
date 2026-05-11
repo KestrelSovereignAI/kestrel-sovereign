@@ -925,6 +925,7 @@ class FeatureFeaturesFeature(Feature):
         rows = []
         missing_registered: list[str] = []
         missing_action_providers: list[str] = []
+        missing_provider_requirements: list[dict[str, Any]] = []
         missing_cognition_prompts: list[str] = []
         missing_workflow_prerequisites: list[dict[str, Any]] = []
         for registration in build_feature_feature_registrations(self.agent):
@@ -940,12 +941,19 @@ class FeatureFeaturesFeature(Feature):
             registered_handler_ready = _registered_handler_ready(
                 actual_registration
             )
+            provider_requirements = _provider_requirement_status(
+                self.agent,
+                provider_name,
+            )
+            provider_requirements_ready = all(
+                item["ready"] for item in provider_requirements
+            )
             action_provider_ready = (
                 mode != "action"
                 or registered_handler_ready
                 or (
                     provider_name is not None
-                    and _provider_requirements_ready(self.agent, provider_name)
+                    and provider_requirements_ready
                 )
             )
             prompt_ready = (
@@ -964,6 +972,17 @@ class FeatureFeaturesFeature(Feature):
             )
             if mode == "action" and not action_provider_ready:
                 missing_action_providers.append(registration.name)
+            if mode == "action" and not registered_handler_ready:
+                for requirement in provider_requirements:
+                    if requirement["ready"]:
+                        continue
+                    missing_provider_requirements.append(
+                        {
+                            "source": registration.name,
+                            "provider": provider_name,
+                            "requirement": requirement["name"],
+                        }
+                    )
             if mode == "cognition" and not prompt_ready:
                 missing_cognition_prompts.append(registration.name)
             for prerequisite in workflow_prerequisites:
@@ -977,10 +996,13 @@ class FeatureFeaturesFeature(Feature):
             rows.append(
                 {
                     "name": registration.name,
+                    "stage": _source_stage(registration.name),
                     "mode": mode,
                     "registered": registered,
                     "provider": provider_name,
                     "registered_handler": registered_handler_ready,
+                    "provider_requirements": provider_requirements,
+                    "provider_requirements_ready": provider_requirements_ready,
                     "action_provider_ready": action_provider_ready,
                     "prompt_template_exists": prompt_ready,
                     "workflow_prerequisites": workflow_prerequisites,
@@ -997,13 +1019,17 @@ class FeatureFeaturesFeature(Feature):
         ok = (
             not missing_registered
             and not missing_action_providers
+            and not missing_provider_requirements
             and not missing_cognition_prompts
             and not missing_workflow_prerequisites
         )
+        blocking_sources = [row for row in rows if not row["ready"]]
         data = {
             "sources": rows,
+            "blocking_sources": blocking_sources,
             "missing_registered": missing_registered,
             "missing_action_providers": missing_action_providers,
+            "missing_provider_requirements": missing_provider_requirements,
             "missing_cognition_prompts": missing_cognition_prompts,
             "missing_workflow_prerequisites": missing_workflow_prerequisites,
             "ready": ok,
@@ -2178,7 +2204,7 @@ async def _github_create_issue(
 
 
 def _resolve_provider_name(agent: Any, source: str) -> str | None:
-    stage = source.split(".")[-1]
+    stage = _source_stage(source)
     for name in (
         f"feature_feature_{stage}",
         f"feature_feature_handle_{stage}",
@@ -2186,6 +2212,10 @@ def _resolve_provider_name(agent: Any, source: str) -> str | None:
         if callable(getattr(agent, name, None)):
             return name
     return None
+
+
+def _source_stage(source: str) -> str:
+    return source.split(".")[-1]
 
 
 def _registered_handler_ready(registration: Any) -> bool:
@@ -2197,16 +2227,32 @@ def _registered_handler_ready(registration: Any) -> bool:
     )
 
 
-def _provider_requirements_ready(agent: Any, provider_name: str) -> bool:
+def _provider_requirement_status(
+    agent: Any,
+    provider_name: str | None,
+) -> list[dict[str, Any]]:
+    if provider_name is None:
+        return []
+    statuses: list[dict[str, Any]] = []
     if bool(getattr(agent, f"{provider_name}_requires_github_token", False)):
-        return bool(_github_token())
+        statuses.append({"name": "github_token", "ready": bool(_github_token())})
     if bool(getattr(agent, f"{provider_name}_requires_ci_token", False)):
-        return bool(_ci_green_token())
+        statuses.append({"name": "ci_token", "ready": bool(_ci_green_token())})
     if bool(getattr(agent, f"{provider_name}_requires_talon", False)):
-        return _talon_feature(agent) is not None
+        statuses.append(
+            {
+                "name": "TalonCoordinatorFeature",
+                "ready": _talon_feature(agent) is not None,
+            }
+        )
     if bool(getattr(agent, f"{provider_name}_requires_audit_anchor", False)):
-        return _audit_anchor_feature(agent) is not None
-    return True
+        statuses.append(
+            {
+                "name": "AuditAnchorFeature",
+                "ready": _audit_anchor_feature(agent) is not None,
+            }
+        )
+    return statuses
 
 
 def _workflow_prerequisite_status(
