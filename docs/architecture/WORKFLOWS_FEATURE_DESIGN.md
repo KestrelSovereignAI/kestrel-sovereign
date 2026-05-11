@@ -347,7 +347,7 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 ### Phase 6 — Docs
 
 - [ ] Architecture chapter (this doc, post-merge)
-- [ ] Developer guide: "Defining a Kestrel Workflow" (mirrors `SIGNAL_SOURCES_GUIDE.md` shape)
+- [ ] Developer guide: "Defining a Kestrel Workflow" (mirrors `SIGNAL_SOURCES_GUIDE.md` shape; compensation alert tiering starts in `WORKFLOWS_DEVELOPER_GUIDE.md`)
 - [ ] SKILL.md for the WorkflowsFeature
 - [ ] Update #1047 feature-package architecture rewrite
 

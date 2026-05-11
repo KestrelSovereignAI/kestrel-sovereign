@@ -6060,10 +6060,16 @@ async def test_runner_force_abort_requires_sovereign_signature(
 @pytest.mark.asyncio
 async def test_runner_force_abort_preserves_irreversible_residue_status(
     runner_components,
+    monkeypatch,
 ):
     c = runner_components
     started = asyncio.Event()
     cancelled = asyncio.Event()
+    residue_metrics: list[str] = []
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.workflows.runner.record_irreversible_residue",
+        residue_metrics.append,
+    )
 
     async def deploy(payload):
         return {"ok": True}
@@ -6126,6 +6132,7 @@ async def test_runner_force_abort_preserves_irreversible_residue_status(
     links = await c.store.list_stage_links(run.run_id)
     assert links[0].compensate_state == "record_only"
     assert links[1].forced is True
+    assert residue_metrics == ["release"]
 
 
 @pytest.mark.asyncio
@@ -7317,9 +7324,17 @@ async def test_runner_retry_refuses_irreversible_residue(runner_components):
 @pytest.mark.asyncio
 async def test_runner_retry_refuses_failed_compensation_residue(
     runner_components,
+    monkeypatch,
 ):
     c = runner_components
     events: list[str] = []
+    failed_metrics: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "kestrel_sovereign.features.workflows.runner.record_compensation_failed",
+        lambda workflow_name, stage_name: failed_metrics.append(
+            (workflow_name, stage_name)
+        ),
+    )
 
     async def create(payload):
         events.append("create")
@@ -7369,6 +7384,7 @@ async def test_runner_retry_refuses_failed_compensation_residue(
     links = await c.store.list_stage_links(failed.run_id)
     assert [link.stage_name for link in links] == ["create", "configure"]
     assert links[0].compensate_state == "failed"
+    assert failed_metrics == [("resource", "create")]
 
 
 @pytest.mark.asyncio
