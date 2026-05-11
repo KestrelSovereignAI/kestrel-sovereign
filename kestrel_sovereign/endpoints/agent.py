@@ -9,7 +9,7 @@ import logging
 import re
 import time
 
-from kestrel_sovereign.voice.stream_tap import AgentStreamTap
+from kestrel_sovereign.streams.tap import AgentStreamTap
 
 from kestrel_sovereign.kestrel_config.constants import (
     MAX_SSE_CONNECTIONS_PER_CLIENT,

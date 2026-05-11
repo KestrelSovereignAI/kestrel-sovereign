@@ -101,7 +101,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `36` discoverable modules and `36` exported `Feature` subclasses.
+- Current audited snapshot: `35` discoverable modules and `35` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -134,7 +134,6 @@ The inventory below lists **core features only**. Installed feature packages app
 - `strategic_memory`
 - `talon`
 - `tasks`
-- `voice`
 - `web_search`
 - `webhooks`
 - `wellness`
@@ -173,7 +172,6 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `StrategicMemoryFeature`
 - `TalonCoordinatorFeature`
 - `TaskFeature`
-- `VoiceFeature`
 - `WebSearchFeature`
 - `WebhookFeature`
 - `WellnessFeature`
@@ -322,7 +320,8 @@ agent feature packages and should not be listed in
   - `POST /api/saved-items/structured`
   - `POST /api/saved-items/search`
   - `POST /api/saved-items/{item_id}/pin`
-- [`kestrel_sovereign/endpoints/voice.py`](kestrel_sovereign/endpoints/voice.py)
+- `kestrel-feature-voice` optional package via the
+  `kestrel_sovereign.features` entry-point group
   - `GET /voice/voices`
   - `GET /voice/providers/status` — diagnostic surface for every TTS/STT/conversation provider attempted at boot. Returns `init_error`, `available_error`, live `voice_count` for TTS, and an actionable `install_hint`. Drives the voice picker's "why is this empty?" inline reason.
   - `GET /voice/config`
@@ -331,7 +330,6 @@ agent feature packages and should not be listed in
   - `POST /voice/tts/stream`
   - `POST /voice/stt`
   - `WebSocket /voice/chat`
-- [`kestrel_sovereign/endpoints/voice_realtime.py`](kestrel_sovereign/endpoints/voice_realtime.py)
   - `POST /realtime/session` — declared on the realtime router; **served at `POST /voice/realtime/session`**. Body accepts per-call routing overrides (`prefer_realtime`, `preferred_tts`, `preferred_stt`) so the voice picker can force Pipeline mode or pin a TTS without persisting agent config. Privacy-gated via the voice path resolver; returns 409 with fallback provider names when the active route is not realtime.
   - `POST /realtime/tools/{session_id}` — **served at `POST /voice/realtime/tools/{session_id}`**. Browser POSTs here when the Realtime model invokes a tool; runs it against the agent's enabled features and returns the result. Always 200 with a result payload (errors as `{result: {error: ...}}`) so the frontend always commits *something* back to the data channel — silence wedges the model.
   - `GET /realtime/route` — **served at `GET /voice/realtime/route`**. Pure introspection: returns the resolved voice route + the model that would actually answer (`gpt-realtime-1.5` for Realtime, your chat LLM for Pipeline) plus the available conversation/TTS/STT providers. Query params (`prefer_realtime`, `preferred_tts`, `preferred_stt`) preview alternative routes without minting. Drives the voice picker's live route-preview block.

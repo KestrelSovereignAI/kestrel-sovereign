@@ -120,11 +120,6 @@ dependencies = [
     "anthropic>=0.75.0",
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
-    # VAD for the voice WebSocket pipeline. Tiny C extension. Without it,
-    # /voice/chat falls through to per-frame STT calls that get rejected by
-    # OpenAI as too-short — no transcripts ever reach the user. Required for
-    # any working voice path; kept in core (not voice-local) on purpose.
-    "webrtcvad>=2.0.10",
     "pqcrypto>=0.4.0",
     # Workflows feature (#1131): the public ``validate_spec_payload``
     # entrypoint runs draft-2020-12 schema validation at workflow_define
@@ -171,23 +166,6 @@ local = [
     "langchain>=0.3.31",
     "langchain-community>=0.3.31",
     "numpy==2.3.1",
-]
-# Voice local providers (Piper TTS + Faster-Whisper STT) — heavy deps.
-# webrtcvad lives in core dependencies above; the voice WS is unusable without it.
-voice-local = [
-    "piper-tts>=1.2.0",
-    "soundfile>=0.13.0",
-    "faster-whisper>=1.1.0",
-]
-# Voice cloud provider SDK deps (used by kestrel-voice-* entry_point packages)
-voice-cloud = [
-    "elevenlabs>=1.0.0",
-    "deepgram-sdk>=4.0.0",
-]
-# Voice (all providers: local + cloud)
-voice = [
-    "kestrel_sovereign[voice-local]",
-    "kestrel_sovereign[voice-cloud]",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
 # Prometheus support comes via the SDK's [metrics] extra; OpenTelemetry
@@ -242,7 +220,6 @@ all-features = [
     "kestrel_sovereign[search]",
     "kestrel_sovereign[local]",
     "kestrel_sovereign[ml]",
-    "kestrel_sovereign[voice]",
     "kestrel_sovereign[observability]",
 ]
 # Full installation (everything including test and dev tools)

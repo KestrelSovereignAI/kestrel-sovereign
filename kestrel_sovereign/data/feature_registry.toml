@@ -222,7 +222,7 @@ features = ["VoiceFeature"]
 description = "Text-to-speech and speech-to-text (local: Piper, Faster-Whisper; cloud via voice provider packages)"
 tags = ["communication", "voice", "tts", "stt"]
 icon = "microphone"
-core = true
+core = false
 
 [voice.skills]
 speak = { description = "Convert text to speech audio", category = "communication", tags = ["voice", "tts"] }
