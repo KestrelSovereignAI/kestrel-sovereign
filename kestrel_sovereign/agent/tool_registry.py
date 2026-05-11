@@ -35,6 +35,8 @@ class ToolRegistryMixin:
             try:
                 if self._feature_hidden_from_context(feature):
                     continue
+                if not self._feature_supports_subagent_dispatch(feature):
+                    continue
                 # Skip subagent dispatcher for pre-explored features
                 # (their individual tools are already in the direct tool list)
                 if feature.tool_name in self._explored_features:
@@ -78,28 +80,16 @@ class ToolRegistryMixin:
             feature.tool_name: feature
             for feature in self.features.values()
             if not self._feature_hidden_from_context(feature)
+            and self._feature_supports_subagent_dispatch(feature)
         }
 
     def _visible_known_tool_names(self) -> set[str]:
         """Return tool names the LLM may call under the active context profile."""
-        hidden_tools = self._hidden_context_tools()
-        names = {
+        return {
             tool_def["function"]["name"]
             for tool_def in self._build_all_tools()
             if isinstance(tool_def.get("function", {}).get("name"), str)
         }
-        for feature in self.features.values():
-            if self._feature_hidden_from_context(feature):
-                continue
-            if not hasattr(feature, "get_tools"):
-                continue
-            try:
-                for tool in feature.get_tools():
-                    if tool.name not in hidden_tools:
-                        names.add(tool.name)
-            except Exception:
-                pass
-        return names
 
     def _register_explored_feature_tools(self, feature) -> None:
         """Register a feature's individual tools for direct calling.
@@ -165,37 +155,50 @@ class ToolRegistryMixin:
         if not self.features:
             return ""
 
-        sections = ["\n\n## LOADED FEATURES (Active Subagents)\n"]
-        sections.append("These are your ACTIVE subagents. They are loaded and ready to use RIGHT NOW:\n")
+        feature_sections = []
 
         hidden_tools = self._hidden_context_tools()
         for feature in self.features.values():
             try:
                 if self._feature_hidden_from_context(feature):
                     continue
+                if not self._feature_supports_subagent_dispatch(feature):
+                    continue
                 # Feature name and description
-                sections.append(f"\n### {feature.name}")
-                sections.append(f"**Capabilities:** {feature.tool_description}")
+                feature_sections.append(f"\n### {feature.name}")
+                feature_sections.append(f"**Capabilities:** {feature.tool_description}")
 
                 # List the feature's tools/commands
                 tools = feature.get_tools()
                 if tools:
-                    sections.append("\n**Available commands:**")
+                    feature_sections.append("\n**Available commands:**")
                     for tool in tools:
                         if tool.name in hidden_tools:
                             continue
                         cmd_prefix = tool.schema.command_prefix or ""
                         if cmd_prefix:
-                            sections.append(f"- `{cmd_prefix}` - {tool.schema.description}")
+                            feature_sections.append(f"- `{cmd_prefix}` - {tool.schema.description}")
                         else:
-                            sections.append(f"- {tool.name}: {tool.schema.description}")
+                            feature_sections.append(f"- {tool.name}: {tool.schema.description}")
             except (AttributeError, TypeError, KeyError) as e:
                 logging.warning(f"Failed to build prompt section for feature {feature.name}: {e}")
             except Exception as e:
                 logging.warning(f"Failed to build prompt section for feature {feature.name}: {e}", exc_info=True)
 
+        if not feature_sections:
+            return ""
+
+        sections = ["\n\n## LOADED FEATURES (Active Subagents)\n"]
+        sections.append("These are your ACTIVE subagents. They are loaded and ready to use RIGHT NOW:\n")
+        sections.extend(feature_sections)
         sections.append("\n\n**CRITICAL:** When asked about your subagents, capabilities, or available tools, LIST the features above by name. They ARE your active subagents. Never say 'no active subagents' - that is incorrect.")
         return "\n".join(sections)
+
+    def _feature_supports_subagent_dispatch(self, feature: Any) -> bool:
+        return (
+            callable(getattr(feature, "to_orchestrator_tool", None))
+            and callable(getattr(feature, "execute_as_subagent", None))
+        )
 
     def _hidden_context_features(self) -> set[str]:
         hidden = getattr(self, "_tool_context_hidden_features", set())
