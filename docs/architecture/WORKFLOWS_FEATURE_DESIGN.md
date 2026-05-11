@@ -160,6 +160,11 @@ Adversarial review is non-optional for any stage that publishes code. Hardened m
 - In-flight stage actions are NOT killed mid-call. They complete; their result is recorded (with a `post_cancel=True` flag in the StageLink); the engine then runs compensation.
 - The `WorkflowHarness` MUST exercise the action_complete↔cancel race (test fixture in Phase 1).
 
+**Force abort as emergency interrupt:**
+- `workflow_force_abort(run_id, reason, authority_did, authority_sig)` is separate from graceful cancel. It requires a sovereign DID signature over the force-abort payload, cancels the in-flight supervised Signal dispatch task (stage or active compensator), records `forced=True` plus a `force_abort:<reason>` gate failure on the in-flight/pending StageLink, and terminalizes the run without running compensation.
+- Force abort skips compensation guarantees by design. If any completed stage is irreversible / `compensate_record_only`, the runner still records residue and uses `cancelled_with_irreversible_residue`; otherwise the terminal status is `cancelled`.
+- Stage dispatches have per-mode timeout ceilings (`ACTION`/`ARTIFACT` default 4h, `COGNITION` default 30m; stage params may lower/override via `timeout_seconds`). Timeout cancels the supervised dispatch and fails the stage through the normal compensation path; it is not marked `forced`.
+
 **Compensation:**
 - `compensate` is mandatory on every stage. Default `noop_idempotent` is a **closed eligibility set** evaluated against fields on the **Stage** (not on `SourceRegistration`, which intentionally exposes `allowed_modes`/`default_mode` only):
   - `stage.signal_mode == ACTION` AND `stage.read_only == True` (the latter is the Stage-declared field from §3.1; runner instruments the ACTION handler with a backend-portable write-counter shim and fails the gate if the handler writes any non-`workflow_*` table. Handler child tasks inherit the audit callback; late non-`workflow_*` writes after handler return are rejected before execution).
@@ -200,6 +205,7 @@ Stages that emit code (typically `signal_mode=ACTION` with a code-emitting handl
 | `workflow_pause(run_id)` | Pause at current stage boundary. | Owner/admin |
 | `workflow_resume(run_id)` | Resume from last checkpoint. | Owner/admin |
 | `workflow_cancel(run_id)` | Set the cancel barrier; reverse-order compensation runs. | Owner/admin |
+| `workflow_force_abort(run_id, reason, authority_did, authority_sig)` | Emergency interrupt: cancel in-flight dispatch, mark forced, skip compensation guarantees. | Sovereign DID signature |
 | `workflow_remediate(run_id, stage, action)` | Handle on-fail routes (retry, skip-with-justification, abort). | Sovereign or named adjudicator |
 | `workflow_history(run_id)` | Full audit trail of stage transitions, joining `workflow_stage_links` and `signal_log`. | Read for owner/admin |
 | `workflow_list_definitions()` | Browse registered workflows. | Open |
@@ -266,6 +272,7 @@ CREATE TABLE workflow_stage_links (
     gate_reason       TEXT,            -- e.g. red_team_unconverged, doctrine_drift, constitutional_boundary_violation
     compensate_state  TEXT,            -- not_required|pending|complete|record_only|failed
     post_cancel       BOOLEAN NOT NULL DEFAULT FALSE,
+    forced            BOOLEAN NOT NULL DEFAULT FALSE,
     actor_did         TEXT NOT NULL,
     actor_sig         TEXT NOT NULL,   -- DID signature over (run_id, stage_name, attempt_number, signal_id, gate_outcome)
     occurred_at       TIMESTAMPTZ NOT NULL DEFAULT now(),

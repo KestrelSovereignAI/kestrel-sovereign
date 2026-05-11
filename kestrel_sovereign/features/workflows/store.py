@@ -259,6 +259,7 @@ class WorkflowStore(UnifiedStoreBase):
                 gate_reason       TEXT,
                 compensate_state  TEXT,
                 post_cancel       {bool_type} NOT NULL DEFAULT {self._bool_default(False)},
+                forced            {bool_type} NOT NULL DEFAULT {self._bool_default(False)},
                 actor_did         TEXT NOT NULL,
                 actor_sig         TEXT NOT NULL,
                 occurred_at       {ts_type} NOT NULL {ts_default},
@@ -306,6 +307,15 @@ class WorkflowStore(UnifiedStoreBase):
         # itself (see above). It catches the rare runner-bug shape
         # where two different (run_id, stage_name, attempt_number)
         # tuples accidentally derive the same idempotency_key.
+        try:
+            await self._backend.execute(
+                f"ALTER TABLE {self.STAGE_LINKS_TABLE} "
+                f"ADD COLUMN forced {bool_type} NOT NULL "
+                f"DEFAULT {self._bool_default(False)}"
+            )
+        except Exception as exc:  # noqa: BLE001 - duplicate column is benign
+            if "duplicate" not in str(exc).lower() and "exists" not in str(exc).lower():
+                raise
 
     # ------------------------------------------------------------------
     # Phase 0 surface: minimal helpers needed for the migration tests
@@ -631,7 +641,8 @@ class WorkflowStore(UnifiedStoreBase):
         current_stages: Optional[list[str]] = None,
         finished_at: Optional[datetime] = None,
         clear_finished_at: bool = False,
-    ) -> None:
+        if_not_terminal: bool = False,
+    ) -> bool:
         parsed_status = RunStatus(status)
         fields = ["status = ?"]
         params: list[Any] = [parsed_status.value]
@@ -645,11 +656,23 @@ class WorkflowStore(UnifiedStoreBase):
         if finished_at is not None:
             fields.append("finished_at = ?")
             params.append(self.to_timestamp_param(finished_at))
+        where_clause = "WHERE run_id = ?"
         params.append(run_id)
-        await self._backend.execute(
-            f"UPDATE {self.RUNS_TABLE} SET {', '.join(fields)} WHERE run_id = ?",
+        if if_not_terminal:
+            where_clause += " AND status NOT IN (?, ?, ?, ?)"
+            params.extend(
+                [
+                    RunStatus.COMPLETED.value,
+                    RunStatus.FAILED.value,
+                    RunStatus.CANCELLED.value,
+                    RunStatus.CANCELLED_WITH_IRREVERSIBLE_RESIDUE.value,
+                ]
+            )
+        changed = await self._backend.execute(
+            f"UPDATE {self.RUNS_TABLE} SET {', '.join(fields)} {where_clause}",
             tuple(params),
         )
+        return changed > 0
 
     async def mark_run_signature_post_revocation(self, run_id: str) -> None:
         await self._backend.execute(
@@ -681,9 +704,9 @@ class WorkflowStore(UnifiedStoreBase):
             INSERT INTO {self.STAGE_LINKS_TABLE}
                 (link_id, run_id, stage_name, attempt_number, signal_id,
                  idempotency_key, gate_outcome, gate_reason,
-                 compensate_state, post_cancel, actor_did, actor_sig,
+                 compensate_state, post_cancel, forced, actor_did, actor_sig,
                  occurred_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 link.link_id,
@@ -696,6 +719,7 @@ class WorkflowStore(UnifiedStoreBase):
                 link.gate_reason,
                 link.compensate_state,
                 self.to_bool_param(link.post_cancel),
+                self.to_bool_param(link.forced),
                 link.actor_did,
                 link.actor_sig,
                 self.to_timestamp_param(
@@ -714,16 +738,22 @@ class WorkflowStore(UnifiedStoreBase):
         actor_did: str,
         actor_sig: str,
         post_cancel: bool = False,
+        forced: bool = False,
     ) -> None:
         parsed_outcome = (
             GateOutcome(gate_outcome).value if gate_outcome is not None else None
         )
+        where_clause = "WHERE link_id = ?"
+        where_params: list[Any] = [link_id]
+        if not forced:
+            where_clause += " AND forced = ?"
+            where_params.append(self.to_bool_param(False))
         await self._backend.execute(
             f"""
             UPDATE {self.STAGE_LINKS_TABLE}
             SET signal_id = ?, gate_outcome = ?, gate_reason = ?,
-                actor_did = ?, actor_sig = ?, post_cancel = ?
-            WHERE link_id = ?
+                actor_did = ?, actor_sig = ?, post_cancel = ?, forced = ?
+            {where_clause}
             """,
             (
                 signal_id,
@@ -732,7 +762,8 @@ class WorkflowStore(UnifiedStoreBase):
                 actor_did,
                 actor_sig,
                 self.to_bool_param(post_cancel),
-                link_id,
+                self.to_bool_param(forced),
+                *where_params,
             ),
         )
 
@@ -753,7 +784,7 @@ class WorkflowStore(UnifiedStoreBase):
             f"""
             SELECT link_id, run_id, stage_name, attempt_number, signal_id,
                    idempotency_key, gate_outcome, gate_reason,
-                   compensate_state, post_cancel, actor_did, actor_sig,
+                   compensate_state, post_cancel, forced, actor_did, actor_sig,
                    occurred_at
             FROM {self.STAGE_LINKS_TABLE}
             WHERE run_id = ?
@@ -773,9 +804,10 @@ class WorkflowStore(UnifiedStoreBase):
                 gate_reason=row[7],
                 compensate_state=row[8],
                 post_cancel=bool(row[9]),
-                actor_did=row[10],
-                actor_sig=row[11],
-                occurred_at=self.from_timestamp_field(row[12]),
+                forced=bool(row[10]),
+                actor_did=row[11],
+                actor_sig=row[12],
+                occurred_at=self.from_timestamp_field(row[13]),
             )
             for row in rows
         ]

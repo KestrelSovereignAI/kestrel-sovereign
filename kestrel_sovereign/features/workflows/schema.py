@@ -705,6 +705,7 @@ WORKFLOW_STAGE_LINK_SCHEMA: dict[str, Any] = {
             ],
         },
         "post_cancel": {"type": "boolean"},
+        "forced": {"type": "boolean"},
         # Codex round 14 P2: dataclass requires non-empty actor identity.
         # An unsigned/identity-less transition would pass schema before
         # failing later or persisting in a schema-only path.

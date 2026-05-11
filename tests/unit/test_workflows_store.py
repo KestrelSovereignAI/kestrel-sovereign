@@ -22,8 +22,10 @@ from kestrel_sdk.signals import SignalMode
 from kestrel_sovereign.features.workflows import (
     Edge,
     EdgeKind,
+    GateOutcome,
     RevocationReason,
     Stage,
+    StageLink,
     WorkflowSpec,
 )
 from kestrel_sovereign.features.workflows.store import WorkflowStore
@@ -324,6 +326,51 @@ async def test_stage_links_unique_constraint(store: WorkflowStore):
         insert_link,
         ("l-3", "run-1", "lint", 2, "1" * 64, "did:web:k.example", "sig"),
     )
+
+
+async def test_stage_transition_update_preserves_forced_abort_marker(
+    store: WorkflowStore,
+):
+    spec = _signed_spec()
+    await store.insert_definition_for_test(spec)
+    await store.backend.execute(
+        f"INSERT INTO {store.RUNS_TABLE} (run_id, workflow_name, workflow_ver, "
+        f"params_json, status, engine_nonce, started_by_did) "
+        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("run-1", "release", 1, "{}", "running", "0" * 32, "did:web:k.example"),
+    )
+    await store.insert_stage_link(
+        StageLink(
+            link_id="l-1",
+            run_id="run-1",
+            stage_name="lint",
+            attempt_number=1,
+            signal_id="sig-force",
+            idempotency_key="0" * 64,
+            gate_outcome=GateOutcome.FAIL,
+            gate_reason="force_abort:operator emergency",
+            actor_did="did:web:k.example",
+            actor_sig="sig",
+            post_cancel=True,
+            forced=True,
+        )
+    )
+
+    await store.update_stage_link_transition(
+        "l-1",
+        signal_id="sig-normal",
+        gate_outcome=GateOutcome.PASS,
+        gate_reason=None,
+        actor_did="did:web:k.example",
+        actor_sig="sig-normal",
+    )
+
+    links = await store.list_stage_links("run-1")
+    assert links[0].forced is True
+    assert links[0].post_cancel is True
+    assert links[0].signal_id == "sig-force"
+    assert links[0].gate_outcome == GateOutcome.FAIL
+    assert links[0].gate_reason == "force_abort:operator emergency"
 
 
 # ---------------------------------------------------------------------------

@@ -1438,6 +1438,7 @@ class StageLink:
     gate_reason: Optional[str] = None
     compensate_state: Optional[str] = None
     post_cancel: bool = False
+    forced: bool = False
     occurred_at: Optional[datetime] = None
 
     def __post_init__(self) -> None:
@@ -1499,6 +1500,10 @@ class StageLink:
             raise WorkflowDefinitionError(
                 "stage_link.post_cancel must be bool"
             )
+        if not isinstance(self.forced, bool):
+            raise WorkflowDefinitionError(
+                "stage_link.forced must be bool"
+            )
 
         # Round 9 P2: same datetime-or-None invariant as WorkflowRun;
         # storage adapters must parse ISO strings before constructing.
@@ -1534,6 +1539,7 @@ class StageLink:
             "gate_reason": self.gate_reason,
             "compensate_state": self.compensate_state,
             "post_cancel": self.post_cancel,
+            "forced": self.forced,
             "actor_did": self.actor_did,
             "actor_sig": self.actor_sig,
             "occurred_at": _iso(self.occurred_at),

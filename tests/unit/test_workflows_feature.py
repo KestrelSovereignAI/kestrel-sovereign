@@ -181,6 +181,42 @@ async def test_workflow_revoke_definition_records_typed_reason(feature_component
 
 
 @pytest.mark.asyncio
+async def test_workflow_force_abort_tool_calls_runner(feature_components):
+    c = feature_components
+    calls: list[tuple[str, str, str, str]] = []
+
+    class Runner:
+        async def force_abort_run(
+            self,
+            run_id: str,
+            reason: str,
+            *,
+            authority_did: str,
+            authority_sig: str,
+        ):
+            calls.append((run_id, reason, authority_did, authority_sig))
+            return SimpleNamespace(value="cancelled")
+
+    c.feature.runner = Runner()
+
+    result = await c.feature.workflow_force_abort(
+        "run-1",
+        "operator emergency",
+        "did:web:k.example",
+        "sig",
+    )
+
+    assert result.status.value == "ok"
+    assert result.data == {
+        "run_id": "run-1",
+        "status": "cancelled",
+        "forced": True,
+        "reason": "operator emergency",
+    }
+    assert calls == [("run-1", "operator emergency", "did:web:k.example", "sig")]
+
+
+@pytest.mark.asyncio
 async def test_runner_preserves_missing_script_provider_for_preflight(
     feature_components,
 ):

@@ -78,6 +78,18 @@ _HYBRID_PREFIX = "hybrid:"
 # ---------------------------------------------------------------------------
 
 
+def canonical_force_abort_payload(*, run_id: str, reason: str) -> bytes:
+    """Canonical payload signed by the sovereign for emergency abort."""
+
+    body = json.dumps(
+        {"reason": reason, "run_id": run_id},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return f"workflow.force_abort.v1\n{body}".encode("utf-8")
+
+
 def canonical_definition_revocation_payload(
     *,
     name: str,
