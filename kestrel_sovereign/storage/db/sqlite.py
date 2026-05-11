@@ -19,6 +19,7 @@ from .interface import (
     Row,
     TransactionError,
 )
+from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +102,7 @@ class SQLiteBackend(DatabaseBackend):
     
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
+        record_write_query(query)
         conn = self._ensure_connected()
         try:
             cursor = await conn.execute(query, params)
@@ -114,6 +116,9 @@ class SQLiteBackend(DatabaseBackend):
     
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
+        if not params_list:
+            return 0
+        record_write_query(query)
         conn = self._ensure_connected()
         try:
             cursor = await conn.executemany(query, params_list)
@@ -127,6 +132,7 @@ class SQLiteBackend(DatabaseBackend):
     
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
+        record_write_query(query)
         conn = self._ensure_connected()
         try:
             cursor = await conn.execute(query, params)
@@ -139,6 +145,7 @@ class SQLiteBackend(DatabaseBackend):
     
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
         """Fetch all rows."""
+        record_write_query(query)
         conn = self._ensure_connected()
         try:
             cursor = await conn.execute(query, params)
@@ -156,6 +163,7 @@ class SQLiteBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
+        record_write_script(script)
         conn = self._ensure_connected()
         try:
             await conn.executescript(script)

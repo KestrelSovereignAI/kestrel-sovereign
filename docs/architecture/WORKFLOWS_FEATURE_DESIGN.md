@@ -162,7 +162,7 @@ Adversarial review is non-optional for any stage that publishes code. Hardened m
 
 **Compensation:**
 - `compensate` is mandatory on every stage. Default `noop_idempotent` is a **closed eligibility set** evaluated against fields on the **Stage** (not on `SourceRegistration`, which intentionally exposes `allowed_modes`/`default_mode` only):
-  - `stage.signal_mode == ACTION` AND `stage.read_only == True` (the latter is the Stage-declared field from §3.1; runner instruments to verify no DB writes outside `workflow_*` tables in the stage's window — §8 Open Q1 covers the mechanism).
+  - `stage.signal_mode == ACTION` AND `stage.read_only == True` (the latter is the Stage-declared field from §3.1; runner instruments the ACTION handler with a backend-portable write-counter shim and fails the gate if the handler writes any non-`workflow_*` table. Handler child tasks inherit the audit callback; late non-`workflow_*` writes after handler return are rejected before execution).
   - Stages whose gate is `consent_collect` (where rejection naturally compensates the request).
 - All other stages declare a real `compensate` (a separate signal source dispatched in compensation order).
 - Compensation events run reverse-order over completed stages, each as its own dispatched signal with its own idempotency key.
@@ -361,7 +361,7 @@ The v3.x engine spike dissolves. SignalDispatcher already gives durable executio
 
 ## 8. Open questions
 
-1. **Determining `read_only=True` automatically.** Trigger-based (Postgres) vs. write-counter shim (both backends). Resolve in Phase 1. Sub-issue.
+1. **Determining `read_only=True` automatically.** Resolved in Phase 1: backend-portable write-counter shim around the registered ACTION handler. Postgres audit triggers can still be added later for richer operator telemetry, but compensation eligibility does not depend on a Postgres-only mechanism.
 2. **Where workflow definitions live.** In each consuming feature's package, or in a shared `kestrel-workflows-stdlib`? Lean: each consuming feature owns its definitions; this package only provides primitives.
 3. **Reviewer attestation registry storage location.** Per-agent in `features/identity/`, or fleet-wide in Castle/kestrel-claws? Lean: schema is the same, storage layer is pluggable; sovereign solos use per-agent, managed fleets use fleet-wide.
 4. **`workflow_stage_links.signal_id` foreign-key strictness.** True FK to `signal_log.id` (with cross-table delete cascade implications on retention) vs. soft reference (text column, no constraint). Lean: soft reference — `signal_log` has its own retention which can outlive or under-live workflow runs.

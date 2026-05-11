@@ -295,6 +295,589 @@ async def test_runner_walks_sequential_signal_status_ok_flow(runner_components):
 
 
 @pytest.mark.asyncio
+async def test_runner_rejects_noop_idempotent_after_read_only_write(
+    runner_components,
+):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(payload):
+        await c.backend.execute(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            ("write-1", payload["value"]),
+        )
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="ci.lint",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    params={"value": "mutated"},
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    links = await c.store.list_stage_links(result.run_id)
+    assert links[0].gate_outcome == "fail"
+    assert links[0].gate_reason == "read_only_violation:side_effects"
+    assert links[0].compensate_state == "pending"
+    rows = await c.backend.fetch_all("SELECT id, value FROM side_effects")
+    assert rows == [("write-1", "mutated")]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_read_only_execute_many_writes(runner_components):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(payload):
+        await c.backend.execute_many(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            [("write-1", payload["value"]), ("write-2", payload["value"])],
+        )
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="ci.lint",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    params={"value": "mutated"},
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_reason == "read_only_violation:side_effects"
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_read_only_fetch_returning_writes(runner_components):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(payload):
+        rows = await c.backend.fetch_all(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?) RETURNING id",
+            ("write-1", payload["value"]),
+        )
+        return {"rows": rows}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="ci.lint",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    params={"value": "mutated"},
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_reason == "read_only_violation:side_effects"
+    assert await c.backend.fetch_all("SELECT id, value FROM side_effects") == [
+        ("write-1", "mutated")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_read_only_write_before_pending_gate_resume(
+    runner_components,
+):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(_payload):
+        await c.backend.execute(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            ("write-1", "before-pending"),
+        )
+        return {
+            "scope": "publish_pr",
+            "status": "pending",
+            "approval_id": "approval-123",
+        }
+
+    c.registry.register(_action_source("hooks.consent", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="approve",
+                    signal_source="hooks.consent",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    gate=Gate(
+                        type="consent_collect",
+                        params={"scope": "publish_pr"},
+                    ),
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    run = await c.store.get_run(result.run_id)
+    assert run is not None
+    assert run.status == RunStatus.FAILED
+    assert run.current_stages == ()
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_outcome == "fail"
+    assert link.gate_reason == (
+        "read_only_violation:side_effects;consent_collect_pending:approval-123"
+    )
+    assert link.compensate_state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_runner_rejects_read_only_writes_with_sql_prefixes(
+    runner_components,
+):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(payload):
+        await c.backend.execute(
+            "-- allowed SQL comment\n"
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            ("commented", payload["value"]),
+        )
+        await c.backend.execute(
+            """
+            WITH rows(id, value) AS (SELECT ? AS id, ? AS value)
+            INSERT INTO side_effects (id, value)
+            SELECT id, value FROM rows
+            """,
+            ("cte", payload["value"]),
+        )
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[
+                Stage(
+                    name="lint",
+                    signal_source="ci.lint",
+                    signal_mode=SignalMode.ACTION,
+                    read_only=True,
+                    params={"value": "mutated"},
+                )
+            ],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_reason == "read_only_violation:side_effects"
+
+
+def test_read_only_write_table_detects_postgres_truncate():
+    assert workflow_runner_module._write_table("TRUNCATE side_effects") == "side_effects"
+    assert (
+        workflow_runner_module._write_table("TRUNCATE TABLE side_effects")
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table("TRUNCATE TABLE ONLY public.side_effects")
+        == "side_effects"
+    )
+
+
+def test_read_only_write_table_detects_schema_writes():
+    assert (
+        workflow_runner_module._write_table(
+            "CREATE INDEX idx_side_effects_value ON side_effects(value)"
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "CREATE TRIGGER trig AFTER INSERT ON side_effects BEGIN SELECT 1; END"
+        )
+        == "side_effects"
+    )
+    assert workflow_runner_module._write_table("DROP INDEX idx_side_effects") == (
+        "idx_side_effects"
+    )
+    assert workflow_runner_module._mutating_sql("CREATE FUNCTION f() RETURNS int") is True
+    assert workflow_runner_module._write_table("CREATE FUNCTION f() RETURNS int") is None
+
+
+def test_read_only_mutating_sql_ignores_keywords_in_read_queries():
+    assert workflow_runner_module._write_table("SELECT 'DELETE FROM side_effects'") is None
+    assert (
+        workflow_runner_module._write_table("SELECT 1 -- DELETE FROM side_effects")
+        is None
+    )
+    assert workflow_runner_module._mutating_sql("SELECT 'update'") is False
+    assert (
+        workflow_runner_module._mutating_sql(
+            "SELECT * FROM notes WHERE body LIKE '%insert%'"
+        )
+        is False
+    )
+    assert (
+        workflow_runner_module._mutating_sql(
+            "WITH rows AS (SELECT 'delete') SELECT * FROM rows"
+        )
+        is False
+    )
+    assert (
+        workflow_runner_module._mutating_sql(
+            "WITH rows AS (SELECT 1) INSERT INTO side_effects SELECT * FROM rows"
+        )
+        is True
+    )
+    assert workflow_runner_module._write_table("EXPLAIN INSERT INTO side_effects VALUES (1)") is None
+    assert workflow_runner_module._mutating_sql("EXPLAIN UPDATE side_effects SET id = 1") is False
+    assert (
+        workflow_runner_module._write_table(
+            "EXPLAIN ANALYZE INSERT INTO side_effects VALUES (1)"
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "EXPLAIN (ANALYZE true) UPDATE side_effects SET id = 1"
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "SELECT id, value INTO side_effects FROM workflow_tmp"
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "SELECT id INTO TEMP side_effects FROM workflow_tmp"
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "COPY side_effects FROM '/tmp/data.csv'"
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "SELECT $$INSERT INTO side_effects VALUES (1)$$"
+        )
+        is None
+    )
+    assert (
+        workflow_runner_module._write_table(
+            "SELECT $sql$COPY side_effects FROM '/tmp/data.csv'$sql$"
+        )
+        is None
+    )
+
+
+def test_read_only_write_tables_detects_multiple_targets():
+    assert workflow_runner_module._write_tables(
+        "INSERT INTO workflow_events(id) VALUES (1); "
+        "INSERT INTO side_effects(id) VALUES (1)"
+    ) == ("workflow_events", "side_effects")
+    assert workflow_runner_module._write_tables(
+        "WITH moved AS (DELETE FROM workflow_tmp RETURNING id) "
+        "INSERT INTO side_effects SELECT id FROM moved"
+    ) == ("workflow_tmp", "side_effects")
+    assert workflow_runner_module._write_tables(
+        "DROP TABLE workflow_tmp, side_effects"
+    ) == ("workflow_tmp", "side_effects")
+    assert workflow_runner_module._write_tables(
+        "TRUNCATE TABLE ONLY workflow_tmp, side_effects"
+    ) == ("workflow_tmp", "side_effects")
+
+
+def test_read_only_write_table_handles_quoted_schema_qualified_targets():
+    assert (
+        workflow_runner_module._write_table(
+            'INSERT INTO "workflow_aux"."side_effects" (id) VALUES (1)'
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            'CREATE INDEX "idx" ON "workflow_aux"."side_effects" (id)'
+        )
+        == "side_effects"
+    )
+    assert (
+        workflow_runner_module._write_table(
+            'TRUNCATE TABLE ONLY "workflow_aux"."side_effects"'
+        )
+        == "side_effects"
+    )
+
+
+@pytest.mark.asyncio
+async def test_read_only_audit_does_not_count_sibling_task_writes(
+    runner_components,
+):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(_payload):
+        entered.set()
+        await release.wait()
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+
+    run_task = asyncio.create_task(c.runner.run_to_completion(name="release"))
+    await entered.wait()
+    await c.backend.execute(
+        "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+        ("outside", "not-stage-handler"),
+    )
+    release.set()
+    result = await run_task
+
+    assert result.status == RunStatus.COMPLETED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_outcome == "pass"
+    assert link.compensate_state == "not_required"
+
+
+@pytest.mark.asyncio
+async def test_read_only_audit_rejects_handler_background_task_writes(
+    runner_components,
+):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+    release_background = asyncio.Event()
+    background_tasks: list[asyncio.Task] = []
+
+    async def background_write():
+        await release_background.wait()
+        await c.backend.execute(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            ("late", "after-return"),
+        )
+
+    async def handler(_payload):
+        background_tasks.append(asyncio.create_task(background_write()))
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    assert result.status == RunStatus.COMPLETED
+
+    release_background.set()
+    with pytest.raises(WorkflowRunnerError, match="read_only_violation:side_effects"):
+        await background_tasks[0]
+    assert await c.backend.fetch_all("SELECT id, value FROM side_effects") == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_audit_still_writes_signal_log(runner_components):
+    c = runner_components
+
+    async def handler(_payload):
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+    assert result.status == RunStatus.COMPLETED
+
+    if c.agent.background_tasks:
+        await asyncio.gather(*c.agent.background_tasks, return_exceptions=True)
+    rows = await c.backend.fetch_all(
+        "SELECT source, status FROM signal_log WHERE source = ?",
+        ("ci.lint",),
+    )
+    assert rows == [("ci.lint", "ok")]
+
+
+@pytest.mark.asyncio
+async def test_read_only_audit_ignores_empty_execute_many_batch(runner_components):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(_payload):
+        await c.backend.execute_many(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            [],
+        )
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_outcome == "pass"
+    assert link.compensate_state == "not_required"
+    assert await c.backend.fetch_all("SELECT id, value FROM side_effects") == []
+
+
+@pytest.mark.asyncio
+async def test_read_only_audit_ignores_semicolon_in_script_literal(
+    runner_components,
+):
+    c = runner_components
+
+    async def handler(_payload):
+        await c.backend.execute_script(
+            "SELECT '; INSERT INTO side_effects VALUES (1)';"
+        )
+        return {"ok": True}
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.COMPLETED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_outcome == "pass"
+    assert link.compensate_state == "not_required"
+
+
+@pytest.mark.asyncio
+async def test_read_only_audit_reports_violation_when_handler_fails(
+    runner_components,
+):
+    c = runner_components
+    await c.backend.execute(
+        "CREATE TABLE side_effects (id TEXT PRIMARY KEY, value TEXT)"
+    )
+
+    async def handler(_payload):
+        await c.backend.execute(
+            "INSERT INTO side_effects (id, value) VALUES (?, ?)",
+            ("leaked", "before-error"),
+        )
+        raise RuntimeError("handler failed")
+
+    c.registry.register(_action_source("ci.lint", handler))
+    await _put_signed(
+        c,
+        WorkflowSpec(
+            name="release",
+            version=1,
+            stages=[_stage("lint", "ci.lint")],
+        ),
+    )
+
+    result = await c.runner.run_to_completion(name="release")
+
+    assert result.status == RunStatus.FAILED
+    link = (await c.store.list_stage_links(result.run_id))[0]
+    assert link.gate_outcome == "fail"
+    assert link.gate_reason == (
+        "read_only_violation:side_effects;RuntimeError: handler failed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_runner_refuses_unregistered_stage_before_signal(runner_components):
     c = runner_components
     await _put_signed(

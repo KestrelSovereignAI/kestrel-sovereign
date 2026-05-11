@@ -36,6 +36,7 @@ from .interface import (
     TransactionError,
 )
 from .placeholder import sqlite_to_postgres
+from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,7 @@ class PostgresBackend(DatabaseBackend):
 
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
+        record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
         params = self._strip_tz(params)
@@ -243,6 +245,9 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
+        if not params_list:
+            return 0
+        record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
         params_list = [self._strip_tz(p) for p in params_list]
@@ -260,6 +265,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
+        record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
         params = self._strip_tz(params)
@@ -279,6 +285,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
         """Fetch all rows."""
+        record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
         params = self._strip_tz(params)
@@ -296,6 +303,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""
+        record_write_query(query)
         pool = self._ensure_connected()
         pg_query = self._convert_query(query)
         params = self._strip_tz(params)
@@ -311,6 +319,7 @@ class PostgresBackend(DatabaseBackend):
     
     async def execute_script(self, script: str) -> None:
         """Execute a multi-statement SQL script."""
+        record_write_script(script)
         pool = self._ensure_connected()
         
         try:

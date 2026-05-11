@@ -83,11 +83,13 @@ When a workflow run is cancelled, the runner walks the completed stages in rever
 
 | `Stage.compensate` value           | Runner action                                                            |
 |------------------------------------|---------------------------------------------------------------------------|
-| `noop_idempotent`                  | No dispatch. The runner records `compensate_state="not_required"` on the stage_link. |
+| `noop_idempotent`                  | No dispatch. The runner records `compensate_state="not_required"` on the stage_link only after the ACTION handler passes the runtime `read_only=True` write-counter check. |
 | `compensate_record_only`           | No dispatch. The runner records `compensate_state="record_only"` on the stage_link. The run status becomes `cancelled_with_irreversible_residue` (per design §3.5). |
 | _any other value_                  | Treated as a registered source name. The runner constructs a `Signal` with `source=<value>`, `mode=ACTION` (compensations are ALWAYS `ACTION` mode — they MUST have observable side effects), and `payload` includes the original stage's `params` plus a `compensate=true` flag. The dispatched signal's `SignalResult` determines `compensate_state`: `OK` → `complete`, anything else → `failed`. |
 
 **Compensation signal mode is always `ACTION`.** Even if the original stage was `COGNITION`, its compensation is by definition a side-effect-reversing action. Registrar (Phase 1) refuses to register a workflow whose compensation source's `allowed_modes` doesn't include `ACTION`.
+
+**`read_only=True` enforcement:** the Phase 1 runner uses a backend-portable write-counter shim around the registered ACTION handler. A `noop_idempotent` stage that writes any non-`workflow_*` table during that handler window fails its gate with `read_only_violation:<table>` and does not receive `compensate_state="not_required"`. Handler child tasks inherit the audit callback; after the handler returns, late non-`workflow_*` writes are rejected before execution so asynchronous side effects cannot bypass the stage decision. Dispatcher-owned logging happens outside the handler window, so normal `signal_log` audit writes do not make every read-only stage fail.
 
 ## 5. `forbidden_modules` enforcement
 
