@@ -415,6 +415,12 @@ async def test_heartbeat_dispatch_drops_quiet_hours_below_override(components):
 
     agent, registry, dispatcher, _ = components
 
+    # Pin the clock to 12:00 UTC to ensure we're always inside the quiet window.
+    # The test isn't testing wall-clock behavior; it's testing the quiet-hours
+    # decision logic. Using a pinned clock makes the test deterministic.
+    pinned_time = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dispatcher._clock = lambda: pinned_time
+
     # Build a registration whose quiet window is 24h (effectively always
     # quiet for this test).
     reg = build_heartbeat_registration(
@@ -450,11 +456,17 @@ async def test_heartbeat_dispatch_drops_quiet_hours_below_override(components):
 
 @pytest.mark.asyncio
 async def test_heartbeat_dispatch_high_urgency_overrides_quiet_hours(components):
-    from datetime import time as dtime
+    from datetime import datetime, time as dtime, timezone
     from kestrel_sdk.signals import AttentionPolicy
     from dataclasses import replace
 
     agent, registry, dispatcher, _ = components
+
+    # Pin the clock to 12:00 UTC to ensure we're always inside the quiet window.
+    # The test isn't testing wall-clock behavior; it's testing the quiet-hours
+    # decision logic. Using a pinned clock makes the test deterministic.
+    pinned_time = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    dispatcher._clock = lambda: pinned_time
 
     reg = build_heartbeat_registration(
         interval_seconds=1800,

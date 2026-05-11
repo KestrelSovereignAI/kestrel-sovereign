@@ -348,9 +348,16 @@ async def test_high_urgency_overrides_quiet_hours(tmp_path):
     await store.initialize()
     registry = SourceRegistry()
     agent = _FakeAgent()
+
+    # Pin the clock to 12:00 UTC to ensure we're always inside the quiet window.
+    # The test isn't testing wall-clock behavior; it's testing the quiet-hours
+    # decision logic. Using a pinned clock makes the test deterministic.
+    pinned_time = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
     dispatcher = SignalDispatcher(
         agent=agent, registry=registry,
         lock_manager=OrderedLockManager(), store=store,
+        clock=lambda: pinned_time,
     )
 
     # Force quiet hours to "always quiet" for this test.

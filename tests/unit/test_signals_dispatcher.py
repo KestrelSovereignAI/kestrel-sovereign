@@ -498,6 +498,13 @@ async def test_quiet_hours_drops_cognition_below_override(
     c = dispatcher_components
     template = tmp_path / "tpl.md"
     template.write_text("x")
+
+    # Pin the clock to 12:00 UTC to ensure we're always inside the quiet window.
+    # The test isn't testing wall-clock behavior; it's testing the quiet-hours
+    # decision logic. Using a pinned clock makes the test deterministic.
+    pinned_time = datetime(2024, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    c.dispatcher._clock = lambda: pinned_time
+
     # Quiet 00:00–23:59 in UTC — effectively always quiet for this test.
     policy = AttentionPolicy(
         quiet_hours=(time(0, 0), time(23, 59)),
