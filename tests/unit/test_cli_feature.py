@@ -38,17 +38,27 @@ def _make_registry():
         ),
         "cloud": FeaturePackageInfo(
             name="cloud",
-            package="kestrel-feature-cloud",
-            git="https://github.com/example/cloud.git",
-            features=["RunPodFeature", "VastAIFeature"],
-            description="GPU cloud orchestration",
+            package="kestrel-sovereign",
+            git="https://github.com/example/ks.git",
+            features=["DeployFeature", "ComputeFeature"],
+            description="Core deployment and guarded compute surfaces",
             tags=["infrastructure", "gpu"],
             icon="cloud",
-            core=False,
+            core=True,
             skills=[
-                SkillInfo(name="list_instances", description="List GPU instances", category="compute", tags=["gpu"]),
-                SkillInfo(name="launch_instance", description="Launch GPU instance", category="compute", tags=["gpu"]),
+                SkillInfo(name="deploy_agent", description="Deploy agent", category="compute", tags=["gpu"]),
+                SkillInfo(name="run_script", description="Run guarded script", category="system", tags=["gpu"]),
             ],
+        ),
+        "wallet": FeaturePackageInfo(
+            name="wallet",
+            package="kestrel-feature-wallet",
+            git="https://github.com/example/wallet.git",
+            features=["WalletFeature"],
+            description="Wallet tools",
+            tags=["wallet"],
+            icon="wallet",
+            core=False,
         ),
         "voice": FeaturePackageInfo(
             name="voice",
@@ -88,7 +98,7 @@ class TestFeatureList:
         reg = _make_registry()
         reg["identity"].status = FeatureStatus.INSTALLED
         reg["voice"].status = FeatureStatus.INSTALLED
-        reg["cloud"].status = FeatureStatus.AVAILABLE
+        reg["wallet"].status = FeatureStatus.AVAILABLE
         mock_get_reg.return_value = reg
 
         args = _make_args()
@@ -98,7 +108,7 @@ class TestFeatureList:
         output = capsys.readouterr().out
         assert "identity" in output
         assert "voice" in output
-        assert "cloud" in output
+        assert "wallet" in output
         assert "INSTALLED" in output or "installed" in output
         assert "AVAILABLE" in output or "available" in output
 
@@ -110,7 +120,7 @@ class TestFeatureList:
         reg = _make_registry()
         reg["identity"].status = FeatureStatus.INSTALLED
         reg["voice"].status = FeatureStatus.INSTALLED
-        reg["cloud"].status = FeatureStatus.AVAILABLE
+        reg["wallet"].status = FeatureStatus.AVAILABLE
         mock_get_reg.return_value = reg
 
         args = _make_args()
@@ -152,19 +162,17 @@ class TestFeatureInstall:
     def test_install_runs_pip(self, mock_load, mock_run, capsys):
         from kestrel_sovereign.cli import cmd_feature_install
 
-        reg = _make_registry()
-        reg["cloud"].core = False
-        mock_load.return_value = reg
+        mock_load.return_value = _make_registry()
         mock_run.return_value = MagicMock(returncode=0)
 
-        args = _make_args(name="cloud")
+        args = _make_args(name="wallet")
         result = cmd_feature_install(args)
         assert result == 0
 
         # Verify pip was called with the right package
         call_args = mock_run.call_args[0][0]
         assert "pip" in call_args
-        assert "kestrel-feature-cloud" in call_args
+        assert "kestrel-feature-wallet" in call_args
 
 
 # ---------------------------------------------------------------------------
@@ -212,11 +220,11 @@ class TestFeatureEnableDisable:
         assert result == 0
 
         saved = mock_set.call_args[0][1]
-        assert "RunPodFeature" in saved
-        assert "VastAIFeature" in saved
+        assert "DeployFeature" in saved
+        assert "ComputeFeature" in saved
         assert "Disabled" in capsys.readouterr().out
 
-    @patch("kestrel_sovereign.cli._get_toml_disabled_features", return_value=["RunPodFeature", "VastAIFeature"])
+    @patch("kestrel_sovereign.cli._get_toml_disabled_features", return_value=["DeployFeature", "ComputeFeature"])
     @patch("kestrel_sovereign.feature_registry.load_registry")
     def test_disable_already_disabled(self, mock_load, mock_get, capsys):
         from kestrel_sovereign.cli import cmd_feature_disable
@@ -258,11 +266,11 @@ class TestFeatureInfo:
 
         output = capsys.readouterr().out
         assert "cloud" in output
-        assert "GPU cloud" in output
-        assert "kestrel-feature-cloud" in output
-        assert "RunPodFeature" in output
-        assert "VastAIFeature" in output
-        assert "list_instances" in output
+        assert "Core deployment" in output
+        assert "kestrel-sovereign" in output
+        assert "DeployFeature" in output
+        assert "ComputeFeature" in output
+        assert "deploy_agent" in output
 
     @patch("kestrel_sovereign.feature_registry.get_registry")
     @patch("kestrel_sovereign.cli._get_toml_disabled_features", return_value=[])
@@ -284,7 +292,7 @@ class TestFeatureInfo:
         reg["cloud"].status = FeatureStatus.INSTALLED
         mock_get_reg.return_value = reg
 
-        args = _make_args(name="RunPodFeature")
+        args = _make_args(name="DeployFeature")
         result = cmd_feature_info(args)
         assert result == 0
         assert "cloud" in capsys.readouterr().out
@@ -390,13 +398,13 @@ class TestFeatureSkills:
 
         mock_load.return_value = _make_registry()
         mock_skills.return_value = [
-            SkillInfo(name="list_instances", description="List GPU instances", category="compute", tags=["gpu"]),
+            SkillInfo(name="deploy_agent", description="Deploy agent", category="compute", tags=["gpu"]),
         ]
 
         args = _make_args(name="cloud")
         result = cmd_feature_skills(args)
         assert result == 0
-        assert "list_instances" in capsys.readouterr().out
+        assert "deploy_agent" in capsys.readouterr().out
 
     @patch("kestrel_sovereign.feature_registry.load_registry")
     def test_skills_unknown_package(self, mock_load, capsys):
@@ -437,8 +445,8 @@ class TestSkillsSearch:
         assert result == 0
 
         output = capsys.readouterr().out
-        assert "list_instances" in output
-        assert "launch_instance" in output
+        assert "deploy_agent" in output
+        assert "run_script" in output
 
     @patch("kestrel_sovereign.feature_registry.load_registry")
     def test_search_no_results(self, mock_load, capsys):
@@ -471,7 +479,7 @@ class TestResolveFeatureName:
     def test_feature_class_name(self):
         from kestrel_sovereign.cli import _resolve_feature_name
         reg = _make_registry()
-        assert _resolve_feature_name("RunPodFeature", reg) == "cloud"
+        assert _resolve_feature_name("DeployFeature", reg) == "cloud"
         assert _resolve_feature_name("VoiceFeature", reg) == "voice"
 
     def test_unknown_returns_none(self):
@@ -505,16 +513,16 @@ class TestBuildParser:
     def test_feature_enable_args(self):
         from kestrel_sovereign.cli import build_parser
         parser = build_parser()
-        args = parser.parse_args(["feature", "enable", "RunPodFeature"])
+        args = parser.parse_args(["feature", "enable", "DeployFeature"])
         assert args.feature_command == "enable"
-        assert args.name == "RunPodFeature"
+        assert args.name == "DeployFeature"
 
     def test_feature_disable_args(self):
         from kestrel_sovereign.cli import build_parser
         parser = build_parser()
-        args = parser.parse_args(["feature", "disable", "RunPodFeature"])
+        args = parser.parse_args(["feature", "disable", "DeployFeature"])
         assert args.feature_command == "disable"
-        assert args.name == "RunPodFeature"
+        assert args.name == "DeployFeature"
 
     def test_feature_info_args(self):
         from kestrel_sovereign.cli import build_parser

@@ -41,10 +41,10 @@ def get_disabled_features() -> Set[str]:
     1. KESTREL_DISABLED_FEATURES env var (comma-separated class names)
     2. [features].disabled list in kestrel.toml (project-level config)
 
-    Example env: KESTREL_DISABLED_FEATURES=RunPodFeature,CreativeFeature
+    Example env: KESTREL_DISABLED_FEATURES=VoiceFeature,CreativeFeature
     Example toml:
         [features]
-        disabled = ["RunPodFeature", "VoiceFeature"]
+        disabled = ["VoiceFeature", "CreativeFeature"]
     """
     disabled: Set[str] = set()
 
@@ -162,7 +162,7 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
     External feature packages register entry points in their pyproject.toml:
 
         [project.entry-points."kestrel_sovereign.features"]
-        RunPodFeature = "kestrel_feature_cloud.runpod.feature:RunPodFeature"
+        GreeterFeature = "kestrel_feature_greeter.feature:GreeterFeature"
 
     Returns:
         Dict mapping class name to Feature class.

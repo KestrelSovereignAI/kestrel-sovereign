@@ -63,17 +63,18 @@ class TestLoadRegistry:
         assert "memory" in registry
 
     def test_cloud_package_contents(self):
-        """Verify the cloud package matches the issue specification."""
+        """Verify cloud is the core operator surface, not provider packages."""
         registry = load_registry()
         cloud = registry["cloud"]
-        assert cloud.package == "kestrel-feature-cloud"
-        assert "RunPodFeature" in cloud.features
-        assert "VastAIFeature" in cloud.features
-        assert "GCPComputeFeature" in cloud.features
+        assert cloud.package == "kestrel-sovereign"
+        assert "RunPodFeature" not in cloud.features
+        assert "VastAIFeature" not in cloud.features
+        assert "GCPComputeFeature" not in cloud.features
         assert "DeployFeature" in cloud.features
         assert "ComputeFeature" in cloud.features
         assert "gpu" in cloud.tags
         assert cloud.icon == "cloud"
+        assert cloud.core is True
 
     def test_voice_package_contents(self):
         """Verify the voice package matches the issue specification."""
@@ -98,7 +99,7 @@ class TestLoadRegistry:
         expected = {
             "IdentityFeature", "SecurityFeature", "PeersFeature",
             "ConstitutionFeature", "MemoryFeature", "ModelAgent",
-            "VoiceFeature", "MCPAgent", "RunPodFeature",
+            "VoiceFeature", "MCPAgent", "DeployFeature",
             "SpawnFeature", "ObservabilityFeature",
         }
         assert expected.issubset(all_classes), f"Missing: {expected - all_classes}"
@@ -210,10 +211,16 @@ class TestGetPackageForFeature:
     """Tests for feature class → package lookup."""
 
     def test_finds_known_feature(self):
-        """RunPodFeature maps to the cloud package."""
-        info = get_package_for_feature("RunPodFeature")
+        """DeployFeature maps to the cloud package."""
+        info = get_package_for_feature("DeployFeature")
         assert info is not None
         assert info.name == "cloud"
+
+    def test_cloud_providers_are_not_feature_classes(self):
+        """Provider packages register elsewhere, not as feature classes."""
+        assert get_package_for_feature("RunPodFeature") is None
+        assert get_package_for_feature("VastAIFeature") is None
+        assert get_package_for_feature("GCPComputeFeature") is None
 
     def test_unknown_feature_returns_none(self):
         """Unknown class name returns None."""
@@ -254,5 +261,6 @@ class TestSkills:
         """Skills from the cloud package include compute-related entries."""
         skills = get_skills_for_package("cloud")
         skill_names = {s.name for s in skills}
-        assert "list_instances" in skill_names
-        assert "launch_instance" in skill_names
+        assert "deploy_agent" in skill_names
+        assert "write_script" in skill_names
+        assert "run_script" in skill_names

@@ -607,6 +607,31 @@ greet = { description = "Greet a user by name", category = "utility", tags = ["g
 - `enabled` — loaded and active
 - `disabled` — explicitly disabled via `KESTREL_DISABLED_FEATURES`
 
+### Feature Packages vs Provider Packages
+
+Feature packages register `Feature` classes through:
+
+```toml
+[project.entry-points."kestrel_sovereign.features"]
+GreeterFeature = "kestrel_feature_greeter.feature:GreeterFeature"
+```
+
+Provider packages are different: they implement an SDK provider contract and
+register with that provider's entry-point group. Do not add provider classes to
+`features = [...]` in `feature_registry.toml` unless they are actual
+`Feature` lifecycle classes. For example, cloud deployment providers register
+with:
+
+```toml
+[project.entry-points."kestrel_sovereign.cloud_providers"]
+runpod = "kestrel_cloud_runpod.provider:RunPodProvider"
+```
+
+The core cloud feature entry covers Kestrel's own `DeployFeature` and
+`ComputeFeature`. Packages such as `kestrel-cloud-runpod`,
+`kestrel-cloud-vastai`, and `kestrel-cloud-gcp` are provider packages, not
+`kestrel-feature-cloud`.
+
 ## Complete Example
 
 Putting it all together — a feature with a tool, a hook, an HTTP endpoint, and configuration:

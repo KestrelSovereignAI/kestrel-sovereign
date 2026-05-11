@@ -201,19 +201,25 @@ search_saved = { description = "Search saved items", category = "utility", tags 
 # =============================================================================
 
 [cloud]
-package = "kestrel-feature-cloud"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-cloud.git"
-features = ["RunPodFeature", "VastAIFeature", "GCPComputeFeature", "DeployFeature", "ComputeFeature"]
-description = "GPU cloud orchestration (RunPod, Vast.ai, GCP)"
+package = "kestrel-sovereign"
+git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
+features = ["DeployFeature", "ComputeFeature"]
+description = "Core deployment and guarded compute surfaces"
 tags = ["infrastructure", "gpu", "cloud", "compute"]
 icon = "cloud"
 core = true
 
 [cloud.skills]
-list_instances = { description = "List running GPU instances", category = "compute", tags = ["gpu", "cloud"] }
-launch_instance = { description = "Launch a new GPU instance", category = "compute", tags = ["gpu", "cloud"] }
-stop_instance = { description = "Stop a running GPU instance", category = "compute", tags = ["gpu", "cloud"] }
-deploy = { description = "Deploy agent to cloud infrastructure", category = "compute", tags = ["deploy", "cloud"] }
+deploy_agent = { description = "Deploy or manage a Kestrel agent on supported infrastructure", category = "compute", tags = ["deploy", "cloud"] }
+write_script = { description = "Stage a signed script for guarded execution", category = "system", tags = ["compute", "script"] }
+run_script = { description = "Submit a signed script for security review and execution", category = "system", tags = ["compute", "script"] }
+get_compute_capabilities = { description = "List available guarded compute executors", category = "system", tags = ["compute", "capabilities"] }
+
+# Cloud provider packages are not feature packages. They implement provider
+# contracts such as kestrel_sovereign.cloud_providers and are installed
+# independently (for example: kestrel-cloud-runpod, kestrel-cloud-vastai,
+# kestrel-cloud-gcp). Do not add RunPod/Vast/GCP provider classes to this
+# feature package entry.
 
 [voice]
 package = "kestrel-feature-voice"

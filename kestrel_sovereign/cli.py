@@ -1252,7 +1252,7 @@ def _resolve_feature_name(name: str, registry: dict) -> Optional[str]:
     """
     Resolve a user-provided name to a registry package name.
 
-    Accepts: package name ("cloud"), feature class name ("RunPodFeature"),
+    Accepts: package name ("voice"), feature class name ("VoiceFeature"),
     or human-friendly name (case-insensitive match).
     """
     # Direct package name match

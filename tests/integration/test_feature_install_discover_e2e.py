@@ -720,7 +720,7 @@ class TestRegistryStatusResolution:
         """Features in KESTREL_DISABLED_FEATURES are marked as DISABLED."""
         from kestrel_sovereign.feature_registry import get_registry, FeatureStatus
 
-        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: "RunPodFeature"}):
+        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: "DeployFeature"}):
             registry = get_registry(enabled_class_names=set())
 
         cloud_pkg = registry.get("cloud")
