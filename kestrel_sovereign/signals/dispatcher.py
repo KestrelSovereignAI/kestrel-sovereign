@@ -112,6 +112,11 @@ from kestrel_sovereign.signals.constitution_metrics import (
 from kestrel_sovereign.signals.lock_manager import OrderedLockManager
 from kestrel_sovereign.signals.registry import RegistrationError, SourceRegistry
 from kestrel_sovereign.signals.store import SignalLogStore
+from kestrel_sovereign.storage.db.write_audit import (
+    capture_write_queries,
+    requested_handler_write_audit_callback,
+    suppress_write_audit,
+)
 from kestrel_sovereign.telemetry import optional_span
 
 logger = logging.getLogger(__name__)
@@ -569,7 +574,12 @@ class SignalDispatcher:
             try:
                 if signal.mode == SignalMode.ACTION:
                     assert registration.handler is not None
-                    action_result = await registration.handler(signal.payload)
+                    write_audit_callback = requested_handler_write_audit_callback()
+                    if write_audit_callback is None:
+                        action_result = await registration.handler(signal.payload)
+                    else:
+                        with capture_write_queries(write_audit_callback):
+                            action_result = await registration.handler(signal.payload)
                     return self._success(
                         signal, start, registration, action_result=action_result
                     )
@@ -1374,9 +1384,10 @@ class SignalDispatcher:
         audit: Optional[_ConstitutionAudit] = None,
     ) -> None:
         try:
-            result_summary = await self._store.append(
-                signal, registration, result, **_audit_to_log_kwargs(audit)
-            )
+            with suppress_write_audit():
+                result_summary = await self._store.append(
+                    signal, registration, result, **_audit_to_log_kwargs(audit)
+                )
         except Exception:
             logger.exception(
                 "Failed to write signal_log entry for %s", signal.id

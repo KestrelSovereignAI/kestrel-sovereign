@@ -80,8 +80,101 @@ from kestrel_sovereign.security.crypto_suite import (
     get_suite,
 )
 from kestrel_sovereign.signals import SignalDispatcher, SourceRegistry
+from kestrel_sovereign.storage.db.write_audit import request_handler_write_audit
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+_SQL_WRITE_TARGET = r'(?:"[^"]+"|[\w]+)(?:\s*\.\s*(?:"[^"]+"|[\w]+))*'
+_WRITE_TARGET_RES = (
+    re.compile(
+        rf"""
+        \b(?:
+            DROP\s+TABLE(?:\s+IF\s+EXISTS)?
+          | TRUNCATE(?:\s+TABLE)?(?:\s+ONLY)?
+        )
+        \s+(
+            {_SQL_WRITE_TARGET}
+            (?:\s*,\s*(?:ONLY\s+)?{_SQL_WRITE_TARGET})+
+        )
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    re.compile(
+        rf"""
+        \b(?:
+            INSERT\s+(?:OR\s+\w+\s+)?INTO
+          | REPLACE\s+(?:OR\s+\w+\s+)?INTO
+          | UPDATE
+          | DELETE\s+FROM
+          | CREATE\s+(?:TEMP(?:ORARY)?\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?
+          | ALTER\s+TABLE
+          | DROP\s+TABLE(?:\s+IF\s+EXISTS)?
+          | TRUNCATE(?:\s+TABLE)?(?:\s+ONLY)?
+          | MERGE\s+INTO
+          | COPY
+        )
+        \s+({_SQL_WRITE_TARGET})
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    re.compile(
+        rf"""
+        \bSELECT\b.+?\bINTO\s+
+        (?:(?:TEMP(?:ORARY)?|UNLOGGED)\s+)?
+        ({_SQL_WRITE_TARGET})
+        """,
+        re.IGNORECASE | re.VERBOSE | re.DOTALL,
+    ),
+    re.compile(
+        rf"""
+        \bCREATE\s+(?:UNIQUE\s+)?INDEX(?:\s+IF\s+NOT\s+EXISTS)?
+        \s+{_SQL_WRITE_TARGET}\s+ON\s+({_SQL_WRITE_TARGET})
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+    re.compile(
+        rf"""
+        \bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER(?:\s+IF\s+NOT\s+EXISTS)?
+        \s+{_SQL_WRITE_TARGET}.*?\bON\s+({_SQL_WRITE_TARGET})
+        """,
+        re.IGNORECASE | re.VERBOSE | re.DOTALL,
+    ),
+    re.compile(
+        rf"""
+        \b(?:
+            CREATE\s+(?:TEMP(?:ORARY)?\s+)?VIEW(?:\s+IF\s+NOT\s+EXISTS)?
+          | DROP\s+(?:INDEX|TRIGGER|VIEW)(?:\s+IF\s+EXISTS)?
+        )
+        \s+({_SQL_WRITE_TARGET})
+        """,
+        re.IGNORECASE | re.VERBOSE,
+    ),
+)
+_MUTATING_SQL_RE = re.compile(
+    r"\A\s*(?:INSERT|REPLACE|UPDATE|DELETE|CREATE|ALTER|DROP|TRUNCATE|MERGE|COPY|VACUUM|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+_MUTATING_CTE_SQL_RE = re.compile(
+    r"\A\s*WITH\b.*\b(?:INSERT|UPDATE|DELETE|MERGE)\b",
+    re.IGNORECASE,
+)
+_EXPLAIN_SQL_RE = re.compile(r"\A\s*EXPLAIN\b", re.IGNORECASE)
+_EXPLAIN_EXECUTES_SQL_RE = re.compile(
+    r"\A\s*EXPLAIN\s+(?:ANALY[ZS]E|\([^)]*\bANALY[ZS]E\b)",
+    re.IGNORECASE,
+)
+_LEADING_SQL_COMMENT_RE = re.compile(
+    r"\A\s*(?:(?:--[^\n]*(?:\n|\Z))|(?:/\*.*?\*/))*",
+    re.DOTALL,
+)
+_SQL_COMMENT_RE = re.compile(r"--[^\n]*(?:\n|\Z)|/\*.*?\*/", re.DOTALL)
+_SQL_DOLLAR_STRING_RE = re.compile(
+    r"\$\$.*?\$\$|\$[A-Za-z_][A-Za-z_0-9]*\$.*?\$[A-Za-z_][A-Za-z_0-9]*\$",
+    re.DOTALL,
+)
+_SQL_STRING_RE = re.compile(
+    r"'(?:''|[^'])*'",
+    re.DOTALL,
+)
 
 
 _RUNNER_GATE_TYPES = frozenset(
@@ -132,6 +225,58 @@ class WorkflowRevocationResult:
     changed: bool
     reason: RevocationReason
     force_revoked_run_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReadOnlyWriteViolation:
+    table: str
+    statement: str
+
+
+class _NullWriteCounter:
+    def __enter__(self) -> list[ReadOnlyWriteViolation]:
+        return []
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+
+class _ReadOnlyWriteCounter:
+    def __init__(self, violations: list[ReadOnlyWriteViolation]) -> None:
+        self.violations = violations
+        self._closed = False
+        self._ctx = request_handler_write_audit(self._record_statement)
+
+    def __enter__(self) -> list[ReadOnlyWriteViolation]:
+        self._ctx.__enter__()
+        return self.violations
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self._closed = True
+        self._ctx.__exit__(exc_type, exc, tb)
+        return None
+
+    def _record_statement(self, statement: str) -> None:
+        tables = list(_write_tables(statement))
+        if not tables:
+            if not _mutating_sql(statement):
+                return
+            tables = ["unknown"]
+        violating_tables = [table for table in tables if not table.startswith("workflow_")]
+        if not violating_tables:
+            return
+        if self._closed:
+            raise WorkflowRunnerError(
+                "read_only_violation:"
+                f"{violating_tables[0]} after workflow stage handler returned"
+            )
+        self.violations.extend(
+            ReadOnlyWriteViolation(
+                table=table,
+                statement=statement.strip(),
+            )
+            for table in violating_tables
+        )
 
 
 _TERMINAL_RUN_STATUSES: frozenset[RunStatus] = frozenset(
@@ -980,13 +1125,26 @@ class WorkflowRunner:
                 )
             ],
         )
-        result = await self.dispatcher.dispatch_signal(signal)
+        with self._read_only_write_counter(stage) as write_violations:
+            result = await self.dispatcher.dispatch_signal(signal)
         gate_outcome, gate_reason = await self._evaluate_gate(
             stage,
             result,
             run=run,
             attempt_number=attempt_number,
         )
+        if (
+            stage.compensate == "noop_idempotent"
+            and write_violations
+        ):
+            original_reason = gate_reason
+            gate_outcome = GateOutcome.FAIL
+            gate_reason = (
+                "read_only_violation:"
+                + ",".join(sorted({v.table for v in write_violations}))
+            )
+            if original_reason:
+                gate_reason = f"{gate_reason};{original_reason}"
         actor_did, actor_sig = sign_stage_transition(
             run_id=run.run_id,
             stage_name=stage.name,
@@ -1013,6 +1171,17 @@ class WorkflowRunner:
             await self.store.update_compensate_state(link.link_id, "not_required")
         record_gate_outcome(spec.name, stage.name, gate_outcome.value)
         return gate_outcome
+
+    def _read_only_write_counter(self, stage: Stage):
+        if not (
+            stage.compensate == "noop_idempotent"
+            and stage.signal_mode == SignalMode.ACTION
+            and stage.read_only
+        ):
+            return _NullWriteCounter()
+
+        violations: list[ReadOnlyWriteViolation] = []
+        return _ReadOnlyWriteCounter(violations)
 
     async def _preflight_stage_gate(
         self, stage: Stage
@@ -3115,6 +3284,53 @@ def _matching_forbidden_module(
         ):
             return forbidden
     return None
+
+
+def _write_table(statement: str) -> Optional[str]:
+    tables = _write_tables(statement)
+    return tables[0] if tables else None
+
+
+def _write_tables(statement: str) -> tuple[str, ...]:
+    statement = _sql_without_strings_or_comments(statement)
+    if _plain_explain_sql(statement):
+        return ()
+    tables: list[str] = []
+    for pattern in _WRITE_TARGET_RES:
+        for match in pattern.finditer(statement):
+            tables.extend(
+                _normalize_sql_target(target)
+                for target in match.group(1).split(",")
+            )
+    return tuple(dict.fromkeys(tables))
+
+
+def _normalize_sql_target(target: str) -> str:
+    return target.replace(" ", "").replace('"', "").split(".")[-1]
+
+
+def _mutating_sql(statement: str) -> bool:
+    statement = _sql_without_strings_or_comments(statement)
+    if _plain_explain_sql(statement):
+        return False
+    return (
+        _MUTATING_SQL_RE.search(statement) is not None
+        or _MUTATING_CTE_SQL_RE.search(statement) is not None
+    )
+
+
+def _sql_without_strings_or_comments(statement: str) -> str:
+    statement = _LEADING_SQL_COMMENT_RE.sub("", statement)
+    statement = _SQL_DOLLAR_STRING_RE.sub("", statement)
+    statement = _SQL_STRING_RE.sub("", statement)
+    return _SQL_COMMENT_RE.sub(" ", statement)
+
+
+def _plain_explain_sql(statement: str) -> bool:
+    return (
+        _EXPLAIN_SQL_RE.search(statement) is not None
+        and _EXPLAIN_EXECUTES_SQL_RE.search(statement) is None
+    )
 
 
 def derive_stage_idempotency_key(
