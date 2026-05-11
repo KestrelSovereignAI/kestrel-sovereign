@@ -205,7 +205,7 @@ def get_package_for_feature(feature_class_name: str, path: Optional[Path] = None
     Look up which package a feature class belongs to.
 
     Args:
-        feature_class_name: The Feature class name (e.g. "RunPodFeature").
+        feature_class_name: The Feature class name (e.g. "VoiceFeature").
         path: Optional override for the registry TOML path.
 
     Returns:

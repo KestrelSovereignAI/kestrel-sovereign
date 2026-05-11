@@ -200,7 +200,7 @@ graph TB
         GITHUB["🐙 GitHubFeature<br/>Code introspection"]
         SEARCH["🔍 WebSearchFeature<br/>Tavily search"]
         VISUAL["🎨 VisualIdentity<br/>Avatar generation"]
-        RUNPOD["⚡ RunPodFeature<br/>GPU compute"]
+        CLOUD["⚡ Cloud providers<br/>entry-point packages"]
     end
 
     style core fill:#1a5276,stroke:#85c1e9

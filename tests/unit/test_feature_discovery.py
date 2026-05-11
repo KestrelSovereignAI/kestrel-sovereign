@@ -39,21 +39,21 @@ class TestGetDisabledFeatures:
 
     def test_single_feature_disabled(self):
         """Test disabling a single feature."""
-        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: "RunPodFeature"}):
+        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: "VoiceFeature"}):
             result = get_disabled_features()
-            assert result == {"RunPodFeature"}
+            assert result == {"VoiceFeature"}
 
     def test_multiple_features_disabled(self):
         """Test disabling multiple features."""
-        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: "RunPodFeature,CreativeFeature,MCPAgent"}):
+        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: "VoiceFeature,CreativeFeature,MCPAgent"}):
             result = get_disabled_features()
-            assert result == {"RunPodFeature", "CreativeFeature", "MCPAgent"}
+            assert result == {"VoiceFeature", "CreativeFeature", "MCPAgent"}
 
     def test_handles_whitespace(self):
         """Test that whitespace is trimmed."""
-        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: " RunPodFeature , CreativeFeature "}):
+        with patch.dict(os.environ, {DISABLED_FEATURES_ENV: " VoiceFeature , CreativeFeature "}):
             result = get_disabled_features()
-            assert result == {"RunPodFeature", "CreativeFeature"}
+            assert result == {"VoiceFeature", "CreativeFeature"}
 
 
 class TestDiscoverFeatureModules:
