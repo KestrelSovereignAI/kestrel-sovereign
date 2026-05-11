@@ -44,6 +44,7 @@ Status meanings:
 | `tasks` | `kestrel_sovereign/features/tasks/` | `tests/unit/test_workflow_executor.py`, `tests/unit/test_a2a_task_manager.py`, `tests/integration/test_orchestration_e2e.py` | Direct |
 | `vastai` | `kestrel_sovereign/features/vastai/` | `tests/unit/test_vastai_feature.py`, `tests/unit/test_cloud_launcher_contracts.py`, `tests/integration/test_vastai_e2e.py` | Direct |
 | `visual_identity` | `kestrel_sovereign/features/visual_identity/` | `tests/unit/test_visual_identity_feature.py` | Direct |
+| `voice` | `kestrel-feature-voice` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-voice` | Boundary |
 | `wallet` | `kestrel-feature-wallet` optional package via `kestrel_sovereign.features` entry point | `tests/unit/test_extracted_feature_boundary_contracts.py`; package tests live in `kestrel-feature-wallet` | Boundary |
 | `web_search` | `kestrel_sovereign/features/web_search/` | `tests/unit/test_web_search_feature.py` | Direct |
 | `webhooks` | `kestrel_sovereign/features/webhooks.py` | `tests/unit/test_webhooks_feature.py` | Direct |

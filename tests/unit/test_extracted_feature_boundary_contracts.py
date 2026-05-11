@@ -67,6 +67,22 @@ def test_github_feature_is_external_to_core():
     assert source_files == []
 
 
+def test_voice_feature_is_external_to_core():
+    registry = (PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml").read_text()
+    feature_dir = PROJECT_ROOT / "kestrel_sovereign/features/voice"
+    support_dir = PROJECT_ROOT / "kestrel_sovereign/voice"
+
+    assert 'package = "kestrel-feature-voice"' in registry
+    assert "[voice]" in registry
+    assert "`voice` | `kestrel-feature-voice`" in (
+        PROJECT_ROOT / "docs/audit/FEATURE_PROOF_MATRIX.md"
+    ).read_text()
+    voice_block = registry.split("[voice]", 1)[1].split("\n[", 1)[0]
+    assert "core = false" in voice_block
+    assert not feature_dir.exists()
+    assert not support_dir.exists()
+
+
 def test_reflection_feature_is_external_to_core():
     registry = (PROJECT_ROOT / "kestrel_sovereign/data/feature_registry.toml").read_text()
     feature_dir = PROJECT_ROOT / "kestrel_sovereign/features/reflection"

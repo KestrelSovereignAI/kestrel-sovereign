@@ -4,7 +4,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-05-11
-**Scope:** 1651 tracked files (1008 `.py`, 260 `.md`, 383 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 1625 tracked files (982 `.py`, 260 `.md`, 383 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -226,10 +226,6 @@ Repo entry points and standard project files.
   - `async def get_spawn_children(request)`
 - **kestrel_sovereign/endpoints/ui.py** — UI theme + i18n endpoint.
   - `async def get_theme(theme, locale)`; `async def list_themes()`
-- **kestrel_sovereign/endpoints/voice.py** — Voice HTTP endpoints and WebSocket real-time voice chat.
-  - `class VoiceConfigRequest`; `class TTSRequest`; `class TTSStreamRequest`; `async def list_voices(request, provider)`; `async def providers_status(request)`; `async def get_voice_config(request)`; `async def set_voice_config(request, body)`; `async def synthesize_speech(request, body)`; `…`
-- **kestrel_sovereign/endpoints/voice_realtime.py** — Voice Realtime ephemeral-session mint endpoint.
-  - `class RealtimeSessionRequest`; `class RealtimeSessionResponse`; `class RealtimeUnavailableResponse`; `async def create_realtime_session(body, request)`; `class RouteIntrospectionResponse`; `async def introspect_voice_route(request, prefer_realtime, preferred_tts, preferred_stt)`; `class ToolCallRequest`; `class ToolCallResponse`; `…`
 - **kestrel_sovereign/entrypoints.py** — Entry Point Discovery Utilities.
   - `def discover_entry_point_classes(group, base_class)`
 - **kestrel_sovereign/ephemeral_session.py** — Ephemeral Session Handler for Kestrel Privacy System.
@@ -273,7 +269,7 @@ Repo entry points and standard project files.
   - `class ChannelRegistry`
 - **kestrel_sovereign/features/cli/__init__.py** — Feature-owned CLI adapter support.
 - **kestrel_sovereign/features/cli/adapters.py** — Feature-owned CLI adapters.
-  - `class CliAdapterError`; `class CliAvailabilityReport`; `class FeatureCliAdapter`; `class GitHubCliAdapter`; `def redact_json(value)`
+  - `class CliAdapterError`; `class CliAvailabilityReport`; `class FeatureCliAdapter`; `class GitHubCliAdapter`; `class GitCliAdapter`; `def redact_json(value)`
 - **kestrel_sovereign/features/cli/component.yaml** — (configuration)
 - **kestrel_sovereign/features/cli/feature.py** — CLI feature: registered feature-owned command-line adapters.
   - `class CliFeature`
@@ -499,9 +495,6 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/vertex_ai/__init__.py** — Vertex AI Feature for Kestrel.
 - **kestrel_sovereign/features/vertex_ai/vertex_ai_manager.py** — Vertex AI Custom Job Manager for LoRA Training.
   - `class JobState`; `class VertexAITrainingJob`; `class VertexAIManagerError`; `class VertexAIManager`
-- **kestrel_sovereign/features/voice/__init__.py** — Voice Feature — TTS synthesis, STT transcription, voice selection.
-- **kestrel_sovereign/features/voice/feature.py** — Voice Feature — TTS synthesis, STT transcription, voice selection.
-  - `class VoicePrivacyError`; `class VoiceFeature`
 - **kestrel_sovereign/features/web_search/__init__.py** — —
 - **kestrel_sovereign/features/web_search/base.py** — Search Provider Abstract Base Class.
   - `class SearchProvider`
@@ -937,6 +930,9 @@ Repo entry points and standard project files.
   - `class TemporalAnalyzer`
 - **kestrel_sovereign/storage/tiered_manager.py** — Tiered Storage Manager
   - `class TieredStorageManager`; `def create_default_manager(privacy_mode, lighthouse_api_key)`
+- **kestrel_sovereign/streams/__init__.py** — Shared stream infrastructure for framework endpoints and extensions.
+- **kestrel_sovereign/streams/tap.py** — Agent stream tap — shared infrastructure for tapping into active agent streams.
+  - `class AgentStreamTap`
 - **kestrel_sovereign/telemetry.py** — OpenTelemetry tracing integration for Kestrel Sovereign.
   - `def is_tracing_enabled()`; `def setup_tracing(app)`; `def get_tracer()`; `def optional_span(name, attributes)`; `def start_span(name, attributes)`; `def end_span(span, error)`
 - **kestrel_sovereign/templates/default_soul.md** — SOUL.md - Default Personality — **CRITICAL INSTRUCTION:** When answering personal questions, respond in natural paragraphs.
@@ -956,23 +952,6 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/ui/__init__.py** — —
 - **kestrel_sovereign/ui/theme_loader.py** — Theme/locale label resolver for the UI theme + i18n system (epic #986).
   - `class ThemeNotFoundError`; `class ThemeBundle`; `def load_theme(theme, locale)`; `def list_available_themes()`; `def clear_cache()`
-- **kestrel_sovereign/voice/__init__.py** — Kestrel Voice Provider Abstraction Layer.
-- **kestrel_sovereign/voice/agent_prompt_snippet.md** — <!-- Injected into the agent's system prompt by kestrel_sovereign.voice.routing when the active turn is being voiced.
-- **kestrel_sovereign/voice/base.py** — Base classes for voice providers (TTS and STT).
-- **kestrel_sovereign/voice/faster_whisper_stt.py** — Faster-Whisper STT Provider.
-  - `class FasterWhisperSTTProvider`
-- **kestrel_sovereign/voice/piper_tts.py** — Piper TTS Provider — local, CPU-based, privacy-safe text-to-speech.
-  - `class PiperTTSProvider`; `def wave_file(wav_buf, config)`
-- **kestrel_sovereign/voice/provider_registry.py** — Voice Provider Registry.
-  - `class ProviderDiagnostic`; `class VoiceProviderRegistry`
-- **kestrel_sovereign/voice/routing.py** — Voice path resolver — single source of truth for picking the voice path.
-  - `class UserVoicePreferences`; `class InstalledProviders`; `class VoiceRoutingContext`; `class VoiceRoute`; `def resolve(ctx)`
-- **kestrel_sovereign/voice/stream_tap.py** — Agent stream tap — shared infrastructure for tapping into active agent streams.
-  - `class AgentStreamTap`
-- **kestrel_sovereign/voice/tags.py** — Voice tag normalizer — one canonical vocabulary, per-provider adapters.
-  - `class TagToken`; `class ParsedText`; `def parse_tags(text, known)`; `class NormalizedOutput`; `class ProviderTagAdapter`; `class ElevenLabsV3Adapter`; `class OpenAITTSAdapter`; `class OpenAIRealtimeAdapter`; `…`
-- **kestrel_sovereign/voice/vad.py** — Voice Activity Detection for WebSocket turn-taking.
-  - `class VoiceActivityDetector`; `def load_vad_config(config)`
 
 ## `endpoints/`
 
@@ -1159,6 +1138,7 @@ Repo entry points and standard project files.
 - **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — Kestrel Compute Feature - Architecture Design — ## Executive Summary
 - **docs/architecture/CONSTITUTION_INJECTION.md** — SignalDispatcher Constitutional Injection — Architecture Design — > Draft v1.
 - **docs/architecture/DYNAMIC_TOOL_LOADING.md** — Dynamic Tool Loading — **Status:** Implemented **Author:** Design review **Date:** 2026-02-16 **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`, `kestrel_sovereign/prompts/syste…
+- **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
 - **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
 - **docs/architecture/GITHUB_FEATURE_DESIGN.md** — GitHub Feature Design — > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-poin…
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
@@ -1722,10 +1702,6 @@ Repo entry points and standard project files.
   - `class MockSyncState`; `class MockSyncTarget`; `def temp_db(tmp_path)`; `def temp_db_with_keeper(tmp_path)`; `def temp_db_with_data(tmp_path)`; `def mock_target()`; `def failing_target()`; `def network_partition_target()`; `…`
 - **tests/integration/test_tool_calling_e2e.py** — Integration tests for OpenAI-style tool calling with Features as Subagents.
   - `class TestToolCall`; `class TestLLMResponse`; `class TestFeatureAsSubagent`; `class TestOpenAIAdapterToolCalling`; `class TestToolFormatConversion`; `class TestE2EToolCallingFlow`; `class TestToolSchemaGeneration`; `class TestAutonomousToolCalling`
-- **tests/integration/test_voice_faster_whisper.py** — Integration tests for faster-whisper STT — real local transcription.
-  - `def provider()`; `class TestFasterWhisperReal`
-- **tests/integration/test_voice_piper.py** — Integration tests for Piper TTS — real local synthesis.
-  - `def provider()`; `class TestPiperTTSReal`
 - **tests/js/test_voice_events.mjs** — (mjs asset)
 - **tests/js/test_voice_state_machine.mjs** — (mjs asset)
 - **tests/llm/__init__.py** — —
@@ -1831,7 +1807,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_caller_context_auth.py** — Unit tests for caller context auth gate on governance commands.
   - `def test_sovereign_factory()`; `def test_authenticated_factory()`; `def test_anonymous_factory()`; `def test_jwt_authenticated()`; `async def test_sovereign_can_run_safe_mode_exit()`; `async def test_oauth_user_rejected_from_safe_mode_exit()`; `async def test_no_caller_rejected_from_safe_mode_exit()`; `async def test_sovereign_can_run_reanchor()`; `…`
 - **tests/unit/test_caller_context_endpoint_propagation.py** — Regression suite for #736 — every authenticated endpoint must pass a CallerContext into agent.process_input/process_input_streaming so that sovereign-command authorization is consistent regardless of…
-  - `def test_chat_completions_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_propagates_sovereign_caller_from_api_key()`; `def test_bridge_stream_propagates_sovereign_caller_from_api_key()`; `def test_voice_websocket_auth_returns_sovereign_caller_for_valid_api_key()`; `def test_voice_websocket_auth_returns_none_for_bad_api_key()`; `def test_voice_websocket_auth_returns_authenticated_caller_for_session_cookie()`; `def test_voice_websocket_auth_no_key_configured_is_sovereign()`
+  - `def test_chat_completions_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_propagates_sovereign_caller_from_api_key()`; `def test_bridge_stream_propagates_sovereign_caller_from_api_key()`
 - **tests/unit/test_canonical_inventory_sync.py** — (unparseable Python source)
 - **tests/unit/test_car_builder.py** — Tests for CAR v1 builder and reader.
   - `class TestVarint`; `class TestCID`; `class TestCARBuilder`; `class TestCARReader`; `class TestCARRoundTrip`
@@ -1848,7 +1824,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
   - `class TestArgumentParsing`; `class TestCommandDispatch`; `class TestProcessHelpers`; `def multi_agent_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStorage`; `class TestCmdStop`; `…`
 - **tests/unit/test_cli_adapter_feature.py** — Tests for feature-owned CLI adapter support.
-  - `class FakeTerminal`; `async def test_github_pr_view_uses_registered_read_only_gh_command()`; `async def test_github_pr_files_and_checks_project_pr_payload_lists()`; `async def test_github_read_file_at_ref_decodes_contents_response()`; `async def test_github_read_file_at_pr_head_uses_head_oid_ref()`; `async def test_github_pr_review_context_can_include_bounded_file_contents()`; `async def test_github_pr_review_context_coerces_string_boolean_false()`; `async def test_github_read_file_at_ref_rejects_endpoint_escape_inputs()`; `…`
+  - `class FakeTerminal`; `async def test_github_pr_view_uses_registered_read_only_gh_command()`; `async def test_git_status_uses_registered_read_only_git_command(tmp_path, monkeypatch)`; `async def test_git_diff_validates_ref_and_path_before_argv(tmp_path, monkeypatch)`; `async def test_git_log_caps_max_count(tmp_path, monkeypatch)`; `async def test_git_show_file_and_merge_base_build_safe_argv(tmp_path, monkeypatch)`; `async def test_git_adapter_rejects_unsafe_refs_paths_and_missing_repo(tmp_path, monkeypatch)`; `async def test_git_adapter_rejects_repos_outside_allowed_roots(tmp_path, monkeypatch)`; `…`
 - **tests/unit/test_cli_agent_docker.py** — ``kestrel agent docker`` CLI tests — sub-PR 3.2 of epic #1050 (bash-to-Python port of ``scripts/sovereign-agent.sh``).
   - `def test_argparse_create_minimal()`; `def test_argparse_chat()`; `def test_argparse_retire_with_yes()`; `def test_kestrel_cli_registers_agent_docker()`; `def test_cmd_agent_no_subverb_prints_usage(capsys)`; `def test_cmd_agent_docker_no_subverb_prints_usage(capsys)`; `def test_create_without_data_key_errors_with_hint(monkeypatch, capsys)`; `def test_chat_without_data_key_errors(monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli_constitution_reanchor.py** — Unit tests for the ``kestrel constitution reanchor`` CLI surface.
@@ -2024,9 +2000,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_extract_raw_user_content.py** — Tests for ``context_builder.extract_raw_user_content``.
   - `def test_strips_full_sent_form_with_retrieved_context()`; `def test_strips_sent_form_without_retrieved_context()`; `def test_strips_sent_form_round_trips_wrap_user_input()`; `def test_legacy_raw_content_unchanged()`; `def test_preserves_inner_newlines_in_raw()`; `def test_preserves_inner_tag_like_content()`; `def test_malformed_partial_wrappers_left_alone()`; `def test_retrieved_context_only_no_user_input_wrap()`
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
-  - `def test_feature_proof_matrix_marks_mcp_as_external_package_boundary()`; `def test_observability_feature_is_external_to_core()`; `def test_wallet_feature_is_external_to_core()`; `def test_github_feature_is_external_to_core()`; `def test_reflection_feature_is_external_to_core()`; `def test_council_feature_is_external_to_core()`
-- **tests/unit/test_faster_whisper_stt.py** — Unit tests for FasterWhisperSTTProvider.
-  - `class TestDeviceDetection`; `class TestFasterWhisperSTTProvider`; `class TestAvailability`; `class TestModelCaching`; `class TestTranscription`
+  - `def test_feature_proof_matrix_marks_mcp_as_external_package_boundary()`; `def test_observability_feature_is_external_to_core()`; `def test_wallet_feature_is_external_to_core()`; `def test_github_feature_is_external_to_core()`; `def test_voice_feature_is_external_to_core()`; `def test_reflection_feature_is_external_to_core()`; `def test_council_feature_is_external_to_core()`
 - **tests/unit/test_feature_discovery.py** — Tests for the Feature Discovery module.
   - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`
 - **tests/unit/test_feature_doc_canonicality.py** — Guardrails for canonical feature-document structure.
@@ -2193,8 +2167,6 @@ Repo entry points and standard project files.
   - `def detector()`; `class TestRegexDetection`; `class TestAnonymization`; `class TestNERDetection`; `class TestPIIReport`; `class TestGlobalSingleton`; `class TestEdgeCases`
 - **tests/unit/test_pin_quotas.py** — Tests for pin quota enforcement, monitoring, and admin bulk-unpin.
   - `class FakeDB`; `async def test_pin_quota_enforced()`; `async def test_pin_quota_configurable()`; `async def test_pin_quota_repin_does_not_double_count()`; `async def test_pin_ratio_warning()`; `async def test_pin_ratio_no_warning_below_threshold()`; `async def test_admin_bulk_unpin_all()`; `async def test_admin_bulk_unpin_all_empty()`; `…`
-- **tests/unit/test_piper_tts.py** — Unit tests for PiperTTSProvider.
-  - `class TestIsAvailable`; `class TestListVoices`; `class TestSynthesize`; `class TestSynthesizeStream`; `class TestModelCaching`; `class TestSentenceSplitting`; `class TestProviderMetadata`
 - **tests/unit/test_post_response_pipeline.py** — Unit tests for post-response memory tagging pipeline (#565).
   - `class TestMemorySystemTagMessage`; `class TestMemoryManagerTagExchange`; `class TestUpdateMessageMetadataAtomicMerge`; `class TestEpisodeCreationThreshold`; `class TestPostResponsePipeline`
 - **tests/unit/test_privacy_active_session_contracts.py** — Active-session privacy transition contracts.
@@ -2218,7 +2190,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_prometheus_metrics.py** — Tests for Prometheus metrics endpoint and instrumentation.
   - `class TestMetricDefinitions`; `class TestGenerateMetrics`; `class TestMetricsEndpoint`; `class TestLLMServicePrometheus`; `class TestGracefulDegradation`; `class TestLabelCardinality`
 - **tests/unit/test_provider_entrypoints.py** — Tests for provider entry_point discovery across all registries.
-  - `class TestDiscoverEntryPointClasses`; `class TestVoiceProviderEntryPoints`; `class TestLLMProviderEntryPoints`; `class TestChannelRegistryEntryPoints`; `class TestStorageProviderEntryPoints`; `class TestDeployManagerEntryPoints`; `class TestWebSearchEntryPoints`
+  - `class TestDiscoverEntryPointClasses`; `class TestLLMProviderEntryPoints`; `class TestChannelRegistryEntryPoints`; `class TestStorageProviderEntryPoints`; `class TestDeployManagerEntryPoints`; `class TestWebSearchEntryPoints`
 - **tests/unit/test_provider_registry_no_sdk_retries.py** — Regression guard for #656.
   - `class TestOpenAICompatibleClientsDisableSdkRetries`; `class TestConnectionErrorFailsFast`
 - **tests/unit/test_rasa_shim_endpoint_contracts.py** — Contract tests for the Rasa webhook shim.
@@ -2383,6 +2355,8 @@ Repo entry points and standard project files.
   - `async def test_github_api_offloads_urlopen_via_to_thread()`; `async def test_github_post_offloads_urlopen_via_to_thread()`
 - **tests/unit/test_strategic_memory_toolresult.py** — ToolResult contract tests for StrategicMemoryFeature (#1061 wave 12).
   - `async def test_strategy_view_no_data_returns_error()`; `async def test_strategy_view_unknown_section_returns_error()`; `async def test_strategy_view_vision_falls_back_when_empty()`; `async def test_strategy_view_vision_present()`; `async def test_resolve_blocker_missing_returns_error()`; `async def test_resolve_blocker_present_returns_ok()`; `async def test_backlog_hygiene_prereq_failure_returns_error()`; `async def test_backlog_hygiene_dry_run_returns_partial()`; `…`
+- **tests/unit/test_stream_tap.py** — Unit tests for the generic agent stream tap.
+  - `async def test_stream_tap_publishes_chunks_and_cleans_up()`
 - **tests/unit/test_streaming_audit.py** — Unit tests for streaming response functionality.
   - `class TestStreamingBasics`; `class TestRealStreaming`
 - **tests/unit/test_streaming_inband_revising_sentinel.py** — Wave 5E in-band revising sentinel — kestrel-sovereign #1086.
@@ -2439,32 +2413,8 @@ Repo entry points and standard project files.
   - `def html_text()`; `def legacy_labels()`; `def test_index_html_has_annotations(html_text)`; `def test_every_data_label_key_exists_in_legacy_theme(html_text, legacy_labels)`; `def test_every_data_label_attr_value_exists_in_legacy_theme(html_text, legacy_labels)`; `def test_inline_text_for_a_few_keys_matches_legacy_value(html_text, legacy_labels)`; `def test_attribute_inline_values_match_legacy(html_text, legacy_labels)`; `def test_theme_js_is_loaded_in_index_html(html_text)`; `…`
 - **tests/unit/test_ui_theme_loader.py** — Unit tests for the UI theme loader (epic #986, sub-issue #989).
   - `def isolated_themes(tmp_path, monkeypatch)`; `def test_load_legacy_returns_full_label_map()`; `def test_load_falconry_overrides_legacy_on_diverging_keys()`; `def test_load_plain_overrides_legacy_on_diverging_keys()`; `def test_unknown_theme_raises()`; `def test_list_available_themes_includes_shipped_themes()`; `def test_default_theme_and_locale_constants()`; `def test_load_theme_caches_results()`; `…`
-- **tests/unit/test_vad.py** — Unit tests for Voice Activity Detection (kestrel_sovereign/voice/vad.py).
-  - `class TestVADConstruction`; `class TestIsSpeech`; `class TestDetectUtterances`; `class TestLoadVADConfig`
 - **tests/unit/test_verify_policy.py** — verify_policy tests — Wave 1 sub-PR 4 (#916).
   - `def test_archival_import_defaults_to_legacy_allowed()`; `def test_live_identity_defaults_to_legacy_allowed_pre_wave_2()`; `def test_new_identity_issuance_defaults_to_hybrid_required()`; `def test_constitution_checkpoint_defaults_to_pq_required()`; `def test_every_context_has_a_default()`; `def test_legacy_allowed_accepts_classical_only()`; `def test_legacy_allowed_accepts_pq_only()`; `def test_legacy_allowed_accepts_hybrid()`; `…`
-- **tests/unit/test_voice_base.py** — Unit tests for voice provider abstraction layer.
-  - `class FakeTTSLocal`; `class FakeTTSCloud`; `class FakeSTTLocal`; `class FakeSTTCloud`; `class TestVoiceConfig`; `class TestVoiceInfo`; `class TestVoiceProviderRegistry`; `class TestABCEnforcement`; `…`
-- **tests/unit/test_voice_conversation_base.py** — Unit tests for the ConversationProvider ABC.
-  - `class FakeConversationSession`; `class FakeConversationProvider`; `def provider()`; `def tool_echo()`; `async def test_provider_exposes_name_and_is_local(provider)`; `async def test_provider_discovers_models_at_runtime(provider)`; `async def test_provider_lists_voices_at_runtime(provider)`; `async def test_provider_is_available(provider)`; `…`
-- **tests/unit/test_voice_endpoints.py** — Unit tests for the voice HTTP endpoints (endpoints/voice.py).
-  - `class TestListVoices`; `class TestGetVoiceConfig`; `class TestSetVoiceConfig`; `class TestTTS`; `class TestTTSStream`; `class TestSTT`; `class TestAuthMiddleware`
-- **tests/unit/test_voice_feature.py** — Unit tests for VoiceFeature.
-  - `class FakeLocalTTS`; `class FakeCloudTTS`; `class FakeLocalSTT`; `class FakeCloudSTT`; `def agent()`; `def feature(agent)`; `class TestFeatureDiscovery`; `class TestToolRegistration`; `…`
-- **tests/unit/test_voice_matching.py** — Unit tests for voice personality matching.
-  - `class TestMatchVoice`; `class TestPersonalityVoiceFields`; `class TestVoiceInfoExtended`; `class FakeTTS`; `class FakeUnavailableTTS`; `class TestResolveVoice`; `class TestSetVoicePersonalitySync`
-- **tests/unit/test_voice_privacy.py** — Unit tests for voice privacy gate — auto-switch providers by privacy mode.
-  - `class FakeLocalTTS`; `class FakeCloudTTS`; `class FakeLocalSTT`; `class FakeCloudSTT`; `class TestPrivacyPresetTTS`; `class TestPrivacyPresetSTT`; `class TestAutoFallback`; `class TestErrorMessages`; `…`
-- **tests/unit/test_voice_realtime_endpoint.py** — Unit tests for the ephemeral-token mint endpoint ``POST /voice/realtime/session``.
-  - `def client()`; `class TestRealtimeSessionSuccess`; `class TestRealtimeUnavailable`; `class TestRealtimeErrors`; `class TestComposeInstructions`; `class TestCollectTools`; `class TestClampTurnMode`; `class TestDefaultVoice`; `…`
-- **tests/unit/test_voice_routing.py** — Unit tests for the voice path resolver.
-  - `def test_local_only_selects_piper_and_faster_whisper(privacy)`; `def test_local_only_ignores_openai_llm_vendor(privacy)`; `def test_local_only_ignores_cloud_preference(privacy)`; `def test_local_only_returns_none_when_no_local_tts(privacy)`; `def test_local_only_returns_none_when_no_local_stt(privacy)`; `def test_local_only_accepts_third_party_local_provider(privacy)`; `def test_realtime_path_selected_for_openai_llm_and_normal_privacy()`; `def test_realtime_path_selected_for_openai_llm_and_public_privacy()`; `…`
-- **tests/unit/test_voice_streaming.py** — Unit tests for streaming TTS — sentence splitting, stream tap, and endpoint modes.
-  - `class TestSplitSentences`; `class TestAgentStreamTap`; `class TestTTSStreamFullTextMode`; `class TestTTSStreamAgentMode`; `class TestTTSStreamValidation`
-- **tests/unit/test_voice_tags.py** — Unit tests for the voice tag normalizer.
-  - `class TestParseTags`; `class TestElevenLabsV3Adapter`; `class TestOpenAITTSAdapter`; `class TestOpenAIRealtimeAdapter`; `class TestPiperAdapter`; `class TestGetAdapter`; `class TestPromptSnippet`; `def test_same_input_through_all_adapters()`
-- **tests/unit/test_voice_websocket.py** — Unit tests for the WebSocket /voice/chat endpoint (endpoints/voice.py).
-  - `def disable_vad()`; `class TestBinaryFraming`; `class TestVoiceChatConnection`; `class TestVoiceChatPrivacy`; `class TestVoiceChatStateMachine`; `class TestVoiceChatDisconnect`; `class TestWsForcesPipelineRoute`
 - **tests/unit/test_web_search_feature.py** — Unit tests for WebSearchFeature and WebSearchTool.
   - `class TestWebSearchTool`; `class TestWebSearchFeature`; `class TestWebSearchIntegration`
 - **tests/unit/test_webhooks_feature.py** — Unit tests for the generic Webhook Receiver feature (#156).
