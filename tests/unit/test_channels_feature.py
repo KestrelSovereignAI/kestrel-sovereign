@@ -29,6 +29,7 @@ from kestrel_sovereign.features.channels.models import (
 from kestrel_sovereign.features.channels.adapter import ChannelAdapter
 from kestrel_sovereign.features.channels.registry import ChannelRegistry
 from kestrel_sovereign.features.channels.feature import ChannelFeature
+from kestrel_sdk.channels import ChannelMessage as SDKChannelMessage
 
 
 # ============================================================================
@@ -114,6 +115,9 @@ def _make_agent(db=None, agent_id="test-agent"):
 
 
 class TestChannelMessage:
+    def test_channel_message_uses_sdk_contract(self):
+        assert ChannelMessage is SDKChannelMessage
+
     def test_defaults(self):
         msg = ChannelMessage(
             channel_type="telegram",
@@ -585,6 +589,35 @@ class TestChannelFeature:
 
         # Message should be routed
         router.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_handle_inbound_enqueues_signal_when_dispatcher_available(self):
+        db = _make_db()
+        agent = _make_agent(db=db)
+        agent.did = "did:test:channels"
+        agent.dispatcher = MagicMock()
+        agent.dispatcher.enqueue_signal = AsyncMock()
+
+        feat = ChannelFeature(agent)
+        await feat.initialize()
+        router = AsyncMock()
+        feat.registry.set_inbound_router(router)
+        feat.registry.register(StubAdapter(channel="telegram"))
+
+        msg = ChannelMessage(
+            channel_type="telegram",
+            direction=MessageDirection.INBOUND,
+            sender="alice",
+            recipient="bot",
+            content="hi there",
+        )
+        await feat.handle_inbound(msg)
+
+        agent.dispatcher.enqueue_signal.assert_awaited_once()
+        signal = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert signal.source == "channel.message"
+        assert signal.payload["content"] == "hi there"
+        router.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handle_inbound_blocked_sender(self, feature):

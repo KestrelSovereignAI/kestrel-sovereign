@@ -12,6 +12,7 @@ External packages can register channel adapters via entry_points::
 import logging
 from typing import Awaitable, Callable, Dict, List, Optional
 
+from kestrel_sdk.channels import CHANNEL_ADAPTER_ENTRY_POINT_GROUP
 from kestrel_sovereign.entrypoints import discover_entry_point_classes
 from .adapter import ChannelAdapter
 from .models import ChannelMessage, MessageDirection
@@ -20,8 +21,6 @@ logger = logging.getLogger(__name__)
 
 # Callback type for routing inbound messages to an agent/session
 InboundRouter = Callable[[ChannelMessage], Awaitable[None]]
-
-CHANNEL_ADAPTER_ENTRY_POINT_GROUP = "kestrel_sovereign.channel_adapters"
 
 
 class ChannelRegistry:

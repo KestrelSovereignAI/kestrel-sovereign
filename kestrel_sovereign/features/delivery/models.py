@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from kestrel_sdk.delivery import DeliveryResult, DeliveryTask
+
 
 class DeliveryStatus(Enum):
     """Lifecycle states for a delivery queue entry."""
@@ -72,15 +74,9 @@ class QueueEntry:
         raw = f"{recipient}:{content_json}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-
-@dataclass
-class DeliveryResult:
-    """Result of attempting to deliver a single message."""
-    success: bool
-    error: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {"success": self.success}
-        if self.error:
-            d["error"] = self.error
-        return d
+__all__ = [
+    "DeliveryResult",
+    "DeliveryStatus",
+    "DeliveryTask",
+    "QueueEntry",
+]

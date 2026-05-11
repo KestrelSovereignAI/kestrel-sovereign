@@ -43,10 +43,9 @@ dependencies = [
     # constitution_injection / system_prompt_budget_bytes) that chunks 1D,
     # 1F, and 1G consume. Defaults are backwards-compatible.
     #
-    # 0.13 floor: required for Lighthouse SELF_WALLET in the
-    # PayerPolicy support matrix (see
-    # docs/architecture/PAYER_POLICY_FOUNDATION.md).
-    "kestrel-sovereign-sdk>=0.13,<1",
+    # 0.14 floor: adds SDK-owned channel, delivery, and output contracts
+    # while preserving the 0.13 Lighthouse SELF_WALLET support matrix.
+    "kestrel-sovereign-sdk>=0.14,<1",
     # Core web framework
     "fastapi==0.128.1",
     "uvicorn==0.35.0",

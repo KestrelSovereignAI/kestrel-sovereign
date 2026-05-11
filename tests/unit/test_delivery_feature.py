@@ -614,16 +614,15 @@ class TestQueueProcessPending:
         assert processed == 0
 
     @pytest.mark.asyncio
-    async def test_process_delivers_pending_message(self, queue):
+    async def test_process_without_delivery_provider_schedules_retry(self, queue):
         row = _make_queue_row(status="pending")
         queue._db.fetchall = AsyncMock(return_value=[row])
         queue._db.fetchone = AsyncMock(return_value=None)
 
-        # No delivery callback -> auto-success
         processed = await queue.process_pending()
         assert processed == 1
 
-        # Should have set status to in_flight, then to delivered
+        # Should have set status to in_flight, then failed/retryable.
         execute_calls = queue._db.execute.call_args_list
         statuses = []
         for call in execute_calls:
@@ -632,6 +631,25 @@ class TestQueueProcessPending:
                 params = call[0][1]
                 statuses.append(params[0])  # status is first param
         assert "in_flight" in statuses
+        assert "failed" in statuses
+        assert "delivered" not in statuses
+
+    @pytest.mark.asyncio
+    async def test_process_noop_delivery_requires_explicit_opt_in(self, queue):
+        row = _make_queue_row(status="pending")
+        queue._db.fetchall = AsyncMock(return_value=[row])
+        queue._db.fetchone = AsyncMock(return_value=None)
+        queue._allow_noop_delivery = True
+
+        processed = await queue.process_pending()
+        assert processed == 1
+
+        execute_calls = queue._db.execute.call_args_list
+        statuses = [
+            call[0][1][0]
+            for call in execute_calls
+            if "UPDATE delivery_queue" in call[0][0] and "status" in call[0][0]
+        ]
         assert "delivered" in statuses
 
     @pytest.mark.asyncio

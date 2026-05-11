@@ -29,6 +29,10 @@ from .models import (
     MessageDirection,
 )
 from .registry import ChannelRegistry
+from kestrel_sovereign.signals.sources.channels import (
+    build_channel_message_registration,
+    build_signal_for_channel_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +105,7 @@ class ChannelFeature(Feature):
 
         # Create the channel registry
         self.registry = ChannelRegistry()
+        self._register_channel_signal_source()
 
         # Create tables if DB is available
         if self._db:
@@ -116,6 +121,16 @@ class ChannelFeature(Feature):
             "ChannelFeature initialized for agent: %s",
             (self._agent_id[:30] + "...") if len(self._agent_id) > 30 else self._agent_id,
         )
+
+    def _register_channel_signal_source(self) -> None:
+        signal_registry = getattr(self.agent, "signal_registry", None)
+        if signal_registry is None:
+            return
+        try:
+            if signal_registry.get("channel.message") is None:
+                signal_registry.register(build_channel_message_registration())
+        except Exception as exc:
+            logger.warning("Could not register channel.message signal source: %s", exc)
 
     async def shutdown(self):
         """Disconnect all registered adapters."""
@@ -403,5 +418,23 @@ class ChannelFeature(Feature):
         # Log inbound message
         await self._log_message(message, status="received")
 
-        # Route through registry
-        await self.registry.route_message(message)
+        dispatched_signal = False
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        if dispatcher is not None:
+            try:
+                signal = build_signal_for_channel_message(
+                    message,
+                    target_agent=getattr(self.agent, "did", self._agent_id),
+                )
+                await dispatcher.enqueue_signal(signal)
+                dispatched_signal = True
+            except Exception:
+                logger.exception(
+                    "Failed to enqueue channel.message signal for message id=%s",
+                    message.id,
+                )
+
+        if not dispatched_signal:
+            # Legacy adapter/router path remains as fallback when the
+            # dispatcher is unavailable or rejected the signal.
+            await self.registry.route_message(message)
