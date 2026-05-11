@@ -2356,6 +2356,13 @@ def _workflow_prerequisite_status(
     agent: Any,
     source: str,
 ) -> list[dict[str, Any]]:
+    if source == "feature_features.council_review":
+        return [
+            {
+                "name": "workflow_council_approve_provider",
+                "ready": _council_approve_provider_ready(agent),
+            },
+        ]
     if source != "feature_features.red_team_review":
         return []
     return [
@@ -2400,6 +2407,33 @@ def _red_team_attestation_resolver_ready(agent: Any) -> bool:
                 break
     runner = getattr(workflow, "runner", None)
     return callable(getattr(runner, "red_team_attestation_resolver", None))
+
+
+def _council_approve_provider_ready(agent: Any) -> bool:
+    if callable(getattr(agent, "workflow_council_approve_provider", None)):
+        return True
+    features = getattr(agent, "features", None)
+    if not isinstance(features, dict):
+        return False
+    workflow = features.get("WorkflowsFeature")
+    if workflow is None:
+        for feature in features.values():
+            if feature.__class__.__name__ == "WorkflowsFeature":
+                workflow = feature
+                break
+    runner = getattr(workflow, "runner", None)
+    provider = getattr(runner, "council_approve_provider", None)
+    if not callable(provider):
+        return False
+    owner = getattr(provider, "__self__", None)
+    if (
+        owner is not None
+        and owner.__class__.__name__ == "WorkflowsFeature"
+        and getattr(provider, "__name__", None) == "_council_approve_provider"
+    ):
+        owner_agent = getattr(owner, "agent", None)
+        return callable(getattr(owner_agent, "workflow_council_approve_provider", None))
+    return True
 
 
 def _talon_feature(agent: Any) -> Any | None:
