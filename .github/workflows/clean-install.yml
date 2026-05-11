@@ -1,11 +1,20 @@
 name: Clean Install Validation
 
-# Validates that QUICKSTART.md works on a fresh machine.
-# Covers: git clone → uv sync → kestrel setup --quickstart → kestrel doctor
-#         → kestrel start → 3 pillars verified → DID persists across restart.
+# Validates that QUICKSTART.md works on a fresh machine — across two
+# install methods so packaging regressions are caught before they hit
+# PyPI users:
 #
-# The verification logic lives in scripts/ci/clean_install_verify.py — pure
-# Python with no shell idioms — so this workflow runs identically on
+#   sync   git clone → uv sync                      (the source-clone path)
+#   wheel  git clone → uv build --wheel → pip       (what `pip install
+#                                                    kestrel-sovereign`
+#                                                    exercises end-to-end)
+#
+# Both paths run the same readiness assertions: kestrel setup → doctor →
+# 3 pillars → start → /health → top-level /v1/chat/completions returns 503
+# → DID persists across restart → agent is tagged is_test_instance.
+#
+# The verification logic lives in scripts/ci/clean_install_verify.py —
+# pure Python with no shell idioms — so each step runs identically on
 # Ubuntu, macOS, and Windows runners (where steps would otherwise default
 # to PowerShell).
 #
@@ -25,6 +34,25 @@ env:
   # With this set, build_context() returns NonInteractivePrompter which
   # accepts defaults silently — exactly what --quickstart needs in CI.
   KESTREL_NONINTERACTIVE: "1"
+  # Mark every agent the wizard incepts in CI as a test instance. The
+  # CLI honours this env var in cmd_setup; the inception_service writes
+  # is_test_instance=True + a generated test_cycle_id onto the agent's
+  # properties node. Catches the next bystander who reads from a CI
+  # database thinking they have a real agent.
+  KESTREL_TEST_INSTANCE: "1"
+  # Per-job dynamic value, set by the "Resolve uv run flag" step below.
+  # Pre-declared here so the linter recognises ``${{ env.UVRUN }}`` in
+  # subsequent steps; the actual value is written at runtime via
+  # ``echo UVRUN=... >> "$GITHUB_ENV"``.
+  UVRUN: ""
+  # Python 3.11+ flag that blocks Python from prepending the cwd / script
+  # dir to ``sys.path``. Without this, ``python -m kestrel_sovereign.cli``
+  # run from the checkout root would resolve ``kestrel_sovereign`` against
+  # the source tree even on the wheel matrix — so a packaging regression
+  # in the wheel could silently slip through. Editable installs (used by
+  # the sync matrix) still resolve via ``site-packages`` ``.pth`` entries,
+  # which are unaffected by this flag — both paths keep working.
+  PYTHONSAFEPATH: "1"
 
 # The wizard creates an agent named "Kestrel" by default in quickstart
 # mode (kestrel_sovereign/setup/steps/agent.py::_prompt_name). Centralise
@@ -35,6 +63,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # ``sync`` is the source-clone install path (uv sync + uv run).
+        # ``wheel`` builds dist/*.whl from the same checkout and installs
+        # it into a fresh venv — the path PyPI users hit. Adding it as a
+        # parallel dimension means each method runs on its own runner
+        # (true parallelism, fail isolation) rather than chained serially.
+        install_method: [sync, wheel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
@@ -55,44 +89,83 @@ jobs:
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
 
-      # QUICKSTART Step 2: install dependencies
+      # QUICKSTART Step 2 (sync): install dependencies straight from the
+      # source tree via uv. Subsequent ``uv run`` invocations re-sync
+      # against pyproject.toml + uv.lock, so we don't pass --no-sync.
       - name: Install dependencies (uv sync)
+        if: matrix.install_method == 'sync'
         run: uv sync
+
+      # QUICKSTART Step 2 (wheel): build a wheel from this checkout and
+      # install it into a clean .venv. Mirrors what a downstream user
+      # gets from ``pip install kestrel-sovereign``. We stop ``uv run``
+      # from re-syncing (which would clobber the wheel install with the
+      # source tree) by setting UVRUN=uv run --no-sync below.
+      - name: Build wheel + install into clean venv
+        if: matrix.install_method == 'wheel'
+        shell: bash
+        run: |
+          uv build --wheel
+          uv venv --python ${{ env.PYTHON_VERSION }}
+          uv pip install dist/*.whl
+
+      # Each run line uses ``${{ env.UVRUN }}`` so we don't need an
+      # ``if:`` per step. ``--no-sync`` is mandatory on the wheel path
+      # (otherwise uv re-syncs from pyproject.toml on the first run and
+      # silently overwrites the wheel install with the source tree).
+      - name: Resolve uv run flag for matrix install_method
+        shell: bash
+        run: |
+          if [ "${{ matrix.install_method }}" = "wheel" ]; then
+            echo "UVRUN=uv run --no-sync" >> "$GITHUB_ENV"
+          else
+            echo "UVRUN=uv run" >> "$GITHUB_ENV"
+          fi
 
       # QUICKSTART Step 4: run the setup wizard.
       # --quickstart accepts Ollama as the LLM (no API key needed in CI),
       # generates KESTREL_DATA_KEY + KESTREL_API_KEY, writes [llm] into
       # kestrel.toml, and runs inception for an agent named "Kestrel".
+      # KESTREL_TEST_INSTANCE=1 (workflow env) flips inception's
+      # is_test_instance flag so the agent is identifiable as a CI agent.
       - name: Run setup wizard (kestrel setup --quickstart)
-        run: uv run kestrel setup --quickstart
+        run: ${{ env.UVRUN }} kestrel setup --quickstart
 
       # All assertions below delegate to scripts/ci/clean_install_verify.py.
       # That script is pure Python (stdlib only, no shell idioms), so each
       # `run:` is a single command line — identical on bash, PowerShell, cmd.
       - name: Verify wizard artifacts (.env, kestrel.toml, multi_agent.toml)
-        run: uv run python scripts/ci/clean_install_verify.py wizard-artifacts
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py wizard-artifacts
 
       - name: Run kestrel doctor (readiness gate)
-        run: uv run kestrel doctor
+        run: ${{ env.UVRUN }} kestrel doctor
 
       - name: Verify Identity Pillar
-        run: uv run python scripts/ci/clean_install_verify.py identity --agent-name "${{ env.AGENT_NAME }}"
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py identity --agent-name "${{ env.AGENT_NAME }}"
 
       - name: Verify Constitution Pillar
-        run: uv run python scripts/ci/clean_install_verify.py constitution --agent-name "${{ env.AGENT_NAME }}"
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py constitution --agent-name "${{ env.AGENT_NAME }}"
 
       - name: Verify Memory Pillar
-        run: uv run python scripts/ci/clean_install_verify.py memory --agent-name "${{ env.AGENT_NAME }}"
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py memory --agent-name "${{ env.AGENT_NAME }}"
+
+      - name: Verify agent is tagged as a test instance
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py test-instance --agent-name "${{ env.AGENT_NAME }}"
 
       - name: Start agent and verify health endpoint
-        run: uv run python scripts/ci/clean_install_verify.py start-and-health --agent-name "${{ env.AGENT_NAME }}"
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py start-and-health --agent-name "${{ env.AGENT_NAME }}"
+
+      # No-LLM contract probe: in multi-agent host mode, /v1/chat/completions
+      # must 503 (routing) rather than 500 (server error). Locks in #1110.
+      - name: Verify host top-level /v1/chat/completions → 503
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py host-and-chat-503
 
       - name: Verify DID persists across restart
-        run: uv run python scripts/ci/clean_install_verify.py did-persists --agent-name "${{ env.AGENT_NAME }}"
+        run: ${{ env.UVRUN }} python scripts/ci/clean_install_verify.py did-persists --agent-name "${{ env.AGENT_NAME }}"
 
       - name: Summary
         if: always()
         run: |
-          echo "Clean Install Validation matrix: ${{ matrix.os }}"
+          echo "Clean Install Validation matrix: ${{ matrix.os }} / ${{ matrix.install_method }}"
           echo "Python: ${{ env.PYTHON_VERSION }}"
           echo "Agent: ${{ env.AGENT_NAME }}"
