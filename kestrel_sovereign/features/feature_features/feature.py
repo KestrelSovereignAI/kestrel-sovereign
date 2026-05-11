@@ -135,6 +135,12 @@ class FeatureFeaturesFeature(Feature):
                 "feature_feature_red_team_review",
                 self._feature_feature_red_team_review,
             )
+        if getattr(self.agent, "feature_feature_council_review", None) is None:
+            setattr(
+                self.agent,
+                "feature_feature_council_review",
+                self._feature_feature_council_review,
+            )
         if getattr(self.agent, "feature_feature_ci_green", None) is None:
             setattr(
                 self.agent,
@@ -398,6 +404,24 @@ class FeatureFeaturesFeature(Feature):
             **snapshot,
             "status": "ok",
             "review": "red_team",
+        }
+
+    async def _feature_feature_council_review(
+        self,
+        payload: dict,
+    ) -> dict[str, Any]:
+        """Open a council-review wait point for operator/council approval."""
+
+        request_id = _payload_string(payload, "workflow_run_id") or _payload_string(
+            payload,
+            "council_request_id",
+        )
+        return {
+            "status": "pending",
+            "reason": "council_approve_pending",
+            "council_request_id": request_id,
+            "workflow_run_id": _payload_string(payload, "workflow_run_id"),
+            "workflow_stage_name": _payload_string(payload, "workflow_stage_name"),
         }
 
     async def _feature_feature_ci_green(
