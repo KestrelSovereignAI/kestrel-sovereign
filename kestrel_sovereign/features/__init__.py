@@ -202,6 +202,38 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
     return classes
 
 
+def discover_feature_class_by_name(name: str) -> Optional[Type[Feature]]:
+    """Resolve a discoverable feature class by class name, module name, or shorthand.
+
+    Local core features take priority over entry-point features, matching
+    ``discover_features`` duplicate handling.
+    """
+
+    target = _normalize_feature_lookup(name)
+    if not target:
+        return None
+
+    for module_path in discover_feature_modules():
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError as e:
+            logger.warning(f"Failed to import feature module {module_path}: {e}")
+            continue
+        feature_class = find_feature_class(module)
+        if feature_class is None:
+            continue
+        aliases = _feature_lookup_aliases(feature_class, module_path)
+        if target in aliases:
+            return feature_class
+
+    for feature_class in discover_entrypoint_feature_classes().values():
+        aliases = _feature_lookup_aliases(feature_class, feature_class.__module__)
+        if target in aliases:
+            return feature_class
+
+    return None
+
+
 def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> List[Feature]:
     """
     Discover and instantiate Feature classes from local directory and entry_points.
@@ -289,3 +321,19 @@ def get_feature_by_name(features: List[Feature], name: str) -> Optional[Feature]
         if feature.name == name or feature.__class__.__name__ == name:
             return feature
     return None
+
+
+def _normalize_feature_lookup(name: str) -> str:
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _feature_lookup_aliases(feature_class: Type[Feature], module_path: str) -> Set[str]:
+    class_name = feature_class.__name__
+    aliases = {
+        _normalize_feature_lookup(class_name),
+        _normalize_feature_lookup(class_name.removesuffix("Feature")),
+    }
+    module_name = module_path.split(".")[-2] if module_path.endswith(".feature") else module_path.split(".")[-1]
+    aliases.add(_normalize_feature_lookup(module_name))
+    aliases.add(_normalize_feature_lookup(module_name.removesuffix("_feature")))
+    return {alias for alias in aliases if alias}

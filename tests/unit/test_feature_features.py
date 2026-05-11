@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+from kestrel_sdk.features.base import Feature as SDKBaseFeature
 from kestrel_sdk.signals import SignalMode
 from kestrel_sdk.tools.base import ToolCategory, ToolParameter, ToolSchema
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -13,6 +15,7 @@ from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 from kestrel_sovereign.features.feature_features.feature import (
     FeatureFeaturesFeature,
 )
+from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.features.feature_features.signals import (
     build_feature_feature_registrations,
 )
@@ -61,6 +64,38 @@ def _mock_feature(class_name: str, tool_name: str, tools: list):
     feature.tool_description = f"{class_name} description"
     feature.get_tools = lambda: tools
     return feature
+
+
+class RuntimeDemoFeature(Feature):
+    @property
+    def tool_description(self):
+        return "Runtime demo feature"
+
+    async def initialize(self):
+        self.initialized = True
+
+    async def on_enable(self):
+        self.enabled = True
+
+    async def on_disable(self):
+        self.disabled = True
+
+    async def shutdown(self):
+        self.shutdown_called = True
+
+
+class RouterDemoFeature(RuntimeDemoFeature):
+    def get_router(self):
+        return object()
+
+
+class ExternalSdkDemoFeature(SDKBaseFeature):
+    @property
+    def tool_description(self):
+        return "External SDK demo feature"
+
+    async def initialize(self):
+        self.initialized = True
 
 
 @pytest.mark.parametrize(
@@ -321,6 +356,271 @@ async def test_feature_unfocus_parses_schema_advertised_reset_string():
     assert false_reset.error == "Provide features/tools to hide, or reset=True."
     assert true_reset.status is ToolResultStatus.OK
     assert true_reset.data["profile"]["hidden_features"] == []
+
+
+@pytest.mark.asyncio
+async def test_feature_add_loads_discoverable_runtime_feature():
+    agent = SimpleNamespace(
+        features={},
+        _cached_features_prompt="stale",
+    )
+    agent._build_features_prompt_section = lambda: "fresh"
+
+    async def register_feature(instance):
+        await instance.initialize()
+        agent.features[instance.name] = instance
+        await instance.on_enable()
+
+    agent._register_feature = register_feature
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_class_by_name",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.get_disabled_features",
+            return_value=set(),
+        ),
+    ):
+        result = await feature.feature_add("runtime-demo")
+
+    assert result.status is ToolResultStatus.OK
+    assert "RuntimeDemoFeature" in agent.features
+    assert agent.features["RuntimeDemoFeature"].initialized is True
+    assert agent.features["RuntimeDemoFeature"].enabled is True
+    assert agent._cached_features_prompt == "fresh"
+    assert result.data["feature"]["class"] == "RuntimeDemoFeature"
+
+
+@pytest.mark.asyncio
+async def test_feature_add_can_pre_explore_loaded_feature_tools():
+    tool = _mock_agent_tool("runtime_status")
+    agent = SimpleNamespace(features={})
+    registered = []
+
+    async def register_feature(instance):
+        instance.get_tools = lambda: [tool]
+        await instance.initialize()
+        agent.features[instance.name] = instance
+
+    agent._register_feature = register_feature
+    agent._register_explored_feature_tools = lambda instance: registered.append(
+        instance.tool_name
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_class_by_name",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.get_disabled_features",
+            return_value=set(),
+        ),
+    ):
+        result = await feature.feature_add("RuntimeDemoFeature", pre_explore="true")
+
+    assert result.status is ToolResultStatus.OK
+    assert registered == ["runtime_demo_feature"]
+
+
+@pytest.mark.asyncio
+async def test_feature_add_validates_pre_explore_before_loading():
+    agent = SimpleNamespace(features={})
+    called = False
+
+    async def register_feature(instance):
+        nonlocal called
+        called = True
+        agent.features[instance.name] = instance
+
+    agent._register_feature = register_feature
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_add("RuntimeDemoFeature", pre_explore="maybe")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.error == "pre_explore must be a boolean."
+    assert called is False
+    assert agent.features == {}
+
+
+@pytest.mark.asyncio
+async def test_feature_add_respects_agent_allowed_feature_profile():
+    agent = SimpleNamespace(
+        features={},
+        _allowed_features={"OtherFeature"},
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_class_by_name",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.get_disabled_features",
+            return_value=set(),
+        ),
+    ):
+        result = await feature.feature_add("RuntimeDemoFeature")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "not allowed" in result.error
+    assert agent.features == {}
+
+
+@pytest.mark.asyncio
+async def test_feature_add_notifies_existing_features_after_runtime_load():
+    class ExistingFeature(RuntimeDemoFeature):
+        async def post_all_features_loaded(self, agent):
+            self.post_loaded_count = getattr(self, "post_loaded_count", 0) + 1
+
+    existing = ExistingFeature(SimpleNamespace())
+    agent = SimpleNamespace(features={existing.name: existing})
+
+    async def register_feature(instance):
+        await instance.initialize()
+        agent.features[instance.name] = instance
+
+    agent._register_feature = register_feature
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_class_by_name",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.get_disabled_features",
+            return_value=set(),
+        ),
+    ):
+        result = await feature.feature_add("RuntimeDemoFeature")
+
+    assert result.status is ToolResultStatus.OK
+    assert existing.post_loaded_count == 1
+
+
+@pytest.mark.asyncio
+async def test_feature_add_rolls_back_when_post_load_notification_fails():
+    agent = SimpleNamespace(features={})
+    registered = []
+
+    async def register_feature(instance):
+        registered.append(instance)
+        await instance.initialize()
+        agent.features[instance.name] = instance
+        await instance.on_enable()
+
+    agent._register_feature = register_feature
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_class_by_name",
+            return_value=RuntimeDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.get_disabled_features",
+            return_value=set(),
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature._notify_features_loaded",
+            side_effect=RuntimeError("post-load boom"),
+        ),
+    ):
+        result = await feature.feature_add("RuntimeDemoFeature")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "post-load boom" in result.error
+    assert agent.features == {}
+    assert registered[0].disabled is True
+    assert registered[0].shutdown_called is True
+
+
+@pytest.mark.asyncio
+async def test_feature_add_rejects_router_backed_features():
+    agent = SimpleNamespace(features={})
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_class_by_name",
+            return_value=RouterDemoFeature,
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.get_disabled_features",
+            return_value=set(),
+        ),
+    ):
+        result = await feature.feature_add("RouterDemoFeature")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "exposes HTTP routes" in result.error
+    assert agent.features == {}
+
+
+@pytest.mark.asyncio
+async def test_feature_remove_unloads_feature_and_refreshes_context():
+    agent = SimpleNamespace(
+        features={},
+        _cached_features_prompt="stale",
+    )
+    runtime = RuntimeDemoFeature(agent)
+    agent.features[runtime.name] = runtime
+    agent._build_features_prompt_section = lambda: "fresh"
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_remove("runtime-demo")
+
+    assert result.status is ToolResultStatus.OK
+    assert "RuntimeDemoFeature" not in agent.features
+    assert runtime.disabled is True
+    assert runtime.shutdown_called is True
+    assert agent._cached_features_prompt == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_feature_remove_rejects_router_backed_features():
+    agent = SimpleNamespace(features={})
+    runtime = RouterDemoFeature(agent)
+    agent.features[runtime.name] = runtime
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_remove("router-demo")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "exposes HTTP routes" in result.error
+    assert agent.features[runtime.name] is runtime
+
+
+@pytest.mark.asyncio
+async def test_feature_remove_allows_external_sdk_features_without_router_override():
+    agent = SimpleNamespace(features={})
+    runtime = ExternalSdkDemoFeature(agent)
+    agent.features[runtime.__class__.__name__] = runtime
+    feature = FeatureFeaturesFeature(agent)
+
+    result = await feature.feature_remove("external-sdk-demo")
+
+    assert result.status is ToolResultStatus.OK
+    assert agent.features == {}
+
+
+@pytest.mark.asyncio
+async def test_feature_remove_rejects_self_removal():
+    agent = SimpleNamespace(features={})
+    feature = FeatureFeaturesFeature(agent)
+    agent.features[feature.name] = feature
+
+    result = await feature.feature_remove("feature-features")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "cannot remove itself" in result.error
 
 
 @pytest.mark.asyncio

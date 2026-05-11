@@ -281,6 +281,33 @@ class TestBuildAllTools:
 
         assert agent._visible_features_by_tool_name() == {}
 
+    @pytest.mark.asyncio
+    async def test_disable_feature_removes_runtime_tool_registrations(self, agent):
+        """Runtime feature removal clears dispatchers, direct tools, and context hides."""
+        feature = _make_mock_feature("model_agent", [_make_mock_tool("list_models")])
+        feature.name = "ModelAgent"
+        feature.on_disable = AsyncMock()
+        feature.shutdown = AsyncMock()
+        feature.get_hooks.return_value = []
+        feature.get_agent_card.return_value.name = "ModelAgent"
+        agent.features = {"ModelAgent": feature}
+        agent.task_manager = MagicMock()
+        agent._register_explored_feature_tools(feature)
+        agent._tool_context_hidden_features = {"model_agent"}
+        agent._tool_context_hidden_tools = {"list_models"}
+
+        await agent._disable_feature("model_agent")
+
+        assert "ModelAgent" not in agent.features
+        assert "model_agent" not in agent._explored_features
+        assert "list_models" not in agent._direct_tools
+        assert "list_models" not in agent._tool_to_feature
+        assert agent._direct_tool_defs == []
+        assert agent._tool_context_hidden_features == set()
+        assert agent._tool_context_hidden_tools == set()
+        feature.shutdown.assert_awaited_once()
+        agent.task_manager.unregister_agent.assert_called_once_with("ModelAgent")
+
 
 # =============================================================================
 # Direct tool execution
