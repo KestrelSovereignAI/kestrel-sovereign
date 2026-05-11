@@ -100,6 +100,21 @@ class ExternalSdkDemoFeature(SDKBaseFeature):
         self.initialized = True
 
 
+class ExternalSdkToolOnlyFeature(SDKBaseFeature):
+    name = "ExternalSdkToolOnlyFeature"
+    tool_name = "external_sdk_tool_only"
+
+    @property
+    def tool_description(self):
+        return "External SDK tool-only demo feature"
+
+    async def initialize(self):
+        return None
+
+    def get_tools(self):
+        return [_mock_agent_tool("github_issue_fetch", "Fetch a GitHub issue")]
+
+
 @pytest.mark.parametrize(
     ("name", "payload"),
     [
@@ -354,7 +369,73 @@ async def test_feature_discover_includes_runtime_context_and_tool_rows():
     assert row["loaded"] is True
     assert row["visible_in_context"] is False
     assert row["tools"][0]["name"] == "list_models"
+    assert row["tools_discoverable"] is True
+    assert row["direct_tool_invokable"] is False
+    assert row["subagent_capable"] is False
+    assert row["subagent_executable"] is False
+    assert row["workflow_invocation_modes"] == []
+    assert row["subagent_workflow_executable"] is False
     assert result.data["counts"]["hidden_from_context"] == 1
+
+
+@pytest.mark.asyncio
+async def test_feature_discover_distinguishes_sdk_tool_only_from_subagent():
+    sdk_feature = ExternalSdkToolOnlyFeature(SimpleNamespace())
+    agent = SimpleNamespace(features={"GitHubFeature": sdk_feature})
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(query="github", include_tools=True)
+
+    assert result.status is ToolResultStatus.OK
+    row = result.data["features"][0]
+    assert row["class"] == "ExternalSdkToolOnlyFeature"
+    assert row["tools_discoverable"] is True
+    assert row["direct_tool_invokable"] is False
+    assert row["tools"][0]["name"] == "github_issue_fetch"
+    assert row["subagent_capable"] is False
+    assert row["subagent_executable"] is False
+    assert row["subagent_workflow_executable"] is False
+    assert row["workflow_invocation_modes"] == []
+
+
+@pytest.mark.asyncio
+async def test_feature_discover_marks_promoted_direct_tools_invokable():
+    sdk_feature = ExternalSdkToolOnlyFeature(SimpleNamespace())
+    agent = SimpleNamespace(
+        features={"GitHubFeature": sdk_feature},
+        _direct_tools={"github_issue_fetch": _mock_agent_tool("github_issue_fetch")},
+        _tool_to_feature={"github_issue_fetch": "external_sdk_tool_only"},
+    )
+    feature = FeatureFeaturesFeature(agent)
+
+    with (
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_feature_modules",
+            return_value=[],
+        ),
+        patch(
+            "kestrel_sovereign.features.feature_features.feature.discover_entrypoint_feature_classes",
+            return_value={},
+        ),
+    ):
+        result = await feature.feature_discover(query="github", include_tools=True)
+
+    assert result.status is ToolResultStatus.OK
+    row = result.data["features"][0]
+    assert row["tools_discoverable"] is True
+    assert row["direct_tool_invokable"] is True
+    assert row["subagent_executable"] is False
+    assert row["workflow_invocation_modes"] == ["direct_tool"]
 
 
 @pytest.mark.asyncio
@@ -508,6 +589,8 @@ async def test_feature_context_status_reports_hidden_direct_tools():
     assert result.status is ToolResultStatus.OK
     assert result.data["counts"]["hidden_direct_tools"] == 1
     assert result.data["direct_tools"][0]["visible_in_context"] is False
+    assert result.data["direct_tools"][0]["invocation_mode"] == "direct_tool"
+    assert result.data["direct_tools"][0]["invokable"] is True
 
 
 @pytest.mark.asyncio

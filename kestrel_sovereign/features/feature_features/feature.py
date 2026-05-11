@@ -1306,6 +1306,14 @@ def _feature_catalog(
                     "tool_name": loaded["tool_name"],
                     "tool_count": loaded["tool_count"],
                     "tools": loaded["tools"] if include_tools else [],
+                    "tools_discoverable": loaded["tools_discoverable"],
+                    "direct_tool_invokable": loaded["direct_tool_invokable"],
+                    "subagent_capable": loaded["subagent_capable"],
+                    "subagent_executable": loaded["subagent_executable"],
+                    "workflow_invocation_modes": loaded["workflow_invocation_modes"],
+                    "subagent_workflow_executable": loaded[
+                        "subagent_workflow_executable"
+                    ],
                     "disabled": loaded["class"] in disabled,
                     "allowed": _feature_allowed(loaded["class"], allowed_set),
                 }
@@ -1344,6 +1352,31 @@ def _feature_catalog_row(
         "tool_name": loaded["tool_name"] if loaded is not None else None,
         "tool_count": loaded["tool_count"] if loaded is not None else 0,
         "tools": loaded["tools"] if include_tools and loaded is not None else [],
+        "tools_discoverable": bool(loaded["tools_discoverable"])
+        if loaded is not None
+        else False,
+        "direct_tool_invokable": (
+            bool(loaded["direct_tool_invokable"]) if loaded is not None else False
+        ),
+        "subagent_capable": _feature_class_supports_subagent(feature_class),
+        "subagent_executable": (
+            bool(loaded["subagent_executable"])
+            if loaded is not None
+            else False
+        ),
+        "workflow_invocation_modes": (
+            loaded["workflow_invocation_modes"]
+            if loaded is not None
+            else _workflow_invocation_modes(
+                direct_tool_invokable=False,
+                subagent_executable=False,
+            )
+        ),
+        "subagent_workflow_executable": (
+            bool(loaded["subagent_workflow_executable"])
+            if loaded is not None
+            else False
+        ),
         "disabled": disabled,
         "allowed": allowed,
     }
@@ -1429,6 +1462,7 @@ def _without_catalog_tools(row: dict[str, Any]) -> dict[str, Any]:
 def _loaded_feature_inventory(agent: Any) -> list[dict[str, Any]]:
     rows = []
     hidden_features = _hidden_features(agent)
+    direct_tool_names_by_feature = _direct_tool_names_by_feature(agent)
     for key, feature in sorted(_agent_features(agent).items()):
         tool_name = getattr(feature, "tool_name", key)
         class_name = feature.__class__.__name__
@@ -1448,6 +1482,14 @@ def _loaded_feature_inventory(agent: Any) -> list[dict[str, Any]]:
                     ),
                 }
             )
+        tools_discoverable = bool(tools)
+        direct_tool_invokable = bool(direct_tool_names_by_feature.get(tool_name))
+        subagent_capable = _feature_supports_subagent(feature)
+        subagent_executable = _feature_supports_subagent(feature)
+        workflow_invocation_modes = _workflow_invocation_modes(
+            direct_tool_invokable=direct_tool_invokable,
+            subagent_executable=subagent_executable,
+        )
         rows.append(
             {
                 "registry_key": key,
@@ -1455,6 +1497,12 @@ def _loaded_feature_inventory(agent: Any) -> list[dict[str, Any]]:
                 "tool_name": tool_name,
                 "module": feature.__class__.__module__,
                 "tool_count": len(tools),
+                "tools_discoverable": tools_discoverable,
+                "direct_tool_invokable": direct_tool_invokable,
+                "subagent_capable": subagent_capable,
+                "subagent_executable": subagent_executable,
+                "workflow_invocation_modes": workflow_invocation_modes,
+                "subagent_workflow_executable": subagent_executable,
                 "visible_in_context": (
                     tool_name not in hidden_features
                     and class_name not in hidden_features
@@ -1475,6 +1523,15 @@ def _loaded_feature_row(agent: Any, feature: Any) -> dict[str, Any]:
         "tool_name": getattr(feature, "tool_name", None),
         "module": feature.__class__.__module__,
         "tool_count": 0,
+        "tools_discoverable": False,
+        "direct_tool_invokable": False,
+        "subagent_capable": _feature_supports_subagent(feature),
+        "subagent_executable": _feature_supports_subagent(feature),
+        "workflow_invocation_modes": _workflow_invocation_modes(
+            direct_tool_invokable=False,
+            subagent_executable=_feature_supports_subagent(feature),
+        ),
+        "subagent_workflow_executable": _feature_supports_subagent(feature),
         "visible_in_context": True,
         "tools": [],
     }
@@ -1530,6 +1587,44 @@ def _has_runtime_router(feature: Any) -> bool:
     return get_router not in (Feature.get_router, SDKBaseFeature.get_router, None)
 
 
+def _feature_supports_subagent(feature: Any) -> bool:
+    return _feature_class_supports_subagent(feature.__class__)
+
+
+def _feature_class_supports_subagent(feature_class: type) -> bool:
+    return (
+        callable(getattr(feature_class, "handle_task", None))
+        and callable(getattr(feature_class, "execute_as_subagent", None))
+    )
+
+
+def _workflow_invocation_modes(
+    *,
+    direct_tool_invokable: bool,
+    subagent_executable: bool,
+) -> list[str]:
+    modes = []
+    if direct_tool_invokable:
+        modes.append("direct_tool")
+    if subagent_executable:
+        modes.append("subagent")
+    return modes
+
+
+def _direct_tool_names_by_feature(agent: Any) -> dict[str, set[str]]:
+    direct_tools = getattr(agent, "_direct_tools", {})
+    tool_to_feature = getattr(agent, "_tool_to_feature", {})
+    if not isinstance(direct_tools, dict) or not isinstance(tool_to_feature, dict):
+        return {}
+    rows: dict[str, set[str]] = {}
+    for tool_name in direct_tools:
+        owner = tool_to_feature.get(tool_name)
+        if not isinstance(owner, str) or not owner:
+            continue
+        rows.setdefault(owner, set()).add(tool_name)
+    return rows
+
+
 async def _notify_features_loaded(agent: Any) -> None:
     for feature in list(_agent_features(agent).values()):
         await feature.post_all_features_loaded(agent)
@@ -1560,6 +1655,8 @@ def _direct_tool_inventory(agent: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "feature_tool_name": feature_tool_name,
                 "feature_class": feature_class,
+                "invocation_mode": "direct_tool",
+                "invokable": True,
                 "visible_in_context": (
                     name not in hidden_tools
                     and feature_tool_name not in hidden_features
