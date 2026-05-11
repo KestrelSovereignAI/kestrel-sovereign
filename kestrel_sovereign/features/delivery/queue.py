@@ -23,6 +23,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional
 from kestrel_sovereign.features.delivery.models import (
     DeliveryResult,
     DeliveryStatus,
+    DeliveryTask,
     QueueEntry,
 )
 
@@ -76,6 +77,7 @@ class DeliveryQueue:
         db,
         agent_id: str,
         deliver: Optional[DeliveryCallback] = None,
+        allow_noop_delivery: bool = False,
         poll_interval: int = POLL_INTERVAL_SECONDS,
         batch_size: int = BATCH_SIZE,
         max_retries: int = DEFAULT_MAX_RETRIES,
@@ -85,7 +87,8 @@ class DeliveryQueue:
             db: AsyncDatabase-like object with execute/fetchall/fetchone.
             agent_id: The owning agent's identifier.
             deliver: Async callable(channel_type, recipient, content) -> DeliveryResult.
-                     If None, messages are marked delivered immediately (useful for testing).
+            allow_noop_delivery: Explicit test/development opt-in for marking
+                messages delivered when no delivery provider is configured.
             poll_interval: Seconds between background poll cycles.
             batch_size: Max messages to process per tick.
             max_retries: Default maximum retries before dead-lettering.
@@ -93,6 +96,7 @@ class DeliveryQueue:
         self._db = db
         self._agent_id = agent_id
         self._deliver = deliver
+        self._allow_noop_delivery = allow_noop_delivery
         self._poll_interval = poll_interval
         self._batch_size = batch_size
         self._max_retries = max_retries
@@ -568,9 +572,32 @@ class DeliveryQueue:
                 )
             except Exception as e:
                 result = DeliveryResult(success=False, error=str(e))
+        elif self._allow_noop_delivery:
+            result = DeliveryResult(
+                success=True,
+                metadata={"noop_delivery": True},
+            )
         else:
-            # No delivery callback -- auto-succeed (testing / placeholder)
-            result = DeliveryResult(success=True)
+            task = DeliveryTask(
+                id=entry.id,
+                agent_id=entry.agent_id,
+                channel_type=entry.channel_type,
+                recipient=entry.recipient,
+                content=entry.content,
+            )
+            logger.warning(
+                "No delivery provider configured for %s/%s; leaving task %s retryable",
+                task.channel_type,
+                task.recipient,
+                task.id,
+            )
+            result = DeliveryResult(
+                success=False,
+                error=(
+                    "No delivery provider configured; install or register a "
+                    f"provider for channel '{task.channel_type}'"
+                ),
+            )
 
         new_attempts = entry.attempts + 1
 
