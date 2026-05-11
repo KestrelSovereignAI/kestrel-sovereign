@@ -12,7 +12,7 @@ from kestrel_sdk.tools.result import ToolResultStatus
 
 from kestrel_sovereign.features import discover_feature_modules
 from kestrel_sovereign.features.cli.adapters import GitCliAdapter, GitHubCliAdapter
-from kestrel_sovereign.features.cli.feature import CliFeature
+from kestrel_sovereign.features.cli.feature import CliFeature, _approval_argv_summary
 from kestrel_sovereign.features.cli.terminal import (
     CliRisk,
     TerminalCommandRequest,
@@ -44,6 +44,16 @@ class FakeTerminal:
         if not self.results:
             raise AssertionError("FakeTerminal has no queued result")
         return self.results.pop(0)
+
+
+class FakeApprovalQueue:
+    def __init__(self, approved: bool = True):
+        self.approved = approved
+        self.requests: list[dict] = []
+
+    async def request_approval(self, **kwargs):
+        self.requests.append(kwargs)
+        return self.approved, "once"
 
 
 def _result(stdout: str = "", stderr: str = "", returncode: int = 0) -> TerminalCommandResult:
@@ -86,6 +96,157 @@ async def test_github_pr_view_uses_registered_read_only_gh_command():
     assert "--json" in request.argv
     assert "headRefOid" in request.argv[-1]
     assert "statusCheckRollup" in request.argv[-1]
+
+
+@pytest.mark.asyncio
+async def test_terminal_execution_blocks_non_read_only_without_approval_callback():
+    terminal = TerminalExecutionService()
+
+    result = await terminal.run(
+        TerminalCommandRequest(
+            argv=[sys.executable, "-c", "print('should not run')"],
+            risk=CliRisk.LOCAL_MUTATION,
+            command_id="test.local_mutation",
+        )
+    )
+
+    assert result.returncode == 126
+    assert "requires approval" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.asyncio
+async def test_terminal_execution_blocks_non_read_only_when_approval_denies():
+    seen: list[TerminalCommandRequest] = []
+
+    async def deny(request: TerminalCommandRequest) -> bool:
+        seen.append(request)
+        return False
+
+    terminal = TerminalExecutionService(approval_callback=deny)
+
+    result = await terminal.run(
+        TerminalCommandRequest(
+            argv=[sys.executable, "-c", "print('should not run')"],
+            risk=CliRisk.REMOTE_MUTATION,
+            command_id="test.remote_mutation",
+        )
+    )
+
+    assert seen[0].command_id == "test.remote_mutation"
+    assert result.returncode == 126
+    assert "denied by approval gate" in result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.asyncio
+async def test_terminal_execution_runs_non_read_only_after_approval():
+    seen: list[TerminalCommandRequest] = []
+
+    async def approve(request: TerminalCommandRequest) -> bool:
+        seen.append(request)
+        return True
+
+    terminal = TerminalExecutionService(approval_callback=approve)
+
+    result = await terminal.run(
+        TerminalCommandRequest(
+            argv=[sys.executable, "-c", "print('approved')"],
+            risk=CliRisk.LOCAL_MUTATION,
+            command_id="test.local_mutation",
+        )
+    )
+
+    assert seen[0].risk is CliRisk.LOCAL_MUTATION
+    assert result.ok is True
+    assert result.stdout.strip() == "approved"
+
+
+@pytest.mark.asyncio
+async def test_cli_feature_approval_callback_uses_security_queue():
+    queue = FakeApprovalQueue(approved=True)
+    security = Mock(approval_queue=queue)
+    agent = Mock()
+    agent.get_feature.return_value = security
+    feature = CliFeature(agent)
+
+    approved = await feature._approve_cli_command(
+        TerminalCommandRequest(
+            argv=["gh", "pr", "merge", "1", "--repo", "owner/repo"],
+            risk=CliRisk.REMOTE_MUTATION,
+            command_id="github.pr_merge",
+            env={"GITHUB_TOKEN": "secret", "PATH": "/usr/bin"},
+        )
+    )
+
+    assert approved is True
+    request = queue.requests[0]
+    assert request["feature_name"] == "cli"
+    assert request["tool_name"] == "github.pr_merge"
+    assert request["timeout"] == 300
+    assert request["tool_args"]["risk"] == "remote_mutation"
+    assert request["tool_args"]["env_keys"] == ["GITHUB_TOKEN", "PATH"]
+    assert request["tool_args"]["argc"] == 6
+
+
+@pytest.mark.asyncio
+async def test_cli_feature_approval_callback_fails_closed_without_security_queue():
+    agent = Mock()
+    agent.get_feature.return_value = None
+    agent.features = {}
+    feature = CliFeature(agent)
+
+    approved = await feature._approve_cli_command(
+        TerminalCommandRequest(
+            argv=["gh", "pr", "merge", "1"],
+            risk=CliRisk.REMOTE_MUTATION,
+            command_id="github.pr_merge",
+        )
+    )
+
+    assert approved is False
+
+
+def test_cli_approval_argv_summary_redacts_values_and_sensitive_flags():
+    summary = _approval_argv_summary(
+        [
+            "deployctl",
+            "--repo",
+            "owner/repo",
+            "--password",
+            "hunter2",
+            "--token=abc123",
+            "--message=ship it",
+            "positional-secret",
+            "-p",
+            "short-secret",
+            "-phunter2",
+            "-p=hunter2",
+            "--api_key",
+            "sk-proj-secretsecretsecretsecret",
+        ]
+    )
+
+    assert summary == [
+        "deployctl",
+        "--repo",
+        "[ARG]",
+        "--password",
+        "[REDACTED]",
+        "--token=[REDACTED]",
+        "--message=[ARG]",
+        "[ARG]",
+        "-p",
+        "[ARG]",
+        "-p[ARG]",
+        "-p=[ARG]",
+        "--api_key",
+        "[REDACTED]",
+    ]
+    assert "hunter2" not in summary
+    assert "hunter2" not in "".join(summary)
+    assert "abc123" not in "".join(summary)
+    assert "positional-secret" not in summary
 
 
 @pytest.mark.asyncio

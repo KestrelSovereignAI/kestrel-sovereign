@@ -13,7 +13,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 _TOKEN_PATTERNS = [
@@ -107,11 +107,20 @@ class CliCommandDefinition:
     tools: tuple[str, ...]
 
 
+CliApprovalCallback = Callable[[TerminalCommandRequest], Awaitable[bool]]
+
+
 class TerminalExecutionService:
     """Run argument-vector commands without shell interpolation."""
 
-    def __init__(self, *, max_output_bytes: int = 1_048_576):
+    def __init__(
+        self,
+        *,
+        max_output_bytes: int = 1_048_576,
+        approval_callback: CliApprovalCallback | None = None,
+    ):
         self.max_output_bytes = max_output_bytes
+        self.approval_callback = approval_callback
 
     def platform_metadata(self) -> dict[str, str]:
         return {
@@ -146,6 +155,16 @@ class TerminalExecutionService:
             raise ValueError("argv must not be empty")
 
         started = time.monotonic()
+        approval_error = await self._approval_error(request)
+        if approval_error:
+            return TerminalCommandResult(
+                argv=list(request.argv),
+                returncode=126,
+                stdout="",
+                stderr=approval_error,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *request.argv,
@@ -224,6 +243,25 @@ class TerminalExecutionService:
 
     def _decode_output(self, data: bytes) -> str:
         return data.decode("utf-8", errors="replace")
+
+    async def _approval_error(self, request: TerminalCommandRequest) -> str | None:
+        if request.risk == CliRisk.READ_ONLY:
+            return None
+
+        risk = request.risk.value if isinstance(request.risk, CliRisk) else str(request.risk)
+        if self.approval_callback is None:
+            return (
+                f"CLI command {request.command_id or request.argv[0]} has risk "
+                f"{risk} and requires approval, but no approval callback is configured"
+            )
+
+        try:
+            approved = await self.approval_callback(request)
+        except Exception as exc:  # noqa: BLE001
+            return redact_secrets(f"CLI command approval failed for risk {risk}: {exc}")
+        if not approved:
+            return f"CLI command denied by approval gate for risk {risk}"
+        return None
 
 
 def redact_secrets(value: str) -> str:

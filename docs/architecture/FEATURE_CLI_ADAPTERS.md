@@ -155,9 +155,20 @@ Every registered command has a `CliRisk`:
 - `FINANCIAL_OR_BILLING`
 - `UNKNOWN`
 
-The initial shipped adapters expose read-only commands only. Future mutating
-commands must add an approval layer before execution. Do not smuggle mutation
-into a command declared as `READ_ONLY`.
+The initial shipped adapters expose read-only commands only. The terminal
+substrate fails closed for every non-`READ_ONLY` risk unless an explicit
+approval callback approves the exact command request. `CliFeature` wires that
+callback to `SecurityFeature.approval_queue` when the security feature is
+available.
+
+Approval payloads must be safe to display in the UI before execution. The
+shared `CliFeature` approval callback sends a conservative argv summary:
+command name and option names are shown, ordinary values become `[ARG]`, and
+sensitive option values become `[REDACTED]`.
+
+Do not smuggle mutation into a command declared as `READ_ONLY`. Future mutating
+commands must use the correct risk class so the substrate can pause for
+approval before process execution.
 
 ### Keep availability checks diagnostic
 
@@ -195,6 +206,7 @@ Every adapter should cover:
 - every user-controlled argument rejects option-like values and traversal-shaped
   values when relevant
 - command-prefix positional parsing works for every exposed `!command`
+- non-read-only commands fail closed without approval and do not spawn
 - missing or malformed CLI payloads fail closed
 
 ## Reference Adapters
@@ -234,6 +246,7 @@ working directory plus any roots configured through
 
 ## Future Work
 
-Before adding mutating commands such as `git fetch`, `gh pr merge`, cloud
-deploys, or package publishes, add an explicit approval and audit path for
-non-read-only `CliRisk` values.
+Mutating commands such as `git fetch`, `gh pr merge`, cloud deploys, or package
+publishes can now reuse the substrate approval gate, but each adapter still
+needs command-specific validation, focused approval payloads, and tests that
+prove the command cannot run before approval.
