@@ -3,9 +3,7 @@ import json
 import logging
 import os
 import re
-from types import UnionType
 from typing import Any, Callable, Dict, List, Optional, Type, Union, Protocol, runtime_checkable, TYPE_CHECKING
-from typing import get_args, get_origin, get_type_hints
 
 if TYPE_CHECKING:
     from kestrel_sdk.hooks.base import Hook
@@ -930,38 +928,26 @@ def tool(name: str, description: str, category: ToolCategory = ToolCategory.SYST
             dict: "object"
         }
         
-        try:
-            type_hints = get_type_hints(func)
-        except (NameError, TypeError, AttributeError):
-            type_hints = {}
-
         for param_name, param in sig.parameters.items():
             if param_name == 'self':
                 continue
 
             # Handle typing generics
-            annotation = type_hints.get(param_name, param.annotation)
-            origin = get_origin(annotation)
-            if origin in (Union, UnionType):
-                optional_args = [
-                    arg for arg in get_args(annotation) if arg is not type(None)
-                ]
-                if len(optional_args) == 1:
-                    annotation = optional_args[0]
-                    origin = get_origin(annotation)
+            from typing import get_origin, get_args
+            origin = get_origin(param.annotation)
             items_schema = None
             if origin is not None:
                 param_type = type_map.get(origin, "string")
                 # For List[X], derive items schema from the type argument
                 if param_type == "array":
-                    type_args = get_args(annotation)
+                    type_args = get_args(param.annotation)
                     if type_args:
                         inner = type_args[0]
                         inner_type = type_map.get(inner, None)
                         if inner_type:
                             items_schema = {"type": inner_type}
             else:
-                param_type = type_map.get(annotation, "string")
+                param_type = type_map.get(param.annotation, "string")
             required = param.default == inspect.Parameter.empty
 
             # Get description from parsed docstring, fallback to placeholder
