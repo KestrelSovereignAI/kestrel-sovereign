@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
 
-from .adapter import LLMResponse, messages_for
+from .adapter import LLMResponse, ThinkingDelta, messages_for
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
 
@@ -422,7 +422,7 @@ class StreamingMixin:
         model_override: Optional[str] = None,
         system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
-    ) -> AsyncIterator[Union[str, ToolCallStarted, LLMResponse]]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
 
@@ -440,6 +440,9 @@ class StreamingMixin:
           marker arrives. ``stream_with_tool_detection`` does not
           itself process or filter markers; it forwards them
           unchanged from the underlying adapter.
+        * :class:`ThinkingDelta` — provider-separated model reasoning
+          that should be displayed as expandable UI affordance, not as
+          assistant answer text or persisted conversation content.
         * :class:`LLMResponse` — exactly once at end-of-stream when
           tool calls were detected. Source of truth for the assembled
           tool calls (id, name, arguments) and token usage.

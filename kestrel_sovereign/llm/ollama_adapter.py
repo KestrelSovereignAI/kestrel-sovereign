@@ -14,7 +14,15 @@ from typing import Any, Dict, List, Optional, Type, Union, TYPE_CHECKING, AsyncI
 
 from pydantic import BaseModel
 
-from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .adapter import (
+    LLMAdapter,
+    LLMResponse,
+    ThinkingContentSplitter,
+    ThinkingDelta,
+    ToolCall,
+    should_split_plain_reasoning,
+    split_thinking_from_content,
+)
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
 from .retry import with_retry
@@ -140,6 +148,20 @@ class OllamaAdapter(LLMAdapter):
             else:
                 content = None
 
+            should_split_thinking = (
+                content
+                and (
+                    "<think" in content.lower()
+                    or should_split_plain_reasoning(model)
+                )
+            )
+            if (
+                response_format is None
+                and not kwargs.get("_preserve_thinking_content")
+                and should_split_thinking
+            ):
+                _, content = split_thinking_from_content(content)
+
             # If using structured output, validate against the Pydantic model
             if response_format is not None and content:
                 try:
@@ -226,7 +248,7 @@ class OllamaAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         """
         Gets a streaming response from Ollama.
 
@@ -275,6 +297,12 @@ class OllamaAdapter(LLMAdapter):
 
             chunk_count = 0
             response_accum = ""
+            splitter = ThinkingContentSplitter(
+                provider="ollama",
+                split_plain_reasoning=(
+                    response_format is None and should_split_plain_reasoning(model)
+                ),
+            )
             async for chunk in stream:
                 content = None
                 if isinstance(chunk, dict):
@@ -287,7 +315,14 @@ class OllamaAdapter(LLMAdapter):
                     if response_format is not None:
                         # Accumulate for final validation
                         response_accum += content
-                    yield content
+                        yield content
+                    else:
+                        for event in splitter.feed(content):
+                            yield event
+
+            if response_format is None:
+                for event in splitter.flush():
+                    yield event
 
             logger.info(f"Ollama stream completed. Total chunks: {chunk_count}")
 
@@ -317,7 +352,7 @@ class OllamaAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, LLMResponse]]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
         """
         Stream response with tool call detection.
 
@@ -356,6 +391,7 @@ class OllamaAdapter(LLMAdapter):
                     messages=messages,
                     tools=tools,
                     response_format=response_format,
+                    _preserve_thinking_content=True,
                     **kwargs
                 )
 
@@ -367,7 +403,19 @@ class OllamaAdapter(LLMAdapter):
 
                 # No tool calls - yield the text content and we're done
                 if response.content:
-                    yield response.content
+                    should_split_thinking = (
+                        "<think" in response.content.lower()
+                        or should_split_plain_reasoning(model)
+                    )
+                    if not should_split_thinking:
+                        yield response.content
+                        return
+                    thinking, clean = split_thinking_from_content(response.content)
+                    if thinking:
+                        yield ThinkingDelta(thinking, provider="ollama")
+                    response.content = clean
+                    if response.content:
+                        yield response.content
                 return
 
             # No tools - use regular streaming
@@ -426,50 +474,35 @@ class OllamaAdapter(LLMAdapter):
             tools=tools
         )
 
-    # Minimum parameter count for reliable tool calling.
-    # Models below this can chat but can't handle function calling schemas.
-    # Ollama's /api/show gives us exact param counts — no guessing.
-    MIN_TOOL_PARAMS = 7_000_000_000  # 7B
-
     async def _check_tool_support(self, client: "ollama.AsyncClient", model_name: str) -> bool:
         """Check if a model supports tool calling via /api/show metadata.
 
-        Two conditions must be met:
-        1. The model's template includes .Tools (knows the format)
-        2. The model has >= MIN_TOOL_PARAMS parameters (can follow instructions)
+        Ollama exposes tool capability directly in recent versions and older
+        templates include ``.Tools`` when the chat template knows how to render
+        function schemas. Trust those provider signals; parameter-count gates
+        falsely mark small but tool-capable models such as qwen2.5:0.5b as
+        unsupported.
 
         Returns:
-            True if the model can reliably handle tool calling
+            True if the model advertises tool calling support.
         """
         try:
             info = await client.show(model_name)
             # Extract template — check for .Tools presence
             template = ""
+            capabilities = []
             if isinstance(info, dict):
                 template = info.get("template", "")
+                capabilities = info.get("capabilities") or []
             elif hasattr(info, "template"):
                 template = info.template or ""
+                capabilities = getattr(info, "capabilities", None) or []
 
             has_tools_template = ".Tools" in template
-
-            # Extract parameter count
-            # The Python SDK uses 'modelinfo', the JSON API uses 'model_info'
-            param_count = 0
-            model_info = None
-            if isinstance(info, dict):
-                model_info = info.get("model_info", {}) or info.get("modelinfo", {})
-            elif hasattr(info, "modelinfo"):
-                model_info = info.modelinfo or {}
-            elif hasattr(info, "model_info"):
-                model_info = info.model_info or {}
-
-            if isinstance(model_info, dict):
-                param_count = model_info.get("general.parameter_count", 0) or 0
-
-            supports = has_tools_template and param_count >= self.MIN_TOOL_PARAMS
+            supports = "tools" in capabilities or has_tools_template
             logger.debug(
                 f"Tool support for {model_name}: template={has_tools_template}, "
-                f"params={param_count:,}, supports_tools={supports}"
+                f"capabilities={capabilities}, supports_tools={supports}"
             )
             return supports
         except Exception as e:

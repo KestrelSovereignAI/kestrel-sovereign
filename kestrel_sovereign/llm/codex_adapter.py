@@ -32,7 +32,7 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
 
-from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
 from .continuation_store import (
     ContinuationCursor,
     ContinuationStore,
@@ -808,7 +808,7 @@ class CodexAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         """Get a streaming response from the ChatGPT backend."""
         token = client
         if not isinstance(token, str):
@@ -838,6 +838,7 @@ class CodexAdapter(LLMAdapter):
         chunk_count = 0
         last_response_id: Optional[str] = None
         new_turn_outputs: List[Dict[str, Any]] = []
+        splitter = ThinkingContentSplitter(provider="codex")
 
         async with httpx.AsyncClient(timeout=120) as http:
             for attempt in range(2):
@@ -865,7 +866,15 @@ class CodexAdapter(LLMAdapter):
                         event_type = event.get("type", "")
                         if event_type == "response.output_text.delta":
                             chunk_count += 1
-                            yield event.get("delta", "")
+                            for item in splitter.feed(event.get("delta", "")):
+                                yield item
+                        elif event_type in (
+                            "response.reasoning_text.delta",
+                            "response.reasoning_summary_text.delta",
+                        ):
+                            delta = event.get("delta", "")
+                            if delta:
+                                yield ThinkingDelta(delta, provider="codex")
                         elif event_type == "response.output_item.done":
                             item = event.get("item", {})
                             if item.get("type") in ("reasoning", "function_call", "message"):
@@ -874,6 +883,9 @@ class CodexAdapter(LLMAdapter):
                             resp_data = event.get("response", {})
                             last_response_id = resp_data.get("id") or last_response_id
                     break  # successful stream consumed
+
+        for item in splitter.flush():
+            yield item
 
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,
@@ -889,7 +901,7 @@ class CodexAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, LLMResponse]]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
         """Stream response with tool call detection."""
         token = client
         if not isinstance(token, str):
@@ -925,6 +937,7 @@ class CodexAdapter(LLMAdapter):
         final_usage: Dict[str, Any] = {}
         last_response_id: Optional[str] = None
         new_turn_outputs: List[Dict[str, Any]] = []
+        splitter = ThinkingContentSplitter(provider="codex")
 
         async with httpx.AsyncClient(timeout=120) as http:
             for attempt in range(2):
@@ -961,8 +974,18 @@ class CodexAdapter(LLMAdapter):
                         if event_type == "response.output_text.delta":
                             chunk_count += 1
                             delta = event.get("delta", "")
-                            text_content += delta
-                            yield delta
+                            for item in splitter.feed(delta):
+                                if isinstance(item, str):
+                                    text_content += item
+                                yield item
+
+                        elif event_type in (
+                            "response.reasoning_text.delta",
+                            "response.reasoning_summary_text.delta",
+                        ):
+                            delta = event.get("delta", "")
+                            if delta:
+                                yield ThinkingDelta(delta, provider="codex")
 
                         elif event_type == "response.function_call_arguments.delta":
                             idx = event.get("output_index", 0)
@@ -1052,6 +1075,11 @@ class CodexAdapter(LLMAdapter):
                             final_usage = usage
                             last_response_id = resp_data.get("id") or last_response_id
                     break  # successful stream consumed
+
+        for item in splitter.flush():
+            if isinstance(item, str):
+                text_content += item
+            yield item
 
         self._record_continuation(
             session_id, last_response_id, len(input_messages), signature,

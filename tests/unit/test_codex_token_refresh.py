@@ -23,6 +23,7 @@ from unittest.mock import patch
 
 import pytest
 
+from kestrel_sovereign.llm.adapter import ThinkingDelta
 from kestrel_sovereign.llm.codex_adapter import CodexAdapter
 from kestrel_sovereign.llm.continuation_store import InMemoryContinuationStore
 
@@ -170,6 +171,65 @@ class TestExternalRefreshAdoption:
         assert captured[1]["Authorization"] == f"Bearer {new_file_token}"
         # In-memory cache now holds the refreshed token for subsequent calls.
         assert adapter._refreshed_token == new_file_token
+
+
+@pytest.mark.asyncio
+async def test_codex_streaming_emits_reasoning_summary_as_thinking_delta():
+    token = _fake_token("acct-test")
+    captured: List[Dict[str, str]] = []
+    responses = [
+        _ScriptedResponse(200, _sse([
+            {
+                "type": "response.reasoning_summary_text.delta",
+                "delta": "I should answer directly.",
+            },
+            {"type": "response.output_text.delta", "delta": "4"},
+            _completed("resp_reasoning"),
+        ])),
+    ]
+    adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+
+    with _patch_httpx(responses, captured):
+        items = []
+        async for item in adapter.get_streaming_response(
+            client=token,
+            model="gpt-5-mini",
+            messages=[{"role": "user", "content": "2+2?"}],
+        ):
+            items.append(item)
+
+    assert isinstance(items[0], ThinkingDelta)
+    assert items[0].provider == "codex"
+    assert items[0].content == "I should answer directly."
+    assert "".join(item for item in items if isinstance(item, str)) == "4"
+
+
+@pytest.mark.asyncio
+async def test_codex_streaming_splits_think_tags_from_output_text():
+    token = _fake_token("acct-test")
+    captured: List[Dict[str, str]] = []
+    responses = [
+        _ScriptedResponse(200, _sse([
+            {"type": "response.output_text.delta", "delta": "<think>private</think>"},
+            {"type": "response.output_text.delta", "delta": "CODEX_OK"},
+            _completed("resp_think_tag"),
+        ])),
+    ]
+    adapter = CodexAdapter(continuation_store=InMemoryContinuationStore())
+
+    with _patch_httpx(responses, captured):
+        items = []
+        async for item in adapter.get_streaming_response(
+            client=token,
+            model="gpt-5.4-mini",
+            messages=[{"role": "user", "content": "test"}],
+        ):
+            items.append(item)
+
+    assert isinstance(items[0], ThinkingDelta)
+    assert items[0].provider == "codex"
+    assert items[0].content == "private"
+    assert "".join(item for item in items if isinstance(item, str)) == "CODEX_OK"
 
 
 @pytest.mark.asyncio

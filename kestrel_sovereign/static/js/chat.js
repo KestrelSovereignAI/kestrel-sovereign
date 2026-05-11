@@ -25,6 +25,12 @@ const {
 // first sets it; the other becomes a no-op.
 const REVISE_SENTINEL_PREFIX = '\x1eKESTREL:REVISE:';
 const REVISE_SENTINEL_SUFFIX = '\x1e';
+const THINKING_SENTINEL_PREFIX = '\x1eKESTREL:THINK:';
+const THINKING_SENTINEL_SUFFIX = '\x1e';
+const STREAM_SENTINELS = [
+    { kind: 'revise', prefix: REVISE_SENTINEL_PREFIX, suffix: REVISE_SENTINEL_SUFFIX },
+    { kind: 'thinking', prefix: THINKING_SENTINEL_PREFIX, suffix: THINKING_SENTINEL_SUFFIX },
+];
 
 function renderToolActivityLineHtml(line) {
     const escaped = escapeHtml(line);
@@ -209,32 +215,109 @@ export function renderToolActivityHtml(activityText) {
  * helper runs, so wire metadata should never be rendered as prose.
  */
 function stripReviseSentinel(chunk) {
-    const start = chunk.indexOf(REVISE_SENTINEL_PREFIX);
-    if (start < 0) {
-        return { textBefore: chunk, textAfter: '', sawSentinel: false };
-    }
+    return stripStreamSentinels(chunk);
+}
 
-    let stripped = '';
-    let cursor = 0;
+function findNextStreamSentinel(chunk, fromIndex = 0) {
+    let found = null;
+    for (const spec of STREAM_SENTINELS) {
+        const idx = chunk.indexOf(spec.prefix, fromIndex);
+        if (idx >= 0 && (!found || idx < found.idx)) {
+            found = { ...spec, idx };
+        }
+    }
+    return found;
+}
+
+function stripStreamSentinels(chunk) {
+    let textBefore = '';
     let sawSentinel = false;
-    while (cursor < chunk.length) {
-        const sentinelStart = chunk.indexOf(REVISE_SENTINEL_PREFIX, cursor);
-        if (sentinelStart < 0) {
-            stripped += chunk.slice(cursor);
+    const thoughts = [];
+    let pos = 0;
+
+    while (pos < chunk.length) {
+        const found = findNextStreamSentinel(chunk, pos);
+        if (!found) {
+            textBefore += chunk.slice(pos);
             break;
         }
 
-        stripped += chunk.slice(cursor, sentinelStart);
-        const sentinelOpenEnd = sentinelStart + REVISE_SENTINEL_PREFIX.length;
-        const closeIdx = chunk.indexOf(REVISE_SENTINEL_SUFFIX, sentinelOpenEnd);
+        textBefore += chunk.slice(pos, found.idx);
+
+        const payloadStart = found.idx + found.prefix.length;
+        const closeIdx = chunk.indexOf(found.suffix, payloadStart);
         if (closeIdx < 0) {
+            if (found.kind === 'revise') sawSentinel = true;
             break;
         }
 
-        sawSentinel = true;
-        cursor = closeIdx + REVISE_SENTINEL_SUFFIX.length;
+        const payloadText = chunk.slice(payloadStart, closeIdx);
+        if (found.kind === 'revise') {
+            sawSentinel = true;
+        } else {
+            try {
+                const payload = JSON.parse(payloadText);
+                if (payload && payload.content) thoughts.push(payload);
+            } catch (_) {
+                // Malformed UI metadata should not corrupt visible text.
+            }
+        }
+        pos = closeIdx + found.suffix.length;
     }
-    return { textBefore: stripped, textAfter: '', sawSentinel };
+
+    return {
+        textBefore,
+        textAfter: '',
+        sawSentinel,
+        thoughts,
+    };
+}
+
+function appendThinkingItems(target, thoughts) {
+    if (!target || !thoughts || thoughts.length === 0) return;
+    for (const thought of thoughts) {
+        const content = typeof thought === 'string' ? thought : (thought.content || '');
+        if (!content) continue;
+        const provider = typeof thought === 'object' ? (thought.provider || '') : '';
+        const last = target[target.length - 1];
+        const lastProvider = typeof last === 'object' ? (last.provider || '') : '';
+        if (last && lastProvider === provider) {
+            if (typeof last === 'string') {
+                target[target.length - 1] = last + content;
+            } else {
+                last.content = (last.content || '') + content;
+            }
+        } else {
+            target.push(typeof thought === 'string' ? { content, provider } : { ...thought, content, provider });
+        }
+    }
+}
+
+function findLastOpenStreamSentinel(text) {
+    let found = null;
+    for (const spec of STREAM_SENTINELS) {
+        const idx = text.lastIndexOf(spec.prefix);
+        if (idx >= 0 && (!found || idx > found.idx)) {
+            found = { ...spec, idx };
+        }
+    }
+    return found;
+}
+
+function trimPartialStreamSentinel(text) {
+    for (const spec of STREAM_SENTINELS) {
+        const maxCheck = Math.min(text.length, spec.prefix.length - 1);
+        for (let i = maxCheck; i > 0; i--) {
+            const tail = text.slice(text.length - i);
+            if (spec.prefix.startsWith(tail)) {
+                return {
+                    text: text.slice(0, text.length - i),
+                    buffer: tail,
+                };
+            }
+        }
+    }
+    return { text, buffer: '' };
 }
 
 // ============================================================================
@@ -344,6 +427,7 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.generation += 1;
     pane.streamingMsgDiv = null;
     pane.fullContent = '';
+    pane.thinkingItems = [];
     pane.sessionId = null;
     pane.hasUnrenderedMermaid = false;
     pane.pendingRevise = false;
@@ -796,6 +880,7 @@ export async function sendMessage() {
         if (state.useStreaming) {
             const msgDiv = addMessageStreaming('agent', pane.element);
             pane.streamingMsgDiv = msgDiv;
+            pane.thinkingItems = [];
             let fullContent = '';
 
             try {
@@ -821,22 +906,25 @@ export async function sendMessage() {
                     let processable = merged;
                     // Case A: a full prefix without close in this
                     // chunk — buffer everything from prefix on.
-                    const lastFullPrefixIdx = merged.lastIndexOf(REVISE_SENTINEL_PREFIX);
-                    if (lastFullPrefixIdx >= 0) {
+                    const lastOpen = findLastOpenStreamSentinel(merged);
+                    if (lastOpen) {
                         const closeAfter = merged.indexOf(
-                            REVISE_SENTINEL_SUFFIX,
-                            lastFullPrefixIdx + REVISE_SENTINEL_PREFIX.length,
+                            lastOpen.suffix,
+                            lastOpen.idx + lastOpen.prefix.length,
                         );
                         if (closeAfter < 0) {
-                            processable = merged.slice(0, lastFullPrefixIdx);
-                            sentinelBuffer = merged.slice(lastFullPrefixIdx);
+                            processable = merged.slice(0, lastOpen.idx);
+                            sentinelBuffer = merged.slice(lastOpen.idx);
                         }
                     }
-                    // Strip any complete sentinels in processable. The
-                    // sentinel is a wire marker, not a command to hide
-                    // user-visible prose.
-                    let { textBefore, textAfter, sawSentinel } =
-                        stripReviseSentinel(processable);
+                    // Strip any complete sentinels in processable.
+                    // Revise markers and thinking markers are wire
+                    // metadata; visible prose stays in the accumulator.
+                    let { textBefore, textAfter, sawSentinel, thoughts } =
+                        stripStreamSentinels(processable);
+                    if (thoughts.length) {
+                        appendThinkingItems(pane.thinkingItems, thoughts);
+                    }
                     // Case B: a PARTIAL prefix at the tail of post-
                     // strip output — happens when a chunk splits
                     // INSIDE the prefix string ("\x1eKESTREL:REV" then
@@ -846,18 +934,10 @@ export async function sendMessage() {
                     if (!sentinelBuffer) {
                         const target = textBefore;
                         if (target.length > 0) {
-                            const maxCheck = Math.min(
-                                target.length,
-                                REVISE_SENTINEL_PREFIX.length - 1,
-                            );
-                            for (let i = maxCheck; i > 0; i--) {
-                                const tail = target.slice(target.length - i);
-                                if (REVISE_SENTINEL_PREFIX.startsWith(tail)) {
-                                    sentinelBuffer = tail;
-                                    const trimmed = target.slice(0, target.length - i);
-                                    textBefore = trimmed;
-                                    break;
-                                }
+                            const trimmed = trimPartialStreamSentinel(target);
+                            if (trimmed.buffer) {
+                                sentinelBuffer = trimmed.buffer;
+                                textBefore = trimmed.text;
                             }
                         }
                     }
@@ -899,7 +979,7 @@ export async function sendMessage() {
                     // different agent). When they come back, the
                     // streaming text is already there.
                     if (isPaneFresh()) {
-                        updateStreamingMessage(msgDiv, fullContent, pane.element);
+                        updateStreamingMessage(msgDiv, fullContent, pane.element, pane.thinkingItems);
                     }
                 }
                 if (isPaneFresh()) {
@@ -1159,17 +1239,42 @@ export function addMessageStreaming(role, paneElement = null) {
     return div;
 }
 
-export function updateStreamingMessage(msgDiv, content, paneElement = null) {
+function renderThinkingBubbles(thinkingItems = []) {
+    if (!thinkingItems || thinkingItems.length === 0) return '';
+    return thinkingItems.map((item, idx) => {
+        const content = typeof item === 'string' ? item : (item.content || '');
+        const providerText = typeof item === 'object' && item.provider ? ` · ${item.provider}` : '';
+        const provider = escapeThinkingLabel(providerText);
+        const rendered = renderStreamingMarkdown(content);
+        return `<details class="thinking-bubble">
+            <summary>Thinking ${idx + 1}${provider}</summary>
+            <div class="thinking-bubble-content">${rendered}</div>
+        </details>`;
+    }).join('');
+}
+
+function escapeThinkingLabel(text) {
+    return String(text || '').replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+    }[ch]));
+}
+
+export function updateStreamingMessage(msgDiv, content, paneElement = null, thinkingItems = []) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
+        const thinkingHtml = renderThinkingBubbles(thinkingItems);
         const split = splitToolActivity(content);
 
         if (split.hasToolActivity) {
-            contentDiv.innerHTML = renderStreamingResponseSections(split, content);
+            contentDiv.innerHTML = `${thinkingHtml}${renderStreamingResponseSections(split, content)}`;
             highlightCodeBlocks(contentDiv, true);
         } else {
             // No tool indicators - regular markdown
-            contentDiv.innerHTML = renderStreamingMarkdown(content);
+            contentDiv.innerHTML = `${thinkingHtml}${renderStreamingMarkdown(content)}`;
             highlightCodeBlocks(contentDiv, true);
         }
 
@@ -1222,6 +1327,11 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     const mounted = !!(c && paneEl && paneEl.parentNode === c);
 
     await finalizeAgentContent(contentDiv, content);
+    const thinkingItems = pane && pane.thinkingItems ? pane.thinkingItems : [];
+    if (thinkingItems.length) {
+        contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
+        highlightCodeBlocks(contentDiv, true);
+    }
     if (!mounted && pane && /```mermaid/.test(content)) {
         // Mark the pane so mountChatPane re-runs the mermaid pass.
         pane.hasUnrenderedMermaid = true;

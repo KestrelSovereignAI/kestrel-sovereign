@@ -349,7 +349,7 @@ class ProviderRegistry:
             if base_url:
                 kwargs["base_url"] = base_url
             client = openai.AsyncOpenAI(**kwargs)
-            return client, adapter_cls()
+            return client, adapter_cls(name=vendor)
 
         # --- Fallback: try plain instantiation; let adapter fail at call time ---
         logger.warning("No client builder for adapter %s — using adapter-only", adapter_cls.__name__)

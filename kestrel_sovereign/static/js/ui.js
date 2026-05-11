@@ -89,6 +89,7 @@ export async function loadCommands(apiModule) {
 //     generation: number,               // bumped on within-agent context change
 //     streamingMsgDiv: HTMLDivElement|null,
 //     fullContent: string,
+//     thinkingItems: Array,             // UI-only thought bubbles for current stream
 //     sessionId: string|null,
 //     scrollPos: number,
 //     hasUnrenderedMermaid: boolean,    // mermaid render deferred until mount
@@ -173,6 +174,7 @@ export function getOrCreateChatPane(agentName) {
         generation: 0,
         streamingMsgDiv: null,
         fullContent: '',
+        thinkingItems: [],
         sessionId: null,
         scrollPos: 0,
         hasUnrenderedMermaid: false,

@@ -9,7 +9,6 @@ Adapter for OpenAI's chat completion API with full support for:
 """
 import json
 import os
-import re
 import openai
 import logging
 from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
@@ -18,12 +17,24 @@ from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
 
-from .adapter import LLMAdapter, LLMResponse, ToolCall
+from .adapter import (
+    LLMAdapter,
+    LLMResponse,
+    ThinkingContentSplitter,
+    ThinkingDelta,
+    ToolCall,
+    should_split_plain_reasoning,
+    split_thinking_from_content,
+)
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 
 logger = logging.getLogger(__name__)
+
+_split_thinking_from_content = split_thinking_from_content
+_ThinkingContentSplitter = ThinkingContentSplitter
+_should_split_plain_reasoning = should_split_plain_reasoning
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -36,8 +47,8 @@ class OpenAIAdapter(LLMAdapter):
     - JSON mode
     """
 
-    def __init__(self):
-        self.name = "openai"
+    def __init__(self, name: str = "openai"):
+        self.name = name
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]
@@ -160,43 +171,10 @@ class OpenAIAdapter(LLMAdapter):
                 output_tokens = getattr(response.usage, 'completion_tokens', None)
                 total_tokens = getattr(response.usage, 'total_tokens', None)
 
-            # Strip chain-of-thought reasoning from response
-            content = message.content
-
-            # 1. Use reasoning_content if server separated it (--reasoning-format deepseek)
-            reasoning_content = getattr(message, 'reasoning_content', None)
-            if reasoning_content and content:
-                # Server already stripped thinking — content is clean
-                pass
-            elif content:
-                # 2. Strip <think>...</think> tags (DeepSeek-R1 format)
-                content = re.sub(r'<think>.*?</think>\s*', '', content, flags=re.DOTALL)
-
-                # 3. Strip inline chain-of-thought from models that dump reasoning
-                #    as plain text (Kimi K2.5). Reasoning paragraphs start with
-                #    meta-cognitive phrases and don't contain markdown formatting.
-                paragraphs = content.split('\n\n')
-                if len(paragraphs) >= 2:
-                    reasoning_markers = [
-                        'The user', 'I should', 'I need to', 'Let me',
-                        'I\'ll ', 'I will ', 'This is a', 'Since ',
-                        'Looking at', 'Based on', 'I can see',
-                        'Overall,', 'Now I', 'I have',
-                    ]
-                    cleaned = []
-                    for p in paragraphs:
-                        stripped = p.strip()
-                        # Skip paragraphs that look like reasoning (start with
-                        # marker AND don't contain markdown formatting like
-                        # headers, tables, lists, or bold text)
-                        is_reasoning = (
-                            any(stripped.startswith(m) for m in reasoning_markers)
-                            and not any(c in stripped for c in ['#', '|', '- ', '* ', '**'])
-                        )
-                        if not is_reasoning:
-                            cleaned.append(p)
-                    if cleaned:
-                        content = '\n\n'.join(cleaned).strip()
+            _, content = _split_thinking_from_content(
+                message.content,
+                getattr(message, 'reasoning_content', None),
+            )
 
             return LLMResponse(
                 content=content,
@@ -228,7 +206,7 @@ class OpenAIAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         """
         Gets a streaming response from the OpenAI model.
 
@@ -293,12 +271,27 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
+            splitter = _ThinkingContentSplitter(
+                provider=self.name,
+                split_plain_reasoning=_should_split_plain_reasoning(model),
+            )
             chunk_count = 0
             async for chunk in stream:
                 delta = chunk.choices[0].delta
-                if delta.content:
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    yield ThinkingDelta(reasoning_content, provider=self.name)
+                content_delta = getattr(delta, "content", None)
+                if isinstance(content_delta, str) and content_delta:
+                    for item in splitter.feed(content_delta):
+                        if isinstance(item, str):
+                            chunk_count += 1
+                        yield item
+
+            for item in splitter.flush():
+                if isinstance(item, str):
                     chunk_count += 1
-                    yield delta.content
+                yield item
 
             logger.info(f"Stream completed. Total chunks: {chunk_count}")
 
@@ -323,7 +316,7 @@ class OpenAIAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, LLMResponse]]:
+    ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
         """
         Stream response with tool call detection.
 
@@ -404,6 +397,10 @@ class OpenAIAdapter(LLMAdapter):
             # Accumulator for tool calls - keyed by index
             # Each tool call arrives in chunks with the same index
             tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
+            splitter = _ThinkingContentSplitter(
+                provider=self.name,
+                split_plain_reasoning=_should_split_plain_reasoning(model),
+            )
             text_content = ""
             chunk_count = 0
             input_tokens = None
@@ -424,10 +421,17 @@ class OpenAIAdapter(LLMAdapter):
                 delta = chunk.choices[0].delta
 
                 # Handle text content - yield immediately for real-time streaming
-                if delta.content:
-                    chunk_count += 1
-                    text_content += delta.content
-                    yield delta.content
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if isinstance(reasoning_content, str) and reasoning_content:
+                    yield ThinkingDelta(reasoning_content, provider=self.name)
+
+                content_delta = getattr(delta, "content", None)
+                if isinstance(content_delta, str) and content_delta:
+                    for item in splitter.feed(content_delta):
+                        if isinstance(item, str):
+                            chunk_count += 1
+                            text_content += item
+                        yield item
 
                 # Handle tool call deltas - accumulate by index
                 if hasattr(delta, 'tool_calls') and delta.tool_calls:
@@ -479,6 +483,12 @@ class OpenAIAdapter(LLMAdapter):
                             )
 
             logger.info(f"Stream completed. Text chunks: {chunk_count}, Tool calls: {len(tool_calls_accumulator)}")
+
+            for item in splitter.flush():
+                if isinstance(item, str):
+                    chunk_count += 1
+                    text_content += item
+                yield item
 
             # If we have tool calls, yield a final LLMResponse with assembled tool calls
             if tool_calls_accumulator:
