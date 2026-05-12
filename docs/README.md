@@ -56,6 +56,10 @@ Regenerate via `scripts/generate_feature_docs.py`.
 - **[`design/launch/README.md`](design/launch/README.md)** — launch-page copy drafts (wireframe, one-screen variant, preview-packet language)
 - **[`logo-prompts.md`](logo-prompts.md)** — logo prompt history
 
+## Business & GTM
+
+- **[`GTM_STRATEGY.md`](GTM_STRATEGY.md)** — working go-to-market strategy covering segments, ICPs, wedge, packaging assumptions, channels, sequencing, proof points, objections, and 30-60-90 priorities
+
 ## Archive
 
 - **[`archive/KESTREL_FEATURES_legacy.md`](archive/KESTREL_FEATURES_legacy.md)** — legacy feature catalog kept for historical reference
