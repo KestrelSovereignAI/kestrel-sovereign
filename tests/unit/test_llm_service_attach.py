@@ -14,6 +14,7 @@ invariant at construction time so it cannot regress.
 from __future__ import annotations
 
 import pytest
+from unittest.mock import AsyncMock
 
 from kestrel_sovereign.llm.service import (
     LLMService,
@@ -64,3 +65,19 @@ class TestAttachToAgent:
         from kestrel_sovereign.llm.service import LLMServiceError
 
         assert issubclass(LLMServiceAlreadyAttachedError, LLMServiceError)
+
+    @pytest.mark.asyncio
+    async def test_llm_observability_receives_owner_agent_did(self) -> None:
+        svc = LLMService()
+        svc.attach_to_agent("did:test:agent-a")
+        store = AsyncMock()
+        svc.set_observability_store(store)
+
+        await svc._log_llm_call(
+            provider="openai",
+            model="gpt-5.4",
+            duration_ms=12,
+            success=True,
+        )
+
+        assert store.log_llm_call.await_args.kwargs["agent_did"] == "did:test:agent-a"

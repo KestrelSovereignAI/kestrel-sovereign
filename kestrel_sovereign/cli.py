@@ -872,6 +872,112 @@ def cmd_storage(args) -> int:
     return handler(args)
 
 
+def cmd_tool_log(args) -> int:
+    """Query structured tool dispatch logs."""
+    subcommands = {
+        "failure-rate": cmd_tool_log_failure_rate,
+        "recent-failures": cmd_tool_log_recent_failures,
+    }
+    handler = subcommands.get(args.tool_log_command)
+    if handler is None:
+        print("Usage: kestrel tool-dispatches {failure-rate,recent-failures} ...")
+        return 1
+    return handler(args)
+
+
+def _resolve_agent_db_path(agent: str, db_path: Optional[str] = None) -> Path:
+    if db_path:
+        return Path(db_path).expanduser().resolve()
+
+    project_dir = _get_project_dir()
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+    local_agents = multi_agent.get_local_agents()
+    if agent not in local_agents:
+        available = ", ".join(sorted(local_agents)) or "(none)"
+        raise ValueError(f"Agent '{agent}' not found. Available agents: {available}")
+    return (project_dir / local_agents[agent].data_dir / "kestrel_prime.db").resolve()
+
+
+async def _query_tool_dispatches(args, query_name: str):
+    from kestrel_sovereign.a2a.stores.observability_store import (
+        SQLiteObservabilityStore,
+    )
+
+    db_path = _resolve_agent_db_path(args.agent, getattr(args, "db_path", None))
+    store = SQLiteObservabilityStore(str(db_path))
+    await store.initialize()
+    try:
+        agent_did = args.agent_did or await _resolve_agent_did_from_db(
+            store.backend, args.agent
+        )
+        if query_name == "failure-rate":
+            return await store.tool_failure_rate(agent_did, args.last_n_turns)
+        return await store.recent_failures(agent_did, args.limit)
+    finally:
+        await store.close()
+
+
+async def _resolve_agent_did_from_db(backend, agent_name: str) -> str:
+    row = await backend.fetch_one(
+        """
+        SELECT node_id
+        FROM graph_nodes
+        WHERE node_type = 'agent'
+          AND (label = ? OR json_extract(properties, '$.agent_name') = ?)
+        ORDER BY node_id
+        LIMIT 1
+        """,
+        (agent_name, agent_name),
+    )
+    if row and row[0]:
+        return row[0]
+    raise ValueError(
+        f"Could not resolve DID for agent '{agent_name}'. "
+        "Pass --agent-did explicitly."
+    )
+
+
+def cmd_tool_log_failure_rate(args) -> int:
+    try:
+        result = asyncio.run(_query_tool_dispatches(args, "failure-rate"))
+    except Exception as exc:
+        print(f"Error querying tool dispatches: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            f"Agent {result['agent_did']}: {result['failure_calls']}/"
+            f"{result['total_calls']} non-success calls over "
+            f"{result['turns_observed']} turns "
+            f"({result['failure_rate']:.1%})"
+        )
+        for row in result["dominant_failures"]:
+            print(
+                f"{row['count']:4d} {row['rate']:.1%} "
+                f"{row['tool_name']} / {row['error_class']}"
+            )
+    return 0
+
+
+def cmd_tool_log_recent_failures(args) -> int:
+    try:
+        result = asyncio.run(_query_tool_dispatches(args, "recent-failures"))
+    except Exception as exc:
+        print(f"Error querying tool dispatches: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        for row in result:
+            print(
+                f"#{row['id']} {row['ts']} {row['tool_name']} "
+                f"{row['result_status']} {row['error_class'] or ''}: "
+                f"{row['error_message'] or ''}"
+            )
+    return 0
+
+
 def cmd_storage_health(args) -> int:
     """Show Lighthouse deal-lag and GCS fallback health."""
     from datetime import timedelta
@@ -1815,6 +1921,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print machine-readable JSON"
     )
 
+    # kestrel tool-dispatches {failure-rate,recent-failures}
+    tool_log_p = subparsers.add_parser(
+        "tool-dispatches",
+        aliases=["tool-log"],
+        help="Query structured tool/subagent dispatch logs",
+    )
+    tool_log_sub = tool_log_p.add_subparsers(dest="tool_log_command")
+    failure_rate_p = tool_log_sub.add_parser(
+        "failure-rate",
+        help="Summarize per-tool failure rates over the last N turns",
+    )
+    failure_rate_p.add_argument("agent", help="Agent name from multi_agent.toml")
+    failure_rate_p.add_argument(
+        "--agent-did",
+        help="Agent DID stored in a2a_tool_dispatches.agent_did",
+    )
+    failure_rate_p.add_argument(
+        "--last-n-turns", type=int, default=100, help="Turn window (default: 100)"
+    )
+    failure_rate_p.add_argument("--db-path", default=None, help="Override DB path")
+    failure_rate_p.add_argument("--json", action="store_true")
+
+    recent_failures_p = tool_log_sub.add_parser(
+        "recent-failures", help="Show recent non-success tool call rows"
+    )
+    recent_failures_p.add_argument("agent", help="Agent name from multi_agent.toml")
+    recent_failures_p.add_argument(
+        "--agent-did",
+        help="Agent DID stored in a2a_tool_dispatches.agent_did",
+    )
+    recent_failures_p.add_argument(
+        "--limit", type=int, default=20, help="Maximum rows (default: 20)"
+    )
+    recent_failures_p.add_argument("--db-path", default=None, help="Override DB path")
+    recent_failures_p.add_argument("--json", action="store_true")
+
     # kestrel setup [step]
     setup_p = subparsers.add_parser(
         "setup", help="Run the setup wizard (idempotent, re-runnable)"
@@ -2037,6 +2179,8 @@ def main() -> int:
         "health": cmd_health,
         "doctor": cmd_doctor,
         "storage": cmd_storage,
+        "tool-dispatches": cmd_tool_log,
+        "tool-log": cmd_tool_log,
         "setup": cmd_setup,
         "constitution": cmd_constitution,
         "migrate-llm-config": cmd_migrate_llm_config,

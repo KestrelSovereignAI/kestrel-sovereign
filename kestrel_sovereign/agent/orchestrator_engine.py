@@ -14,11 +14,17 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 from kestrel_sdk.hooks.base import HookEvent, HookInput, PermissionDecision
+from kestrel_sovereign.a2a.stores.unified.observability_store import (
+    ToolDispatchEntry,
+    infer_tool_result_status,
+    tool_result_size_bytes,
+)
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import optional_span
@@ -422,6 +428,8 @@ class OrchestratorEngineMixin:
         tool_name = tool_call.name
         args = tool_call.arguments if isinstance(tool_call.arguments, dict) else {}
         log_prefix = "[ORCHESTRATOR-STREAM]" if streaming else "[ORCHESTRATOR]"
+        dispatch_start = time.time()
+        dispatch_meta: Dict[str, Optional[str]] = {}
 
         # Validate tool arguments before execution
         is_valid, validation_error = validate_tool_arguments(
@@ -447,13 +455,26 @@ class OrchestratorEngineMixin:
                     "name": tool_name,
                     "result": summarize_tool_result_for_audit(serialized_result),
                 })
+            await OrchestratorEngineMixin._log_tool_dispatch(
+                self,
+                tool_name=tool_name,
+                adapter=OrchestratorEngineMixin._tool_call_adapter(
+                    self, tool_name, features_by_tool_name
+                ),
+                args=args,
+                result=result,
+                session_id=session_id,
+                dispatch_start=dispatch_start,
+                status_hint="error",
+                error_class="ToolValidationError",
+                error_message=f"Tool validation failed: {validation_error}",
+            )
             return
 
         # Stream tool start indicator
         if streaming and tool_events is not None:
             tool_events.append({'type': 'start', 'tool': tool_name})
 
-        dispatch_start = time.time()
         dispatch_event_id = await self.observability_store.log_tool_call(
             agent_name=self.did,
             tool_name=f"feature_dispatch:{tool_name}",
@@ -467,16 +488,21 @@ class OrchestratorEngineMixin:
             result = await self._dispatch_feature_tool(
                 tool_call, feature, args, dispatch_start, dispatch_event_id,
                 user_message, tool_events=tool_events, streaming=streaming,
-                session_id=session_id,
+                session_id=session_id, dispatch_meta=dispatch_meta,
             )
         elif tool_name in self._direct_tools:
             result = await self._dispatch_direct_tool(
                 tool_call, tool_name, args, dispatch_start, dispatch_event_id,
                 tool_events=tool_events, streaming=streaming,
-                session_id=session_id,
+                session_id=session_id, dispatch_meta=dispatch_meta,
             )
         else:
             result = {"success": False, "error": f"Unknown feature tool: {tool_name}"}
+            dispatch_meta.update({
+                "status": "error",
+                "error_class": "UnknownToolError",
+                "error_message": f"Unknown feature tool: {tool_name}",
+            })
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
                 event_id=dispatch_event_id,
@@ -533,11 +559,85 @@ class OrchestratorEngineMixin:
         if context_stats is not None:
             context_stats.record(tool_name, args, len(result_json))
 
+        await OrchestratorEngineMixin._log_tool_dispatch(
+            self,
+            tool_name=tool_name,
+            adapter=OrchestratorEngineMixin._tool_call_adapter(
+                self, tool_name, features_by_tool_name
+            ),
+            args=args,
+            result=result,
+            session_id=session_id,
+            dispatch_start=dispatch_start,
+            status_hint=dispatch_meta.get("status"),
+            error_class=dispatch_meta.get("error_class"),
+            error_message=dispatch_meta.get("error_message"),
+        )
+
         return result
+
+    def _tool_call_adapter(self, tool_name: str, features_by_tool_name: dict) -> str:
+        """Return a stable adapter identifier for a dispatched tool call."""
+        feature = features_by_tool_name.get(tool_name)
+        if feature is not None:
+            return f"{type(feature).__name__}.execute_as_subagent"
+        feature_name = getattr(self, "_tool_to_feature", {}).get(tool_name)
+        if feature_name:
+            return f"{feature_name}.{tool_name}"
+        return tool_name
+
+    async def _log_tool_dispatch(
+        self,
+        *,
+        tool_name: str,
+        adapter: str,
+        args: dict,
+        result: Any,
+        session_id: Optional[str],
+        dispatch_start: float,
+        status_hint: Optional[str] = None,
+        error_class: Optional[str] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """Best-effort structured dispatch log. Never affects tool behavior."""
+        observability_store = getattr(self, "observability_store", None)
+        if observability_store is None:
+            return
+        log_dispatch = getattr(observability_store, "log_tool_dispatch", None)
+        if log_dispatch is None:
+            log_dispatch = getattr(observability_store, "log_structured_tool_call", None)
+        if log_dispatch is None:
+            return
+        try:
+            normalized_session_id = session_id
+            if normalized_session_id in ("", "original", "orchestrator"):
+                normalized_session_id = None
+            await log_dispatch(
+                ToolDispatchEntry(
+                    agent_did=self.did,
+                    session_id=normalized_session_id,
+                    turn_id=(
+                        self._get_current_turn_id()
+                        if callable(getattr(self, "_get_current_turn_id", None))
+                        else None
+                    ) or "turn_unknown",
+                    tool_name=tool_name,
+                    adapter=adapter,
+                    args_redacted=args,
+                    result_status=infer_tool_result_status(result, status_hint),
+                    error_class=error_class,
+                    error_message=error_message,
+                    latency_ms=int((time.time() - dispatch_start) * 1000),
+                    result_size_bytes=tool_result_size_bytes(result),
+                )
+            )
+        except Exception as exc:
+            print(f"a2a_tool_dispatches dispatch wrapper failed: {exc}", file=sys.stderr)
 
     async def _dispatch_feature_tool(
         self, tool_call, feature, args, dispatch_start, dispatch_event_id,
         user_message, *, tool_events=None, streaming=False, session_id="orchestrator",
+        dispatch_meta=None,
     ):
         """Dispatch to a feature subagent with hook enforcement."""
         tool_name = tool_call.name
@@ -558,6 +658,12 @@ class OrchestratorEngineMixin:
             reason = subagent_hook_output.permission_reason or "Subagent call blocked by policy"
             logging.warning(f"[HOOKS] Subagent denied: {hook_feature_name}.{tool_name} - {reason}")
             result = {"success": False, "error": f"Permission denied: {reason}"}
+            if dispatch_meta is not None:
+                dispatch_meta.update({
+                    "status": "policy_denied",
+                    "error_class": "PermissionDenied",
+                    "error_message": reason,
+                })
 
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
@@ -625,13 +731,14 @@ class OrchestratorEngineMixin:
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
-                session_id=session_id,
+                session_id=session_id, dispatch_meta=dispatch_meta,
             )
         except Exception as e:
             return await self._handle_feature_error(
                 e, tool_name, hook_feature_name, args, dispatch_start,
                 dispatch_event_id, tool_events=tool_events, streaming=streaming,
                 log_traceback=True, session_id=session_id,
+                dispatch_meta=dispatch_meta,
             )
 
     async def _get_denied_tools(self, feature_name: str) -> set:
@@ -679,6 +786,7 @@ class OrchestratorEngineMixin:
         self, error, tool_name, hook_feature_name, args, dispatch_start,
         dispatch_event_id, *, tool_events=None, streaming=False, log_traceback=False,
         session_id="orchestrator",
+        dispatch_meta=None,
     ):
         """Handle feature execution error with logging and hooks."""
         if log_traceback:
@@ -686,6 +794,13 @@ class OrchestratorEngineMixin:
         else:
             logging.error(f"Feature {tool_name} execution failed: {error}")
         result = {"success": False, "error": str(error)}
+        if dispatch_meta is not None:
+            status = "timeout" if isinstance(error, TimeoutError) else "error"
+            dispatch_meta.update({
+                "status": status,
+                "error_class": type(error).__name__,
+                "error_message": str(error),
+            })
 
         dispatch_duration = int((time.time() - dispatch_start) * 1000)
         await self.observability_store.log_tool_response(
@@ -716,6 +831,7 @@ class OrchestratorEngineMixin:
     async def _dispatch_direct_tool(
         self, tool_call, tool_name, args, dispatch_start, dispatch_event_id,
         *, tool_events=None, streaming=False, session_id="orchestrator",
+        dispatch_meta=None,
     ):
         """Dispatch a direct tool call (no subagent LLM hop)."""
         tool = self._direct_tools[tool_name]
@@ -747,6 +863,13 @@ class OrchestratorEngineMixin:
         except Exception as e:
             logging.error(f"[DIRECT-TOOL] {tool_name} failed: {e}")
             result = {"success": False, "error": str(e)}
+            if dispatch_meta is not None:
+                status = "timeout" if isinstance(e, TimeoutError) else "error"
+                dispatch_meta.update({
+                    "status": status,
+                    "error_class": type(e).__name__,
+                    "error_message": str(e),
+                })
 
             dispatch_duration = int((time.time() - dispatch_start) * 1000)
             await self.observability_store.log_tool_response(
