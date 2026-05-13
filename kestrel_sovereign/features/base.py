@@ -25,6 +25,24 @@ logger = logging.getLogger(__name__)
 # Increased to 50 for long-running tasks like code analysis and multi-step operations
 MAX_TOOL_ITERATIONS = int(os.environ.get("KESTREL_MAX_TOOL_ITERATIONS", "50"))
 
+CONTINUATION_INTENT_RE = re.compile(
+    r"\b("
+    r"let me|i(?:'ll| will| am going to)|"
+    r"one moment|hang on|checking|calling|running|searching|looking up"
+    r")\b.{0,80}\b("
+    r"check|look|search|call|run|fetch|inspect|open|query|verify|use|try|"
+    r"github|tool|cli|browser|file|repo|issue|database|db|talon"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this task is still in progress, but you did not emit a tool call.
+
+Continue the same task now:
+- If the work requires an available tool, emit the tool call now.
+- If no tool is needed or available, provide the final answer now.
+- Do not describe a future tool call without making it."""
+
 
 def _serialize_tool_result(result: Any) -> Any:
     """Convert a tool result to a JSON-serializable format.
@@ -132,6 +150,41 @@ class Feature(_SdkFeature):
         self.agent = agent
         self.name = self.__class__.__name__
         self.disabled_skills: set = set()
+
+    @staticmethod
+    def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
+        """Return True when assistant text promises more tool-backed work."""
+        if not content:
+            return False
+        return bool(CONTINUATION_INTENT_RE.search(content))
+
+    @staticmethod
+    def _append_missing_tool_call_repair(messages: list, content: str) -> list:
+        """Return a repaired message list for one no-tool continuation retry."""
+        repaired = list(messages)
+        repaired.append({"role": "assistant", "content": content or ""})
+        repaired.append({"role": "user", "content": TURN_COMPLETION_REPAIR_PROMPT})
+        return repaired
+
+    async def _repair_subagent_premature_yield(
+        self,
+        response: Any,
+        messages: list,
+        tools: List[Dict[str, Any]],
+    ) -> Any:
+        """Give a feature subagent one more step when it narrates but emits no tool."""
+        content = getattr(response, "content", "") or ""
+        if not tools or not self._signals_unfinished_tool_work(content):
+            return response
+
+        logger.warning(
+            "[SUBAGENT %s] Model signaled continuation without tool_calls; issuing one repair turn",
+            self.name,
+        )
+        return await self.agent.llm_service.generate_with_messages(
+            messages=self._append_missing_tool_call_repair(messages, content),
+            tools=tools if tools else None,
+        )
 
     # =========================================================================
     # Lifecycle Methods
@@ -573,7 +626,8 @@ class Feature(_SdkFeature):
                 response,
                 feature_tools,
                 system_prompt,
-                max_iterations=max_iterations
+                max_iterations=max_iterations,
+                user_prompt=user_prompt,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -627,7 +681,8 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         response: Union[str, Any],
         tools: List[Dict[str, Any]],
         system_prompt: str,
-        max_iterations: int = None
+        max_iterations: int = None,
+        user_prompt: Optional[str] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -653,25 +708,44 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         if isinstance(response, str):
             return response
 
-        # Check if response has tool_calls attribute
-        if not hasattr(response, 'tool_calls') or not response.tool_calls:
-            return response.content or ""
-
         # Build message history for multi-turn tool calling
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "assistant", "content": response.content, "tool_calls": [
+        ]
+        if user_prompt:
+            messages.append({"role": "user", "content": user_prompt})
+
+        # Check if response has tool_calls attribute
+        if not hasattr(response, 'tool_calls') or not response.tool_calls:
+            response = await self._repair_subagent_premature_yield(
+                response,
+                messages,
+                tools,
+            )
+            if isinstance(response, str):
+                return response
+            if not hasattr(response, 'tool_calls') or not response.tool_calls:
+                return response.content or ""
+
+        messages.append({
+            "role": "assistant",
+            "content": response.content,
+            "tool_calls": [
                 {
                     "id": tc.id,
                     "type": "function",
                     "function": {
                         "name": tc.name,
-                        "arguments": json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else tc.arguments
+                        "arguments": (
+                            json.dumps(tc.arguments)
+                            if isinstance(tc.arguments, dict)
+                            else tc.arguments
+                        ),
                     }
                 }
                 for tc in response.tool_calls
-            ]}
-        ]
+            ],
+        })
 
         # Get tools by name for execution
         tools_by_name = {tool.name: tool for tool in self.get_tools()}
@@ -757,6 +831,34 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 return response
 
             if not hasattr(response, 'tool_calls') or not response.tool_calls:
+                response = await self._repair_subagent_premature_yield(
+                    response,
+                    messages,
+                    tools,
+                )
+                if isinstance(response, str):
+                    return response
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content,
+                        "tool_calls": [
+                            {
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": (
+                                        json.dumps(tc.arguments)
+                                        if isinstance(tc.arguments, dict)
+                                        else tc.arguments
+                                    ),
+                                }
+                            }
+                            for tc in response.tool_calls
+                        ]
+                    })
+                    continue
                 return response.content or ""
 
             # Add assistant response with new tool calls to messages
