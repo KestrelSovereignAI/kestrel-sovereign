@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kestrel Blog &mdash; Sovereign AI, Memory, and Governance</title>
+  <meta name="description" content="Essays and technical notes from Kestrel on sovereign AI, user-owned memory, agent identity, and constitutional governance." />
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+  <link rel="icon" type="image/png" sizes="32x32" href="../favicon-32.png" />
+  <link rel="icon" type="image/x-icon" href="../favicon.ico" />
+  <link rel="apple-touch-icon" sizes="180x180" href="../apple-touch-icon.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #060B18;
+      --surface: #0C1525;
+      --surface-2: #111D30;
+      --border: #1C2C47;
+      --border-light: #243351;
+      --blue: #38BDF8;
+      --indigo: #818CF8;
+      --green: #34D399;
+      --text: #F0F6FF;
+      --text-2: #94A3B8;
+      --text-3: #64748B;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Inter', system-ui, sans-serif;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    .container { width: 100%; max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      border-bottom: 1px solid var(--border);
+      background: rgba(6, 11, 24, 0.92);
+      backdrop-filter: blur(12px);
+    }
+    .nav-inner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      height: 64px;
+      gap: 16px;
+    }
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--text);
+      text-decoration: none;
+      font-weight: 700;
+    }
+    .nav-logo img { width: 34px; height: 34px; object-fit: contain; }
+    .nav-links { display: flex; align-items: center; gap: 8px; list-style: none; }
+    .nav-links a {
+      color: var(--text-2);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      padding: 6px 12px;
+      border-radius: 6px;
+    }
+    .nav-links a:hover { color: var(--text); background: var(--surface-2); }
+    .btn-nav {
+      background: var(--blue);
+      color: #000 !important;
+      font-weight: 700 !important;
+      padding: 8px 16px !important;
+      border-radius: 8px !important;
+    }
+    .hero { padding: 84px 0 44px; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--blue);
+      font-size: 0.8125rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 16px;
+    }
+    .eyebrow::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+    }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 28px;
+      align-items: stretch;
+    }
+    .hero-copy h1 {
+      font-size: clamp(2.3rem, 5vw, 3.8rem);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+      margin-bottom: 16px;
+    }
+    .hero-copy p {
+      max-width: 650px;
+      color: var(--text-2);
+      font-size: 1.05rem;
+    }
+    .featured-card,
+    .post-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 28px;
+    }
+    .featured-card { height: 100%; }
+    .post-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 18px;
+      padding-bottom: 80px;
+    }
+    .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 20px 0 32px;
+    }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.08);
+      border: 1px solid rgba(56, 189, 248, 0.18);
+      color: var(--blue);
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+    .meta {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+      color: var(--text-3);
+      font-size: 0.8rem;
+    }
+    .post-card h2,
+    .featured-card h2 {
+      font-size: 1.4rem;
+      line-height: 1.3;
+      letter-spacing: -0.02em;
+      margin-bottom: 12px;
+    }
+    .post-card p,
+    .featured-card p { color: var(--text-2); margin-bottom: 16px; }
+    .link {
+      color: var(--text);
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .link:hover { color: var(--blue); }
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 32px 0 40px;
+    }
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .footer-copy { color: var(--text-3); font-size: 0.875rem; }
+    .footer-links { display: flex; gap: 20px; list-style: none; }
+    .footer-links a { color: var(--text-3); text-decoration: none; font-size: 0.875rem; }
+    .footer-links a:hover { color: var(--text-2); }
+    @media (max-width: 860px) {
+      .hero-grid { grid-template-columns: 1fr; }
+      .nav-links .hide-mobile { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="container">
+      <div class="nav-inner">
+        <a href="../" class="nav-logo">
+          <img src="../logo.png" alt="Kestrel" />
+          Kestrel
+        </a>
+        <ul class="nav-links">
+          <li class="hide-mobile"><a href="../#pillars">Architecture</a></li>
+          <li class="hide-mobile"><a href="../#open-source">Open Source</a></li>
+          <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="btn-nav" target="_blank" rel="noopener">GitHub &rarr;</a></li>
+        </ul>
+      </div>
+    </div>
+  </nav>
+
+  <section class="hero">
+    <div class="container">
+      <div class="eyebrow">Kestrel Blog</div>
+      <div class="hero-grid">
+        <div class="hero-copy">
+          <h1>Teach the market the idea before you ask it to buy the product.</h1>
+          <p>
+            This first blog scaffold gives Kestrel a place to explain sovereign AI in public:
+            why ownership matters, why memory belongs to the user, and why governed agents are
+            different from disposable chat experiences.
+          </p>
+          <div class="tag-row">
+            <span class="tag">Sovereign AI</span>
+            <span class="tag">Agent Identity</span>
+            <span class="tag">Memory Ownership</span>
+            <span class="tag">Governance</span>
+            <span class="tag">Founder Notes</span>
+          </div>
+        </div>
+        <article class="featured-card">
+          <div class="meta">
+            <span class="tag">Featured</span>
+            <span>5 min read</span>
+          </div>
+          <h2>What Sovereign AI Actually Means</h2>
+          <p>
+            Start here. This is the plain-language explanation of what Kestrel is building and why
+            ownership, continuity, and governance are not optional details.
+          </p>
+          <a class="link" href="what-is-sovereign-ai.html">Read the opening essay &rarr;</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="container">
+      <div class="post-grid">
+        <article class="post-card">
+          <div class="meta">
+            <span class="tag">Why Kestrel</span>
+            <span>May 2026</span>
+            <span>5 min read</span>
+          </div>
+          <h2>What Sovereign AI Actually Means</h2>
+          <p>
+            A plain-language piece that defines the core problem Kestrel is solving and gives people
+            a way to repeat the idea without sounding abstract.
+          </p>
+          <a class="link" href="what-is-sovereign-ai.html">Read article &rarr;</a>
+        </article>
+
+        <article class="post-card">
+          <div class="meta">
+            <span class="tag">Memory Ownership</span>
+            <span>May 2026</span>
+            <span>6 min read</span>
+          </div>
+          <h2>Why Agent Memory Should Belong to the User</h2>
+          <p>
+            Explains why long-term value in AI comes from retained context and why that context loses
+            meaning if it lives inside someone else's platform boundary.
+          </p>
+          <a class="link" href="agent-memory-belongs-to-the-user.html">Read article &rarr;</a>
+        </article>
+
+        <article class="post-card">
+          <div class="meta">
+            <span class="tag">Governance</span>
+            <span>May 2026</span>
+            <span>7 min read</span>
+          </div>
+          <h2>Constitutional Governance for Agents</h2>
+          <p>
+            Frames the difference between prompting a model and governing an agent that is meant to
+            persist, act, and hold trust over time.
+          </p>
+          <a class="link" href="constitutional-governance-for-agents.html">Read article &rarr;</a>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-copy">&copy; 2026 Kestrel Sovereign, LLC. Static blog scaffold v0.1.</div>
+        <ul class="footer-links">
+          <li><a href="../">Home</a></li>
+          <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" target="_blank" rel="noopener">GitHub</a></li>
+          <li><a href="mailto:hello@kestrelsovereign.com">Contact</a></li>
+        </ul>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

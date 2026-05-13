@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Why Agent Memory Should Belong to the User &mdash; Kestrel Blog</title>
+  <meta name="description" content="Why user-owned memory is the difference between disposable AI and durable AI relationships." />
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root { --bg:#060B18; --surface:#0C1525; --border:#1C2C47; --blue:#38BDF8; --text:#F0F6FF; --text-2:#94A3B8; --text-3:#64748B; }
+    body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; line-height: 1.75; }
+    .container { width:100%; max-width:860px; margin:0 auto; padding:0 24px; }
+    nav, footer { border-bottom: 1px solid var(--border); }
+    nav { background: rgba(6,11,24,0.92); position: sticky; top:0; }
+    .nav-inner, .footer-inner { display:flex; justify-content:space-between; align-items:center; gap:16px; min-height:64px; flex-wrap:wrap; }
+    .nav-logo { color: var(--text); text-decoration:none; font-weight:700; display:flex; align-items:center; gap:10px; }
+    .nav-logo img { width:34px; height:34px; }
+    .nav-link { color: var(--text-2); text-decoration:none; font-size:0.875rem; }
+    .nav-link:hover { color: var(--text); }
+    article { padding:72px 0 88px; }
+    .meta { display:flex; gap:10px; flex-wrap:wrap; color: var(--text-3); font-size:0.82rem; margin-bottom:18px; }
+    .tag { display:inline-flex; padding:4px 10px; border-radius:999px; background: rgba(56,189,248,0.08); border:1px solid rgba(56,189,248,0.18); color: var(--blue); font-size:0.74rem; font-weight:700; }
+    h1 { font-size: clamp(2.2rem, 5vw, 3.5rem); line-height:1.1; letter-spacing:-0.03em; margin-bottom:18px; }
+    .dek { color: var(--text-2); font-size:1.08rem; margin-bottom:32px; }
+    .article-card { background: var(--surface); border:1px solid var(--border); border-radius:20px; padding:32px; }
+    h2 { font-size:1.35rem; margin:30px 0 12px; letter-spacing:-0.02em; }
+    p { color: var(--text-2); margin-bottom:16px; }
+    strong { color: var(--text); }
+    ul { margin: 8px 0 18px 22px; color: var(--text-2); }
+    li { margin-bottom: 10px; }
+    .footer-copy, .footer-link { color: var(--text-3); font-size:0.875rem; text-decoration:none; }
+    .footer-link:hover { color: var(--text-2); }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="container">
+      <div class="nav-inner">
+        <a href="../" class="nav-logo"><img src="../logo.png" alt="Kestrel" />Kestrel</a>
+        <a class="nav-link" href="index.html">Back to blog</a>
+      </div>
+    </div>
+  </nav>
+  <article>
+    <div class="container">
+      <div class="meta"><span class="tag">Memory Ownership</span><span>May 2026</span><span>6 min read</span></div>
+      <h1>Why Agent Memory Should Belong to the User</h1>
+      <p class="dek">The value of an agent compounds through memory. If the memory is not portable and user-controlled, the relationship is not really durable.</p>
+      <div class="article-card">
+        <p>When people talk about AI, they often focus on the model. But for a long-lived agent, the model is only part of the story. The deeper value comes from the memory layer: what the agent knows about the user, the work, the context, the patterns, and the history of interaction over time.</p>
+
+        <p>That means memory is not an accessory. It is the continuity layer.</p>
+
+        <h2>Why platform-bound memory is a problem</h2>
+        <p>If a vendor owns the memory boundary, then the user's long-term relationship depends on the vendor's pricing, policies, product roadmap, and survival. Even if the interface is elegant, the dependency remains structural.</p>
+
+        <h2>What user-owned memory changes</h2>
+        <ul>
+          <li>The relationship can move across hosting environments.</li>
+          <li>The context can survive product transitions.</li>
+          <li>The user can govern retention, deletion, and portability.</li>
+          <li>The memory becomes part of the user's asset base, not the vendor's moat.</li>
+        </ul>
+
+        <h2>Why this matters for Kestrel</h2>
+        <p>Kestrel treats memory as owned infrastructure. That means the user's conversation history, documents, and relationships are not merely cached convenience. They are part of the durable system the user controls.</p>
+
+        <p><strong>The practical claim is simple:</strong> if the memory is not yours, the agent is not really yours either.</p>
+
+        <h2>Why this matters in the market</h2>
+        <p>As agents become more embedded in research, operations, education, and professional workflows, continuity becomes economically important. Teams will not want to rebuild trusted context every time a platform changes. The products that respect memory ownership will have an advantage that is deeper than novelty.</p>
+      </div>
+    </div>
+  </article>
+  <footer>
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-copy">&copy; 2026 Kestrel Sovereign, LLC.</div>
+        <a class="footer-link" href="index.html">Back to blog</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

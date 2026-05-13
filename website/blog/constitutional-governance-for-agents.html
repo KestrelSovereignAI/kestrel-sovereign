@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Constitutional Governance for Agents &mdash; Kestrel Blog</title>
+  <meta name="description" content="Why prompting alone is not enough to govern long-lived agents and why constitutional controls matter." />
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root { --bg:#060B18; --surface:#0C1525; --border:#1C2C47; --blue:#38BDF8; --text:#F0F6FF; --text-2:#94A3B8; --text-3:#64748B; }
+    body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; line-height: 1.75; }
+    .container { width:100%; max-width:860px; margin:0 auto; padding:0 24px; }
+    nav, footer { border-bottom: 1px solid var(--border); }
+    nav { background: rgba(6,11,24,0.92); position: sticky; top:0; }
+    .nav-inner, .footer-inner { display:flex; justify-content:space-between; align-items:center; gap:16px; min-height:64px; flex-wrap:wrap; }
+    .nav-logo { color: var(--text); text-decoration:none; font-weight:700; display:flex; align-items:center; gap:10px; }
+    .nav-logo img { width:34px; height:34px; }
+    .nav-link { color: var(--text-2); text-decoration:none; font-size:0.875rem; }
+    .nav-link:hover { color: var(--text); }
+    article { padding:72px 0 88px; }
+    .meta { display:flex; gap:10px; flex-wrap:wrap; color: var(--text-3); font-size:0.82rem; margin-bottom:18px; }
+    .tag { display:inline-flex; padding:4px 10px; border-radius:999px; background: rgba(56,189,248,0.08); border:1px solid rgba(56,189,248,0.18); color: var(--blue); font-size:0.74rem; font-weight:700; }
+    h1 { font-size: clamp(2.2rem, 5vw, 3.5rem); line-height:1.1; letter-spacing:-0.03em; margin-bottom:18px; }
+    .dek { color: var(--text-2); font-size:1.08rem; margin-bottom:32px; }
+    .article-card { background: var(--surface); border:1px solid var(--border); border-radius:20px; padding:32px; }
+    h2 { font-size:1.35rem; margin:30px 0 12px; letter-spacing:-0.02em; }
+    p { color: var(--text-2); margin-bottom:16px; }
+    strong { color: var(--text); }
+    .callout { border-left:4px solid var(--blue); background: rgba(56,189,248,0.07); padding:16px 18px; border-radius: 0 12px 12px 0; margin: 22px 0; color: var(--text); }
+    .footer-copy, .footer-link { color: var(--text-3); font-size:0.875rem; text-decoration:none; }
+    .footer-link:hover { color: var(--text-2); }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="container">
+      <div class="nav-inner">
+        <a href="../" class="nav-logo"><img src="../logo.png" alt="Kestrel" />Kestrel</a>
+        <a class="nav-link" href="index.html">Back to blog</a>
+      </div>
+    </div>
+  </nav>
+  <article>
+    <div class="container">
+      <div class="meta"><span class="tag">Governance</span><span>May 2026</span><span>7 min read</span></div>
+      <h1>Constitutional Governance for Agents</h1>
+      <p class="dek">If an agent is meant to persist, act, and hold trust over time, prompting alone is not enough. It needs durable rules above the model.</p>
+      <div class="article-card">
+        <p>A prompt can influence a model. It cannot provide the kind of durable governance that long-lived agents need. Prompting is flexible, but flexibility is not the same thing as constitutional control.</p>
+
+        <h2>Why the distinction matters</h2>
+        <p>As soon as an agent becomes important, the stakes change. The user is no longer asking for a one-off answer. They are relying on a persistent system with memory, identity, and behavioral continuity. That requires stronger guarantees.</p>
+
+        <h2>What constitutional governance means in practice</h2>
+        <p>It means the agent operates under explicit principles that are durable, inspectable, and harder to override casually. The model still reasons. But it reasons inside a governed system, not as the final source of truth.</p>
+
+        <div class="callout">A governed agent should not be one prompt away from losing its principles.</div>
+
+        <h2>Why this is different from alignment rhetoric</h2>
+        <p>Many systems talk about alignment abstractly. Constitutional governance is more operational. It asks: what are the rules, where are they enforced, how are they amended, and who has authority over those changes?</p>
+
+        <h2>Why it matters commercially</h2>
+        <p>People will trust governed agents sooner in settings where behavior matters over time: research, operations, institutional workflows, and other high-context domains. Governance becomes a product property, not just a philosophical claim.</p>
+
+        <p>That is one of the reasons Kestrel treats constitutional governance as a foundational pillar rather than an optional overlay.</p>
+      </div>
+    </div>
+  </article>
+  <footer>
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-copy">&copy; 2026 Kestrel Sovereign, LLC.</div>
+        <a class="footer-link" href="index.html">Back to blog</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

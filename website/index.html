@@ -534,6 +534,77 @@
       line-height: 1.6;
     }
 
+    /* ─── Blog preview ─── */
+    .blog-preview-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      flex-wrap: wrap;
+      margin-bottom: 32px;
+    }
+    .blog-preview-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+    }
+    .blog-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 24px;
+      text-decoration: none;
+      color: inherit;
+      transition: transform 0.15s, border-color 0.15s, background 0.15s;
+      display: block;
+    }
+    .blog-card:hover {
+      transform: translateY(-2px);
+      border-color: var(--border-light);
+      background: var(--surface-2);
+    }
+    .blog-card-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .blog-card-tag {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid rgba(56, 189, 248, 0.18);
+      background: rgba(56, 189, 248, 0.08);
+      color: var(--blue);
+      border-radius: 999px;
+      padding: 4px 10px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .blog-card-time {
+      font-size: 0.75rem;
+      color: var(--text-3);
+    }
+    .blog-card-title {
+      font-size: 1.1rem;
+      font-weight: 800;
+      line-height: 1.35;
+      letter-spacing: -0.02em;
+      margin-bottom: 10px;
+    }
+    .blog-card-body {
+      font-size: 0.9375rem;
+      color: var(--text-2);
+      line-height: 1.7;
+      margin-bottom: 16px;
+    }
+    .blog-card-link {
+      color: var(--text);
+      font-size: 0.875rem;
+      font-weight: 700;
+    }
+
     /* ─── Footer ─── */
     footer {
       border-top: 1px solid var(--border);
@@ -588,6 +659,7 @@
       <ul class="nav-links">
         <li class="hide-mobile"><a href="#pillars">Architecture</a></li>
         <li class="hide-mobile"><a href="#open-source">Open Source</a></li>
+        <li class="hide-mobile"><a href="blog/">Blog</a></li>
         <li>
           <a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" class="btn-nav" target="_blank" rel="noopener">
             GitHub &rarr;
@@ -810,6 +882,61 @@
   </div>
 </section>
 
+<!-- ─── Blog preview ─── -->
+<section class="section" id="blog">
+  <div class="container">
+    <div class="blog-preview-head">
+      <div style="max-width:640px;">
+        <span class="section-label">Blog</span>
+        <h2 class="section-title">Teach the market what sovereign AI means</h2>
+        <p class="section-sub" style="margin:12px 0 0;">
+          Kestrel needs a place to explain the why behind sovereign AI, not just the code.
+          Start with a few clear essays. Grow it into a real publication later.
+        </p>
+      </div>
+      <a href="blog/" class="btn-secondary">Visit the blog &rarr;</a>
+    </div>
+
+    <div class="blog-preview-grid">
+      <a class="blog-card" href="blog/what-is-sovereign-ai.html">
+        <div class="blog-card-meta">
+          <span class="blog-card-tag">Why Kestrel</span>
+          <span class="blog-card-time">5 min read</span>
+        </div>
+        <div class="blog-card-title">What Sovereign AI Actually Means</div>
+        <div class="blog-card-body">
+          A plain-language explanation of why identity, memory, and governance belong to the user, not the platform.
+        </div>
+        <div class="blog-card-link">Read article &rarr;</div>
+      </a>
+
+      <a class="blog-card" href="blog/agent-memory-belongs-to-the-user.html">
+        <div class="blog-card-meta">
+          <span class="blog-card-tag">Memory Ownership</span>
+          <span class="blog-card-time">6 min read</span>
+        </div>
+        <div class="blog-card-title">Why Agent Memory Should Belong to the User</div>
+        <div class="blog-card-body">
+          If your agent cannot carry its memory with it, you do not really own the relationship or the context it builds.
+        </div>
+        <div class="blog-card-link">Read article &rarr;</div>
+      </a>
+
+      <a class="blog-card" href="blog/constitutional-governance-for-agents.html">
+        <div class="blog-card-meta">
+          <span class="blog-card-tag">Governance</span>
+          <span class="blog-card-time">7 min read</span>
+        </div>
+        <div class="blog-card-title">Constitutional Governance for Agents</div>
+        <div class="blog-card-body">
+          Why model behavior cannot be trusted to prompting alone when long-term, user-owned agents are making important decisions.
+        </div>
+        <div class="blog-card-link">Read article &rarr;</div>
+      </a>
+    </div>
+  </div>
+</section>
+
 <!-- ─── CTA / Email ─── -->
 <section class="section cta-section" id="early-access">
   <div class="container" style="max-width:720px;">
@@ -857,6 +984,7 @@
       </div>
       <ul class="footer-links">
         <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign" target="_blank" rel="noopener">GitHub</a></li>
+        <li><a href="blog/">Blog</a></li>
         <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/SOVEREIGNTY.md" target="_blank" rel="noopener">Architecture</a></li>
         <li><a href="https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/CONTRIBUTING.md" target="_blank" rel="noopener">Contributing</a></li>
         <li><a href="mailto:hello@kestrelsovereign.com">Contact</a></li>

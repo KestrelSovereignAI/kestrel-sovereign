@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>What Sovereign AI Actually Means &mdash; Kestrel Blog</title>
+  <meta name="description" content="A plain-language explanation of sovereign AI and why Kestrel cares about ownership, continuity, and governance." />
+  <link rel="icon" type="image/svg+xml" href="../favicon.svg" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root { --bg:#060B18; --surface:#0C1525; --border:#1C2C47; --blue:#38BDF8; --text:#F0F6FF; --text-2:#94A3B8; --text-3:#64748B; }
+    body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; line-height: 1.75; }
+    .container { width: 100%; max-width: 860px; margin: 0 auto; padding: 0 24px; }
+    nav, footer { border-top: 1px solid transparent; border-bottom: 1px solid var(--border); }
+    nav { background: rgba(6, 11, 24, 0.92); position: sticky; top: 0; }
+    .nav-inner, .footer-inner { display:flex; justify-content:space-between; align-items:center; gap:16px; min-height:64px; flex-wrap:wrap; }
+    .nav-logo { color: var(--text); text-decoration:none; font-weight:700; display:flex; align-items:center; gap:10px; }
+    .nav-logo img { width: 34px; height: 34px; }
+    .nav-link { color: var(--text-2); text-decoration:none; font-size:0.875rem; }
+    .nav-link:hover { color: var(--text); }
+    article { padding: 72px 0 88px; }
+    .meta { display:flex; gap:10px; flex-wrap:wrap; color: var(--text-3); font-size:0.82rem; margin-bottom:18px; }
+    .tag { display:inline-flex; padding:4px 10px; border-radius:999px; background: rgba(56,189,248,0.08); border:1px solid rgba(56,189,248,0.18); color: var(--blue); font-size:0.74rem; font-weight:700; }
+    h1 { font-size: clamp(2.2rem, 5vw, 3.5rem); line-height:1.1; letter-spacing:-0.03em; margin-bottom:18px; }
+    .dek { color: var(--text-2); font-size:1.08rem; margin-bottom:32px; }
+    .article-card { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 32px; }
+    h2 { font-size:1.35rem; margin:30px 0 12px; letter-spacing:-0.02em; }
+    p { color: var(--text-2); margin-bottom:16px; }
+    strong { color: var(--text); }
+    .callout { border-left:4px solid var(--blue); background: rgba(56,189,248,0.07); padding:16px 18px; border-radius: 0 12px 12px 0; margin: 22px 0; color: var(--text); }
+    .footer-copy, .footer-link { color: var(--text-3); font-size:0.875rem; text-decoration:none; }
+    .footer-link:hover { color: var(--text-2); }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="container">
+      <div class="nav-inner">
+        <a href="../" class="nav-logo"><img src="../logo.png" alt="Kestrel" />Kestrel</a>
+        <a class="nav-link" href="index.html">Back to blog</a>
+      </div>
+    </div>
+  </nav>
+  <article>
+    <div class="container">
+      <div class="meta"><span class="tag">Why Kestrel</span><span>May 2026</span><span>5 min read</span></div>
+      <h1>What Sovereign AI Actually Means</h1>
+      <p class="dek">Sovereign AI is not just a technical architecture choice. It is a statement about who should own an agent's identity, memory, and governing rules over time.</p>
+
+      <div class="article-card">
+        <p>Most AI products today are rented intelligence. They may be useful, but the relationship is shallow. The memory lives on someone else's servers. The rules can change without your permission. The identity is platform-issued. If the vendor changes direction, your agent's continuity can disappear with it.</p>
+
+        <p>Kestrel starts from a different assumption: <strong>if an agent is going to become important, it cannot be owned by the platform before it is owned by the user.</strong></p>
+
+        <h2>Sovereignty starts with identity</h2>
+        <p>If an agent's identity comes from the platform, the platform can ultimately revoke, redefine, or subordinate it. Kestrel's model is that identity should be portable, cryptographic, and user-controlled from the beginning.</p>
+
+        <h2>It continues with memory</h2>
+        <p>The most valuable thing an agent accumulates over time is not a prompt. It is context: what it has learned, what it has seen, what it remembers, and how that memory compounds across use. If memory is trapped in a vendor boundary, the user's relationship is trapped too.</p>
+
+        <div class="callout">Sovereign AI means the long-term relationship belongs to the user, not the software company hosting the current interface.</div>
+
+        <h2>Governance is the third pillar</h2>
+        <p>An agent that persists should not be governed only by prompts and goodwill. It needs durable rules, explicit boundaries, and an audit trail around how those rules change. That is what makes governed agents different from disposable assistants.</p>
+
+        <h2>Why this matters commercially</h2>
+        <p>People will increasingly rely on agents for work, knowledge, decisions, and continuity. As that happens, trust shifts from being a nice-to-have to being infrastructure. The systems that win long-term will not just be convenient. They will be the ones people can actually own, move, govern, and trust.</p>
+
+        <p>Kestrel exists because we think the next generation of AI should be built on that foundation from day one.</p>
+      </div>
+    </div>
+  </article>
+  <footer>
+    <div class="container">
+      <div class="footer-inner">
+        <div class="footer-copy">&copy; 2026 Kestrel Sovereign, LLC.</div>
+        <a class="footer-link" href="index.html">Back to blog</a>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
