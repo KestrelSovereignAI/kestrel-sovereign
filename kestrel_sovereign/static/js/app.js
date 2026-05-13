@@ -79,15 +79,16 @@ async function init() {
     // Initialize feature store component
     initFeatureStore();
 
-    // Initialize security module
-    Security.init();
-
     // Initialize sovereignty panel buttons (Export/Import)
     initSovereigntyButtons();
 
     // Load agents first — in multi_agent mode, selectAgent() handles loading
     // all agent-specific data (identity, privacy, models, SSE, context).
     await loadAgents();
+
+    // Initialize security after agent selection so per-agent security routes
+    // use /api/agents/{name}/... in multi_agent mode.
+    Security.init();
 
     // In standalone mode (no multi_agent agent selected), load data directly.
     // #879: each loader self-guards against its capability being disabled
