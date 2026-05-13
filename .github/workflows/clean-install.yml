@@ -25,6 +25,9 @@ on:
     branches: [main, vision-refinement-v2]
   pull_request:
     branches: [main, vision-refinement-v2, 'epic/**']
+  schedule:
+    # Full cross-platform clean-install sweep once per night.
+    - cron: "23 8 * * *"
   workflow_dispatch:
 
 env:
@@ -58,17 +61,53 @@ env:
 # mode (kestrel_sovereign/setup/steps/agent.py::_prompt_name). Centralise
 # the name so future renames stay in lockstep with the wizard.
 jobs:
+  select-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      full_matrix: ${{ steps.matrix.outputs.full_matrix }}
+    steps:
+      - name: Checkout
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Select clean-install matrix
+        id: matrix
+        shell: bash
+        run: |
+          full=false
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            full=true
+          else
+            git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" > changed-files.txt
+
+            if grep -Eq '^(pyproject\.toml|uv\.lock|README\.md|QUICKSTART\.md|\.github/workflows/|scripts/ci/clean_install_verify\.py|kestrel_sovereign/cli\.py|kestrel_sovereign/cli_|kestrel_sovereign/setup/|kestrel_sovereign/server\.py|kestrel_sovereign/host\.py|kestrel_sovereign/data/feature_registry\.toml)' changed-files.txt; then
+              full=true
+            fi
+          fi
+
+          if [ "$full" = true ]; then
+            matrix='{"include":[{"os":"ubuntu-latest","install_method":"sync"},{"os":"ubuntu-latest","install_method":"wheel"},{"os":"macos-latest","install_method":"sync"},{"os":"macos-latest","install_method":"wheel"},{"os":"windows-latest","install_method":"sync"},{"os":"windows-latest","install_method":"wheel"}]}'
+          else
+            matrix='{"include":[{"os":"ubuntu-latest","install_method":"sync"},{"os":"ubuntu-latest","install_method":"wheel"}]}'
+          fi
+
+          echo "full_matrix=$full" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   clean-install:
+    needs: select-matrix
     strategy:
       fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        # ``sync`` is the source-clone install path (uv sync + uv run).
-        # ``wheel`` builds dist/*.whl from the same checkout and installs
-        # it into a fresh venv — the path PyPI users hit. Adding it as a
-        # parallel dimension means each method runs on its own runner
-        # (true parallelism, fail isolation) rather than chained serially.
-        install_method: [sync, wheel]
+      # Pull requests always run Ubuntu sync + wheel. The macOS/Windows
+      # axis is reserved for scheduled/manual/main runs and PRs that touch
+      # packaging, setup, install, or CI-sensitive surfaces.
+      matrix: ${{ fromJSON(needs.select-matrix.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     env:
