@@ -13,10 +13,11 @@ from .commands import router as commands_router
 from .files import router as files_router
 from .saved_items import router as saved_items_router
 from .metrics import router as metrics_router
+from .observability import router as observability_router
 from .features import router as features_router
 from .ui import router as ui_router
 
-# Feature-contributed routers (voice, spawn, observability) are no longer
+# Feature-contributed routers (voice, spawn) are no longer
 # imported here. They are mounted dynamically via Feature.get_router()
 # during server startup. See server.py _mount_feature_routers().
 
@@ -32,6 +33,7 @@ __all__ = [
     "files_router",
     "saved_items_router",
     "metrics_router",
+    "observability_router",
     "features_router",
     "ui_router",
 ]
