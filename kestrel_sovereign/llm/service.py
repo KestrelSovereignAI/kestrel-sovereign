@@ -1085,6 +1085,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 model=model,
                 duration_ms=duration_ms,
                 success=success,
+                agent_did=self._owner_agent_did,
                 session_id=self._observability_context.get("session_id"),
                 companion_id=self._observability_context.get("companion_id"),
                 user_id=self._observability_context.get("user_id"),

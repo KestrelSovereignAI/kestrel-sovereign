@@ -11,6 +11,8 @@ Works with both SQLite and PostgreSQL backends.
 """
 
 import logging
+import sys
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -21,6 +23,23 @@ from kestrel_sovereign.a2a.stores.unified.base import UnifiedStoreBase
 from kestrel_sovereign.storage.db.interface import DatabaseBackend
 
 logger = logging.getLogger(__name__)
+
+MAX_TOOL_ARGS_JSON_BYTES = 2048
+MAX_TOOL_ERROR_MESSAGE_CHARS = 1024
+
+_SECRET_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth",
+    "bearer",
+    "client_secret",
+    "cookie",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+}
 
 
 class ObservabilityEvent(BaseModel):
@@ -43,6 +62,7 @@ class LLMCallEvent(BaseModel):
 
     event_id: str
     timestamp: Any
+    agent_did: Optional[str] = None
     session_id: Optional[str]
     companion_id: Optional[str]
     user_id: Optional[str]
@@ -58,6 +78,26 @@ class LLMCallEvent(BaseModel):
     error_message: Optional[str]
     tool_calls: Optional[list[dict]]  # If tools were called
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ToolDispatchEntry:
+    """Structured row for a model-requested tool/subagent dispatch."""
+
+    agent_did: str
+    session_id: Optional[str]
+    turn_id: str
+    tool_name: str
+    adapter: str
+    args_redacted: Any
+    result_status: str
+    error_class: Optional[str]
+    error_message: Optional[str]
+    latency_ms: int
+    result_size_bytes: Optional[int]
+
+
+ToolCallLogEntry = ToolDispatchEntry
 
 
 class ObservabilityStore(UnifiedStoreBase):
@@ -83,6 +123,7 @@ class ObservabilityStore(UnifiedStoreBase):
         ts_default = self.now_default()
         json_type = self.json_type()
         bool_type = self.boolean_type()
+        int_pk_type = self.integer_primary_key_type()
 
         # Original observability table for tool calls, metrics, etc.
         await self._backend.execute_script(f"""
@@ -115,6 +156,7 @@ class ObservabilityStore(UnifiedStoreBase):
             CREATE TABLE IF NOT EXISTS a2a_llm_calls (
                 id TEXT PRIMARY KEY,
                 timestamp {ts_type} {ts_default},
+                agent_did TEXT,
                 session_id TEXT,
                 companion_id TEXT,
                 user_id TEXT,
@@ -136,6 +178,13 @@ class ObservabilityStore(UnifiedStoreBase):
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_timestamp ON a2a_llm_calls(timestamp)"
         )
+        try:
+            await self.add_column_if_missing("a2a_llm_calls", "agent_did", "TEXT")
+        except Exception as exc:
+            logger.debug("Migration check for a2a_llm_calls.agent_did: %s", exc)
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_llm_calls_agent ON a2a_llm_calls(agent_did)"
+        )
         await self._backend.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON a2a_llm_calls(session_id)"
         )
@@ -149,7 +198,183 @@ class ObservabilityStore(UnifiedStoreBase):
             "CREATE INDEX IF NOT EXISTS idx_llm_calls_provider ON a2a_llm_calls(provider)"
         )
 
+        await self._backend.execute_script(f"""
+            CREATE TABLE IF NOT EXISTS a2a_tool_dispatches (
+                id {int_pk_type},
+                agent_did TEXT NOT NULL,
+                session_id TEXT,
+                turn_id TEXT NOT NULL,
+                ts {ts_type} {ts_default},
+                tool_name TEXT NOT NULL,
+                adapter TEXT NOT NULL,
+                args_redacted {json_type} NOT NULL,
+                result_status TEXT NOT NULL CHECK (
+                    result_status IN ('success', 'error', 'empty', 'policy_denied', 'timeout')
+                ),
+                error_class TEXT,
+                error_message TEXT,
+                latency_ms INTEGER NOT NULL,
+                result_size_bytes INTEGER
+            )
+        """)
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_turn "
+            "ON a2a_tool_dispatches(agent_did, turn_id, id)"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_agent_ts "
+            "ON a2a_tool_dispatches(agent_did, ts)"
+        )
+        await self._backend.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_dispatches_status "
+            "ON a2a_tool_dispatches(agent_did, result_status)"
+        )
+
         logger.info(f"ObservabilityStore initialized ({self._backend.backend_type})")
+
+    async def log_tool_dispatch(self, entry: ToolDispatchEntry) -> None:
+        """Best-effort structured insert. Never break dispatch on log failure."""
+        try:
+            await self._backend.execute(
+                """
+                INSERT INTO a2a_tool_dispatches (
+                    agent_did, session_id, turn_id, ts, tool_name, adapter,
+                    args_redacted, result_status, error_class, error_message,
+                    latency_ms, result_size_bytes
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.agent_did,
+                    entry.session_id,
+                    entry.turn_id,
+                    self.now_utc_param(),
+                    entry.tool_name,
+                    entry.adapter,
+                    redact_tool_args_json(entry.args_redacted),
+                    entry.result_status,
+                    entry.error_class,
+                    _cap_text(entry.error_message, MAX_TOOL_ERROR_MESSAGE_CHARS),
+                    int(entry.latency_ms),
+                    entry.result_size_bytes,
+                ),
+            )
+        except Exception as exc:
+            print(f"a2a_tool_dispatches write failed: {exc}", file=sys.stderr)
+
+    async def log_structured_tool_call(self, entry: ToolDispatchEntry) -> None:
+        """Compatibility alias for callers/tests using the original #1239 name."""
+        await self.log_tool_dispatch(entry)
+
+    async def tool_failure_rate(
+        self, agent_did: str, last_n_turns: int = 100
+    ) -> dict[str, Any]:
+        """Return per-tool/per-error counts and rates for recent turns."""
+        turn_rows = await self._backend.fetch_all(
+            """
+            SELECT turn_id
+            FROM (
+                SELECT turn_id, MAX(id) AS last_id
+                FROM a2a_tool_dispatches
+                WHERE agent_did = ? AND turn_id IS NOT NULL
+                GROUP BY turn_id
+                ORDER BY last_id DESC
+                LIMIT ?
+            )
+            """,
+            (agent_did, int(last_n_turns)),
+        )
+        turn_ids = [row[0] for row in turn_rows]
+        if not turn_ids:
+            return {
+                "agent_did": agent_did,
+                "last_n_turns": int(last_n_turns),
+                "turns_observed": 0,
+                "total_calls": 0,
+                "failure_calls": 0,
+                "failure_rate": 0.0,
+                "dominant_failures": [],
+            }
+
+        placeholders = ", ".join("?" for _ in turn_ids)
+        params = (agent_did, *turn_ids)
+        total_row = await self._backend.fetch_one(
+            f"""
+            SELECT COUNT(*)
+            FROM a2a_tool_dispatches
+            WHERE agent_did = ? AND turn_id IN ({placeholders})
+            """,
+            params,
+        )
+        failures = await self._backend.fetch_all(
+            f"""
+            SELECT
+                tool_name,
+                COALESCE(error_class, result_status) AS error_class,
+                COUNT(*) AS count
+            FROM a2a_tool_dispatches
+            WHERE agent_did = ?
+              AND turn_id IN ({placeholders})
+              AND result_status != 'success'
+            GROUP BY tool_name, COALESCE(error_class, result_status)
+            ORDER BY count DESC, tool_name ASC, error_class ASC
+            """,
+            params,
+        )
+        failure_total = sum(int(row[2]) for row in failures)
+        total_calls = int(total_row[0] if total_row else 0)
+        return {
+            "agent_did": agent_did,
+            "last_n_turns": int(last_n_turns),
+            "turns_observed": len(turn_ids),
+            "total_calls": total_calls,
+            "failure_calls": failure_total,
+            "failure_rate": failure_total / total_calls if total_calls else 0.0,
+            "dominant_failures": [
+                {
+                    "tool_name": row[0],
+                    "error_class": row[1],
+                    "count": int(row[2]),
+                    "rate": int(row[2]) / total_calls if total_calls else 0.0,
+                }
+                for row in failures
+            ],
+        }
+
+    async def recent_failures(
+        self, agent_did: str, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        rows = await self._backend.fetch_all(
+            """
+            SELECT
+                id, agent_did, session_id, turn_id, ts, tool_name, adapter,
+                args_redacted, result_status, error_class, error_message,
+                latency_ms, result_size_bytes
+            FROM a2a_tool_dispatches
+            WHERE agent_did = ? AND result_status != 'success'
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (agent_did, int(limit)),
+        )
+        return [
+            {
+                "id": row[0],
+                "agent_did": row[1],
+                "session_id": row[2],
+                "turn_id": row[3],
+                "ts": str(row[4]) if row[4] is not None else None,
+                "tool_name": row[5],
+                "adapter": row[6],
+                "args_redacted": json_loads(row[7]) if row[7] else {},
+                "result_status": row[8],
+                "error_class": row[9],
+                "error_message": row[10],
+                "latency_ms": row[11],
+                "result_size_bytes": row[12],
+            }
+            for row in rows
+        ]
 
     async def log_tool_call(
         self,
@@ -373,6 +598,7 @@ class ObservabilityStore(UnifiedStoreBase):
             metadata=json_loads(row[9]) if row[9] else {},
         )
 
+
     # ==========================================================================
     # LLM Call Observability (A2A-compatible)
     # ==========================================================================
@@ -394,6 +620,7 @@ class ObservabilityStore(UnifiedStoreBase):
         error_message: Optional[str] = None,
         tool_calls: Optional[list[dict]] = None,
         metadata: Optional[dict[str, Any]] = None,
+        agent_did: Optional[str] = None,
     ) -> str:
         """
         Log an LLM call with full details for observability.
@@ -417,6 +644,7 @@ class ObservabilityStore(UnifiedStoreBase):
             error_message: Error message if failed
             tool_calls: List of tool calls if any
             metadata: Additional metadata dict
+            agent_did: Agent DID that owns the LLM call
 
         Returns:
             event_id for the logged call
@@ -433,15 +661,16 @@ class ObservabilityStore(UnifiedStoreBase):
         await self._backend.execute(
             """
             INSERT INTO a2a_llm_calls
-            (id, timestamp, session_id, companion_id, user_id, provider, model,
+            (id, timestamp, agent_did, session_id, companion_id, user_id, provider, model,
              system_prompt_preview, user_prompt_preview, response_preview,
              input_tokens, output_tokens, duration_ms, success, error_message,
              tool_calls, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event_id,
                 now,
+                agent_did,
                 session_id,
                 companion_id,
                 user_id,
@@ -468,6 +697,7 @@ class ObservabilityStore(UnifiedStoreBase):
 
     async def query_llm_calls(
         self,
+        agent_did: Optional[str] = None,
         session_id: Optional[str] = None,
         companion_id: Optional[str] = None,
         user_id: Optional[str] = None,
@@ -482,6 +712,7 @@ class ObservabilityStore(UnifiedStoreBase):
         Query LLM call events with filters.
 
         Args:
+            agent_did: Filter by agent DID
             session_id: Filter by session
             companion_id: Filter by companion
             user_id: Filter by user
@@ -501,6 +732,9 @@ class ObservabilityStore(UnifiedStoreBase):
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
+        if agent_did:
+            conditions.append("agent_did = ?")
+            params.append(agent_did)
         if companion_id:
             conditions.append("companion_id = ?")
             params.append(companion_id)
@@ -528,7 +762,12 @@ class ObservabilityStore(UnifiedStoreBase):
 
         rows = await self._backend.fetch_all(
             f"""
-            SELECT * FROM a2a_llm_calls
+            SELECT
+                id, timestamp, agent_did, session_id, companion_id, user_id,
+                provider, model, system_prompt_preview, user_prompt_preview,
+                response_preview, input_tokens, output_tokens, duration_ms,
+                success, error_message, tool_calls, metadata
+            FROM a2a_llm_calls
             {where}
             ORDER BY timestamp DESC
             LIMIT ?
@@ -627,27 +866,112 @@ class ObservabilityStore(UnifiedStoreBase):
         Convert database row to LLMCallEvent object.
 
         Row columns (in order):
-        0: id, 1: timestamp, 2: session_id, 3: companion_id, 4: user_id,
-        5: provider, 6: model, 7: system_prompt_preview, 8: user_prompt_preview,
-        9: response_preview, 10: input_tokens, 11: output_tokens, 12: duration_ms,
-        13: success, 14: error_message, 15: tool_calls, 16: metadata
+        0: id, 1: timestamp, 2: agent_did, 3: session_id, 4: companion_id,
+        5: user_id, 6: provider, 7: model, 8: system_prompt_preview,
+        9: user_prompt_preview, 10: response_preview, 11: input_tokens,
+        12: output_tokens, 13: duration_ms, 14: success, 15: error_message,
+        16: tool_calls, 17: metadata
         """
         return LLMCallEvent(
             event_id=row[0],
             timestamp=self.from_timestamp_field(row[1]),
-            session_id=row[2],
-            companion_id=row[3],
-            user_id=row[4],
-            provider=row[5],
-            model=row[6],
-            system_prompt_preview=row[7],
-            user_prompt_preview=row[8],
-            response_preview=row[9],
-            input_tokens=row[10],
-            output_tokens=row[11],
-            duration_ms=row[12],
-            success=self.from_bool_field(row[13]),
-            error_message=row[14],
-            tool_calls=json_loads(row[15]) if row[15] else None,
-            metadata=json_loads(row[16]) if row[16] else {},
+            agent_did=row[2],
+            session_id=row[3],
+            companion_id=row[4],
+            user_id=row[5],
+            provider=row[6],
+            model=row[7],
+            system_prompt_preview=row[8],
+            user_prompt_preview=row[9],
+            response_preview=row[10],
+            input_tokens=row[11],
+            output_tokens=row[12],
+            duration_ms=row[13],
+            success=self.from_bool_field(row[14]),
+            error_message=row[15],
+            tool_calls=json_loads(row[16]) if row[16] else None,
+            metadata=json_loads(row[17]) if row[17] else {},
         )
+
+
+def redact_tool_args_json(value: Any) -> str:
+    """Redact secret-looking fields and cap serialized JSON at ~2 KiB."""
+    redacted = _redact(value)
+    text = json_dumps(redacted)
+    encoded = text.encode("utf-8")
+    if len(encoded) <= MAX_TOOL_ARGS_JSON_BYTES:
+        return text
+    budget = MAX_TOOL_ARGS_JSON_BYTES - 128
+    preview = encoded[: max(0, budget)].decode("utf-8", errors="ignore")
+    return json_dumps({"_truncated": True, "preview": preview})
+
+
+def infer_tool_result_status(result: Any, status_hint: Optional[str] = None) -> str:
+    if status_hint:
+        return status_hint
+    if result is None or result == "" or result == [] or result == {}:
+        return "empty"
+    if isinstance(result, dict):
+        success = result.get("success")
+        status = str(result.get("status", "")).lower()
+        error_text = str(result.get("error", ""))
+        if error_text.lower().startswith("permission denied"):
+            return "policy_denied"
+        if success is False or status in {"error", "failed", "failure"} or result.get("error"):
+            return "error"
+    if getattr(result, "failed", False):
+        return "error"
+    error = getattr(result, "error", None)
+    if error:
+        return "error"
+    status = str(getattr(result, "status", "")).lower()
+    if status in {"error", "failed", "failure"}:
+        return "error"
+    return "success"
+
+
+def tool_result_size_bytes(result: Any) -> Optional[int]:
+    try:
+        from kestrel_sovereign.features.base import _serialize_tool_result
+
+        return len(json_dumps(_serialize_tool_result(result)).encode("utf-8"))
+    except Exception:
+        try:
+            return len(str(result).encode("utf-8"))
+        except Exception:
+            return None
+
+
+def _redact(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return "<max-depth>"
+    if isinstance(value, dict):
+        out = {}
+        for key, val in value.items():
+            key_str = str(key)
+            if _is_secret_key(key_str):
+                out[key_str] = "<redacted>"
+            else:
+                out[key_str] = _redact(val, depth + 1)
+        return out
+    if isinstance(value, (list, tuple)):
+        if len(value) > 50:
+            return [_redact(item, depth + 1) for item in value[:50]] + ["<truncated>"]
+        return [_redact(item, depth + 1) for item in value]
+    if isinstance(value, bytes):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, str) and len(value) > 512:
+        return value[:512] + "...<truncated>"
+    return value
+
+
+def _is_secret_key(key: str) -> bool:
+    normalized = key.lower().replace("-", "_")
+    return any(secret in normalized for secret in _SECRET_KEYS)
+
+
+def _cap_text(value: Optional[str], limit: int) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value)
+    return text if len(text) <= limit else text[:limit]

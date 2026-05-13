@@ -106,6 +106,18 @@ class UnifiedStoreBase:
             return "BOOLEAN"
         return "INTEGER"
 
+    def integer_primary_key_type(self) -> str:
+        """
+        Get SQL type for an auto-generated integer primary key.
+
+        Returns:
+            "BIGSERIAL PRIMARY KEY" for PostgreSQL,
+            "INTEGER PRIMARY KEY AUTOINCREMENT" for SQLite
+        """
+        if self.is_postgres:
+            return "BIGSERIAL PRIMARY KEY"
+        return "INTEGER PRIMARY KEY AUTOINCREMENT"
+
     def interval_days(self, days: int) -> str:
         """
         Get SQL expression for interval subtraction.
@@ -119,6 +131,25 @@ class UnifiedStoreBase:
         if self.is_postgres:
             return f"NOW() - INTERVAL '{days} days'"
         return f"datetime('now', '-{days} days')"
+
+    async def add_column_if_missing(
+        self, table: str, column: str, column_definition: str
+    ) -> None:
+        """Add a column idempotently across supported SQL backends."""
+        if self.is_postgres:
+            await self._backend.execute(
+                f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {column_definition}"
+            )
+            return
+
+        result = await self._backend.fetch_one(
+            f"SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name=?",
+            (column,),
+        )
+        if result and result[0] == 0:
+            await self._backend.execute(
+                f"ALTER TABLE {table} ADD COLUMN {column} {column_definition}"
+            )
 
     # ==========================================================================
     # Value Conversion Helpers

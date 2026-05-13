@@ -46,6 +46,9 @@ logger = logging.getLogger(__name__)
 _CURRENT_CHAIN: contextvars.ContextVar[list[CausationFrame]] = (
     contextvars.ContextVar("kestrel_signals_current_chain", default=[])
 )
+_CURRENT_TURN_ID: contextvars.ContextVar[Optional[str]] = (
+    contextvars.ContextVar("kestrel_agent_current_turn_id", default=None)
+)
 
 
 class TurnLifecycleMixin:
@@ -91,6 +94,10 @@ class TurnLifecycleMixin:
         """
         chain = _CURRENT_CHAIN.get()
         return chain if chain else None
+
+    def _get_current_turn_id(self) -> Optional[str]:
+        """Return the current agent turn id for per-turn observability."""
+        return _CURRENT_TURN_ID.get()
 
     def _set_current_chain(
         self, chain: Optional[list[CausationFrame]]
@@ -139,7 +146,9 @@ class TurnLifecycleMixin:
         mgr = self._get_lock_manager()
         async with mgr.acquire({ResourceLock.CONVERSATION}):
             logger.debug("turn_lifecycle: %s begin", turn_id)
+            token = _CURRENT_TURN_ID.set(turn_id)
             try:
                 yield turn_id
             finally:
+                _CURRENT_TURN_ID.reset(token)
                 logger.debug("turn_lifecycle: %s end", turn_id)
