@@ -485,6 +485,7 @@ from kestrel_sovereign.endpoints import (
     security_router,
     saved_items_router,
     metrics_router,
+    observability_router,
     features_router,
     ui_router,
 )
@@ -508,6 +509,7 @@ app.include_router(files_router)
 app.include_router(security_router)
 app.include_router(saved_items_router)
 app.include_router(metrics_router)
+app.include_router(observability_router)
 app.include_router(features_router)
 app.include_router(ui_router)
 app.include_router(rasa_shim_router)

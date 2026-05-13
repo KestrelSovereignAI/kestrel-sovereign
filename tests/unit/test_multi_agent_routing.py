@@ -23,6 +23,8 @@ def _make_mock_agent(agent_id: str = "did:pkh:eip155:1:0xABC", name: str = "Test
     agent.agent_id = agent_id
     agent.initialize = AsyncMock()
     agent.shutdown = AsyncMock()
+    agent.observability_store = MagicMock()
+    agent.observability_store.query_events = AsyncMock(return_value=[])
 
     # Mock get_agent_card for /api/agents endpoint
     mock_card = MagicMock()
@@ -89,6 +91,7 @@ def _create_multi_agent_app(agents: dict[str, MagicMock]) -> FastAPI:
     # Add a test endpoint that uses get_agent
     from fastapi import Request
     from kestrel_sovereign.endpoints.agent_helpers import get_agent
+    from kestrel_sovereign.endpoints.observability import router as observability_router
 
     @app.get("/api/agent/info")
     async def agent_info(request: Request):
@@ -108,6 +111,8 @@ def _create_multi_agent_app(agents: dict[str, MagicMock]) -> FastAPI:
                 })
             return {"agents": agents_list, "mode": "multi_agent"}
         return {"agents": [], "mode": "standalone"}
+
+    app.include_router(observability_router)
 
     return app
 
@@ -178,6 +183,19 @@ class TestAgentRoutingMiddleware:
         # After rewriting /api/agents/Claw/api/agent/info -> /agent/info
         resp = client.get("/api/agents/Claw/api/agent/info")
         assert resp.status_code == 200
+
+    def test_agent_prefixed_observability_events_route(self):
+        """Tasks Activity Log reaches the selected agent's observability store."""
+        nellie = _make_mock_agent("did:nellie", "Nellie")
+        app = _create_multi_agent_app({"Nellie": nellie})
+
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/api/agents/Nellie/api/observability/events?limit=50")
+
+        assert resp.status_code == 200
+        assert resp.json()["events"] == []
+        nellie.observability_store.query_events.assert_awaited_once()
+        assert nellie.observability_store.query_events.await_args.kwargs["limit"] == 50
 
 
 class TestAgentCRUDEndpoints:
