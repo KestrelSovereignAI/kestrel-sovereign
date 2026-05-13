@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -39,6 +40,25 @@ KESTREL_DIMINISHING_THRESHOLD = None
 KESTREL_MAX_LOW_DELTA = None
 KESTREL_BUDGET_STOP_PCT = None
 MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
+
+
+CONTINUATION_INTENT_RE = re.compile(
+    r"\b("
+    r"let me|i(?:'ll| will| am going to)|"
+    r"one moment|hang on|checking|calling|running|searching|looking up"
+    r")\b.{0,80}\b("
+    r"check|look|search|call|run|fetch|inspect|open|query|verify|use|try|"
+    r"github|tool|cli|browser|file|repo|issue|database|db"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+TURN_COMPLETION_REPAIR_PROMPT = """You just wrote text that indicates this turn is still in progress, but you did not emit a tool call.
+
+Continue the same turn now:
+- If the work requires an available tool, emit the tool call now.
+- If no tool is needed or available, provide the final answer now.
+- Do not describe a future tool call without making it."""
 
 
 def _init_constants():
@@ -302,6 +322,49 @@ class ContextStats:
 
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
+
+    @staticmethod
+    def _signals_unfinished_tool_work(content: Optional[str]) -> bool:
+        """Return True when assistant text promises more tool-backed work."""
+        if not content:
+            return False
+        return bool(CONTINUATION_INTENT_RE.search(content))
+
+    @staticmethod
+    def _append_missing_tool_call_repair(messages: list, content: str) -> list:
+        """Return a repaired message list for one no-tool continuation retry."""
+        repaired = list(messages)
+        repaired.append({"role": "assistant", "content": content or ""})
+        repaired.append({"role": "user", "content": TURN_COMPLETION_REPAIR_PROMPT})
+        return repaired
+
+    async def _repair_premature_turn_yield(
+        self,
+        response: LLMResponse,
+        messages: list,
+        tools: List[Dict[str, Any]],
+        force_local_only: bool,
+        effective_model: str,
+        session_id: Optional[str],
+        *,
+        streaming: bool = False,
+    ) -> Union[str, LLMResponse]:
+        """Give the model one more step when it narrates continuing but emits no tool call."""
+        content = response.content or ""
+        if not tools or not OrchestratorEngineMixin._signals_unfinished_tool_work(content):
+            return response
+
+        logging.warning(
+            "[ORCHESTRATOR%s] Model signaled continuation without tool_calls; issuing one repair turn",
+            "-STREAM" if streaming else "",
+        )
+        return await self.llm_service.generate_with_messages(
+            messages=OrchestratorEngineMixin._append_missing_tool_call_repair(messages, content),
+            tools=tools or None,
+            force_local_only=force_local_only,
+            model_override=effective_model,
+            session_id=session_id,
+        )
 
     async def _execute_tool_with_hooks(
         self,
@@ -1051,9 +1114,6 @@ class OrchestratorEngineMixin:
         if isinstance(response, str):
             return response
 
-        if not response.has_tool_calls:
-            return response.content or ""
-
         # Build message history for multi-turn tool calling
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1064,6 +1124,21 @@ class OrchestratorEngineMixin:
             logging.debug(f"[ORCHESTRATOR] Added user message to context: {user_message[:100]}...")
         else:
             logging.warning("[ORCHESTRATOR] No user_message provided - LLM won't have context for tool results!")
+
+        if not response.has_tool_calls:
+            if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                response = await self._repair_premature_turn_yield(
+                    response=response,
+                    messages=messages,
+                    tools=feature_tools,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                    session_id=session_id,
+                )
+                if isinstance(response, str):
+                    return response
+            if not response.has_tool_calls:
+                return response.content or ""
 
         # Add initial assistant response with tool calls
         assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1106,6 +1181,24 @@ class OrchestratorEngineMixin:
                 return response
 
             if not response.has_tool_calls:
+                if all_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                    response = await self._repair_premature_turn_yield(
+                        response=response,
+                        messages=messages,
+                        tools=all_tools,
+                        force_local_only=force_local_only,
+                        effective_model=effective_model,
+                        session_id=session_id,
+                    )
+                    if isinstance(response, str):
+                        logging.info(f"[ORCHESTRATOR] Final response after repair (string): {response[:300]}...")
+                        return response
+                    if response.has_tool_calls:
+                        assistant_msg = {"role": "assistant", "content": response.content or ""}
+                        if response.tool_calls:
+                            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+                        messages.append(assistant_msg)
+                        continue
                 final_content = response.content or ""
                 logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
                 return final_content
@@ -1228,10 +1321,6 @@ class OrchestratorEngineMixin:
             yield response
             return
 
-        if not response.has_tool_calls:
-            yield response.content or ""
-            return
-
         messages = [
             {"role": "system", "content": system_prompt},
         ]
@@ -1241,6 +1330,24 @@ class OrchestratorEngineMixin:
             logging.debug(f"[ORCHESTRATOR-STREAM] Added user message to context: {user_message[:100]}...")
         else:
             logging.warning("[ORCHESTRATOR-STREAM] No user_message provided!")
+
+        if not response.has_tool_calls:
+            if feature_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
+                response = await self._repair_premature_turn_yield(
+                    response=response,
+                    messages=messages,
+                    tools=feature_tools,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                    session_id=session_id,
+                    streaming=True,
+                )
+                if isinstance(response, str):
+                    yield response
+                    return
+            if not response.has_tool_calls:
+                yield response.content or ""
+                return
 
         assistant_msg = {"role": "assistant", "content": response.content or ""}
         if response.tool_calls:
@@ -1283,6 +1390,31 @@ class OrchestratorEngineMixin:
                 return
 
             if not response.has_tool_calls:
+                repaired_missing_tool_call = (
+                    bool(all_tools)
+                    and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or "")
+                )
+                if repaired_missing_tool_call:
+                    response = await self._repair_premature_turn_yield(
+                        response=response,
+                        messages=messages,
+                        tools=all_tools,
+                        force_local_only=force_local_only,
+                        effective_model=effective_model,
+                        session_id=session_id,
+                        streaming=True,
+                    )
+                    if isinstance(response, str):
+                        yield response
+                        return
+                    if response.has_tool_calls:
+                        assistant_msg = {"role": "assistant", "content": response.content or ""}
+                        if response.tool_calls:
+                            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+                        messages.append(assistant_msg)
+                        continue
+                    yield response.content or ""
+                    return
                 logging.info("[ORCHESTRATOR-STREAM] Streaming final response")
                 yield "\n---\n"
                 async for chunk in self.llm_service.stream_with_messages(
