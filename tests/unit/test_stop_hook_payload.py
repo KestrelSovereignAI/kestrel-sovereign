@@ -269,6 +269,57 @@ async def test_streaming_stop_hook_captures_chained_tool_iterations():
 
 
 @pytest.mark.asyncio
+async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatch():
+    """Cancellation edge: when streaming is stopped after the initial LLM
+    emitted tool_calls but BEFORE any result envelope is appended, the
+    STOP payload must still carry tool_calls (from the LLM's initial
+    response) so subscribers can distinguish 'cancelled mid-tool' from
+    'no tools at all'. Without this fallback, deriving solely from an
+    empty tool_results list collapses both states to None (codex review
+    caught this on v2)."""
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    captured: list[HookInput] = []
+    agent = _build_streaming_mock_agent(stop_captured=captured)
+
+    async def _stream_with_tool(**kwargs):
+        yield "About to call. "
+        yield LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="tc-X", name="will_be_cancelled", arguments={"q": "x"})
+            ],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = _stream_with_tool
+
+    # Orchestrator stream: simulates immediate cancellation — never appends
+    # to tool_results, yields nothing. The outer for-loop in
+    # process_input_streaming completes without populating any envelopes.
+    async def _orchestrator_stream(*, tool_results=None, **kwargs):
+        return
+        yield  # unreachable; makes this an async generator
+
+    agent._handle_orchestrator_response_streaming = _orchestrator_stream
+
+    async for _ in agent.process_input_streaming(
+        "do the thing", session_id="s-cancel"
+    ):
+        pass
+
+    assert len(captured) == 1
+    stop = captured[0]
+    # tool_results is empty (no envelope ever appended) but tool_calls
+    # survives — derived from the initial tool_calls_payload.
+    assert stop.tool_results == [] or stop.tool_results is None
+    assert stop.tool_calls is not None and len(stop.tool_calls) == 1
+    assert stop.tool_calls[0]["name"] == "will_be_cancelled"
+    assert stop.tool_calls[0]["id"] == "tc-X"
+
+
+@pytest.mark.asyncio
 async def test_streaming_stop_hook_skipped_when_no_hooks_manager():
     """If the agent has no hooks_manager, the STOP block is a no-op —
     no AttributeError. Pure regression guard."""

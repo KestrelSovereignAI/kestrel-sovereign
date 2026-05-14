@@ -508,21 +508,28 @@ class StreamingMixin:
             final_assistant_text = tool_final_text
             stop_tool_results: Optional[list] = tool_results
             # Derive stop_tool_calls from the accumulated tool_results
-            # envelopes rather than from `tool_calls_payload`. The payload
-            # only carries the FIRST iteration's calls — multi-iteration
-            # tool flows (model calls A, sees result, calls B) would
-            # otherwise produce a STOP payload where `tool_results` has
-            # rows that `tool_calls` doesn't, forcing subscribers back to
-            # storage to reconstruct the chain (codex review on the
-            # initial enrichment).
-            stop_tool_calls: Optional[list] = [
-                {
-                    "id": env.get("tool_call_id"),
-                    "name": env.get("name"),
-                    "arguments": env.get("arguments"),
-                }
-                for env in (tool_results or [])
-            ] or None
+            # envelopes — multi-iteration tool flows (model calls A,
+            # sees result, calls B) require this so tool_calls and
+            # tool_results stay aligned across all iterations.
+            # Cancellation edge: when the request was stopped after the
+            # initial LLM emitted tool_calls but before any result was
+            # appended, `tool_results` is empty but the LLM *did* emit
+            # tools. Fall back to the initial ``tool_calls_payload`` in
+            # that case so a STOP subscriber can distinguish
+            # "cancelled mid-tool" from "no tools at all" (codex review).
+            if tool_results:
+                stop_tool_calls: Optional[list] = [
+                    {
+                        "id": env.get("tool_call_id"),
+                        "name": env.get("name"),
+                        "arguments": env.get("arguments"),
+                    }
+                    for env in tool_results
+                ]
+            elif tool_calls_payload:
+                stop_tool_calls = list(tool_calls_payload)
+            else:
+                stop_tool_calls = None
         else:
             # No tool calls - text was already streamed above. Pre-tool
             # prose / tool_calls / tool_results all stay None: a hook
