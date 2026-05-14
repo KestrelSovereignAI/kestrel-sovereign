@@ -161,7 +161,12 @@ def test_identity_check_treats_whitespace_only_env_as_unset(monkeypatch):
 
 
 def test_core_features_default_to_allow():
-    """Boot-critical features must not paralyze a fresh agent (Meridian #406)."""
+    """Boot-critical features must not paralyze a fresh agent (Meridian #406).
+
+    Names MUST match actual ``Feature.name`` (Python class name) values —
+    aspirational names would silently fall through to ASK. Codex review on
+    the first revision caught five name mismatches; this test pins the names.
+    """
     from kestrel_sovereign.features.security.feature import (
         default_permission_for_feature,
     )
@@ -173,11 +178,18 @@ def test_core_features_default_to_allow():
         "ConstitutionFeature",
         "MemoryFeature",
         "MemoryAgencyFeature",
+        "StrategicMemoryFeature",
         "SovereigntyFeature",
         "ContextFeature",
         "HealthFeature",
-        "ModelFeature",
-        "PrivacyFeature",
+        "ModelAgent",            # NOT ModelFeature
+        "SaveFeature",
+        "KeyManagementFeature",  # NOT KeysFeature
+        "TaskFeature",           # NOT TasksFeature
+        "ChannelFeature",        # NOT ChannelsFeature
+        "CliFeature",
+        "WorkflowsFeature",
+        "FeatureFeaturesFeature",
     ]
     for name in core_must_allow:
         assert default_permission_for_feature(name) == PermissionLevel.ALLOW, (
@@ -194,16 +206,62 @@ def test_risky_features_default_to_ask():
     from kestrel_sovereign.features.security.permissions import PermissionLevel
 
     must_ask = [
-        "ComputeFeature",  # arbitrary code execution
-        "SpawnFeature",  # creates new agents
-        "DeliveryFeature",  # sends external messages
-        "WebhooksFeature",  # external network egress
-        "BridgeFeature",  # cross-agent escalation
+        "ComputeFeature",          # arbitrary code execution
+        "ComputerUseFeature",      # arbitrary screen/keyboard actions
+        "SpawnFeature",            # creates new agents
+        "DeliveryFeature",         # sends external messages
+        "WebhookFeature",          # external network egress; NOT WebhooksFeature
+        "BridgeFeature",           # cross-agent escalation
+        "DeployFeature",           # deploys infrastructure
+        "TalonCoordinatorFeature", # spawns workspaces and runs codex jobs
     ]
     for name in must_ask:
         assert default_permission_for_feature(name) == PermissionLevel.ASK, (
             f"{name} should default to ASK — it has external side effects."
         )
+
+
+def test_default_map_keys_match_real_feature_class_names():
+    """Every key in the default-permission map must match an actual class name
+    in kestrel_sovereign.features. If a key drifts (e.g. someone writes
+    "ModelFeature" when the class is "ModelAgent"), this fails — far better
+    than silently falling through to ASK on production agents.
+    """
+    import importlib
+    import pkgutil
+    from pathlib import Path
+
+    from kestrel_sovereign.features.security.feature import (
+        _DEFAULT_PERMISSION_BY_FEATURE,
+    )
+
+    # Walk the features package and collect every class name defined in
+    # kestrel_sovereign/features/**/feature.py (and top-level modules).
+    features_pkg = importlib.import_module("kestrel_sovereign.features")
+    features_root = Path(features_pkg.__file__).parent
+
+    known_class_names: set[str] = set()
+    for py_file in features_root.rglob("*.py"):
+        if py_file.name.startswith("_"):
+            continue
+        text = py_file.read_text(encoding="utf-8", errors="ignore")
+        for line in text.splitlines():
+            stripped = line.lstrip()
+            if not stripped.startswith("class "):
+                continue
+            head = stripped[len("class "):]
+            name = head.split("(", 1)[0].split(":", 1)[0].strip()
+            if name and (name.endswith("Feature") or name.endswith("Agent")):
+                known_class_names.add(name)
+
+    map_keys = set(_DEFAULT_PERMISSION_BY_FEATURE.keys())
+    missing = map_keys - known_class_names
+    assert not missing, (
+        f"Default-permission map has keys with no matching Feature/Agent "
+        f"class in the source tree: {sorted(missing)}. Either fix the typo "
+        f"(common case: 'ModelFeature' should be 'ModelAgent') or remove the "
+        f"entry. A mismatched key silently falls through to ASK."
+    )
 
 
 def test_unmapped_features_fall_back_to_ask():

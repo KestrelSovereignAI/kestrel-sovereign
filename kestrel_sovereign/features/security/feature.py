@@ -17,6 +17,15 @@ from kestrel_sovereign.features.security.permissions import PermissionLevel, Per
 
 # Per-feature default permission levels for fresh agents (#406).
 #
+# Keys here MUST match the registered ``Feature.name`` value (which is the
+# Python class name in core features). Codex review on #1262 caught a first
+# revision where these used aspirational-sounding names (`ModelFeature`,
+# `TasksFeature`, `KeysFeature`, `ChannelsFeature`, `WebhooksFeature`) that
+# do not match the actual class names — those entries silently fell through
+# to the ASK fallback, leaving the very approval loop this map is supposed
+# to prevent. Class names below are the canonical ones; cross-reference
+# against ``grep -rn '^class.*Feature\\|^class.*Agent' kestrel_sovereign/features/``.
+#
 # When SecurityFeature registers each loaded feature's tools at startup, the
 # default permission used to be ASK for everything. That left brand-new
 # agents paralyzed: every core boot tool (Bootstrap, Sovereignty, Identity)
@@ -38,29 +47,33 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "ContextFeature": PermissionLevel.ALLOW,
     "SovereigntyFeature": PermissionLevel.ALLOW,
     "HealthFeature": PermissionLevel.ALLOW,
-    "ModelFeature": PermissionLevel.ALLOW,
-    "PrivacyFeature": PermissionLevel.ALLOW,
+    "ModelAgent": PermissionLevel.ALLOW,            # not ModelFeature
     "SaveFeature": PermissionLevel.ALLOW,
-    "KeysFeature": PermissionLevel.ALLOW,
-    "TasksFeature": PermissionLevel.ALLOW,
+    "KeyManagementFeature": PermissionLevel.ALLOW,  # not KeysFeature
+    "TaskFeature": PermissionLevel.ALLOW,           # not TasksFeature
     "StateOfMindFeature": PermissionLevel.ALLOW,
     "ResponseAuditFeature": PermissionLevel.ALLOW,
     "AuditAnchorFeature": PermissionLevel.ALLOW,
     "WellnessFeature": PermissionLevel.ALLOW,
     "WebSearchFeature": PermissionLevel.ALLOW,
-    "ChannelsFeature": PermissionLevel.ALLOW,
+    "ChannelFeature": PermissionLevel.ALLOW,        # not ChannelsFeature
     "PeersFeature": PermissionLevel.ALLOW,
     "SchedulerFeature": PermissionLevel.ALLOW,
     "ConsentFeature": PermissionLevel.ALLOW,
     "SkillsFeature": PermissionLevel.ALLOW,
+    "CliFeature": PermissionLevel.ALLOW,
+    "WorkflowsFeature": PermissionLevel.ALLOW,
+    "FeatureFeaturesFeature": PermissionLevel.ALLOW,
 
     # --- Externally-visible / irreversible / risky: ASK explicitly ---
     "ComputeFeature": PermissionLevel.ASK,
+    "ComputerUseFeature": PermissionLevel.ASK,
     "SpawnFeature": PermissionLevel.ASK,
     "DeliveryFeature": PermissionLevel.ASK,
-    "WebhooksFeature": PermissionLevel.ASK,
+    "WebhookFeature": PermissionLevel.ASK,          # not WebhooksFeature
     "BridgeFeature": PermissionLevel.ASK,
-    "TalonFeature": PermissionLevel.ASK,
+    "DeployFeature": PermissionLevel.ASK,
+    "TalonCoordinatorFeature": PermissionLevel.ASK,
 }
 
 

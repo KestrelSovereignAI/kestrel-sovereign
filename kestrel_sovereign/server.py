@@ -16,10 +16,7 @@ from contextlib import asynccontextmanager
 import logging
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
-from kestrel_sovereign.lifecycle_checks import (
-    verify_identity_isolation,
-    verify_llm_providers_initialized,
-)
+from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
 from slowapi import _rate_limit_exceeded_handler
@@ -335,13 +332,10 @@ async def lifespan(app: FastAPI):
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
 
+            # Lifecycle hardening: provider availability (#377) is verified
+            # inside KestrelAgent.initialize so every boot path — including
+            # the multi-agent AgentManager path above — gets the same check.
             await app.state.agent.initialize()
-            # Provider check runs AFTER agent.initialize so PayerPolicy has
-            # had a chance to resolve and set llm_service.disabled. An
-            # explicitly disabled LLM service (PayerKind.NONE) is a valid
-            # configuration where zero providers is expected; only fail
-            # startup when the operator wanted LLM but no provider came up.
-            verify_llm_providers_initialized(llm_service)
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except Exception as e:
             logger.error(f"Error during startup: {e}", exc_info=True)
