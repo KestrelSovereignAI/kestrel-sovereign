@@ -3,6 +3,61 @@
  * Core parsing functions using marked.js
  */
 
+// Escape attribute values inserted into rendered HTML.
+function _escapeAttr(value) {
+    return String(value).replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+    }[ch]));
+}
+
+// Configure marked once, on first load, to render external links with
+// target="_blank" rel="noopener noreferrer". In-page (#anchor) links keep
+// default behavior so internal jump links still work in the same view.
+let _markedLinkRendererInstalled = false;
+function _installMarkedLinkRenderer() {
+    if (_markedLinkRendererInstalled) return;
+    if (typeof marked === 'undefined' || typeof marked.use !== 'function') return;
+
+    // marked v11 passes a token object {href, title, text}; older versions
+    // pass positional args (href, title, text). Handle both.
+    function renderLink(hrefOrToken, titleArg, textArg) {
+        let href, title, text;
+        if (typeof hrefOrToken === 'object' && hrefOrToken !== null) {
+            href = hrefOrToken.href;
+            title = hrefOrToken.title;
+            // marked passes inner tokens; if rendered text is on the token, use it,
+            // otherwise fall back to the raw text.
+            text = hrefOrToken.text;
+            if (hrefOrToken.tokens && this && typeof this.parser?.parseInline === 'function') {
+                try {
+                    text = this.parser.parseInline(hrefOrToken.tokens);
+                } catch (_e) {
+                    // fall back to token.text
+                }
+            }
+        } else {
+            href = hrefOrToken;
+            title = titleArg;
+            text = textArg;
+        }
+        if (href == null) href = '';
+        const isInPage = typeof href === 'string' && href.startsWith('#');
+        const titleAttr = title ? ` title="${_escapeAttr(title)}"` : '';
+        const hrefAttr = _escapeAttr(href);
+        if (isInPage) {
+            return `<a href="${hrefAttr}"${titleAttr}>${text}</a>`;
+        }
+        return `<a href="${hrefAttr}"${titleAttr} target="_blank" rel="noopener noreferrer">${text}</a>`;
+    }
+
+    marked.use({ renderer: { link: renderLink } });
+    _markedLinkRendererInstalled = true;
+}
+
 /**
  * Normalize excessive newlines in text.
  * Collapses 3+ consecutive newlines to exactly 2 (single paragraph break).
@@ -27,6 +82,7 @@ function renderMarkdown(text) {
     const normalized = normalizeNewlines(text);
 
     if (typeof marked !== 'undefined') {
+        _installMarkedLinkRenderer();
         return marked.parse(normalized, {
             breaks: true,
             gfm: true,
@@ -48,6 +104,8 @@ function renderStreamingMarkdown(content) {
     if (typeof marked === 'undefined') {
         return normalizeNewlines(content).replace(/\n/g, '<br>');
     }
+
+    _installMarkedLinkRenderer();
 
     // Normalize excessive newlines before processing
     let processedContent = normalizeNewlines(content);
