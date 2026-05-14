@@ -93,9 +93,11 @@ nav {
     padding: 2px;
 }
 
+.nav-brand .kestrel-icon img,
 .nav-brand .kestrel-icon svg {
     width: 100%;
     height: 100%;
+    display: block;
 }
 
 .nav-tabs {
