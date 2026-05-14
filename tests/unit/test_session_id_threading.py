@@ -53,6 +53,17 @@ class TestOrchestratorThreadsSessionId:
     """``_handle_orchestrator_response`` threads session_id into the LLM call."""
 
     def _bind_handler(self, agent):
+        # The reflection phase (#1238) lives on the same mixin and is invoked
+        # from every final-return path. Bind it as a real method; with no
+        # fact-save tools loaded it short-circuits and doesn't perturb the
+        # session_id assertions.
+        agent._run_reflection_phase = (
+            OrchestratorEngineMixin._run_reflection_phase.__get__(agent)
+        )
+        agent._log_reflection_call = (
+            OrchestratorEngineMixin._log_reflection_call.__get__(agent)
+        )
+        agent._finalize_turn = OrchestratorEngineMixin._finalize_turn.__get__(agent)
         return OrchestratorEngineMixin._handle_orchestrator_response.__get__(agent)
 
     async def test_session_id_passed_to_generate_with_messages(self):

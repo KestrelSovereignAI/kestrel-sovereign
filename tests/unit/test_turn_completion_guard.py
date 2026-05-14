@@ -26,6 +26,23 @@ def _bind_turn_completion_helpers(agent):
     )
     agent._signals_unfinished_tool_work = OrchestratorEngineMixin._signals_unfinished_tool_work
     agent._append_missing_tool_call_repair = OrchestratorEngineMixin._append_missing_tool_call_repair
+    # Reflection phase (#1238) lives on the same mixin and is invoked from
+    # every final-return path of the orchestrator. Bind it as a real method
+    # and ensure these tests skip the reflection LLM call so they assert
+    # only the turn-completion behavior they're scoped to.
+    agent._run_reflection_phase = (
+        OrchestratorEngineMixin._run_reflection_phase.__get__(agent)
+    )
+    agent._log_reflection_call = (
+        OrchestratorEngineMixin._log_reflection_call.__get__(agent)
+    )
+    agent._finalize_turn = OrchestratorEngineMixin._finalize_turn.__get__(agent)
+    # No fact tools loaded -> reflection phase short-circuits.
+    if not hasattr(agent, "_build_all_tools") or not isinstance(agent._build_all_tools, MagicMock):
+        agent._build_all_tools = MagicMock(return_value=[])
+    else:
+        # Existing tests stub _build_all_tools to return []; keep that.
+        pass
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,14 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     infer_tool_result_status,
     tool_result_size_bytes,
 )
+from kestrel_sovereign.agent.reflection import (
+    REFLECTION_SYSTEM_PROMPT,
+    ReflectionOutcome,
+    filter_reflection_tools,
+    format_turn_transcript,
+    now_monotonic_ms,
+    reflection_disabled,
+)
 from kestrel_sovereign.llm.adapter import LLMResponse
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import optional_span
@@ -337,6 +345,188 @@ class OrchestratorEngineMixin:
         repaired.append({"role": "assistant", "content": content or ""})
         repaired.append({"role": "user", "content": TURN_COMPLETION_REPAIR_PROMPT})
         return repaired
+
+    async def _run_reflection_phase(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        final_content: Optional[str],
+        session_id: Optional[str],
+        force_local_only: bool = False,
+        effective_model: Optional[str] = None,
+    ) -> ReflectionOutcome:
+        """Issue the post-turn reflection LLM call with restricted fact-save tools.
+
+        Runs after the orchestrator has finalized its visible response for a
+        turn. Single round of tool calls, no follow-up LLM call. Failures are
+        logged and swallowed — reflection must never break the main turn.
+
+        Returns a ReflectionOutcome (for tests + observability).
+        """
+        if reflection_disabled():
+            return ReflectionOutcome(skipped=True, skip_reason="env_disabled")
+
+        try:
+            all_tools = self._build_all_tools()
+        except Exception as exc:
+            logger_msg = f"[REFLECTION] could not build tools, skipping: {exc}"
+            logging.warning(logger_msg)
+            return ReflectionOutcome(skipped=True, skip_reason="tool_build_failed", error=str(exc))
+
+        fact_tools = filter_reflection_tools(all_tools)
+        if not fact_tools:
+            return ReflectionOutcome(skipped=True, skip_reason="no_fact_tools_available")
+
+        transcript = format_turn_transcript(messages, final_content)
+        reflection_messages = [
+            {"role": "system", "content": REFLECTION_SYSTEM_PROMPT},
+            {"role": "user", "content": transcript},
+        ]
+
+        start_ms = now_monotonic_ms()
+        try:
+            response = await self.llm_service.generate_with_messages(
+                messages=reflection_messages,
+                tools=fact_tools,
+                force_local_only=force_local_only,
+                model_override=effective_model,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            duration_ms = now_monotonic_ms() - start_ms
+            logging.warning(f"[REFLECTION] LLM call failed: {exc}", exc_info=True)
+            await self._log_reflection_call(
+                duration_ms=duration_ms,
+                success=False,
+                tool_calls_count=0,
+                error=str(exc),
+                session_id=session_id,
+            )
+            return ReflectionOutcome(
+                skipped=True,
+                skip_reason="llm_call_failed",
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+
+        duration_ms = now_monotonic_ms() - start_ms
+
+        if isinstance(response, str) or not isinstance(response, LLMResponse) or not response.has_tool_calls:
+            # Reflection produced no tool calls — valid outcome per the prompt.
+            await self._log_reflection_call(
+                duration_ms=duration_ms,
+                success=True,
+                tool_calls_count=0,
+                error=None,
+                session_id=session_id,
+            )
+            return ReflectionOutcome(tool_calls_executed=0, duration_ms=duration_ms)
+
+        # Single round of tool calls — only the three reflection tools, executed
+        # via the normal batch path so PRE/POST hooks fire and dispatches are
+        # recorded in observability the same way as any other tool call.
+        features_by_tool_name = self._visible_features_by_tool_name()
+        known_tools = self._visible_known_tool_names()
+
+        assistant_msg: Dict[str, Any] = {"role": "assistant", "content": response.content or ""}
+        assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+        reflection_messages.append(assistant_msg)
+
+        try:
+            await self._execute_tool_batch(
+                response.tool_calls,
+                features_by_tool_name,
+                known_tools,
+                reflection_messages,
+                0,
+                None,
+                session_id=session_id,
+            )
+        except Exception as exc:
+            logging.warning(f"[REFLECTION] tool batch failed: {exc}", exc_info=True)
+            await self._log_reflection_call(
+                duration_ms=duration_ms,
+                success=False,
+                tool_calls_count=len(response.tool_calls),
+                error=str(exc),
+                session_id=session_id,
+            )
+            return ReflectionOutcome(
+                tool_calls_executed=0,
+                duration_ms=duration_ms,
+                error=str(exc),
+            )
+
+        await self._log_reflection_call(
+            duration_ms=duration_ms,
+            success=True,
+            tool_calls_count=len(response.tool_calls),
+            error=None,
+            session_id=session_id,
+        )
+        return ReflectionOutcome(
+            tool_calls_executed=len(response.tool_calls),
+            duration_ms=duration_ms,
+        )
+
+    async def _log_reflection_call(
+        self,
+        *,
+        duration_ms: int,
+        success: bool,
+        tool_calls_count: int,
+        error: Optional[str],
+        session_id: Optional[str],
+    ) -> None:
+        """Best-effort observability log for the reflection LLM call (#1239 pattern)."""
+        store = getattr(self, "observability_store", None)
+        if store is None:
+            return
+        try:
+            await store.log_llm_call(
+                provider="reflection",
+                model="reflection_phase",
+                duration_ms=duration_ms,
+                success=success,
+                session_id=session_id,
+                error_message=error,
+                metadata={
+                    "phase": "reflection",
+                    "tool_calls_count": tool_calls_count,
+                },
+                agent_did=getattr(self, "did", None),
+            )
+        except Exception as exc:
+            logging.debug(f"[REFLECTION] observability log failed (non-fatal): {exc}")
+
+    async def _finalize_turn(
+        self,
+        *,
+        final_content: str,
+        messages: List[Dict[str, Any]],
+        session_id: Optional[str],
+        force_local_only: bool = False,
+        effective_model: Optional[str] = None,
+    ) -> str:
+        """Run reflection (if enabled) then return the final content.
+
+        Sole purpose is to wrap the final-return path so all exit points in
+        the orchestrator handlers benefit from the reflection phase without
+        scattering try/except blocks everywhere.
+        """
+        try:
+            await self._run_reflection_phase(
+                messages=messages,
+                final_content=final_content,
+                session_id=session_id,
+                force_local_only=force_local_only,
+                effective_model=effective_model,
+            )
+        except Exception as exc:
+            # Defense in depth: _run_reflection_phase already swallows, but if
+            # something exotic escapes we still must not break the main turn.
+            logging.warning(f"[REFLECTION] phase escaped exception, ignoring: {exc}", exc_info=True)
+        return final_content
 
     async def _repair_premature_turn_yield(
         self,
@@ -1136,9 +1326,21 @@ class OrchestratorEngineMixin:
                     session_id=session_id,
                 )
                 if isinstance(response, str):
-                    return response
+                    return await self._finalize_turn(
+                        final_content=response,
+                        messages=messages,
+                        session_id=session_id,
+                        force_local_only=force_local_only,
+                        effective_model=effective_model,
+                    )
             if not response.has_tool_calls:
-                return response.content or ""
+                return await self._finalize_turn(
+                    final_content=response.content or "",
+                    messages=messages,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
 
         # Add initial assistant response with tool calls
         assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1178,7 +1380,13 @@ class OrchestratorEngineMixin:
 
             if isinstance(response, str):
                 logging.info(f"[ORCHESTRATOR] Final response (string): {response[:300]}...")
-                return response
+                return await self._finalize_turn(
+                    final_content=response,
+                    messages=messages,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
 
             if not response.has_tool_calls:
                 if all_tools and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or ""):
@@ -1192,7 +1400,13 @@ class OrchestratorEngineMixin:
                     )
                     if isinstance(response, str):
                         logging.info(f"[ORCHESTRATOR] Final response after repair (string): {response[:300]}...")
-                        return response
+                        return await self._finalize_turn(
+                            final_content=response,
+                            messages=messages,
+                            session_id=session_id,
+                            force_local_only=force_local_only,
+                            effective_model=effective_model,
+                        )
                     if response.has_tool_calls:
                         assistant_msg = {"role": "assistant", "content": response.content or ""}
                         if response.tool_calls:
@@ -1201,7 +1415,13 @@ class OrchestratorEngineMixin:
                         continue
                 final_content = response.content or ""
                 logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
-                return final_content
+                return await self._finalize_turn(
+                    final_content=final_content,
+                    messages=messages,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
 
             # Track diminishing returns on this response before continuing
             tracker.record(response)
@@ -1210,7 +1430,13 @@ class OrchestratorEngineMixin:
                     f"[ORCHESTRATOR] Diminishing returns detected at iteration {iteration + 1}/{max_iterations} "
                     f"(consecutive_low_delta={tracker.consecutive_low_delta}). Stopping."
                 )
-                return response.content or "Stopped: diminishing returns detected"
+                return await self._finalize_turn(
+                    final_content=response.content or "Stopped: diminishing returns detected",
+                    messages=messages,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
 
             assistant_msg = {"role": "assistant", "content": response.content or ""}
             if response.tool_calls:
@@ -1218,7 +1444,13 @@ class OrchestratorEngineMixin:
             messages.append(assistant_msg)
 
         logging.warning("Max tool call iterations reached")
-        return response.content or "Error: Maximum tool call iterations exceeded"
+        return await self._finalize_turn(
+            final_content=response.content or "Error: Maximum tool call iterations exceeded",
+            messages=messages,
+            session_id=session_id,
+            force_local_only=force_local_only,
+            effective_model=effective_model,
+        )
 
     # ------------------------------------------------------------------
     # Message pruning
@@ -1344,9 +1576,24 @@ class OrchestratorEngineMixin:
                 )
                 if isinstance(response, str):
                     yield response
+                    await self._run_reflection_phase(
+                        messages=messages,
+                        final_content=response,
+                        session_id=session_id,
+                        force_local_only=force_local_only,
+                        effective_model=effective_model,
+                    )
                     return
             if not response.has_tool_calls:
-                yield response.content or ""
+                final_text = response.content or ""
+                yield final_text
+                await self._run_reflection_phase(
+                    messages=messages,
+                    final_content=final_text,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
                 return
 
         assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1387,6 +1634,13 @@ class OrchestratorEngineMixin:
 
             if isinstance(response, str):
                 yield response
+                await self._run_reflection_phase(
+                    messages=messages,
+                    final_content=response,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
                 return
 
             if not response.has_tool_calls:
@@ -1406,6 +1660,13 @@ class OrchestratorEngineMixin:
                     )
                     if isinstance(response, str):
                         yield response
+                        await self._run_reflection_phase(
+                            messages=messages,
+                            final_content=response,
+                            session_id=session_id,
+                            force_local_only=force_local_only,
+                            effective_model=effective_model,
+                        )
                         return
                     if response.has_tool_calls:
                         assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1413,17 +1674,35 @@ class OrchestratorEngineMixin:
                             assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
                         messages.append(assistant_msg)
                         continue
-                    yield response.content or ""
+                    repaired_text = response.content or ""
+                    yield repaired_text
+                    await self._run_reflection_phase(
+                        messages=messages,
+                        final_content=repaired_text,
+                        session_id=session_id,
+                        force_local_only=force_local_only,
+                        effective_model=effective_model,
+                    )
                     return
                 logging.info("[ORCHESTRATOR-STREAM] Streaming final response")
                 yield "\n---\n"
+                streamed_chunks: List[str] = []
                 async for chunk in self.llm_service.stream_with_messages(
                     messages=messages,
                     force_local_only=force_local_only,
                     model_override=effective_model,
                     session_id=session_id,
                 ):
+                    if isinstance(chunk, str):
+                        streamed_chunks.append(chunk)
                     yield chunk
+                await self._run_reflection_phase(
+                    messages=messages,
+                    final_content="".join(streamed_chunks),
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
                 return
 
             # Track diminishing returns on this response before continuing
@@ -1433,7 +1712,15 @@ class OrchestratorEngineMixin:
                     f"[ORCHESTRATOR-STREAM] Diminishing returns detected at iteration {iteration + 1}/{max_iterations} "
                     f"(consecutive_low_delta={tracker.consecutive_low_delta}). Stopping."
                 )
-                yield response.content or "Stopped: diminishing returns detected"
+                stopped_text = response.content or "Stopped: diminishing returns detected"
+                yield stopped_text
+                await self._run_reflection_phase(
+                    messages=messages,
+                    final_content=stopped_text,
+                    session_id=session_id,
+                    force_local_only=force_local_only,
+                    effective_model=effective_model,
+                )
                 return
 
             assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1442,4 +1729,12 @@ class OrchestratorEngineMixin:
             messages.append(assistant_msg)
 
         logging.warning("Max tool call iterations reached")
-        yield "Error: Maximum tool call iterations exceeded"
+        max_iter_text = "Error: Maximum tool call iterations exceeded"
+        yield max_iter_text
+        await self._run_reflection_phase(
+            messages=messages,
+            final_content=max_iter_text,
+            session_id=session_id,
+            force_local_only=force_local_only,
+            effective_model=effective_model,
+        )

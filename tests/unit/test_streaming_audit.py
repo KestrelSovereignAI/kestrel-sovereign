@@ -77,6 +77,16 @@ class TestRealStreaming:
         mock_agent._handle_orchestrator_response_streaming = (
             KestrelAgent._handle_orchestrator_response_streaming.__get__(mock_agent)
         )
+        # Reflection phase (#1238) runs at every final-return path; bind it so
+        # the streaming handler can call self._run_reflection_phase. With no
+        # fact-save tools loaded it short-circuits.
+        for refl_method in ("_run_reflection_phase", "_log_reflection_call", "_finalize_turn"):
+            setattr(
+                mock_agent,
+                refl_method,
+                getattr(KestrelAgent, refl_method).__get__(mock_agent),
+            )
+        mock_agent._build_all_tools = MagicMock(return_value=[])
 
         chunks = []
         async for chunk in mock_agent._handle_orchestrator_response_streaming(
@@ -156,6 +166,11 @@ class TestRealStreaming:
             '_hidden_context_tools',
             '_feature_hidden_from_context',
             '_direct_tool_hidden_from_context',
+            # Reflection phase (#1238) lives on OrchestratorEngineMixin and is
+            # called from every final-return path of the streaming handler.
+            '_run_reflection_phase',
+            '_log_reflection_call',
+            '_finalize_turn',
         ):
             setattr(mock_agent, method_name,
                     getattr(KestrelAgent, method_name).__get__(mock_agent))
