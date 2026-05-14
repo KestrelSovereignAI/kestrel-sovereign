@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-13
-**Scope:** 1633 tracked files (989 `.py`, 261 `.md`, 383 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-14
+**Scope:** 1628 tracked files (991 `.py`, 261 `.md`, 376 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -90,7 +90,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/stores/unified/memory_service.py** — Unified MemoryService — Task Completion Archive.
   - `class MemoryEntry`; `class MemoryService`
 - **kestrel_sovereign/a2a/stores/unified/observability_store.py** — Unified ObservabilityStore - Backend-Agnostic Telemetry.
-  - `class ObservabilityEvent`; `class LLMCallEvent`; `class ObservabilityStore`
+  - `class ObservabilityEvent`; `class LLMCallEvent`; `class ToolDispatchEntry`; `class ObservabilityStore`; `def redact_tool_args_json(value)`; `def infer_tool_result_status(result, status_hint)`; `def tool_result_size_bytes(result)`
 - **kestrel_sovereign/a2a/stores/unified/orchestration_store.py** — Unified OrchestrationStore - Backend-Agnostic Workflow Coordination.
   - `class OrchestrationStatus`; `class OrchestrationTask`; `class OrchestrationStore`
 - **kestrel_sovereign/a2a/stores/unified/session_service.py** — Unified SessionService - Backend-Agnostic Session Management.
@@ -1528,6 +1528,7 @@ Repo entry points and standard project files.
 - **tests/frontend/api_client.test.mjs** — (mjs asset)
 - **tests/frontend/api_client_dispatch_pinning.test.mjs** — (mjs asset)
 - **tests/frontend/api_client_stop.test.mjs** — (mjs asset)
+- **tests/frontend/app_init_order.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
 - **tests/frontend/autoload_race.test.mjs** — (mjs asset)
 - **tests/frontend/capabilities.test.mjs** — (mjs asset)
@@ -2411,6 +2412,8 @@ Repo entry points and standard project files.
   - `class TestBudgetOverflow`; `class TestReallocateUnused`; `class TestCrossModelBudgets`; `class TestModelSwitching`; `class TestConcurrentBudgetAllocation`; `class TestBudgetSummary`; `class TestAdaptiveBudgetEdgeCases`; `class TestTokenAllocationProperties`
 - **tests/unit/test_tool_concurrency.py** — Tests for tool concurrency batching (#562 v2).
   - `class FakeToolCall`; `class FakeToolSchema`; `class FakeTool`; `class FakeFeature`; `class TestPartitionToolCalls`; `class TestIsConcurrencySafe`; `class TestMaxConcurrency`
+- **tests/unit/test_tool_dispatches.py** — —
+  - `async def test_tool_dispatch_schema_uses_database_dialect_helpers()`; `async def test_tool_dispatch_write_path_redacts_and_queries(tmp_path)`; `async def test_llm_call_observability_records_and_filters_agent_did(tmp_path)`; `async def test_broken_direct_tool_dispatch_writes_failure_row(tmp_path)`; `def test_redact_args_json_caps_large_payloads()`
 - **tests/unit/test_tool_honesty_prompt.py** — Tests for the tool-honesty system prompt addendum (issue #1042 Fix 1).
   - `class TestToolHonestyPromptConstant`; `class TestAppendSecurityAddendum`; `class TestProductionCallSites`
 - **tests/unit/test_tool_result_contract.py** — Tests for kestrel_sovereign.tools.result_contract.
@@ -2419,6 +2422,8 @@ Repo entry points and standard project files.
   - `class TestBuildPersistedPreview`
 - **tests/unit/test_training_adapter_hygiene.py** — —
   - `async def test_runpod_cleanup_pauses_persistent_pod()`; `async def test_runpod_cleanup_terminates_on_demand_pod()`; `def test_replicate_training_zip_contains_avatar_bytes()`; `async def test_replicate_training_uses_client_file_input(monkeypatch)`
+- **tests/unit/test_turn_completion_guard.py** — Regression coverage for premature turn-yield repair (#1237).
+  - `async def test_no_tool_continuation_gets_one_repair_step()`; `async def test_final_no_tool_answer_does_not_repair()`; `async def test_feature_subagent_no_tool_continuation_gets_repair_step()`
 - **tests/unit/test_turn_lifecycle.py** — Race regression tests for the shared turn lifecycle.
   - `async def test_two_concurrent_turns_serialize()`; `async def test_three_concurrent_turns_serialize_in_order()`; `async def test_exception_in_turn_body_releases_lock()`; `async def test_conversation_lock_is_held_inside_turn()`; `async def test_turn_id_is_unique_per_call()`; `async def test_process_input_enters_lifecycle_before_bootstrap_and_commands()`; `async def test_lifecycle_shares_lock_manager_with_dispatcher()`; `async def test_concurrent_set_current_chain_is_task_local()`; `…`
 - **tests/unit/test_ui_theme_endpoint.py** — Contract tests for the /api/ui/theme endpoint (epic #986, sub-issue #989).
@@ -2548,7 +2553,6 @@ Repo entry points and standard project files.
 - **.github/workflows/publish.yml** — (configuration)
 - **.github/workflows/release-sign.yml** — (configuration)
 - **.github/workflows/repo-map.yml** — (configuration)
-- **.github/workflows/website-pages.yml** — (configuration)
 - **.github/workflows/weekly-analysis.yml** — (configuration)
 
 ## `.devcontainer/`
@@ -2564,13 +2568,3 @@ Repo entry points and standard project files.
   - `async def main()`
 - **examples/demo_sovereignty.py** — Demonstration of Kestrel's Sovereignty System
   - `async def demo_sovereignty_export()`; `async def demo_sovereignty_workflow()`
-
-## `website/`
-
-- **website/CNAME** — —
-- **website/apple-touch-icon.png** — —
-- **website/favicon-32.png** — —
-- **website/favicon.ico** — —
-- **website/favicon.svg** — —
-- **website/index.html** — (html asset)
-- **website/logo.png** — —
