@@ -68,6 +68,31 @@ def test_provider_check_raises_when_providers_is_none():
         verify_llm_providers_initialized(svc)
 
 
+def test_provider_check_skipped_when_llm_service_disabled():
+    """PayerKind.NONE: zero providers is the intended state — don't raise."""
+    svc = _FakeLLMService(providers=[])
+    svc.disabled = True
+    # Must not raise — operator has explicitly disabled LLM use for this agent.
+    verify_llm_providers_initialized(svc)
+
+
+def test_provider_check_still_raises_when_disabled_false_and_no_providers():
+    """Explicitly-enabled LLM with no providers is still a failure."""
+    svc = _FakeLLMService(providers=[])
+    svc.disabled = False
+    with pytest.raises(NoLLMProvidersError):
+        verify_llm_providers_initialized(svc)
+
+
+def test_provider_check_message_mentions_payer_policy_escape_hatch():
+    svc = _FakeLLMService(providers=[])
+    with pytest.raises(NoLLMProvidersError) as exc:
+        verify_llm_providers_initialized(svc)
+    # Operators reading the error should see the path to a deliberate-disable
+    # configuration, not just "missing key" diagnostics.
+    assert "PayerPolicy.llm.kind = NONE" in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # #381 — refuse to start if the DB's agent DID differs from the operator's
 # declaration (KESTREL_EXPECTED_DID env var)

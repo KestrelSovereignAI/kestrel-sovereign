@@ -222,12 +222,34 @@ class SecurityFeature(Feature):
             else:
                 feature_default = default_permission_for_feature(feature_name)
 
+            # Register the inner @tool methods.
             for tool_obj in feature.get_tools():
                 await self.permission_store.register_tool(
                     feature_name=feature_name,
                     tool_name=tool_obj.name,
                     default_level=feature_default,
                 )
+
+            # Also register the feature-as-subagent dispatch entry. The
+            # orchestrator may call the whole feature as a subagent (e.g.
+            # `BootstrapFeature.bootstrap_feature`) and SecurityHook checks
+            # permission for that feature-level tool name too. Without this
+            # the per-feature ALLOW defaults wouldn't cover subagent calls,
+            # leaving the Meridian first-boot approval loop in place (#406
+            # codex review P1).
+            subagent_tool_name = getattr(feature, "tool_name", None)
+            if subagent_tool_name and not isinstance(subagent_tool_name, property):
+                try:
+                    await self.permission_store.register_tool(
+                        feature_name=feature_name,
+                        tool_name=subagent_tool_name,
+                        default_level=feature_default,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "Could not register subagent permission for "
+                        f"{feature_name}.{subagent_tool_name}: {exc}"
+                    )
 
         if is_demo_server:
             logger.info(

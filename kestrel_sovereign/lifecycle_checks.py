@@ -49,13 +49,25 @@ def verify_llm_providers_initialized(llm_service: Any) -> None:
     obscurely. But once the server is up, an empty ``providers`` list means
     the agent is mute, and we should refuse to declare startup successful.
 
+    PayerPolicy carve-out: when ``llm_service.disabled is True`` (set by
+    ``KestrelAgent.initialize`` when the agent's ``PayerPolicy.llm.kind``
+    is ``PayerKind.NONE``), zero providers is the *intended* state —
+    operator has explicitly opted the agent out of LLM use. Skip the check
+    in that case rather than rejecting a valid configuration.
+
     Args:
         llm_service: An ``LLMService`` instance whose ``initialize_providers``
-            has already run. We read ``llm_service.providers``.
+            has already run, and (when applicable) whose PayerPolicy has been
+            resolved via ``KestrelAgent.initialize``. We read both
+            ``llm_service.providers`` and ``llm_service.disabled``.
 
     Raises:
-        NoLLMProvidersError: when ``len(providers) == 0``.
+        NoLLMProvidersError: when LLM is intended-on and ``len(providers) == 0``.
     """
+    if getattr(llm_service, "disabled", False):
+        # PayerKind.NONE — operator has explicitly disabled LLM use. Zero
+        # providers is the intended state; don't raise.
+        return
     providers = getattr(llm_service, "providers", None) or []
     if len(providers) > 0:
         return
@@ -65,7 +77,8 @@ def verify_llm_providers_initialized(llm_service: Any) -> None:
         "(ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, "
         "GOOGLE_API_KEY) or that a local provider (Ollama, llama.cpp) is "
         "reachable. See LLM_SERVICE_ARCHITECTURE.md for the route-config "
-        "shape."
+        "shape. If this agent is intentionally LLM-disabled, configure "
+        "PayerPolicy.llm.kind = NONE."
     )
 
 
