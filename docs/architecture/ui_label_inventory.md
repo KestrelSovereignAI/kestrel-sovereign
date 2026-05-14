@@ -12,7 +12,6 @@ Catalog of every user-facing string in the Kestrel Sovereign main console, class
 **Out of scope**
 
 - `voice-test.html` — auxiliary surface, no theme-relevant labels.
-- `generate_branding_suite.py` — covers logos/imagery, not in-app text.
 
 **Note on inline CSS:** `index.html` has a ~1,180-line inline `<style>` block (lines 9–1181). Not in scope for this epic, but flagged as a separate housekeeping follow-up.
 
