@@ -49,7 +49,6 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "HealthFeature": PermissionLevel.ALLOW,
     "ModelAgent": PermissionLevel.ALLOW,            # not ModelFeature
     "SaveFeature": PermissionLevel.ALLOW,
-    "KeyManagementFeature": PermissionLevel.ALLOW,  # not KeysFeature
     "TaskFeature": PermissionLevel.ALLOW,           # not TasksFeature
     "StateOfMindFeature": PermissionLevel.ALLOW,
     "ResponseAuditFeature": PermissionLevel.ALLOW,
@@ -74,6 +73,13 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "BridgeFeature": PermissionLevel.ASK,
     "DeployFeature": PermissionLevel.ASK,
     "TalonCoordinatorFeature": PermissionLevel.ASK,
+    # KeyManagementFeature is ASK at the feature level because it bundles
+    # destructive operations (delete_service_key, remove_service_key) with
+    # read-only listings. ALLOW on the whole feature would auto-grant
+    # irreversible credential deletion to a fresh agent. Operators can
+    # upgrade specific read-only tools to ALLOW post-inception if needed,
+    # but the feature default stays conservative (codex review v3 #1262).
+    "KeyManagementFeature": PermissionLevel.ASK,
 }
 
 
