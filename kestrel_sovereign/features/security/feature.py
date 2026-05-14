@@ -9,10 +9,72 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.security.permissions import PermissionLevel, PermissionStore
+
+
+# Per-feature default permission levels for fresh agents (#406).
+#
+# When SecurityFeature registers each loaded feature's tools at startup, the
+# default permission used to be ASK for everything. That left brand-new
+# agents paralyzed: every core boot tool (Bootstrap, Sovereignty, Identity)
+# raised an approval modal nobody was there to answer, looping the agent
+# into a 20+ minute timeout cascade on first run (Meridian, #406).
+#
+# This map opts the core "must work to function" features into ALLOW.
+# Genuinely destructive or externally-visible features stay on ASK. Anything
+# not listed falls through to ASK — adding a new feature to the agent does
+# NOT silently grant it; the maintainer must add it here explicitly.
+_DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
+    # --- Core boot / identity / memory: ALLOW (agent cannot function without) ---
+    "BootstrapFeature": PermissionLevel.ALLOW,
+    "IdentityFeature": PermissionLevel.ALLOW,
+    "ConstitutionFeature": PermissionLevel.ALLOW,
+    "MemoryFeature": PermissionLevel.ALLOW,
+    "MemoryAgencyFeature": PermissionLevel.ALLOW,
+    "StrategicMemoryFeature": PermissionLevel.ALLOW,
+    "ContextFeature": PermissionLevel.ALLOW,
+    "SovereigntyFeature": PermissionLevel.ALLOW,
+    "HealthFeature": PermissionLevel.ALLOW,
+    "ModelFeature": PermissionLevel.ALLOW,
+    "PrivacyFeature": PermissionLevel.ALLOW,
+    "SaveFeature": PermissionLevel.ALLOW,
+    "KeysFeature": PermissionLevel.ALLOW,
+    "TasksFeature": PermissionLevel.ALLOW,
+    "StateOfMindFeature": PermissionLevel.ALLOW,
+    "ResponseAuditFeature": PermissionLevel.ALLOW,
+    "AuditAnchorFeature": PermissionLevel.ALLOW,
+    "WellnessFeature": PermissionLevel.ALLOW,
+    "WebSearchFeature": PermissionLevel.ALLOW,
+    "ChannelsFeature": PermissionLevel.ALLOW,
+    "PeersFeature": PermissionLevel.ALLOW,
+    "SchedulerFeature": PermissionLevel.ALLOW,
+    "ConsentFeature": PermissionLevel.ALLOW,
+    "SkillsFeature": PermissionLevel.ALLOW,
+
+    # --- Externally-visible / irreversible / risky: ASK explicitly ---
+    "ComputeFeature": PermissionLevel.ASK,
+    "SpawnFeature": PermissionLevel.ASK,
+    "DeliveryFeature": PermissionLevel.ASK,
+    "WebhooksFeature": PermissionLevel.ASK,
+    "BridgeFeature": PermissionLevel.ASK,
+    "TalonFeature": PermissionLevel.ASK,
+}
+
+
+def default_permission_for_feature(
+    feature_name: str,
+    fallback: PermissionLevel = PermissionLevel.ASK,
+) -> PermissionLevel:
+    """Return the default permission level for a freshly-loaded feature.
+
+    Unmapped features get the conservative ASK fallback — adding a new feature
+    does not silently grant it permission. To opt a feature into ALLOW or to
+    explicitly ASK, update ``_DEFAULT_PERMISSION_BY_FEATURE`` above.
+    """
+    return _DEFAULT_PERMISSION_BY_FEATURE.get(feature_name, fallback)
 from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sdk.hooks.base import Hook
@@ -130,15 +192,19 @@ class SecurityFeature(Feature):
         logger.info("SecurityFeature async initialization complete")
 
     async def _register_all_tools(self):
-        """Register all agent tools with default ASK permission.
+        """Register all agent tools with sensible per-feature default permissions.
 
         Demo servers (KESTREL_DEMO_SERVER=1, set by ``kestrel demo run``) get
-        ALLOW as the default instead — Playwright demos can't click
-        through an interactive approval modal, and the demo agent runs
-        in an isolated DB so the broader-grants are scoped correctly.
-        Without this, every demo whose subject is something OTHER than
-        the security flow has to chase modal-dismissal helpers in JS
-        for whichever feature the LLM happens to pick (#897 review).
+        ALLOW for every tool — Playwright demos can't click through an
+        interactive approval modal, and the demo agent runs in an isolated DB
+        so the broader-grants are scoped correctly (#897).
+
+        Production agents use per-feature defaults from
+        ``default_permission_for_feature``: core boot features get ALLOW so a
+        fresh agent isn't paralyzed in an approval-modal loop on first turn
+        (#406, Meridian incident); features that take externally-visible or
+        irreversible action stay on ASK; unmapped features default to ASK so
+        adding a new feature never silently grants it.
         """
         if not hasattr(self.agent, "features"):
             return
@@ -146,18 +212,21 @@ class SecurityFeature(Feature):
         is_demo_server = os.environ.get("KESTREL_DEMO_SERVER", "").lower() in (
             "1", "true", "yes",
         )
-        default_level = PermissionLevel.ALLOW if is_demo_server else PermissionLevel.ASK
 
         for feature_name, feature in self.agent.features.items():
-            # Skip registering our own tools
             if feature_name == "SecurityFeature":
                 continue
+
+            if is_demo_server:
+                feature_default = PermissionLevel.ALLOW
+            else:
+                feature_default = default_permission_for_feature(feature_name)
 
             for tool_obj in feature.get_tools():
                 await self.permission_store.register_tool(
                     feature_name=feature_name,
                     tool_name=tool_obj.name,
-                    default_level=default_level,
+                    default_level=feature_default,
                 )
 
         if is_demo_server:
@@ -165,7 +234,9 @@ class SecurityFeature(Feature):
                 "Registered all tools with ALLOW (KESTREL_DEMO_SERVER=1)"
             )
         else:
-            logger.info("Registered all tools with security permissions")
+            logger.info(
+                "Registered all tools with per-feature default permissions"
+            )
 
     async def _emit_approval_request(self, request: ApprovalRequest):
         """

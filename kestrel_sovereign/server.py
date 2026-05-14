@@ -16,6 +16,10 @@ from contextlib import asynccontextmanager
 import logging
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.lifecycle_checks import (
+    verify_identity_isolation,
+    verify_llm_providers_initialized,
+)
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
 from slowapi import _rate_limit_exceeded_handler
@@ -309,7 +313,9 @@ async def lifespan(app: FastAPI):
                 storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
                 db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(storage_dir)
+                verify_identity_isolation(agent_did)
                 llm_service = LLMService()
+                verify_llm_providers_initialized(llm_service)
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
@@ -321,7 +327,9 @@ async def lifespan(app: FastAPI):
                 storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
                 db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(storage_dir)
+                verify_identity_isolation(agent_did)
                 llm_service = LLMService()
+                verify_llm_providers_initialized(llm_service)
                 app.state.agent = KestrelAgent(
                     did=agent_did,
                     storage_path=db_path,
