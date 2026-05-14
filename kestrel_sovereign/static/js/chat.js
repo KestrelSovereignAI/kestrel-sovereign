@@ -758,8 +758,14 @@ export function updateThinkingIndicator() {
     if (thinkingIndicator) {
         thinkingIndicator.style.display = busy ? 'flex' : 'none';
     }
-    if (messageInput) messageInput.disabled = busy;
-    if (sendButton) sendButton.disabled = busy;
+    // #1255: composer stays editable while the agent is streaming.
+    // Hitting Enter mid-stream is the universal interrupt pattern
+    // (ChatGPT, Claude.ai, Cursor); sendMessage detects the busy
+    // state and routes through stopAgent before dispatching the new
+    // turn. The disable lines that used to live here forced the user
+    // to click Stop, wait, then start typing — an extra click and a
+    // state transition for what is by far the most common path of
+    // "I'd like to redirect mid-answer."
 }
 
 /**
@@ -836,7 +842,24 @@ export async function sendMessage() {
     // before the first stream chunk arrives, and the user's typed text
     // must always land in the agent it was dispatched against.
     const dispatchAgent = API.getHostAgent();
-    if (!text || state.waitingAgents.has(dispatchAgent)) return;
+    if (!text) return;
+
+    // #1255: interrupt-on-send. When the user hits Enter while the
+    // dispatch agent is still streaming, stop the in-flight turn
+    // before dispatching the new one. ``stopAgent`` aborts the
+    // client-side fetch synchronously and awaits the server's
+    // ``/api/agent/stop`` ack, so the cancellation is registered
+    // server-side BEFORE the next ``streamInvoke`` POST opens; the
+    // backend's loop-level checkpoints (#1256) then halt the prior
+    // turn cleanly. Without this, two streams for the same agent
+    // would race and the prior turn's chunks could keep painting
+    // into the pane after the new user message had already been
+    // rendered. Note: ``stopAgent`` removes the agent from
+    // ``state.waitingAgents`` itself, so the subsequent ``add``
+    // below is the correct next state.
+    if (state.waitingAgents.has(dispatchAgent)) {
+        await stopAgent(dispatchAgent);
+    }
 
     const pane = getOrCreateChatPane(dispatchAgent);
     // Capture the pane-local generation. This dispatch's DOM writes
