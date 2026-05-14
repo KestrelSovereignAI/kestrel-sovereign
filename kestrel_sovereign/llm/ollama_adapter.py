@@ -40,6 +40,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _extract_message_fields(payload: Any) -> tuple[Optional[str], Optional[str]]:
+    """Return ``(thinking, content)`` from an Ollama chat payload.
+
+    Handles both dict shapes (raw HTTP / aiohttp paths) and the Pydantic-
+    style ``ChatResponse`` objects returned by the ollama-python SDK.
+    ``thinking`` is the native ``message.thinking`` field populated by
+    Ollama for thinking-capable models (Gemma 4, gpt-oss, etc.); empty
+    or missing fields are returned as ``None`` rather than ``""`` so
+    callers can branch with a simple truthiness check.
+    """
+    if payload is None:
+        return None, None
+
+    if isinstance(payload, dict):
+        message = payload.get("message") or {}
+        if not isinstance(message, dict):
+            return None, None
+        thinking = message.get("thinking")
+        content = message.get("content")
+    else:
+        message = getattr(payload, "message", None)
+        if message is None:
+            return None, None
+        thinking = getattr(message, "thinking", None)
+        content = getattr(message, "content", None)
+
+    return (thinking or None), (content or None)
+
+
 class OllamaAdapter(LLMAdapter):
     """
     Adapter for interacting with a local Ollama instance.
@@ -154,6 +183,12 @@ class OllamaAdapter(LLMAdapter):
                 and should_split_thinking
             ):
                 _, content = split_thinking_from_content(content)
+
+            # Native `message.thinking` (Ollama 0.x+ thinking-capable models —
+            # Gemma 4, gpt-oss, etc.) is preserved on the raw response so
+            # streaming-with-tools fallback can re-surface it as a
+            # ThinkingDelta. Non-streaming callers that only want the visible
+            # content already get it cleanly via `LLMResponse.content`.
 
             # If using structured output, validate against the Pydantic model
             if response_format is not None and content:
@@ -292,11 +327,10 @@ class OllamaAdapter(LLMAdapter):
             response_accum = ""
             splitter = ThinkingContentSplitter(provider="ollama")
             async for chunk in stream:
-                content = None
-                if isinstance(chunk, dict):
-                    content = chunk.get('message', {}).get('content')
-                elif hasattr(chunk, 'message') and hasattr(chunk.message, 'content'):
-                    content = chunk.message.content
+                thinking, content = _extract_message_fields(chunk)
+
+                if thinking and response_format is None:
+                    yield ThinkingDelta(thinking, provider="ollama")
 
                 if content:
                     chunk_count += 1
@@ -389,7 +423,14 @@ class OllamaAdapter(LLMAdapter):
                     yield response
                     return
 
-                # No tool calls - yield the text content and we're done
+                # No tool calls - yield native thinking (if any) + text content.
+                # Structured-output mode suppresses thinking to keep the
+                # caller's JSON stream clean (matches the regular streaming
+                # path's `response_format is None` guard).
+                if response_format is None:
+                    native_thinking, _ = _extract_message_fields(response.raw)
+                    if native_thinking:
+                        yield ThinkingDelta(native_thinking, provider="ollama")
                 if response.content:
                     should_split_thinking = "<think" in response.content.lower()
                     if not should_split_thinking:
