@@ -1302,6 +1302,7 @@ class OrchestratorEngineMixin:
         tool_events: list = None,
         tool_results: list = None,
         session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -1359,7 +1360,20 @@ class OrchestratorEngineMixin:
             max_low_delta=KESTREL_MAX_LOW_DELTA,
             budget_stop_pct=KESTREL_BUDGET_STOP_PCT,
         )
+        def _cancelled() -> bool:
+            # #1256: honor stop-button cancellation between tool batches.
+            # We never abort an in-flight ``_execute_tool_batch`` mid-call —
+            # tools have side effects we can't undo, and ``await``ing the
+            # batch to completion keeps the in-memory messages array's
+            # tool_use/tool_result pairing valid. Cancellation here just
+            # prevents the NEXT iteration's tool batch and the NEXT LLM
+            # round-trip from firing.
+            return bool(request_id) and self.is_request_cancelled(request_id)
+
         for iteration in range(max_iterations):
+            if _cancelled():
+                return
+
             # Stream tool names for user visibility
             for tc in response.tool_calls:
                 yield f"\U0001f527 Calling {tc.name}...\n"
@@ -1372,6 +1386,14 @@ class OrchestratorEngineMixin:
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id,
             )
+
+            if _cancelled():
+                # Tool batch finished cleanly; skip synthesis. The user
+                # already saw the "🔧 Calling X..." markers and any
+                # pre-tool prose; the assistant turn persists with that
+                # partial visible text plus the ``cancelled`` metadata
+                # marker set by the persist helper.
+                return
 
             all_tools = self._build_all_tools()
             messages = self._prune_orchestrator_messages(messages, all_tools)
@@ -1423,6 +1445,10 @@ class OrchestratorEngineMixin:
                     model_override=effective_model,
                     session_id=session_id,
                 ):
+                    if _cancelled():
+                        # #1256: stop pulling tokens from the synthesis
+                        # call when the user hit stop mid-stream.
+                        break
                     yield chunk
                 return
 
