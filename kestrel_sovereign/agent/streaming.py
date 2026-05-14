@@ -507,7 +507,22 @@ class StreamingMixin:
             )
             final_assistant_text = tool_final_text
             stop_tool_results: Optional[list] = tool_results
-            stop_tool_calls: Optional[list] = tool_calls_payload
+            # Derive stop_tool_calls from the accumulated tool_results
+            # envelopes rather than from `tool_calls_payload`. The payload
+            # only carries the FIRST iteration's calls — multi-iteration
+            # tool flows (model calls A, sees result, calls B) would
+            # otherwise produce a STOP payload where `tool_results` has
+            # rows that `tool_calls` doesn't, forcing subscribers back to
+            # storage to reconstruct the chain (codex review on the
+            # initial enrichment).
+            stop_tool_calls: Optional[list] = [
+                {
+                    "id": env.get("tool_call_id"),
+                    "name": env.get("name"),
+                    "arguments": env.get("arguments"),
+                }
+                for env in (tool_results or [])
+            ] or None
         else:
             # No tool calls - text was already streamed above. Pre-tool
             # prose / tool_calls / tool_results all stay None: a hook

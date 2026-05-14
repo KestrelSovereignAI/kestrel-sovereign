@@ -167,13 +167,15 @@ async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fir
 
     # The orchestrator-streaming generator's signature accepts
     # ``tool_results`` as an out-parameter — our mock populates it the
-    # same way the real orchestrator would.
+    # same way the real orchestrator would. Envelope shape includes
+    # ``arguments`` so STOP can derive tool_calls from the same list.
     async def _orchestrator_stream(*, tool_results=None, **kwargs):
         if tool_results is not None:
             tool_results.append(
                 {
                     "tool_call_id": "tc-A",
                     "name": "github_view",
+                    "arguments": {"issue": 1238},
                     "result": {"status": "ok", "data": {"title": "the issue"}},
                 }
             )
@@ -195,14 +197,75 @@ async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fir
     # Meridian self-recall fix). STOP carries the same text.
     assert "Looking that up." in (stop.response_text or "")
     assert "Found it." in (stop.response_text or "")
-    # Tool calls populated with id/name/arguments shape.
+    # Tool calls derived from accumulated tool_results envelopes —
+    # name/arguments/id line up by index.
     assert stop.tool_calls is not None and len(stop.tool_calls) == 1
     assert stop.tool_calls[0]["name"] == "github_view"
     assert stop.tool_calls[0]["arguments"] == {"issue": 1238}
+    assert stop.tool_calls[0]["id"] == "tc-A"
     # Tool results carry the envelope the dispatcher recorded.
     assert stop.tool_results is not None and len(stop.tool_results) == 1
     assert stop.tool_results[0]["name"] == "github_view"
     assert stop.tool_results[0]["result"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_streaming_stop_hook_captures_chained_tool_iterations():
+    """Multi-iteration tool flow (model calls A, sees result, calls B)
+    must produce a STOP payload where tool_calls and tool_results line up
+    by index across all iterations — not just the first. Without this,
+    subscribers see tool_results rows with no matching call metadata and
+    fall back to storage queries (codex review caught this on v1)."""
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+
+    captured: list[HookInput] = []
+    agent = _build_streaming_mock_agent(stop_captured=captured)
+
+    async def _stream_with_initial_tool(**kwargs):
+        yield "Step one. "
+        yield LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc-A", name="lookup_a", arguments={"q": "first"})],
+        )
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = _stream_with_initial_tool
+
+    # Orchestrator stream simulates the second iteration: after lookup_a
+    # returns, the model decides to call lookup_b. Both envelopes get
+    # appended to tool_results, even though only lookup_a appears in the
+    # initial LLMResponse.
+    async def _orchestrator_stream(*, tool_results=None, **kwargs):
+        if tool_results is not None:
+            tool_results.append({
+                "tool_call_id": "tc-A",
+                "name": "lookup_a",
+                "arguments": {"q": "first"},
+                "result": {"status": "ok"},
+            })
+            tool_results.append({
+                "tool_call_id": "tc-B",
+                "name": "lookup_b",
+                "arguments": {"q": "second"},
+                "result": {"status": "ok"},
+            })
+        yield "All done."
+
+    agent._handle_orchestrator_response_streaming = _orchestrator_stream
+
+    async for _ in agent.process_input_streaming("chain please", session_id="s-chain"):
+        pass
+
+    assert len(captured) == 1
+    stop = captured[0]
+    assert stop.tool_calls is not None and len(stop.tool_calls) == 2
+    assert stop.tool_results is not None and len(stop.tool_results) == 2
+    # Index alignment: tool_calls[i] matches tool_results[i].
+    for i in range(2):
+        assert stop.tool_calls[i]["id"] == stop.tool_results[i]["tool_call_id"]
+        assert stop.tool_calls[i]["name"] == stop.tool_results[i]["name"]
+    assert {tc["name"] for tc in stop.tool_calls} == {"lookup_a", "lookup_b"}
 
 
 @pytest.mark.asyncio

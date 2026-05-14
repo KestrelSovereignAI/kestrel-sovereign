@@ -516,6 +516,7 @@ class OrchestratorEngineMixin:
                 tool_results.append({
                     "tool_call_id": tool_call.id,
                     "name": tool_name,
+                    "arguments": args,
                     "result": summarize_tool_result_for_audit(serialized_result),
                 })
             await OrchestratorEngineMixin._log_tool_dispatch(
@@ -614,6 +615,7 @@ class OrchestratorEngineMixin:
             tool_results.append({
                 "tool_call_id": tool_call.id,
                 "name": tool_name,
+                "arguments": args,
                 "result": summarize_tool_result_for_audit(serialized_result),
             })
 

@@ -2044,16 +2044,24 @@ Expected Duration: {expected_duration}
         # storage to reconstruct the turn that just completed. Mirrors
         # the streaming path's STOP fire in agent/streaming.py.
         if self.hooks_manager:
-            stop_tool_calls = None
-            if isinstance(response, LLMResponse) and response.tool_calls:
-                stop_tool_calls = [
+            # Derive stop_tool_calls from the accumulated tool_results
+            # envelopes so multi-iteration tool flows (model calls A, sees
+            # the result, then calls B) produce a payload where tool_calls
+            # and tool_results line up by index — building from
+            # ``response.tool_calls`` alone would only capture the first
+            # iteration (codex review on the initial enrichment).
+            stop_tool_calls = (
+                [
                     {
-                        "id": tc.id,
-                        "name": tc.name,
-                        "arguments": tc.arguments,
+                        "id": env.get("tool_call_id"),
+                        "name": env.get("name"),
+                        "arguments": env.get("arguments"),
                     }
-                    for tc in response.tool_calls
+                    for env in stop_tool_results
                 ]
+                if stop_tool_results
+                else None
+            )
             hook_input = HookInput(
                 session_id=session_id or "",
                 hook_event_name=HookEvent.STOP.value,
