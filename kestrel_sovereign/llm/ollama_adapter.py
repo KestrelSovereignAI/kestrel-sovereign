@@ -20,7 +20,6 @@ from .adapter import (
     ThinkingContentSplitter,
     ThinkingDelta,
     ToolCall,
-    should_split_plain_reasoning,
     split_thinking_from_content,
 )
 from .model_metadata import ModelInfo, ModelCategory
@@ -148,13 +147,7 @@ class OllamaAdapter(LLMAdapter):
             else:
                 content = None
 
-            should_split_thinking = (
-                content
-                and (
-                    "<think" in content.lower()
-                    or should_split_plain_reasoning(model)
-                )
-            )
+            should_split_thinking = content and "<think" in content.lower()
             if (
                 response_format is None
                 and not kwargs.get("_preserve_thinking_content")
@@ -297,12 +290,7 @@ class OllamaAdapter(LLMAdapter):
 
             chunk_count = 0
             response_accum = ""
-            splitter = ThinkingContentSplitter(
-                provider="ollama",
-                split_plain_reasoning=(
-                    response_format is None and should_split_plain_reasoning(model)
-                ),
-            )
+            splitter = ThinkingContentSplitter(provider="ollama")
             async for chunk in stream:
                 content = None
                 if isinstance(chunk, dict):
@@ -403,10 +391,7 @@ class OllamaAdapter(LLMAdapter):
 
                 # No tool calls - yield the text content and we're done
                 if response.content:
-                    should_split_thinking = (
-                        "<think" in response.content.lower()
-                        or should_split_plain_reasoning(model)
-                    )
+                    should_split_thinking = "<think" in response.content.lower()
                     if not should_split_thinking:
                         yield response.content
                         return
