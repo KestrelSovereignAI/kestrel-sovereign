@@ -293,6 +293,35 @@ async def lifespan(app: FastAPI):
             app.state.agent_manager = manager
             app.state.agent = None  # No single default agent
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
+
+            # Lifecycle hardening (#377): surface per-agent init failures
+            # — without this, a multi-agent host whose providers all failed
+            # would report healthy startup while every agent was mute.
+            init_failures = manager.init_failures
+            if init_failures and loaded == 0:
+                # Every configured agent failed to initialize. Treat the
+                # whole host as broken so /health reports it.
+                _set_startup_error(
+                    app,
+                    RuntimeError(
+                        "Multi-agent startup: no agents initialized. "
+                        f"{len(init_failures)} failures — "
+                        + "; ".join(
+                            f"{name}: {type(exc).__name__}: {exc}"
+                            for name, exc in init_failures[:5]
+                        )
+                    ),
+                )
+            elif init_failures:
+                # Partial failure: some agents up, some not. Log loudly so
+                # operators see the gap. Not a startup error (the host can
+                # still serve the agents that did come up), but the partial
+                # state must be visible in logs.
+                for name, exc in init_failures:
+                    logger.error(
+                        f"Multi-agent partial failure: agent '{name}' failed "
+                        f"to initialize — {type(exc).__name__}: {exc}"
+                    )
         except Exception as e:
             logger.error(f"Error during multi-agent startup: {e}", exc_info=True)
             app.state.agent_manager = None
