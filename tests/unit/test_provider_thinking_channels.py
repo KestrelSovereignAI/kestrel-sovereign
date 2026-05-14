@@ -112,6 +112,108 @@ async def test_ollama_streaming_splits_think_tags(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ollama_streaming_emits_native_thinking_field(monkeypatch):
+    monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
+    adapter = OllamaAdapter()
+
+    async def stream():
+        # Mirrors what Ollama emits for Gemma 4 / gpt-oss: per-chunk
+        # `message.thinking` deltas while `content` is empty, then a
+        # final chunk with the user-facing content.
+        yield {"message": {"thinking": "The user is asking ", "content": ""}}
+        yield {"message": {"thinking": "for 2+2.", "content": ""}}
+        yield {"message": {"thinking": "", "content": "4."}}
+
+    async def chat(**kwargs):
+        return stream()
+
+    client = SimpleNamespace(chat=chat)
+
+    items = []
+    async for item in adapter.get_streaming_response(
+        client=client,
+        model="gemma4:31b",
+        messages=[{"role": "user", "content": "2+2?"}],
+    ):
+        items.append(item)
+
+    thinking_events = [e for e in items if isinstance(e, ThinkingDelta)]
+    assert [e.content for e in thinking_events] == [
+        "The user is asking ",
+        "for 2+2.",
+    ]
+    assert all(e.provider == "ollama" for e in thinking_events)
+    assert "".join(e for e in items if isinstance(e, str)) == "4."
+
+
+@pytest.mark.asyncio
+async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatch):
+    monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
+    adapter = OllamaAdapter()
+
+    def _chunk(thinking: str = "", content: str = ""):
+        return SimpleNamespace(
+            message=SimpleNamespace(thinking=thinking, content=content)
+        )
+
+    async def stream():
+        yield _chunk(thinking="step 1 ", content="")
+        yield _chunk(thinking="step 2.", content="")
+        yield _chunk(thinking="", content="final")
+
+    async def chat(**kwargs):
+        return stream()
+
+    client = SimpleNamespace(chat=chat)
+
+    items = []
+    async for item in adapter.get_streaming_response(
+        client=client,
+        model="gemma4:31b",
+        messages=[{"role": "user", "content": "test"}],
+    ):
+        items.append(item)
+
+    thinking_events = [e for e in items if isinstance(e, ThinkingDelta)]
+    assert [e.content for e in thinking_events] == ["step 1 ", "step 2."]
+    assert "".join(e for e in items if isinstance(e, str)) == "final"
+
+
+@pytest.mark.asyncio
+async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(monkeypatch):
+    monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
+    adapter = OllamaAdapter()
+
+    async def chat(**kwargs):
+        # Non-streaming response: native thinking field present, content clean,
+        # no tool calls. Wrapper should yield the thinking as a ThinkingDelta
+        # before yielding the visible content.
+        return {
+            "message": {
+                "thinking": "Plan: compute 2+2.",
+                "content": "4.",
+            }
+        }
+
+    client = SimpleNamespace(chat=chat)
+
+    items = []
+    async for item in adapter.get_streaming_response_with_tools(
+        client=client,
+        model="gemma4:31b",
+        messages=[{"role": "user", "content": "2+2?"}],
+        tools=[{"type": "function", "function": {"name": "noop"}}],
+    ):
+        items.append(item)
+
+    thinking = [e for e in items if isinstance(e, ThinkingDelta)]
+    assert len(thinking) == 1
+    assert thinking[0].content == "Plan: compute 2+2."
+    assert thinking[0].provider == "ollama"
+    assert "".join(e for e in items if isinstance(e, str)) == "4."
+
+
+@pytest.mark.asyncio
 async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch):
     monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
     adapter = OllamaAdapter()
