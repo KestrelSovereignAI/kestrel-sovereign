@@ -23,7 +23,6 @@ from .adapter import (
     ThinkingContentSplitter,
     ThinkingDelta,
     ToolCall,
-    should_split_plain_reasoning,
     split_thinking_from_content,
 )
 from .gpt5_overlay import prepend_gpt5_overlay
@@ -34,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 _split_thinking_from_content = split_thinking_from_content
 _ThinkingContentSplitter = ThinkingContentSplitter
-_should_split_plain_reasoning = should_split_plain_reasoning
 
 
 class OpenAIAdapter(LLMAdapter):
@@ -271,10 +269,7 @@ class OpenAIAdapter(LLMAdapter):
                 **extra_kwargs
             )
 
-            splitter = _ThinkingContentSplitter(
-                provider=self.name,
-                split_plain_reasoning=_should_split_plain_reasoning(model),
-            )
+            splitter = _ThinkingContentSplitter(provider=self.name)
             chunk_count = 0
             async for chunk in stream:
                 delta = chunk.choices[0].delta
@@ -397,10 +392,7 @@ class OpenAIAdapter(LLMAdapter):
             # Accumulator for tool calls - keyed by index
             # Each tool call arrives in chunks with the same index
             tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
-            splitter = _ThinkingContentSplitter(
-                provider=self.name,
-                split_plain_reasoning=_should_split_plain_reasoning(model),
-            )
+            splitter = _ThinkingContentSplitter(provider=self.name)
             text_content = ""
             chunk_count = 0
             input_tokens = None

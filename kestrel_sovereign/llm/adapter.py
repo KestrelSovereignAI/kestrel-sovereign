@@ -44,33 +44,21 @@ class ThinkingDelta:
     provider: Optional[str] = None
 
 
-REASONING_MARKERS = (
-    'The user', 'I should', 'I need to', 'Let me',
-    'I\'ll ', 'I will ', 'This is a', 'Since ',
-    'Looking at', 'Based on', 'I can see',
-    'Overall,', 'Now I', 'I have', 'Wait,',
-    'Constraints:', 'The constraints',
-)
-
-
-def looks_like_plain_reasoning(paragraph: str) -> bool:
-    stripped = paragraph.strip()
-    if stripped.startswith(('Constraints:', 'The constraints')):
-        return True
-    return (
-        any(stripped.startswith(m) for m in REASONING_MARKERS)
-        and not any(c in stripped for c in ['#', '|', '- ', '* ', '**'])
-    )
-
-
 def split_thinking_from_content(
     content: Optional[str],
     reasoning_content: Optional[str] = None,
 ) -> tuple[Optional[str], Optional[str]]:
-    """Return ``(thinking, final_content)`` from provider output."""
+    """Return ``(thinking, final_content)`` from provider output.
+
+    Recognises two structural signals: a provider-native
+    ``reasoning_content`` field and ``<think>…</think>`` tags inside
+    ``content``. Plain prose outside a tag is never reclassified as
+    reasoning — if a model leaks reasoning past ``</think>`` it stays
+    visible. Rely on llama.cpp's ``--reasoning-format deepseek`` or the
+    chat template to wrap reasoning correctly.
+    """
     thinking_parts = []
-    has_separate_reasoning = isinstance(reasoning_content, str) and bool(reasoning_content)
-    if has_separate_reasoning:
+    if isinstance(reasoning_content, str) and reasoning_content:
         thinking_parts.append(reasoning_content)
     if not content:
         return ("\n\n".join(thinking_parts).strip() or None), content
@@ -86,44 +74,22 @@ def split_thinking_from_content(
         flags=re.DOTALL | re.IGNORECASE,
     )
 
-    paragraphs = clean.split('\n\n')
-    if not has_separate_reasoning and len(paragraphs) >= 2:
-        visible = []
-        for paragraph in paragraphs:
-            if looks_like_plain_reasoning(paragraph):
-                thinking_parts.append(paragraph.strip())
-            else:
-                visible.append(paragraph)
-        if visible:
-            clean = '\n\n'.join(visible).strip()
-
     return ("\n\n".join(p for p in thinking_parts if p).strip() or None), clean
 
 
-def should_split_plain_reasoning(model: str) -> bool:
-    # These families are known to leak reasoning as plain visible paragraphs
-    # on some local/OpenAI-compatible servers, without native reasoning fields
-    # or <think> tags. Keep this narrowly family-scoped so normal prose from
-    # other models is not accidentally hidden in the UI.
-    model_l = (model or "").lower()
-    return (
-        "kimi" in model_l
-        or "deepseek-r1" in model_l
-        or "deepseek-reasoner" in model_l
-        or "qwen3" in model_l
-        or "qwq" in model_l
-    )
-
-
 class ThinkingContentSplitter:
-    """Streaming parser for provider reasoning channels and tag fallbacks."""
+    """Streaming parser for ``<think>…</think>`` tags in content streams.
 
-    def __init__(self, *, provider: str, split_plain_reasoning: bool = False):
+    Provider-native ``reasoning_content`` fields are surfaced upstream
+    of this splitter; this class only handles inline tag stripping.
+    Anything outside a ``<think>`` block passes through as visible
+    content unchanged.
+    """
+
+    def __init__(self, *, provider: str):
         self.provider = provider
-        self.split_plain_reasoning = split_plain_reasoning
         self.in_think = False
         self.tag_buffer = ""
-        self.plain_buffer = ""
 
     def feed(self, text: str):
         if not text:
@@ -165,11 +131,13 @@ class ThinkingContentSplitter:
                         break
                 plain = self.tag_buffer[:-keep] if keep else self.tag_buffer
                 self.tag_buffer = self.tag_buffer[-keep:] if keep else ""
-                events.extend(self._feed_plain(plain))
+                if plain:
+                    events.append(plain)
                 return events
 
             plain = self.tag_buffer[:start]
-            events.extend(self._feed_plain(plain))
+            if plain:
+                events.append(plain)
             self.tag_buffer = self.tag_buffer[start + len("<think>"):]
             self.in_think = True
 
@@ -181,32 +149,9 @@ class ThinkingContentSplitter:
             if self.in_think:
                 events.append(ThinkingDelta(self.tag_buffer, provider=self.provider))
             else:
-                events.extend(self._feed_plain(self.tag_buffer))
+                events.append(self.tag_buffer)
             self.tag_buffer = ""
-        if self.plain_buffer:
-            events.extend(self._emit_plain_paragraph(self.plain_buffer))
-            self.plain_buffer = ""
         return events
-
-    def _feed_plain(self, text: str):
-        if not text:
-            return []
-        if not self.split_plain_reasoning:
-            return [text]
-
-        events = []
-        self.plain_buffer += text
-        while "\n\n" in self.plain_buffer:
-            paragraph, self.plain_buffer = self.plain_buffer.split("\n\n", 1)
-            events.extend(self._emit_plain_paragraph(paragraph + "\n\n"))
-        return events
-
-    def _emit_plain_paragraph(self, paragraph: str):
-        if not paragraph:
-            return []
-        if looks_like_plain_reasoning(paragraph):
-            return [ThinkingDelta(paragraph.strip(), provider=self.provider)]
-        return [paragraph]
 
 
 __all__ = [
@@ -216,9 +161,7 @@ __all__ = [
     "ThinkingContentSplitter",
     "ToolCall",
     "build_messages",
-    "looks_like_plain_reasoning",
     "messages_for",
-    "should_split_plain_reasoning",
     "split_thinking_from_content",
 ]
 

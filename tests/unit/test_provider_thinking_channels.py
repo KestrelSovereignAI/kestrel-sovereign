@@ -112,7 +112,7 @@ async def test_ollama_streaming_splits_think_tags(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ollama_with_tools_splits_non_streaming_content(monkeypatch):
+async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch):
     monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
     adapter = OllamaAdapter()
 
@@ -137,10 +137,10 @@ async def test_ollama_with_tools_splits_non_streaming_content(monkeypatch):
     ):
         items.append(item)
 
-    assert isinstance(items[0], ThinkingDelta)
-    assert items[0].provider == "ollama"
-    assert items[0].content == "The user is asking for simple arithmetic."
-    assert "".join(item for item in items if isinstance(item, str)) == "4"
+    assert not any(isinstance(item, ThinkingDelta) for item in items)
+    assert "".join(item for item in items if isinstance(item, str)) == (
+        "The user is asking for simple arithmetic.\n\n4"
+    )
 
 
 @pytest.mark.asyncio
