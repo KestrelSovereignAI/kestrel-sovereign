@@ -1069,6 +1069,18 @@ class KestrelAgent(
 
             # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
+        # Lifecycle hardening (#377): refuse to declare initialization
+        # successful when no LLM provider came up. Lives here rather than in
+        # the server lifespan so single-agent, multi-agent (AgentManager),
+        # and direct-test boot paths all benefit. Runs at the end of
+        # initialize() so PayerPolicy has had a chance to set
+        # ``llm_service.disabled = True`` (carved out below in the check
+        # itself — PayerKind.NONE is a valid no-LLM configuration).
+        from kestrel_sovereign.lifecycle_checks import (
+            verify_llm_providers_initialized,
+        )
+        verify_llm_providers_initialized(self.llm_service)
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""

@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 import logging
 from kestrel_sovereign.main import get_agent_did_async
 from kestrel_sovereign.kestrel_agent import KestrelAgent
+from kestrel_sovereign.lifecycle_checks import verify_identity_isolation
 from kestrel_sovereign.llm.service import LLMService
 from dotenv import load_dotenv
 from slowapi import _rate_limit_exceeded_handler
@@ -292,6 +293,35 @@ async def lifespan(app: FastAPI):
             app.state.agent_manager = manager
             app.state.agent = None  # No single default agent
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
+
+            # Lifecycle hardening (#377): surface per-agent init failures
+            # — without this, a multi-agent host whose providers all failed
+            # would report healthy startup while every agent was mute.
+            init_failures = manager.init_failures
+            if init_failures and loaded == 0:
+                # Every configured agent failed to initialize. Treat the
+                # whole host as broken so /health reports it.
+                _set_startup_error(
+                    app,
+                    RuntimeError(
+                        "Multi-agent startup: no agents initialized. "
+                        f"{len(init_failures)} failures — "
+                        + "; ".join(
+                            f"{name}: {type(exc).__name__}: {exc}"
+                            for name, exc in init_failures[:5]
+                        )
+                    ),
+                )
+            elif init_failures:
+                # Partial failure: some agents up, some not. Log loudly so
+                # operators see the gap. Not a startup error (the host can
+                # still serve the agents that did come up), but the partial
+                # state must be visible in logs.
+                for name, exc in init_failures:
+                    logger.error(
+                        f"Multi-agent partial failure: agent '{name}' failed "
+                        f"to initialize — {type(exc).__name__}: {exc}"
+                    )
         except Exception as e:
             logger.error(f"Error during multi-agent startup: {e}", exc_info=True)
             app.state.agent_manager = None
@@ -309,6 +339,7 @@ async def lifespan(app: FastAPI):
                 storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
                 db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(storage_dir)
+                verify_identity_isolation(agent_did)
                 llm_service = LLMService()
                 app.state.agent = KestrelAgent(
                     did=agent_did,
@@ -321,6 +352,7 @@ async def lifespan(app: FastAPI):
                 storage_dir = os.environ.get("KESTREL_DB_PATH", os.getcwd())
                 db_path = os.path.join(storage_dir, "kestrel_prime.db")
                 agent_did = await get_agent_did_async(storage_dir)
+                verify_identity_isolation(agent_did)
                 llm_service = LLMService()
                 app.state.agent = KestrelAgent(
                     did=agent_did,
@@ -329,6 +361,9 @@ async def lifespan(app: FastAPI):
                 )
                 logger.info(f"Using SQLite backend for Kestrel: {db_path}")
 
+            # Lifecycle hardening: provider availability (#377) is verified
+            # inside KestrelAgent.initialize so every boot path — including
+            # the multi-agent AgentManager path above — gets the same check.
             await app.state.agent.initialize()
             logger.info(f"Kestrel Agent initialized and ready (backend: {db_backend})")
         except Exception as e:

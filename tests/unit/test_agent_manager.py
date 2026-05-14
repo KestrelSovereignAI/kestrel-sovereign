@@ -165,6 +165,62 @@ class TestLoadFromConfig:
         assert loaded == 0
         assert manager.get_agent("broken") is None
 
+    @pytest.mark.asyncio
+    @patch("kestrel_sovereign.multi_agent.agent_manager._get_agent_did", new_callable=AsyncMock)
+    @patch("kestrel_sovereign.multi_agent.agent_manager.KestrelAgent")
+    @patch("kestrel_sovereign.multi_agent.agent_manager.LLMService")
+    async def test_load_from_config_records_init_failures(
+        self, mock_llm_cls, mock_agent_cls, mock_get_did
+    ):
+        """Per-agent init failures are exposed via manager.init_failures so
+        the lifespan handler can surface them via /health (#377 lifecycle
+        hardening for multi-agent boot — codex review v3 followup).
+        """
+        from kestrel_sovereign.lifecycle_checks import NoLLMProvidersError
+
+        config = MultiAgentConfig(
+            agents={
+                "good": LocalAgentConfig(data_dir=Path("/tmp/good"), port=8801, autostart=True),
+                "muted": LocalAgentConfig(data_dir=Path("/tmp/muted"), port=8802, autostart=True),
+            }
+        )
+
+        mock_get_did.side_effect = ["did:good", "did:muted"]
+        good_agent = _make_mock_agent("did:good")
+        muted_agent = _make_mock_agent("did:muted")
+        # The muted agent's initialize raises the lifecycle hardening error.
+        muted_agent.initialize = AsyncMock(
+            side_effect=NoLLMProvidersError("no providers for muted")
+        )
+        mock_agent_cls.side_effect = [good_agent, muted_agent]
+
+        with patch.object(LocalAgentConfig, "validate_runtime", return_value=[]):
+            manager = AgentManager(base_data_dir=Path("/tmp"))
+            loaded = await manager.load_from_config(config)
+
+        assert loaded == 1
+        assert manager.get_agent("good") is good_agent
+        assert manager.get_agent("muted") is None
+
+        failures = manager.init_failures
+        assert len(failures) == 1
+        name, exc = failures[0]
+        assert name == "muted"
+        assert isinstance(exc, NoLLMProvidersError)
+        assert "no providers for muted" in str(exc)
+
+    @pytest.mark.asyncio
+    async def test_init_failures_resets_on_each_load(self):
+        """A fresh load_from_config call clears prior failures."""
+        manager = AgentManager(base_data_dir=Path("/tmp"))
+        manager._init_failures = [("stale", RuntimeError("from a previous run"))]
+
+        empty_config = MultiAgentConfig(agents={})
+        loaded = await manager.load_from_config(empty_config)
+
+        assert loaded == 0
+        assert manager.init_failures == []
+
 
 class TestCreateAgent:
     """Test create_agent (inception + load)."""

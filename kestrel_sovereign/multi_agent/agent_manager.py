@@ -57,6 +57,10 @@ class AgentManager:
         self._child_mandates: dict[str, SpawnMandate] = {}  # child_name -> mandate
         self._base_data_dir = base_data_dir or Path.cwd()
         self._lock = asyncio.Lock()
+        # Per-agent initialization failures recorded by load_from_config so
+        # the FastAPI lifespan can surface them via /health (#377 lifecycle
+        # hardening for multi-agent boot).
+        self._init_failures: list[tuple[str, Exception]] = []
 
     async def load_agent(self, name: str, config: LocalAgentConfig) -> KestrelAgent:
         """Create and initialize a KestrelAgent from a multi_agent config entry.
@@ -120,10 +124,17 @@ class AgentManager:
     async def load_from_config(self, config: MultiAgentConfig) -> int:
         """Load all autostart agents from a MultiAgentConfig.
 
+        Per-agent failures are recorded in ``self._init_failures`` so the
+        FastAPI lifespan handler can surface them via ``/health`` (lifecycle
+        hardening #377 — without this, a multi-agent host whose providers
+        all failed to initialize would silently report a healthy startup).
+
         Returns:
             Number of agents successfully loaded.
         """
         loaded = 0
+        # Reset failure list — fresh load attempt.
+        self._init_failures = []
         for name, agent_cfg in config.agents.items():
             if not isinstance(agent_cfg, LocalAgentConfig):
                 logger.info(f"Skipping remote agent '{name}' (not supported in-process)")
@@ -136,7 +147,16 @@ class AgentManager:
                 loaded += 1
             except Exception as e:
                 logger.error(f"Failed to load agent '{name}': {e}")
+                self._init_failures.append((name, e))
         return loaded
+
+    @property
+    def init_failures(self) -> list[tuple[str, Exception]]:
+        """Read-only view of per-agent initialization failures from the last
+        ``load_from_config`` call. Used by the FastAPI lifespan to surface
+        lifecycle errors (e.g. ``NoLLMProvidersError``) via ``/health``.
+        """
+        return list(self._init_failures)
 
     def get_agent(self, name: str) -> Optional[KestrelAgent]:
         """Get an agent by name (case-insensitive)."""
