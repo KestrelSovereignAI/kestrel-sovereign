@@ -478,6 +478,26 @@ export function initChat() {
     // Event listeners
     sendButton?.addEventListener('click', sendMessage);
 
+    // Ensure every external link rendered in chat opens in a new tab.
+    // Markdown links go through marked's renderer (already adds target=_blank),
+    // but anchors injected via innerHTML (system messages, notifications,
+    // tool-result HTML) bypass marked. A delegated listener on the chat
+    // container backstops both paths without preventing default — middle-click,
+    // Cmd-click, and right-click "open in new tab" keep their native behavior.
+    chatContainer?.addEventListener('click', (event) => {
+        const anchor = event.target instanceof Element
+            ? event.target.closest('a[href]')
+            : null;
+        if (!anchor) return;
+        const href = anchor.getAttribute('href') || '';
+        // Leave in-page anchors and javascript: hrefs alone.
+        if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) return;
+        if (anchor.getAttribute('target') !== '_blank') {
+            anchor.setAttribute('target', '_blank');
+            anchor.setAttribute('rel', 'noopener noreferrer');
+        }
+    });
+
     // Stop button for cancelling requests
     const stopButton = document.getElementById('stop-button');
     stopButton?.addEventListener('click', stopRequest);
