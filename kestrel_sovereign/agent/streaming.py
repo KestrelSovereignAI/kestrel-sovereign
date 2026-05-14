@@ -342,6 +342,19 @@ class StreamingMixin:
             system_prompt=system_prompt,
             session_id=session_id,
         ):
+            # #1256: Honor stop-button cancellation INSIDE the agent
+            # loop, not just at the HTTP response layer. Before this
+            # check existed, /api/agent/stop only set a flag that the
+            # endpoint generator inspected — the upstream LLM stream
+            # kept pulling tokens (and any tool-using turn kept
+            # dispatching tools with side effects) right through to
+            # completion. Breaking out here closes the underlying SDK
+            # stream and leaves ``tool_response is None`` so the
+            # has_tool_calls branch is skipped; partial text already in
+            # ``full_response`` flows through to the no-tools persist
+            # path below and the cancellation marker lands in metadata.
+            if request_id and self.is_request_cancelled(request_id):
+                break
             if isinstance(item, str):
                 # Text chunk - yield immediately for real-time streaming
                 full_response.append(item)
@@ -391,6 +404,21 @@ class StreamingMixin:
             duration_ms=llm_duration,
         )
 
+        # #1256: If the user hit Stop after the LLM finished but before
+        # we dispatched tools, skip the tool batch entirely. The tools
+        # are about to mutate state (send messages, write files, hit
+        # external APIs) — running them after the user said "stop" is
+        # the surprising-side-effect bug. Persist whatever pre-tool
+        # prose the LLM already yielded so the user can see what the
+        # agent had been about to do.
+        if has_tool_calls and request_id and self.is_request_cancelled(request_id):
+            cancelled_text = "".join(full_response)
+            await self._persist_assistant_turn_safely(
+                cancelled_text, metadata=None, session_id=session_id,
+                request_id=request_id,
+            )
+            return
+
         # Handle tool calls if present (A2A pattern)
         if has_tool_calls:
             logging.info(f"[AGENTIC-STREAM] Tool calls: {[tc.name for tc in tool_response.tool_calls]}")
@@ -420,12 +448,20 @@ class StreamingMixin:
                 tool_events=tool_events,
                 tool_results=tool_results,
                 session_id=session_id,
+                request_id=request_id,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     yield _build_thinking_sentinel(chunk)
                     continue
                 tool_response_chunks.append(chunk)
                 yield chunk
+                # #1256: belt-and-suspenders cancel check at the outer
+                # boundary. The inner orchestrator generator also checks
+                # ``is_request_cancelled`` at iteration boundaries; this
+                # outer break stops accumulating tokens if a cancel
+                # arrives between the inner check and the next yield.
+                if request_id and self.is_request_cancelled(request_id):
+                    break
             # Persist the FULL visible assistant text — pre-tool reasoning
             # the LLM emitted before deciding to call tools (full_response,
             # already yielded to the client at the first stream loop) plus
@@ -466,7 +502,8 @@ class StreamingMixin:
             )
             meta = {'tool_events': tool_events} if tool_events else None
             await self._persist_assistant_turn_safely(
-                tool_final_text, metadata=meta, session_id=session_id
+                tool_final_text, metadata=meta, session_id=session_id,
+                request_id=request_id,
             )
         else:
             # No tool calls - text was already streamed above. Pre-tool
@@ -479,7 +516,8 @@ class StreamingMixin:
                 final_text, session_id,
             )
             await self._persist_assistant_turn_safely(
-                final_text, metadata=None, session_id=session_id
+                final_text, metadata=None, session_id=session_id,
+                request_id=request_id,
             )
 
         # Fire STOP hook (streaming response cycle complete)
@@ -546,6 +584,7 @@ class StreamingMixin:
         text: str,
         metadata: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> None:
         """Persist the assistant turn under cancellation-safe handling.
 
@@ -563,7 +602,17 @@ class StreamingMixin:
         We never re-raise — the request is already over from the
         client's perspective; raising here would only mask the original
         cancellation.
+
+        When ``request_id`` is supplied and the request has been
+        cancelled by the user (stop button), stamp ``cancelled: True``
+        into the persisted metadata. The next turn's history loader and
+        any UI surface that re-renders the turn can then distinguish a
+        user-aborted partial from a normally-completed turn. The check
+        runs here rather than in the caller so the marker lands even on
+        the disconnect-before-persist path that the shield protects.
         """
+        if request_id and self.is_request_cancelled(request_id):
+            metadata = {**(metadata or {}), "cancelled": True}
         try:
             await asyncio.shield(
                 self.privacy_agent.add_conversation(
