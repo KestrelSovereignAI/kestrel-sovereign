@@ -127,8 +127,10 @@ function controlledStream() {
     let resolveNext = null;
     let buffer = [];
     let done = false;
+    let pendingError = null;
     const iter = (async function* () {
         while (true) {
+            if (pendingError) { const e = pendingError; pendingError = null; throw e; }
             if (buffer.length) { yield buffer.shift(); continue; }
             if (done) return;
             await new Promise((r) => { resolveNext = r; });
@@ -143,6 +145,13 @@ function controlledStream() {
         },
         end() {
             done = true;
+            if (resolveNext) resolveNext();
+        },
+        // Inject an error on the next __anext__ — used to simulate a
+        // mid-stream AbortError, the path stopAgent triggers through
+        // ``AbortController.abort()`` on the prior turn's fetch.
+        error(err) {
+            pendingError = err;
             if (resolveNext) resolveNext();
         },
     };
@@ -280,6 +289,100 @@ test('sendMessage does NOT call stopAgent when the agent is idle (#1255)', async
     );
     assert.ok(eventLog.includes('streamInvoke'),
         'streamInvoke must fire on a normal send');
+});
+
+
+test('concurrent sendMessage: prior turn\'s finally cannot un-mark the new turn as busy (#1255 race)', async () => {
+    // Codex/claude flagged: when the new sendMessage's stopAgent
+    // fires AbortController.abort() on the prior turn's fetch, both
+    // (a) the prior's catch/finally chain (which deletes from
+    // state.waitingAgents) and (b) the new turn's setup (which adds
+    // to state.waitingAgents) race. If the prior's finally fires
+    // AFTER the new turn's add, the agent would be silently
+    // un-marked as busy mid-stream — the visible spinner disappears
+    // and a subsequent interrupt attempt finds no busy state.
+    //
+    // The implementation relies on JS microtask ordering: abort()
+    // schedules a rejection microtask on the prior fetch, while
+    // ``await API.stop(...)`` schedules a macrotask (the POST). The
+    // microtask drain runs to completion before the macrotask
+    // resolves, so the prior's catch/finally completes BEFORE
+    // stopAgent returns. This test pins that ordering — if a future
+    // refactor breaks it (e.g., by removing the awaited /stop POST,
+    // or by making stopAgent resolve before the abort microtask
+    // drains), this test fails loudly.
+    getOrCreateChatPane('agent-race');
+    apiModule.default.setHostAgent('agent-race');
+    mountChatPane('agent-race');
+
+    // Prior turn: a controllable stream that hangs until we tell it
+    // to error out (simulating AbortController.abort propagating
+    // through the fetch).
+    const ctrlPrior = controlledStream();
+    apiModule.default.streamInvoke = (...args) => ctrlPrior.iter;
+    apiModule.default.invoke = async () => ({ response: '' });
+
+    messageInput.value = 'first turn';
+    const priorPromise = sendMessage();
+
+    // Let the prior turn set up: await addMessage, waitingAgents.add,
+    // enter the streamInvoke for-await. By this microtask checkpoint
+    // the prior is suspended at __anext__ on the controllable stream.
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(state.waitingAgents.has('agent-race'), true,
+        'precondition: prior turn must have marked the agent as busy');
+
+    // Wire up stopAgent's plumbing for the interrupt. abort() injects
+    // an AbortError into the prior's stream iterator; /stop POST
+    // resolves quickly. We deliberately make the abort propagation
+    // FAST (synchronous error injection on the next __anext__) and
+    // the /stop POST also fast — under these conditions the race
+    // window is widest.
+    apiModule.default.getStreamAbortController = () => ({
+        abort() {
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            ctrlPrior.error(err);
+        },
+        signal: {},
+    });
+    apiModule.default.getCurrentStreamRequestId = () => 'prior-req';
+    apiModule.default.stop = async () => ({ ok: true });
+
+    // New turn: a fresh controllable stream so we can hold the new
+    // dispatch in its streamInvoke await.
+    const ctrlNew = controlledStream();
+    apiModule.default.streamInvoke = (...args) => ctrlNew.iter;
+
+    messageInput.value = 'second turn';
+    const newPromise = sendMessage();
+
+    // Yield long enough for: stopAgent.abort, microtask drain (prior
+    // catch+finally fires + deletes from waitingAgents), stopAgent's
+    // /stop POST resolves, new turn's state.waitingAgents.add, new
+    // turn enters streamInvoke await.
+    await new Promise((r) => setTimeout(r, 20));
+
+    // CRITICAL invariant: after the interrupt has settled and the
+    // new turn is awaiting its stream, the agent MUST still be in
+    // waitingAgents (because the new turn re-added it). If the
+    // prior's finally raced and fired after the new turn's add, the
+    // agent would be missing here.
+    assert.equal(state.waitingAgents.has('agent-race'), true,
+        'after interrupt: new turn must have re-marked the agent ' +
+        'as busy, and the prior turn\'s late finally must not have ' +
+        'un-marked it');
+
+    // Cleanup: end the new stream so its sendMessage resolves.
+    ctrlNew.end();
+    await newPromise;
+    // Prior promise resolves via the AbortError throw -> catch path.
+    await priorPromise;
+
+    // Post-cleanup: both finallys have fired. The new turn's finally
+    // does the cleanup (matching dispatch); waitingAgents is empty.
+    assert.equal(state.waitingAgents.has('agent-race'), false,
+        'after both turns unwind, waitingAgents should be clean');
 });
 
 
