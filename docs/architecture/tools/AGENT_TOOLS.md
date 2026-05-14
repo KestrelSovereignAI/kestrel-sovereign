@@ -1,433 +1,180 @@
-# Agent Tools Documentation
+# Agent Tools
 
-> **⚠ DEPRECATED — describes a removed architecture.**
-> This doc covers the `AgentToolMixin` / `kestrel_agent_tools.py` /
-> top-level `tools/` directory pattern, all of which have been
-> removed. Tool delivery now happens through feature packages
-> registered via the `kestrel_sovereign.features` entry-point group
-> using the `@tool` decorator from `kestrel_sdk.features.base`.
->
-> See [`docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md`](../core/FEATURE_AGENT_FRAMEWORK.md)
-> for the modern pattern.
->
-> Rewrite tracked in [#1047](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1047);
-> kept here meanwhile for git-archaeology context.
+**Status:** Active
+**Last updated:** 2026-05-14
+**Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Agent Tools Implementation](AGENT_TOOLS_IMPLEMENTATION.md), [Feature Agent Framework](../core/FEATURE_AGENT_FRAMEWORK.md)
 
-## Overview
+Kestrel tools are actions exposed by features. They can be called by the
+orchestrator LLM, reached through command prefixes, or used by other runtime
+paths after feature discovery. The tool surface is dynamic: it depends on which
+core features are enabled and which optional feature packages are installed.
 
-Kestrel agents now have access to powerful tools that enhance their capabilities:
+For the canonical live inventory, use `KESTREL_FEATURES.md` and runtime feature
+discovery. This document explains the tool model and current categories rather
+than trying to maintain a complete hand-written catalog.
 
-1. **Web Search** - Real-time web search using Tavily API
-2. **Feedback & Diagnostics** - Self-observation and error tracking
-3. **Tool Usage Analytics** - Automatic tracking of tool performance
+## Tool Model
 
-These tools enable agents to:
-- Search the web for current information
-- Record their own observations and diagnostics
-- Track errors and capability gaps
-- Provide transparency into their tool usage
+| Term | Meaning |
+|---|---|
+| Tool | One `@tool`-decorated async method on a feature |
+| Feature | A bundle of tools, hooks, routers, config, and lifecycle behavior |
+| Feature dispatcher | The high-level tool that lets the orchestrator delegate to a feature |
+| Direct tool | An individual feature tool promoted into the LLM tool list |
+| ToolResult | The structured result envelope used by migrated tools |
 
-## Configuration
+The runtime starts with feature dispatcher tools to keep the LLM context small.
+Individual tools can be promoted after the feature has been explored or when a
+feature opts into startup promotion.
 
-### Environment Variables
+## Categories
 
-```bash
-# Required for web search
-export TAVILY_API_KEY="your-tavily-api-key"
+Tool categories come from `kestrel_sdk.tools.base.ToolCategory`:
 
-# Database (required for feedback tools)
-export DATABASE_URL="postgresql://user:pass@host:port/dbname"
-```
+- `MODEL_MANAGEMENT`
+- `FILE_OPERATIONS`
+- `WEB_SEARCH`
+- `MEMORY`
+- `COMMUNICATION`
+- `SYSTEM`
+- `DATA_ACCESS`
+- `COMPUTE`
+- `UTILITY`
+- `AGENT_MANAGEMENT`
 
-### Getting a Tavily API Key
+Categories help organize tools for schemas, docs, and UI. They are not a
+permission system by themselves; policy still belongs to privacy, security,
+consent, hooks, and feature-specific checks.
 
-1. Sign up at https://tavily.com
-2. Get your API key from the dashboard
-3. Add it to your `.env` file or export it
+## Result Envelope
 
-## Available Tools
-
-### 1. Web Search Tool
-
-Enables agents to perform real-time web searches and access current information.
-
-**Commands:**
-```
-!search <query>         - Search the web
-!web-search <query>     - Alternative search command
-```
-
-**Examples:**
-```
-!search latest developments in AI
-!web-search weather in San Francisco
-```
-
-**Features:**
-- AI-generated answer summaries
-- Top 5 relevant results with URLs
-- Content snippets from each result
-- Automatic search tracking in database
-
-**Response Format:**
-```
-🔍 Web Search Results for: 'your query'
-
-Summary: [AI-generated summary of findings]
-
-Found 5 results:
-
-1. [Title]
-   URL: [URL]
-   [Content snippet...]
-
-2. [Title]
-   ...
-
-(Search completed in XXXms)
-```
-
-### 2. Feedback & Diagnostic Tool
-
-Allows agents to record observations, track errors, and maintain self-diagnostics.
-
-**Commands:**
-```
-!feedback list [type] [severity]   - List feedback entries
-!feedback stats                     - View tool usage statistics
-!feedback record <type> <title> <content> - Manually record feedback
-```
-
-**Feedback Types:**
-- `observation` - General observations about user behavior or context
-- `diagnostic` - Self-diagnostic about internal state or performance
-- `tool_error` - Errors encountered while using tools
-- `user_feedback` - Feedback from the user
-- `self_reflection` - Agent's reflections on interactions
-- `capability_gap` - Identifies missing capabilities
-
-**Severity Levels:**
-- `info` - Informational only
-- `warning` - Potential issue
-- `error` - Error occurred
-- `critical` - Critical error
-
-### 3. Model Management Tools
-
-Tools for managing the agent's underlying AI models (via Ollama).
-
-**Commands:**
-```
-!list-models            - List all available models
-!pull-model <name>      - Download a new model (e.g., !pull-model llama3)
-!model-info <name>      - Get detailed info about a model
-!storage-status         - Check model storage usage
-!cleanup-models         - Remove unused models to free space
-```
-
-### 4. MCP (Model Context Protocol) Tools
-
-Tools for dynamically loading and using external capabilities via Docker containers.
-
-**Commands:**
-```
-!mcp-load <image>       - Load an MCP server from a Docker image
-!mcp-list               - List active MCP servers and tools
-!mcp-call <container> <tool> [json_args] - Execute a specific MCP tool
-!mcp-unload <container> - Stop an MCP server
-```
-
-### 5. Sovereignty Tools
-
-Tools for managing the agent's sovereign identity and data export.
-
-**Commands:**
-```
-!export-sovereignty [tier] - Export agent state to IPFS/Filecoin
-!import-sovereignty <cid>  - Restore agent state from an export
-!sovereignty-status        - Check export status and history
-```
-
-
-**Examples:**
-```
-!feedback list                                    # List all feedback
-!feedback list tool_error error                   # List tool errors
-!feedback stats                                   # View usage statistics
-!feedback record observation "User preference" "User prefers concise answers"
-```
-
-**Response Formats:**
-
-List feedback:
-```
-📝 Found 3 feedback entries:
-
-⏳ [ERROR] Web search failed
-   Type: tool_error | Source: tool
-   Created: 2025-11-07 15:30:00
-   Search failed: Connection timeout...
-
-✅ [INFO] User prefers technical details
-   Type: observation | Source: agent
-   Created: 2025-11-07 14:15:00
-   User consistently asks for code examples...
-```
-
-Tool stats:
-```
-📊 Tool Usage Statistics (Last 7 days):
-
-🔧 web_search
-   Total uses: 15 | Success rate: 93.3%
-   Successful: 14 | Failed: 1
-   Avg time: 850ms | Max time: 1500ms
-
-🔧 feedback_tool
-   Total uses: 8 | Success rate: 100.0%
-   Successful: 8 | Failed: 0
-   Avg time: 25ms | Max time: 50ms
-```
-
-### 3. Tool Discovery
-
-View all available tools and their status.
-
-**Command:**
-```
-!tools    - List all available tools
-```
-
-**Example Response:**
-```
-🔧 Available Tools:
-
-🔍 Web Search: ✅ Enabled
-   Commands: !search <query>, !web-search <query>
-   Powered by: Tavily API
-
-📝 Feedback & Diagnostics: ✅ Enabled
-   Commands: !feedback list|stats|record
-   Features: Self-diagnostics, observations, tool error tracking
-```
-
-### 4. MCP Tool Manager (Coming Soon)
-
-Enables agents to dynamically discover, install, and use tools from the Docker MCP Hub.
-
-**Commands:**
-```
-!mcp-search <query>     - Search for tools on Docker Hub
-!mcp-install <image>    - Install an MCP server image
-!mcp-list               - List installed MCP servers
-!mcp-start <image>      - Start an MCP server
-!mcp-stop <image>       - Stop an MCP server
-```
-
-**Features:**
-- Access to the entire ecosystem of Model Context Protocol tools
-- Sandboxed execution in Docker containers
-- Dynamic capability expansion without code changes
-
-## Programmatic Tool Access
-
-### For Agent Developers
-
-Agents can use tools programmatically (not just via commands):
+Migrated tools return `ToolResult`:
 
 ```python
-# Web search
-result = await agent.web_search.search_and_format("query", max_results=5)
+from kestrel_sdk.tools.result import ToolResult
 
-# Record observation
-await agent.record_observation(
-    title="User interaction pattern",
-    content="User frequently asks follow-up questions",
-    severity=FeedbackSeverity.INFO,
-    tags=["interaction", "pattern"]
-)
-
-# Record capability gap
-await agent.record_capability_gap(
-    missing_capability="image generation",
-    context="User asked for diagram creation",
-    workaround="Provided text description instead"
-)
-
-# Track tool usage
-await agent.record_tool_usage(
-    tool_name="custom_tool",
-    success=True,
-    execution_time_ms=250,
-    input_params={"param": "value"},
-    output_result={"result": "data"}
+return ToolResult.ok(
+    confirmation="Indexed 3 documents.",
+    data={"documents": 3},
 )
 ```
 
-## Database Schema
+The envelope has four fields:
 
-### agent_feedback Table
-Stores all feedback, observations, and diagnostics.
+- `status`: `ok`, `partial`, or `error`
+- `confirmation`: user-facing success/caveat text when available
+- `error`: failure or caveat text when available
+- `data`: structured machine-readable payload
 
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| companion_id | UUID | Reference to companion |
-| user_id | UUID | Reference to user |
-| feedback_type | VARCHAR(50) | Type of feedback |
-| severity | VARCHAR(20) | Severity level |
-| source | VARCHAR(50) | Source (agent/user/system/tool) |
-| title | VARCHAR(255) | Short title |
-| content | TEXT | Detailed content |
-| context | JSONB | Additional JSON context |
-| tags | TEXT[] | Searchable tags |
-| is_resolved | BOOLEAN | Resolution status |
-| created_at | TIMESTAMPTZ | Creation timestamp |
-| updated_at | TIMESTAMPTZ | Update timestamp |
+Use the constructors:
 
-### tool_usage Table
-Tracks all tool executions and performance.
+- `ToolResult.ok(...)` for complete success
+- `ToolResult.partial(...)` for partial success or a caveat
+- `ToolResult.failed(...)` for failure
 
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| companion_id | UUID | Reference to companion |
-| user_id | UUID | Reference to user |
-| tool_name | VARCHAR(100) | Name of tool |
-| success | BOOLEAN | Whether tool succeeded |
-| input_params | JSONB | Input parameters |
-| output_result | JSONB | Output/result |
-| error_message | TEXT | Error if failed |
-| execution_time_ms | INTEGER | Execution time |
-| conversation_context | TEXT | What triggered the tool |
-| created_at | TIMESTAMPTZ | Creation timestamp |
+The dynamic wrapper serializes this envelope before it reaches downstream
+callers.
 
-### web_searches Table
-History of web searches performed by agents.
+## Commands
 
-| Column | Type | Description |
-|--------|------|-------------|
-| id | UUID | Primary key |
-| companion_id | UUID | Reference to companion |
-| user_id | UUID | Reference to user |
-| query | TEXT | Search query |
-| search_provider | VARCHAR(50) | Provider (tavily) |
-| results | JSONB | Array of search results |
-| result_count | INTEGER | Number of results |
-| conversation_context | TEXT | Why search was performed |
-| created_at | TIMESTAMPTZ | Creation timestamp |
+A tool can opt into command-style invocation with `command_prefix`:
 
-## Privacy & Security
+```python
+@tool(
+    name="web_search",
+    description="Search the web",
+    category=ToolCategory.WEB_SEARCH,
+    command_prefix="!search",
+)
+async def web_search(self, query: str) -> ToolResult:
+    ...
+```
 
-### Data Retention
+Commands are convenience affordances layered on top of the same feature-owned
+tool. They should not duplicate tool logic.
 
-- Feedback entries persist until manually resolved or deleted
-- Tool usage data retained for analytics (configurable)
-- Web search history retained for context (configurable)
-- All data respects companion privacy modes (ephemeral, isolated, normal)
+## Where Tools Come From
 
-### Multi-Tenant Isolation
+Current tool sources include:
 
-- All tool data is scoped to companion_id and user_id
-- Row-level security ensures users only access their own data
-- Agents cannot access other users' tool data or feedback
+- core features under `kestrel_sovereign/features/`
+- optional feature packages registered in `kestrel_sovereign.features`
+- provider implementations registered in provider-specific entry-point groups
+  and surfaced by their owning features
 
-### API Key Security
+Examples of feature-owned domains include web search, model management, memory,
+security, channels, delivery, tasks, peers, spawn, workflows, compute, and
+response audit. Optional packages add domains such as MCP, wallet, GitHub,
+observability, voice, reflection, council, visual, code, and cloud providers
+when installed.
 
-- Tavily API key stored as environment variable
-- Never exposed to users or logs
-- Validated at tool initialization
+## Adding a Tool
 
-## Best Practices
+Add tools inside a feature:
 
-### For Agent Developers
+1. Choose the owning feature or create a new feature package.
+2. Add an async method decorated with `@tool`.
+3. Return `ToolResult` for new or migrated tools.
+4. Add tests for direct method execution and `Feature.get_tools()` execution.
+5. Use a command prefix only when users or operators need stable command syntax.
+6. Keep feature-specific HTTP endpoints in `get_router()`, not in unrelated
+   core server imports.
 
-1. **Always check tool availability** before using:
-   ```python
-   if hasattr(agent, 'web_search') and agent.web_search.enabled:
-       result = await agent.web_search.search(query)
-   ```
+Minimal shape:
 
-2. **Record capability gaps** when users ask for unavailable features:
-   ```python
-   await agent.record_capability_gap(
-       missing_capability="image generation",
-       context=user_query
-   )
-   ```
+```python
+from kestrel_sdk.features.base import tool
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature
 
-3. **Track tool usage** for debugging:
-   ```python
-   start = time.time()
-   try:
-       result = await some_tool()
-       await agent.record_tool_usage(
-           tool_name="some_tool",
-           success=True,
-           execution_time_ms=int((time.time() - start) * 1000)
-       )
-   except Exception as e:
-       await agent.record_tool_usage(
-           tool_name="some_tool",
-           success=False,
-           error_message=str(e)
-       )
-   ```
 
-### For Users
+class ExampleFeature(Feature):
+    @property
+    def tool_description(self) -> str:
+        return "Demonstrate a feature-owned tool"
 
-1. **Use `!tools`** to see what's available
-2. **Use `!feedback stats`** to understand agent tool usage
-3. **Review feedback** to see what the agent has observed
-4. **Provide feedback** using `!feedback record`
+    async def initialize(self):
+        pass
 
-## Troubleshooting
+    @tool("example_echo", "Echo text back", ToolCategory.UTILITY)
+    async def example_echo(self, text: str) -> ToolResult:
+        """Echo text back.
 
-### Web Search Not Working
+        Args:
+            text: Text to echo.
+        """
+        return ToolResult.ok(
+            confirmation="Echoed text.",
+            data={"text": text},
+        )
+```
 
-**Issue:** `❌ Web search is not available`
+## Honesty Expectations
 
-**Solution:**
-1. Check TAVILY_API_KEY is set: `echo $TAVILY_API_KEY`
-2. Verify API key is valid at https://tavily.com
-3. Restart the server after setting the key
+Tool narration must be grounded in observed results:
 
-### Feedback Tool Not Working
+- before a tool returns, use present-progressive language such as "Saving that
+  now" or "Looking that up"
+- after a tool returns, reflect its actual `ToolResult`
+- if the status is `partial` or `error`, surface the caveat plainly
+- do not claim a save, send, delete, publish, or other action succeeded unless
+  the result confirms it
 
-**Issue:** `❌ Feedback tool is not available`
+The prompt, result envelope, streaming `ToolCallStarted` boundary, and
+`ResponseAuditHook` all exist to make this honest behavior enforceable.
 
-**Solution:**
-1. Check DATABASE_URL is set
-2. Verify database connection
-3. Run migrations: Database tables are auto-created on startup
-4. Check logs for database errors
+## What Remains Host-Owned
 
-### Tool Commands Not Responding
+The framework owns:
 
-**Issue:** Commands like `!search` return no response
+- feature discovery and lifecycle
+- the runtime tool catalog
+- direct-tool promotion and eviction
+- hook dispatch and signal dispatch
+- prompt guardrails and response audit
+- shared policy surfaces such as privacy, consent, and security
 
-**Solution:**
-1. Verify tools are initialized: Check agent has `init_tools()` called
-2. Check for errors in server logs
-3. Ensure agent class is `KestrelAgent` with `AgentToolMixin`
-
-## Future Enhancements
-
-Planned tool additions:
-- [ ] Image generation tool (DALL-E, Stable Diffusion)
-- [ ] Document analysis tool (PDF, images)
-- [ ] Calculator/computation tool
-- [ ] Memory search tool (semantic search)
-- [ ] Code execution sandbox
-- [ ] File upload/download tools
-
-## API Reference
-
-See:
-- `/tools/web_search.py` - WebSearchTool implementation
-- `/tools/feedback_tool.py` - FeedbackTool implementation
-- `/kestrel_agent_tools.py` - AgentToolMixin integration
-
----
-
-*Last Updated: November 7, 2025*
+Feature packages own their tools and domain behavior. Provider packages own
+provider implementations. Keep those boundaries intact when adding new
+capability.

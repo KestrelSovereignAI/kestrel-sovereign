@@ -1,324 +1,196 @@
-# Agent Tools Implementation Summary
+# Agent Tools Implementation
 
-> **⚠ DEPRECATED — describes a removed architecture.**
-> The files this doc references (`/tools/web_search.py`,
-> `/tools/feedback_tool.py`, `kestrel_agent_tools.py`,
-> `AgentToolMixin`, the top-level `tools/` directory) have all
-> been removed. Tools now ship through feature packages
-> registered via the `kestrel_sovereign.features` entry-point
-> group with the `@tool` decorator from `kestrel_sdk.features.base`.
->
-> See [`docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md`](../core/FEATURE_AGENT_FRAMEWORK.md)
-> for the modern pattern.
->
-> Rewrite tracked in [#1047](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1047);
-> kept here meanwhile for git-archaeology context.
+**Status:** Active implementation map
+**Last updated:** 2026-05-14
+**Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Building Features](../../guides/BUILDING_FEATURES.md), [SDK README](https://github.com/KestrelSovereignAI/kestrel-sovereign-sdk#readme)
 
-**Date:** November 7, 2025
-**Status:** ✅ Complete and Ready for Testing/Deployment
+This document maps the modern tool system to the files on `main`. It is not an
+installation checklist for a separate tool layer. Tools are implemented inside
+features and discovered by the runtime.
 
-## Overview
+## Core Files
 
-Implemented comprehensive tool capabilities for Kestrel agents, enabling:
-1. **Web Search** - Real-time web search using Tavily API
-2. **Feedback & Diagnostics** - Agent self-observation and error tracking
-3. **Tool Analytics** - Automatic performance tracking and statistics
+| Area | File | Responsibility |
+|---|---|---|
+| Feature base and tool wrapping | `kestrel_sovereign/features/base.py` | `Feature`, lifecycle methods, `get_tools()`, `DynamicTool`, `tool()` compatibility export |
+| Feature discovery | `kestrel_sovereign/features/__init__.py` | local feature discovery plus `kestrel_sovereign.features` entry points |
+| Runtime tool catalog | `kestrel_sovereign/agent/tool_registry.py` | feature dispatcher tools, direct-tool promotion, hiding, eviction |
+| Result contract validation | `kestrel_sovereign/tools/result_contract.py` | scoped validator for migrated `@tool -> ToolResult` modules |
+| Command bridge | `kestrel_sovereign/command_handler.py` | command-prefix execution and `ToolResult` envelope rendering |
+| Honesty prompt | `kestrel_sovereign/security/input_guardrails.py` | `TOOL_HONESTY_SYSTEM_PROMPT` and prompt assembly |
+| Narration check | `kestrel_sovereign/security/narration_check.py` | deterministic pre-tool prose vs tool-result analysis |
+| Response audit hook | `kestrel_sovereign/features/response_audit/` | hook that applies audit and narration-risk checks |
 
-## What Was Implemented
+The SDK owns the shared data structures imported by these files:
 
-### 1. Core Tool Modules
+- `kestrel_sdk.features.base.Feature`
+- `kestrel_sdk.features.base.tool`
+- `kestrel_sdk.tools.base.AgentTool`
+- `kestrel_sdk.tools.base.ToolCategory`
+- `kestrel_sdk.tools.base.ToolParameter`
+- `kestrel_sdk.tools.base.ToolSchema`
+- `kestrel_sdk.tools.result.ToolResult`
+- `kestrel_sdk.tools.result.ToolResultStatus`
 
-#### `/tools/web_search.py`
-- `WebSearchTool` class for Tavily API integration
-- Async web search with configurable results (1-10)
-- AI-generated answer summaries
-- Formatted output for LLM consumption
-- Error handling and timeout management
+## Writing a Tool
 
-#### `/tools/feedback_tool.py`
-- `FeedbackTool` class for agent diagnostics
-- Multiple feedback types:
-  - `observation` - User behavior patterns
-  - `diagnostic` - Agent internal state
-  - `tool_error` - Tool execution errors
-  - `user_feedback` - User-provided feedback
-  - `self_reflection` - Agent reflections
-  - `capability_gap` - Missing capabilities
-- Severity levels: info, warning, error, critical
-- Tool usage tracking with performance metrics
-- Web search history tracking
-
-#### `/tools/__init__.py`
-- Clean exports for easy importing
-- Singleton pattern for tool instances
-
-### 2. Agent Integration
-
-#### `/kestrel_agent_tools.py`
-- `AgentToolMixin` class for adding tools to KestrelAgent
-- Chat commands:
-  - `!search <query>` / `!web-search <query>` - Web search
-  - `!feedback list [type] [severity]` - List feedback entries
-  - `!feedback stats` - View tool usage statistics
-  - `!feedback record <type> <title> <content>` - Record feedback
-  - `!tools` - List available tools
-- Programmatic API methods:
-  - `record_observation()` - Record agent observations
-  - `record_capability_gap()` - Track missing capabilities
-  - `record_tool_usage()` - Track tool performance
-- Automatic error logging to feedback system
-
-### 3. Database Schema
-
-#### New Tables (auto-created on server startup)
-
-**agent_feedback**
-- Stores all feedback, observations, and diagnostics
-- Fields: type, severity, source, title, content, context (JSONB), tags, resolution status
-- Indexes: companion_id, feedback_type, severity, tags (GIN), unresolved
-
-**tool_usage**
-- Tracks all tool executions and performance
-- Fields: tool_name, success, input/output (JSONB), error, execution_time_ms
-- Indexes: companion_id, tool_name, success
-
-**web_searches**
-- History of web searches
-- Fields: query, provider, results (JSONB), result_count, context
-- Indexes: companion_id, created_at
-
-### 4. Server Integration
-
-#### `/kestrel/server.py` Updates
-- Import `AgentToolMixin` and create enhanced `KestrelAgent` class
-- Initialize tools on agent creation with `init_tools()`
-- Database migration for new tables (runs on startup)
-- Tool command handling in chat endpoint
-- Indexes for optimal query performance
-
-### 5. Dependencies
-
-#### `pyproject.toml` Updates
-Added:
-- `httpx>=0.27.0` - Async HTTP client for Tavily API
-- `tavily-python>=0.3.0` - Official Tavily Python SDK
-
-### 6. Documentation
-
-#### `/docs/AGENT_TOOLS.md`
-- Comprehensive tool documentation
-- Usage examples for all commands
-- Programmatic API reference
-- Database schema documentation
-- Privacy & security guidelines
-- Troubleshooting guide
-- Best practices
-
-#### `/examples/tool_usage_example.py`
-- Working example script
-- Demonstrates web search and feedback tools
-- Shows programmatic usage patterns
-- Database connection examples
-
-#### `.env.example` Updates
-- Added `TAVILY_API_KEY` configuration
-- Instructions for obtaining API key
-
-### 7. Migration Files
-
-#### `/kestrel/migrations/add_agent_feedback.sql`
-- Standalone SQL migration file
-- Can be run manually if needed
-- Includes all indexes and comments
-- Auto-update trigger for updated_at
-
-## How It Works
-
-### For Users (Chat Interface)
-
-1. **Web Search:**
-   ```
-   User: !search latest AI developments
-   Agent: 🔍 Web Search Results for: 'latest AI developments'
-
-   Summary: [AI-generated summary]
-
-   Found 5 results:
-   1. Title...
-      URL: ...
-      Content...
-   ```
-
-2. **View Tools:**
-   ```
-   User: !tools
-   Agent: 🔧 Available Tools:
-
-   🔍 Web Search: ✅ Enabled
-   📝 Feedback & Diagnostics: ✅ Enabled
-   ```
-
-3. **Check Tool Stats:**
-   ```
-   User: !feedback stats
-   Agent: 📊 Tool Usage Statistics (Last 7 days):
-
-   🔧 web_search
-      Total uses: 15 | Success rate: 93.3%
-      Avg time: 850ms
-   ```
-
-### For Agents (Programmatic)
+A tool is an async feature method decorated with `@tool`. The method signature
+and docstring become the JSON schema shown to the model.
 
 ```python
-# Initialize agent with tools
-agent = KestrelAgent(...)
-agent.init_tools(pg_pool=pool, user_id=uid, companion_id=cid)
+from kestrel_sdk.features.base import tool
+from kestrel_sdk.tools.base import ToolCategory
+from kestrel_sdk.tools.result import ToolResult
+from kestrel_sovereign.features.base import Feature
 
-# Use web search
-result = await agent.web_search.search_and_format("query")
 
-# Record observations
-await agent.record_observation(
-    title="User prefers concise answers",
-    content="Observed pattern over 10 interactions",
-    tags=["user_preference", "interaction"]
-)
+class NotesFeature(Feature):
+    @property
+    def tool_description(self) -> str:
+        return "Create and inspect short notes"
 
-# Record capability gaps
-await agent.record_capability_gap(
-    missing_capability="image generation",
-    context="User requested diagram",
-    workaround="Provided text description"
-)
+    async def initialize(self):
+        self.notes = []
+
+    @tool(
+        name="note_add",
+        description="Save a short note",
+        category=ToolCategory.MEMORY,
+        command_prefix="!note-add",
+    )
+    async def note_add(self, text: str) -> ToolResult:
+        """Save a short note.
+
+        Args:
+            text: Note text to save.
+        """
+        self.notes.append(text)
+        return ToolResult.ok(
+            confirmation="Saved note.",
+            data={"count": len(self.notes)},
+        )
 ```
 
-## Configuration Required
+Use `ToolResult.ok()` when the action succeeded, `ToolResult.partial()` when
+there is a usable result with a caveat, and `ToolResult.failed()` when the tool
+could not complete the requested action.
 
-### Environment Variables
+## Registration and Execution
 
-```bash
-# Required for web search
-export TAVILY_API_KEY="tvly-xxxxxxxxxxxxx"
+`Feature.get_tools()` discovers decorated methods on a feature instance. For
+each method it creates a `DynamicTool` wrapper with:
 
-# Required for feedback tools (Kestrel already has this)
-export DATABASE_URL="postgresql://user:pass@host:port/dbname"
+- `name` from the decorator
+- `schema` from SDK `ToolSchema`
+- `execute(**kwargs)` that calls the feature method
+- optional A2A `AgentSkill` metadata
+
+When a method returns `ToolResult`, `DynamicTool.execute()` serializes it with
+`to_dict()` and returns a JSON-safe wrapper:
+
+```python
+{
+    "success": true,
+    "result": {
+        "status": "ok",
+        "confirmation": "Saved note.",
+        "error": null,
+        "data": {"count": 1}
+    },
+    "tool": "note_add"
+}
 ```
 
-### Getting Tavily API Key
+For `ToolResultStatus.ERROR`, the wrapper sets top-level `success` to `False`
+and copies the error to the top level for older callers. For
+`ToolResultStatus.PARTIAL`, the wrapper keeps `success` true but also surfaces
+the caveat in `error`.
 
-1. Visit https://tavily.com
-2. Sign up for free account
-3. Copy API key from dashboard
-4. Add to `.env` file or environment
+## Discovery Sources
 
-## Testing Checklist
+Core features are discovered from `kestrel_sovereign/features/`.
 
-- [ ] Install dependencies: `uv pip install httpx tavily-python`
-- [ ] Set `TAVILY_API_KEY` environment variable
-- [ ] Start local server: `python kestrel/server.py`
-- [ ] Test web search: Send `!search test query`
-- [ ] Test tools list: Send `!tools`
-- [ ] Test feedback: Send `!feedback stats`
-- [ ] Verify database tables created
-- [ ] Check tool usage tracking in DB
-- [ ] Test error handling (invalid search, missing API key)
+External feature packages register here:
 
-## Deployment Steps
+```toml
+[project.entry-points."kestrel_sovereign.features"]
+notes = "kestrel_feature_notes.feature:NotesFeature"
+```
 
-1. **Update Dependencies:**
-   ```bash
-   cd ./
-   uv pip install -e .
-   ```
+Provider packages register in provider-specific groups when they extend a
+registry rather than shipping a whole feature:
 
-2. **Set Environment Variables:**
-   ```bash
-   # Add to Cloud Run environment
-   TAVILY_API_KEY=tvly-xxxxx
-   ```
+```toml
+[project.entry-points."kestrel_sovereign.cloud_providers"]
+[project.entry-points."kestrel_sovereign.voice_providers"]
+[project.entry-points."kestrel_sovereign.storage_providers"]
+```
 
-3. **Build and Deploy:**
-   ```bash
-   cd kestrel
-   uv run kestrel deploy build
-   uv run kestrel deploy dev
-   ./scripts/test_environment.sh dev https://dev.YOUR_DOMAIN.com
-   ```
+The framework's own `pyproject.toml` declares these groups so package managers
+and feature authors have stable targets.
 
-4. **Verify:**
-   - Create companion
-   - Send `!tools` command
-   - Test web search with `!search AI news`
-   - Check `!feedback stats`
+## ToolResult Migration Guard
 
-## Files Created/Modified
+`kestrel_sovereign/tools/result_contract.py` contains
+`MIGRATED_FEATURE_MODULES`, a scoped allowlist of modules whose `@tool` methods
+must annotate `-> ToolResult`. The validator runs when direct tools are
+registered.
 
-### New Files
-- `/tools/web_search.py` - Web search tool implementation
-- `/tools/feedback_tool.py` - Feedback and diagnostics tool
-- `/tools/__init__.py` - Tool exports
-- `/kestrel_agent_tools.py` - Agent tool mixin
-- `/docs/AGENT_TOOLS.md` - Comprehensive documentation
-- `/examples/tool_usage_example.py` - Usage examples
-- `/kestrel/migrations/add_agent_feedback.sql` - Migration file
-- `/AGENT_TOOLS_IMPLEMENTATION.md` - This file
+This keeps the migration incremental:
 
-### Modified Files
-- `/pyproject.toml` - Added httpx and tavily-python
-- `/kestrel/server.py` - Tool integration, database migrations
-- `/.env.example` - Added TAVILY_API_KEY
+- unmigrated modules can continue returning legacy data while they are being
+  converted
+- migrated modules fail fast if a new tool forgets the `ToolResult` contract
+- extracted feature packages can be guarded by dotted module name just like
+  in-tree modules
 
-## Benefits
+The escape hatch `KESTREL_TOOL_RESULT_CONTRACT_WARN_ONLY=1` downgrades failures
+to warnings for emergency rollback only.
 
-### For Users
-- Agents can access real-time information via web search
-- Transparency into agent tool usage and performance
-- Agents can identify their own limitations
-- Better error tracking and debugging
+## Commands
 
-### For Developers
-- Easy to add new tools following the same pattern
-- Built-in tracking for all tool executions
-- Database-backed analytics and diagnostics
-- Clean separation of concerns (tools vs agent logic)
+Command prefixes are metadata on individual tools, not a separate command-tool
+class. A decorated method can set `command_prefix="!something"`. The command
+handler resolves matching tools and renders a `ToolResult` envelope into CLI
+text for command-style use.
 
-### For the Platform
-- Tool usage metrics for optimization
-- Error patterns for debugging
-- Capability gap analysis for roadmap planning
-- Privacy-respecting tool tracking (multi-tenant isolated)
+Prefer command prefixes for stable operator affordances. Do not build a parallel
+command framework for a feature package.
 
-## Future Enhancements
+## Testing
 
-Potential additions using the same pattern:
-- Image generation tool (DALL-E, Stable Diffusion)
-- Document analysis tool (PDF reader, OCR)
-- Calculator/computation tool
-- Memory search tool (semantic search across all memories)
-- Code execution sandbox
-- Calendar/scheduling tool
-- Email/notification tool
+Recommended tests for a feature-owned tool:
 
-## Security & Privacy
+- instantiate the feature with a minimal mocked agent
+- call the decorated method directly and assert the `ToolResult` status
+- call `feature.get_tools()` and execute the wrapper to verify schema and
+  serialization
+- test command-prefix rendering when the tool is command-addressable
+- add the feature module to `MIGRATED_FEATURE_MODULES` only after all tools in
+  that module return `ToolResult`
 
-- All tool data scoped to user_id and companion_id
-- Row-level security ensures multi-tenant isolation
-- API keys stored as environment variables only
-- Web search history retained per privacy mode
-- Tool errors logged without exposing sensitive data
-- No user data sent to external services (only search queries)
+Useful existing tests:
 
-## Performance Considerations
+- `tests/unit/test_dynamic_tool_execute_toolresult.py`
+- `tests/unit/test_feature_inventory_contracts.py`
+- `tests/unit/test_feature_startup_promotion.py`
+- `tests/unit/test_tool_result_contract.py`
+- `tests/unit/test_response_audit.py`
 
-- Web search: ~800ms average (Tavily API latency)
-- Feedback recording: <50ms (database write)
-- Tool stats: <100ms (database aggregation)
-- Async/await throughout for non-blocking operations
-- Connection pooling for database efficiency
-- Indexes on all frequently-queried fields
+## Packaging Checklist
 
----
+For an out-of-tree feature package:
 
-**Ready for:** Local testing and cloud deployment
-**Next Steps:** Set TAVILY_API_KEY, test locally, deploy to dev, promote to prod
+1. Depend on `kestrel-sovereign-sdk`.
+2. Expose one or more `Feature` subclasses.
+3. Register the feature in `kestrel_sovereign.features`.
+4. Return `ToolResult` from migrated tool methods.
+5. Include tests that execute both the feature method and the dynamic wrapper.
+6. Publish the package independently; do not add it as a framework dependency.
+
+For a provider package:
+
+1. Depend on the SDK or owning provider contract.
+2. Register under the provider-specific entry-point group.
+3. Keep the feature that consumes the provider responsible for user-facing
+   tools and policy.
