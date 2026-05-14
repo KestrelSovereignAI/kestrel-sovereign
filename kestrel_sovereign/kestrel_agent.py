@@ -1996,7 +1996,13 @@ Expected Duration: {expected_duration}
                 }
             )
 
-        # Handle tool calls if present (A2A pattern)
+        # Handle tool calls if present (A2A pattern). ``stop_tool_results``
+        # is populated in place by ``_execute_tool_batch`` so the STOP
+        # HookInput below carries the same tool envelopes the LLM saw —
+        # mirrors the streaming path and gives per-turn subscribers
+        # (e.g. kestrel-feature-reflection #1238) everything they need
+        # without a round-trip through storage.
+        stop_tool_results: list = []
         response_text = await self._handle_orchestrator_response(
             response=response,
             feature_tools=feature_tools,
@@ -2005,6 +2011,7 @@ Expected Duration: {expected_duration}
             effective_model=effective_model,
             user_message=prompt,  # Pass original user message for subagent context
             session_id=session_id,
+            tool_results=stop_tool_results,
         )
 
         # Fire POST_RESPONSE hooks (e.g., response audit)
@@ -2028,11 +2035,32 @@ Expected Duration: {expected_duration}
         # Phase 2 (async): Temporal analysis + associative linking — background
         await self._post_response_pipeline(user_input, response_text, session_id)
 
-        # Fire STOP hook (response cycle complete)
+        # Fire STOP hook (response cycle complete).
+        #
+        # STOP HookInput carries the turn's user message, the final visible
+        # assistant text, and (when applicable) tool_calls + tool_results
+        # so per-turn subscribers — e.g. the kestrel-feature-reflection
+        # `on_stop` handler for #1238 — don't have to round-trip through
+        # storage to reconstruct the turn that just completed. Mirrors
+        # the streaming path's STOP fire in agent/streaming.py.
         if self.hooks_manager:
+            stop_tool_calls = None
+            if isinstance(response, LLMResponse) and response.tool_calls:
+                stop_tool_calls = [
+                    {
+                        "id": tc.id,
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    }
+                    for tc in response.tool_calls
+                ]
             hook_input = HookInput(
                 session_id=session_id or "",
                 hook_event_name=HookEvent.STOP.value,
+                user_message=user_input,
+                response_text=response_text,
+                tool_calls=stop_tool_calls,
+                tool_results=stop_tool_results or None,
             )
             await self.hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input

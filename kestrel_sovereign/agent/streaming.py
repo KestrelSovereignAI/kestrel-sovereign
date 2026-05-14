@@ -505,6 +505,9 @@ class StreamingMixin:
                 tool_final_text, metadata=meta, session_id=session_id,
                 request_id=request_id,
             )
+            final_assistant_text = tool_final_text
+            stop_tool_results: Optional[list] = tool_results
+            stop_tool_calls: Optional[list] = tool_calls_payload
         else:
             # No tool calls - text was already streamed above. Pre-tool
             # prose / tool_calls / tool_results all stay None: a hook
@@ -519,13 +522,33 @@ class StreamingMixin:
                 final_text, metadata=None, session_id=session_id,
                 request_id=request_id,
             )
+            final_assistant_text = final_text
+            stop_tool_results = None
+            stop_tool_calls = None
 
-        # Fire STOP hook (streaming response cycle complete)
+        # Fire STOP hook (streaming response cycle complete).
+        #
+        # STOP HookInput carries the turn's user message, the final visible
+        # assistant text, and (when applicable) tool_calls + tool_results
+        # so per-turn subscribers — e.g. the kestrel-feature-reflection
+        # `on_stop` handler for #1238 — don't have to round-trip through
+        # storage to reconstruct the turn that just completed. Without
+        # this, every subscriber would issue its own query against
+        # `conversation_history` / `a2a_tool_dispatches` at hook-fire
+        # time, multiplying read load and risking races with the
+        # persistence write above. SDK HookInput already declares
+        # `user_message`, `response_text`, `tool_calls`, `tool_results`
+        # fields (used by POST_RESPONSE) — we're just populating them
+        # for STOP too.
         hooks_manager = getattr(self, "hooks_manager", None)
         if hooks_manager:
             hook_input = HookInput(
                 session_id=session_id or "",
                 hook_event_name=HookEvent.STOP.value,
+                user_message=user_input,
+                response_text=final_assistant_text,
+                tool_calls=stop_tool_calls,
+                tool_results=stop_tool_results,
             )
             await hooks_manager.execute_hooks_parallel(
                 HookEvent.STOP, hook_input
