@@ -180,6 +180,43 @@ async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_ollama_with_tools_suppresses_thinking_under_structured_output(monkeypatch):
+    monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
+    adapter = OllamaAdapter()
+
+    from pydantic import BaseModel
+
+    class Answer(BaseModel):
+        value: int
+
+    async def chat(**kwargs):
+        return {
+            "message": {
+                "thinking": "Plan: emit JSON.",
+                "content": '{"value": 4}',
+            }
+        }
+
+    client = SimpleNamespace(chat=chat)
+
+    items = []
+    async for item in adapter.get_streaming_response_with_tools(
+        client=client,
+        model="gemma4:31b",
+        messages=[{"role": "user", "content": "2+2?"}],
+        tools=[{"type": "function", "function": {"name": "noop"}}],
+        response_format=Answer,
+    ):
+        items.append(item)
+
+    # Structured-output mode must not leak the thinking field — callers
+    # expect a clean JSON stream parseable by the response_format model.
+    # Content is the Pydantic-revalidated form, which is the compact JSON.
+    assert not any(isinstance(item, ThinkingDelta) for item in items)
+    assert "".join(item for item in items if isinstance(item, str)) == '{"value":4}'
+
+
+@pytest.mark.asyncio
 async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(monkeypatch):
     monkeypatch.setattr(ollama_module, "OLLAMA_AVAILABLE", True)
     adapter = OllamaAdapter()

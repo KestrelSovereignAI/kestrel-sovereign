@@ -423,10 +423,14 @@ class OllamaAdapter(LLMAdapter):
                     yield response
                     return
 
-                # No tool calls - yield native thinking (if any) + text content
-                native_thinking, _ = _extract_message_fields(response.raw)
-                if native_thinking:
-                    yield ThinkingDelta(native_thinking, provider="ollama")
+                # No tool calls - yield native thinking (if any) + text content.
+                # Structured-output mode suppresses thinking to keep the
+                # caller's JSON stream clean (matches the regular streaming
+                # path's `response_format is None` guard).
+                if response_format is None:
+                    native_thinking, _ = _extract_message_fields(response.raw)
+                    if native_thinking:
+                        yield ThinkingDelta(native_thinking, provider="ollama")
                 if response.content:
                     should_split_thinking = "<think" in response.content.lower()
                     if not should_split_thinking:
