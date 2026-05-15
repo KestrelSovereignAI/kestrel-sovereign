@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-14
-**Scope:** 1628 tracked files (991 `.py`, 261 `.md`, 376 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-15
+**Scope:** 1536 tracked files (992 `.py`, 260 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -427,7 +427,7 @@ Repo entry points and standard project files.
   - `class ApprovalStatus`; `class ApprovalRequest`; `class ApprovalQueue`
 - **kestrel_sovereign/features/security/component.yaml** — (configuration)
 - **kestrel_sovereign/features/security/feature.py** — Kestrel Security Feature - Main feature class.
-  - `class SecurityFeature`
+  - `def default_permission_for_feature(feature_name, fallback)`; `class SecurityFeature`
 - **kestrel_sovereign/features/security/hooks.py** — Kestrel Security - Security Hook Implementation.
   - `class SecurityHook`
 - **kestrel_sovereign/features/security/permissions.py** — Kestrel Security - Hierarchical Permission Storage.
@@ -599,9 +599,11 @@ Repo entry points and standard project files.
   - `class LLMRequest`; `class LLMResponse`; `class LLMProvider`; `class LLMService`
 - **kestrel_sovereign/kestrel_types/storage_types.py** — Storage Protocol definitions.
   - `class DatabaseProvider`; `class StorageProvider`; `class ConversationStore`
+- **kestrel_sovereign/lifecycle_checks.py** — Startup lifecycle hardening checks.
+  - `class NoLLMProvidersError`; `class IdentityIsolationError`; `def verify_llm_providers_initialized(llm_service)`; `def verify_identity_isolation(db_did, expected_did)`
 - **kestrel_sovereign/llm/LLM_SERVICE_HARDENING.md** — LLM Service Hardening Implementation — ## Overview
 - **kestrel_sovereign/llm/adapter.py** — Framework-side LLM adapter base.
-  - `class ThinkingDelta`; `def looks_like_plain_reasoning(paragraph)`; `def split_thinking_from_content(content, reasoning_content)`; `def should_split_plain_reasoning(model)`; `class ThinkingContentSplitter`; `def build_messages(user_prompt, system_prompt)`; `def messages_for(adapter)`; `class LLMAdapter`
+  - `class ThinkingDelta`; `def split_thinking_from_content(content, reasoning_content)`; `class ThinkingContentSplitter`; `def build_messages(user_prompt, system_prompt)`; `def messages_for(adapter)`; `class LLMAdapter`
 - **kestrel_sovereign/llm/anthropic_adapter.py** — Anthropic Claude Adapter
   - `class AnthropicAdapter`
 - **kestrel_sovereign/llm/claude_max_adapter.py** — Claude Max Subscription Adapter
@@ -796,6 +798,7 @@ Repo entry points and standard project files.
   - `class ScopedConstitution`
 - **kestrel_sovereign/sql_utils.py** — Shared SQL safety utilities.
   - `def safe_table_name(name)`; `def safe_column_name(name)`
+- **kestrel_sovereign/static/favicon-dark.svg** — —
 - **kestrel_sovereign/static/favicon.ico** — —
 - **kestrel_sovereign/static/favicon.svg** — —
 - **kestrel_sovereign/static/index.css** — (css asset)
@@ -968,8 +971,6 @@ Repo entry points and standard project files.
   - `def build_stable_system_prompt()`; `async def one_turn(client, base_url, messages)`; `async def run_benchmark(base_url, turns)`; `def main()`
 - **scripts/bench_prompt_cache_providers.py** — Multi-provider prompt-cache benchmark for issue #703.
   - `class TurnResult`; `class ProviderResult`
-- **scripts/build_logo_assets.py** — Build the Kestrel logo asset bundle (SVG + PNG + ICO) from a source PNG.
-  - `class PaletteEntry`; `def extract_palette(rgb, k)`; `def classify_palette(palette)`; `def background_mask(rgb, tol)`; `def colour_mask(rgb, target, bg, tolerance)`; `def drop_small_components(mask, min_area)`; `def trace_mask_to_paths(mask)`; `class TracedLayer`; `…`
 - **scripts/ci/__init__.py** — —
 - **scripts/ci/analyze_and_comment.py** — Analyze test feedback and post PR comment with insights.
   - `def get_feedback_entries(db_path)`; `def analyze_patterns(entries)`; `def format_pr_comment(insights, failures)`; `def post_pr_comment(comment)`; `def main()`
@@ -989,8 +990,6 @@ Repo entry points and standard project files.
   - `def print_token_usage(session)`; `def load_council_config()`; `def build_sqlite_evidence()`; `async def run_council_session()`
 - **scripts/create_insight_tickets.py** — Create GitHub issues from reflection insights.
   - `async def main()`
-- **scripts/generate_branding_suite.py** — Generate the full Kestrel ecosystem branding suite using Nano Banana Pro.
-  - `def load_reference_image()`; `def generate_image(prompt, output_path, model, ref_image)`; `def main()`
 - **scripts/generate_feature_docs.py** — Generate audience-specific feature docs from the canonical KESTREL_FEATURES.md.
   - `def get_client_and_model(model_override, refresh_discovery)`; `def generate(audience, model_override, dry_run, refresh_discovery)`; `def main()`
 - **scripts/generate_logos.py** — Generate Kestrel Sovereign logo concepts using Nano Banana 2 (Gemini 3.1 Flash Image Preview).
@@ -1035,8 +1034,6 @@ Repo entry points and standard project files.
   - `def main()`
 - **scripts/setup_demo_agent.py** — Create a fresh demo agent for the technical demo (Issue #133, Track A).
   - `def build_demo_kestrel_toml()`; `async def main()`
-- **scripts/smooth_svg_paths.py** — Smooth jagged SVG paths by resampling and re-fitting bezier curves.
-  - `def tokenize_path(d)`; `def parse_path(d)`; `def eval_cubic_bezier(p0, p1, p2, p3, …)`; `def subpath_to_polyline(subpath, samples_per_segment)`; `def rdp_simplify(points, epsilon)`; `def fit_cubic_bezier(points)`; `def fit_bezier_chain(points, max_error, max_segment_points)`; `def smooth_polyline(points, window)`; `…`
 - **scripts/submit_ipfs_gen.py** — Submit generation jobs using IPFS CIDs to Vertex AI.
   - `async def main()`
 - **scripts/submit_nurse_gen.py** — Submit generation jobs to Vertex AI using GCS LoRAs.
@@ -1048,8 +1045,6 @@ Repo entry points and standard project files.
   - `class RepoConfig`; `class DaemonConfig`; `class DaemonStats`; `def load_config(path, overrides)`; `def get_gh_token(gh_user)`; `def list_claimable_issues(repo, label, gh_token)`; `def build_talon_command(repo_config, issue_number, daemon_config)`; `async def process_issue(repo_config, issue, daemon_config, gh_token)`; `…`
 - **scripts/test_runpod_e2e_companion.py** — E2E Test: RunPod LoRA Training Workflow
   - `class E2ETestRunner`; `def main()`
-- **scripts/trace_logo.py** — Trace Kestrel logo PNG to SVG using color segmentation and contour detection.
-  - `def load_image(path)`; `def get_dominant_colors(img_rgb, n_colors)`; `def rgb_to_hex(rgb)`; `def create_color_mask(img_rgb, target_color, tolerance)`; `def contours_to_svg_paths(contours, color_hex, min_area)`; `def trace_color_layer(mask, color_hex, min_area)`; `def trace_with_potrace(mask, color_hex)`; `def contours_to_svg_paths_with_hierarchy(contours, hierarchy, color_hex, min_area)`; `…`
 - **scripts/train_luna_lora.py** — Train Luna's LoRA on the persistent RunPod pod.
   - `async def get_db_pool()`; `async def fetch_luna_avatar(pool)`; `async def submit_training(avatar_data)`; `async def poll_training_status(job_id)`; `async def download_lora(job_id)`; `async def store_lora(pool, companion_id, lora_data, trigger_word)`; `async def main()`
 - **scripts/train_sally_lora_gcp.py** — Train Sally's LoRA using GCP Compute A100 80GB.
@@ -1165,6 +1160,7 @@ Repo entry points and standard project files.
 - **docs/architecture/core/AGENT_ECOSYSTEM.md** — PRD: The Kestrel Agent Ecosystem — ## 1.
 - **docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md** — PRD: Feature Agent Framework — ## 1.
 - **docs/architecture/core/INFRASTRUCTURE.md** — Kestrel Development Infrastructure — Complete toolkit for accelerated parallel development with Claude Code.
+- **docs/architecture/core/MODULAR_RUNTIME.md** — Modular Runtime Boundary — **Status:** Contract scaffold **Parent issues:** #413, #416, #419 **Last updated:** 2026-05-14
 - **docs/architecture/core/MULTI_MODEL_SUPPORT.md** — PRD: Multi-Model Foundational Support — > **Historical PRD — preserved for context, do not follow as guidance.** This describes the *original* multi-model support architecture from initial build.
 - **docs/architecture/economics/AGENT_ECONOMICS.md** — Agent Economics: Autonomous Economic Entities — ## 1.
 - **docs/architecture/economics/ECONOMICS_WORK_SESSION.md** — Economics Work Session – Kestrel / Sovereign Agents — **Purpose:** Shared scratchpad for coordinating between top-level models (and humans) on Kestrel / Kestrel economics: pricing, fee containment (LLM, Runpod, Filecoin, infra), revenue distribution (pl…
@@ -1196,9 +1192,9 @@ Repo entry points and standard project files.
 - **docs/architecture/subagent_isolation_audit.md** — Subagent Isolation Audit — **Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569) **Phase:** 1 (Audit Only -- No…
 - **docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md** — LLM Router Enhancement - Comprehensive Testing Plan — ## Testing Philosophy - **REAL TESTS ONLY - NO MOCKS** - Tests use real Ollama (localhost:11434), real OpenAI API, real filesystem - Tests create and verify real data - Tests measure real performance…
 - **docs/architecture/testing/TESTING_GUIDE.md** — Kestrel Test Strategy Guide — A comprehensive guide to running and writing tests for Kestrel Sovereign.
-- **docs/architecture/tools/AGENT_TOOLS.md** — Agent Tools Documentation — > **⚠ DEPRECATED — describes a removed architecture.** This doc covers the `AgentToolMixin` / `kestrel_agent_tools.py` / top-level `tools/` directory pattern, all of which have been removed.
-- **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — Agent Tools Architecture - Design Document — > **⚠ DEPRECATED — describes a removed architecture.** The Phase 1-4 implementation centred on `AgentToolMixin` (`kestrel_agent_tools.py`), `tools/registry.py`, and the legacy top-level `tools/` dire…
-- **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — Agent Tools Implementation Summary — > **⚠ DEPRECATED — describes a removed architecture.** The files this doc references (`/tools/web_search.py`, `/tools/feedback_tool.py`, `kestrel_agent_tools.py`, `AgentToolMixin`, the top-level `too…
+- **docs/architecture/tools/AGENT_TOOLS.md** — Agent Tools — **Status:** Active **Last updated:** 2026-05-14 **Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Agent Tools Implementation](AGENT_TOOLS_IMPLEMENTATION.md), [Feature Agent Frame…
+- **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — Agent Tools Architecture — **Status:** Active **Last updated:** 2026-05-14 **Related:** [Feature Agent Framework](../core/FEATURE_AGENT_FRAMEWORK.md), [Modular Runtime Boundary](../core/MODULAR_RUNTIME.md), [SDK README](https:…
+- **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — Agent Tools Implementation — **Status:** Active implementation map **Last updated:** 2026-05-14 **Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Building Features](../../guides/BUILDING_FEATURES.md), [SDK R…
 - **docs/architecture/ui_label_inventory.md** — UI Label Inventory — Catalog of every user-facing string in the Kestrel Sovereign main console, classified for the theme + i18n system (epic #986).
 - **docs/architecture/ui_theme_schema.md** — UI Theme File Schema — Theme files define the user-facing labels for the Kestrel UI under the theme + i18n system established by epic #986.
 - **docs/archive/KESTREL_FEATURES_legacy.md** — Kestrel Sovereign Legacy Feature Catalog — > Historical snapshot of the pre-canonical feature catalog.
@@ -1270,31 +1266,11 @@ Repo entry points and standard project files.
 - **docs/demos/DEMO_SCRIPT.md** — Kestrel Sovereign - Demo Script — **Issue #133 — Track A: Technical Demo** **Duration:** ~2 minutes automated, 10-12 minutes with live narration **Closer:** *"In 30 minutes you can have your own agent running with all of this active.…
 - **docs/deployment/README.md** — Deployment Operations — How to build, deploy, and update Kestrel Sovereign on Cloud Run.
 - **docs/deployment/prometheus-workflows-alerts.yml** — (configuration)
-- **docs/design/ECOSYSTEM_BRAND_GUIDE.md** — Kestrel Ecosystem Brand Guide — ## The Metaphor
-- **docs/design/KESTREL LOGO -PDF.pdf** — —
 - **docs/design/KESTREL_LOGO.png** — —
-- **docs/design/KESTREL_LOGO_ASCII_CONCEPT.md** — Kestrel Logo - ASCII Art Representation — **Date:** November 11, 2025 **Purpose:** Visual concept representation **Note:** This is a text-based approximation of the logo design
-- **docs/design/KESTREL_LOGO_DESIGN_SPEC.md** — Kestrel Logo Design Specification — **Date:** November 11, 2025 **Designer:** AI Assistant **Client:** Kestrel Sovereign AI Platform **Version:** 1.0
-- **docs/design/_backup_2026-05-05/docs-design/KESTREL_LOGO.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_comparison_icon.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_comparison_logo.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_mask_bird_silhouette.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_mask_bright_teal.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_mask_dark_teal.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_mask_gold.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/_mask_silver.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/kestrel_avatar_400x400.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/kestrel_avatar_400x400_circle.png** — —
-- **docs/design/_backup_2026-05-05/docs-design/kestrel_bird_only.svg** — —
-- **docs/design/_backup_2026-05-05/docs-design/kestrel_icon.svg** — —
-- **docs/design/_backup_2026-05-05/docs-design/kestrel_logo.svg** — —
-- **docs/design/_backup_2026-05-05/static/favicon.svg** — —
-- **docs/design/_backup_2026-05-05/static/kestrel_logo.svg** — —
+- **docs/design/README.md** — docs/design/ — Canonical published brand assets — the refreshed kestrel-on-rook mark adopted 2026-05-05.
 - **docs/design/kestrel_avatar_400x400.png** — —
 - **docs/design/kestrel_avatar_400x400_circle.png** — —
-- **docs/design/kestrel_banks.png** — —
 - **docs/design/kestrel_bird_only.svg** — —
-- **docs/design/kestrel_flaps_down.png** — —
 - **docs/design/kestrel_icon.svg** — —
 - **docs/design/kestrel_logo.svg** — —
 - **docs/design/launch/LANDING_PAGE_HTML_STRUCTURE.md** — Kestrel Landing Page HTML Structure — This document translates the landing-page copy into an implementation-ready HTML structure for engineering.
@@ -1303,7 +1279,6 @@ Repo entry points and standard project files.
 - **docs/design/launch/PUBLISH_READY_LANDING_PAGE_COPY.md** — Kestrel Landing Page Copy: Publish-Ready Draft — This draft is the tightened, publish-ready version of the earlier wireframe.
 - **docs/design/launch/README.md** — Launch Copy Drafts — This folder holds the current launch-copy assets for the Kestrel open-source launch.
 - **docs/design/launch/SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md** — Kestrel Simple Launch Page: One-Screen Version — Use this if the team wants a single-screen launch page with minimal implementation overhead.
-- **docs/design/launch/fonts/Montserrat-VF.ttf** — —
 - **docs/design/launch/lockup/kestrel_lockup.min.svg** — —
 - **docs/design/launch/lockup/kestrel_lockup.svg** — —
 - **docs/design/launch/lockup/png/kestrel_lockup_1024.png** — —
@@ -1341,8 +1316,6 @@ Repo entry points and standard project files.
 - **docs/design/launch/mark/png/kestrel_mark_512_white.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64_white.png** — —
-- **docs/design/launch/sources/kestrel_lockup_source.png** — —
-- **docs/design/launch/sources/kestrel_mark_source.png** — —
 - **docs/development/BIG_BRAIN.md** — Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
 - **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
 - **docs/development/README.md** — Development Documentation — Developer notes, experiments, and technical development guides.
@@ -1378,80 +1351,6 @@ Repo entry points and standard project files.
 - **docs/generated/FEATURES_user.md** — <!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually --> <!-- Audience: user | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 --> <!-- Regenerate: uv run python scripts/gen…
 - **docs/generated/README.md** — Generated Feature Docs — These documents are derived artifacts generated from the canonical feature inventory at [`KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md).
 - **docs/guides/BUILDING_FEATURES.md** — Building Your First Kestrel Feature — This guide walks you through creating a feature package for Kestrel Sovereign from scratch.
-- **docs/logo-concepts/all-concepts-grid.png** — —
-- **docs/logo-concepts/ecosystem-v2/castle/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/castle/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/castle/minimalist.png** — —
-- **docs/logo-concepts/ecosystem-v2/claws/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/claws/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/claws/minimalist.png** — —
-- **docs/logo-concepts/ecosystem-v2/ecosystem-grid.png** — —
-- **docs/logo-concepts/ecosystem-v2/eye/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/eye/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/eye/minimalist.png** — —
-- **docs/logo-concepts/ecosystem-v2/falconer/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/falconer/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/falconer/minimalist.png** — —
-- **docs/logo-concepts/ecosystem-v2/family/full-flock.png** — —
-- **docs/logo-concepts/ecosystem-v2/family/hierarchy.png** — —
-- **docs/logo-concepts/ecosystem-v2/flight/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/flight/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/flight/minimalist.png** — —
-- **docs/logo-concepts/ecosystem-v2/rituals/evening-return.png** — —
-- **docs/logo-concepts/ecosystem-v2/rituals/learning-loop.png** — —
-- **docs/logo-concepts/ecosystem-v2/rituals/morning-signal.png** — —
-- **docs/logo-concepts/ecosystem-v2/rituals/the-hunt.png** — —
-- **docs/logo-concepts/ecosystem-v2/sovereign/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/sovereign/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/sovereign/minimalist.png** — —
-- **docs/logo-concepts/ecosystem-v2/talon/dramatic.png** — —
-- **docs/logo-concepts/ecosystem-v2/talon/heraldic.png** — —
-- **docs/logo-concepts/ecosystem-v2/talon/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/castle/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/castle/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/castle/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/claws/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/claws/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/claws/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/ecosystem-grid.png** — —
-- **docs/logo-concepts/ecosystem/eye/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/eye/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/eye/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/falconer/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/falconer/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/falconer/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/family/full-flock.png** — —
-- **docs/logo-concepts/ecosystem/family/hierarchy.png** — —
-- **docs/logo-concepts/ecosystem/flight/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/flight/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/flight/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/rituals/evening-return.png** — —
-- **docs/logo-concepts/ecosystem/rituals/learning-loop.png** — —
-- **docs/logo-concepts/ecosystem/rituals/morning-signal.png** — —
-- **docs/logo-concepts/ecosystem/rituals/the-hunt.png** — —
-- **docs/logo-concepts/ecosystem/sovereign/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/sovereign/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/sovereign/minimalist.png** — —
-- **docs/logo-concepts/ecosystem/talon/dramatic.png** — —
-- **docs/logo-concepts/ecosystem/talon/heraldic.png** — —
-- **docs/logo-concepts/ecosystem/talon/minimalist.png** — —
-- **docs/logo-concepts/kestrel-dramatic.png** — —
-- **docs/logo-concepts/kestrel-heraldic.png** — —
-- **docs/logo-concepts/kestrel-logos.zip** — —
-- **docs/logo-concepts/kestrel-minimalist.png** — —
-- **docs/logo-concepts/kestrel-modern_tech.png** — —
-- **docs/logo-concepts/kestrel-playful.png** — —
-- **docs/logo-concepts/kestrel-woodcut.png** — —
-- **docs/logo-concepts/v2/herald-v1-sharp.png** — —
-- **docs/logo-concepts/v2/herald-v2-modern.png** — —
-- **docs/logo-concepts/v2/herald-v3-seal.png** — —
-- **docs/logo-concepts/v2/herald-v4-crest.png** — —
-- **docs/logo-concepts/v2/herald-v5-minimal.png** — —
-- **docs/logo-concepts/v2/min-v1-upward.png** — —
-- **docs/logo-concepts/v2/min-v2-negative.png** — —
-- **docs/logo-concepts/v2/min-v3-circle.png** — —
-- **docs/logo-concepts/v2/min-v4-merged.png** — —
-- **docs/logo-concepts/v2/min-v5-launching.png** — —
 - **docs/logo-prompts.md** — Kestrel Sovereign Logo Concepts — Image Gen Prompts — ## Concept: Rook Castle with Kestrels Launching
 - **docs/principles/CONTEXT.md** — This directory contains the foundational, high-level principles that govern the Kestrel project and all agents created within its framework.
 - **docs/principles/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
@@ -1536,10 +1435,12 @@ Repo entry points and standard project files.
 - **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
 - **tests/frontend/effective_session_id.test.mjs** — (mjs asset)
 - **tests/frontend/initial_pane_migration.test.mjs** — (mjs asset)
+- **tests/frontend/markdown_link_target.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
 - **tests/frontend/parallel_chat.test.mjs** — (mjs asset)
 - **tests/frontend/route_selector.test.mjs** — (mjs asset)
 - **tests/frontend/sendmessage_adopts_session_id.test.mjs** — (mjs asset)
+- **tests/frontend/sendmessage_interrupts_when_busy.test.mjs** — (mjs asset)
 - **tests/frontend/session_id_property.test.mjs** — (mjs asset)
 - **tests/frontend/tool_activity_expandable.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
@@ -2086,6 +1987,8 @@ Repo entry points and standard project files.
   - `class TestKeyRotationTaskLifecycle`; `class TestRotationEndToEnd`
 - **tests/unit/test_key_storage.py** — Unit tests for SecureKeyStorage.
   - `def master_key()`; `def test_private_key()`; `def storage(master_key, temp_dir, monkeypatch)`; `class TestSecureKeyStorageInit`; `class TestKeyEncryption`; `class TestKeyMigration`; `class TestEncryptedKeyBundle`; `class TestEdgeCases`; `…`
+- **tests/unit/test_lifecycle_checks.py** — Tests for the startup lifecycle hardening rails (#377, #381, #406).
+  - `def test_provider_check_passes_when_at_least_one_provider_initialized()`; `def test_provider_check_passes_with_multiple_providers()`; `def test_provider_check_raises_when_zero_providers()`; `def test_provider_check_raises_when_providers_attr_missing()`; `def test_provider_check_raises_when_providers_is_none()`; `def test_provider_check_skipped_when_llm_service_disabled()`; `def test_provider_check_still_raises_when_disabled_false_and_no_providers()`; `def test_provider_check_message_mentions_payer_policy_escape_hatch()`; `…`
 - **tests/unit/test_lighthouse_payment.py** — Unit tests for Lighthouse payment methods.
   - `class TestLighthousePayment`; `class TestLighthouseBalance`; `class TestLighthousePaymentIntegration`
 - **tests/unit/test_lighthouse_rest.py** — Tests for Lighthouse REST client.
@@ -2138,6 +2041,8 @@ Repo entry points and standard project files.
   - `class TestModelSetOpenRouter`
 - **tests/unit/test_models_configuration_endpoint_contracts.py** — Focused contract tests for model/configuration endpoints.
   - `def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter()`; `def test_wallet_endpoint_prefers_wallet_agent_and_falls_back_to_identity_balance()`; `def test_keys_endpoints_use_storage_contract_without_exposing_secrets()`; `def test_key_update_delete_and_usage_endpoints_preserve_provider_contracts()`; `def test_models_endpoint_groups_results_and_rejects_invalid_category()`; `def test_current_and_set_model_endpoints_share_runtime_preference_contract()`; `def test_available_sources_reports_only_agent_tier_on_sqlite_deployments()`; `def test_available_sources_returns_all_false_when_agent_has_no_key()`; `…`
+- **tests/unit/test_module_contracts.py** — Structural contracts for the modular runtime boundary scaffold.
+  - `def test_modular_runtime_doc_exists_and_names_core_contract_terms()`; `def test_modular_runtime_doc_points_to_current_entry_point_groups()`; `def test_feature_base_exposes_documented_module_contribution_seams()`; `def test_documented_lifecycle_seams_are_subclass_extension_points()`; `def test_modular_runtime_doc_preserves_core_to_feature_dependency_direction()`
 - **tests/unit/test_multi_agent_asgi_routing.py** — Tests for the ASGI-level multi_agent routing middleware.
   - `async def test_http_request_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_known_agent_strips_prefix_and_attaches_agent()`; `async def test_websocket_with_unknown_agent_closes_with_4404()`; `async def test_http_with_unknown_agent_returns_404_json()`; `async def test_non_agent_path_passes_through_unchanged()`; `async def test_no_agent_manager_passes_through()`; `async def test_lifespan_scope_passes_through()`
 - **tests/unit/test_multi_agent_config.py** — Unit tests for MultiAgent configuration.
@@ -2153,7 +2058,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_nellie_backend_smoke.py** — Nellie backend smoke-proof tests (issue #427, updated for epic #688).
   - `class TestNellieAnthropicPlan`; `class TestNellieOpenAIPlan`; `class TestNellieFailureModes`; `class TestNellieBackendSwitch`
 - **tests/unit/test_openai_thinking_channel.py** — —
-  - `def test_non_streaming_split_extracts_think_tags()`; `def test_non_streaming_split_extracts_kimi_plain_reasoning()`; `def test_non_streaming_split_extracts_kimi_constraints_and_self_check()`; `def test_non_streaming_split_preserves_visible_content_with_reasoning_field()`; `def test_plain_reasoning_model_gate_excludes_non_reasoning_chat_models()`; `def test_streaming_splitter_emits_thinking_delta_for_plain_kimi_reasoning()`; `def test_streaming_splitter_extracts_kimi_constraints_and_self_check()`; `def test_streaming_splitter_buffers_split_closing_think_tag()`; `…`
+  - `def test_non_streaming_split_extracts_think_tags()`; `def test_non_streaming_split_preserves_untagged_prose_as_visible()`; `def test_non_streaming_split_preserves_visible_content_with_reasoning_field()`; `def test_streaming_splitter_preserves_untagged_prose_as_visible()`; `def test_streaming_splitter_preserves_prose_after_closing_think_tag()`; `def test_streaming_splitter_buffers_split_closing_think_tag()`; `async def test_streaming_response_yields_reasoning_content_as_thinking_delta()`; `async def test_openai_compatible_adapter_uses_configured_provider_name()`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
   - `def test_no_traversal_rejects_dotdot()`; `def test_no_traversal_rejects_nul()`; `def test_no_traversal_allows_clean_paths()`; `def test_resolve_realpath_canonicalizes(tmp_path)`; `def test_resolve_realpath_follows_symlink(tmp_path)`; `def test_resolve_realpath_rejects_traversal(tmp_path)`; `def test_resolve_realpath_handles_nonexistent_leaf(tmp_path)`; `def test_resolve_realpath_expands_user()`; `…`
 - **tests/unit/test_paths.py** — Unit tests for :mod:`kestrel_sovereign.paths`.
@@ -2205,7 +2110,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_provider_registry_no_sdk_retries.py** — Regression guard for #656.
   - `class TestOpenAICompatibleClientsDisableSdkRetries`; `class TestConnectionErrorFailsFast`
 - **tests/unit/test_provider_thinking_channels.py** — —
-  - `async def test_anthropic_streaming_emits_thinking_delta()`; `async def test_anthropic_streaming_splits_think_tags()`; `async def test_ollama_streaming_splits_think_tags(monkeypatch)`; `async def test_ollama_with_tools_splits_non_streaming_content(monkeypatch)`; `async def test_ollama_non_reasoning_model_preserves_plain_intro(monkeypatch)`; `async def test_ollama_tool_support_trusts_capabilities_for_small_models()`
+  - `async def test_anthropic_streaming_emits_thinking_delta()`; `async def test_anthropic_streaming_splits_think_tags()`; `async def test_ollama_streaming_splits_think_tags(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_field(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatch)`; `async def test_ollama_with_tools_suppresses_thinking_under_structured_output(monkeypatch)`; `async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(monkeypatch)`; `async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch)`; `…`
 - **tests/unit/test_rasa_shim_endpoint_contracts.py** — Contract tests for the Rasa webhook shim.
   - `def test_rasa_webhook_does_not_force_hardcoded_model_override()`
 - **tests/unit/test_raw_user_strip_in_consumers.py** — Regression: raw-user content consumers (personality calibration, wellness depth metrics) must strip the sent-form wrappers from user-role rows before measuring/exporting.
@@ -2374,6 +2279,8 @@ Repo entry points and standard project files.
   - `async def test_stream_tap_publishes_chunks_and_cleans_up()`
 - **tests/unit/test_streaming_audit.py** — Unit tests for streaming response functionality.
   - `class TestStreamingBasics`; `class TestRealStreaming`
+- **tests/unit/test_streaming_cancellation_loop.py** — Issue #1256: the agent loop must honor stop-button cancellation, not just the HTTP response layer.
+  - `async def test_persist_marks_cancelled_when_request_was_stopped()`; `async def test_persist_merges_cancelled_with_caller_metadata()`; `async def test_persist_no_marker_when_not_cancelled()`; `async def test_persist_no_marker_when_request_id_not_provided()`; `async def test_stream_loop_breaks_when_cancel_arrives_mid_stream()`; `async def test_cancel_between_llm_and_tool_dispatch_skips_tools()`; `async def test_no_cancel_path_unaffected_for_normal_completion()`; `async def test_orchestrator_loop_returns_early_when_cancelled_between_iterations()`; `…`
 - **tests/unit/test_streaming_inband_revising_sentinel.py** — Wave 5E in-band revising sentinel — kestrel-sovereign #1086.
   - `class TestSentinelConstruction`; `async def test_inband_sentinel_yielded_through_chat_stream()`; `async def test_sentinel_not_appended_to_persisted_assistant_text()`; `async def test_no_sentinel_when_no_marker_fires()`; `async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted()`; `async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted()`; `async def test_multiple_markers_yield_multiple_sentinels()`
 - **tests/unit/test_streaming_persist_cancellation.py** — Cancellation-safe persistence: when the streaming generator is cancelled (client disconnect, browser nav, agent switch) AFTER the last chunk is yielded but BEFORE the assistant row is inserted, the i…
@@ -2420,6 +2327,8 @@ Repo entry points and standard project files.
   - `def test_pilot_features_pass_contract(feature_cls)`; `def test_pilot_modules_are_in_allowlist(feature_cls)`; `def test_assert_feature_returns_tool_result_does_not_raise(feature_cls)`; `def test_non_migrated_module_is_not_validated()`; `def test_find_violations_catches_dict_return()`; `def test_find_violations_catches_missing_annotation()`; `def test_find_violations_rejects_optional_tool_result()`; `def test_assert_feature_returns_tool_result_raises_on_dirty()`; `…`
 - **tests/unit/test_tool_result_persistence.py** — Tests for large tool result persistence — preview with head+tail.
   - `class TestBuildPersistedPreview`
+- **tests/unit/test_tools_architecture_docs.py** — Guardrails for the current tools architecture docs.
+  - `def test_tools_docs_no_longer_carry_deprecation_banners()`; `def test_tools_docs_do_not_reference_removed_tool_architecture_files()`; `def test_tools_docs_name_current_sdk_and_feature_package_contracts()`; `def test_tools_docs_crosslink_core_feature_framework_and_sdk_readme()`
 - **tests/unit/test_training_adapter_hygiene.py** — —
   - `async def test_runpod_cleanup_pauses_persistent_pod()`; `async def test_runpod_cleanup_terminates_on_demand_pod()`; `def test_replicate_training_zip_contains_avatar_bytes()`; `async def test_replicate_training_uses_client_file_input(monkeypatch)`
 - **tests/unit/test_turn_completion_guard.py** — Regression coverage for premature turn-yield repair (#1237).
