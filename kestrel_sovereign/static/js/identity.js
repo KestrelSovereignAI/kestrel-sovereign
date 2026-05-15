@@ -125,7 +125,7 @@ export function initNavigation() {
         });
     });
 
-    // If the default-active "identity" tab was removed because the host
+    // If the default-active "chat" tab was removed because the host
     // opted out, promote the first surviving tab to active so the page
     // doesn't open onto a vanished panel.
     const active = document.querySelector('.nav-tab.active');
