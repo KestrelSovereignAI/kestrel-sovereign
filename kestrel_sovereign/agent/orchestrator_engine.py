@@ -516,6 +516,7 @@ class OrchestratorEngineMixin:
                 tool_results.append({
                     "tool_call_id": tool_call.id,
                     "name": tool_name,
+                    "arguments": args,
                     "result": summarize_tool_result_for_audit(serialized_result),
                 })
             await OrchestratorEngineMixin._log_tool_dispatch(
@@ -614,6 +615,7 @@ class OrchestratorEngineMixin:
             tool_results.append({
                 "tool_call_id": tool_call.id,
                 "name": tool_name,
+                "arguments": args,
                 "result": summarize_tool_result_for_audit(serialized_result),
             })
 
@@ -1100,12 +1102,20 @@ class OrchestratorEngineMixin:
         max_iterations: int = None,
         user_message: str = None,
         session_id: Optional[str] = None,
+        tool_results: Optional[list] = None,
     ) -> str:
         """
         Handle the orchestrator's response, executing any tool calls.
 
         If the LLM returns tool_calls, we dispatch them to the appropriate
         features (as subagents), then continue the conversation with results.
+
+        Args:
+            tool_results: Optional out-parameter mirroring the streaming
+                handler. When passed, each tool dispatch appends its
+                ``{tool_call_id, name, result}`` envelope so the caller can
+                forward them to the STOP HookInput (#1238 — non-streaming
+                parity with the streaming path's existing plumbing).
         """
         _init_constants()
         if max_iterations is None:
@@ -1160,6 +1170,7 @@ class OrchestratorEngineMixin:
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
+                tool_results=tool_results,
                 session_id=session_id,
             )
 
