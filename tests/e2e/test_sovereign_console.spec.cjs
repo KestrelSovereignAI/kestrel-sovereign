@@ -254,11 +254,11 @@ test.describe('Initial Page Load & Authentication', () => {
         }
     });
 
-    test('Identity tab is active by default', async ({ page }) => {
+    test('Chat tab is active by default', async ({ page }) => {
         await page.goto(BASE_URL);
-        const identityTab = page.locator('.nav-tab').filter({ hasText: /identity/i });
-        await expect(identityTab).toHaveClass(/active/);
-        await expect(page.locator('#panel-identity')).toBeVisible();
+        const chatTab = page.locator('.nav-tab').filter({ hasText: /chat/i });
+        await expect(chatTab).toHaveClass(/active/);
+        await expect(page.locator('#panel-chat')).toBeVisible();
     });
 
     test('sidebar renders with all sections', async ({ page }) => {
@@ -293,18 +293,21 @@ test.describe('Identity Panel - Agent Identity', () => {
 
     test('displays agent DID after loading', async ({ page }) => {
         await page.goto(BASE_URL);
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         // Wait for DID to appear
         await expect(page.getByText(/did:pkh|did:key/i).first()).toBeVisible({ timeout: 15000 });
     });
 
     test('shows agent name or default name', async ({ page }) => {
         await page.goto(BASE_URL);
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         const identityCard = page.locator('#identity-card');
         await expect(identityCard).toContainText(/Kestrel Agent/i, { timeout: 10000 });
     });
 
     test('displays constitution verification status', async ({ page }) => {
         await page.goto(BASE_URL);
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         // Wait for identity to load
         await page.waitForTimeout(2000);
         // Should show checkmark for constitution
@@ -313,6 +316,7 @@ test.describe('Identity Panel - Agent Identity', () => {
 
     test('genesis audit section exists (may be empty if no audit data)', async ({ page }) => {
         await page.goto(BASE_URL);
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         await page.waitForTimeout(3000);
         // Element always exists but may be empty (no innerHTML) if identity.genesis_audit is null
         const auditSection = page.locator('#genesis-audit');
@@ -326,6 +330,7 @@ test.describe('Identity Panel - Agent Identity', () => {
 
     test('displays wallet balance in stats', async ({ page }) => {
         await page.goto(BASE_URL);
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         await page.waitForTimeout(3000);
         // Should show FIL balance
         await expect(page.locator('#identity-card')).toContainText(/FIL/i);
@@ -333,6 +338,7 @@ test.describe('Identity Panel - Agent Identity', () => {
 
     test('copy DID button exists and is clickable', async ({ page }) => {
         await page.goto(BASE_URL);
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         await page.waitForTimeout(3000);
         const copyButton = page.locator('#identity-card button[title="Copy DID"]');
         // Button should exist

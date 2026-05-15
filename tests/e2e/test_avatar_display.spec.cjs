@@ -9,6 +9,8 @@ test.describe('Avatar Display in Kestrel UI', () => {
         await page.goto(KESTREL_URL);
         // Wait for DOM to be ready (not networkidle - that can hang on polling pages)
         await page.waitForLoadState('domcontentloaded');
+        // Chat is the default tab — navigate to Identity to render its panel.
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
         await page.waitForSelector('.identity-header', { timeout: 15000 });
     });
 

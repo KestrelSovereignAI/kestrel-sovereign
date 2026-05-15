@@ -21,8 +21,8 @@
             <h1 id="nav-agent-name">Kestrel</h1>
         </div>
         <div class="nav-tabs">
-            <button class="nav-tab active" data-panel="identity" data-label-key="tab_identity">Identity</button>
-            <button class="nav-tab" data-panel="chat" data-label-key="tab_chat">Chat</button>
+            <button class="nav-tab active" data-panel="chat" data-label-key="tab_chat">Chat</button>
+            <button class="nav-tab" data-panel="identity" data-label-key="tab_identity">Identity</button>
             <button class="nav-tab" data-panel="constitution" data-label-key="tab_constitution">Constitution</button>
             <button class="nav-tab" data-panel="memories" data-label-key="tab_memories">Memories</button>
             <button class="nav-tab" data-panel="tasks">
@@ -94,7 +94,7 @@
         </aside>
 
         <!-- Identity Panel -->
-        <div class="panel active" id="panel-identity">
+        <div class="panel" id="panel-identity">
             <div class="panel-content">
                 <div class="identity-card" id="identity-card">
                     <div class="loading" data-label-key="loading_identity">Loading identity...</div>
@@ -104,7 +104,7 @@
         </div>
 
         <!-- Chat Panel -->
-        <div class="panel" id="panel-chat">
+        <div class="panel active" id="panel-chat">
             <div style="display: flex; height: 100%; gap: 0;">
                 <!-- Chat History Sidebar (Session 4) -->
                 <div id="history-sidebar" style="

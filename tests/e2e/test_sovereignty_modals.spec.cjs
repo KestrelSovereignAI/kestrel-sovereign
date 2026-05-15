@@ -354,6 +354,9 @@ test.describe('Copy to Clipboard', () => {
 
         await page.goto(KESTREL_URL);
 
+        // Chat is the default tab — navigate to Identity to render its panel.
+        await page.locator('.nav-tab').filter({ hasText: /identity/i }).click();
+
         // Wait for identity to load
         await page.waitForSelector('#identity-card .identity-did');
 

@@ -105,7 +105,7 @@ const chatPanes = new Map();
 let mountedChatAgent;  // undefined sentinel — null is a valid key
 
 export const state = {
-    currentPanel: 'identity',
+    currentPanel: 'chat',
     identity: null,
     constitution: null,
     memories: null,
