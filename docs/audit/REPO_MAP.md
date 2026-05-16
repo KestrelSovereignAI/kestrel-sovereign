@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-15
-**Scope:** 1536 tracked files (992 `.py`, 260 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-16
+**Scope:** 1537 tracked files (993 `.py`, 260 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2265,6 +2265,8 @@ Repo entry points and standard project files.
   - `def clean_sse_connections()`; `def app_with_mock_agent()`; `class TestSSEConnectionLimits`; `class TestSSEConnectionTrackerModule`
 - **tests/unit/test_state_of_mind_feature.py** — Direct contracts for the StateOfMind feature.
   - `async def test_state_of_mind_requires_llm_service()`; `async def test_state_of_mind_formats_via_profile_service()`
+- **tests/unit/test_stop_hook_payload.py** — STOP HookInput enrichment for #1238.
+  - `async def test_streaming_stop_hook_carries_user_message_and_response_text_no_tools()`; `async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fired()`; `async def test_streaming_stop_hook_captures_chained_tool_iterations()`; `async def test_streaming_stop_hook_preserves_tool_calls_on_cancel_before_dispatch()`; `async def test_streaming_stop_hook_skipped_when_no_hooks_manager()`; `async def test_orchestrator_response_accepts_tool_results_out_param()`; `def test_handle_orchestrator_response_signature_has_tool_results_kwarg()`
 - **tests/unit/test_storage.py** — —
   - `async def storage(temp_dir)`; `def test_file(tmpdir)`; `async def test_file_storage(storage, test_file)`; `async def test_knowledge_graph(storage)`; `async def test_rag_pipeline(storage, test_file)`; `async def test_conversation_history(storage)`; `async def test_backup_local_only(storage)`
 - **tests/unit/test_storage_health.py** — —
