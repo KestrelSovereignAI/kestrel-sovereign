@@ -137,8 +137,9 @@ class TestContextPreservationRoundTrip:
             assert len(context_cleared.messages) == 0, "Database should be empty after clear"
 
             # Import from backup
-            stats = await sovereign_adapter.import_agent(cid)
-            assert stats['messages_restored'] == 4
+            result = await sovereign_adapter.import_agent(cid)
+            assert result.success
+            assert result.messages_restored == 4
 
             # Build context AFTER import
             manager_after = ContextManager(
@@ -191,8 +192,9 @@ class TestContextPreservationRoundTrip:
 
             # Clear and restore
             await storage.db.execute_commit("DELETE FROM conversation_history")
-            stats = await sovereign_adapter.import_agent(cid)
-            assert stats['messages_restored'] == 35
+            result = await sovereign_adapter.import_agent(cid)
+            assert result.success
+            assert result.messages_restored == 35
 
             # Build context on restored data
             manager = ContextManager(

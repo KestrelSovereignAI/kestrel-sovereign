@@ -109,10 +109,12 @@ async def test_platform_shutdown_does_not_lose_data():
             assert await storage.get_conversation_history() == []
 
             # Step 4: User has ONLY the export CID. Prove it can restore data.
-            stats = await adapter.import_agent(cid)
-            assert stats["agent_did"] == agent_did
-            assert stats["manifest_version"] == "3.0"
-            assert stats["messages_restored"] == len(precious_conversations)
+            result = await adapter.import_agent(cid)
+            assert result.success
+            assert result.status == "imported"
+            assert result.agent_did == agent_did
+            assert result.manifest_version == "3.0"
+            assert result.messages_restored == len(precious_conversations)
 
             restored = await storage.get_conversation_history()
             assert [(m["role"], m["content"]) for m in restored] == precious_conversations
@@ -252,12 +254,13 @@ async def test_sovereignty_vs_simple_download():
 
             assert cid
 
-            stats = await adapter.import_agent(cid)
-            assert stats["agent_did"] == agent_did
-            assert stats["manifest_version"] == "3.0"
-            assert stats["shards_restored"] > 0
-            assert stats["messages_restored"] == 2
-            assert "assets_restored" in stats
+            result = await adapter.import_agent(cid)
+            assert result.success
+            assert result.agent_did == agent_did
+            assert result.manifest_version == "3.0"
+            assert result.shards_restored > 0
+            assert result.messages_restored == 2
+            assert result.assets_restored is not None
 
             restored = await storage.get_conversation_history()
             assert [(m["role"], m["content"]) for m in restored] == [
@@ -314,9 +317,10 @@ async def test_inheritance_scenario():
 
             # Family receives the CID from the will and imports the archive.
             await storage.db.execute_commit("DELETE FROM conversation_history")
-            stats = await adapter.import_agent(cid)
-            assert stats["agent_did"] == agent_did
-            assert stats["messages_restored"] == len(precious_memories)
+            result = await adapter.import_agent(cid)
+            assert result.success
+            assert result.agent_did == agent_did
+            assert result.messages_restored == len(precious_memories)
 
             restored = await storage.get_conversation_history()
             assert [(m["role"], m["content"]) for m in restored] == precious_memories

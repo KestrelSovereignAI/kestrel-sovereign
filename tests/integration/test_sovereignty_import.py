@@ -80,14 +80,17 @@ async def test_export_import_roundtrip(temp_db):
         print("✅ Simulated data loss (deleted local DB)")
 
         # 4. Import from CID
-        stats = await sovereign_adapter.import_agent(cid)
+        result = await sovereign_adapter.import_agent(cid)
 
-        assert stats['messages_restored'] == 4
-        assert stats['shards_restored'] > 0
-        assert stats['agent_did'] == agent_did
-        assert stats['manifest_version'] == "3.0"
-        assert 'assets_restored' in stats
-        print(f"✅ Imported {stats['messages_restored']} messages")
+        assert result.success
+        assert result.status == "imported"
+        assert result.messages_restored == 4
+        assert result.shards_restored > 0
+        assert result.agent_did == agent_did
+        assert result.manifest_version == "3.0"
+        assert result.assets_restored is not None
+        assert result.continuity.is_verified()
+        print(f"✅ Imported {result.messages_restored} messages")
 
         # 5. Verify restored data matches original
         restored_history = await storage.get_conversation_history()
@@ -103,8 +106,9 @@ async def test_export_import_roundtrip(temp_db):
 @pytest.mark.asyncio
 async def test_import_with_wrong_key_fails(temp_db):
     """
-    Verify that import fails if user provides wrong encryption key.
-    This proves the encryption is real.
+    Verify that import with the wrong encryption key is *rejected*
+    (not raised) and the host DB is left untouched. Proves the
+    encryption is real AND the new verification-gated contract.
     """
     agent_did = "did:pkh:eip155:1:test_wrong_key"
 
@@ -114,13 +118,25 @@ async def test_import_with_wrong_key_fails(temp_db):
         await storage.add_conversation("user", "Secret message", metadata={"timestamp": "2025-11-21T10:00:00Z"})
         cid = await export_adapter.export_agent(agent_did, storage_tier=StorageTier.LOCAL_ONLY)
 
+        # Sentinel conversation present in the host DB before the
+        # rejected import — must still be there afterward.
+        before = await storage.get_conversation_history()
+        assert len(before) == 1
+
         # Try to import with different key
         import_adapter = SovereignStorageAdapter(storage.db, user_secret="wrong-key")
 
-        with pytest.raises(Exception):  # Should fail to decrypt
-            await import_adapter.import_agent(cid)
+        result = await import_adapter.import_agent(cid)
+        assert result.success is False
+        assert result.status == "rejected"
+        assert result.reject_reason == "keyring_decrypt_failed"
 
-        print("✅ Import correctly failed with wrong key")
+        # Host DB UNTOUCHED — no DELETE/INSERT happened.
+        after = await storage.get_conversation_history()
+        assert len(after) == 1
+        assert after[0]["content"] == "Secret message"
+
+        print("✅ Import correctly rejected wrong key; host DB untouched")
 
 
 @pytest.mark.asyncio
@@ -267,14 +283,23 @@ async def test_partial_shard_recovery(temp_db):
             # Clear existing conversations
             await storage.db.execute_commit("DELETE FROM conversation_history")
 
-            # Attempt import - should fail or report partial recovery
+            # Attempt import - with a shard cache file removed the CAR
+            # bytes themselves are unaffected (the CAR is one blob keyed
+            # by the manifest CID), so this still round-trips. The point
+            # of the new contract is that *if* verification fails the
+            # result is a structured rejection, never a raised exception.
             try:
                 result = await sovereign_adapter.import_agent(cid)
-                # If import succeeds, check if all messages were recovered
-                messages_recovered = result.get("messages_restored", 0)
-                print(f"✅ Import completed with {messages_recovered} messages recovered")
-                # With one shard missing, we should have fewer than 2 messages
-                # This tests graceful degradation
+                if result.success:
+                    messages_recovered = result.messages_restored
+                    print(f"✅ Import completed with {messages_recovered} messages recovered")
+                else:
+                    # Structured rejection — must name the failure clearly.
+                    reason = (result.reject_reason or "").lower()
+                    acceptable_keywords = ["shard", "corrupt", "fail", "missing", "retrieve", "decrypt", "continuity", "manifest", "car"]
+                    assert any(kw in reason for kw in acceptable_keywords), \
+                        f"Reject reason should clearly indicate the problem. Got: {result.reject_reason}"
+                    print(f"✅ Graceful structured rejection: {result.reject_reason}")
             except Exception as e:
                 # Acceptable failure modes - should mention the issue clearly
                 error_str = str(e).lower()
