@@ -217,11 +217,16 @@
                     <!-- Input Footer with Context Status -->
                     <div class="input-footer" style="
                         display: flex;
-                        justify-content: flex-end;
+                        justify-content: space-between;
+                        align-items: center;
                         padding: 0.25rem 1rem 0.5rem;
                         font-size: 0.75rem;
                         color: var(--text-tertiary);
                     ">
+                        <button id="composer-mode-toggle" type="button"
+                            class="composer-mode-toggle" data-mode="interrupt"
+                            title="Send-while-busy: stop the current turn and send now. Click to switch to Queue."
+                        >Interrupt</button>
                         <span id="context-status"></span>
                     </div>
                 </div>

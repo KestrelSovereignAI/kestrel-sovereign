@@ -100,6 +100,15 @@ export async function loadCommands(apiModule) {
 //                                        //   its revise applied. Both signals (SSE + in-band
 //                                        //   sentinel) check this so a delayed signal for an
 //                                        //   already-consumed request is a no-op.
+//     composerMode: 'interrupt'|'queue', // #1257: per-pane send-while-busy mode.
+//                                        //   'interrupt' (default) = Phase 1 behavior
+//                                        //   (stop the in-flight turn, dispatch now).
+//                                        //   'queue' = stash the message and dispatch
+//                                        //   it when the in-flight turn finishes.
+//     queuedMessage: string|null,        // #1257: the single pending message in queue
+//                                        //   mode. Re-Enter replaces it. Dispatched from
+//                                        //   the completing turn's finally; cleared by
+//                                        //   Stop and by a conversation switch.
 //   }
 const chatPanes = new Map();
 let mountedChatAgent;  // undefined sentinel — null is a valid key
@@ -180,6 +189,8 @@ export function getOrCreateChatPane(agentName) {
         hasUnrenderedMermaid: false,
         pendingRevise: false,
         reviseConsumedRequestId: null,
+        composerMode: 'interrupt',
+        queuedMessage: null,
     };
     chatPanes.set(agentName, pane);
     return pane;
