@@ -27,6 +27,7 @@ import pytest
 
 from kestrel_sovereign.filecoin_adapter import StorageTier
 from kestrel_sovereign.storage import Storage
+from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 from kestrel_sovereign.storage.sovereign_adapter import (
     SovereignImportResult,
     SovereignStorageAdapter,
@@ -329,3 +330,75 @@ async def test_append_only_audit_log_accumulates(
 
         # Row count strictly increases — never rewritten in place.
         assert len(await good.get_import_log()) >= 3
+
+
+# ---------------------------------------------------------------------------
+# 6. Partially-broken multi-shard package is rejected (not raised)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_partial_shard_package_is_structured_reject(
+    db_path: Path, user_secret: str,
+):
+    """A CAR whose manifest references a shard whose block is absent must
+    return a structured ``rejected`` result (reason ``incomplete_shards``)
+    and leave the host DB untouched — it must NOT pass verification and
+    then raise mid-restore. Regression for the codex P2 on #1272.
+    """
+    async with Storage(db_path=str(db_path), agent_id=AGENT_ID) as storage:
+        # _MESSAGES spans 2025-11 and 2025-12 → two monthly shards.
+        await _seed(storage)
+        adapter = SovereignStorageAdapter(
+            storage.db, user_secret=user_secret, agent_id=AGENT_ID,
+        )
+        cid = await adapter.export_agent(
+            AGENT_DID, storage_tier=StorageTier.LOCAL_ONLY,
+        )
+        car_bytes = await adapter._download_content(cid)
+
+        # Rebuild the CAR with the REAL primitives, dropping exactly one
+        # shard block while keeping the manifest that still references it.
+        reader = CARReader(car_bytes)
+        manifest = reader.get_dag_cbor_block(reader.root_cid)
+        shard_cids = [s["cid"] for s in manifest["shards"]]
+        assert len(shard_cids) >= 2, "need a multi-shard package"
+        dropped = shard_cids[0]
+
+        builder = CARBuilder()
+        for block_cid in reader.list_cids():
+            if block_cid == reader.root_cid or block_cid == dropped:
+                continue
+            builder.add_raw_block(reader.get_block(block_cid))
+        manifest_cid = builder.add_dag_cbor_block(manifest)
+        builder.set_root(manifest_cid)
+        tampered = builder.build()
+
+        await storage.db.execute_commit("DELETE FROM conversation_history")
+        await storage.add_conversation(
+            "user", "PARTIAL_SENTINEL",
+            metadata={"timestamp": "2026-01-01T00:00:00Z"},
+        )
+
+        result = await adapter.import_agent(tampered)
+
+        assert result.success is False
+        assert result.status == "rejected"
+        assert result.reject_reason == "incomplete_shards"
+        # Only the 0.15-weight shards_decrypt check fails, so the
+        # weighted score (0.85) is still ABOVE the 0.7 threshold — the
+        # rejection is driven by the critical reject_reason, NOT the
+        # score. This is exactly the gap codex flagged: score alone
+        # would have let it through.
+        assert result.continuity.overall_score == pytest.approx(0.85)
+        assert result.continuity.is_verified()  # score passes…
+        assert result.success is False           # …but hard-rejected anyway
+
+        after = await storage.get_conversation_history()
+        assert len(after) == 1
+        assert after[0]["content"] == "PARTIAL_SENTINEL"
+
+        log = await adapter.get_import_log(agent_did=AGENT_DID)
+        assert len(log) == 1
+        assert log[0]["status"] == "rejected"
+        assert log[0]["reject_reason"] == "incomplete_shards"
+        assert log[0]["messages_restored"] == 0

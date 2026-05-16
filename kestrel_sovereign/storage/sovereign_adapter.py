@@ -805,8 +805,14 @@ class SovereignImportVerifier:
             "shards_decrypt", shards_pass, 0.15,
             f"{shard_ok}/{shard_total} shards decrypted",
         ))
-        if reject_reason is None and shard_total > 0 and shard_ok == 0:
-            reject_reason = "no_shards_decrypted"
+        if reject_reason is None and shard_total > 0 and shard_ok < shard_total:
+            # Any shard that fails to resolve/decrypt is a hard reject:
+            # otherwise a partially-broken multi-shard package scores
+            # above threshold and then raises mid-restore instead of
+            # returning the structured rejection the receiver promises.
+            reject_reason = (
+                "no_shards_decrypted" if shard_ok == 0 else "incomplete_shards"
+            )
 
         total_w = sum(c.weight for c in checks) or 1.0
         score = sum(c.weight for c in checks if c.passed) / total_w
