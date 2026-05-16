@@ -133,10 +133,13 @@ async def test_full_backup_restore_round_trip(db_path: Path, user_secret: str):
         assert len(post_delete) == 0, "data-loss simulation incomplete"
 
         # ---- Phase 4: import from CID -------------------------------
-        stats = await adapter.import_agent(cid)
-        assert stats["messages_restored"] == len(_TEST_MESSAGES)
-        assert stats["shards_restored"] > 0
-        assert stats["agent_did"] == AGENT_DID
+        result = await adapter.import_agent(cid)
+        assert result.success
+        assert result.status == "imported"
+        assert result.messages_restored == len(_TEST_MESSAGES)
+        assert result.shards_restored > 0
+        assert result.agent_did == AGENT_DID
+        assert result.continuity.is_verified()
 
         # ---- Phase 5: verify integrity ------------------------------
         restored = await storage.get_conversation_history()
@@ -168,9 +171,11 @@ async def test_full_backup_restore_round_trip(db_path: Path, user_secret: str):
 
 @pytest.mark.asyncio
 async def test_import_with_wrong_key_rejects(db_path: Path, user_secret: str):
-    """Phase 6 of the bash original: import with a non-matching
-    ``user_secret`` must raise. Proves the encryption is real and
-    the import path actually validates the AEAD tag.
+    """Phase 6 of the bash original, ported to the new contract: import
+    with a non-matching ``user_secret`` must be *rejected* (structured
+    result, no exception) and must leave the host DB untouched. Proves
+    the encryption is real, the AEAD tag is validated, and the
+    verification gate fires before any host mutation.
 
     The bash variant used a different Fernet key as the "wrong" key;
     we just generate a fresh secret. Either way the
@@ -194,15 +199,22 @@ async def test_import_with_wrong_key_rejects(db_path: Path, user_secret: str):
             storage_tier=StorageTier.LOCAL_ONLY,
         )
 
-        # Wipe and try to import with the wrong key.
-        await storage.db.execute_commit("DELETE FROM conversation_history")
+        # Sentinel must survive a rejected import — the host DB is
+        # only mutated AFTER verification passes.
+        before = await storage.get_conversation_history()
+        assert len(before) == 1
+
         wrong_adapter = SovereignStorageAdapter(
             storage.db,
             user_secret=wrong_secret,
             agent_id=AGENT_ID,
         )
-        with pytest.raises(Exception):
-            # Catching ``Exception`` rather than the specific
-            # ``InvalidTag`` because the adapter wraps decrypt failures
-            # in its own error path; we just need the import to refuse.
-            await wrong_adapter.import_agent(cid)
+        result = await wrong_adapter.import_agent(cid)
+        assert result.success is False
+        assert result.status == "rejected"
+        assert result.reject_reason == "keyring_decrypt_failed"
+
+        # Host DB UNTOUCHED.
+        after = await storage.get_conversation_history()
+        assert len(after) == 1
+        assert after[0]["content"] == "secret-payload"
