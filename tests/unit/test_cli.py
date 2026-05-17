@@ -23,6 +23,7 @@ from kestrel_sovereign.cli import (
     cmd_list,
     cmd_create,
     cmd_shell,
+    cmd_ask,
     cmd_health,
     cmd_storage,
     cmd_config,
@@ -1068,3 +1069,110 @@ class TestAutoDiscovery:
         assert rc == 0
         output = capsys.readouterr().out
         assert "auto_agent" in output
+
+
+# -----------------------------------------------------------------------
+# cmd_ask tests (#1287) — non-interactive one-shot to a RUNNING agent
+# -----------------------------------------------------------------------
+
+class TestAskParsing:
+    def test_ask_parses(self):
+        args = build_parser().parse_args(
+            ["ask", "Nellie", "hello there", "--session", "s1", "--json"]
+        )
+        assert args.command == "ask"
+        assert args.name == "Nellie"
+        assert args.message == "hello there"
+        assert args.session == "s1"
+        assert args.json is True
+
+    def test_ask_defaults(self):
+        args = build_parser().parse_args(["ask", "claw", "hi"])
+        assert args.session is None
+        assert args.json is False
+
+    def test_dispatch_ask(self):
+        with patch("sys.argv", ["kestrel", "ask", "claw", "hi"]), \
+             patch("kestrel_sovereign.cli.cmd_ask", return_value=0) as mock:
+            main()
+            mock.assert_called_once()
+
+
+class TestCmdAsk:
+    def test_unknown_agent_errors(self, multi_agent_env, capsys):
+        args = build_parser().parse_args(["ask", "ghost", "hi"])
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env):
+            rc = cmd_ask(args)
+        assert rc == 1
+        assert "not found in multi_agent config" in capsys.readouterr().err
+
+    def test_no_running_server_errors_no_inprocess_fallback(self, multi_agent_env, capsys):
+        """The whole point of `ask`: if no live server, error — never
+        cold-boot an in-process agent."""
+        args = build_parser().parse_args(["ask", "claw", "hi"])
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch("kestrel_sovereign.cli._detect_running_agent_server",
+                   return_value=None) as detect, \
+             patch("kestrel_sovereign.cli._run_shell") as inproc:
+            rc = cmd_ask(args)
+        assert rc == 1
+        detect.assert_called_once()
+        inproc.assert_not_called()
+        err = capsys.readouterr().err
+        assert "No running server" in err and "kestrel shell" in err
+
+    def test_running_server_one_shot_prints_response(self, multi_agent_env, capsys):
+        args = build_parser().parse_args(["ask", "claw", "what is 2+2?"])
+        fake_resp = MagicMock(status_code=200)
+        fake_resp.json.return_value = {"response": "4", "session_id": "sess-9"}
+        fake_client = MagicMock()
+        fake_client.__enter__ = MagicMock(return_value=fake_client)
+        fake_client.__exit__ = MagicMock(return_value=False)
+        fake_client.post.return_value = fake_resp
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch("kestrel_sovereign.cli._detect_running_agent_server",
+                   return_value=("http://localhost:18801", "k3y")), \
+             patch("httpx.Client", return_value=fake_client):
+            rc = cmd_ask(args)
+        assert rc == 0
+        assert capsys.readouterr().out.strip() == "4"
+        # one-shot: exactly one invoke, correct payload
+        fake_client.post.assert_called_once()
+        call = fake_client.post.call_args
+        assert call.args[0] == "/api/agent/invoke"
+        assert call.kwargs["json"] == {"input": "what is 2+2?"}
+
+    def test_json_and_session_forwarded(self, multi_agent_env, capsys):
+        args = build_parser().parse_args(
+            ["ask", "claw", "hi", "--session", "S", "--json"]
+        )
+        fake_resp = MagicMock(status_code=200)
+        fake_resp.json.return_value = {"response": "hey", "session_id": "S"}
+        fake_client = MagicMock()
+        fake_client.__enter__ = MagicMock(return_value=fake_client)
+        fake_client.__exit__ = MagicMock(return_value=False)
+        fake_client.post.return_value = fake_resp
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch("kestrel_sovereign.cli._detect_running_agent_server",
+                   return_value=("http://localhost:18801", "")), \
+             patch("httpx.Client", return_value=fake_client):
+            rc = cmd_ask(args)
+        assert rc == 0
+        out = capsys.readouterr().out.strip()
+        assert '"response": "hey"' in out and '"session_id": "S"' in out
+        assert fake_client.post.call_args.kwargs["json"] == {"input": "hi", "session_id": "S"}
+
+    def test_http_error_returns_nonzero(self, multi_agent_env, capsys):
+        args = build_parser().parse_args(["ask", "claw", "hi"])
+        fake_resp = MagicMock(status_code=500, text="boom")
+        fake_client = MagicMock()
+        fake_client.__enter__ = MagicMock(return_value=fake_client)
+        fake_client.__exit__ = MagicMock(return_value=False)
+        fake_client.post.return_value = fake_resp
+        with patch("kestrel_sovereign.cli._get_project_dir", return_value=multi_agent_env), \
+             patch("kestrel_sovereign.cli._detect_running_agent_server",
+                   return_value=("http://localhost:18801", "k")), \
+             patch("httpx.Client", return_value=fake_client):
+            rc = cmd_ask(args)
+        assert rc == 1
+        assert "HTTP 500" in capsys.readouterr().err
