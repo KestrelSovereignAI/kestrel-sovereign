@@ -105,6 +105,22 @@ def derive_command(
     return None
 
 
+def _extract_repo_token(command: str) -> Optional[str]:
+    """Return the exact ``owner/name`` after ``-R``/``--repo``, if any.
+
+    Used for the repo-scope guard so ``owner/repo`` can never be confused
+    with ``owner/repo-fork`` (a substring check would — codex P1, #1290).
+    """
+    try:
+        toks = shlex.split(command)
+    except ValueError:
+        toks = command.split()
+    for i, t in enumerate(toks):
+        if t in ("-R", "--repo") and i + 1 < len(toks):
+            return toks[i + 1]
+    return None
+
+
 _FREEFORM_FLAGS = {
     "--title", "--body", "-t", "-b", "-F", "--body-file", "-m",
     "--message", "-c", "--comment",
@@ -149,7 +165,9 @@ def suggest_rule_from_command(command: str) -> tuple[str, str]:
         i += 1
     if not prefix:
         prefix = tokens[:1]
-    pattern = "^" + re.escape(" ".join(prefix))
+    # Trailing boundary so the prefix can't bleed into a longer token
+    # (e.g. ``owner/repo`` must not match ``owner/repo-fork``).
+    pattern = "^" + re.escape(" ".join(prefix)) + r"(?:\s|$)"
     return pattern, repo_scope
 
 
@@ -242,17 +260,20 @@ class AutoApprovePolicy:
     ) -> Optional[AutoApproveMatch]:
         """Return the matching rule, or ``None`` to fall through to human.
 
-        Match requires, for some rule: agent-scope OK *and* the
-        ``repo_scope`` string present in the command *and* the regex
-        matching the command. First match wins.
+        Match requires, for some rule: agent-scope OK *and* the command's
+        ``-R``/``--repo`` token equals ``repo_scope`` exactly *and* the
+        regex matches the command. First match wins.
         """
         command = derive_command(feature_name, tool_name, tool_args)
         if not command:
             return None
+        cmd_repo = _extract_repo_token(command)
         for rule in await self._all_rules():
             if rule.agent is not None and rule.agent != agent_name:
                 continue
-            if rule.repo_scope and rule.repo_scope not in command:
+            # Exact repo match, not substring: a rule scoped to
+            # ``owner/repo`` must never authorise ``owner/repo-fork``.
+            if rule.repo_scope and cmd_repo != rule.repo_scope:
                 continue
             regex = rule.compiled()
             if regex is None:

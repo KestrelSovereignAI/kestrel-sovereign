@@ -82,6 +82,37 @@ async def test_policy_match_positive_and_scopes():
     ) is None
 
 
+@pytest.mark.asyncio
+async def test_repo_scope_is_exact_not_substring():
+    """codex P1: owner/repo must never authorise owner/repo-fork."""
+    rule = AutoApproveRule(
+        pattern=r"^gh issue create -R o/r",
+        repo_scope="o/r", agent="Emma",
+    )
+    pol = AutoApprovePolicy([rule])
+    forked = {"argv": ["gh", "issue", "create", "-R", "o/r-fork",
+                        "--title", "x"]}
+    assert await pol.evaluate(
+        agent_name="Emma", feature_name="computer_use",
+        tool_name="shell", tool_args=forked,
+    ) is None
+    exact = {"argv": ["gh", "issue", "create", "-R", "o/r", "--title", "x"]}
+    assert await pol.evaluate(
+        agent_name="Emma", feature_name="computer_use",
+        tool_name="shell", tool_args=exact,
+    ) is not None
+
+
+def test_suggest_rule_has_trailing_boundary():
+    pattern, _ = suggest_rule_from_command("gh issue create -R o/r --title x")
+    import re as _re
+
+    rx = _re.compile(pattern)
+    assert rx.search("gh issue create -R o/r --title y")
+    # Must NOT match a longer repo token.
+    assert not rx.search("gh issue create -R o/r-fork --title y")
+
+
 def test_suggest_rule_from_command_is_conservative():
     pattern, repo = suggest_rule_from_command(
         'gh issue create -R KestrelSovereignAI/kestrel-sovereign '

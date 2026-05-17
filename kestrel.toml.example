@@ -582,7 +582,7 @@ role = "technical_reviewer"
 # the same way); these TOML entries are the operator-seeded baseline.
 #
 # [[security.auto_approve.shell]]
-# pattern = "^gh issue (create|comment) -R KestrelSovereignAI/kestrel-sovereign"
+# pattern = "^gh issue (create|comment) -R KestrelSovereignAI/kestrel-sovereign(?:\\s|$)"
 # repo_scope = "KestrelSovereignAI/kestrel-sovereign"
 # audit = true
 # agent = "Emma"   # optional; omit to allow any agent

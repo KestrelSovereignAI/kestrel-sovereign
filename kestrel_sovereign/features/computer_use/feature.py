@@ -59,7 +59,12 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
-_DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python"]
+# ``gh`` is allow-listed so it reaches the approval queue rather than
+# being hard-denied by binary policy before the scoped auto-approve seam
+# can govern it (epic #1290 D4: talon_file_and_claim → gh issue create).
+# Allow-listed != auto-run: BinaryPolicy still returns REQUIRE_APPROVAL,
+# so a human (or an explicit, scoped auto-approve rule) remains the gate.
+_DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
 _DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
