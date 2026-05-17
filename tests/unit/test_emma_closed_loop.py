@@ -40,6 +40,15 @@ def test_derive_command_shell_and_compute():
         {"script_name": "x.py", "purpose": "do thing"},
     ) is None
     assert derive_command("computer_use", "fs_read", {"path": "/x"}) is None
+    # codex P2: the PRE_TOOL_USE hook passes raw {"command": ...} (no
+    # argv) and cannot finalize the audit row — must NOT match, so only
+    # the internal gate (argv) is the auto-approve+audit point.
+    assert derive_command(
+        "computer_use", "shell", {"command": "gh issue create -R o/r"}
+    ) is None
+    assert derive_command(
+        "computer_use", "shell", {"argv": ["gh", "issue", "create"]}
+    ) == "gh issue create"
 
 
 @pytest.mark.asyncio

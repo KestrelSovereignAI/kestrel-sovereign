@@ -89,11 +89,21 @@ def derive_command(
     """
     fname = (feature_name or "").lower()
     if fname == "computer_use" and tool_name == "shell":
+        # Match ONLY the internal computer_use gate's signature, which
+        # always carries ``argv``. The PRE_TOOL_USE SecurityHook reaches
+        # request_approval first for a direct LLM shell tool call and
+        # passes the raw ``{"command": ...}`` tool_input (no ``argv``);
+        # if we matched that too we'd write an auto_approve_audit row the
+        # hook can't thread into allowed_by, so it would dangle at
+        # exit_code=NULL while the internal gate writes+finalizes a second
+        # row — a duplicate "running…" entry (codex review P2, #1290).
+        # Requiring ``argv`` means the sole auto-approve+audit point is the
+        # internal gate, whose exit code IS finalized in
+        # computer_use._audit_run.
         argv = tool_args.get("argv")
         if isinstance(argv, (list, tuple)) and argv:
             return shlex.join(str(a) for a in argv)
-        cmd = tool_args.get("command")
-        return str(cmd) if cmd else None
+        return None
     # NOTE: compute.run_script is deliberately NOT auto-approvable here.
     # A regex allowlist matches a command *string*; a signed script's
     # executable content is fetched by id and is not in tool_args, so any
