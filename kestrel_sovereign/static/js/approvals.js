@@ -57,7 +57,9 @@ async function decide(approvalId, approved, scope, remember) {
             }),
         });
         if (res && res.success) {
-            if (res.remembered) {
+            if (res.remembered && res.remembered.skipped) {
+                Toast.success(`Approved (not remembered: ${res.remembered.skipped})`);
+            } else if (res.remembered) {
                 Toast.success(
                     `Approved & remembered: ${res.remembered.pattern}`
                 );

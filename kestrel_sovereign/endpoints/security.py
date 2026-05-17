@@ -433,18 +433,26 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
             )
             if command:
                 pattern, repo_scope = suggest_rule_from_command(command)
-                agent_name = _resolve_agent_name(security)
-                await security.permission_store.add_auto_approve_rule(
-                    pattern=pattern,
-                    repo_scope=repo_scope,
-                    agent=agent_name,
-                    added_by="mews_approval",
-                )
-                remembered = {
-                    "pattern": pattern,
-                    "repo_scope": repo_scope,
-                    "agent": agent_name,
-                }
+                if not repo_scope:
+                    # A scoped allowlist must be scoped. Refuse to remember
+                    # a rule we can't bind to a repo (codex P2, #1290) —
+                    # the one-off approval still stands.
+                    remembered = {
+                        "skipped": "no repo scope; not remembered",
+                    }
+                else:
+                    agent_name = _resolve_agent_name(security)
+                    await security.permission_store.add_auto_approve_rule(
+                        pattern=pattern,
+                        repo_scope=repo_scope,
+                        agent=agent_name,
+                        added_by="mews_approval",
+                    )
+                    remembered = {
+                        "pattern": pattern,
+                        "repo_scope": repo_scope,
+                        "agent": agent_name,
+                    }
         except Exception as exc:  # noqa: BLE001 - remember is best-effort
             logger.warning(
                 "Approve-and-remember failed for %s: %s",

@@ -103,6 +103,19 @@ async def test_repo_scope_is_exact_not_substring():
     ) is not None
 
 
+@pytest.mark.asyncio
+async def test_rule_without_repo_scope_never_auto_approves():
+    """codex P2: a scoped allowlist must be scoped — an unscoped rule
+    must never auto-approve in any repo context."""
+    rule = AutoApproveRule(pattern=r"^echo hi", repo_scope="", agent="Emma")
+    pol = AutoApprovePolicy([rule])
+    args = {"argv": ["echo", "hi"]}
+    assert await pol.evaluate(
+        agent_name="Emma", feature_name="computer_use",
+        tool_name="shell", tool_args=args,
+    ) is None
+
+
 def test_suggest_rule_has_trailing_boundary():
     pattern, _ = suggest_rule_from_command("gh issue create -R o/r --title x")
     import re as _re

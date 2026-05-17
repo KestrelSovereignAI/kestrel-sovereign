@@ -271,9 +271,12 @@ class AutoApprovePolicy:
         for rule in await self._all_rules():
             if rule.agent is not None and rule.agent != agent_name:
                 continue
-            # Exact repo match, not substring: a rule scoped to
-            # ``owner/repo`` must never authorise ``owner/repo-fork``.
-            if rule.repo_scope and cmd_repo != rule.repo_scope:
+            # A scoped allowlist must be scoped: a rule with no repo_scope
+            # never auto-approves (it would otherwise authorise the command
+            # in *any* repo context — codex P2, #1290). Exact match, not
+            # substring, so ``owner/repo`` can't authorise
+            # ``owner/repo-fork``.
+            if not rule.repo_scope or cmd_repo != rule.repo_scope:
                 continue
             regex = rule.compiled()
             if regex is None:
