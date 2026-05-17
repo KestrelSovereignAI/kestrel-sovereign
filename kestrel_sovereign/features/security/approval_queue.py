@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
 
 if TYPE_CHECKING:
+    from kestrel_sovereign.security.auto_approve import AutoApprovePolicy
+
     from .permissions import PermissionStore
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,8 @@ class ApprovalQueue:
         on_request_added: Optional[OnRequestAddedCallback] = None,
         on_request_withdrawn: Optional[OnRequestWithdrawnCallback] = None,
         permission_store: Optional["PermissionStore"] = None,
+        auto_approve_policy: Optional["AutoApprovePolicy"] = None,
+        agent: Optional[object] = None,
     ):
         """
         Initialize the approval queue.
@@ -134,6 +138,8 @@ class ApprovalQueue:
         self._on_request_added = on_request_added
         self._on_request_withdrawn = on_request_withdrawn
         self._permission_store = permission_store
+        self._auto_approve_policy = auto_approve_policy
+        self._agent = agent
 
     @property
     def pending_count(self) -> int:
@@ -217,6 +223,57 @@ class ApprovalQueue:
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "ApprovalQueue: failed to evaluate pre-approval policy for "
+                    f"{feature_name}.{tool_name}: {e}",
+                    exc_info=True,
+                )
+
+        # Scoped auto-approve allowlist. Runs AFTER the explicit DENY/AUTO
+        # fast-path (so an operator DENY still hard-stops) and BEFORE a
+        # human is queued. A match means the Sovereign pre-authorised this
+        # exact pattern for this agent+repo; we write the full audit row
+        # *before* returning so the invocation can never run silently.
+        if self._auto_approve_policy is not None:
+            try:
+                agent_name = getattr(self._agent, "_agent_name", None)
+                agent_did = getattr(self._agent, "did", None) or "anonymous"
+                match = await self._auto_approve_policy.evaluate(
+                    agent_name=agent_name,
+                    feature_name=feature_name,
+                    tool_name=tool_name,
+                    tool_args=tool_args,
+                )
+                if match is not None and self._permission_store is not None:
+                    audit_id = await self._permission_store.log_auto_approve(
+                        agent_did=agent_did,
+                        agent_name=agent_name,
+                        feature_name=feature_name,
+                        tool_name=tool_name,
+                        command=match.command,
+                        pattern=match.rule.pattern,
+                        repo_scope=match.rule.repo_scope,
+                        rule_source=match.rule.source,
+                    )
+                    await self._permission_store.log_decision(
+                        feature_name=feature_name,
+                        tool_name=tool_name,
+                        action="tool_execution",
+                        decision="auto_approved",
+                        user_choice=f"auto_approve:{match.rule.source}",
+                        args_summary=self._summarize_args(tool_args),
+                    )
+                    logger.info(
+                        "ApprovalQueue auto-approved %s.%s for agent=%s "
+                        "(audit_id=%s, source=%s)",
+                        feature_name, tool_name, agent_name or "?",
+                        audit_id, match.rule.source,
+                    )
+                    # The audit id rides the existing allowed_by
+                    # "approval:<scope>" chain so the executing tool can
+                    # finalize the real exit code once it returns.
+                    return (True, f"auto_approve:{audit_id}")
+            except Exception as e:  # noqa: BLE001 - never block on policy
+                logger.warning(
+                    "ApprovalQueue: auto-approve evaluation failed for "
                     f"{feature_name}.{tool_name}: {e}",
                     exc_info=True,
                 )

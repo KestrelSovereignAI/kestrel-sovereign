@@ -56,6 +56,19 @@
                     font-weight: 600;
                 ">0</span>
             </button>
+            <button class="nav-tab" data-panel="approvals">
+                <span class="ki ki-check"></span> <span data-label-key="tab_approvals">Approvals</span>
+                <span id="approvals-pending-badge" style="
+                    display: none;
+                    background: var(--error);
+                    color: white;
+                    font-size: 0.7rem;
+                    padding: 0.125rem 0.4rem;
+                    border-radius: 10px;
+                    margin-left: 0.25rem;
+                    font-weight: 600;
+                ">0</span>
+            </button>
         </div>
         <div class="nav-status">
             <!-- Privacy indicator moved to chat header -->
@@ -803,6 +816,41 @@
                     gap: 1rem;
                 ">
                     <div class="loading" data-label-key="loading_features">Loading features...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Approvals Panel (epic #1290, D2) -->
+        <div class="panel" id="panel-approvals">
+            <div class="panel-content">
+                <div class="row-between mb-3">
+                    <h2 style="margin: 0;" data-label-key="approvals_title">Approval Queue</h2>
+                    <button id="btn-refresh-approvals" class="btn btn-secondary text-sm">Refresh</button>
+                </div>
+                <p class="text-muted mb-4" data-label-key="approvals_description">
+                    Pending agent actions awaiting your decision. Review the full command,
+                    then Approve, Reject, or Approve&nbsp;&amp;&nbsp;remember (which adds a
+                    scoped, revocable auto-approve rule so you are never asked for that
+                    exact command on that repo again).
+                </p>
+                <div id="approvals-list">
+                    <div class="loading">Loading…</div>
+                </div>
+
+                <h3 style="margin: 2rem 0 0.75rem 0;">Remembered auto-approve rules</h3>
+                <p class="text-muted mb-3 text-sm">
+                    Sovereign-curated. Each is scoped to an agent + repo and revocable here.
+                </p>
+                <div id="approvals-rules">
+                    <div class="loading">Loading…</div>
+                </div>
+
+                <h3 style="margin: 2rem 0 0.75rem 0;">Recent auto-approved invocations</h3>
+                <p class="text-muted mb-3 text-sm">
+                    The immutable "no silent runs" record: command, agent DID, time, exit code.
+                </p>
+                <div id="approvals-audit">
+                    <div class="loading">Loading…</div>
                 </div>
             </div>
         </div>

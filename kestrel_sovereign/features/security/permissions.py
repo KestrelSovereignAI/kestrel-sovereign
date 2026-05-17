@@ -164,6 +164,50 @@ class PermissionStore:
                 ON security_audit_log(created_at DESC)
             """)
 
+            # Sovereign-curated auto-approve allowlist (the "Approve-and-
+            # remember" store). Operator-seeded rules live in kestrel.toml;
+            # these are the rows the Sovereign added via the Mews approval
+            # panel and can revoke by deleting the row. See
+            # kestrel_sovereign/security/auto_approve.py.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS auto_approve_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent TEXT,
+                    pattern TEXT NOT NULL,
+                    repo_scope TEXT NOT NULL DEFAULT '',
+                    added_by TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(agent, pattern, repo_scope)
+                )
+            """)
+
+            # Full, immutable audit row for every auto-approved invocation.
+            # security_audit_log lacks agent_did/command/exit_code columns;
+            # this is the "no silent runs" record the constitution requires.
+            # Two-phase: a row is inserted at approve-time (exit_code NULL)
+            # and finalized with the real exit code once the tool returns.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS auto_approve_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_did TEXT,
+                    agent_name TEXT,
+                    feature_name TEXT,
+                    tool_name TEXT,
+                    command TEXT,
+                    pattern TEXT,
+                    repo_scope TEXT,
+                    rule_source TEXT,
+                    decision TEXT NOT NULL DEFAULT 'auto_approved',
+                    exit_code INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    completed_at TIMESTAMP
+                )
+            """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_approve_audit_created
+                ON auto_approve_audit(created_at DESC)
+            """)
+
             await db.commit()
 
         self._initialized = True
@@ -430,6 +474,121 @@ class PermissionStore:
             }
             for row in rows
         ]
+
+    # ------------------------------------------------------------------
+    # Auto-approve allowlist (Sovereign-curated, revocable)
+    # ------------------------------------------------------------------
+
+    async def list_auto_approve_rules(self) -> List[Dict]:
+        """Return the dynamic (DB-backed) auto-approve rules."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT id, agent, pattern, repo_scope, added_by, created_at
+                FROM auto_approve_rules ORDER BY created_at DESC
+            """)
+            rows = await cursor.fetchall()
+        return [
+            {
+                "id": r["id"],
+                "agent": r["agent"],
+                "pattern": r["pattern"],
+                "repo_scope": r["repo_scope"],
+                "added_by": r["added_by"],
+                "created_at": r["created_at"],
+            }
+            for r in rows
+        ]
+
+    async def add_auto_approve_rule(
+        self,
+        *,
+        pattern: str,
+        repo_scope: str = "",
+        agent: Optional[str] = None,
+        added_by: Optional[str] = None,
+    ) -> None:
+        """Add (or no-op if duplicate) a Sovereign-curated allowlist rule.
+
+        This is what the Mews "Approve-and-remember" button calls. Revoke
+        by deleting the row (:meth:`remove_auto_approve_rule`).
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                INSERT OR IGNORE INTO auto_approve_rules
+                (agent, pattern, repo_scope, added_by)
+                VALUES (?, ?, ?, ?)
+            """, (agent, pattern, repo_scope, added_by))
+            await db.commit()
+        logger.info(
+            "auto_approve: remembered rule (agent=%s, repo=%s) added_by=%s",
+            agent or "*", repo_scope or "*", added_by or "?",
+        )
+
+    async def remove_auto_approve_rule(self, rule_id: int) -> bool:
+        """Revoke a dynamic rule. Returns True if a row was deleted."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "DELETE FROM auto_approve_rules WHERE id = ?", (rule_id,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def log_auto_approve(
+        self,
+        *,
+        agent_did: Optional[str],
+        agent_name: Optional[str],
+        feature_name: str,
+        tool_name: str,
+        command: str,
+        pattern: str,
+        repo_scope: str,
+        rule_source: str,
+    ) -> int:
+        """Insert the phase-1 audit row; return its id for finalization.
+
+        The row is written *before* the tool runs so an auto-approved
+        invocation can never execute without an audit trail. ``exit_code``
+        is filled in by :meth:`finalize_auto_approve` once the tool exits.
+        """
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("""
+                INSERT INTO auto_approve_audit
+                (agent_did, agent_name, feature_name, tool_name, command,
+                 pattern, repo_scope, rule_source, decision)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'auto_approved')
+            """, (
+                agent_did, agent_name, feature_name, tool_name, command,
+                pattern, repo_scope, rule_source,
+            ))
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def finalize_auto_approve(
+        self, audit_id: int, exit_code: int
+    ) -> None:
+        """Stamp the real exit code + completion time on a phase-1 row."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("""
+                UPDATE auto_approve_audit
+                SET exit_code = ?, completed_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND completed_at IS NULL
+            """, (exit_code, audit_id))
+            await db.commit()
+
+    async def get_auto_approve_audit(self, limit: int = 50) -> List[Dict]:
+        """Recent auto-approve audit rows (most recent first)."""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("""
+                SELECT id, agent_did, agent_name, feature_name, tool_name,
+                       command, pattern, repo_scope, rule_source, decision,
+                       exit_code, created_at, completed_at
+                FROM auto_approve_audit ORDER BY created_at DESC LIMIT ?
+            """, (limit,))
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
 
     def clear_session_overrides(self) -> None:
         """Clear all session-scoped permission overrides and global Auto."""

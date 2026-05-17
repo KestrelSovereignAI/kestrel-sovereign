@@ -127,6 +127,7 @@ class SecurityFeature(Feature):
         super().__init__(agent)
         self.permission_store: Optional[PermissionStore] = None
         self.approval_queue: Optional[ApprovalQueue] = None
+        self.auto_approve_policy = None
         self.security_hook: Optional[SecurityHook] = None
         self._initialized = False
         self._init_lock: Optional[asyncio.Lock] = None
@@ -148,6 +149,29 @@ class SecurityFeature(Feature):
         # Initialize permission store
         self.permission_store = PermissionStore(db_path)
 
+        # Build the scoped auto-approve policy from kestrel.toml's
+        # [security] section + the Sovereign-curated DB allowlist. This is
+        # what lets a sovereign agent close her own loop without the
+        # Sovereign typing CLI approvals (epic #1290).
+        try:
+            from kestrel_sovereign.config import load_section
+            from kestrel_sovereign.security.auto_approve import (
+                AutoApprovePolicy,
+            )
+
+            self.auto_approve_policy = AutoApprovePolicy.from_config(
+                load_section("security"),
+                self.permission_store,
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade to human approval
+            logger.warning(
+                "SecurityFeature: auto-approve policy unavailable "
+                "(falling back to human approval): %s",
+                exc,
+                exc_info=True,
+            )
+            self.auto_approve_policy = None
+
         # Initialize approval queue with SSE callback AND a reference to the
         # permission store so the queue can persist the user's scope choice
         # ("session"/"always") and write audit rows centrally.  Without this,
@@ -159,6 +183,8 @@ class SecurityFeature(Feature):
             on_request_added=self._emit_approval_request,
             on_request_withdrawn=self._emit_approval_withdrawn,
             permission_store=self.permission_store,
+            auto_approve_policy=self.auto_approve_policy,
+            agent=self.agent,
         )
 
         # Create security hook

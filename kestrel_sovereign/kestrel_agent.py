@@ -1779,6 +1779,28 @@ Expected Duration: {expected_duration}
             if hook_input.tool_input and "user_message" in hook_input.tool_input:
                 user_input = hook_input.tool_input["user_message"]
 
+        # Pre-turn state-load block (epic #1290, D3). Opt-in per agent via
+        # [preturn_state]. Merged into the addendum so it rides the same
+        # budget-aware injection path as the constitutional canary; the
+        # canary stays last (a directive the model must echo), the state
+        # snapshot precedes it. Best-effort: never blocks the turn.
+        try:
+            from kestrel_sovereign.agent.preturn_state import (
+                build_preturn_state_block,
+            )
+
+            _state_block = await build_preturn_state_block(self)
+            if _state_block:
+                system_prompt_addendum = (
+                    f"{_state_block}\n\n{system_prompt_addendum}"
+                    if system_prompt_addendum
+                    else _state_block
+                )
+        except Exception as _e:  # noqa: BLE001 - never break a turn
+            logging.warning(
+                "preturn_state: injection skipped: %s", _e, exc_info=True
+            )
+
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
         #

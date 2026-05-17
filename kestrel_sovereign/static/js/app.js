@@ -27,6 +27,7 @@ import { loadResources } from './resources.js';
 import { initMetrics, loadMetrics } from './metrics.js';
 import { initSpawn, loadSpawn } from './spawn.js';
 import { initFeatureStore, loadFeatureStore } from './feature-store.js';
+import { initApprovals, loadApprovals } from './approvals.js';
 // Import modules with side effects that define window.* functions
 import './database.js';  // Defines window.toggleDbExplorer
 import './ipfs.js';      // Defines window.toggleIpfsStatus
@@ -54,6 +55,7 @@ async function init() {
         loadMetrics,
         loadSpawn,
         loadFeatureStore,
+        loadApprovals,
     });
 
     // Initialize navigation
@@ -78,6 +80,9 @@ async function init() {
 
     // Initialize feature store component
     initFeatureStore();
+
+    // Initialize approvals panel (epic #1290, D2)
+    initApprovals();
 
     // Initialize sovereignty panel buttons (Export/Import)
     initSovereigntyButtons();
