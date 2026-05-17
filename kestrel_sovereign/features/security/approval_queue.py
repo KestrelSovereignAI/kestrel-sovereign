@@ -234,6 +234,42 @@ class ApprovalQueue:
         # *before* returning so the invocation can never run silently.
         if self._auto_approve_policy is not None:
             try:
+                from .permissions import PermissionLevel
+
+                # The internal computer_use gate keys this call as
+                # "computer_use.shell", but the permissions UI registers /
+                # denies it under the canonical class name
+                # "ComputerUseFeature.shell". An operator DENY on the
+                # canonical key MUST still hard-stop the auto-approve path,
+                # otherwise revocation is ineffective for the exact
+                # commands being auto-approved (codex review P1, #1290).
+                _alias = {"computer_use": "ComputerUseFeature"}
+                _deny_keys = {feature_name}
+                if feature_name in _alias:
+                    _deny_keys.add(_alias[feature_name])
+                _denied = False
+                if self._permission_store is not None:
+                    for _fk in _deny_keys:
+                        if await self._permission_store.get_permission(
+                            _fk, tool_name
+                        ) == PermissionLevel.DENY:
+                            _denied = True
+                            break
+                if _denied:
+                    await self._permission_store.log_decision(
+                        feature_name=feature_name,
+                        tool_name=tool_name,
+                        action="tool_execution",
+                        decision="auto_denied",
+                        user_choice="canonical_deny",
+                        args_summary=self._summarize_args(tool_args),
+                    )
+                    logger.info(
+                        "ApprovalQueue: canonical DENY blocks auto-approve "
+                        "for %s.%s", feature_name, tool_name,
+                    )
+                    return (False, "denied")
+
                 agent_name = getattr(self._agent, "_agent_name", None)
                 agent_did = getattr(self._agent, "did", None) or "anonymous"
                 match = await self._auto_approve_policy.evaluate(

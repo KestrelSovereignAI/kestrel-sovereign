@@ -220,6 +220,30 @@ async def test_approval_queue_auto_approves_and_deny_still_wins(store):
     assert approved2 is False and scope2 == "denied"
 
 
+@pytest.mark.asyncio
+async def test_canonical_deny_blocks_auto_approve(store):
+    """codex P1: DENY registered under the canonical class name
+    (ComputerUseFeature.shell) must block the internal-gate
+    (computer_use.shell) auto-approve path — revocation must work."""
+    agent = SimpleNamespace(_agent_name="Emma", did="did:pkh:emma")
+    pol = AutoApprovePolicy(
+        [AutoApproveRule(pattern=r"^gh issue create -R o/r",
+                         repo_scope="o/r", agent="Emma")],
+        store,
+    )
+    q = ApprovalQueue(permission_store=store, auto_approve_policy=pol,
+                      agent=agent)
+    args = {"argv": ["gh", "issue", "create", "-R", "o/r", "--title", "t"]}
+    # Deny under the canonical permissions-UI key, NOT the gate key.
+    await store.set_permission(
+        "ComputerUseFeature", "shell", PermissionLevel.DENY, scope="always",
+    )
+    approved, scope = await q.request_approval(
+        "computer_use", "shell", args, timeout=1,
+    )
+    assert approved is False and scope == "denied"
+
+
 # --------------------------------------------------------------------------
 # D3 - pre-turn state block
 # --------------------------------------------------------------------------
