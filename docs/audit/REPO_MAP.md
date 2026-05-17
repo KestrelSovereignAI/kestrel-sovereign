@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-16
-**Scope:** 1537 tracked files (993 `.py`, 260 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-17
+**Scope:** 1538 tracked files (994 `.py`, 260 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -911,7 +911,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/schema_router.py** — Schema-aware routing: promote extracted structure to typed storage.
   - `class ActionItem`; `class PersonMatch`; `class PersonResolver`; `class ActionItemExtractor`; `class DecisionExtractor`; `def extract_interaction_sentiment(content)`; `class SchemaRouter`
 - **kestrel_sovereign/storage/sovereign_adapter.py** — Sovereign Storage Adapter V2 - The Encrypted Merkle Forest.
-  - `class ShardMetadata`; `class AssetDescriptor`; `class AssetMetadata`; `class AssetCollector`; `class RootManifest`; `class ConvergentEncryptor`; `class SovereignStorageAdapter`
+  - `class ShardMetadata`; `class AssetDescriptor`; `class AssetMetadata`; `class AssetCollector`; `class RootManifest`; `class ImportCheck`; `class ImportContinuity`; `class SovereignImportResult`; `…`
 - **kestrel_sovereign/storage/sync/__init__.py** — SQLite-First Sync Layer
 - **kestrel_sovereign/storage/sync/gcs_target.py** — GCS Sync Target
   - `class GCSTarget`
@@ -1590,6 +1590,8 @@ Repo entry points and standard project files.
   - `async def test_soft_delete_filters_from_default_reads(tmp_path)`; `async def test_soft_delete_then_restore(tmp_path)`; `async def test_soft_delete_re_stamping_is_a_noop(tmp_path)`; `async def test_purge_message_destroys_row(tmp_path)`; `async def test_clear_history_is_soft(tmp_path)`; `async def test_purge_all_destroys_everything(tmp_path)`; `async def test_session_round_trip_through_privacy_wrapper(tmp_path)`
 - **tests/integration/test_solvency.py** — —
   - `def temp_db()`; `async def agent(temp_db)`; `async def test_solvency_green_zone(agent)`; `async def test_solvency_yellow_zone(agent)`; `async def test_solvency_red_zone(agent)`; `async def test_solvency_transitions(agent)`
+- **tests/integration/test_sovereign_import_receiver.py** — Real export→import round-trip tests for the verification-gated, audit-logged sovereignty *import receiver* (issue #1272).
+  - `def db_path(tmp_path)`; `def user_secret()`; `async def test_verified_ingest_happy_path(db_path, user_secret)`; `async def test_import_accepts_raw_bytes(db_path, user_secret)`; `async def test_rejected_import_leaves_db_untouched_and_logs(db_path, user_secret)`; `async def test_continuity_threshold_gate(db_path, user_secret)`; `async def test_append_only_audit_log_accumulates(db_path, user_secret)`; `async def test_partial_shard_package_is_structured_reject(db_path, user_secret)`
 - **tests/integration/test_sovereignty_context.py** — End-to-end tests for Context Preservation during Sovereignty Export/Import.
   - `def temp_db_path()`; `async def storage_with_context_data(temp_db_path)`; `class TestContextPreservationRoundTrip`; `class TestContextMetadataPreservation`; `class TestDifferentModelContextsAfterImport`; `class TestPrivacyModeAfterImport`; `class TestBudgetConsistencyAfterImport`
 - **tests/integration/test_sovereignty_e2e.py** — Integration tests for sovereignty export/import system (V2).
