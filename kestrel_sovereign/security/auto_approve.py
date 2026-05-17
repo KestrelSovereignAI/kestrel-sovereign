@@ -2,9 +2,9 @@
 
 This is the keystone that lets a sovereign agent (Emma) close her own
 dispatch loop without the Sovereign typing approvals on the CLI. A
-``computer_use.shell`` (or ``compute.run_script``) request that matches a
-Sovereign-curated regex allowlist, scoped to a specific agent and repo, is
-auto-approved at the single approval chokepoint
+``computer_use.shell`` request that matches a Sovereign-curated regex
+allowlist, scoped to a specific agent and repo, is auto-approved at the
+single approval chokepoint
 (:meth:`ApprovalQueue.request_approval`) instead of stalling on a human.
 
 Constitutional invariant (Article I): this expands Emma's *authority*, not
@@ -94,14 +94,14 @@ def derive_command(
             return shlex.join(str(a) for a in argv)
         cmd = tool_args.get("command")
         return str(cmd) if cmd else None
-    if fname in ("computefeature", "compute") and tool_name == "run_script":
-        # The script body is fetched by id elsewhere; the allowlist matches
-        # the human-meaningful surface (name + purpose), mirroring how the
-        # approval modal describes it.
-        name = str(tool_args.get("script_name", "")).strip()
-        purpose = str(tool_args.get("purpose", "")).strip()
-        joined = f"{name}: {purpose}".strip(": ").strip()
-        return joined or None
+    # NOTE: compute.run_script is deliberately NOT auto-approvable here.
+    # A regex allowlist matches a command *string*; a signed script's
+    # executable content is fetched by id and is not in tool_args, so any
+    # name+purpose-based key would let a different script body run
+    # unreviewed (codex review P1, epic #1290). Signed-script approval
+    # therefore stays fully human-gated. The only auto-approve surface is
+    # computer_use.shell, whose exit code IS finalized in
+    # computer_use._audit_run — so there is no unfinalized-audit path.
     return None
 
 

@@ -567,12 +567,13 @@ role = "technical_reviewer"
 # ---------------------------------------------------------------------------
 # [security] — scoped auto-approve allowlist (epic #1290)
 # ---------------------------------------------------------------------------
-# Lets a sovereign agent close her own loop: a computer_use.shell (or
-# compute.run_script) request whose command matches one of these regexes,
-# scoped to the named agent + repo, is auto-approved at the approval queue
-# instead of stalling on a human. Every auto-approved invocation writes a
-# full immutable audit row (command, agent DID, timestamp, exit code) to
-# the auto_approve_audit table — there are NO silent runs.
+# Lets a sovereign agent close her own loop: a computer_use.shell request
+# whose command matches one of these regexes, scoped to the named agent +
+# repo, is auto-approved at the approval queue instead of stalling on a
+# human. (Signed compute scripts are intentionally NOT auto-approvable —
+# a regex can't bind a script's content.) Every auto-approved invocation
+# writes a full immutable audit row (command, agent DID, timestamp, exit
+# code) to the auto_approve_audit table — there are NO silent runs.
 #
 # Constitutional: this delegates form-filling, not decision-making. Each
 # rule is (a) scoped to a pattern the Sovereign explicitly added, (b)

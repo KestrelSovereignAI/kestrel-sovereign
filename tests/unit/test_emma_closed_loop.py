@@ -33,10 +33,12 @@ def test_derive_command_shell_and_compute():
     assert derive_command(
         "computer_use", "shell", {"argv": ["gh", "issue", "create"]}
     ) == "gh issue create"
+    # compute.run_script is intentionally NOT auto-approvable: a regex
+    # allowlist can't bind a signed script's content (codex P1, #1290).
     assert derive_command(
         "ComputeFeature", "run_script",
         {"script_name": "x.py", "purpose": "do thing"},
-    ) == "x.py: do thing"
+    ) is None
     assert derive_command("computer_use", "fs_read", {"path": "/x"}) is None
 
 
