@@ -63,7 +63,7 @@ SUPPORTED_MODELS = {
 # FLUX.2-dev requires ~90GB VRAM full, ~64GB with FP8 quantization
 # RTX 4090 (24GB) needs aggressive quantization settings below
 DEFAULT_CONFIG = {
-    "base_model": "black-forest-labs/FLUX.2-dev",  # FLUX.2 - sovereign, uncensored
+    "base_model": "black-forest-labs/FLUX.2-dev",  # FLUX.2 base model
     "training_steps": 500,
     "learning_rate": 1e-4,
     "lora_rank": 16,

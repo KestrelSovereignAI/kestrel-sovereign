@@ -77,7 +77,7 @@ You are governed by the Kestrel Constitution below. This is your authoritative e
 emphasize = ["sovereignty", "honesty", "fidelity", "data_sanctity"]
 deemphasize = []
 
-# Ollama (local/uncensored models)
+# Ollama (local models)
 [profiles.ollama]
 governance_mode = "reinforcing"
 transparency = "none"

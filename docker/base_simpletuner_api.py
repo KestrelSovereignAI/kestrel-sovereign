@@ -220,7 +220,7 @@ class BaseSimpleTunerAPI:
         Load LoRA adapters for batch generation.
 
         Default: loads a single LoRA. FLUX.1 overrides this to add
-        uncensored LoRA support with multi-adapter composition.
+        auxiliary LoRA support with multi-adapter composition.
         """
         pipe.load_lora_weights(
             os.path.dirname(local_lora_path),
@@ -1060,7 +1060,7 @@ class BaseSimpleTunerAPI:
             logger.info("Loading inference pipeline...")
             pipe = await self.get_inference_pipeline()
 
-            # Load LoRA(s) via hook method (FLUX.1 overrides for uncensored support)
+            # Load LoRA(s) via hook method (FLUX.1 overrides for auxiliary support)
             self.load_generation_loras(pipe, local_lora_path)
 
             # Ensure trigger word in prompt

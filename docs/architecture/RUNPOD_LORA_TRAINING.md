@@ -11,34 +11,29 @@
 > - The container variants below (`kestrel-lora:v8`, `kestrel-lora-flux1:v1`) and operational notes describe a Q1 2026 deployment that still applies for the most part, but the surrounding code has moved.
 > - Not production-stable. Treat this as a runbook for reproducing what worked, not as a guarantee.
 
-## Current Architecture: Dual Model Support ✅
+## Current Architecture: Dual Model Support
 
-We support **two FLUX variants** for different content needs:
+We support **two FLUX variants** for different operational needs:
 
-| Model | Container | Content Type | Notes |
+| Model | Container | Use | Notes |
 |-------|-----------|--------------|-------|
-| **FLUX.2-dev** | `kestrel-lora:v8` | SFW + Artistic Nudity | Base model has subtle content filtering |
-| **FLUX.1-dev + Uncensored LoRA** | `kestrel-lora-flux1:v1` | **Full NSFW** | Multi-LoRA: character + uncensored |
+| **FLUX.2-dev** | `kestrel-lora:v8` | Default training/generation | Base model has standard provider behavior |
+| **FLUX.1-dev** | `kestrel-lora-flux1:v1` | Compatibility path | Optional auxiliary LoRA composition |
 
 ### Key Discovery (January 2026)
 
-**FLUX.2-dev has built-in content filtering** that cannot be bypassed:
-- ✅ Works fine for SFW content and artistic nudity (e.g., "topless" scenes)
-- ❌ Fails for explicit anatomy prompts - produces "swimsuit with sewn-on vulva" effect
-- ❌ No uncensored LoRA adapters exist for FLUX.2-dev
+**FLUX.2-dev and FLUX.1-dev LoRAs are not interchangeable.**
 
-**Solution: FLUX.1-dev with Uncensored LoRA**
-- Uses `enhanceaiteam/Flux-Uncensored-V2` LoRA adapter
-- Multi-LoRA stacking: character appearance + uncensored capabilities
-- Requires training new LoRAs on FLUX.1-dev (FLUX.2 LoRAs incompatible)
+The FLUX.1 path remains available for older experiments and compatibility
+testing. It can optionally compose a trained character LoRA with an
+operator-supplied auxiliary LoRA configured at runtime.
 
 ### Which Model to Use?
 
-| Content Type | Model | Container |
+| Need | Model | Container |
 |--------------|-------|-----------|
-| Portrait, Lifestyle, Fashion | FLUX.2-dev | `kestrel-lora:v8` |
-| Artistic Nudity (topless) | FLUX.2-dev | `kestrel-lora:v8` |
-| **Explicit NSFW** | FLUX.1-dev + Uncensored | `kestrel-lora-flux1:v1` |
+| Default training and generation | FLUX.2-dev | `kestrel-lora:v8` |
+| FLUX.1 compatibility testing | FLUX.1-dev | `kestrel-lora-flux1:v1` |
 
 ---
 
@@ -56,7 +51,7 @@ We use **RunPod for both training AND generation** with FLUX.2-dev:
 - ✅ A100 80GB with int8-quanto quantization (~50GB VRAM)
 - ✅ Network volume caches models (no re-download)
 - ⚠️ Single-image training takes 2-3 hours (1000+ repeats)
-- ⚠️ **Content filtering on explicit scenes** - use FLUX.1 for NSFW
+- ⚠️ Provider/model policy behavior may differ by deployment target
 
 **Generation on RunPod:**
 - ✅ Same pod, same cached models
@@ -65,32 +60,34 @@ We use **RunPod for both training AND generation** with FLUX.2-dev:
 
 ---
 
-## FLUX.1-dev Uncensored Architecture (For NSFW) 🔞
+## FLUX.1-dev Compatibility Architecture
 
-For explicit content generation, we use FLUX.1-dev with the uncensored LoRA adapter.
+The FLUX.1-dev container supports optional auxiliary LoRA composition. By
+default it loads only the trained character LoRA.
 
 ### Multi-LoRA Stacking
 
-The FLUX.1 container loads **two LoRA adapters simultaneously**:
+When configured, the FLUX.1 container can load **two LoRA adapters
+simultaneously**:
 
 ```python
 # 1. Character LoRA (trained appearance)
 pipe.load_lora_weights("/tmp/lora", weight_name="pytorch_lora_weights.safetensors", adapter_name="character")
 
-# 2. Uncensored LoRA (removes content filtering)
-pipe.load_lora_weights("enhanceaiteam/Flux-Uncensored-V2", weight_name="lora.safetensors", adapter_name="uncensored")
+# 2. Optional auxiliary LoRA
+pipe.load_lora_weights(auxiliary_lora_repo, weight_name="lora.safetensors", adapter_name="auxiliary")
 
 # 3. Combine with weights
-pipe.set_adapters(["character", "uncensored"], adapter_weights=[1.0, 0.8])
+pipe.set_adapters(["character", "auxiliary"], adapter_weights=[1.0, 0.8])
 ```
 
-### Files for FLUX.1 Uncensored
+### Files for FLUX.1
 
 | File | Purpose |
 |------|---------|
-| `docker/Dockerfile.flux1-uncensored` | Docker image for FLUX.1-dev |
+| `docker/Dockerfile.flux1` | Docker image for FLUX.1-dev |
 | `docker/simpletuner_flux1_api.py` | API with multi-LoRA support |
-| `docker/cloudbuild-flux1-uncensored.yaml` | Cloud Build config |
+| `docker/cloudbuild-flux1.yaml` | Cloud Build config |
 
 ### Key Differences from FLUX.2
 
@@ -99,14 +96,14 @@ pipe.set_adapters(["character", "uncensored"], adapter_weights=[1.0, 0.8])
 | `model_family` | `flux2` | `flux` |
 | `pretrained_model_name_or_path` | `black-forest-labs/FLUX.2-dev` | `black-forest-labs/FLUX.1-dev` |
 | Pipeline Class | `Flux2Pipeline` | `FluxPipeline` |
-| Uncensored LoRA | ❌ Not available | ✅ `enhanceaiteam/Flux-Uncensored-V2` |
+| Auxiliary LoRA | Optional | Optional runtime configuration |
 | diffusers version | `git+...diffusers.git` | `diffusers>=0.31.0` (stable) |
 
 ### Build FLUX.1 Image
 
 ```bash
 cd ./
-gcloud builds submit --config=docker/cloudbuild-flux1-uncensored.yaml --project=YOUR_PROJECT_ID
+gcloud builds submit --config=docker/cloudbuild-flux1.yaml --project=YOUR_PROJECT_ID
 ```
 
 ### Container Registry
@@ -114,7 +111,7 @@ gcloud builds submit --config=docker/cloudbuild-flux1-uncensored.yaml --project=
 | Image | Tag | Purpose |
 |-------|-----|---------|
 | `gcr.io/YOUR_PROJECT_ID/kestrel-lora` | `:v8` | FLUX.2-dev (SFW + artistic) |
-| `gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1` | `:v1` | FLUX.1-dev uncensored (NSFW) |
+| `gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1` | `:v1` | FLUX.1-dev compatibility image |
 
 ### Important: LoRA Compatibility
 
@@ -122,20 +119,7 @@ gcloud builds submit --config=docker/cloudbuild-flux1-uncensored.yaml --project=
 
 - LoRAs trained on FLUX.2-dev only work with FLUX.2-dev
 - LoRAs trained on FLUX.1-dev only work with FLUX.1-dev
-- For NSFW companions, train on FLUX.1-dev from the start
-
-### Trigger Words for Uncensored Content
-
-From the [Flux-Uncensored-V2 model card](https://huggingface.co/enhanceaiteam/Flux-Uncensored-V2):
-
-```
-nsfw, naked, pron, kissing, erotic, nude, sensual, adult content, explicit
-```
-
-Example prompt:
-```
-A photo of TOKabc123, nude, explicit, full frontal nudity, photorealistic, 8k
-```
+- Pick the model family before training and keep generation on the same family
 
 ### Workflow
 
@@ -167,7 +151,7 @@ A photo of TOKabc123, nude, explicit, full frontal nudity, photorealistic, 8k
 │  1. Same pod, FLUX.2-dev already loaded                         │
 │  2. Load companion's LoRA from IPFS or local cache              │
 │  3. Generate with prompt: "TOK{id} at the beach"                │
-│  4. UNCENSORED output - full creative freedom                   │
+│  4. Store generated output                                      │
 │  5. Store selfie in companion_files table                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -178,9 +162,9 @@ A photo of TOKabc123, nude, explicit, full frontal nudity, photorealistic, 8k
 
 | Provider | Training Cost | Training Time | Generation | Notes |
 |----------|---------------|---------------|------------|-------|
-| **Replicate (training)** | ~$6-7 | 15-20 min | Censored | Fast, reliable |
-| **RunPod (training)** | ~$5-6 | 2-3 hours | Uncensored | Complex, TTL issues |
-| **RunPod (generation)** | ~$0.02/image | Instant | Uncensored | Our choice |
+| **Replicate (training)** | ~$6-7 | 15-20 min | Filtered | Fast, reliable |
+| **RunPod (training)** | ~$5-6 | 2-3 hours | Configurable | Complex, TTL issues |
+| **RunPod (generation)** | ~$0.02/image | Instant | Configurable | Our choice |
 | **fal.ai** | ~$8+ | ~30 min | Varies | More expensive |
 
 **Bottom Line:** Replicate for training + RunPod for generation = best of both worlds.
@@ -189,7 +173,7 @@ A photo of TOKabc123, nude, explicit, full frontal nudity, photorealistic, 8k
 
 ## Kestrel Integration via TrainingProviderFactory
 
-The `TrainingProviderFactory` provides a unified interface for training and generation across multiple providers. As of December 2025, RunPod is the recommended provider for selfie generation due to uncensored FLUX.2-dev support.
+The `TrainingProviderFactory` provides a unified interface for training and generation across multiple providers. As of December 2025, RunPod is the recommended provider for selfie generation because it keeps training and generation on the same GPU-backed path.
 
 ### Architecture
 

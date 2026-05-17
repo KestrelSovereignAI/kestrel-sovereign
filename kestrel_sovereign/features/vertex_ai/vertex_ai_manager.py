@@ -154,7 +154,7 @@ class VertexAIManager:
             region: GCP region (default: us-central1)
             service_account: Service account email for jobs
             flux_version: FLUX version to use ("flux1" or "flux2", default: "flux2")
-                         flux1 = FLUX.1-dev with uncensored LoRA support
+                         flux1 = FLUX.1-dev with optional auxiliary LoRA support
                          flux2 = FLUX.2-dev with standard content filtering
         """
         self.project_id = project_id or os.getenv("GCP_PROJECT_ID", self.DEFAULT_PROJECT)
@@ -463,7 +463,7 @@ class VertexAIManager:
         The container will:
         1. Download LoRA from IPFS or GCS
         2. Load FLUX model with int8-quanto quantization
-        3. Generate images (with uncensored LoRA stacking if using FLUX.1)
+        3. Generate images (with optional auxiliary LoRA stacking if using FLUX.1)
         4. Upload results to GCS
         5. Exit
 

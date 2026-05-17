@@ -1,13 +1,11 @@
-# Dockerfile for FLUX.1-dev with Uncensored LoRA Support
-# For generating NSFW/explicit content with character LoRAs
+# Dockerfile for FLUX.1-dev with optional auxiliary LoRA support
 #
 # Key differences from FLUX.2 Dockerfile:
 # - Uses FLUX.1-dev (black-forest-labs/FLUX.1-dev)
-# - Pre-downloads enhanceaiteam/Flux-Uncensored-V2 LoRA
 # - Uses FluxPipeline instead of Flux2Pipeline
 #
 # Usage:
-#   1. Build: docker build -f docker/Dockerfile.flux1-uncensored -t flux1-uncensored .
+#   1. Build: docker build -f docker/Dockerfile.flux1 -t flux1 .
 #   2. Deploy on RunPod/Vertex AI with A100 80GB
 #   3. API server listens on port 8000
 
@@ -75,8 +73,11 @@ ENV SIMPLETUNER_LOG_LEVEL=DEBUG
 # HF_TOKEN passed at runtime for gated models
 ENV HF_TOKEN=""
 
-# Enable uncensored mode by default
-ENV FLUX_UNCENSORED=true
+# Optional auxiliary LoRA composition. Leave blank unless explicitly configured
+# by the operator at runtime.
+ENV FLUX_AUX_LORA_REPO=""
+ENV FLUX_AUX_LORA_FILENAME="lora.safetensors"
+ENV FLUX_AUX_LORA_WEIGHT="0.8"
 
 # Expose API port
 EXPOSE 8000

@@ -2,7 +2,7 @@
 
 Below are several **self-hosted web UI frameworks** that support **LoRA training** on diffusion models and
 **text-to-image inference** with LoRA adapters, meeting the criteria of permissive model licensing, container
-deployability, minimal censorship, and API extensibility.
+deployability, minimal filtering, and API extensibility.
 
 ## **SimpleTuner (Terminus / BGHira)**
 
@@ -60,9 +60,9 @@ generation in any Stable Diffusion pipeline (SimpleTuner itself can run inferenc
 **Licensing & Open Models:** The SimpleTuner code is AGPL-3.0 [1](https://github.com/bghira/SimpleTuner#:~:text=%2A%20AGPL), but it **uses only permissively**
 **licensed models** – e.g. Stable Diffusion (CreativeML OpenRAIL-M), FLUX (open dev license), etc. No
 proprietary or closed models are required.
-**Content Filtering: No baked-in censorship.** SimpleTuner does not impose any safety filters on
+**Content Filtering: No baked-in filtering.** SimpleTuner does not impose any safety filters on
 training data or outputs. The user has full control of prompts and dataset. (Since it’s self-hosted, any
-NSFW or content restrictions would only come from the chosen model; e.g. Stable Diffusion’s default
+content-safety or content restrictions would only come from the chosen model; e.g. Stable Diffusion’s default
 safety checker is not used here.)
 **Deployment: Docker support** is built-in (provides a Dockerfile, docker-compose, etc. [4](https://github.com/bghira/SimpleTuner#:~:text=match%20at%20L321%20docker) [5](https://github.com/bghira/SimpleTuner#:~:text=docker) ). You
 can run the web UI on a local machine or deploy it to cloud GPU instances. While not officially
@@ -150,18 +150,18 @@ also supports _sample image generation during training_ to monitor progress [12]
 use another tool for inference (Kohya’s GUI will output the `.safetensors` LoRA file and some
 
 sample images, but it’s not an all-purpose image generator UI). However, since it’s built for fine
-tuning, **no censorship or safety filters** are applied to outputs – you have direct control over training
+tuning, **no filtering or safety filters** are applied to outputs – you have direct control over training
 and sample prompts.
 **Licensing:** The GUI code is Apache-2.0 [10](https://github.com/bmaltais/kohya_ss#:~:text=%2A%20README%20%2A%20Apache,Security) and relies on open-source training scripts. The models
 you train on must be accessible (for example, Stable Diffusion 1.5 is CreativeML OpenRAIL-M). There
 are **no restrictive fine-tuning rules** enforced by the tool itself – it will train whatever you give it.
 **Content Filtering: Unfiltered by default.** Kohya’s GUI does not include any hard-coded content
 moderation. Because it’s an offline tool, it assumes you manage your own data responsibly. Even the
-Stable Diffusion safety checker (NSFW filter) is typically disabled for training and sample generation.
-(Users have reported that if using diffusers pipelines for sample preview, the `--no-nsfw_checker`
+Stable Diffusion safety checker (content-safety filter) is typically disabled for training and sample generation.
+(Users have reported that if using diffusers pipelines for sample preview, the `--no-content_safety_checker`
 
 flag can be set, and by default the safety checker is off in recent versions [13](https://github.com/invoke-ai/InvokeAI/issues/1729#:~:text=,checker%20should%20be%20turned%20off) .) In practice, it’s known
-as an uncensored training solution.
+as an unfiltered training solution.
 **Deployment:** Supports **Docker and cloud deployment** . The project includes a Dockerfile and even a
 one-click **RunPod** setup script [14](https://github.com/bmaltais/kohya_ss#:~:text=,user%2C%20Docker%20is%20also%20supported) . Many users run this GUI on cloud GPU services (RunPod, Vast.ai,
 etc.) since it’s convenient for training on rented GPUs. It can also be installed locally via pip or `uv`
@@ -280,10 +280,10 @@ prompt.
 default no model is included, and you download your own. The typical choices (Stable Diffusion
 checkpoints) are all open-license for research/commercial use under conditions (OpenRAIL-M). No
 closed or propietary model is enforced.
-**Content Filtering: No hardcoded censorship.** Automatic1111’s UI is known for being **uncensored** –
+**Content Filtering: No hardcoded filtering.** Automatic1111’s UI is known for being **unfiltered** –
 it does **not** include the Stable Diffusion “safety checker” unless you add it. In fact, users often discuss
-how _the base UI has no NSFW filter_ (only optional add-ons) [19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful) . There is an **NSFW filter extension**
-available [19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful), but by default the UI will happily generate any content the model allows. This was a
+how _the base UI has no content-safety filter_ (only optional add-ons) [19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful) . There is an **content-safety filter extension**
+available [19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful), but by default the UI will happily generate any content the model allows. This was a
 key reason this WebUI became popular, as it imposes no additional content restrictions beyond the
 model’s own biases. Prompting and fine-tuning are unrestricted (aside from obvious legal/commonsense limits left to the user).
 
@@ -308,11 +308,11 @@ can expose publicly or restrict. Many users also run it in Colab notebooks. In s
 
 
 
-[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful)
+[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful)
 
 
 
-[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful)
+[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful)
 
 
 
@@ -336,7 +336,7 @@ image-to-image, etc. This makes it easy to integrate into other applications or 
 Additionally, its **extension system** means you can add new endpoints or features. Many third-party
 tools (like Adobe Photoshop plugins, Blender addons, etc.) interface with Automatic1111’s API to
 generate images. The combination of a powerful UI and an open API gives you flexible integration
-options. (Do note that the API inherits the UI’s lack of censorship – e.g. it will return NSFW images if
+options. (Do note that the API inherits the UI’s lack of filtering – e.g. it will return content-safety images if
 your model/prompt produce them, unless you manually add a filter extension.)
 
 ## **InvokeAI (InvokeAI 3.x “Creative Engine”)**
@@ -404,16 +404,16 @@ is to be **commercial-friendly** and open source. Models included or downloaded 
 
 one).
 
-**Content Filtering: Optional safety, user-controlled.** InvokeAI historically included an **NSFW**
+**Content Filtering: Optional safety, user-controlled.** InvokeAI historically included an **content-safety**
 **checker** (the Diffusers safety filter) that could be toggled. In recent versions, the default is _no_
-_filtering_ unless you enable it. For example, in InvokeAI 2.2 the `--no-nsfw_checker` flag was
+_filtering_ unless you enable it. For example, in InvokeAI 2.2 the `--no-content_safety_checker` flag was
 
 introduced and if you run normally, the safety checker is off by default [13](https://github.com/invoke-ai/InvokeAI/issues/1729#:~:text=,checker%20should%20be%20turned%20off) . There have been user
-reports of needing to disable the NSFW filter in settings, but generally InvokeAI does not censor
+reports of needing to disable the content-safety filter in settings, but generally InvokeAI does not filter
 outputs beyond what the user configures. The UI does not have hardcoded forbidden terms or
 anything – you have full control to generate any content that your loaded model allows. (If using
 their official installer with SDXL, you might get the default SDXL safety guidance, but it can be turned
-off easily.) Overall, InvokeAI is considered **uncensored** – aligned with the open-source ethos that the
+off easily.) Overall, InvokeAI is considered **unfiltered** – aligned with the open-source ethos that the
 
 user decides how to use it.
 
@@ -517,9 +517,9 @@ underlying training code it calls (AI-Toolkit by Ostris, Kohya scripts) are MIT 
 models used are open. There is **no enforced fine-tuning restriction** – you can train on any data and
 any model you have rights to.
 **Content Filtering: None.** ComfyUI has zero built-in filtering – it’s a low-level tool that doesn’t
-assume anything about content. It will happily generate NSFW or any material the model can
+assume anything about content. It will happily generate content-safety or any material the model can
 produce. Since workflows are user-defined, you could even insert your own filter node if desired, but
-by default **nothing is censored or blocked** . The LoRA training extension likewise imposes no safety
+by default **nothing is filtered or blocked** . The LoRA training extension likewise imposes no safety
 checks (other than what the model might inherently do or what the user chooses to include in a
 training workflow). This framework is considered as _“raw”_ as it gets – maximal freedom, but it
 expects the user to know what they are doing.
@@ -709,12 +709,12 @@ under a non-commercial research license [46](https://huggingface.co/XLabs-AI/flu
 without a commercial license – but that is a model restriction, not something enforced by the UI. If
 you swap in a model like Stable Diffusion 1.5, you abide by that model’s OpenRAIL terms (which
 allow commercial use with some rules). FluxGym itself puts **no additional restrictions** on finetuning or outputs.
-**Content Filtering: No content filters.** FluxGym does not include any NSFW or profanity filters. It will
+**Content Filtering: No content filters.** FluxGym does not include any content-safety or profanity filters. It will
 train on whatever images/captions you feed it. Since it’s focused on training, the only “outputs” are
 the LoRA file and some sample images – none of which are subject to any automatic moderation.
 The design goal is simplicity, so it doesn’t impose any safety layers (you have full responsibility for
 the training data’s content). Generated samples too come straight from the model without any
-intervention. In short, **uncensored by design** .
+intervention. In short, **unfiltered by design** .
 **Deployment: Container & Cloud:** FluxGym provides a Dockerfile and even a one-click installer via a
 tool called Pinokio [47](https://github.com/cocktailpeanut/fluxgym#:~:text=https%3A%2F%2Fpinokio) . It’s meant to be very easy to run anywhere. Docker support was announced
 as of Sept 25, 2025 [48](https://github.com/cocktailpeanut/fluxgym#:~:text=News), which also enabled automatic downloading of base models. You can fire up
@@ -770,10 +770,10 @@ features, license info, and model support) and known issues or forum posts regar
 
 deployment options. For example, SimpleTuner’s README confirms its multi-model LoRA support,
 Kohya’s GUI documentation notes its training features including LoRA and SDXL [11](https://github.com/bmaltais/kohya_ss#:~:text=This%20project%20provides%20a%20user,Rank%20Adaptation), and community Q&As
-highlight the lack of forced filters in these UIs (e.g. Automatic1111 requiring an extension for NSFW filtering
+highlight the lack of forced filters in these UIs (e.g. Automatic1111 requiring an extension for content-safety filtering
 
 
-[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful)
+[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful)
 
 ). We have cited these sources inline to provide verifiable details for each framework. Each of these tools
 is under active open-source development as of 2025, so capabilities may expand further (e.g. InvokeAI
@@ -790,7 +790,7 @@ criteria of LoRA training + inference with permissive models and minimal restric
 
 
 
-[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful)
+[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful)
 
 
 
@@ -824,7 +824,7 @@ GitHub - bmaltais/kohya_ss
 
 
 
-[bug]: the NSFW checker isn't being disabled · Issue #1729 - GitHub
+[bug]: the content-safety checker isn't being disabled · Issue #1729 - GitHub
 
 
 
@@ -856,11 +856,11 @@ hako-mikan/sd-webui-traintrain: LoRA training extention for ... - GitHub
 
 
 
-[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20NSFW%20filter%20extension,Was%20this%20translation%20helpful)
+[19](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/11969#:~:text=There%27s%20an%20content-safety%20filter%20extension,Was%20this%20translation%20helpful)
 
 
 
-Is there nsfw_filter on api? or .. #11969 - GitHub
+Is there content_safety_filter on api? or .. #11969 - GitHub
 
 
 

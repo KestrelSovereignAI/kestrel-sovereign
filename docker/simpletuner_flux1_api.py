@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """
-SimpleTuner API Wrapper for FLUX.1-dev Training with Uncensored Support
+SimpleTuner API Wrapper for FLUX.1-dev Training
 
 BACKWARDS COMPATIBILITY WRAPPER - This file now imports the refactored FLUX.1 implementation.
 The actual implementation has been moved to flux1_api.py as part of consolidation effort.
 
 Wraps SimpleTuner's FLUX.1-dev training in a REST API for RunPod/Vertex AI deployment.
-This version uses FLUX.1-dev (not FLUX.2-dev) to enable uncensored content generation
-via the enhanceaiteam/Flux-Uncensored-V2 LoRA adapter.
+This version uses FLUX.1-dev (not FLUX.2-dev) and supports optional
+operator-supplied auxiliary LoRA composition.
 
 Key Features:
   - FLUX.1-dev base model (black-forest-labs/FLUX.1-dev)
   - Character LoRA training via SimpleTuner
-  - Uncensored LoRA (enhanceaiteam/Flux-Uncensored-V2) for NSFW generation
-  - Multi-LoRA support: combines character + uncensored adapters
+  - Optional multi-LoRA support: combines character + auxiliary adapters
 
 API Endpoints:
   POST /train      - Start LoRA training
@@ -22,8 +21,10 @@ API Endpoints:
   GET  /download   - Download trained LoRA
 
 Environment Variables:
-  FLUX_UNCENSORED=true  - Enable uncensored LoRA (default: true)
-  HF_TOKEN              - HuggingFace token for gated models
+  FLUX_AUX_LORA_REPO      - Optional auxiliary LoRA repository
+  FLUX_AUX_LORA_FILENAME  - Auxiliary LoRA filename (default: lora.safetensors)
+  FLUX_AUX_LORA_WEIGHT    - Auxiliary LoRA blend weight (default: 0.8)
+  HF_TOKEN                - HuggingFace token for gated models
 
 IMPORTANT: RunPod mode requires network volume mounted at /workspace.
            NO FALLBACKS - if /workspace is not mounted, the service will fail.
@@ -31,8 +32,8 @@ IMPORTANT: RunPod mode requires network volume mounted at /workspace.
 """
 
 # Import the refactored FLUX.1 API implementation
-from flux1_api import FLUX1API, setup_paths
-import asyncio
+from base_simpletuner_api import setup_paths
+from flux1_api import Flux1SimpleTunerAPI, run_main
 import logging
 import sys
 
@@ -43,21 +44,17 @@ api = None
 
 if __name__ == "__main__":
     # Initialize the API instance
-    api = FLUX1API()
+    api = Flux1SimpleTunerAPI()
 
     # Use the main execution from the FLUX1API class
-    import argparse
-
     # Check if any arguments are provided for batch mode
     if len(sys.argv) > 1:
-        # Delegate to FLUX1API implementation with sys.argv
+        # Delegate to the refactored implementation with sys.argv
         # This preserves the original command-line interface
         original_name = sys.argv[0]
         sys.argv[0] = "flux1_api.py"  # Set expected name for argument parsing
         try:
-            # Import and run the main from flux1_api
-            from flux1_api import main
-            asyncio.run(main())
+            run_main(Flux1SimpleTunerAPI, "Kestrel FLUX.1 LoRA Training API")
         except SystemExit:
             # This is expected when batch modes complete
             pass

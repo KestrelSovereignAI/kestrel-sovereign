@@ -50,12 +50,12 @@ Require instance lifecycle management:
 
 Each provider has different capabilities. Use `TrainingProviderFactory.get_capabilities()` to query these programmatically.
 
-| Provider | Training | Generation | Uncensored | FLUX Version | Cost/Train | Notes |
+| Provider | Training | Generation | Unfiltered | FLUX Version | Cost/Train | Notes |
 |----------|----------|------------|------------|--------------|------------|-------|
 | **RunPod** | ✅ | ✅ | ✅ | 2.x | ~$3-5 | Persistent pod, best for iteration |
 | **Vertex AI** | ✅ | ✅ | ✅ | 2.x | ~$5-10 | Serverless, most reliable |
 | **Replicate** | ✅ | ✅ | ❌ | 1.x | ~$2-5 | Cheapest, but censored |
-| **Vast.ai** | ✅ | ✅ | ✅ | 2.x | ~$2-4 | Cheapest uncensored |
+| **Vast.ai** | ✅ | ✅ | ✅ | 2.x | ~$2-4 | Lowest-cost marketplace option |
 | **GCP Compute** | ✅ | ✅ | ✅ | 2.x | ~$4-8 | VM-based, manual control |
 
 ### Capability Details
@@ -64,8 +64,8 @@ Each provider has different capabilities. Use `TrainingProviderFactory.get_capab
 
 **Generation**: All providers can generate images using trained LoRA weights.
 
-**Uncensored**: Whether content safety filters are applied:
-- ✅ = No filters, NSFW content allowed
+**Unfiltered**: Whether the provider adds extra content filters:
+- ✅ = No additional provider filters
 - ❌ = Content safety filters applied by provider
 
 **FLUX Version**:
@@ -101,7 +101,7 @@ The Replicate adapter will return a clear error if IPFS URLs are passed.
 2. **Upload to HuggingFace**: Store LoRA on HuggingFace and use the HF path
 3. **Train on Replicate**: If you train on Replicate, the model is hosted there automatically
 
-**Recommended Workflow for Uncensored Content:**
+**Recommended Cross-Provider Workflow:**
 ```python
 # Train on Replicate (cheap)
 replicate_provider = TrainingProviderFactory.get_provider("replicate")
@@ -109,8 +109,8 @@ job = await replicate_provider.start_training(companion_id, avatar_data)
 # ... wait for completion ...
 weights = await replicate_provider.download_weights(job.job_id)
 
-# Generate on RunPod (uncensored)
-runpod_provider = TrainingProviderFactory.get_uncensored_provider()
+# Generate on RunPod
+runpod_provider = TrainingProviderFactory.get_unfiltered_provider()
 # Upload weights to RunPod and generate
 ```
 
@@ -119,15 +119,15 @@ runpod_provider = TrainingProviderFactory.get_uncensored_provider()
 ```python
 from features.training import TrainingProviderFactory
 
-# Get first available uncensored provider
-provider = TrainingProviderFactory.get_uncensored_provider()
+# Get first available provider without additional generation filters
+provider = TrainingProviderFactory.get_unfiltered_provider()
 
-# Get provider for generation (optionally require uncensored)
-provider = TrainingProviderFactory.get_generation_provider(uncensored=True)
+# Get provider for generation (optionally require unfiltered output)
+provider = TrainingProviderFactory.get_generation_provider(unfiltered=True)
 
 # Check capabilities of specific provider
 caps = TrainingProviderFactory.get_capabilities("replicate")
-if caps and not caps.uncensored:
+if caps and not caps.unfiltered_generation:
     print("Replicate applies content filters")
 ```
 

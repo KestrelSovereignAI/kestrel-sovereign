@@ -1063,7 +1063,7 @@ Repo entry points and standard project files.
 ## `docker/`
 
 - **docker/Dockerfile.cloudrun** — —
-- **docker/Dockerfile.flux1-uncensored** — —
+- **docker/Dockerfile.flux1** — —
 - **docker/Dockerfile.gpu** — —
 - **docker/Dockerfile.lora-trainer** — —
 - **docker/Dockerfile.multi_agent** — —
@@ -1081,7 +1081,7 @@ Repo entry points and standard project files.
 - **docker/claude-agent/entrypoint.sh** — Claude Code Agent Container Entrypoint
 - **docker/claude-agent/export-token.sh** — Export Claude OAuth token from macOS Keychain
 - **docker/claude-agent/run-agent.sh** — Run Claude Code agent in container
-- **docker/cloudbuild-flux1-uncensored.yaml** — (configuration)
+- **docker/cloudbuild-flux1.yaml** — (configuration)
 - **docker/cloudbuild-ipfs.yaml** — (configuration)
 - **docker/cloudbuild-ollama.yaml** — (configuration)
 - **docker/cloudbuild-simpletuner.yaml** — (configuration)
@@ -2424,10 +2424,6 @@ Repo entry points and standard project files.
 - **demos/technical/demo.cjs** — —
 - **demos/technical/eye.toml** — (configuration)
 - **demos/technical/presenter.md** — Kestrel Demo — Presenter Slides Guide — **Audience:** Investor / Emotional (Noel) **Core emotion to leave with:** TRUST — with a touch of love **Total time:** ~12 minutes **Screenshots:** `demos/technical/demo-output/`
-- **demos/trash/config.cjs** — —
-- **demos/trash/demo.cjs** — —
-- **demos/trash/eye.toml** — (configuration)
-- **demos/trash/narration.md** — Trash Vignette — Narration — ## Why this feature exists
 - **demos/voice/config.cjs** — —
 - **demos/voice/demo.cjs** — —
 - **demos/voice/eye.toml** — (configuration)

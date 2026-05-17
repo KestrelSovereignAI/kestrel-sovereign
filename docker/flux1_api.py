@@ -4,7 +4,7 @@ FLUX.1 SimpleTuner API — FLUX.1 [dev]-specific configuration and overrides.
 
 All shared logic lives in base_simpletuner_api.py. This file only contains:
 - Model identifiers and pipeline classes
-- Uncensored LoRA support (FLUX.1-specific)
+- Optional auxiliary LoRA composition (FLUX.1-specific)
 - Model-specific config overrides
 """
 
@@ -19,14 +19,14 @@ from kestrel_sovereign.kestrel_config.constants import (
 
 logger = logging.getLogger(__name__)
 
-# FLUX.1-specific: uncensored LoRA for NSFW content generation
-UNCENSORED_LORA_REPO = "enhanceateam/Flux-Uncensored-V2"
-UNCENSORED_LORA_FILENAME = "lora.safetensors"
-UNCENSORED_LORA_WEIGHT = 0.8  # Blend weight for uncensored adapter
+# FLUX.1-specific: optional auxiliary LoRA composition.
+AUXILIARY_LORA_REPO = os.getenv("FLUX_AUX_LORA_REPO", "")
+AUXILIARY_LORA_FILENAME = os.getenv("FLUX_AUX_LORA_FILENAME", "lora.safetensors")
+AUXILIARY_LORA_WEIGHT = float(os.getenv("FLUX_AUX_LORA_WEIGHT", "0.8"))
 
 
 class Flux1SimpleTunerAPI(BaseSimpleTunerAPI):
-    """FLUX.1 [dev] implementation with uncensored LoRA support."""
+    """FLUX.1 [dev] implementation with optional auxiliary LoRA support."""
 
     def __init__(self):
         super().__init__(
@@ -82,11 +82,11 @@ class Flux1SimpleTunerAPI(BaseSimpleTunerAPI):
         return base_config
 
     # =========================================================================
-    # FLUX.1-specific: uncensored LoRA support
+    # FLUX.1-specific: optional auxiliary LoRA support
     # =========================================================================
 
     def load_generation_loras(self, pipe, local_lora_path: str):
-        """Load LoRA adapters with optional uncensored LoRA composition."""
+        """Load LoRA adapters with optional auxiliary LoRA composition."""
         # Load primary (companion) LoRA as "companion" adapter
         pipe.load_lora_weights(
             os.path.dirname(local_lora_path),
@@ -94,28 +94,34 @@ class Flux1SimpleTunerAPI(BaseSimpleTunerAPI):
             adapter_name="companion",
         )
 
-        # Also load uncensored LoRA for NSFW generation
+        if not AUXILIARY_LORA_REPO:
+            pipe.set_adapters(["companion"], adapter_weights=[1.0])
+            return
+
+        # Optionally load an operator-specified auxiliary LoRA.
         try:
-            logger.info(f"Loading uncensored LoRA: {UNCENSORED_LORA_REPO}")
+            logger.info(f"Loading auxiliary LoRA: {AUXILIARY_LORA_REPO}")
             pipe.load_lora_weights(
-                UNCENSORED_LORA_REPO,
-                weight_name=UNCENSORED_LORA_FILENAME,
-                adapter_name="uncensored",
+                AUXILIARY_LORA_REPO,
+                weight_name=AUXILIARY_LORA_FILENAME,
+                adapter_name="auxiliary",
             )
             # Compose both adapters
             pipe.set_adapters(
-                ["companion", "uncensored"],
-                adapter_weights=[1.0, UNCENSORED_LORA_WEIGHT],
+                ["companion", "auxiliary"],
+                adapter_weights=[1.0, AUXILIARY_LORA_WEIGHT],
             )
-            logger.info(f"Composed LoRAs: companion=1.0, uncensored={UNCENSORED_LORA_WEIGHT}")
+            logger.info(f"Composed LoRAs: companion=1.0, auxiliary={AUXILIARY_LORA_WEIGHT}")
         except Exception as e:
-            logger.warning(f"Failed to load uncensored LoRA, using companion only: {e}")
+            logger.warning(f"Failed to load auxiliary LoRA, using companion only: {e}")
             pipe.set_adapters(["companion"], adapter_weights=[1.0])
 
     def get_generation_metadata_extras(self) -> dict:
+        if not AUXILIARY_LORA_REPO:
+            return {}
         return {
-            "uncensored_lora": UNCENSORED_LORA_REPO,
-            "uncensored_weight": UNCENSORED_LORA_WEIGHT,
+            "auxiliary_lora": AUXILIARY_LORA_REPO,
+            "auxiliary_weight": AUXILIARY_LORA_WEIGHT,
         }
 
 

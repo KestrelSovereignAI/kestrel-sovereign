@@ -1,20 +1,18 @@
-# Cloud Build configuration for FLUX.1-dev with Uncensored LoRA support
+# Cloud Build configuration for FLUX.1-dev with optional auxiliary LoRA support
 # Builds and pushes to gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1
 #
-# This uses FLUX.1-dev (not FLUX.2-dev) to enable:
-#   - enhanceaiteam/Flux-Uncensored-V2 LoRA for NSFW content
-#   - Multi-LoRA support (character + uncensored)
+# This uses FLUX.1-dev (not FLUX.2-dev) with optional multi-LoRA support.
 #
 # Usage:
 #   cd ./
-#   gcloud builds submit --config=docker/cloudbuild-flux1-uncensored.yaml .
+#   gcloud builds submit --config=docker/cloudbuild-flux1.yaml .
 #
 # Tags:
-#   :v1 - Initial FLUX.1-dev with uncensored LoRA support
+#   :v1 - Initial FLUX.1-dev build
 #   :latest - Always points to latest stable build
 
 steps:
-  # Build the FLUX.1 uncensored image with versioned tag
+  # Build the FLUX.1 image with versioned tag
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
@@ -23,7 +21,7 @@ steps:
       - '-t'
       - 'gcr.io/YOUR_PROJECT_ID/kestrel-lora-flux1:latest'
       - '-f'
-      - 'docker/Dockerfile.flux1-uncensored'
+      - 'docker/Dockerfile.flux1'
       - '.'
     timeout: 3600s  # 1 hour for large image
 

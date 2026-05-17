@@ -170,7 +170,7 @@ LIGHTHOUSE_API_KEY=your_api_key_here
 
 **Cross-Provider Strategy:**
 ```
-Train on Replicate (~$3)  →  Download weights  →  Generate on RunPod (uncensored)
+Train on Replicate (~$3)  →  Download weights  →  Generate on RunPod
    (cheap, serverless)          (portable)           (FLUX.2-dev, no filters)
 ```
 
@@ -182,7 +182,7 @@ Train on Replicate (~$3)  →  Download weights  →  Generate on RunPod (uncens
 **Recommendation:**
 - Use for **cost-effective training** ($2-5 vs $5-10 on Vertex)
 - Use for **safe content generation** (filtered output acceptable)
-- For **uncensored generation**: download weights, use RunPod
+- For **provider-specific generation policy needs**: download weights, use RunPod
 - Monitor for affiliate program launch
 
 ### Modal Labs (Serverless GPU) - NO PUBLIC PROGRAM

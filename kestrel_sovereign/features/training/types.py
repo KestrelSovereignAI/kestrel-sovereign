@@ -134,7 +134,7 @@ class ProviderCapabilities:
     """
     training: bool = False              # Supports LoRA training
     generation: bool = False            # Supports image generation with trained LoRA
-    uncensored: bool = False            # No content safety filters (NSFW allowed)
+    unfiltered_generation: bool = False  # Provider does not enforce additional content filters
     flux_version: str = "1.x"           # FLUX model version: "1.x" or "2.x"
     supports_lora_download: bool = True  # Can download weights for use elsewhere
 
@@ -142,7 +142,7 @@ class ProviderCapabilities:
         return {
             "training": self.training,
             "generation": self.generation,
-            "uncensored": self.uncensored,
+            "unfiltered_generation": self.unfiltered_generation,
             "flux_version": self.flux_version,
             "supports_lora_download": self.supports_lora_download,
         }

@@ -14,8 +14,8 @@ Usage:
     # List available providers
     available = TrainingProviderFactory.list_available_providers()
 
-    # Get first available uncensored provider
-    provider = TrainingProviderFactory.get_uncensored_provider()
+    # Get first available provider without additional content filters
+    provider = TrainingProviderFactory.get_unfiltered_provider()
 
     # Check provider capabilities
     caps = TrainingProviderFactory.get_capabilities("replicate")
@@ -45,7 +45,7 @@ class TrainingProviderFactory:
     # Vertex AI third: serverless, supports both training AND generation (batch mode)
     PROVIDER_PRIORITY = [
         "local_mps",     # Local Apple Silicon (MPS backend), zero cloud cost
-        "runpod",        # Persistent pod, FLUX.2, uncensored, training + generation
+        "runpod",        # Persistent pod, FLUX.2, training + generation
         "vertex_ai",     # Serverless, FLUX.2, training + generation (batch)
         "replicate",     # Serverless, FLUX.1 only, censored
         "gcp_compute",   # VM-based, good reliability
@@ -68,42 +68,42 @@ class TrainingProviderFactory:
         "local_mps": ProviderCapabilities(
             training=True,
             generation=True,  # SDXL pipeline on MPS
-            uncensored=True,  # SDXL is not content-filtered
+            unfiltered_generation=True,
             flux_version="sdxl",  # Using SDXL (commercial-friendly license)
             supports_lora_download=True,
         ),
         "runpod": ProviderCapabilities(
             training=True,
             generation=True,
-            uncensored=True,
+            unfiltered_generation=True,
             flux_version="2.x",
             supports_lora_download=True,
         ),
         "vertex_ai": ProviderCapabilities(
             training=True,
             generation=True,
-            uncensored=True,
+            unfiltered_generation=True,
             flux_version="2.x",
             supports_lora_download=True,
         ),
         "replicate": ProviderCapabilities(
             training=True,
             generation=True,
-            uncensored=False,  # Replicate applies content safety filters
+            unfiltered_generation=False,  # Replicate applies content safety filters
             flux_version="1.x",  # Uses FLUX.1-dev, not FLUX.2
             supports_lora_download=True,  # Weights can be downloaded and used elsewhere
         ),
         "gcp_compute": ProviderCapabilities(
             training=True,
             generation=True,
-            uncensored=True,
+            unfiltered_generation=True,
             flux_version="2.x",
             supports_lora_download=True,
         ),
         "vastai": ProviderCapabilities(
             training=True,
             generation=True,
-            uncensored=True,
+            unfiltered_generation=True,
             flux_version="2.x",
             supports_lora_download=True,
         ),
@@ -188,34 +188,34 @@ class TrainingProviderFactory:
         return cls.PROVIDER_CAPABILITIES.get(name)
 
     @classmethod
-    def get_uncensored_provider(cls) -> Optional[TrainingProvider]:
+    def get_unfiltered_provider(cls) -> Optional[TrainingProvider]:
         """
-        Get first available provider with uncensored generation.
+        Get first available provider without additional generation filters.
 
-        Useful when content requires no safety filtering.
+        Useful when an operator needs direct access to the model output.
         Priority follows PROVIDER_PRIORITY order.
 
         Returns:
-            First available uncensored provider, or None if none available
+            First available unfiltered provider, or None if none available
         """
         for name in cls.PROVIDER_PRIORITY:
             caps = cls.PROVIDER_CAPABILITIES.get(name)
-            if caps and caps.uncensored:
+            if caps and caps.unfiltered_generation:
                 provider = cls.get_provider(name)
                 if provider:
-                    logger.info(f"Using uncensored provider: {name}")
+                    logger.info(f"Using unfiltered provider: {name}")
                     return provider
 
-        logger.warning("No uncensored providers available")
+        logger.warning("No unfiltered providers available")
         return None
 
     @classmethod
-    def get_generation_provider(cls, uncensored: bool = False) -> Optional[TrainingProvider]:
+    def get_generation_provider(cls, unfiltered: bool = False) -> Optional[TrainingProvider]:
         """
         Get a provider that supports image generation.
 
         Args:
-            uncensored: If True, only return providers with uncensored generation
+            unfiltered: If True, only return providers without additional generation filters
 
         Returns:
             TrainingProvider with generation capability, or None
@@ -237,14 +237,17 @@ class TrainingProviderFactory:
         for name in cls.PROVIDER_PRIORITY:
             caps = cls.PROVIDER_CAPABILITIES.get(name)
             if caps and caps.generation:
-                if uncensored and not caps.uncensored:
+                if unfiltered and not caps.unfiltered_generation:
                     continue
                 provider = cls.get_provider(name)
                 if provider:
-                    logger.info(f"Using generation provider: {name} (uncensored={caps.uncensored})")
+                    logger.info(
+                        f"Using generation provider: {name} "
+                        f"(unfiltered={caps.unfiltered_generation})"
+                    )
                     return provider
 
-        logger.warning(f"No generation providers available (uncensored={uncensored})")
+        logger.warning(f"No generation providers available (unfiltered={unfiltered})")
         return None
 
     @classmethod

@@ -337,7 +337,7 @@ class VertexAITrainingAdapter:
             output_gcs = f"gs://{manager.gcs_bucket}/generation/{job_uuid}/{timestamp}"
 
             # Select container image based on FLUX version
-            # flux1 = FLUX.1-dev with uncensored LoRA stacking support
+            # flux1 = FLUX.1-dev with auxiliary LoRA stacking support
             # flux2 = FLUX.2-dev with standard content filtering (default)
             image_uri = None
             if flux_version and flux_version in self.CONTAINER_IMAGES:

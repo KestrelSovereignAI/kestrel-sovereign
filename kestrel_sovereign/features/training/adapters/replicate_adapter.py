@@ -12,9 +12,7 @@ Uses the Replicate API directly for FLUX.1 LoRA training:
 Image generation with trained LoRA:
 - ~$0.003-0.03 per image depending on model
 - Multiple FLUX models supported (schnell, dev, pro)
-- NOTE: Replicate applies content safety filters (censored)
-
-For uncensored generation, download weights and use with RunPod or Vast.ai.
+- NOTE: Replicate applies content safety filters.
 """
 
 import asyncio
@@ -67,9 +65,7 @@ class ReplicateTrainingAdapter:
     - Training: ~$2-5 per run, ~15-20 minutes
     - Generation: ~$0.003-0.03 per image
     - FLUX.1-dev based (not FLUX.2)
-    - CENSORED: Replicate applies content safety filters
-
-    For uncensored generation, download weights and use with RunPod/Vast.ai.
+    - Replicate applies content safety filters.
     """
 
     TRAINER_VERSION = "ostris/flux-dev-lora-trainer:b6af14222e6bd9be257cbc1ea4afda3cd0503e1133083b9d1de0364d8568e6ef"
@@ -86,7 +82,7 @@ class ReplicateTrainingAdapter:
     CAPABILITIES = ProviderCapabilities(
         training=True,
         generation=True,
-        uncensored=False,  # Replicate applies content safety filters
+        unfiltered_generation=False,  # Replicate applies content safety filters
         flux_version="1.x",  # Uses FLUX.1, not FLUX.2
         supports_lora_download=True,  # Weights can be downloaded for use elsewhere
     )
@@ -484,7 +480,8 @@ class ReplicateTrainingAdapter:
         Generate image using trained LoRA on Replicate.
 
         NOTE: Output is censored by Replicate's content safety filters.
-        For uncensored generation, download weights and use RunPod/Vast.ai.
+        For providers with different policy needs, download weights and use
+        another configured backend.
 
         IMPORTANT: Replicate does NOT support IPFS URLs for LoRA weights.
         Use HuggingFace paths/URLs instead. See _resolve_lora_url() for details.

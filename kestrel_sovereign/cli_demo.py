@@ -41,7 +41,7 @@ Usage::
 
     kestrel demo run technical
     kestrel demo run spawn --port 9001
-    kestrel demo run trash --keep-server   # leave the demo server up
+    kestrel demo run voice --keep-server   # leave the demo server up
 """
 
 from __future__ import annotations
