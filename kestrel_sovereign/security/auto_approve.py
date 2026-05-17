@@ -25,6 +25,22 @@ Rules come from two unioned sources:
 
 The matcher itself is pure and DB-free; the dynamic rules and the audit
 sink live on :class:`PermissionStore` (which already owns the agent DB).
+
+Intentional scope (epic #1290): auto-approve governs the **internal
+computer_use gate** signature (``feature_name="computer_use"`` with an
+``argv`` payload). That is the path the loop-closing primitive
+``talon_file_and_claim`` uses — a direct ``cu.shell()`` method call, with
+no PRE_TOOL_USE hook in front of it — so the acceptance criterion is met
+and every run is audited *and* exit-code-finalized in
+``computer_use._audit_run``. A direct LLM ``computer_use.shell`` *tool*
+call instead hits the PRE_TOOL_USE ``SecurityHook`` first, which keys it
+as ``ComputerUseFeature.shell`` with a raw ``{"command": ...}`` payload
+and cannot thread an audit id through to a finalizer. Auto-approving
+*there* would either dangle an unfinalizable audit row (no silent runs ⇒
+unacceptable) or require POST_TOOL_USE finalization machinery. That
+enhancement is tracked as a follow-up; until it lands, LLM-driven shell
+*tool* calls deliberately still require human approval (the safe
+default). This is a designed boundary, not an oversight.
 """
 
 from __future__ import annotations
