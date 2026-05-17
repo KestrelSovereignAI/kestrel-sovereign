@@ -756,6 +756,92 @@ def cmd_shell(args) -> int:
     return asyncio.run(_run_shell(agent_dir, args))
 
 
+def _run_http_ask(
+    agent_name: str,
+    base_url: str,
+    api_key: str,
+    message: str,
+    session_id: Optional[str],
+    as_json: bool,
+) -> int:
+    """One-shot POST to a running agent's HTTP API; print the reply.
+
+    Non-interactive sibling of ``_run_http_shell`` — same endpoint, same
+    auth, no REPL. Deliberately does NOT boot an in-process agent: the
+    point of ``kestrel ask`` is talking to the *warm running* agent for
+    scripting/validation; a cold in-process boot is the multi-minute trap
+    this command exists to avoid (see #1287).
+    """
+    import httpx
+
+    payload = {"input": message}
+    if session_id:
+        payload["session_id"] = session_id
+    headers = {"X-API-Key": api_key} if api_key else {}
+    try:
+        with httpx.Client(base_url=base_url, headers=headers, timeout=600.0) as client:
+            resp = client.post("/api/agent/invoke", json=payload)
+    except httpx.RequestError as e:
+        print(f"Connection error talking to '{agent_name}' at {base_url}: {e}",
+              file=sys.stderr)
+        return 1
+    if resp.status_code != 200:
+        print(f"HTTP {resp.status_code}: {resp.text[:300]}", file=sys.stderr)
+        return 1
+    try:
+        body = resp.json()
+    except ValueError:
+        print(f"Non-JSON response: {resp.text[:300]}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(body))
+    else:
+        print(body.get("response", ""))
+    return 0
+
+
+def cmd_ask(args) -> int:
+    """Send ONE message to an already-running agent and print its reply.
+
+    Non-interactive, scriptable counterpart of ``kestrel shell``. Reuses
+    the same server detection + ``/api/agent/invoke`` path. If no server
+    hosts the agent it errors (non-zero) rather than cold-booting an
+    in-process instance — that fallback is the latency trap ``ask`` is
+    built to sidestep (#1287).
+    """
+    project_dir = _get_project_dir()
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+    local_agents = multi_agent.get_local_agents()
+
+    if args.name not in local_agents:
+        print(f"Agent '{args.name}' not found in multi_agent config", file=sys.stderr)
+        print(f"Available agents: {', '.join(local_agents.keys()) or '(none)'}",
+              file=sys.stderr)
+        return 1
+
+    agent_cfg = local_agents[args.name]
+    server = _detect_running_agent_server(args.name, agent_cfg, multi_agent)
+    if server is None:
+        print(
+            f"No running server hosts agent '{args.name}'. "
+            f"`kestrel ask` only talks to a live agent — start it first "
+            f"(`kestrel start {args.name}` or `kestrel start host`). "
+            f"For an offline in-process session use `kestrel shell {args.name}`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    base_url, api_key = server
+    return _run_http_ask(
+        args.name,
+        base_url,
+        api_key,
+        args.message,
+        getattr(args, "session", None),
+        bool(getattr(args, "json", False)),
+    )
+
+
 async def _run_shell(agent_dir: Path, args) -> int:
     """Run the interactive chat shell for an agent."""
     from kestrel_sovereign.storage import AsyncStorage
@@ -1886,6 +1972,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Load an application extension",
     )
 
+    # kestrel ask <name> "<message>" — non-interactive one-shot to a
+    # RUNNING agent (no in-process boot; scriptable). See #1287.
+    ask_p = subparsers.add_parser(
+        "ask",
+        help="Send one message to a running agent and print its reply "
+             "(non-interactive)",
+    )
+    ask_p.add_argument("name", help="Agent name")
+    ask_p.add_argument("message", help="Message to send")
+    ask_p.add_argument(
+        "--session", type=str, default=None,
+        help="Session id to thread continuity across calls",
+    )
+    ask_p.add_argument(
+        "--json", action="store_true",
+        help="Emit the full {response, session_id} envelope as JSON",
+    )
+
     # kestrel health (deprecated alias for doctor)
     subparsers.add_parser("health", help="(deprecated) alias for `kestrel doctor`")
 
@@ -2176,6 +2280,7 @@ def main() -> int:
         "list": cmd_list,
         "create": cmd_create,
         "shell": cmd_shell,
+        "ask": cmd_ask,
         "health": cmd_health,
         "doctor": cmd_doctor,
         "storage": cmd_storage,
