@@ -329,6 +329,7 @@ let messageInput = null;
 let sendButton = null;
 let modelSelector = null;
 let thinkingIndicator = null;
+let composerModeToggle = null;  // #1257 send-while-busy mode toggle
 
 // Shared model selector instance
 let sharedModelSelector = null;
@@ -408,6 +409,9 @@ export function mountChatPane(agentName) {
         }
         target.hasUnrenderedMermaid = false;
     }
+    // #1257: mode is per-pane (like session). Reflect the now-visible
+    // agent's send-while-busy mode on the toggle.
+    updateComposerModeToggle();
     return target;
 }
 
@@ -432,6 +436,11 @@ export function wipeAgentChatPane(agentName, html = '') {
     pane.hasUnrenderedMermaid = false;
     pane.pendingRevise = false;
     pane.reviseConsumedRequestId = null;
+    // #1257: a within-agent context change (clear chat, new chat,
+    // conversation switch, delete) discards any queued follow-up — it
+    // belonged to the conversation the user just left. The chip DOM
+    // goes with the innerHTML reset below; null the field too.
+    pane.queuedMessage = null;
     pane.element.innerHTML = html;
     pane.scrollPos = 0;
 }
@@ -452,6 +461,7 @@ export function initChat() {
     sendButton = document.getElementById('send-button');
     modelSelector = document.getElementById('model-selector');
     thinkingIndicator = document.getElementById('thinking-indicator');
+    composerModeToggle = document.getElementById('composer-mode-toggle');
 
     // Initial-pane migration: HTML ships welcome content baked into
     // #chat-container. Move that content into a pane element so the
@@ -476,7 +486,11 @@ export function initChat() {
     }
 
     // Event listeners
-    sendButton?.addEventListener('click', sendMessage);
+    sendButton?.addEventListener('click', () => sendMessage());
+    // #1257 send-while-busy mode toggle. Reflect the initial mounted
+    // agent's mode (default 'interrupt').
+    composerModeToggle?.addEventListener('click', toggleComposerMode);
+    updateComposerModeToggle();
 
     // Ensure every external link rendered in chat opens in a new tab.
     // Markdown links go through marked's renderer (already adds target=_blank),
@@ -829,6 +843,26 @@ async function stopRequest() {
  * backend, not B's.
  */
 export async function stopAgent(agentName) {
+    // #1257: Stop = stop everything. Clear any queued follow-up
+    // SYNCHRONOUSLY, before the abort and before the awaited /stop
+    // POST. This must precede every await: if `API.stop()` is slow,
+    // the in-flight turn's stream can complete (normally — e.g. no
+    // abort controller was registered yet, so `wasAborted` stays
+    // false) and reach its `finally` with `pane.queuedMessage` still
+    // set, dispatching the message the user just cancelled. Clearing
+    // first closes that window — by the time any other async context
+    // runs, the queue is already gone. The finally's `!wasAborted`
+    // guard is a redundant second layer, not the primary one. (The
+    // queued chip's own × cancels ONLY the queued message while
+    // letting the turn run; that path is in renderQueuedChip.) Use
+    // the map directly so we don't conjure a pane for an agent that
+    // never had one.
+    const pane = state.chatPanes.get(agentName);
+    if (pane) {
+        pane.queuedMessage = null;
+        clearQueuedChip(pane);
+    }
+
     const abortController = API.getStreamAbortController(agentName);
     if (abortController) {
         try { abortController.abort(); } catch (_) { /* noop */ }
@@ -851,37 +885,143 @@ export async function stopAgent(agentName) {
 }
 
 // ============================================================================
+// Queue Mode (#1257)
+// ============================================================================
+
+const QUEUED_CHIP_CLASS = 'queued-message-chip';
+
+/**
+ * Render (or replace) the pending-queued-message chip at the bottom of
+ * an agent's pane. Queue mode holds exactly ONE pending message; a
+ * re-Enter replaces the chip so the user always sees precisely what
+ * will be sent when the in-flight turn finishes. The chip lives in
+ * pane.element (like message bubbles) so it travels with the pane
+ * across agent switches and shows when the user returns.
+ */
+function renderQueuedChip(pane, agentName, text) {
+    clearQueuedChip(pane);
+    if (!pane || !pane.element) return;
+    const chip = document.createElement('div');
+    chip.className = QUEUED_CHIP_CLASS;
+    const label = document.createElement('span');
+    label.className = 'queued-message-text';
+    label.textContent = text;
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'queued-message-cancel';
+    cancel.title = 'Cancel queued message';
+    cancel.textContent = '×';  // ×
+    // Cancel ONLY the queued message — the in-flight turn keeps
+    // running. (The big Stop button cancels both; see stopAgent.)
+    cancel.addEventListener('click', () => {
+        pane.queuedMessage = null;
+        clearQueuedChip(pane);
+    });
+    chip.appendChild(label);
+    chip.appendChild(cancel);
+    pane.element.appendChild(chip);
+    // Scroll the real viewport, not pane.element: `.chat-container-pane`
+    // is `display: contents` so it has no scroll box. Mirror the
+    // addMessage/updateStreamingMessage pattern — only scroll when this
+    // pane is the one actually mounted into #chat-container, so a chip
+    // queued for a backgrounded agent doesn't yank the visible pane.
+    const c = getChatContainer();
+    if (c && pane.element.parentNode === c) {
+        c.scrollTop = c.scrollHeight;
+    }
+}
+
+/** Remove the queued-message chip from a pane, if present. */
+function clearQueuedChip(pane) {
+    if (!pane || !pane.element) return;
+    const existing = pane.element.querySelector('.' + QUEUED_CHIP_CLASS);
+    if (existing) existing.remove();
+}
+
+/**
+ * Reflect the mounted agent's composerMode on the toggle button.
+ * Mode is per-pane (like session), so the control always shows the
+ * VISIBLE agent's mode — called on init and on every pane mount.
+ */
+export function updateComposerModeToggle() {
+    if (!composerModeToggle) return;
+    const current = API.getHostAgent();
+    const pane = state.chatPanes.get(current);
+    const mode = (pane && pane.composerMode) || 'interrupt';
+    composerModeToggle.dataset.mode = mode;
+    composerModeToggle.textContent = mode === 'queue' ? 'Queue' : 'Interrupt';
+    composerModeToggle.title = mode === 'queue'
+        ? 'Send-while-busy: queue this message and send it when the agent finishes. Click to switch to Interrupt.'
+        : 'Send-while-busy: stop the current turn and send now. Click to switch to Queue.';
+}
+
+/** Toggle the mounted agent's send-while-busy mode (per-pane). */
+function toggleComposerMode() {
+    const pane = getOrCreateChatPane(API.getHostAgent());
+    pane.composerMode = pane.composerMode === 'queue' ? 'interrupt' : 'queue';
+    updateComposerModeToggle();
+}
+
+// ============================================================================
 // Send Message
 // ============================================================================
 
-export async function sendMessage() {
-    const text = messageInput.value.trim();
+/**
+ * Dispatch a chat turn.
+ *
+ * Normal call (Enter / Send click): reads the composer textarea and
+ * the currently-mounted host agent.
+ *
+ * #1257 queued re-dispatch: the completing turn's finally calls
+ * ``sendMessage(queuedText, originalAgent)`` so the queued message
+ * lands against the agent it was queued for — NOT whatever agent the
+ * user happens to be viewing when the prior turn finishes. Without
+ * the explicit agent, an agent switch between queueing and dispatch
+ * would misroute the message.
+ */
+export async function sendMessage(overrideText, overrideAgent) {
+    const fromComposer = overrideText === undefined;
+    const text = (fromComposer ? messageInput.value : overrideText).trim();
 
     // Capture the dispatch agent and pin the dispatch's pane up front,
     // BEFORE any await — the user could mount a different agent's pane
     // before the first stream chunk arrives, and the user's typed text
     // must always land in the agent it was dispatched against.
-    const dispatchAgent = API.getHostAgent();
+    const dispatchAgent = overrideAgent !== undefined
+        ? overrideAgent
+        : API.getHostAgent();
     if (!text) return;
 
-    // #1255: interrupt-on-send. When the user hits Enter while the
-    // dispatch agent is still streaming, stop the in-flight turn
-    // before dispatching the new one. ``stopAgent`` aborts the
-    // client-side fetch synchronously and awaits the server's
-    // ``/api/agent/stop`` ack, so the cancellation is registered
-    // server-side BEFORE the next ``streamInvoke`` POST opens; the
-    // backend's loop-level checkpoints (#1256) then halt the prior
-    // turn cleanly. Without this, two streams for the same agent
-    // would race and the prior turn's chunks could keep painting
-    // into the pane after the new user message had already been
-    // rendered. Note: ``stopAgent`` removes the agent from
-    // ``state.waitingAgents`` itself, so the subsequent ``add``
-    // below is the correct next state.
+    const pane = getOrCreateChatPane(dispatchAgent);
+
+    // Send-while-busy. Behavior depends on the pane's composerMode.
     if (state.waitingAgents.has(dispatchAgent)) {
+        if (pane.composerMode === 'queue') {
+            // #1257 queue mode: stash the message and surface it as a
+            // pending chip. The completing turn's finally dispatches
+            // it. Re-Enter while something is already queued REPLACES
+            // it — single-slot queue (multi-message queue is a
+            // deferred follow-up). Do NOT interrupt the in-flight turn.
+            pane.queuedMessage = text;
+            if (fromComposer) messageInput.value = '';
+            renderQueuedChip(pane, dispatchAgent, text);
+            return;
+        }
+        // #1255 interrupt mode (default): stop the in-flight turn
+        // before dispatching the new one. ``stopAgent`` aborts the
+        // client-side fetch synchronously and awaits the server's
+        // ``/api/agent/stop`` ack, so the cancellation is registered
+        // server-side BEFORE the next ``streamInvoke`` POST opens; the
+        // backend's loop-level checkpoints (#1256) then halt the prior
+        // turn cleanly. Without this, two streams for the same agent
+        // would race and the prior turn's chunks could keep painting
+        // into the pane after the new user message had already been
+        // rendered. Note: ``stopAgent`` removes the agent from
+        // ``state.waitingAgents`` itself, so the subsequent ``add``
+        // below is the correct next state.
         await stopAgent(dispatchAgent);
     }
 
-    const pane = getOrCreateChatPane(dispatchAgent);
     // Capture the pane-local generation. This dispatch's DOM writes
     // gate on `pane.generation === dispatchGeneration`. Agent switches
     // do NOT bump generation — only within-agent context changes
@@ -897,7 +1037,11 @@ export async function sendMessage() {
     const sessionId = pane.sessionId || null;
 
     await addMessage('user', text, pane.element);
-    messageInput.value = '';
+    // Only clear the composer when the text CAME from it. A #1257
+    // queued re-dispatch passes overrideText and must not wipe
+    // whatever the user has since typed for the (possibly different)
+    // currently-mounted agent.
+    if (fromComposer) messageInput.value = '';
     state.waitingAgents.add(dispatchAgent);
     updateThinkingIndicator();
     refreshAgentThinkingDot(dispatchAgent);
@@ -1097,6 +1241,35 @@ export async function sendMessage() {
         if (!wasAborted && isPaneFresh() && API.getHostAgent() !== dispatchAgent) {
             const label = dispatchAgent || 'agent';
             Toast.info(`${label} finished responding`);
+        }
+        // #1257 queue mode: if a follow-up was queued while this turn
+        // streamed, dispatch it now the turn has fully settled. ALWAYS
+        // clear the stored message + chip here; only RE-dispatch when
+        //   * the turn wasn't user-aborted — Stop = stop everything,
+        //     including the queue (stopAgent also clears it eagerly so
+        //     the chip vanishes on click; this is the belt-and-braces
+        //     half), and
+        //   * the pane is still fresh — a conversation switch
+        //     mid-turn discards the stale queue.
+        // A prior-turn ERROR still dispatches (the user queued it
+        // deliberately; a route failure shouldn't silently eat their
+        // next input). queueMicrotask defers the dispatch past this
+        // finally's own unwind so the queued sendMessage starts from a
+        // clean async context instead of re-entering mid-cleanup —
+        // the ordering lesson from #1255's review.
+        if (pane.queuedMessage != null) {
+            const queued = pane.queuedMessage;
+            pane.queuedMessage = null;
+            clearQueuedChip(pane);
+            if (!wasAborted && isPaneFresh()) {
+                queueMicrotask(() => {
+                    // Re-check generation at fire time — a conversation
+                    // switch could land between this finally and the
+                    // microtask draining.
+                    if (pane.generation !== dispatchGeneration) return;
+                    sendMessage(queued, dispatchAgent);
+                });
+            }
         }
     }
 }

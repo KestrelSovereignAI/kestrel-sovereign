@@ -1049,6 +1049,69 @@ nav {
     border-top: 1px solid var(--border-color);
 }
 
+/* #1257 send-while-busy mode toggle (input footer, left side). */
+.composer-mode-toggle {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-tertiary);
+    border-radius: 999px;
+    padding: 0.1rem 0.6rem;
+    font-size: 0.7rem;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.composer-mode-toggle:hover {
+    color: var(--text-primary);
+    border-color: var(--accent-color);
+}
+.composer-mode-toggle[data-mode="queue"] {
+    color: var(--accent-color);
+    border-color: var(--accent-color);
+}
+
+/* #1257 pending queued-message chip (bottom of the pane). */
+.queued-message-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.5rem 1rem;
+    padding: 0.4rem 0.75rem;
+    border: 1px dashed var(--border-color);
+    border-radius: 12px;
+    background: var(--bg-secondary);
+    color: var(--text-tertiary);
+    font-size: 0.85rem;
+    opacity: 0.85;
+}
+.queued-message-chip::before {
+    content: "queued";
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.05rem 0.4rem;
+    border-radius: 999px;
+    background: var(--bg-primary);
+    color: var(--text-tertiary);
+}
+.queued-message-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.queued-message-cancel {
+    background: transparent;
+    border: none;
+    color: var(--text-tertiary);
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 0.25rem;
+}
+.queued-message-cancel:hover {
+    color: var(--error-color, #ef4444);
+}
+
 .input-area textarea {
     flex: 1;
     padding: 0.75rem 1rem;
