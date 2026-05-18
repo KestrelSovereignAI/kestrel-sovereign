@@ -41,6 +41,7 @@ let loadResources = null;
 let loadMetrics = null;
 let loadSpawn = null;
 let loadFeatureStore = null;
+let loadApprovals = null;
 
 export function setLazyLoaders(loaders) {
     loadConstitution = loaders.loadConstitution;
@@ -51,6 +52,7 @@ export function setLazyLoaders(loaders) {
     loadMetrics = loaders.loadMetrics;
     loadSpawn = loaders.loadSpawn;
     loadFeatureStore = loaders.loadFeatureStore;
+    loadApprovals = loaders.loadApprovals;
 }
 
 // Map data-panel values to the capability keys that gate them (#879).
@@ -81,6 +83,7 @@ const PANEL_CAPABILITIES = {
     spawn: ['spawn'],
     features: ['featureStore'],
     security: ['audit', 'permissions'],
+    approvals: ['permissions'],
 };
 
 function panelIsEnabled(panelId) {
@@ -122,6 +125,7 @@ export function initNavigation() {
             if (panelId === 'metrics' && loadMetrics) loadMetrics();
             if (panelId === 'spawn' && loadSpawn) loadSpawn();
             if (panelId === 'features' && loadFeatureStore) loadFeatureStore();
+            if (panelId === 'approvals' && loadApprovals) loadApprovals();
         });
     });
 

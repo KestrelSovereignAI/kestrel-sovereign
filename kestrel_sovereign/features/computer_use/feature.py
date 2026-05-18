@@ -59,7 +59,12 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
-_DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python"]
+# ``gh`` is allow-listed so it reaches the approval queue rather than
+# being hard-denied by binary policy before the scoped auto-approve seam
+# can govern it (epic #1290 D4: talon_file_and_claim → gh issue create).
+# Allow-listed != auto-run: BinaryPolicy still returns REQUIRE_APPROVAL,
+# so a human (or an explicit, scoped auto-approve rule) remains the gate.
+_DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
 _DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
@@ -456,6 +461,52 @@ class ComputerUseFeature(Feature):
                 agent_did=getattr(self.agent, "did", "anonymous"),
             )
         )
+        await self._finalize_auto_approve_audit(allowed_by, payload, outcome)
+
+    async def _finalize_auto_approve_audit(
+        self,
+        allowed_by: List[str],
+        payload: Dict[str, Any],
+        outcome: str,
+    ) -> None:
+        """Stamp the real exit code on the auto-approve audit row.
+
+        When a run was auto-approved, ``request_approval`` returned
+        ``auto_approve:<id>`` and that id rode the ``approval:<scope>``
+        token in ``allowed_by``. Closing the loop here means the audit row
+        is the full record the constitution requires — command, agent DID,
+        timestamp *and* exit code — for every auto-approved invocation.
+        """
+        token = next(
+            (
+                a.split("approval:auto_approve:", 1)[1]
+                for a in allowed_by
+                if a.startswith("approval:auto_approve:")
+            ),
+            None,
+        )
+        if token is None:
+            return
+        try:
+            audit_id = int(token)
+        except ValueError:
+            return
+        rc = payload.get("returncode")
+        exit_code = (
+            int(rc) if isinstance(rc, int)
+            else (0 if outcome == "ok" else 1)
+        )
+        security = self._get_security_feature()
+        store = getattr(security, "permission_store", None) if security else None
+        if store is None:
+            return
+        try:
+            await store.finalize_auto_approve(audit_id, exit_code)
+        except Exception as exc:  # noqa: BLE001 - audit must not crash a run
+            logger.warning(
+                "computer_use: failed to finalize auto-approve audit %s: %s",
+                audit_id, exc, exc_info=True,
+            )
 
     # =========================================================================
     # Tools

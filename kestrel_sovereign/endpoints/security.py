@@ -4,12 +4,16 @@ Kestrel Security API Endpoints.
 Provides REST API for managing security permissions and approval queue.
 """
 
+import logging
+
 from fastapi import APIRouter, Query, Request, HTTPException
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/security", tags=["security"])
 
@@ -34,6 +38,9 @@ class ApprovalDecisionRequest(BaseModel):
     approval_id: str
     approved: bool
     scope: str = "once"  # "once", "session", "always"
+    # "Approve-and-remember": on approve, add a conservative auto-approve
+    # rule for this agent+repo so the Sovereign never types this again.
+    remember: bool = False
 
 
 class AutoModeRequest(BaseModel):
@@ -66,6 +73,11 @@ class PendingApprovalResponse(BaseModel):
     tool: str
     args: Dict[str, Any]
     timestamp: str
+    agent_name: Optional[str] = None
+    # One-line human summary + the full command/diff preview the Sovereign
+    # reviews before clicking. This is what replaces CLI typing.
+    action_summary: str = ""
+    command_preview: str = ""
 
 
 class PendingListResponse(BaseModel):
@@ -115,6 +127,59 @@ def get_security_feature(request: Request):
         )
 
     return security
+
+
+def _resolve_agent_name(security) -> Optional[str]:
+    """Best-effort agent name, hardened against test mocks.
+
+    ``getattr(mock, "_agent_name", None)`` returns a child MagicMock, not
+    None, so a bare getattr would feed a non-str into the response model.
+    Only a real ``str`` counts; anything else degrades to ``None``.
+    """
+    name = getattr(
+        getattr(security.approval_queue, "_agent", None), "_agent_name", None
+    )
+    return name if isinstance(name, str) else None
+
+
+def _command_preview(
+    feature_name: str, tool_name: str, tool_args: Dict[str, Any]
+) -> str:
+    """The full command / diff the Sovereign reviews before deciding."""
+    try:
+        from kestrel_sovereign.security.auto_approve import derive_command
+
+        cmd = derive_command(feature_name, tool_name, tool_args or {})
+        if cmd:
+            return cmd
+    except Exception:  # noqa: BLE001
+        pass
+    diff = (tool_args or {}).get("diff") or (tool_args or {}).get("preview")
+    if diff:
+        return str(diff)
+    import json as _json
+
+    try:
+        return _json.dumps(tool_args or {}, indent=2, default=str)[:4000]
+    except Exception:  # noqa: BLE001
+        return repr(tool_args)[:4000]
+
+
+def _summarize_action(
+    feature_name: str, tool_name: str, tool_args: Dict[str, Any]
+) -> str:
+    """One-line human summary for the row header."""
+    fname = (feature_name or "").lower()
+    if fname == "computer_use" and tool_name == "shell":
+        argv = (tool_args or {}).get("argv") or []
+        head = " ".join(str(a) for a in argv[:4])
+        return f"shell: {head}".strip()
+    if tool_name == "run_script":
+        return (
+            f"run script '{(tool_args or {}).get('script_name', '?')}' "
+            f"({(tool_args or {}).get('language', '?')})"
+        )
+    return f"{feature_name}.{tool_name}"
 
 
 # === Endpoints ===
@@ -239,6 +304,7 @@ async def get_pending_approvals(request: Request):
     """
     security = get_security_feature(request)
     pending = security.approval_queue.pending_requests
+    agent_name = _resolve_agent_name(security)
 
     return PendingListResponse(
         pending=[
@@ -247,7 +313,14 @@ async def get_pending_approvals(request: Request):
                 feature=r.feature_name,
                 tool=r.tool_name,
                 args=r.tool_args,
-                timestamp=r.created_at.isoformat()
+                timestamp=r.created_at.isoformat(),
+                agent_name=agent_name,
+                action_summary=_summarize_action(
+                    r.feature_name, r.tool_name, r.tool_args
+                ),
+                command_preview=_command_preview(
+                    r.feature_name, r.tool_name, r.tool_args
+                ),
             )
             for r in pending
         ],
@@ -325,6 +398,17 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
             detail=f"Invalid scope '{data.scope}'. Use: once, session, always"
         )
 
+    # Capture the request BEFORE submit_decision resolves/pops it, so
+    # "Approve-and-remember" can derive a rule from its args.
+    remembered = None
+    pending_req = next(
+        (
+            r for r in security.approval_queue.pending_requests
+            if r.id == data.approval_id
+        ),
+        None,
+    )
+
     success = security.approval_queue.submit_decision(
         data.approval_id, data.approved, data.scope
     )
@@ -335,11 +419,56 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
             detail=f"Request '{data.approval_id}' not found or expired"
         )
 
-    return {
+    if data.remember and data.approved and pending_req is not None:
+        try:
+            from kestrel_sovereign.security.auto_approve import (
+                derive_command,
+                suggest_rule_from_command,
+            )
+
+            command = derive_command(
+                pending_req.feature_name,
+                pending_req.tool_name,
+                pending_req.tool_args or {},
+            )
+            if command:
+                pattern, repo_scope = suggest_rule_from_command(command)
+                if not repo_scope:
+                    # A scoped allowlist must be scoped. Refuse to remember
+                    # a rule we can't bind to a repo (codex P2, #1290) —
+                    # the one-off approval still stands.
+                    remembered = {
+                        "skipped": "no repo scope; not remembered",
+                    }
+                else:
+                    agent_name = _resolve_agent_name(security)
+                    await security.permission_store.add_auto_approve_rule(
+                        pattern=pattern,
+                        repo_scope=repo_scope,
+                        agent=agent_name,
+                        added_by="mews_approval",
+                    )
+                    remembered = {
+                        "pattern": pattern,
+                        "repo_scope": repo_scope,
+                        "agent": agent_name,
+                    }
+        except Exception as exc:  # noqa: BLE001 - remember is best-effort
+            logger.warning(
+                "Approve-and-remember failed for %s: %s",
+                data.approval_id, exc, exc_info=True,
+            )
+
+    result = {
         "success": True,
         "approved": data.approved,
-        "scope": data.scope
+        "scope": data.scope,
     }
+    # Only present when a rule was actually remembered, so the existing
+    # /approve contract is byte-identical on the normal path.
+    if remembered is not None:
+        result["remembered"] = remembered
+    return result
 
 
 @router.get("/audit", response_model=AuditLogResponse)
@@ -413,3 +542,47 @@ async def reset_session_overrides(request: Request):
     security = get_security_feature(request)
     security.permission_store.clear_session_overrides()
     return {"success": True, "message": "Session overrides cleared"}
+
+
+# === Auto-approve allowlist (Sovereign-curated, revocable) ===
+
+@router.get("/auto-approve/rules")
+async def list_auto_approve_rules(request: Request):
+    """List the Sovereign-curated auto-approve rules (revocable)."""
+    security = get_security_feature(request)
+    rules = await security.permission_store.list_auto_approve_rules()
+    return {"rules": rules, "count": len(rules)}
+
+
+@router.delete("/auto-approve/rules/{rule_id}")
+@limiter.limit("30/minute")
+async def revoke_auto_approve_rule(request: Request, rule_id: int):
+    """Revoke a remembered rule. Constitutional invariant (c):
+    every auto-approve grant is revocable by removing the pattern."""
+    security = get_security_feature(request)
+    removed = await security.permission_store.remove_auto_approve_rule(
+        rule_id
+    )
+    if not removed:
+        raise HTTPException(
+            status_code=404, detail=f"Rule {rule_id} not found"
+        )
+    await security.permission_store.log_decision(
+        feature_name="SecurityFeature",
+        tool_name="auto_approve_rule",
+        action="permission_change",
+        decision="auto_approve_rule_revoked",
+        user_choice=str(rule_id),
+    )
+    return {"success": True, "revoked": rule_id}
+
+
+@router.get("/auto-approve/audit")
+async def get_auto_approve_audit(
+    request: Request, limit: int = Query(50, ge=1, le=500)
+):
+    """Recent auto-approved invocations — the 'no silent runs' record
+    (command, agent DID, timestamp, exit code)."""
+    security = get_security_feature(request)
+    rows = await security.permission_store.get_auto_approve_audit(limit)
+    return {"audit": rows, "count": len(rows)}

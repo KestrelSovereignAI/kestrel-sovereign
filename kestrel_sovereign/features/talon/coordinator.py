@@ -10,6 +10,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -336,6 +338,136 @@ class TalonCoordinatorFeature(Feature):
         return ToolResult.failed(
             cli_result.get("error") or "talon CLI dispatch failed",
             data=cli_result,
+        )
+
+    @tool(
+        name="talon_file_and_claim",
+        description=(
+            "Loop-closing primitive: file a GitHub issue, then "
+            "immediately dispatch it to Talon. Runs `gh issue create` "
+            "through the audited computer_use shell path (auto-approved "
+            "if the Sovereign added a matching allowlist pattern), parses "
+            "the new issue number, then calls talon_claim. Returns the "
+            "issue URL and the Talon job_id."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!talon file-and-claim",
+    )
+    async def talon_file_and_claim(
+        self,
+        title: str,
+        body: str,
+        labels: Optional[str] = None,
+        repo: str = "KestrelSovereignAI/kestrel-sovereign",
+    ) -> ToolResult:
+        """File an issue and dispatch it to Talon in one hop.
+
+        This is the single primitive that closes Emma's loop: instead of
+        the Sovereign typing `gh issue create` and then a separate claim,
+        the agent calls this once. The `gh` invocation goes through
+        ``ComputerUseFeature.shell`` so the scoped auto-approve policy
+        (epic #1290 / D1) governs it and a full audit row is written —
+        the agent never shells out unaudited.
+
+        Args:
+            title: Issue title.
+            body: Issue body (markdown).
+            labels: Optional comma-separated label names.
+            repo: ``owner/name`` (default the sovereign repo; ``"self"``
+                resolves the same way ``talon_claim`` does).
+
+        Returns:
+            ``ToolResult.ok`` with ``{filed, issue_url, issue_number,
+            job_id, dispatched}``. ``failed`` if the issue could not be
+            created or its number could not be parsed; ``partial`` if the
+            issue was filed but the Talon dispatch did not take.
+        """
+        repo_resolved = self._resolve_repo(repo)
+
+        agent = getattr(self, "agent", None)
+        cu = (
+            agent.get_feature("ComputerUseFeature")
+            if agent is not None and hasattr(agent, "get_feature")
+            else None
+        )
+        if cu is None:
+            return ToolResult.failed(
+                "ComputerUseFeature unavailable — refusing to file the "
+                "issue via an unaudited shell. Enable computer_use so the "
+                "scoped auto-approve policy and audit row apply.",
+                data={"filed": False, "dispatched": False},
+            )
+
+        cmd_parts = [
+            "gh", "issue", "create",
+            "-R", repo_resolved,
+            "--title", title,
+            "--body", body,
+        ]
+        for lab in (
+            l.strip() for l in (labels or "").split(",") if l.strip()
+        ):
+            cmd_parts += ["--label", lab]
+        command = shlex.join(cmd_parts)
+
+        shell_res = await cu.shell(command, timeout=120)
+        shell_data = shell_res.data or {}
+        stdout = str(shell_data.get("stdout", ""))
+        # ToolResultStatus compares equal to its string value ("ok").
+        succeeded = shell_res.status == "ok"
+
+        # `gh issue create` prints the new issue URL on stdout.
+        m = re.search(r"https://github\.com/\S+/issues/(\d+)", stdout)
+        if not succeeded or m is None:
+            return ToolResult.failed(
+                "gh issue create did not return a parseable issue URL "
+                f"(status={shell_res.status}). The command may have been "
+                "denied at the approval gate, or `gh` is not authenticated "
+                "in the agent's environment.",
+                data={
+                    "filed": False,
+                    "dispatched": False,
+                    "shell_status": str(shell_res.status),
+                    "shell_error": shell_res.error,
+                    "stdout_tail": stdout[-300:],
+                },
+            )
+
+        issue_url = m.group(0)
+        issue_number = int(m.group(1))
+
+        claim = await self.talon_claim(repo=repo_resolved, issue=issue_number)
+        claim_data = claim.data or {}
+        dispatched = bool(claim_data.get("dispatched"))
+        job_id = (
+            claim_data.get("job_id")
+            or claim_data.get("message_id")
+            or None
+        )
+        result_data = {
+            "filed": True,
+            "issue_url": issue_url,
+            "issue_number": issue_number,
+            "repo": repo_resolved,
+            "dispatched": dispatched,
+            "job_id": job_id,
+            "claim": claim_data,
+        }
+        if dispatched:
+            return ToolResult.ok(
+                confirmation=(
+                    f"Filed {repo_resolved}#{issue_number} ({issue_url}) "
+                    f"and dispatched it to Talon (job_id={job_id})."
+                ),
+                data=result_data,
+            )
+        return ToolResult.partial(
+            confirmation=(
+                f"Filed {repo_resolved}#{issue_number} ({issue_url}) but "
+                f"the Talon dispatch did not take."
+            ),
+            error=claim.error or "talon_claim did not report dispatched",
+            data=result_data,
         )
 
     @tool(
