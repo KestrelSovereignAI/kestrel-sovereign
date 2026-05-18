@@ -22,6 +22,7 @@ tab_metrics = "Metrics"
 tab_spawn = "Hatchery"
 tab_features = "Features"
 tab_security = "Security"
+tab_approvals = "Approvals"
 
 # Sidebars
 sidebar_agents = "Mews"
@@ -156,6 +157,10 @@ loading_features = "Loading features..."
 security_title = "Security Permissions"
 security_description = "Control which tools can run automatically, require approval, or are blocked."
 security_pending_approvals = "Pending Approvals"
+
+# Approvals panel (epic #1290)
+approvals_title = "Approval Queue"
+approvals_description = "Pending agent actions awaiting your decision. Review the full command, then Approve, Reject, or Approve-and-remember (adds a scoped, revocable auto-approve rule)."
 security_no_pending = "No pending approvals"
 security_permission_tree = "Permission Tree"
 security_load_tree_prompt = "Click to load permission tree..."
