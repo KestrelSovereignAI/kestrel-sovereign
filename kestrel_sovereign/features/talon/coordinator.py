@@ -67,14 +67,28 @@ _RUNNING_AGENT_SOURCE_ROOT = Path(__file__).resolve().parents[3]
 # and ``kestrel-talon claim`` aborts with "Issue #N is already claimed"
 # before doing any work. So a file-then-claim primitive must NOT stamp
 # any of these at creation time — Talon applies ``agent-claimed`` itself
-# when it claims. Mirrors kestrel-talon ``kestreltalon/config.py``
-# (label_analyzing/clarifying/in_progress/blocked/failed/completed).
-# Pinned here rather than imported to avoid a hard dep on the talon
-# package's internals; keep in sync if Talon renames a lifecycle label.
+# when it claims.
+#
+# This is the COMPLETE set, pinned as an exact 1:1 mirror of every
+# ``label_*`` default in kestrel-talon ``kestreltalon/config.py``:
+#
+#     label_analyzing  = "agent-analyzing"
+#     label_clarifying = "agent-clarifying"
+#     label_in_progress = "agent-claimed"   # the is_claimed() marker
+#     label_blocked   = "agent-blocked"
+#     label_failed    = "agent-failed"
+#     label_completed = "agent-complete"
+#
+# (Note: ``label_in_progress`` resolves to ``agent-claimed`` — there is
+# no separate ``agent-in-progress`` label; the claimed marker IS the
+# in-progress marker.) Pinned, not imported: ``kestreltalon`` is invoked
+# as a CLI binary and is not an importable module in this venv, and
+# sibling-checkout path coupling is forbidden (no local-path deps). If
+# Talon ever adds/renames a lifecycle label, update this set to match.
 _TALON_RESERVED_LABELS = frozenset({
     "agent-analyzing",
     "agent-clarifying",
-    "agent-claimed",
+    "agent-claimed",   # == kestrel-talon label_in_progress
     "agent-blocked",
     "agent-failed",
     "agent-complete",
