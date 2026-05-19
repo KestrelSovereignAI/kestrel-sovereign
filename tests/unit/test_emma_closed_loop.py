@@ -387,6 +387,89 @@ async def test_talon_file_and_claim_strips_talon_reserved_labels():
 
 
 @pytest.mark.asyncio
+async def test_talon_file_and_claim_retries_without_unknown_label():
+    """A typo'd/nonexistent label must not sink the whole loop: gh
+    create hard-fails on unknown labels, so file+claim retries with no
+    labels, still closes, and reports the dropped label."""
+    from kestrel_sdk.tools.result import ToolResult
+    from kestrel_sovereign.features.talon.coordinator import (
+        TalonCoordinatorFeature,
+    )
+
+    calls = []
+
+    class FakeCU:
+        async def shell(self, command, timeout=60):
+            calls.append(command)
+            if "--label reliability" in command:
+                return ToolResult.failed(
+                    "exit 1",
+                    data={"returncode": 1, "stdout": "",
+                          "stderr": "could not add label: 'reliability' "
+                                    "not found"},
+                )
+            return ToolResult.ok(
+                "created",
+                data={"returncode": 0,
+                      "stdout": "https://github.com/o/r/issues/99\n"},
+            )
+
+    feat = TalonCoordinatorFeature.__new__(TalonCoordinatorFeature)
+    feat.agent = SimpleNamespace(
+        get_feature=lambda n: FakeCU() if n == "ComputerUseFeature" else None
+    )
+
+    async def fake_claim(repo, issue):
+        assert issue == 99
+        return ToolResult.ok("d", data={"dispatched": True, "job_id": "j"})
+
+    feat.talon_claim = fake_claim
+
+    res = await feat.talon_file_and_claim(
+        title="t", body="b", labels="reliability", repo="o/r",
+    )
+    assert len(calls) == 2
+    assert "--label" not in calls[1]
+    assert res.data["filed"] is True
+    assert res.data["dispatched"] is True
+    assert res.data["label_retry"] is True
+    assert res.data["dropped_unknown_labels"] == ["reliability"]
+    assert res.data["issue_number"] == 99
+
+
+@pytest.mark.asyncio
+async def test_talon_file_and_claim_does_not_retry_on_nonlabel_failure():
+    """A non-label create failure (e.g. auth) must NOT be masked by the
+    no-label retry — it returns failed with diagnostics."""
+    from kestrel_sdk.tools.result import ToolResult
+    from kestrel_sovereign.features.talon.coordinator import (
+        TalonCoordinatorFeature,
+    )
+
+    calls = []
+
+    class FakeCU:
+        async def shell(self, command, timeout=60):
+            calls.append(command)
+            return ToolResult.failed(
+                "exit 1",
+                data={"returncode": 1, "stdout": "",
+                      "stderr": "HTTP 401: Bad credentials"},
+            )
+
+    feat = TalonCoordinatorFeature.__new__(TalonCoordinatorFeature)
+    feat.agent = SimpleNamespace(
+        get_feature=lambda n: FakeCU() if n == "ComputerUseFeature" else None
+    )
+    res = await feat.talon_file_and_claim(
+        title="t", body="b", labels="bug", repo="o/r",
+    )
+    assert len(calls) == 1
+    assert res.data["filed"] is False
+    assert res.data["label_retry"] is False
+
+
+@pytest.mark.asyncio
 async def test_talon_file_and_claim_refuses_without_computer_use():
     from kestrel_sovereign.features.talon.coordinator import (
         TalonCoordinatorFeature,
