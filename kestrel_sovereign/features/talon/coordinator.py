@@ -435,12 +435,6 @@ class TalonCoordinatorFeature(Feature):
                 data={"filed": False, "dispatched": False},
             )
 
-        cmd_parts = [
-            "gh", "issue", "create",
-            "-R", repo_resolved,
-            "--title", title,
-            "--body", body,
-        ]
         # Drop Talon's reserved lifecycle labels (esp. ``agent-claimed``).
         # Filing the issue with ``agent-claimed`` makes the very next
         # ``talon_claim`` abort — Talon's ``is_claimed()`` sees the label
@@ -458,30 +452,72 @@ class TalonCoordinatorFeature(Feature):
             l for l in requested
             if l.lower() in _TALON_RESERVED_LABELS
         ]
-        for lab in applied_labels:
-            cmd_parts += ["--label", lab]
-        command = shlex.join(cmd_parts)
 
-        shell_res = await cu.shell(command, timeout=120)
-        shell_data = shell_res.data or {}
-        stdout = str(shell_data.get("stdout", ""))
-        # ToolResultStatus compares equal to its string value ("ok").
-        succeeded = shell_res.status == "ok"
+        async def _run_create(cmd_labels: List[str]):
+            parts = [
+                "gh", "issue", "create",
+                "-R", repo_resolved,
+                "--title", title,
+                "--body", body,
+            ]
+            for lab in cmd_labels:
+                parts += ["--label", lab]
+            res = await cu.shell(shlex.join(parts), timeout=120)
+            d = res.data or {}
+            out = str(d.get("stdout", ""))
+            err = str(d.get("stderr", ""))
+            ok = res.status == "ok"
+            mm = re.search(r"https://github\.com/\S+/issues/(\d+)", out)
+            return res, ok, out, err, mm
 
-        # `gh issue create` prints the new issue URL on stdout.
-        m = re.search(r"https://github\.com/\S+/issues/(\d+)", stdout)
+        shell_res, succeeded, stdout, stderr, m = await _run_create(
+            applied_labels
+        )
+
+        # A loop-closing primitive must not die on a bad label. ``gh
+        # issue create`` hard-fails (exit 1, no issue) if ANY ``--label``
+        # does not already exist in the repo — one typo'd label from the
+        # LLM would otherwise sink the whole file+claim. If the create
+        # failed while we passed labels and the error is label-related,
+        # retry ONCE with no labels: the issue (the point) still gets
+        # filed, Talon stamps ``agent-claimed`` itself, and the dropped
+        # labels are reported (never silently). The retry is still
+        # ``gh issue create -R <repo> …`` so it stays inside the scoped
+        # auto-approve seed — no new human gate.
+        dropped_unknown_labels: List[str] = []
+        label_retry = False
+        if (not succeeded or m is None) and applied_labels:
+            blob = (
+                f"{stderr}\n{stdout}\n{shell_res.error or ''}"
+            ).lower()
+            if "label" in blob and (
+                "not found" in blob
+                or "could not add" in blob
+                or "not a valid" in blob
+                or "no label" in blob
+            ):
+                label_retry = True
+                dropped_unknown_labels = list(applied_labels)
+                applied_labels = []
+                shell_res, succeeded, stdout, stderr, m = (
+                    await _run_create([])
+                )
+
         if not succeeded or m is None:
             return ToolResult.failed(
                 "gh issue create did not return a parseable issue URL "
                 f"(status={shell_res.status}). The command may have been "
-                "denied at the approval gate, or `gh` is not authenticated "
-                "in the agent's environment.",
+                "denied at the approval gate, `gh` is not authenticated, "
+                "or it failed for a non-label reason.",
                 data={
                     "filed": False,
                     "dispatched": False,
                     "shell_status": str(shell_res.status),
                     "shell_error": shell_res.error,
+                    "stderr_tail": stderr[-300:],
                     "stdout_tail": stdout[-300:],
+                    "label_retry": label_retry,
+                    "dropped_unknown_labels": dropped_unknown_labels,
                 },
             )
 
@@ -505,13 +541,23 @@ class TalonCoordinatorFeature(Feature):
             "job_id": job_id,
             "applied_labels": applied_labels,
             "stripped_labels": stripped_labels,
+            "dropped_unknown_labels": dropped_unknown_labels,
+            "label_retry": label_retry,
             "claim": claim_data,
         }
-        stripped_note = (
-            f" (dropped Talon-reserved label(s) {stripped_labels} so the "
-            f"claim wasn't pre-empted)"
-            if stripped_labels else ""
-        )
+        notes = []
+        if stripped_labels:
+            notes.append(
+                f"dropped Talon-reserved label(s) {stripped_labels} so the "
+                f"claim wasn't pre-empted"
+            )
+        if dropped_unknown_labels:
+            notes.append(
+                f"refiled without unknown/invalid label(s) "
+                f"{dropped_unknown_labels} (not present in the repo) so the "
+                f"loop still closed"
+            )
+        stripped_note = f" ({'; '.join(notes)})" if notes else ""
         if dispatched:
             return ToolResult.ok(
                 confirmation=(
