@@ -73,8 +73,9 @@ def verify_llm_providers_initialized(llm_service: Any) -> None:
         return
     raise NoLLMProvidersError(
         "Inception completed but no LLM providers initialized — the agent "
-        "cannot respond. Check that at least one provider key is set "
-        "(ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, "
+        "cannot respond. Check that at least one provider credential is set "
+        "(ANTHROPIC_API_KEY or ANTHROPIC_AUTH_TOKEN for the Claude OAuth/plan "
+        "route, OPENAI_API_KEY, OPENROUTER_API_KEY, "
         "GOOGLE_API_KEY) or that a local provider (Ollama, llama.cpp) is "
         "reachable. See LLM_SERVICE_ARCHITECTURE.md for the route-config "
         "shape. If this agent is intentionally LLM-disabled, configure "
