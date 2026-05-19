@@ -338,6 +338,55 @@ async def test_talon_file_and_claim_files_then_claims():
 
 
 @pytest.mark.asyncio
+async def test_talon_file_and_claim_strips_talon_reserved_labels():
+    """Filing with agent-claimed makes Talon's claim abort as 'already
+    claimed' (#1299/#1301/#1303). The primitive must drop Talon's
+    reserved lifecycle labels; Talon stamps agent-claimed itself."""
+    from kestrel_sdk.tools.result import ToolResult
+    from kestrel_sovereign.features.talon.coordinator import (
+        TalonCoordinatorFeature,
+    )
+
+    seen = {}
+
+    class FakeCU:
+        async def shell(self, command, timeout=60):
+            seen["command"] = command
+            return ToolResult.ok(
+                "created",
+                data={"returncode": 0,
+                      "stdout": "https://github.com/o/r/issues/77\n"},
+            )
+
+    feat = TalonCoordinatorFeature.__new__(TalonCoordinatorFeature)
+    feat.agent = SimpleNamespace(
+        get_feature=lambda n: FakeCU() if n == "ComputerUseFeature" else None
+    )
+
+    async def fake_claim(repo, issue):
+        return ToolResult.ok("d", data={"dispatched": True, "job_id": "j"})
+
+    feat.talon_claim = fake_claim
+
+    res = await feat.talon_file_and_claim(
+        title="t", body="b",
+        # mixed case + multiple reserved + a real one
+        labels="agent-claimed, reliability, Agent-Complete,bug",
+        repo="o/r",
+    )
+    cmd = seen["command"]
+    # No Talon-reserved label reaches gh issue create...
+    assert "agent-claimed" not in cmd.lower()
+    assert "agent-complete" not in cmd.lower()
+    # ...but real labels do.
+    assert "--label reliability" in cmd and "--label bug" in cmd
+    assert set(res.data["applied_labels"]) == {"reliability", "bug"}
+    assert "agent-claimed" in [s.lower() for s in res.data["stripped_labels"]]
+    assert "agent-complete" in [s.lower() for s in res.data["stripped_labels"]]
+    assert res.data["dispatched"] is True
+
+
+@pytest.mark.asyncio
 async def test_talon_file_and_claim_refuses_without_computer_use():
     from kestrel_sovereign.features.talon.coordinator import (
         TalonCoordinatorFeature,

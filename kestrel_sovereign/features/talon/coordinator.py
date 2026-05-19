@@ -61,6 +61,39 @@ _DEFAULT_PROJECT_PARENT = Path(__file__).resolve().parents[4]
 # ``_workspace_root_for`` and ``talon_setup_workspace``.
 _RUNNING_AGENT_SOURCE_ROOT = Path(__file__).resolve().parents[3]
 
+# Talon's reserved issue-lifecycle labels. kestrel-talon uses
+# ``agent-claimed`` as its "this issue is claimed" marker:
+# ``GitHubClient.is_claimed()`` returns True iff that label is present,
+# and ``kestrel-talon claim`` aborts with "Issue #N is already claimed"
+# before doing any work. So a file-then-claim primitive must NOT stamp
+# any of these at creation time — Talon applies ``agent-claimed`` itself
+# when it claims.
+#
+# This is the COMPLETE set, pinned as an exact 1:1 mirror of every
+# ``label_*`` default in kestrel-talon ``kestreltalon/config.py``:
+#
+#     label_analyzing  = "agent-analyzing"
+#     label_clarifying = "agent-clarifying"
+#     label_in_progress = "agent-claimed"   # the is_claimed() marker
+#     label_blocked   = "agent-blocked"
+#     label_failed    = "agent-failed"
+#     label_completed = "agent-complete"
+#
+# (Note: ``label_in_progress`` resolves to ``agent-claimed`` — there is
+# no separate ``agent-in-progress`` label; the claimed marker IS the
+# in-progress marker.) Pinned, not imported: ``kestreltalon`` is invoked
+# as a CLI binary and is not an importable module in this venv, and
+# sibling-checkout path coupling is forbidden (no local-path deps). If
+# Talon ever adds/renames a lifecycle label, update this set to match.
+_TALON_RESERVED_LABELS = frozenset({
+    "agent-analyzing",
+    "agent-clarifying",
+    "agent-claimed",   # == kestrel-talon label_in_progress
+    "agent-blocked",
+    "agent-failed",
+    "agent-complete",
+})
+
 
 def _path_contains(parent: Path, child: Path) -> bool:
     """True iff ``child`` is ``parent`` or under it. Resolves both."""
@@ -372,7 +405,11 @@ class TalonCoordinatorFeature(Feature):
         Args:
             title: Issue title.
             body: Issue body (markdown).
-            labels: Optional comma-separated label names.
+            labels: Optional comma-separated label names. Talon's
+                reserved lifecycle labels (``agent-claimed`` etc.) are
+                dropped automatically — Talon applies ``agent-claimed``
+                itself when it claims, and pre-stamping it would make the
+                claim abort as "already claimed".
             repo: ``owner/name`` (default the sovereign repo; ``"self"``
                 resolves the same way ``talon_claim`` does).
 
@@ -404,9 +441,24 @@ class TalonCoordinatorFeature(Feature):
             "--title", title,
             "--body", body,
         ]
-        for lab in (
+        # Drop Talon's reserved lifecycle labels (esp. ``agent-claimed``).
+        # Filing the issue with ``agent-claimed`` makes the very next
+        # ``talon_claim`` abort — Talon's ``is_claimed()`` sees the label
+        # and reports "Issue #N is already claimed", so the loop never
+        # closes (root cause of the #1299/#1301/#1303 Talon failures).
+        # Talon stamps ``agent-claimed`` itself as part of claiming.
+        requested = [
             l.strip() for l in (labels or "").split(",") if l.strip()
-        ):
+        ]
+        applied_labels = [
+            l for l in requested
+            if l.lower() not in _TALON_RESERVED_LABELS
+        ]
+        stripped_labels = [
+            l for l in requested
+            if l.lower() in _TALON_RESERVED_LABELS
+        ]
+        for lab in applied_labels:
             cmd_parts += ["--label", lab]
         command = shlex.join(cmd_parts)
 
@@ -451,13 +503,21 @@ class TalonCoordinatorFeature(Feature):
             "repo": repo_resolved,
             "dispatched": dispatched,
             "job_id": job_id,
+            "applied_labels": applied_labels,
+            "stripped_labels": stripped_labels,
             "claim": claim_data,
         }
+        stripped_note = (
+            f" (dropped Talon-reserved label(s) {stripped_labels} so the "
+            f"claim wasn't pre-empted)"
+            if stripped_labels else ""
+        )
         if dispatched:
             return ToolResult.ok(
                 confirmation=(
                     f"Filed {repo_resolved}#{issue_number} ({issue_url}) "
-                    f"and dispatched it to Talon (job_id={job_id})."
+                    f"and dispatched it to Talon (job_id={job_id})"
+                    f"{stripped_note}."
                 ),
                 data=result_data,
             )
