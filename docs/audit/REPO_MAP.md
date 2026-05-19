@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-18
-**Scope:** 1538 tracked files (994 `.py`, 260 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-19
+**Scope:** 1543 tracked files (997 `.py`, 260 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -123,6 +123,8 @@ Repo entry points and standard project files.
   - `class ModelPreferenceMixin`
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
   - `class IterationTracker`; `class ContextStats`; `class OrchestratorEngineMixin`
+- **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
+  - `async def build_preturn_state_block(agent)`
 - **kestrel_sovereign/agent/request_lifecycle.py** — Request lifecycle mixin for KestrelAgent.
   - `class RequestLifecycleMixin`
 - **kestrel_sovereign/agent/sleep.py** — Sleep functionality for Kestrel Agent.
@@ -688,6 +690,8 @@ Repo entry points and standard project files.
   - `class RetirementRecord`; `async def get_agent_info(db_path)`; `async def count_conversations(db_path)`; `async def retire_agent(db_path, reason, archive_dir, force)`; `async def list_retired_agents(archive_dir)`; `def retire_agent_sync(db_path, reason, force)`; `async def retire_test_agent(db_path, reason, archive_dir)`; `def main()`
 - **kestrel_sovereign/security/__init__.py** — Security module for Kestrel Agent.
 - **kestrel_sovereign/security/agent_encryption.py** — Backward-compatible agent encryption re-exports.
+- **kestrel_sovereign/security/auto_approve.py** — Scoped auto-approve policy for gated tool invocations.
+  - `class AutoApproveRule`; `class AutoApproveMatch`; `def derive_command(feature_name, tool_name, tool_args)`; `def suggest_rule_from_command(command)`; `class AutoApprovePolicy`
 - **kestrel_sovereign/security/crypto_suite.py** — CryptoSuite — pluggable signature suites for Kestrel.
   - `class Keypair`; `class CryptoSuite`; `class CryptoSuiteError`; `def register_suite(suite)`; `def get_suite(alg_id)`; `def list_registered()`; `class Secp256k1Suite`; `class Ed25519Suite`; `…`
 - **kestrel_sovereign/security/demo_isolation.py** — Server-side demo-mode isolation (#766).
@@ -806,6 +810,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/static/js/api.js** — (js asset)
 - **kestrel_sovereign/static/js/api_client.mjs** — (mjs asset)
 - **kestrel_sovereign/static/js/app.js** — (js asset)
+- **kestrel_sovereign/static/js/approvals.js** — (js asset)
 - **kestrel_sovereign/static/js/chat.js** — (js asset)
 - **kestrel_sovereign/static/js/database.js** — (js asset)
 - **kestrel_sovereign/static/js/explorers.js** — (js asset)
@@ -1438,6 +1443,7 @@ Repo entry points and standard project files.
 - **tests/frontend/markdown_link_target.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
 - **tests/frontend/parallel_chat.test.mjs** — (mjs asset)
+- **tests/frontend/queue_mode.test.mjs** — (mjs asset)
 - **tests/frontend/route_selector.test.mjs** — (mjs asset)
 - **tests/frontend/sendmessage_adopts_session_id.test.mjs** — (mjs asset)
 - **tests/frontend/sendmessage_interrupts_when_busy.test.mjs** — (mjs asset)
@@ -1891,6 +1897,8 @@ Repo entry points and standard project files.
   - `def test_parse_returns_none_when_block_absent()`; `def test_parse_dormant_when_disabled_explicitly()`; `def test_parse_active_minimal()`; `def test_parse_active_full()`; `def test_parse_active_requires_terms()`; `def test_parse_active_rejects_empty_terms()`; `def test_parse_rejects_non_string_terms()`; `def test_parse_rejects_non_list_proofs()`; `…`
 - **tests/unit/test_embedding_service_missing_model.py** — Soften the first-run UX when Ollama hasn't pulled the embedding model yet — #657.
   - `class TestModelNotFoundIsWarningNotError`
+- **tests/unit/test_emma_closed_loop.py** — Unit tests for the Emma closed-loop machinery (epic #1290).
+  - `def test_derive_command_shell_and_compute()`; `async def test_policy_match_positive_and_scopes()`; `async def test_repo_scope_is_exact_not_substring()`; `async def test_rule_without_repo_scope_never_auto_approves()`; `def test_suggest_rule_has_trailing_boundary()`; `def test_suggest_rule_from_command_is_conservative()`; `async def store()`; `async def test_two_phase_audit(store)`; `…`
 - **tests/unit/test_encryption.py** — Unit tests for storage/encryption.py
   - `class TestGetFernet`; `class TestGetMasterKeyBytes`; `class TestGetAgentFernet`; `class TestEncryptDecryptBytes`; `class TestEncryptDecryptString`; `class TestRemoveEncFlag`; `class TestKeyVersioningIntegration`
 - **tests/unit/test_endpoint_contract_suite.py** — Focused contract tests for weak endpoint groups.
