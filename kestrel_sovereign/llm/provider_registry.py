@@ -165,7 +165,9 @@ class ProviderRegistry:
         if not initialized:
             raise ProviderInitializationError(
                 "No routes could be initialized. Check vendor auth envs "
-                "(e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) and kestrel.toml [llm]."
+                "(e.g. ANTHROPIC_API_KEY, or ANTHROPIC_AUTH_TOKEN for the "
+                "Claude OAuth/plan route, OPENAI_API_KEY) and "
+                "kestrel.toml [llm]."
             )
 
         self.providers = initialized
@@ -242,6 +244,16 @@ class ProviderRegistry:
             auth_token = self._resolve_secret(route_cfg, "auth_token_env", "auth_token")
             if auth_token:
                 client = anthropic.AsyncAnthropic(auth_token=auth_token)
+                # The Anthropic SDK back-fills ``api_key`` from
+                # ``ANTHROPIC_API_KEY`` in the environment whenever the
+                # constructor arg is None (which it is here — we only
+                # passed ``auth_token``). ``auth_headers`` then emits
+                # BOTH ``X-Api-Key`` and ``Authorization: Bearer``, so a
+                # ``plan``/OAuth route silently authenticates and bills
+                # against the metered API key and dies with a spurious
+                # "api key" error the moment that key is disabled. Null
+                # the leaked key so this route sends Bearer ONLY.
+                client.api_key = None
                 logger.info("%s:%s using OAuth token", vendor, route)
             elif api_key:
                 client = anthropic.AsyncAnthropic(api_key=api_key)

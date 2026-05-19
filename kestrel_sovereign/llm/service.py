@@ -740,7 +740,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 )
             raise LLMServiceError(
                 "No LLM routes are configured. Check kestrel.toml [llm] and "
-                "vendor auth envs (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY)."
+                "vendor auth envs (e.g. ANTHROPIC_API_KEY, or "
+                "ANTHROPIC_AUTH_TOKEN for the Claude OAuth/plan route, "
+                "OPENAI_API_KEY)."
             )
 
         return providers_to_use, target_model
