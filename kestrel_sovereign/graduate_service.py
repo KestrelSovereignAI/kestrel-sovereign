@@ -122,14 +122,26 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         else "No 'governed_by' edge from agent"
     )
 
-    # 3. Conversation history (agent has been used)
+    # 3. Conversation history (agent has been used). Live agents write rows
+    # under ``agent_id = self.did`` (per-tenant isolation in
+    # ``AsyncConversationStore``), but this script opens ``Storage`` without an
+    # agent_id, so ``storage.get_conversation_history()`` would only see rows
+    # tagged with the empty-string default tenant. Query the table directly,
+    # filtered by the agent's DID — that's the tenant the agent uses at boot
+    # (kestrel_agent.py:530 instantiates ``AsyncStorage(path, agent_id=self.did)``).
     try:
-        messages = await storage.get_conversation_history(limit=10)
-        msg_count = len(messages)
+        did = agent_node.properties.get("did", "")
+        row = await storage.db.fetchone(
+            "SELECT COUNT(*) FROM conversation_history "
+            "WHERE agent_id = ? AND deleted_at IS NULL",
+            (did,),
+        )
+        msg_count = int(row[0]) if row else 0
         checklist.add_check(
             "Has conversation history",
             msg_count > 0,
-            f"{msg_count} recent messages" if msg_count > 0 else "No conversations"
+            f"{msg_count} messages under agent tenant"
+            if msg_count > 0 else f"No conversations under agent_id={did!r}",
         )
     except Exception as e:
         checklist.add_check("Has conversation history", False, f"Error: {e}")

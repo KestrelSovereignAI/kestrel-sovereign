@@ -89,7 +89,14 @@ def test_graduate_service_signature_has_no_council_session():
 
 @pytest.fixture
 async def graduate_ready_db(tmp_path):
-    """Build a graduate-ready agent DB with all 7 validation gates passing."""
+    """Build a graduate-ready agent DB with all 8 validation gates passing.
+
+    Conversations are written under ``agent_id=did`` so the test exercises
+    the same per-tenant path a live ``KestrelAgent`` uses. The validator
+    must query under that tenant; passing this fixture means the validator
+    is reaching the right tenant, not the empty default. (Codex caught the
+    original cross-tenant bug in PR review.)
+    """
     db_path = tmp_path / "kestrel_prime.db"
     address = "0xTESTADDRESS"
     did = f"did:pkh:eip155:1:{address}"
@@ -98,7 +105,11 @@ async def graduate_ready_db(tmp_path):
     (tmp_path / f"kestrel_{address}.json").write_text('{"id": "did-doc"}')
     (tmp_path / f"kestrel_{address}.key.enc").write_bytes(b"encrypted")
 
-    storage = await Storage.create_sqlite(str(db_path))
+    # Open storage scoped to the agent's DID so conversation rows land under
+    # the same tenant a live agent would use.
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    storage = AsyncStorage(db_path=str(db_path), agent_id=did)
+    await storage.initialize()
     try:
         # Agent node, marked test instance
         agent_id = "agent:test-emma"
@@ -151,7 +162,7 @@ async def graduate_ready_db(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_validate_agent_all_seven_gates_pass(graduate_ready_db):
+async def test_validate_agent_all_eight_gates_pass(graduate_ready_db):
     """Every validation gate must pass on a properly-prepared DB."""
     db_path = graduate_ready_db["db_path"]
     agent_id = graduate_ready_db["agent_id"]
