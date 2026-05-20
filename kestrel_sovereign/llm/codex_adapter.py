@@ -34,6 +34,7 @@ executor and the result back to the app-server.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import (
@@ -213,6 +214,11 @@ class CodexAdapter(LLMAdapter):
         # history for that session, same posture as OpenClaw's
         # ``dynamicToolsFingerprint`` reset).
         self._session_threads: Dict[str, Tuple[str, str]] = {}
+        # Per-thread serialization: the codex app-server allows only one
+        # active turn per thread. Two concurrent ``_run_turn`` calls on
+        # the same thread (same session_id) would race on the turn-sink
+        # registration; the lock makes them queue cleanly instead.
+        self._thread_locks: Dict[str, "asyncio.Lock"] = {}
 
     # ----------------------------------------------------------- app-server glue
     def _app_server(self) -> CodexAppServerClient:
@@ -376,6 +382,13 @@ class CodexAdapter(LLMAdapter):
         )
         turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
 
+        # Serialize per-thread: the app-server runs one active turn per
+        # thread; concurrent ``_run_turn`` calls that share a thread
+        # (same session_id) must not race on the turn-sink / handler
+        # registrations. ``setdefault`` keeps lock identity stable.
+        lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
+        await lock.acquire()
+
         unregister = None
         if tool_executor is not None:
             # Thread-scoped registration: concurrent turns on different
@@ -462,6 +475,7 @@ class CodexAdapter(LLMAdapter):
             app.close_turn_sink(thread_id)
             if unregister is not None:
                 unregister()
+            lock.release()
 
     # --------------------------------------------------------------- public API
     async def get_response(

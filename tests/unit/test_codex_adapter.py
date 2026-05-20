@@ -358,6 +358,51 @@ class TestToolExecutorBridge:
         assert "different turn" in reply["contentItems"][0]["text"]
 
     @pytest.mark.asyncio
+    async def test_per_thread_serialization_for_concurrent_turns(self):
+        """The codex app-server runs one active turn per thread. Two
+        concurrent ``_run_turn`` calls sharing a thread must serialize,
+        not race on turn-sink registration.
+        """
+        import asyncio
+
+        a = _adapter_with(_TEXT_TURN)
+        # Seed the cache so both calls hit the SAME thread.
+        fp = CodexAdapter._thread_fingerprint(None, None, None)
+        a._session_threads["shared"] = ("thr-shared", fp)
+
+        # Make iter_turn_events block until released so we can observe
+        # the second call queuing on the lock.
+        in_turn = asyncio.Event()
+        release = asyncio.Event()
+        original_iter = a._client.iter_turn_events
+
+        async def gated_iter(sink, *, idle_timeout=120):
+            in_turn.set()
+            await release.wait()
+            async for ev in original_iter(sink, idle_timeout=idle_timeout):
+                yield ev
+
+        a._client.iter_turn_events = gated_iter
+
+        async def run_one(label):
+            return label, await a.get_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": label}],
+                session_id="shared",
+            )
+
+        first = asyncio.create_task(run_one("first"))
+        await in_turn.wait()
+        in_turn.clear()
+        second = asyncio.create_task(run_one("second"))
+        # Give second a chance to start; it must be parked on the lock.
+        await asyncio.sleep(0)
+        assert not second.done(), "second turn ran before first released"
+        release.set()
+        results = await asyncio.gather(first, second)
+        assert {r[0] for r in results} == {"first", "second"}
+
+    @pytest.mark.asyncio
     async def test_inline_executed_tools_absent_from_final_response(self):
         """Regression: the app-server runs tools inline via our handler.
         Surfacing those calls in LLMResponse.tool_calls would make the

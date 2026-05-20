@@ -4,7 +4,6 @@ Pure-logic tests run everywhere; the live test spawns the real
 ``codex app-server`` binary and is skipped when it (or auth) is absent.
 """
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -280,26 +279,6 @@ class TestTurnIteration:
                 pass
 
 
-_BIN = "/Applications/Codex.app/Contents/Resources/codex"
-_HAVE_BIN = Path(os.environ.get("KESTREL_CODEX_APP_SERVER_BIN", _BIN)).exists()
-_HAVE_AUTH = (Path.home() / ".codex" / "auth.json").exists()
-
-
-@pytest.mark.skipif(
-    not (_HAVE_BIN and _HAVE_AUTH),
-    reason="codex binary and ~/.codex/auth.json required for live test",
-)
-@pytest.mark.asyncio
-async def test_live_handshake_and_model_list():
-    """Real binary: handshake, version-gate, model/list returns a catalog."""
-    c = CodexAppServerClient()
-    try:
-        await c.ensure_started()
-        result = await c.request(
-            "model/list", {"limit": 3, "cursor": None, "includeHidden": None},
-            timeout=30,
-        )
-        ids = [m.get("id") for m in (result or {}).get("data", [])]
-        assert ids, f"expected models, got {result!r}"
-    finally:
-        await c.aclose()
+# Live handshake against the real binary lives in
+# ``tests/integration/test_codex_real.py``; this unit module is pure
+# in-memory dispatch logic, no subprocesses.
