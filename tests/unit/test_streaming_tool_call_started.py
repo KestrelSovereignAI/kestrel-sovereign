@@ -529,9 +529,9 @@ class TestCodexAdapterEmissionLogic:
                     return {"thread": {"id": "t1"}}
                 return {}
 
-            def register_server_request_handler(self, m, h):
-                self.registered[m] = h
-                return lambda: self.registered.pop(m, None)
+            def register_server_request_handler(self, m, h, *, thread_id=None):
+                self.registered[(m, thread_id)] = h
+                return lambda: self.registered.pop((m, thread_id), None)
 
             def open_turn_sink(self, key):
                 return key

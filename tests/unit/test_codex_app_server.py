@@ -142,7 +142,7 @@ class TestServerRequestHandlerRegistration:
         return c
 
     @pytest.mark.asyncio
-    async def test_registered_handler_invoked_with_params(self):
+    async def test_unscoped_handler_invoked_for_any_thread(self):
         c = self._client()
         seen = []
 
@@ -151,9 +151,62 @@ class TestServerRequestHandlerRegistration:
             return {"ok": True}
 
         c.register_server_request_handler("item/tool/call", handler)
-        await c._handle_server_request(7, "item/tool/call", {"tool": "t"})
-        assert seen == [{"tool": "t"}]
+        await c._handle_server_request(7, "item/tool/call",
+                                       {"threadId": "anything", "tool": "t"})
+        assert seen and seen[0]["tool"] == "t"
         assert c._sent == [{"id": 7, "result": {"ok": True}}]
+
+    @pytest.mark.asyncio
+    async def test_thread_scoped_handler_only_fires_for_matching_thread(self):
+        """Concurrent turns must each get their own handler."""
+        c = self._client()
+        seen_A, seen_B = [], []
+
+        async def hA(params):
+            seen_A.append(params)
+            return {"thread": "A"}
+
+        async def hB(params):
+            seen_B.append(params)
+            return {"thread": "B"}
+
+        c.register_server_request_handler("item/tool/call", hA, thread_id="thrA")
+        c.register_server_request_handler("item/tool/call", hB, thread_id="thrB")
+
+        await c._handle_server_request(11, "item/tool/call",
+                                       {"threadId": "thrA"})
+        await c._handle_server_request(12, "item/tool/call",
+                                       {"threadId": "thrB"})
+
+        assert seen_A and seen_A[0]["threadId"] == "thrA"
+        assert seen_B and seen_B[0]["threadId"] == "thrB"
+        assert c._sent[0]["result"] == {"thread": "A"}
+        assert c._sent[1]["result"] == {"thread": "B"}
+
+    @pytest.mark.asyncio
+    async def test_thread_scoped_unregister_does_not_remove_others(self):
+        c = self._client()
+
+        async def hA(p):
+            return {"thread": "A"}
+
+        async def hB(p):
+            return {"thread": "B"}
+
+        unA = c.register_server_request_handler(
+            "item/tool/call", hA, thread_id="thrA",
+        )
+        c.register_server_request_handler(
+            "item/tool/call", hB, thread_id="thrB",
+        )
+        unA()
+        await c._handle_server_request(20, "item/tool/call",
+                                       {"threadId": "thrA"})
+        await c._handle_server_request(21, "item/tool/call",
+                                       {"threadId": "thrB"})
+        # thrA fell back to the explicit-failure default; thrB still handled.
+        assert c._sent[0]["result"]["success"] is False
+        assert c._sent[1]["result"] == {"thread": "B"}
 
     @pytest.mark.asyncio
     async def test_unregister_removes_handler(self):
@@ -191,7 +244,7 @@ class TestServerRequestHandlerRegistration:
             raise RuntimeError("kaboom")
 
         c.register_server_request_handler("item/tool/call", handler)
-        await c._handle_server_request(11, "item/tool/call", {})
+        await c._handle_server_request(13, "item/tool/call", {})
         assert "error" in c._sent[0]
         assert "kaboom" in c._sent[0]["error"]["message"]
 

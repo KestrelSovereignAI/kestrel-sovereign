@@ -38,7 +38,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -136,11 +136,14 @@ class CodexAppServerClient:
         # concurrent turns never cross-contaminate. Global events
         # (without threadId) broadcast.
         self._turn_sinks: Dict[Any, "asyncio.Queue[dict]"] = {}
-        # Per-method async handlers for server→client requests. The
-        # codex tool-execution bridge registers ``item/tool/call`` here;
-        # without a registered handler, the request gets a clear-fail
-        # reply rather than silently declining.
-        self._server_request_handlers: Dict[str, ServerRequestHandler] = {}
+        # Server-request handlers, keyed by ``(method, thread_id_or_None)``.
+        # Concurrent turns on different threads can each register a
+        # thread-scoped ``item/tool/call`` handler — dispatch tries the
+        # thread-scoped registration first (matched on ``params.threadId``)
+        # and falls back to the unscoped (None) entry, then defaults.
+        self._server_request_handlers: Dict[
+            Tuple[str, Optional[str]], ServerRequestHandler
+        ] = {}
         self._stderr_tail: list[str] = []
         self._closed_error: Optional[BaseException] = None
         self._start_lock = asyncio.Lock()
@@ -303,7 +306,12 @@ class CodexAppServerClient:
         self, mid: Any, method: str, params: dict
     ) -> None:
         try:
-            handler = self._server_request_handlers.get(method)
+            tid = (params or {}).get("threadId")
+            # Prefer a handler scoped to the owning thread; fall back to
+            # a global (None) registration; then to safe defaults.
+            handler = self._server_request_handlers.get((method, tid))
+            if handler is None:
+                handler = self._server_request_handlers.get((method, None))
             if handler is not None:
                 result = await handler(params)
             elif method in _DEFAULT_APPROVAL_REPLIES:
@@ -329,20 +337,26 @@ class CodexAppServerClient:
                 pass
 
     def register_server_request_handler(
-        self, method: str, handler: ServerRequestHandler
+        self, method: str, handler: ServerRequestHandler,
+        *, thread_id: Optional[str] = None,
     ) -> Callable[[], None]:
         """Register an async handler for a server→client request method.
 
-        Returns an ``unregister`` callable. Replacing an existing handler
-        is allowed; the previous one is silently dropped. The bridge uses
-        this to hook ``item/tool/call`` into kestrel's hook-enforcing
-        tool executor for the duration of a turn.
+        Scope the registration to ``thread_id`` when the handler is
+        meaningful only for one turn (the codex tool-execution bridge
+        does this — concurrent turns each get their own
+        ``item/tool/call`` handler keyed by their thread). An unscoped
+        (``thread_id=None``) registration acts as a fallback for any
+        thread without a specific handler.
+
+        Returns an ``unregister`` callable; safe to call once.
         """
-        self._server_request_handlers[method] = handler
+        key = (method, thread_id)
+        self._server_request_handlers[key] = handler
 
         def _unregister() -> None:
-            if self._server_request_handlers.get(method) is handler:
-                self._server_request_handlers.pop(method, None)
+            if self._server_request_handlers.get(key) is handler:
+                self._server_request_handlers.pop(key, None)
 
         return _unregister
 

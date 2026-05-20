@@ -166,9 +166,10 @@ class _FakeAppServer:
             return {"turn": {"id": "turn-1"}}
         return {}
 
-    def register_server_request_handler(self, method, handler):
-        self.registered_handlers[method] = handler
-        return lambda: self.registered_handlers.pop(method, None)
+    def register_server_request_handler(self, method, handler, *, thread_id=None):
+        key = (method, thread_id)
+        self.registered_handlers[key] = handler
+        return lambda: self.registered_handlers.pop(key, None)
 
     def open_turn_sink(self, key):
         return key
@@ -211,18 +212,48 @@ class TestAdapterTextPath:
         assert r.content == "Hello"
         assert (r.input_tokens, r.output_tokens, r.total_tokens) == (7, 2, 9)
         assert r.cache_read_input_tokens == 3
-        assert a._session_threads == {"s1": "thr-1"}
+        cached_id, cached_fp = a._session_threads["s1"]
+        assert cached_id == "thr-1" and cached_fp  # fingerprint set
 
     @pytest.mark.asyncio
     async def test_session_thread_reused(self):
         a = _adapter_with(_TEXT_TURN)
-        a._session_threads["s1"] = "thr-existing"
+        # Pre-seed with the fingerprint that matches this call (model="auto"
+        # → None, no instructions, no tools) so the cache hits.
+        fp = CodexAdapter._thread_fingerprint(None, None, None)
+        a._session_threads["s1"] = ("thr-existing", fp)
         await a.get_response(client="x", model="auto",
                              messages=[{"role": "user", "content": "hi"}],
                              session_id="s1")
         methods = [m for m, _ in a._client.requests]
         assert "thread/start" not in methods
         assert "turn/start" in methods
+
+    @pytest.mark.asyncio
+    async def test_session_thread_restarted_when_config_changes(self):
+        """When tools (or model/system) change on a reused session, the
+        thread is invalidated and re-created — otherwise the model would
+        keep using the old thread-level config."""
+        a = _adapter_with(_TEXT_TURN)
+        a._session_threads["s1"] = (
+            "thr-old", CodexAdapter._thread_fingerprint(None, None, None),
+        )
+
+        async def exe(name, args):
+            return {"success": True, "result": "ok"}
+
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {
+                "name": "t", "description": "d",
+                "parameters": {"type": "object"}}}],
+            session_id="s1", tool_executor=exe,
+        )
+        methods = [m for m, _ in a._client.requests]
+        assert "thread/start" in methods, "thread should be restarted on config change"
+        new_id, _ = a._session_threads["s1"]
+        assert new_id == "thr-1" and new_id != "thr-old"
 
     @pytest.mark.asyncio
     async def test_streaming_yields_text_chunks(self):
@@ -267,8 +298,10 @@ class TestToolExecutorBridge:
                 "parameters": {"type": "object"}}}],
             session_id="s", tool_executor=exe,
         )
-        # Handler unregistered when turn finishes.
-        assert "item/tool/call" not in a._client.registered_handlers
+        # Handler unregistered (thread-scoped key) when turn finishes.
+        assert not any(
+            k[0] == "item/tool/call" for k in a._client.registered_handlers
+        )
 
     @pytest.mark.asyncio
     async def test_dynamic_tools_sent_at_thread_start(self):

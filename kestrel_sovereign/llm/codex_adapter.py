@@ -205,7 +205,14 @@ class CodexAdapter(LLMAdapter):
             else InMemoryContinuationStore()
         )
         self._client: Optional[CodexAppServerClient] = None
-        self._session_threads: Dict[str, str] = {}
+        # session_id → (thread_id, fingerprint). The fingerprint guards
+        # against silently reusing a thread whose initial config (model,
+        # system prompt, tool set) no longer matches what the caller is
+        # asking for — those settings only take effect at thread/start,
+        # so a mismatch must force a fresh thread (loses server-side
+        # history for that session, same posture as OpenClaw's
+        # ``dynamicToolsFingerprint`` reset).
+        self._session_threads: Dict[str, Tuple[str, str]] = {}
 
     # ----------------------------------------------------------- app-server glue
     def _app_server(self) -> CodexAppServerClient:
@@ -221,6 +228,27 @@ class CodexAdapter(LLMAdapter):
             return None
         return model
 
+    @staticmethod
+    def _thread_fingerprint(
+        model_param: Optional[str], instructions: Optional[str],
+        dynamic_tools: Optional[List[Dict[str, Any]]],
+    ) -> str:
+        """Stable hash of every thread-scoped setting the app-server
+        only consumes at thread/start. Used to invalidate a cached
+        thread when the caller asks for different model/instructions/
+        tools — those changes are otherwise silently ignored."""
+        import hashlib
+
+        payload = json.dumps(
+            {
+                "m": model_param or "",
+                "i": instructions or "",
+                "t": dynamic_tools or [],
+            },
+            sort_keys=True, separators=(",", ":"), default=str,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
     async def _ensure_thread(
         self, app: CodexAppServerClient, session_id: Optional[str],
         model: str, instructions: Optional[str],
@@ -233,11 +261,27 @@ class CodexAdapter(LLMAdapter):
         registration is a documented protocol option but not what
         OpenClaw uses, and empirically the model only sees tools when
         they're declared at the thread level.
+
+        On a session whose cached thread was built with different
+        model/instructions/tools, start a fresh thread (the app-server
+        won't apply those changes to an existing thread). This loses
+        server-side history for the session at that boundary —
+        unavoidable given the protocol; mirrors OpenClaw's fingerprint
+        reset behaviour.
         """
-        if session_id and session_id in self._session_threads:
-            return self._session_threads[session_id], False
-        params: Dict[str, Any] = {"sandbox": "read-only"}
         m = self._model_param(model)
+        fingerprint = self._thread_fingerprint(m, instructions, dynamic_tools)
+        if session_id and session_id in self._session_threads:
+            cached_id, cached_fp = self._session_threads[session_id]
+            if cached_fp == fingerprint:
+                return cached_id, False
+            logger.info(
+                "codex session %s thread config changed (%s → %s); "
+                "starting fresh thread", session_id, cached_fp, fingerprint,
+            )
+            # Cached thread no longer matches; drop it.
+            self._session_threads.pop(session_id, None)
+        params: Dict[str, Any] = {"sandbox": "read-only"}
         if m:
             params["model"] = m
         if instructions:
@@ -251,7 +295,7 @@ class CodexAdapter(LLMAdapter):
                 f"thread/start returned no thread id: {result!r}"
             )
         if session_id:
-            self._session_threads[session_id] = thread_id
+            self._session_threads[session_id] = (thread_id, fingerprint)
         return thread_id, True
 
     def _make_tool_call_handler(
@@ -334,9 +378,15 @@ class CodexAdapter(LLMAdapter):
 
         unregister = None
         if tool_executor is not None:
+            # Thread-scoped registration: concurrent turns on different
+            # threads each get their own ``item/tool/call`` handler and
+            # the dispatcher routes by ``params.threadId``. Without
+            # scoping, a second turn's registration would silently
+            # overwrite an in-flight turn's handler.
             unregister = app.register_server_request_handler(
                 "item/tool/call",
                 self._make_tool_call_handler(tool_executor, thread_id),
+                thread_id=thread_id,
             )
 
         sink = app.open_turn_sink(thread_id)
