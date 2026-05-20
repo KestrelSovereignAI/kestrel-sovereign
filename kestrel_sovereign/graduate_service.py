@@ -12,17 +12,23 @@ Usage:
     # Graduate the agent
     python graduate_service.py /path/to/agent/kestrel_prime.db
 
-    # Graduate with council session reference
-    python graduate_service.py /path/to/agent/kestrel_prime.db \
-        --council-session e2ce8a5c-1b5c-4c1b-b798-13aea4a3eef2
+Fleet-restart caveat
+--------------------
+The ``is_test_instance`` flag is read once at ``KestrelAgent`` boot and cached
+on ``self._is_test_instance`` (see ``kestrel_agent.py``). Flipping the flag in
+SQLite while the multi-agent fleet is running does **not** update the in-memory
+copy. No runtime code path consults the flag after boot, so this is not a
+correctness issue — but to see the change reflected on the live agent, restart
+the fleet process (uvicorn ``kestrel_sovereign.server:app``) once graduation
+has been recorded. A future ticket will promote this to a fleet admin endpoint
+that reloads the agent in-place; until then, restart is the cleanest signal.
 """
 
 import argparse
 import asyncio
-import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add project root to path
@@ -32,6 +38,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from kestrel_sovereign.storage import Storage
+from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,10 +80,10 @@ class ValidationChecklist:
         print("GRADUATION VALIDATION CHECKLIST")
         print("=" * 60)
         for check in self.checks:
-            status = "✅" if check["passed"] else "❌"
+            status = "[PASS]" if check["passed"] else "[FAIL]"
             print(f"  {status} {check['name']}")
             if check["details"]:
-                print(f"      {check['details']}")
+                print(f"        {check['details']}")
         print("=" * 60)
         if self.all_passed:
             print(f"Result: ALL {len(self.passed)} CHECKS PASSED")
@@ -89,7 +96,7 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
     """Run validation checks on the agent."""
     checklist = ValidationChecklist()
 
-    # 1. Check agent exists and is a test instance
+    # 1. Agent node exists
     agent_node = await storage.graph.get_node(agent_id)
     if not agent_node:
         checklist.add_check("Agent exists", False, f"No agent found with ID: {agent_id}")
@@ -104,21 +111,20 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
 
     checklist.add_check("Is test instance", True)
 
-    # 2. Check constitution is anchored
-    constitution_edges = await storage.graph.get_edges(
-        from_id=agent_id,
-        edge_type="governed_by"
-    )
+    # 2. Constitution anchored — agent has an outgoing 'governed_by' edge
+    out_edges = await storage.graph.get_edges(agent_id, direction="out")
+    constitution_edges = [e for e in out_edges if e.label == "governed_by"]
     has_constitution = len(constitution_edges) > 0
     checklist.add_check(
         "Constitution anchored",
         has_constitution,
-        f"{len(constitution_edges)} governance edge(s)" if has_constitution else "No constitution link"
+        f"{len(constitution_edges)} governance edge(s)" if has_constitution
+        else "No 'governed_by' edge from agent"
     )
 
-    # 3. Check conversation history exists (agent has been used)
+    # 3. Conversation history (agent has been used)
     try:
-        messages = await storage.conversations.get_conversation_history(limit=10)
+        messages = await storage.get_conversation_history(limit=10)
         msg_count = len(messages)
         checklist.add_check(
             "Has conversation history",
@@ -128,44 +134,39 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
     except Exception as e:
         checklist.add_check("Has conversation history", False, f"Error: {e}")
 
-    # 4. Check DID document exists
-    agent_name = agent_node.properties.get("name", "unknown")
+    # 4. DID document exists on disk
     did = agent_node.properties.get("did", "")
-    if did:
-        # Extract address from DID for filename
-        address = did.split(":")[-1] if did else None
-        if address:
-            db_path = Path(storage.db_path)
-            did_doc_path = db_path.parent / f"kestrel_{address}.json"
-            has_did_doc = did_doc_path.exists()
-            checklist.add_check(
-                "DID document exists",
-                has_did_doc,
-                str(did_doc_path) if has_did_doc else f"Missing: {did_doc_path}"
-            )
-        else:
-            checklist.add_check("DID document exists", False, "Could not parse DID")
+    address = did.split(":")[-1] if did else None
+    db_path = Path(storage.db_path)
+    if address:
+        did_doc_path = db_path.parent / f"kestrel_{address}.json"
+        has_did_doc = did_doc_path.exists()
+        checklist.add_check(
+            "DID document exists",
+            has_did_doc,
+            str(did_doc_path) if has_did_doc else f"Missing: {did_doc_path}"
+        )
     else:
-        checklist.add_check("DID document exists", False, "No DID in agent properties")
+        checklist.add_check(
+            "DID document exists",
+            False,
+            "Could not parse DID" if did else "No DID in agent properties"
+        )
 
-    # 5. Check encrypted key file exists
-    if did:
-        address = did.split(":")[-1] if did else None
-        if address:
-            db_path = Path(storage.db_path)
-            key_path = db_path.parent / f"kestrel_{address}.key.enc"
-            has_key = key_path.exists()
-            checklist.add_check(
-                "Encrypted key file exists",
-                has_key,
-                str(key_path) if has_key else f"Missing: {key_path}"
-            )
+    # 5. Encrypted key file exists on disk
+    if address:
+        key_path = db_path.parent / f"kestrel_{address}.key.enc"
+        has_key = key_path.exists()
+        checklist.add_check(
+            "Encrypted key file exists",
+            has_key,
+            str(key_path) if has_key else f"Missing: {key_path}"
+        )
+    else:
+        checklist.add_check("Encrypted key file exists", False, "No DID address available")
 
-    # 6. Check backup exists (sovereignty export)
-    backup_nodes = await storage.graph.query_nodes(
-        node_type="backup_artifact",
-        limit=5
-    )
+    # 6. Sovereignty backup exists in graph
+    backup_nodes = await storage.graph.get_nodes_by_type("backup_artifact")
     has_backup = len(backup_nodes) > 0
     checklist.add_check(
         "Has sovereignty backup",
@@ -173,13 +174,13 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         f"{len(backup_nodes)} backup(s)" if has_backup else "No backups found"
     )
 
-    # 7. Check knowledge graph has content
-    all_nodes = await storage.graph.query_nodes(limit=100)
-    node_count = len(all_nodes)
+    # 7. Knowledge graph populated — at least agent + 2 other nodes (any type)
+    total_row = await storage.db.fetchone("SELECT COUNT(*) FROM graph_nodes")
+    total_nodes = int(total_row[0]) if total_row else 0
     checklist.add_check(
         "Knowledge graph populated",
-        node_count >= 3,  # At least agent, constitution, and something else
-        f"{node_count} nodes"
+        total_nodes >= 3,
+        f"{total_nodes} nodes"
     )
 
     return checklist
@@ -187,116 +188,111 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
 
 async def graduate_agent(
     db_path: str,
-    council_session: str | None = None,
-    dry_run: bool = False
+    dry_run: bool = False,
 ) -> bool:
     """
     Graduate a test agent to permanent status.
 
     Args:
         db_path: Path to the agent's database
-        council_session: Optional council session ID that approved graduation
         dry_run: If True, only validate without making changes
 
     Returns:
-        True if graduation succeeded
+        True if graduation succeeded (or dry-run passed)
     """
     db_path = Path(db_path)
     if not db_path.exists():
         raise GraduationError(f"Database not found: {db_path}")
 
-    # Find agent ID
     async with Storage(db_path=str(db_path)) as storage:
-        # Get the agent node
-        agents = await storage.graph.query_nodes(node_type="agent", limit=1)
+        agents = await storage.graph.get_nodes_by_type("agent")
         if not agents:
             raise GraduationError("No agent found in database")
 
         agent_node = agents[0]
-        agent_id = agent_node.id
+        agent_id = agent_node.node_id
         agent_name = agent_node.properties.get("name", "Unknown")
 
         print(f"\n{'=' * 60}")
-        print(f"GRADUATION SERVICE")
+        print("GRADUATION SERVICE")
         print(f"{'=' * 60}")
         print(f"Agent: {agent_name}")
         print(f"ID: {agent_id}")
         print(f"Database: {db_path}")
-        if council_session:
-            print(f"Council Session: {council_session}")
         print(f"Mode: {'DRY RUN' if dry_run else 'LIVE'}")
 
-        # Run validation
         checklist = await validate_agent(storage, agent_id)
         checklist.print_report()
 
         if not checklist.all_passed:
-            print("\n❌ GRADUATION BLOCKED - Validation failed")
+            print("\nGRADUATION BLOCKED - Validation failed")
             print("   Fix the failed checks before graduating.")
             return False
 
         if dry_run:
-            print("\n🔍 DRY RUN - No changes made")
+            print("\nDRY RUN - No changes made")
             print("   Run without --dry-run to graduate.")
             return True
 
-        # Perform graduation
         print("\n" + "=" * 60)
         print("PERFORMING GRADUATION")
         print("=" * 60)
 
-        # Update agent properties
-        new_properties = dict(agent_node.properties)
-        new_properties["is_test_instance"] = False
-        new_properties["graduated_at"] = datetime.utcnow().isoformat()
-        if council_session:
-            new_properties["graduation_council_session"] = council_session
+        now_iso = datetime.now(timezone.utc).isoformat()
+        timestamp_suffix = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
-        # Record the graduation in the graph
-        await storage.graph.update_node(
-            node_id=agent_id,
-            properties=new_properties
+        # Upsert agent with new properties — add_node performs INSERT OR REPLACE
+        # / ON CONFLICT UPDATE based on backend, so this updates in place.
+        updated_agent = GraphNode(
+            node_id=agent_node.node_id,
+            node_type=agent_node.node_type,
+            label=agent_node.label,
+            properties={
+                **agent_node.properties,
+                "is_test_instance": False,
+                "graduated_at": now_iso,
+            },
         )
+        await storage.graph.add_node(updated_agent)
 
-        # Create graduation event node
-        graduation_node_id = f"graduation:{agent_id}:{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-        await storage.graph.add_node(
+        # Record the graduation as a lifecycle_event node
+        graduation_node_id = f"graduation:{agent_id}:{timestamp_suffix}"
+        graduation_event = GraphNode(
             node_id=graduation_node_id,
             node_type="lifecycle_event",
+            label=f"Graduation of {agent_name}",
             properties={
                 "event_type": "graduation",
                 "agent_id": agent_id,
                 "agent_name": agent_name,
-                "timestamp": datetime.utcnow().isoformat(),
-                "council_session": council_session,
+                "timestamp": now_iso,
                 "validation_passed": [c["name"] for c in checklist.checks if c["passed"]],
-            }
+            },
         )
+        await storage.graph.add_node(graduation_event)
 
-        # Link graduation event to agent
+        # Link agent -> graduation event
         await storage.graph.add_edge(
-            from_id=agent_id,
-            to_id=graduation_node_id,
-            edge_type="lifecycle_event"
+            source_id=agent_id,
+            target_id=graduation_node_id,
+            label="lifecycle_event",
         )
 
-        print(f"  ✅ Removed test instance flag")
-        print(f"  ✅ Recorded graduation timestamp")
-        print(f"  ✅ Created graduation event node")
-        if council_session:
-            print(f"  ✅ Linked to council session")
+        print("  [OK] Removed test instance flag")
+        print("  [OK] Recorded graduation timestamp")
+        print("  [OK] Created graduation event node")
+        print("  [OK] Linked graduation event to agent")
 
         print("\n" + "=" * 60)
-        print(f"🎓 GRADUATION COMPLETE")
+        print("GRADUATION COMPLETE")
         print(f"   {agent_name} is now a PERMANENT agent")
         print("=" * 60)
 
-        # Print ceremony record
         print("\n" + "=" * 60)
         print("GRADUATION CEREMONY RECORD")
         print("=" * 60)
         print(f"""
-Date: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}
+Date: {now_iso}
 Agent: {agent_name}
 DID: {agent_node.properties.get('did', 'N/A')}
 Previous Status: Test Instance
@@ -305,10 +301,13 @@ New Status: Permanent Agent
 Validation Checks Passed:
 {chr(10).join('  - ' + name for name in checklist.passed)}
 
-Council Approval: {council_session or 'N/A'}
-
 This agent has been graduated from test status to permanent status.
 The retirement service will no longer accept this agent for retirement.
+
+NOTE: If a multi-agent fleet (uvicorn kestrel_sovereign.server:app) is
+running and has this agent loaded, restart it so the in-memory
+_is_test_instance flag re-reads from disk. No runtime code path consults
+the flag after boot, so this is observability, not correctness.
 """)
         print("=" * 60)
 
@@ -322,24 +321,16 @@ def main():
         epilog="""
 Examples:
     # Check if agent is ready for graduation
-    python graduate_service.py ~/emma_data/kestrel_prime.db --dry-run
+    python graduate_service.py /path/to/agent/kestrel_prime.db --dry-run
 
-    # Graduate with council session reference
-    python graduate_service.py ~/emma_data/kestrel_prime.db \\
-        --council-session e2ce8a5c-1b5c-4c1b-b798-13aea4a3eef2
-
-    # Graduate without council reference (not recommended)
-    python graduate_service.py ~/emma_data/kestrel_prime.db
+    # Graduate the agent
+    python graduate_service.py /path/to/agent/kestrel_prime.db
         """
     )
 
     parser.add_argument(
         "db_path",
         help="Path to agent database (kestrel_prime.db)"
-    )
-    parser.add_argument(
-        "--council-session",
-        help="Council session ID that approved graduation"
     )
     parser.add_argument(
         "--dry-run",
@@ -352,15 +343,14 @@ Examples:
     try:
         success = asyncio.run(graduate_agent(
             db_path=args.db_path,
-            council_session=args.council_session,
-            dry_run=args.dry_run
+            dry_run=args.dry_run,
         ))
         sys.exit(0 if success else 1)
     except GraduationError as e:
         logger.error(f"Graduation failed: {e}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n⏹️ Graduation cancelled")
+        print("\nGraduation cancelled")
         sys.exit(1)
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
