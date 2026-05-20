@@ -272,6 +272,64 @@ class TestMemoryRetriever:
 
 
     @pytest.mark.asyncio
+    async def test_update_applied_delegates_to_atomic_increment(self):
+        """``update_applied`` delegates to the store's atomic JSON-set
+        helper rather than a caller-side read-modify-write — that's the
+        write-path contract that prevents lost increments under
+        concurrent application.  See #1326 codex round-1 race.
+
+        Pins the field names too: ``applied_count`` (counter) +
+        ``last_applied`` (timestamp); ``access_count`` must NOT be
+        touched (separate signal).
+        """
+        store = AsyncMock()
+        store.agent_id = "test-agent"
+        store.atomic_increment_metadata_counter = AsyncMock(return_value=True)
+
+        retriever = MemoryRetriever(store, None)
+        await retriever.update_applied(message_id=42, agent_id="test-agent")
+
+        store.atomic_increment_metadata_counter.assert_awaited_once_with(
+            42,
+            counter_field="applied_count",
+            timestamp_field="last_applied",
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_applied_swallows_write_errors(self):
+        """Bookkeeping failures (DB down, disk full) must not propagate
+        — calling code (typically reflection / pre-sleep hook) doesn't
+        want a flaky write to abort its own work."""
+        store = AsyncMock()
+        store.agent_id = "test-agent"
+        store.atomic_increment_metadata_counter = AsyncMock(
+            side_effect=RuntimeError("disk full")
+        )
+
+        retriever = MemoryRetriever(store, None)
+        # Must not raise.
+        await retriever.update_applied(message_id=1, agent_id="test-agent")
+
+    @pytest.mark.asyncio
+    async def test_update_access_also_uses_atomic_increment(self):
+        """Pre-#1326 ``update_access`` had the same read-modify-write
+        race ``update_applied`` would have inherited.  Both now route
+        through the atomic helper — pin that here so a regression to
+        the racy pattern doesn't slip back in for either field."""
+        store = AsyncMock()
+        store.agent_id = "test-agent"
+        store.atomic_increment_metadata_counter = AsyncMock(return_value=True)
+
+        retriever = MemoryRetriever(store, None)
+        await retriever.update_access(message_id=7, agent_id="test-agent")
+
+        store.atomic_increment_metadata_counter.assert_awaited_once_with(
+            7,
+            counter_field="access_count",
+            timestamp_field="last_accessed",
+        )
+
+    @pytest.mark.asyncio
     async def test_retrieve_skips_user_messages(self):
         """User messages should not be returned as memories (prevents echo)."""
         store = AsyncMock()
@@ -336,6 +394,61 @@ class TestDecayCalculation:
 
         assert strength_accessed > strength_no_access
 
+    def test_applied_strengthens_more_than_access(self):
+        """Applied memories should decay slower than memories that have
+        only been retrieved at the same count.  Rewards being
+        load-bearing over being merely familiar — the #1326 distinction.
+        """
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=60)).isoformat()
+
+        strength_accessed = calculate_decay(
+            old, importance=0.5, access_count=3, applied_count=0,
+        )
+        strength_applied = calculate_decay(
+            old, importance=0.5, access_count=0, applied_count=3,
+        )
+
+        assert strength_applied > strength_accessed, (
+            "applied_count must produce a stronger decay-resistance boost "
+            "than access_count at the same magnitude, or the new field "
+            "carries no signal"
+        )
+
+    def test_applied_and_access_compound(self):
+        """A memory that's been BOTH accessed AND applied should out-strength
+        a memory that's been accessed N+M times but never applied.  The two
+        boosts multiply, so they're additive in log space and a memory
+        that's load-bearing benefits from both signals."""
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=60)).isoformat()
+
+        only_accessed = calculate_decay(
+            old, importance=0.5, access_count=6, applied_count=0,
+        )
+        accessed_and_applied = calculate_decay(
+            old, importance=0.5, access_count=3, applied_count=3,
+        )
+        assert accessed_and_applied > only_accessed
+
+    def test_applied_default_unchanged_behavior(self):
+        """Default ``applied_count=0`` must produce identical strength
+        to a pre-#1326 caller that didn't pass the parameter at all.
+        Regression guard — adding the parameter cannot change the math
+        for existing callers.
+
+        ``approx`` accommodates the microsecond-level wall-clock drift
+        between the two calls; the two strengths must agree to far
+        beyond what any consumer of this function could distinguish."""
+        now = datetime.now(timezone.utc)
+        old = (now - timedelta(days=45)).isoformat()
+
+        old_caller_shape = calculate_decay(old, importance=0.5, access_count=2)
+        new_caller_default = calculate_decay(
+            old, importance=0.5, access_count=2, applied_count=0,
+        )
+        assert old_caller_shape == pytest.approx(new_caller_default, rel=1e-9)
+
 
 class TestMemoryMetadata:
     """Tests for MemoryMetadata model."""
@@ -382,6 +495,38 @@ class TestMemoryMetadata:
         assert merged["enc"] is True
         assert merged["session_id"] == "abc123"
         assert merged["emotional_valence"] == 0.7
+
+    def test_applied_count_defaults_to_zero(self):
+        """New #1326 fields default-zero so existing rows / callers see no
+        change in shape until they're explicitly populated."""
+        meta = MemoryMetadata()
+        assert meta.applied_count == 0
+        assert meta.last_applied is None
+
+    def test_applied_fields_roundtrip(self):
+        """``applied_count`` + ``last_applied`` survive to_dict / from_dict."""
+        meta = MemoryMetadata(
+            applied_count=4,
+            last_applied="2026-05-20T16:00:00+00:00",
+        )
+        roundtripped = MemoryMetadata.from_dict(meta.to_dict())
+        assert roundtripped.applied_count == 4
+        assert roundtripped.last_applied == "2026-05-20T16:00:00+00:00"
+
+    def test_from_dict_missing_applied_fields_is_zero(self):
+        """Pre-#1326 metadata rows (without applied_count/last_applied)
+        deserialize cleanly with defaults — no KeyError, no breakage."""
+        legacy = {
+            "emotional_valence": 0.5,
+            "access_count": 7,
+            "last_accessed": "2026-05-15T12:00:00+00:00",
+            # no applied_count / last_applied
+        }
+        meta = MemoryMetadata.from_dict(legacy)
+        assert meta.applied_count == 0
+        assert meta.last_applied is None
+        # Existing fields still come through.
+        assert meta.access_count == 7
 
 
 class TestTemporalPattern:

@@ -464,14 +464,20 @@ class MemoryConsolidator:
             if metadata.get("decay_protected"):
                 continue
 
-            # Calculate decay
+            # Calculate decay.  ``applied_count`` is the load-bearing
+            # signal added in #1326 — a memory that's been demonstrably
+            # applied decays slower than one that's merely been
+            # retrieved at the same rate.  Default 0 keeps behavior
+            # unchanged for pre-#1326 metadata rows.
             importance = metadata.get("importance", 0.5)
             access_count = metadata.get("access_count", 0)
+            applied_count = metadata.get("applied_count", 0)
 
             strength = calculate_decay(
                 created_at,
                 importance=importance,
                 access_count=access_count,
+                applied_count=applied_count,
                 decay_protected=False,
             )
 
