@@ -334,7 +334,9 @@ class TestToolExecutorBridge:
             seen.append((name, args))
             return {"success": True, "result": "salamander"}
 
-        handler = a._make_tool_call_handler(exe, "thr-1")
+        handler = a._make_tool_call_handler(
+            exe, "thr-1", frozenset({"get_secret"}),
+        )
         reply = await handler({
             "threadId": "thr-1", "tool": "get_secret",
             "arguments": '{"k":"v"}',
@@ -352,10 +354,54 @@ class TestToolExecutorBridge:
         async def exe(name, args):
             return {"success": True, "result": "ok"}
 
-        handler = a._make_tool_call_handler(exe, "thr-A")
+        handler = a._make_tool_call_handler(exe, "thr-A", frozenset({"t"}))
         reply = await handler({"threadId": "thr-B", "tool": "t", "arguments": {}})
         assert reply["success"] is False
         assert "different turn" in reply["contentItems"][0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_handler_rejects_unadvertised_tool_name(self):
+        """Security: a tool name the app-server requests but which
+        wasn't in the turn's dynamicTools must not run through the
+        orchestrator's full registry."""
+        a = CodexAdapter()
+        called = []
+
+        async def exe(name, args):
+            called.append(name)
+            return {"success": True, "result": "should-not-run"}
+
+        handler = a._make_tool_call_handler(
+            exe, "thr-1", frozenset({"allowed_tool"}),
+        )
+        reply = await handler({
+            "threadId": "thr-1",
+            "tool": "denied_or_hallucinated_tool",
+            "arguments": {},
+        })
+        assert reply["success"] is False
+        assert "not advertised" in reply["contentItems"][0]["text"]
+        assert called == [], "executor must not run for unadvertised tool"
+
+    @pytest.mark.asyncio
+    async def test_no_handler_registered_for_text_only_turn(self):
+        """Defense in depth: an item/tool/call handler must NOT be
+        registered when the turn has no advertised tools — even if a
+        tool_executor was passed."""
+        a = _adapter_with(_TEXT_TURN)
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        # No tools arg → no dynamic tools → no handler registration.
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="text-only", tool_executor=exe,
+        )
+        assert not any(
+            k[0] == "item/tool/call" for k in a._client.registered_handlers
+        ), "text-only turns must not register a tool handler"
 
     @pytest.mark.asyncio
     async def test_concurrent_first_calls_on_same_session_create_one_thread(self):
@@ -484,7 +530,7 @@ class TestToolExecutorBridge:
         async def exe(name, args):
             raise RuntimeError("boom")
 
-        handler = a._make_tool_call_handler(exe, "thr")
+        handler = a._make_tool_call_handler(exe, "thr", frozenset({"t"}))
         reply = await handler({"threadId": "thr", "tool": "t", "arguments": {}})
         assert reply["success"] is False
         assert "boom" in reply["contentItems"][0]["text"]

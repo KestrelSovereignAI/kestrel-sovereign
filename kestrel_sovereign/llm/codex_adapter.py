@@ -323,15 +323,23 @@ class CodexAdapter(LLMAdapter):
                 lock.release()
 
     def _make_tool_call_handler(
-        self, executor: ToolExecutor, thread_id: str
+        self, executor: ToolExecutor, thread_id: str,
+        allowed_tools: frozenset,
     ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
         """Wrap ``executor`` into an app-server ``item/tool/call``
         handler scoped to this turn's thread.
 
-        Server-request handlers are registered globally per method; if a
-        callback arrives for a *different* thread (e.g. a concurrent
-        turn's), reply with an explicit failure rather than running the
-        wrong executor against the wrong session.
+        Defenses:
+
+        * ``threadId`` mismatch → reject (server-request handlers are
+          keyed by method+thread; a stray callback for another turn
+          must not execute against the wrong session).
+        * ``tool`` name not in ``allowed_tools`` → reject. The advertised
+          dynamic-tool set for this turn is the only thing the executor
+          should run; a hallucinated/malformed tool name could otherwise
+          resolve through the orchestrator's full registry, bypassing
+          per-turn restrictions (denied-tool stripping, capability
+          gating).
         """
 
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -344,6 +352,20 @@ class CodexAdapter(LLMAdapter):
                     "success": False,
                 }
             name = params.get("tool") or params.get("name") or ""
+            if name not in allowed_tools:
+                logger.warning(
+                    "codex requested tool %r not in advertised set %s; "
+                    "refusing dispatch", name, sorted(allowed_tools),
+                )
+                return {
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": (
+                            f"tool {name!r} not advertised for this turn"
+                        ),
+                    }],
+                    "success": False,
+                }
             args = params.get("arguments") or {}
             if isinstance(args, str):
                 try:
@@ -408,7 +430,15 @@ class CodexAdapter(LLMAdapter):
         await lock.acquire()
 
         unregister = None
-        if tool_executor is not None:
+        if tool_executor is not None and dyn:
+            # Only register an item/tool/call handler when tools were
+            # actually advertised this turn. A handler on a text-only
+            # turn would be a footgun — an unsolicited or hallucinated
+            # tool request from the app-server could otherwise execute
+            # against the orchestrator's full tool registry, bypassing
+            # the per-turn restriction. Combined with the allow-set
+            # check inside the handler, this is defense in depth.
+            allowed_tools = frozenset(t["name"] for t in dyn if t.get("name"))
             # Thread-scoped registration: concurrent turns on different
             # threads each get their own ``item/tool/call`` handler and
             # the dispatcher routes by ``params.threadId``. Without
@@ -416,7 +446,9 @@ class CodexAdapter(LLMAdapter):
             # overwrite an in-flight turn's handler.
             unregister = app.register_server_request_handler(
                 "item/tool/call",
-                self._make_tool_call_handler(tool_executor, thread_id),
+                self._make_tool_call_handler(
+                    tool_executor, thread_id, allowed_tools,
+                ),
                 thread_id=thread_id,
             )
 
