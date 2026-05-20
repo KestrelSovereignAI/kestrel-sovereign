@@ -574,9 +574,13 @@ class TestCodexAdapterEmissionLogic:
         ]
         starts = [c for c in out if isinstance(c, ToolCallStarted)]
         finals = [c for c in out if isinstance(c, LLMResponse)]
+        # ToolCallStarted still emitted for UI / honesty-layer signaling.
         assert [(s.id, s.name) for s in starts] == [
             ("c1", "alpha"), ("c2", "beta")
         ]
-        assert finals and len(finals[-1].tool_calls) == 2
-        assert finals[-1].tool_calls[0].arguments == {"x": 1}
-        assert finals[-1].tool_calls[1].arguments == {"y": 2}
+        # Critical: tools were executed INLINE by the app-server (via the
+        # bridge's item/tool/call handler), so the final LLMResponse must
+        # NOT carry them as pending tool_calls — the orchestrator would
+        # otherwise re-dispatch through _execute_tool_batch, duplicating
+        # side effects.
+        assert finals and not finals[-1].tool_calls

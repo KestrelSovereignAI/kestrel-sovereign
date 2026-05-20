@@ -438,7 +438,13 @@ class CodexAdapter(LLMAdapter):
                             name=item.get("name") or item.get("tool") or "",
                             arguments=raw_args if isinstance(raw_args, dict) else {},
                         )
-                        tool_calls.append(tc)
+                        # Critical: the app-server has ALREADY executed
+                        # this tool inline via our item/tool/call handler.
+                        # Yield ToolCallStarted for UI/honesty-layer
+                        # signaling, but DO NOT add to ``tool_calls`` —
+                        # surfacing it would make the orchestrator
+                        # re-dispatch through ``_execute_tool_batch`` and
+                        # duplicate every tool's side effects.
                         yield {"tool_call": tc}
                 elif method == "thread/tokenUsage/updated":
                     usage = _usage_from(p.get("tokenUsage") or {})

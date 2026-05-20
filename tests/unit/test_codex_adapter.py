@@ -358,6 +358,40 @@ class TestToolExecutorBridge:
         assert "different turn" in reply["contentItems"][0]["text"]
 
     @pytest.mark.asyncio
+    async def test_inline_executed_tools_absent_from_final_response(self):
+        """Regression: the app-server runs tools inline via our handler.
+        Surfacing those calls in LLMResponse.tool_calls would make the
+        orchestrator re-dispatch them, duplicating every side effect."""
+        events_with_tool = [
+            {"method": "item/agentMessage/delta", "params": {"delta": "ok"}},
+            {"method": "item/completed", "params": {"item": {
+                "type": "functionCall", "id": "c1",
+                "name": "get_weather", "arguments": '{"city": "SF"}'}}},
+            {"method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "It's sunny."}}},
+            {"method": "turn/completed", "params": {}},
+        ]
+        a = _adapter_with(events_with_tool)
+
+        async def exe(name, args):
+            return {"success": True, "result": "sunny"}
+
+        # Non-streaming path
+        r = await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "weather?"}],
+            tools=[{"type": "function", "function": {
+                "name": "get_weather", "description": "d",
+                "parameters": {"type": "object"}}}],
+            session_id="s-inline", tool_executor=exe,
+        )
+        assert r.content == "It's sunny."
+        assert not r.tool_calls, (
+            "tool was inline-executed; surfacing it would make the "
+            "orchestrator re-dispatch and duplicate side effects"
+        )
+
+    @pytest.mark.asyncio
     async def test_handler_executor_exception_becomes_failure_reply(self):
         a = CodexAdapter()
 
