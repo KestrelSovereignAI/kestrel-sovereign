@@ -320,6 +320,20 @@ class ContextStats:
         }
 
 
+class ToolNotRegisteredError(ValueError):
+    """Raised by ``execute_named_tool`` when the named tool isn't exposed
+    by any of the agent's currently-enabled features.
+
+    Subclasses ``ValueError`` so the prior contract ("ValueError on
+    unknown tool") still holds for callers that don't import this name,
+    but external transports (voice realtime, MCP, A2A) can catch the
+    subclass specifically to distinguish "tool doesn't exist" from a
+    ``ValueError`` raised by the tool's own validation logic.
+    Conflating the two leads to the realtime model retrying with a
+    different *tool name* when it should have corrected its *args*.
+    """
+
+
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
 
@@ -445,6 +459,206 @@ class OrchestratorEngineMixin:
         )
 
         return result
+
+    async def execute_named_tool(
+        self,
+        tool_name: str,
+        args: dict,
+        *,
+        session_id: str,
+        source: str = "external",
+    ) -> Any:
+        """Transport-agnostic governed tool dispatch.
+
+        Resolves ``tool_name`` across the agent's enabled features and runs
+        it through the PRE/POST_TOOL_USE hook stack.  Any external
+        transport that needs to invoke a named tool — voice realtime, MCP,
+        A2A, future Talon CLI — should call this method rather than
+        ``tool.execute(**args)`` directly; the latter bypasses the
+        governance, audit, and honesty-layer guards the platform's other
+        surfaces depend on.
+
+        Differs from the chat path's ``_execute_tool_with_hooks`` in one
+        important respect: if a PRE_TOOL_USE hook returns
+        ``updated_input``, those updated args are what the tool actually
+        runs with.  Input-rewriting hooks (PII redaction, normalization,
+        argument constraint) are a primary use case for external
+        transports — a voice agent invoking ``send_email`` may legitimately
+        have an upstream redactor on the args, and the tool MUST execute
+        with the redacted version.  The chat-path hook wrapper documents
+        a different (LLM-self-correcting) contract; that's intentional
+        there, not mirrored here.
+
+        Args:
+            tool_name: Name of the tool to invoke.  Must match a tool
+                exposed by one of the agent's currently-enabled features.
+            args: Tool arguments.
+            session_id: Caller's session identifier — propagated into hook
+                context for ACL lookup and audit logs.
+            source: Free-form label for audit logs identifying the calling
+                transport (e.g. ``"voice_realtime"``, ``"mcp"``).  Logged
+                only; does not change dispatch behavior.
+
+        Returns:
+            On execution: whatever the tool returns (typically a
+            ToolResult instance for #1061-migrated tools, a dict for
+            legacy ones).
+            On hook denial: an error envelope
+            ``{"success": False, "error": "Permission denied: <reason>"}``
+            so callers can surface the denial to the model as a
+            normal-shaped tool result rather than wedging the session.
+
+        Raises:
+            ToolNotRegisteredError: ``tool_name`` is not registered with
+                any enabled feature.  A ``ValueError`` subclass — callers
+                that ``except ValueError`` still catch it for backwards
+                compatibility, but external transports should
+                ``except ToolNotRegisteredError`` specifically so a
+                ``ValueError`` raised by a tool's own argument validation
+                isn't misreported as "tool not found".
+        """
+        found_tool, found_feature = self._resolve_named_tool(tool_name)
+        if found_tool is None:
+            raise ToolNotRegisteredError(
+                f"Tool {tool_name!r} is not registered with any enabled "
+                f"feature on this agent"
+            )
+
+        feature_name = (
+            getattr(found_feature, "tool_name", None)
+            or getattr(found_feature, "name", None)
+            or type(found_feature).__name__
+        )
+
+        # Run the same input guardrail the chat path uses (#697-based
+        # validation): args must be a dict, every value must be a JSON
+        # type, no string field can exceed ``MAX_TOOL_ARG_LENGTH``.
+        # Without this, a realtime / MCP / A2A caller could ship a
+        # non-dict ``arguments`` (crashes at ``**effective_args``) or
+        # an oversize string payload that bypasses the documented
+        # guardrails and reaches the tool directly.
+        is_valid, validation_error = validate_tool_arguments(tool_name, args)
+        if not is_valid:
+            logging.warning(
+                "[GOVERNED-DISPATCH] arg validation failed source=%s tool=%s err=%s",
+                source, tool_name, validation_error,
+            )
+            return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+
+        logging.info(
+            "[GOVERNED-DISPATCH] source=%s session=%s tool=%s feature=%s",
+            source, session_id, tool_name, feature_name,
+        )
+
+        # --- PRE_TOOL_USE hook ---
+        # The real HookManager threads input through the hook chain,
+        # mutating ``pre_input.tool_input`` whenever a MODIFY hook
+        # returns ``updated_input``; the final HookOutput at the end of
+        # the chain is a fresh ``allow()`` with NO ``updated_input``
+        # set.  So to read post-MODIFY args we look at
+        # ``pre_input.tool_input`` (the threaded payload), not at the
+        # returned HookOutput.  Single-hook fixtures and unit tests
+        # that return ``updated_input`` directly on a HookOutput are
+        # honored too for the case where a hook short-circuits with
+        # modified input.
+        pre_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=feature_name,
+        )
+        pre_output = await self.hooks_manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE, pre_input,
+        )
+        # ASK is just as blocking as DENY — a hook returning ASK is
+        # routing the call to an approval queue and the tool MUST NOT
+        # run until that approval lands.  Surfaced to the caller as a
+        # tool-shaped error so the realtime model can self-correct
+        # rather than wedge the session waiting on a side channel.
+        if pre_output.permission_decision == PermissionDecision.DENY:
+            reason = pre_output.permission_reason or "Blocked by security policy"
+            logging.info(
+                "[GOVERNED-DISPATCH] denied source=%s tool=%s reason=%s",
+                source, tool_name, reason,
+            )
+            return {"success": False, "error": f"Permission denied: {reason}"}
+        if pre_output.permission_decision == PermissionDecision.ASK:
+            reason = pre_output.permission_reason or "Requires approval"
+            logging.info(
+                "[GOVERNED-DISPATCH] approval_required source=%s tool=%s reason=%s",
+                source, tool_name, reason,
+            )
+            return {"success": False, "error": f"Approval required: {reason}"}
+
+        # Honor hook-rewritten args at execution time.  Use explicit
+        # ``is not None`` checks rather than truthiness — a hook may
+        # legitimately rewrite args to ``{}`` (a constraint hook
+        # clearing all arguments), and an ``or`` fallback would silently
+        # discard that rewrite.  ``pre_output.updated_input`` covers
+        # the single-hook short-circuit shape;  ``pre_input.tool_input``
+        # carries the real HookManager's MODIFY accumulation across a
+        # multi-hook chain (and defaults to ``args`` when no MODIFY ran).
+        if pre_output.updated_input is not None:
+            effective_args = pre_output.updated_input
+        else:
+            effective_args = pre_input.tool_input
+
+        # --- Execute the tool ---
+        exec_start = time.time()
+        with optional_span("agent.tool_execution", {
+            "tool.name": tool_name,
+            "tool.feature": feature_name,
+            "tool.source": source,
+        }) as tool_span:
+            result = await found_tool.execute(**effective_args)
+            exec_duration_ms = int((time.time() - exec_start) * 1000)
+            if tool_span:
+                tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
+
+        # --- POST_TOOL_USE hook (parallel, non-blocking) ---
+        post_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.POST_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=effective_args,
+            feature_name=feature_name,
+            tool_response=result if isinstance(result, dict) else {"result": str(result)},
+            execution_time_ms=exec_duration_ms,
+        )
+        await self.hooks_manager.execute_hooks_parallel(
+            HookEvent.POST_TOOL_USE, post_input,
+        )
+
+        return result
+
+    def _resolve_named_tool(self, tool_name: str) -> tuple[Any, Any]:
+        """Find an ``(AgentTool, Feature)`` pair by tool name.
+
+        Walks ``self.features`` directly rather than the explored-tools
+        cache so external transports work on features that haven't been
+        subagent-dispatched yet (the cache only fills after first chat
+        dispatch into a feature).  First match wins — tool names are
+        expected to be globally unique within an agent's enabled-feature
+        set.
+
+        Returns ``(None, None)`` when no feature exposes a tool by that
+        name; the public ``execute_named_tool`` turns that into a
+        ``ValueError``.
+        """
+        features = getattr(self, "features", {}) or {}
+        for feature in features.values():
+            get_tools = getattr(feature, "get_tools", None)
+            if get_tools is None:
+                continue
+            try:
+                tools = get_tools() or []
+            except Exception:  # noqa: BLE001 — one broken feature mustn't block lookup
+                continue
+            for tool in tools:
+                if getattr(tool, "name", None) == tool_name:
+                    return tool, feature
+        return None, None
 
     # ------------------------------------------------------------------
     # Shared helpers used by both streaming and non-streaming loops

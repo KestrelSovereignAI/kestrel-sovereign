@@ -243,8 +243,12 @@ class HooksManager:
                         output.warning_severity = max_warning_severity
                     return output
 
-                # MODIFY updates input for next hook
-                if output.updated_input:
+                # MODIFY updates input for next hook.  Explicit
+                # ``is not None`` so an empty-dict rewrite — a
+                # legitimate decision from a redactor/constraint hook
+                # clearing all sensitive fields — is honored rather
+                # than silently dropped by truthiness fallback.
+                if output.updated_input is not None:
                     input.tool_input = output.updated_input
 
             except asyncio.TimeoutError:

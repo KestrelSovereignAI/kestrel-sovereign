@@ -622,6 +622,38 @@ class TestUserPromptSubmitHooks:
         assert hook_input.tool_input == {"user_message": "sanitized input"}
 
     @pytest.mark.asyncio
+    async def test_modify_threads_empty_dict_rewrite(self):
+        """An empty-dict rewrite from a MODIFY hook is a legitimate
+        decision — a redactor / constraint hook clearing all sensitive
+        fields.  Truthiness checks (``if output.updated_input``) would
+        silently drop the rewrite and downstream callers would see the
+        original payload.  Regression guard for codex round-5 on
+        #1314.
+        """
+        class EmptyRewriteHook(Hook):
+            def __init__(self):
+                super().__init__(name="empty_rewrite", events=[HookEvent.PRE_TOOL_USE], priority=100)
+
+            async def execute(self, input: HookInput) -> HookOutput:
+                return HookOutput.modify(updated_input={}, reason="clear all args")
+
+        manager = HooksManager()
+        manager.register(EmptyRewriteHook())
+
+        hook_input = HookInput(
+            session_id="test",
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name="send_email",
+            tool_input={"to": "x@example.com", "body": "secret"},
+        )
+
+        output = await manager.execute_hooks(HookEvent.PRE_TOOL_USE, hook_input)
+        assert output.continue_execution is True
+        # The empty rewrite REACHES the threaded input — downstream
+        # callers must see ``{}``, not the original sensitive payload.
+        assert hook_input.tool_input == {}
+
+    @pytest.mark.asyncio
     async def test_no_hooks_allows(self):
         """No registered hooks should allow processing to continue."""
         manager = HooksManager()
