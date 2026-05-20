@@ -5,12 +5,16 @@
 > Kestrel makes that claim in three uncoordinated ways and surfaces it in
 > none.
 
-> **Status (2026-05-19):** Design doc, pending review by Emma. No code in
+> **Status (2026-05-20, rev. after Emma's review):** Design doc, signed
+> off by Emma on 2026-05-20 with conditions folded in below. No code in
 > this branch — this is the reviewable surface for the `[EPIC]` that
 > follows. Every claim about current behavior below cites a source file
 > and line range; if a claim lacks evidence, treat it as a hypothesis to
-> verify before implementation. Scope agreed with the Sovereign:
-> **A + D + B this session-track; C is design-first follow-up.**
+> verify before implementation. Scope: **A + B + D is the first
+> implementation track; C is the *next correctness track* — design-first,
+> immediately next, and release-blocking for any claim that context
+> correctness is fixed** (Emma's refinement; was previously framed as a
+> looser follow-up).
 
 ---
 
@@ -188,10 +192,13 @@ should not change — it just needs to be made legible.
 
 ## Redesign
 
-Scope agreed with the Sovereign: **A + D + B** are coherent, contained,
-and shippable on the epic's first track. **C** is the architectural
-spine, design-first, separately reviewed, because it touches the hot
-turn path.
+Scope: **A + B + D** are the first implementation track — coherent,
+contained, and shippable. **C** is the architectural spine and the
+**next correctness track**: design-first, immediately next after the
+A/B/D track lands, and **release-blocking for any claim that context
+correctness is fixed**. C touches the hot turn path, so it gets its own
+reviewed design doc before implementation — but it is *not* an optional
+follow-up. (Refinement adopted from Emma's 2026-05-20 review.)
 
 ### A — Measurement source of truth
 
@@ -223,74 +230,149 @@ the code path; `**` heuristic deleted.
 ### B — Elastic token budget
 
 **Problem:** static `15/40/20/10/15` reserves budget for empty sections
-and throttles history → premature prune / premature "Compress" pressure.
+and throttles other sections → premature prune / premature "Compress"
+pressure.
 
-**Change:** after assembly measures each section, **reallocate unused
-section budget to history** (or to whatever section has overflowing
-demand), within a safe ceiling so the system slice can never be starved.
-Localized to `token_budget.py` + the assembly call site. No persistence
-change, no turn-path risk beyond allocation arithmetic.
+**Change (per Emma's reallocation policy):** budget is computed
+**bottom-up against measured demand**, not top-down by fixed percentage.
+Allocation order each turn:
 
-**Acceptance:** with no episodes/RAG/memories present, history may use
-materially more than 40% of post-reserve budget; system slice retains a
-hard floor; existing budget tests updated to the elastic contract (not
-bypassed — per the no-cop-outs rule, tests assert the documented elastic
-behavior).
+1. **Mandatory floors first.** Compute the **measured token cost of
+   mandatory system/governance content for this agent/model** —
+   constitution, identity/bootstrap, response policy, feature routing,
+   serialization overhead. This floor is **non-borrowable**: history,
+   RAG, episodes, etc. may not crowd it out. If mandatory content cannot
+   fit, that is a **hard-failure / degraded-mode condition**, surfaced
+   loudly, not silently absorbed.
+2. **Satisfy current turn + governance invariants.**
+3. **Allocate eligible sections up to measured demand.** Sections that
+   want less than their default share release the slack.
+4. **Distribute slack to over-demanded sections by priority.** Default
+   priority gives the slack to *history* because that is where the
+   correctness hole hurts most — but a RAG-heavy turn, tool-heavy turn,
+   or memory-recall turn legitimately deserves slack too. Priority is
+   determined by turn intent.
+5. **Expose the decision in the breakdown** (D) so an operator can see
+   *which* section borrowed slack, from where, and why.
+
+Optional system material (extras beyond the mandatory floor) can carry a
+budget that *is* borrowable. The split between mandatory and optional
+system content lives in `token_budget.py` + the system-prompt assembler.
+Localized; no persistence change.
+
+**Acceptance:**
+- Mandatory system content is measured per agent/model and treated as a
+  non-borrowable floor. Below-floor is a hard-failure / degraded-mode
+  condition, never silent absorption.
+- Idle section budget flows to any over-demanded eligible section, not
+  only history; history is the default beneficiary; turn-intent priority
+  is documented.
+- With no episodes/RAG/memories present, conversation may use materially
+  more than the legacy 40% of post-reserve budget.
+- Existing budget tests updated to the elastic contract (not bypassed —
+  per the no-cop-outs rule, tests assert the documented elastic
+  behavior).
 
 ### C — Unify auto-prune with durable compression
 
-> **Design-first follow-up. Not in the A/B/D track. Separately reviewed
-> because it changes the hot turn path.**
+> **Next correctness track.** Design-first, immediately after A/B/D
+> lands. **Release-blocking for any claim that context correctness is
+> fixed.** Touches the hot turn path, so it gets its own reviewed design
+> doc before implementation — but it is not optional. (Framing adopted
+> from Emma's 2026-05-20 review.)
 
 **Problem:** auto-prune silently drops old turns with no durable
-artifact (defect #2).
+artifact (defect #2). A non-emotional but important fact in an old turn
+is silently gone from the model's view.
 
-**Direction (to be specified in its own design before implementation):**
-when the prune path is about to drop verbatim turns, it should emit the
-**same durable artifact `compress_session` produces** —
-summarize→exclude→`summarized_into` link — instead of dropping silently.
-Consequences to work through in the C design:
+**Core invariant (Emma's formulation):**
+
+> **No model-visible pruning without a synchronous durable artifact or
+> lossless pointer. The summary may be async; the salvage record must be
+> sync.**
+
+That is: before anything is removed from the model-visible slice by the
+prune path, the system must **synchronously commit a durable, lossless
+prune record** — session id, message ids/ranges, token estimate, reason,
+timestamp, and enough pointer/raw-span information to reconstruct or
+summarize later. The LLM-driven summarization that converts the raw
+salvage record into the normal
+`summarize → excluded_from_context → summarized_into` shape may run
+**async / deferred / batched** to keep the hot turn path cheap.
+
+If async summarization fails or has not yet run, the UI surfaces a
+**pending fold** or **failed fold** in the breakdown popup — never
+"compression saved this" when only silent-prune happened (D honesty
+invariant).
+
+**Consequences to specify in C's own design doc:**
 
 - manual `!compress` becomes a *tuning knob* (force / keep-N / earlier),
   not a safety requirement;
-- summarization in the turn path implies an LLM call on the hot path —
-  needs an async/deferred or batched strategy so it does not stall the
-  turn;
+- async/deferred/batched summarization strategy (queue, worker, retry,
+  back-pressure) — bounded by the sync salvage record so no fact is ever
+  observed-then-lost mid-turn;
 - interaction with episodes (avoid double-summarizing the same span);
-- idempotency and the `restore_excluded` contract must still hold.
+- idempotency and the `restore_excluded` contract must still hold;
+- UI states: durable-folded · pending-fold · failed-fold ·
+  pointer-only-salvage.
 
-C's acceptance criteria are defined in the C design doc, not here.
+C's full acceptance criteria are defined in the C design doc, not here.
 
 ### D — Legible context: clickable breakdown popup
 
 **Problem:** the model is invisible; the pill's `%` is history-only and
-misleading; there are no users to preserve familiarity for (greenfield)
-so the number should be made *correct*, not kept compatible.
+misleading. Greenfield (no users to preserve familiarity for) → make the
+number *correct*, not compatible.
 
 **Change:**
 
 - The footer pill `%` becomes **honest whole-window utilization** — sum
-  of all measured sections (system + tools + history + episodes + RAG)
-  over `context_limit − response_reserve`, from A's breakdown. Not the
-  history-only slice.
+  of all measured sections (System+Tools+Conversation+Memories+RAG +
+  Reserve/Overhead) over `context_limit − response_reserve`, from A's
+  breakdown. Not the history-only slice.
 - `#context-status` becomes clickable
   (`kestrel_sovereign/static/js/chat.js:1294-1365`), opening
   `Modal.show()` (`kestrel_sovereign/static/js/ui.js:291-490`).
-- The popup surfaces the **layered model** so it is finally legible:
-  - **System** (constitution / briefing / soul / state-of-mind sub-rows)
-  - **Tools** (the previously invisible schema cost)
-  - **History** split into: *verbatim turns* (what `!compress` would
-    fold) · *existing `[COMPRESSED CONTEXT]` markers* (already folded) ·
-    *the tail auto-prune is currently dropping this turn* (the actual
-    argument for compressing — silently lost otherwise)
-  - **Episodes** (system slice, additive, not affected by `!compress`)
-  - **RAG** (query-dependent, labeled estimate)
-  - footer: model · context limit · response reserve · raw-vs-effective
-    note · soft-session note ("this slice is session X; the agent also
-    carries cross-session episodic + semantic memory")
+- The popup uses a **canonical taxonomy that separates source ×
+  visibility-state × budget-behavior** (refined from Emma's review — the
+  earlier history-as-source / about-to-be-pruned-as-state cut conflated
+  the axes):
+  - **System / Governance** — mandatory system prompt, constitution,
+    identity/bootstrap, response policy, feature routing/system extras.
+    *Mandatory* (non-borrowable floor per B) shown distinctly from
+    *optional*.
+  - **Tools** — tool schemas exposed to the model, tool-call scaffolding,
+    and any tool-result payloads injected outside normal history. Tool
+    results that live in conversation rows are counted under
+    Conversation but cross-attributed here.
+  - **Conversation** — current user turn, recent verbatim turns, visible
+    folded summaries, excluded/folded originals (linked by
+    `summarized_into`), **pending-prune spans** (sync-salvaged but not
+    yet summarized, per C), **out-of-window** spans (dropped by the
+    legacy silent-prune path while C is still pending — surfaced
+    honestly, not hidden).
+  - **Memories** — episodes, reflections, KG facts, pinned memories,
+    retrieved autobiographical context. Episodes counted first-class (no
+    `**` heuristic per A).
+  - **Retrieval / RAG** — document chunks, citations, search results,
+    repo/doc context. Query-dependent, labeled estimate.
+  - **Reserve / Overhead** — serialization overhead, model formatting
+    overhead if measurable, unused budget, response safety reserve.
+- The popup surfaces explicit **warnings/state labels** per section
+  where applicable: `not counted`, `estimated`, `pending fold`,
+  `failed fold`, `silently-pruned path still active` (until C lands).
+- footer: model · context limit · response reserve · raw-vs-effective
+  note · soft-session note ("this slice is session X; the agent also
+  carries cross-session episodic + semantic memory") · which section
+  borrowed slack from where this turn (B's transparency requirement).
 - The **Compress** affordance is relabeled/retooltip'd to state what it
   actually does ("summarize older turns into a durable, restorable note
   before pruning drops them"), not implied overflow.
+
+**UI honesty invariant (Emma):** **no UI element may imply "compression
+saved this" when only the silent-prune path executed and no durable fold
+exists.** Out-of-window spans are labeled out-of-window, not folded.
 
 **Performance:** keep the cheap frequent footer poll cheap. If measuring
 RAG/episodes on every poll is too expensive (to be measured, not
@@ -299,9 +381,12 @@ on-demand call that adds it. Decided by a real measurement during
 implementation.
 
 **Acceptance:** pill `%` equals A's whole-window figure; pill is
-clickable; popup renders the layered breakdown incl. tool tokens and the
-"about-to-be-pruned" tail; idle/no-session shows the #713-safe shape;
-frontend + endpoint tests cover idle + populated session.
+clickable; popup renders the canonical taxonomy above incl. tool tokens
+and the pending-fold / out-of-window states; warning labels appear where
+counts are estimated, missing, pending, or failed; no surface implies
+durable compression where only silent prune happened; idle/no-session
+shows the #713-safe shape; frontend + endpoint tests cover idle +
+populated session + the warning-label states.
 
 ---
 
@@ -318,20 +403,38 @@ frontend + endpoint tests cover idle + populated session.
 
 ---
 
-## Review questions for Emma
+## Review record
 
-1. Is the A/B/D vs C split right — is C genuinely safe to defer, or does
-   the silent-prune correctness hole (defect #2) warrant pulling C
-   forward despite the hot-path risk?
-2. B's reallocation policy: should idle budget flow **only** to history,
-   or to any over-demanded section (e.g. RAG-heavy turns)? What is the
-   correct hard floor for the system slice?
-3. C's hot-path LLM-call concern: is deferred/async summarization on
-   prune acceptable, or must the durable artifact be synchronous to
-   guarantee no fact is ever observed-then-lost within a single turn?
-4. Does the layered popup taxonomy in D match how you want the context
-   model explained to operators, or is there a canonical taxonomy to
-   align to?
+**Emma — 2026-05-20 (kestrel-sovereign session `context-system-epic-review-20260520`):**
+Conditional sign-off on A + B + D as the first track. Conditions and
+refinements folded into the sections above:
+
+1. **A/B/D vs C split.** Right *only if C is treated as the next
+   correctness track, not a nice-to-have follow-up.* C is design-first,
+   immediately next, and release-blocking for any claim that context
+   correctness is fixed. → folded into [Redesign intro](#redesign) and
+   [C](#c--unify-auto-prune-with-durable-compression).
+2. **B reallocation policy.** Idle budget flows to *any* over-demanded
+   eligible section by turn-intent priority (not only history). System
+   floor is the **measured token cost of mandatory governance content
+   for this agent/model**, non-borrowable; below-floor is a hard-failure
+   / degraded-mode condition. → folded into
+   [B](#b--elastic-token-budget).
+3. **C hot-path concern.** Async summarization is acceptable; async
+   durable capture is not. Invariant: *no model-visible pruning without
+   a synchronous durable artifact or lossless pointer; the summary may
+   be async, the salvage record must be sync.* → folded into
+   [C](#c--unify-auto-prune-with-durable-compression).
+4. **D popup taxonomy.** Refined to separate source / visibility-state /
+   budget-behavior, with explicit warning labels (`not counted`,
+   `estimated`, `pending fold`, `failed fold`,
+   `silently-pruned path still active`) and the UI-honesty invariant
+   that no surface may imply "compression saved this" when only
+   silent-prune happened. → folded into [D](#d--legible-context-clickable-breakdown-popup).
+
+Pending: explicit ack from Emma that the folded revisions match her
+intent. Once acknowledged, the sub-tickets #1308 / #1309 / #1310 are
+unblocked for claim. #1311 remains design-first.
 
 ---
 
