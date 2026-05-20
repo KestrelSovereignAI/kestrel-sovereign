@@ -1,9 +1,9 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.13.0"
+version = "0.13.1"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "UncleSaurus" }]
@@ -25,6 +25,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
@@ -43,9 +44,9 @@ dependencies = [
     # constitution_injection / system_prompt_budget_bytes) that chunks 1D,
     # 1F, and 1G consume. Defaults are backwards-compatible.
     #
-    # 0.14 floor: adds SDK-owned channel, delivery, and output contracts
-    # while preserving the 0.13 Lighthouse SELF_WALLET support matrix.
-    "kestrel-sovereign-sdk>=0.14,<1",
+    # 0.14.1 floor: adds SDK Python 3.14 support on top of the SDK-owned
+    # channel, delivery, and output contracts from 0.14.
+    "kestrel-sovereign-sdk>=0.14.1,<1",
     # Core web framework
     "fastapi==0.128.1",
     "uvicorn==0.35.0",
@@ -85,7 +86,7 @@ dependencies = [
     # Image processing
     "pillow>=12.1.1",
     # Token counting (lightweight)
-    "tiktoken==0.9.0",
+    "tiktoken>=0.13.0,<1",
     # BM25 for hybrid search
     "rank_bm25>=0.2.2",
     # Web scraping (lightweight)

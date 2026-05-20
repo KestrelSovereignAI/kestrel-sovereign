@@ -199,7 +199,7 @@ Use existing `/feedback/` directory and `FeedbackStore`:
 See `/feedback/chat_session_management.md` for the completed scout that triggered this workflow design.
 
 **Key Findings:**
-- `tiktoken==0.9.0` installed but never imported
+- `tiktoken` installed but never imported
 - Fake token counting using word count × 1.3
 - Character-based limits (50K chars) unrelated to actual tokens
 - No compression, no UI gauge, no `!compact` command

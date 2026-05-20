@@ -21,7 +21,7 @@ Cloud providers (RunPod, Vast.ai), specialized integrations (MCP, GitHub App, wa
 ## 🚀 Quick Start
 
 ### Prerequisites
-- Python 3.11-3.13 (3.14 not yet supported due to tiktoken)
+- Python 3.11-3.14
 - [uv](https://docs.astral.sh/uv/) (for package management)
 - [Ollama](https://ollama.ai) (optional - for local LLM inference without API keys)
 
