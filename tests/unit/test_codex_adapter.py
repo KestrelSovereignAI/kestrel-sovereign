@@ -560,12 +560,25 @@ class TestOpenAIPlanProviderRegistry:
         assert plan.client == "/path/to/codex"
 
     def test_skips_openai_plan_when_binary_unresolvable(self):
-        # Other routes (entry_point plugins) may still register; the
-        # openai:plan route itself must be absent. The registry only
-        # raises "No routes could be initialized" when EVERY route fails.
+        # The invariant: openai:plan must NOT register when the codex
+        # binary can't be resolved. With entry-point plugins installed
+        # this surfaces as the route being absent from a non-empty
+        # providers list; without plugins the registry raises
+        # ``No routes could be initialized`` because openai:plan was
+        # the only configured route. Both outcomes satisfy the
+        # invariant — accept either, since plugin presence is an
+        # environmental detail (CI vs developer machine).
+        from kestrel_sovereign.llm.provider_registry import (
+            ProviderInitializationError,
+        )
         with patch(
             "kestrel_sovereign.llm.codex_app_server.resolve_codex_binary",
             side_effect=CodexAppServerError("codex binary not found"),
         ):
-            providers = ProviderRegistry(self._plan_config()).initialize_providers()
+            try:
+                providers = ProviderRegistry(
+                    self._plan_config(),
+                ).initialize_providers()
+            except ProviderInitializationError:
+                providers = []  # no routes could initialize — invariant holds
         assert not any(p.name == "openai:plan" for p in providers)

@@ -411,10 +411,20 @@ class CodexAdapter(LLMAdapter):
         # the loop.
         dyn = _convert_tools_to_codex_dynamic_tools(tools)
         if dyn and tool_executor is None:
+            # The app-server runs tools inline mid-turn via item/tool/call;
+            # without a kestrel-side executor wired through the orchestrator
+            # we'd have no safe way to honor that callback. The only caller
+            # that supplies tools today is the orchestrator (which always
+            # passes ``tool_executor`` per ``_make_inline_tool_executor``).
+            # If you're hitting this from anywhere else, route that
+            # tool-using call through the orchestrator path, or pick
+            # ``openai:api`` (the standard stateless interface composes
+            # with kestrel's tool model directly).
             raise CodexAppServerError(
                 "openai:plan (codex app-server) requires a tool_executor "
-                "callback when tools are provided. The orchestrator must "
-                "thread its hook-enforcing executor through "
+                "callback when tools are provided — orchestrator-driven "
+                "dispatch only. For non-orchestrator tool-using callers, "
+                "use openai:api or thread an executor through "
                 "generate_with_messages / stream_with_tool_detection."
             )
         thread_id, fresh = await self._ensure_thread(
