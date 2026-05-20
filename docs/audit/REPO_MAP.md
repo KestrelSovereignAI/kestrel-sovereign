@@ -1364,7 +1364,6 @@ Repo entry points and standard project files.
 - **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
 - **docs/research/KV_CACHE_QUANTIZATION.md** — KV Cache Quantization Benchmark — ## Mac Studio M3 Ultra 512GB — Kimi K2.5 (1T params, Q2_K_XL)
 - **docs/research/LLAMA_SERVER_CACHE_FLAGS.md** — llama-server cache flags — Recommended `llama-server` startup flags when Kestrel talks to it via the `llama_cpp:local` route.
-- **docs/research/LoRA/Flux1Uncensored** — —
 - **docs/research/LoRA/LoRATrainingAndInferenceWebUIFrameworks.md** — **LoRA Training & Inference Web UI Frameworks** — Below are several **self-hosted web UI frameworks** that support **LoRA training** on diffusion models and **text-to-image inference** with LoRA adapters, meeting the criteria of permissive model lic…
 - **docs/research/LoRA/TrainingLoRA_FLUX2dev.md** — **Training LoRA on the FLUX 2 [dev] Diffusion Model** — ## **Tools and Templates for FLUX 2 LoRA Training**
 - **docs/research/OpenClaw_Kestrel_Diff.md** — OpenClaw vs Kestrel Sovereign: Feature Diff Analysis — *Research Date: 2026-01-31* *OpenClaw Version: v2026.1.30* *Source: https://github.com/openclaw/openclaw*
@@ -2436,10 +2435,6 @@ Repo entry points and standard project files.
 - **demos/technical/demo.cjs** — —
 - **demos/technical/eye.toml** — (configuration)
 - **demos/technical/presenter.md** — Kestrel Demo — Presenter Slides Guide — **Audience:** Investor / Emotional (Noel) **Core emotion to leave with:** TRUST — with a touch of love **Total time:** ~12 minutes **Screenshots:** `demos/technical/demo-output/`
-- **demos/trash/config.cjs** — —
-- **demos/trash/demo.cjs** — —
-- **demos/trash/eye.toml** — (configuration)
-- **demos/trash/narration.md** — Trash Vignette — Narration — ## Why this feature exists
 - **demos/voice/config.cjs** — —
 - **demos/voice/demo.cjs** — —
 - **demos/voice/eye.toml** — (configuration)

@@ -1,39 +1,84 @@
-# Ignore the virtual environment directory
+# Ignore virtual environments
 .venv_kestrel
-.venv
+.venv/
+venv/
+env/
+ENV/
 
 # Ignore local env files (contains secrets)
 .env
 .env.*
 .env.local
 .env.*.local
+.secrets
+.secrets.*
+.secrets/
+secrets/
 
 # Ignore local kestrel.toml (local providers like llama_cpp bleed into cloud).
 # Cloud images get their LLM config from docker/kestrel.cloudrun.toml instead.
 kestrel.toml
+kestrel.toml.bak
+kestrel.toml.backup
+kestrel.toml.backup-*
 
 # Ignore credentials
 credentials/
+config/
+*.pem
+*.key
+*credentials*.json
+*service-account*.json
+*-key.json
+*.private.json
 
 # Ignore test data
 agent_data/
+agent_data_test/
+agent_dbs/
+trusted_agents/
 test_files/
 
 # Ignore local multi-agent config (auto-discovered in container)
 multi_agent.toml
+multi_agent.toml.*
+llm_config.toml
+llm_config.toml.*
+*.bak
+*.backup
+*.backup-*
 
 # Ignore local databases
 *.db
 *.db-shm
 *.db-wal
+*.sqlite
+*.sqlite3
 
 # Ignore logs
 logs/
+*.log
 
-# Ignore cache
+# Ignore caches and generated local data
 __pycache__/
 *.pyc
 .pytest_cache/
+.ipfs/
+.kestrel/
+storage_cache/
+archive/
+trained_loras/
+generated_images/
+feedback/
+playwright-report/
+test-results/
+demo-output/
+demo-report/
+docs/demo-screenshots/
+.workflow-cassettes/
+tests/cassettes/
+*.workflow-cassette.enc
+*.workflow-cassette.json
 
 # Ignore git
 .git/
@@ -47,3 +92,10 @@ tests/
 # Ignore IDE
 .vscode/
 .idea/
+
+# Ignore OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
