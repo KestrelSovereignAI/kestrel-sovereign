@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-19
-**Scope:** 1543 tracked files (997 `.py`, 260 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-20
+**Scope:** 1544 tracked files (998 `.py`, 260 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -2119,6 +2119,8 @@ Repo entry points and standard project files.
   - `class TestDiscoverEntryPointClasses`; `class TestLLMProviderEntryPoints`; `class TestChannelRegistryEntryPoints`; `class TestStorageProviderEntryPoints`; `class TestDeployManagerEntryPoints`; `class TestWebSearchEntryPoints`
 - **tests/unit/test_provider_registry_no_sdk_retries.py** — Regression guard for #656.
   - `class TestOpenAICompatibleClientsDisableSdkRetries`; `class TestConnectionErrorFailsFast`
+- **tests/unit/test_provider_registry_oauth_no_apikey_leak.py** — Regression guard: the Anthropic OAuth / Claude-Max ``plan`` route must never authenticate with ``ANTHROPIC_API_KEY``.
+  - `class TestOAuthRouteDoesNotLeakApiKey`
 - **tests/unit/test_provider_thinking_channels.py** — —
   - `async def test_anthropic_streaming_emits_thinking_delta()`; `async def test_anthropic_streaming_splits_think_tags()`; `async def test_ollama_streaming_splits_think_tags(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_field(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatch)`; `async def test_ollama_with_tools_suppresses_thinking_under_structured_output(monkeypatch)`; `async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(monkeypatch)`; `async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch)`; `…`
 - **tests/unit/test_rasa_shim_endpoint_contracts.py** — Contract tests for the Rasa webhook shim.
