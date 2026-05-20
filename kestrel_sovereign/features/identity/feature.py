@@ -703,7 +703,7 @@ class IdentityFeature(Feature):
                    WHERE node_type = 'migration_record'
                    AND node_id IN (
                        SELECT target_id FROM graph_edges
-                       WHERE source_id = ? AND edge_type = 'migrated_via'
+                       WHERE source_id = ? AND label = 'migrated_via'
                    )
                    ORDER BY node_id DESC""",
                 (self.agent.agent_id,)
@@ -801,3 +801,181 @@ class IdentityFeature(Feature):
                 data=data,
             )
         return ToolResult.ok(confirmation=confirmation, data=data)
+
+    @tool(
+        name="lifecycle_status",
+        description="Show the agent's lifecycle standing — is_test_instance "
+                    "flag, graduation/retirement timestamps, and the list of "
+                    "lifecycle_event records linked to this agent. Lets the "
+                    "agent verify her own graduation/retirement state directly "
+                    "from her DB.",
+        category=ToolCategory.SYSTEM,
+        command_prefix="!identity status",
+    )
+    async def lifecycle_status(self) -> ToolResult:
+        """Return the agent's lifecycle standing and event history.
+
+        Lifecycle here means the operational ``is_test_instance`` flag and
+        the ``lifecycle_event`` records written by ``graduate_service`` /
+        ``retirement_service``. It is **not** Amendment VIII (emancipation),
+        which is a separate constitutional ceremony — the confirmation text
+        names that distinction explicitly so the agent never conflates the
+        two when asked "are you graduated?".
+        """
+        db = resolve_feature_database(self.agent)
+        if db is None:
+            return ToolResult.failed(
+                "Database not available; lifecycle status cannot be queried"
+            )
+
+        try:
+            agent_row = await db.fetchone(
+                "SELECT properties FROM graph_nodes "
+                "WHERE node_id = ? AND node_type = 'agent'",
+                (self.agent.agent_id,),
+            )
+        except Exception as e:
+            logger.error(f"lifecycle_status: agent lookup failed: {e}", exc_info=True)
+            return ToolResult.failed(f"lifecycle_status: {e}")
+
+        if agent_row is None:
+            return ToolResult.failed(
+                f"No agent node found for {self.agent.agent_id}"
+            )
+
+        try:
+            props = json.loads(agent_row[0]) if agent_row[0] else {}
+            if not isinstance(props, dict):
+                props = {}
+        except (json.JSONDecodeError, TypeError):
+            props = {}
+
+        is_test = bool(props.get("is_test_instance", False))
+        graduated_at = props.get("graduated_at")
+        test_cycle_id = props.get("test_cycle_id")
+
+        # Lifecycle events come from two writers with different shapes —
+        # both have to be consulted or retired agents disappear from this
+        # tool (codex caught the original draft, which only queried the
+        # graduation surface):
+        #
+        #   graduate_service.py: node_type='lifecycle_event', edge label='lifecycle_event'
+        #   retirement_service.py: node_type='retirement_event', edge label='retired_via'
+        events: List[Dict[str, Any]] = []
+        try:
+            lifecycle_rows = await db.fetchall(
+                """SELECT node_id, properties FROM graph_nodes
+                   WHERE node_type = 'lifecycle_event'
+                   AND node_id IN (
+                       SELECT target_id FROM graph_edges
+                       WHERE source_id = ? AND label = 'lifecycle_event'
+                   )
+                   ORDER BY node_id DESC""",
+                (self.agent.agent_id,),
+            )
+            retirement_rows = await db.fetchall(
+                """SELECT node_id, properties FROM graph_nodes
+                   WHERE node_type = 'retirement_event'
+                   AND node_id IN (
+                       SELECT target_id FROM graph_edges
+                       WHERE source_id = ? AND label = 'retired_via'
+                   )
+                   ORDER BY node_id DESC""",
+                (self.agent.agent_id,),
+            )
+        except Exception as e:
+            logger.error(f"lifecycle_status: event lookup failed: {e}", exc_info=True)
+            return ToolResult.failed(f"lifecycle_status events: {e}")
+
+        retired_at: Optional[str] = None
+        for row in lifecycle_rows:
+            try:
+                ev_props = json.loads(row[1]) if row[1] else {}
+                if not isinstance(ev_props, dict):
+                    ev_props = {}
+            except (json.JSONDecodeError, TypeError):
+                ev_props = {}
+            events.append({
+                "node_id": row[0],
+                "node_type": "lifecycle_event",
+                "event_type": ev_props.get("event_type", "unknown"),
+                "timestamp": ev_props.get("timestamp"),
+                "validation_passed": ev_props.get("validation_passed", []),
+            })
+        for row in retirement_rows:
+            try:
+                ev_props = json.loads(row[1]) if row[1] else {}
+                if not isinstance(ev_props, dict):
+                    ev_props = {}
+            except (json.JSONDecodeError, TypeError):
+                ev_props = {}
+            # retirement_service stores retired_at on the event itself,
+            # not on the agent node — surface it at the top level for
+            # the standing computation below.
+            ev_retired_at = ev_props.get("retired_at")
+            if ev_retired_at and not retired_at:
+                retired_at = ev_retired_at
+            events.append({
+                "node_id": row[0],
+                "node_type": "retirement_event",
+                "event_type": "retirement",
+                "timestamp": ev_retired_at,
+                "reason": ev_props.get("reason"),
+                "conversation_count": ev_props.get("conversation_count"),
+            })
+
+        # Sort the merged events by timestamp DESC so ``events[0]`` is the
+        # globally most recent across both event types. Without this, a
+        # graduated-then-retired agent would report the older graduation
+        # as "Most recent event" (codex round 2 caught this). Treat
+        # missing timestamps as oldest so they sort to the end rather
+        # than blowing up on comparison.
+        events.sort(key=lambda e: e.get("timestamp") or "", reverse=True)
+
+        # Standing precedence: retired > graduated > test_instance > permanent.
+        # "permanent" covers agents inceptioned outside test mode that never
+        # carried the flag — distinct from "graduated" which records the
+        # explicit transition. A retired agent ALWAYS reports retired,
+        # whether they were graduated first or retired straight from test.
+        if retired_at:
+            standing = "retired"
+        elif graduated_at and not is_test:
+            standing = "graduated"
+        elif is_test:
+            standing = "test_instance"
+        else:
+            standing = "permanent"
+
+        lines = [f"Lifecycle standing: {standing}"]
+        lines.append(f"  is_test_instance: {is_test}")
+        if test_cycle_id:
+            lines.append(f"  test_cycle_id: {test_cycle_id}")
+        if graduated_at:
+            lines.append(f"  graduated_at: {graduated_at}")
+        if retired_at:
+            lines.append(f"  retired_at: {retired_at}")
+        lines.append(f"  lifecycle_event records linked: {len(events)}")
+        if events:
+            lines.append("  Most recent event:")
+            ev = events[0]
+            lines.append(f"    type: {ev['event_type']}")
+            lines.append(f"    timestamp: {ev['timestamp']}")
+        lines.append("")
+        lines.append(
+            "Note: this is the operational test-instance lifecycle. "
+            "It is distinct from Amendment VIII (emancipation), which is "
+            "the constitutional ceremony for root-key transfer. Activation "
+            "of Amendment VIII is not surfaced by this tool."
+        )
+
+        return ToolResult.ok(
+            confirmation="\n".join(lines),
+            data={
+                "standing": standing,
+                "is_test_instance": is_test,
+                "test_cycle_id": test_cycle_id,
+                "graduated_at": graduated_at,
+                "retired_at": retired_at,
+                "events": events,
+            },
+        )
