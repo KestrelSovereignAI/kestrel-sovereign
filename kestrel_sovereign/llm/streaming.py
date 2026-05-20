@@ -20,7 +20,7 @@ injecting a ``[Provider X unavailable, trying next...]`` note into the
 chat stream where it corrupts the agent's response.
 """
 import logging
-from typing import List, Dict, Any, Optional, Union, Type, AsyncIterator
+from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, AsyncIterator
 
 from pydantic import BaseModel
 
@@ -422,6 +422,7 @@ class StreamingMixin:
         model_override: Optional[str] = None,
         system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -539,6 +540,8 @@ class StreamingMixin:
                         kwargs["extra_body"] = cache_body
                     if session_id:
                         kwargs["session_id"] = session_id
+                    if tool_executor is not None:
+                        kwargs["tool_executor"] = tool_executor
 
                     async for item in adapter.get_streaming_response_with_tools(
                         client=provider["client"],

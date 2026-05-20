@@ -501,59 +501,86 @@ class TestOpenAIEmitsToolCallStarted:
 
 
 class TestCodexAdapterEmissionLogic:
-    """The codex_adapter (OpenAI plan / Responses API) has its own
-    streaming-with-tools event loop. Three event types can each
-    introduce a new function-call index for the first time:
+    """The codex_adapter now drives the ``codex app-server``. Tool calls
+    surface as ``item/completed`` events with a function-call item type;
+    ``get_streaming_response_with_tools`` must emit exactly one
+    ``ToolCallStarted`` per such item (id/name from the item), then a
+    final ``LLMResponse`` carrying the assembled ``ToolCall``s.
 
-    * ``response.output_item.added`` (type=function_call) — the
-      typical first event, populates id and name.
-    * ``response.function_call_arguments.delta`` — may arrive first
-      if the SDK delivers args before the item-added event.
-    * ``response.function_call_arguments.done`` — same.
-
-    The contract is: emit ToolCallStarted exactly once per index,
-    on whichever event lands first. id/name are populated when the
-    output-item.added event was first; ``None`` when an arguments
-    event was first (the OpenAI MAY-BE-NONE rule applied to Codex).
-
-    This test class avoids importing the full CodexAdapter because
-    its constructor wires OAuth machinery; instead it exercises the
-    emission logic by directly building the function-call accumulator
-    structure the adapter uses, and asserting the markers are emitted
-    in the expected order. The full adapter is covered by integration
-    tests when an authenticated codex environment is available.
+    Behavioral test against the real adapter with a scripted in-memory
+    app-server — no source-grep, no live binary.
     """
 
-    def test_emission_logic_pattern_documented_in_module_docstring(self):
-        """Pinned by the inline implementation in codex_adapter.py
-        ``get_streaming_response_with_tools`` (the ``started_indices``
-        set + emission on first-arrival of each index): each branch
-        that creates a new ``func_calls[idx]`` entry also yields a
-        ToolCallStarted exactly once. The branch that runs first for
-        an index determines whether id/name are populated or ``None``."""
-        # The implementation is in
-        # kestrel_sovereign/llm/codex_adapter.py
-        # get_streaming_response_with_tools (around the
-        # ``response.output_item.added`` / ``response.function_call_arguments.delta``
-        # / ``response.function_call_arguments.done`` event handlers).
-        # End-to-end emission verification requires a real Codex SSE
-        # transcript replay, which lives in the codex-specific
-        # integration tests rather than this unit module.
-        from kestrel_sovereign.llm import codex_adapter as ca
-        import inspect
+    @pytest.mark.asyncio
+    async def test_emits_one_toolcallstarted_per_app_server_tool_item(self):
+        from kestrel_sovereign.llm.adapter import LLMResponse
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from kestrel_sdk.llm import ToolCallStarted
 
-        src = inspect.getsource(ca.CodexAdapter.get_streaming_response_with_tools)
-        # Each of the three branches must yield ToolCallStarted exactly
-        # once when introducing a new index. The pattern:
-        # ``started_indices.add(idx) ; yield ToolCallStarted(...)``
-        # appears three times in the method body (one per branch).
-        assert src.count("yield ToolCallStarted(") == 3, (
-            "codex_adapter must emit ToolCallStarted from all three "
-            "first-arrival branches (output_item.added, "
-            "function_call_arguments.delta, function_call_arguments.done) "
-            "to honor the SDK 0.7.0 contract regardless of SSE event "
-            "ordering."
-        )
-        # The ``started_indices`` set guards exactly-once emission
-        # when two of the three branches see the same index.
-        assert "started_indices" in src
+        class _ScriptedApp:
+            def __init__(self):
+                self.registered = {}
+
+            async def ensure_started(self):
+                pass
+
+            async def request(self, method, params=None, *, timeout=120):
+                if method == "thread/start":
+                    return {"thread": {"id": "t1"}}
+                return {}
+
+            def register_server_request_handler(self, m, h, *, thread_id=None):
+                self.registered[(m, thread_id)] = h
+                return lambda: self.registered.pop((m, thread_id), None)
+
+            def open_turn_sink(self, key):
+                return key
+
+            def close_turn_sink(self, key):
+                pass
+
+            async def iter_turn_events(self, sink, *, idle_timeout=120):
+                for ev in [
+                    {"method": "item/agentMessage/delta",
+                     "params": {"delta": "calling"}},
+                    {"method": "item/completed", "params": {"item": {
+                        "type": "functionCall", "id": "c1",
+                        "name": "alpha", "arguments": '{"x": 1}'}}},
+                    {"method": "item/completed", "params": {"item": {
+                        "type": "functionCall", "id": "c2",
+                        "name": "beta", "arguments": {"y": 2}}}},
+                    # duplicate id must NOT re-emit
+                    {"method": "item/completed", "params": {"item": {
+                        "type": "functionCall", "id": "c1",
+                        "name": "alpha", "arguments": '{"x": 1}'}}},
+                    {"method": "turn/completed", "params": {}},
+                ]:
+                    yield ev
+
+        async def exe(name, args):
+            return {"success": True, "result": "ok"}
+
+        adapter = CodexAdapter()
+        adapter._client = _ScriptedApp()
+        out = [
+            c async for c in adapter.get_streaming_response_with_tools(
+                client=None, model="auto",
+                messages=[{"role": "user", "content": "go"}],
+                tools=[{"type": "function", "function": {
+                    "name": "alpha", "description": "d",
+                    "parameters": {"type": "object"}}}],
+                session_id="s", tool_executor=exe,
+            )
+        ]
+        starts = [c for c in out if isinstance(c, ToolCallStarted)]
+        finals = [c for c in out if isinstance(c, LLMResponse)]
+        # ToolCallStarted still emitted for UI / honesty-layer signaling.
+        assert [(s.id, s.name) for s in starts] == [
+            ("c1", "alpha"), ("c2", "beta")
+        ]
+        # Critical: tools were executed INLINE by the app-server (via the
+        # bridge's item/tool/call handler), so the final LLMResponse must
+        # NOT carry them as pending tool_calls — the orchestrator would
+        # otherwise re-dispatch through _execute_tool_batch, duplicating
+        # side effects.
+        assert finals and not finals[-1].tool_calls

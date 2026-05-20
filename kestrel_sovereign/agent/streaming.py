@@ -341,6 +341,7 @@ class StreamingMixin:
             model_override=effective_model,
             system_prompt=system_prompt,
             session_id=session_id,
+            tool_executor=self._make_inline_tool_executor(session_id),
         ):
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this

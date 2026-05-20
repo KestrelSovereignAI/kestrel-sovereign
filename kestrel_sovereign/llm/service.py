@@ -16,7 +16,7 @@ import asyncio
 import inspect
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
+from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
 import openai
 import httpx
@@ -1598,6 +1598,23 @@ No other text or formatting.
         await self.drain_preference_persistence()
 
         for provider in self.providers:
+            # Adapter-owned resources (e.g. CodexAdapter's app-server
+            # subprocess) — adapters that own external state should
+            # expose ``aclose``. The provider's ``client`` slot doesn't
+            # always carry that state (codex stores just the binary
+            # path), so consult the adapter directly.
+            adapter = provider.get("adapter")
+            if adapter is not None and hasattr(adapter, "aclose"):
+                try:
+                    await _wait_for_close_result(adapter.aclose())
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Error closing %s adapter: %s",
+                        provider.get("name"), e, exc_info=True,
+                    )
+
             client = provider.get("client")
             if client is None:
                 continue
@@ -1744,6 +1761,7 @@ No other text or formatting.
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> Union[str, LLMResponse]:
         """Generate using existing message list (for multi-turn tool calling).
 
@@ -1908,6 +1926,7 @@ No other text or formatting.
                     response_format=response_format,
                     extra_body=provider_cache_body(provider),
                     session_id=session_id,
+                    tool_executor=tool_executor,
                 )
                 if tools is not None or response_format is not None:
                     return response
