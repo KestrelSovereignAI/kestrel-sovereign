@@ -98,10 +98,10 @@ def test_resolve_did_prefers_property_then_falls_back_to_node_id():
     node_a = GraphNode(node_id=DID, node_type="agent", label="A", properties={})
     assert graduate_service._resolve_did(node_a) == DID
 
-    # Case B: properties has a different DID (legacy / migration shadow);
+    # Case B: properties has a DID, node_id is something legacy/arbitrary;
     # the property wins so explicit migrations are honored
     node_b = GraphNode(
-        node_id="legacy:node:id",
+        node_id="agent:legacy",
         node_type="agent",
         label="B",
         properties={"did": DID},
@@ -111,6 +111,32 @@ def test_resolve_did_prefers_property_then_falls_back_to_node_id():
     # Case C: properties has empty-string did — treated as absent, fall back
     node_c = GraphNode(node_id=DID, node_type="agent", label="C", properties={"did": ""})
     assert graduate_service._resolve_did(node_c) == DID
+
+
+def test_resolve_did_refuses_non_did_node_id_when_property_missing():
+    """If neither the property nor the node_id is actually a DID, the
+    resolver returns ``""`` instead of laundering an arbitrary id through.
+
+    Without this guard, an agent with ``node_id="agent:test-emma"`` and
+    no ``did`` property would have its non-DID id used for on-disk
+    file lookups (``kestrel_test-emma.json``) and conversation tenant
+    queries — letting any matching files / rows satisfy the gates and
+    weakening graduation. Codex caught this on #1325 round 2.
+    """
+    # node_id is not a DID, no property
+    node_legacy = GraphNode(
+        node_id="agent:test-emma", node_type="agent", label="L", properties={},
+    )
+    assert graduate_service._resolve_did(node_legacy) == ""
+
+    # node_id is not a DID, property is also not a DID
+    node_double_bad = GraphNode(
+        node_id="agent:legacy",
+        node_type="agent",
+        label="DB",
+        properties={"did": "not-a-did-either"},
+    )
+    assert graduate_service._resolve_did(node_double_bad) == ""
 
 
 # ----------------------------------------------------------------------
@@ -263,6 +289,121 @@ async def test_graduate_agent_live_run_flips_flag_and_writes_event(graduate_read
         lifecycle_edges = [e for e in out_edges if e.label == "lifecycle_event"]
         assert len(lifecycle_edges) == 1
         assert lifecycle_edges[0].target_id == grad_event.node_id
+
+
+SYNC_MANIFEST_NAMES = [
+    ".gcs_manifest_{did}.json",          # storage/sync/gcs_target.py
+    ".lighthouse_manifest_{did}.json",   # storage/sync/lighthouse_target.py
+    ".sovereign_ipfs_manifest_{did}.json",  # storage/sync/sovereign_ipfs_target.py
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest_template", SYNC_MANIFEST_NAMES)
+async def test_sovereignty_gate_accepts_disk_manifest_without_backup_artifact(
+    tmp_path, manifest_template
+):
+    """Gate #6 ('Has sovereignty backup') must accept any of the disk sync
+    manifests as proof of sovereignty backup — not require a discrete
+    ``backup_artifact`` graph node, and not be limited to one sync target.
+
+    Parametrised across every sync-target manifest filename in the codebase
+    so a future sync target that's added without updating this gate fails
+    explicitly. (Codex caught the original gap: I only listed two of the
+    three manifest filenames in the first draft.)
+    """
+    db_path = tmp_path / "kestrel_prime.db"
+    address = "0xMANIFEST"
+    did = f"did:pkh:eip155:1:{address}"
+    agent_id = did
+
+    # On-disk DID artifacts
+    (tmp_path / f"kestrel_{address}.json").write_text('{"id": "did-doc"}')
+    (tmp_path / f"kestrel_{address}.key.enc").write_bytes(b"encrypted")
+    # Sync manifest (proof of continuous sovereignty mirroring) — but
+    # deliberately NO backup_artifact graph node.
+    manifest_name = manifest_template.format(did=did)
+    (tmp_path / manifest_name).write_text('{"manifest": "yes"}')
+
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    storage = AsyncStorage(db_path=str(db_path), agent_id=did)
+    await storage.initialize()
+    try:
+        await storage.graph.add_node(GraphNode(
+            node_id=agent_id, node_type="agent", label="Manifest Test",
+            properties={"name": "ManifestTest", "is_test_instance": True},
+        ))
+        constitution_id = "constitution:test"
+        await storage.graph.add_node(GraphNode(
+            node_id=constitution_id, node_type="constitution",
+            label="Constitution", properties={},
+        ))
+        await storage.graph.add_edge(
+            source_id=agent_id, target_id=constitution_id, label="governed_by",
+        )
+        # Pad node count so gate #8 also passes
+        await storage.graph.add_node(GraphNode(
+            node_id="pad:1", node_type="concept", label="Pad", properties={},
+        ))
+        await storage.add_conversation(role="user", content="hi", session_id="s1")
+
+        checklist = await graduate_service.validate_agent(storage, agent_id)
+
+        # All 8 gates pass — including sovereignty gate via disk manifest
+        assert checklist.all_passed, (
+            f"Gate #6 must accept disk manifest as sovereignty proof. "
+            f"Failed: {checklist.failed}"
+        )
+        backup_check = next(
+            c for c in checklist.checks if c["name"] == "Has sovereignty backup"
+        )
+        assert backup_check["passed"]
+        assert manifest_name in backup_check["details"], (
+            f"Details line should name the {manifest_name} that satisfied the gate."
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sovereignty_gate_fails_when_neither_surface_present(tmp_path):
+    """Gate #6 must still fail when neither a ``backup_artifact`` node nor a
+    sync manifest is present. Broadening shouldn't degenerate the gate.
+    """
+    db_path = tmp_path / "kestrel_prime.db"
+    address = "0xNOBACKUP"
+    did = f"did:pkh:eip155:1:{address}"
+    agent_id = did
+
+    (tmp_path / f"kestrel_{address}.json").write_text('{}')
+    (tmp_path / f"kestrel_{address}.key.enc").write_bytes(b"x")
+
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    storage = AsyncStorage(db_path=str(db_path), agent_id=did)
+    await storage.initialize()
+    try:
+        await storage.graph.add_node(GraphNode(
+            node_id=agent_id, node_type="agent", label="NoBackup",
+            properties={"name": "NoBackup", "is_test_instance": True},
+        ))
+        await storage.graph.add_node(GraphNode(
+            node_id="constitution:test", node_type="constitution",
+            label="Constitution", properties={},
+        ))
+        await storage.graph.add_edge(
+            source_id=agent_id, target_id="constitution:test", label="governed_by",
+        )
+        await storage.add_conversation(role="user", content="hi", session_id="s1")
+
+        checklist = await graduate_service.validate_agent(storage, agent_id)
+        backup_check = next(
+            c for c in checklist.checks if c["name"] == "Has sovereignty backup"
+        )
+        assert backup_check["passed"] is False
+        assert "no backup_artifact nodes" in backup_check["details"]
+        assert "no sync manifests on disk" in backup_check["details"]
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio
