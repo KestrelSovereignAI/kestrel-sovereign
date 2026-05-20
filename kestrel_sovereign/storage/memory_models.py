@@ -48,8 +48,18 @@ class MemoryMetadata:
     day_of_week: str = ""               # monday-sunday
 
     # Decay layer
-    access_count: int = 0
+    access_count: int = 0                # Times retrieved (loaded into context)
     last_accessed: Optional[str] = None  # ISO format timestamp
+    # `applied_count` is distinct from `access_count`: a retrieval scored
+    # the memory into the context window, but "applied" means the memory
+    # was demonstrably load-bearing — it changed what the agent did or
+    # said next.  A memory can be accessed every session and never
+    # applied; treating those identically rewards decoration on the
+    # decay side.  Reflection / pre-sleep hooks populate this via
+    # ``MemorySystem.mark_applied``; auto-detection is deliberately out
+    # of scope for the primitive itself.  See #1326.
+    applied_count: int = 0
+    last_applied: Optional[str] = None   # ISO format timestamp
     decay_protected: bool = False
 
     # Context management layer (agent-controlled pruning)
@@ -83,6 +93,8 @@ class MemoryMetadata:
             "day_of_week": self.day_of_week,
             "access_count": self.access_count,
             "last_accessed": self.last_accessed,
+            "applied_count": self.applied_count,
+            "last_applied": self.last_applied,
             "decay_protected": self.decay_protected,
             # Context management fields
             "context_priority": self.context_priority,
@@ -117,6 +129,8 @@ class MemoryMetadata:
             day_of_week=data.get("day_of_week", ""),
             access_count=data.get("access_count", 0),
             last_accessed=data.get("last_accessed"),
+            applied_count=data.get("applied_count", 0),
+            last_applied=data.get("last_applied"),
             decay_protected=data.get("decay_protected", False),
             # Context management fields
             context_priority=data.get("context_priority"),

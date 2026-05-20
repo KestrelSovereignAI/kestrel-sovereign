@@ -13,6 +13,7 @@ All queries are scoped by agent_id for multi-tenant isolation.
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Dict, Optional, List, Any
 
 from .async_database import AsyncDatabase
@@ -1179,6 +1180,125 @@ class AsyncConversationStore:
                 (json.dumps(current_meta), message_id, self.agent_id)
             )
             return True
+
+    async def atomic_increment_metadata_counter(
+        self,
+        message_id: int,
+        counter_field: str,
+        timestamp_field: Optional[str] = None,
+    ) -> bool:
+        """Atomically increment a numeric counter in the metadata JSON.
+
+        Wraps the read-modify-write of an integer field into a single
+        SQL statement so concurrent callers (rehearsal-effect updates,
+        reflection ``mark_applied`` writes, etc.) can't lose increments
+        by both reading the same value and writing the same successor.
+
+        ``counter_field``  — the JSON key holding the integer to bump
+                             (e.g. ``"access_count"``, ``"applied_count"``).
+        ``timestamp_field`` — optional JSON key to overwrite with the
+                             current UTC ISO timestamp in the same
+                             statement (e.g. ``"last_accessed"``,
+                             ``"last_applied"``).  Pass ``None`` to skip.
+
+        Returns ``True`` when the message was found and updated,
+        ``False`` if no row matched (unknown message id, or the row
+        belongs to a different agent).  Use the return value to
+        verify the bookkeeping landed — the caller (retriever or
+        reflection hook) swallows exceptions but a False return is
+        the only signal that the write was a no-op rather than a
+        success.
+
+        Backend-aware: both SQLite (3.38+) and PostgreSQL (jsonb)
+        support ``json_set`` + ``json_extract`` natively, so the
+        statement is a single atomic UPDATE on either.
+        """
+        now_iso = datetime.now(timezone.utc).isoformat() if timestamp_field else None
+
+        if self.db.backend_type == "postgres":
+            # PostgreSQL: ``conversation_history.metadata`` is declared
+            # TEXT (see async_database.py).  Cast to ``jsonb`` consistently
+            # for both the extract and the set — using ``metadata->>?``
+            # on a TEXT column raises an operator-not-found error at
+            # runtime, and the caller (``update_access`` /
+            # ``update_applied``) swallows the exception, so a typo here
+            # would silently drop every bookkeeping write.  Mirrors the
+            # existing ``update_message_metadata`` PG pattern that uses
+            # ``metadata::jsonb`` everywhere it reads metadata.
+            #
+            # Every ``?`` used as a JSON key carries an explicit ``::text``
+            # cast — ``jsonb ->>`` is overloaded between (jsonb, text) and
+            # (jsonb, int), and ``ARRAY[?]`` feeding ``jsonb_set`` needs
+            # the element to be unambiguously text for asyncpg's
+            # statement-prep type inference.  Without these casts the
+            # bookkeeping UPDATE fails to prepare on Postgres and the
+            # caller's exception-swallow silently drops the write.
+            if timestamp_field is None:
+                sql = (
+                    "UPDATE conversation_history SET metadata = "
+                    "  jsonb_set("
+                    "    COALESCE(metadata::jsonb, '{}'::jsonb),"
+                    "    ARRAY[?::text],"
+                    "    to_jsonb(COALESCE((metadata::jsonb->>(?::text))::int, 0) + 1)"
+                    "  ) "
+                    "WHERE id = ? AND agent_id = ?"
+                )
+                params: tuple = (counter_field, counter_field, message_id, self.agent_id)
+            else:
+                sql = (
+                    "UPDATE conversation_history SET metadata = "
+                    "  jsonb_set("
+                    "    jsonb_set("
+                    "      COALESCE(metadata::jsonb, '{}'::jsonb),"
+                    "      ARRAY[?::text],"
+                    "      to_jsonb(COALESCE((metadata::jsonb->>(?::text))::int, 0) + 1)"
+                    "    ),"
+                    "    ARRAY[?::text],"
+                    "    to_jsonb(?::text)"
+                    "  ) "
+                    "WHERE id = ? AND agent_id = ?"
+                )
+                params = (
+                    counter_field, counter_field,
+                    timestamp_field, now_iso,
+                    message_id, self.agent_id,
+                )
+            rows_affected = await self.db.execute_commit(sql, params)
+            return rows_affected > 0
+        else:
+            # SQLite: json_set + json_extract in one statement.  Both
+            # functions are core (3.38+) so no extension load required.
+            if timestamp_field is None:
+                rows_affected = await self.db.execute_commit(
+                    "UPDATE conversation_history SET metadata = "
+                    "  json_set("
+                    "    COALESCE(metadata, '{}'),"
+                    "    '$.' || ?,"
+                    "    COALESCE(json_extract(metadata, '$.' || ?), 0) + 1"
+                    "  ) "
+                    "WHERE id = ? AND agent_id = ?",
+                    (counter_field, counter_field, message_id, self.agent_id),
+                )
+            else:
+                rows_affected = await self.db.execute_commit(
+                    "UPDATE conversation_history SET metadata = "
+                    "  json_set("
+                    "    json_set("
+                    "      COALESCE(metadata, '{}'),"
+                    "      '$.' || ?,"
+                    "      COALESCE(json_extract(metadata, '$.' || ?), 0) + 1"
+                    "    ),"
+                    "    '$.' || ?,"
+                    "    ?"
+                    "  ) "
+                    "WHERE id = ? AND agent_id = ?",
+                    (
+                        counter_field, counter_field,
+                        timestamp_field, now_iso,
+                        message_id, self.agent_id,
+                    ),
+                )
+            return rows_affected > 0
 
     async def update_messages_metadata(
         self,

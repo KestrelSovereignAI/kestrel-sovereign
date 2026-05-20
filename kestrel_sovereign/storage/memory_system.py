@@ -397,6 +397,43 @@ class MemorySystem:
             depth=depth
         )
 
+    async def mark_applied(
+        self,
+        message_id: int,
+        *,
+        reason: Optional[str] = None,
+    ) -> None:
+        """
+        Record that a previously retrieved memory was demonstrably applied.
+
+        Distinct from the implicit retrieval bookkeeping done in
+        ``retrieve()``: that increments ``access_count`` whenever a
+        memory scores into the context window.  ``mark_applied`` is the
+        explicit attestation that the memory was load-bearing for the
+        agent's next decision, populated by reflection / pre-sleep
+        hooks (or any other surface that can witness application
+        directly).  See #1326.
+
+        Args:
+            message_id: Database ID of the message whose memory was applied.
+            reason: Optional human-readable rationale for the
+                attestation (e.g. ``"steered tool choice"``,
+                ``"matched recall constraint"``).  Captured for audit /
+                future telemetry; not yet persisted into metadata —
+                reflection-side aggregation is a follow-up.  Logged
+                here so the application context is visible in agent
+                traces even pre-persistence.
+        """
+        if not self.retriever:
+            logger.warning("Memory retriever not initialized; mark_applied is a no-op")
+            return
+        if reason:
+            logger.info(
+                "memory.mark_applied agent=%s message_id=%s reason=%s",
+                self.agent_id, message_id, reason,
+            )
+        await self.retriever.update_applied(message_id, self.agent_id)
+
     async def consolidate(self) -> Dict[str, Any]:
         """
         Run memory consolidation (call periodically, e.g., nightly).

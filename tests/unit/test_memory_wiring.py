@@ -20,68 +20,44 @@ from kestrel_sovereign.storage.memory_retriever import MemoryRetriever
 
 
 class TestUpdateAccessActuallyWrites:
-    """Verify update_access() actually persists, not just logs."""
+    """Verify update_access() actually persists, not just logs.
+
+    Smoking-gun guard: a previous regression had ``update_access`` just
+    logging without writing.  After #1326 the retriever delegates to
+    the conversation store's ``atomic_increment_metadata_counter`` (a
+    single atomic SQL statement that fixes the lost-update race the
+    old read-modify-write had under concurrent retrievals).  Tests
+    assert delegation; end-to-end "the counter actually moves" is
+    covered against a real SQLite in
+    ``tests/integration/test_atomic_increment_metadata.py``.
+    """
 
     @pytest.mark.asyncio
-    async def test_update_access_calls_update_message_metadata(self):
-        """The smoking-gun test: previous implementation just logged. This
-        verifies it now hits the conversation store."""
+    async def test_update_access_delegates_to_atomic_increment(self):
         conv_store = MagicMock()
         conv_store.agent_id = "test-agent"
-        conv_store.db = MagicMock()
-        conv_store.db.fetchone = AsyncMock(return_value=('{"access_count": 3}',))
-        conv_store.update_message_metadata = AsyncMock(return_value=True)
+        conv_store.atomic_increment_metadata_counter = AsyncMock(return_value=True)
 
         retriever = MemoryRetriever(conversation_store=conv_store)
         await retriever.update_access(message_id=42, agent_id="test-agent")
 
-        conv_store.update_message_metadata.assert_called_once()
-        args, _ = conv_store.update_message_metadata.call_args
-        assert args[0] == 42
-        # access_count must increment, not stay at 0
-        assert args[1]["access_count"] == 4
-        assert "last_accessed" in args[1]
-
-    @pytest.mark.asyncio
-    async def test_update_access_starts_from_zero_when_no_metadata(self):
-        conv_store = MagicMock()
-        conv_store.agent_id = "test-agent"
-        conv_store.db = MagicMock()
-        conv_store.db.fetchone = AsyncMock(return_value=('{}',))
-        conv_store.update_message_metadata = AsyncMock(return_value=True)
-
-        retriever = MemoryRetriever(conversation_store=conv_store)
-        await retriever.update_access(message_id=42, agent_id="test-agent")
-
-        args, _ = conv_store.update_message_metadata.call_args
-        assert args[1]["access_count"] == 1
-
-    @pytest.mark.asyncio
-    async def test_update_access_silent_on_missing_message(self):
-        """No row found should not raise — never break retrieval."""
-        conv_store = MagicMock()
-        conv_store.agent_id = "test-agent"
-        conv_store.db = MagicMock()
-        conv_store.db.fetchone = AsyncMock(return_value=None)
-        conv_store.update_message_metadata = AsyncMock(return_value=True)
-
-        retriever = MemoryRetriever(conversation_store=conv_store)
-        # Should not raise
-        await retriever.update_access(message_id=999, agent_id="test-agent")
-
-        conv_store.update_message_metadata.assert_not_called()
+        conv_store.atomic_increment_metadata_counter.assert_awaited_once_with(
+            42,
+            counter_field="access_count",
+            timestamp_field="last_accessed",
+        )
 
     @pytest.mark.asyncio
     async def test_update_access_silent_on_db_error(self):
         """DB errors must not propagate — never break retrieval."""
         conv_store = MagicMock()
         conv_store.agent_id = "test-agent"
-        conv_store.db = MagicMock()
-        conv_store.db.fetchone = AsyncMock(side_effect=RuntimeError("db down"))
-        conv_store.update_message_metadata = AsyncMock(return_value=True)
+        conv_store.atomic_increment_metadata_counter = AsyncMock(
+            side_effect=RuntimeError("db down")
+        )
 
         retriever = MemoryRetriever(conversation_store=conv_store)
-        # Should not raise even though DB fails
+        # Must not raise even though DB fails.
         await retriever.update_access(message_id=42, agent_id="test-agent")
 
 

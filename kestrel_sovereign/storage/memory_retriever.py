@@ -489,6 +489,10 @@ class MemoryRetriever:
         This implements the rehearsal effect — accessed memories
         decay slower (see calculate_decay below).
 
+        Uses the store's atomic JSON-set increment under the hood so
+        two concurrent retrievals of the same memory both register
+        instead of racing on a read-modify-write of the same counter.
+
         Args:
             message_id: Database ID of the message
             agent_id: Agent ID for verification (currently unused; store is
@@ -498,27 +502,60 @@ class MemoryRetriever:
             return
 
         try:
-            # Read current access_count atomically via the conversation store
-            row = await self.conversations.db.fetchone(
-                "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
-                (message_id, self.conversations.agent_id),
-            )
-            if not row:
-                return
-
-            current_meta = json.loads(row[0]) if row[0] else {}
-            new_count = (current_meta.get("access_count") or 0) + 1
-
-            await self.conversations.update_message_metadata(
+            await self.conversations.atomic_increment_metadata_counter(
                 message_id,
-                {
-                    "access_count": new_count,
-                    "last_accessed": datetime.now(timezone.utc).isoformat(),
-                },
+                counter_field="access_count",
+                timestamp_field="last_accessed",
             )
         except Exception as e:
             # Never let rehearsal-effect bookkeeping break retrieval
             logger.warning(f"update_access failed for message {message_id}: {e}")
+
+    async def update_applied(
+        self,
+        message_id: int,
+        agent_id: str,
+    ) -> None:
+        """
+        Record that a retrieved memory was demonstrably applied.
+
+        Distinct from ``update_access``: access is incremented when the
+        retriever scores a memory into the context window, applied is
+        incremented when the agent's downstream loop (typically the
+        reflection / pre-sleep hook) attests that the memory was
+        load-bearing for the decision that followed.  Without this
+        distinction, decoration that's retrieved every session is
+        indistinguishable from memory that's actually steering the
+        agent.
+
+        Auto-detection of "applied" is intentionally out of scope of
+        this primitive; this method is the write path and reflection
+        decides when to call it.  See #1326.
+
+        Uses the same atomic increment helper ``update_access`` uses so
+        concurrent reflection hooks marking the same memory as applied
+        can't lose increments to a read-modify-write race.
+
+        Args:
+            message_id: Database ID of the message
+            agent_id: Agent ID for verification (currently unused; store
+                is already agent-scoped, parameter matches
+                ``update_access`` shape so the two write paths feel
+                symmetric to callers).
+        """
+        if not self.conversations or message_id is None:
+            return
+
+        try:
+            await self.conversations.atomic_increment_metadata_counter(
+                message_id,
+                counter_field="applied_count",
+                timestamp_field="last_applied",
+            )
+        except Exception as e:
+            # Same safety as update_access — bookkeeping must not
+            # break the calling loop.
+            logger.warning(f"update_applied failed for message {message_id}: {e}")
 
 
 def calculate_decay(
@@ -526,19 +563,45 @@ def calculate_decay(
     importance: float = 0.5,
     access_count: int = 0,
     decay_protected: bool = False,
-    half_life_days: int = 30
+    half_life_days: int = 30,
+    applied_count: int = 0,
 ) -> float:
     """
     Calculate current memory strength based on decay.
 
     Standalone function for use in consolidation and other contexts.
 
+    The ``access_count`` and ``applied_count`` parameters carry distinct
+    signal:
+
+    * ``access_count`` — the memory was retrieved into the agent's
+      context window.  This is the rehearsal-effect signal from
+      Ebbinghaus and is correctly modest in magnitude — every load
+      shouldn't materially extend a memory's lifespan.
+    * ``applied_count`` — the memory demonstrably changed what the
+      agent did next (populated via ``MemorySystem.mark_applied`` from
+      reflection / pre-sleep hooks; see #1326).  A higher boost
+      coefficient than ``access_count`` rewards load-bearing memories
+      over ones that merely keep getting recalled.
+
+    Concretely the boost curves are:
+
+    * access:  ``1.0 + log10(n + 1) * 0.5``  (n=1 → +0.15, n=10 → +0.52, n=100 → +1.0)
+    * applied: ``1.0 + log10(n + 1) * 1.0``  (n=1 → +0.30, n=10 → +1.00, n=100 → +2.00)
+
+    The boosts multiply, so a memory that's been both accessed and
+    applied compounds — the system rewards being *useful* over being
+    *familiar*, but doesn't punish familiarity either.
+
     Args:
         created_at: ISO timestamp of memory creation
         importance: Importance score (0.0 to 1.0)
-        access_count: Number of times accessed
+        access_count: Number of times retrieved
         decay_protected: If True, returns 1.0 (no decay)
         half_life_days: Base half-life in days
+        applied_count: Number of times the memory was demonstrably
+            applied to a downstream decision.  Defaults to 0 so existing
+            callers that pre-date #1326 get unchanged behavior.
 
     Returns:
         Memory strength from 0.0 to 1.0
@@ -564,11 +627,18 @@ def calculate_decay(
         # Importance extends half-life
         effective_half_life = half_life_days * (1.0 + importance * 2.0)
 
-        # Access boosts half-life (rehearsal effect)
+        # Access boosts half-life (rehearsal effect — modest)
         if access_count > 0:
             import math
             access_boost = 1.0 + math.log10(access_count + 1) * 0.5
             effective_half_life *= access_boost
+
+        # Applied boosts half-life more strongly than access — being
+        # load-bearing is a stronger signal than being retrieved.
+        if applied_count > 0:
+            import math
+            applied_boost = 1.0 + math.log10(applied_count + 1) * 1.0
+            effective_half_life *= applied_boost
 
         # Exponential decay
         decay = 0.5 ** (days_old / effective_half_life)
