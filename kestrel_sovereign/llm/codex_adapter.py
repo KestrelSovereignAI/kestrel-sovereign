@@ -214,6 +214,11 @@ class CodexAdapter(LLMAdapter):
         # history for that session, same posture as OpenClaw's
         # ``dynamicToolsFingerprint`` reset).
         self._session_threads: Dict[str, Tuple[str, str]] = {}
+        # Per-session lock for ``_ensure_thread`` lookup-or-create — two
+        # concurrent first calls on the same session_id would otherwise
+        # both call thread/start and race to overwrite the cache,
+        # leaving one thread orphaned with whichever turn was mid-flight.
+        self._session_locks: Dict[str, "asyncio.Lock"] = {}
         # Per-thread serialization: the codex app-server allows only one
         # active turn per thread. Two concurrent ``_run_turn`` calls on
         # the same thread (same session_id) would race on the turn-sink
@@ -277,32 +282,45 @@ class CodexAdapter(LLMAdapter):
         """
         m = self._model_param(model)
         fingerprint = self._thread_fingerprint(m, instructions, dynamic_tools)
-        if session_id and session_id in self._session_threads:
-            cached_id, cached_fp = self._session_threads[session_id]
-            if cached_fp == fingerprint:
-                return cached_id, False
-            logger.info(
-                "codex session %s thread config changed (%s → %s); "
-                "starting fresh thread", session_id, cached_fp, fingerprint,
-            )
-            # Cached thread no longer matches; drop it.
-            self._session_threads.pop(session_id, None)
-        params: Dict[str, Any] = {"sandbox": "read-only"}
-        if m:
-            params["model"] = m
-        if instructions:
-            params["developerInstructions"] = instructions
-        if dynamic_tools:
-            params["dynamicTools"] = dynamic_tools
-        result = await app.request("thread/start", params, timeout=60)
-        thread_id = (result or {}).get("thread", {}).get("id")
-        if not thread_id:
-            raise CodexAppServerError(
-                f"thread/start returned no thread id: {result!r}"
-            )
+
+        # Per-session lock; bare path for session-less calls (each
+        # ephemeral thread is independent — no race possible).
         if session_id:
-            self._session_threads[session_id] = (thread_id, fingerprint)
-        return thread_id, True
+            lock = self._session_locks.setdefault(session_id, asyncio.Lock())
+            await lock.acquire()
+        else:
+            lock = None
+        try:
+            if session_id and session_id in self._session_threads:
+                cached_id, cached_fp = self._session_threads[session_id]
+                if cached_fp == fingerprint:
+                    return cached_id, False
+                logger.info(
+                    "codex session %s thread config changed (%s → %s); "
+                    "starting fresh thread",
+                    session_id, cached_fp, fingerprint,
+                )
+                # Cached thread no longer matches; drop it.
+                self._session_threads.pop(session_id, None)
+            params: Dict[str, Any] = {"sandbox": "read-only"}
+            if m:
+                params["model"] = m
+            if instructions:
+                params["developerInstructions"] = instructions
+            if dynamic_tools:
+                params["dynamicTools"] = dynamic_tools
+            result = await app.request("thread/start", params, timeout=60)
+            thread_id = (result or {}).get("thread", {}).get("id")
+            if not thread_id:
+                raise CodexAppServerError(
+                    f"thread/start returned no thread id: {result!r}"
+                )
+            if session_id:
+                self._session_threads[session_id] = (thread_id, fingerprint)
+            return thread_id, True
+        finally:
+            if lock is not None:
+                lock.release()
 
     def _make_tool_call_handler(
         self, executor: ToolExecutor, thread_id: str

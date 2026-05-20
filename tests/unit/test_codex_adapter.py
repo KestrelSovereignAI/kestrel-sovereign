@@ -358,6 +358,47 @@ class TestToolExecutorBridge:
         assert "different turn" in reply["contentItems"][0]["text"]
 
     @pytest.mark.asyncio
+    async def test_concurrent_first_calls_on_same_session_create_one_thread(self):
+        """Regression: two concurrent first calls on the same session_id
+        must not both run thread/start and overwrite each other's cache
+        entry (loses server-side history for whichever thread doesn't
+        win the race). The per-session lock around ``_ensure_thread``
+        guarantees one thread/start.
+        """
+        import asyncio
+
+        a = _adapter_with(_TEXT_TURN)
+        # Gate the first thread/start so the second call races.
+        original_request = a._client.request
+        gate = asyncio.Event()
+
+        async def gated_request(method, params=None, *, timeout=120):
+            if method == "thread/start":
+                await gate.wait()
+            return await original_request(method, params, timeout=timeout)
+
+        a._client.request = gated_request
+
+        async def call():
+            return await a.get_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="race",
+            )
+
+        t1 = asyncio.create_task(call())
+        t2 = asyncio.create_task(call())
+        await asyncio.sleep(0)  # let both reach the gate
+        gate.set()
+        await asyncio.gather(t1, t2)
+
+        thread_starts = [m for m, _ in a._client.requests if m == "thread/start"]
+        assert len(thread_starts) == 1, (
+            f"expected one thread/start, got {len(thread_starts)} — race "
+            "would have leaked an orphan thread"
+        )
+
+    @pytest.mark.asyncio
     async def test_per_thread_serialization_for_concurrent_turns(self):
         """The codex app-server runs one active turn per thread. Two
         concurrent ``_run_turn`` calls sharing a thread must serialize,

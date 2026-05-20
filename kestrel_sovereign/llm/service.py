@@ -1598,6 +1598,23 @@ No other text or formatting.
         await self.drain_preference_persistence()
 
         for provider in self.providers:
+            # Adapter-owned resources (e.g. CodexAdapter's app-server
+            # subprocess) — adapters that own external state should
+            # expose ``aclose``. The provider's ``client`` slot doesn't
+            # always carry that state (codex stores just the binary
+            # path), so consult the adapter directly.
+            adapter = provider.get("adapter")
+            if adapter is not None and hasattr(adapter, "aclose"):
+                try:
+                    await _wait_for_close_result(adapter.aclose())
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception as e:
+                    logger.warning(
+                        "Error closing %s adapter: %s",
+                        provider.get("name"), e, exc_info=True,
+                    )
+
             client = provider.get("client")
             if client is None:
                 continue
