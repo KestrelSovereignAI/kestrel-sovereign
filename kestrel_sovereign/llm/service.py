@@ -16,7 +16,7 @@ import asyncio
 import inspect
 from kestrel_sovereign.kestrel_config.constants import STORAGE_CACHE_TTL_SECONDS
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
+from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, TYPE_CHECKING
 
 import openai
 import httpx
@@ -1744,6 +1744,7 @@ No other text or formatting.
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> Union[str, LLMResponse]:
         """Generate using existing message list (for multi-turn tool calling).
 
@@ -1908,6 +1909,7 @@ No other text or formatting.
                     response_format=response_format,
                     extra_body=provider_cache_body(provider),
                     session_id=session_id,
+                    tool_executor=tool_executor,
                 )
                 if tools is not None or response_format is not None:
                     return response

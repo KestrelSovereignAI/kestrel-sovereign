@@ -378,6 +378,7 @@ class OrchestratorEngineMixin:
             force_local_only=force_local_only,
             model_override=effective_model,
             session_id=session_id,
+            tool_executor=self._make_inline_tool_executor(session_id),
         )
 
     async def _execute_tool_with_hooks(
@@ -459,6 +460,27 @@ class OrchestratorEngineMixin:
         )
 
         return result
+
+    def _make_inline_tool_executor(self, session_id: str):
+        """Return an async ``(name, args) -> result`` callable bound to
+        this agent's hooks/registry, for transports that run an inline
+        tool loop *inside* a single LLM turn (the codex app-server's
+        ``item/tool/call`` server→client RPC is the current consumer).
+
+        The callable delegates to :meth:`execute_named_tool`, so every
+        gate the chat path enforces — ``PRE_TOOL_USE``/``POST_TOOL_USE``
+        hooks, ``SecurityHook``, the approval queue, denied-tool
+        stripping — fires exactly as it does for orchestrator-driven
+        dispatch. Adapters that don't run an inline tool loop ignore
+        the callable.
+        """
+
+        async def _exec(name: str, args: dict):
+            return await self.execute_named_tool(
+                name, args, session_id=session_id, source="codex_app_server",
+            )
+
+        return _exec
 
     async def execute_named_tool(
         self,
@@ -1399,6 +1421,7 @@ class OrchestratorEngineMixin:
                 force_local_only=force_local_only,
                 model_override=effective_model,
                 session_id=session_id,
+                tool_executor=self._make_inline_tool_executor(session_id),
             )
 
             if isinstance(response, str):
@@ -1630,6 +1653,7 @@ class OrchestratorEngineMixin:
                 force_local_only=force_local_only,
                 model_override=effective_model,
                 session_id=session_id,
+                tool_executor=self._make_inline_tool_executor(session_id),
             )
 
             if isinstance(response, str):

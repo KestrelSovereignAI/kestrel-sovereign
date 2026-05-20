@@ -436,15 +436,24 @@ class TestPreferencePersistence:
 class TestCodexAdapterContract:
     """Contract: the Codex adapter raises clearly and delegates discovery."""
 
-    def test_codex_adapter_raises_without_client(self):
+    def test_codex_adapter_raises_clearly_when_app_server_unavailable(self):
+        # ``client`` is unused now (auth delegated to the codex binary);
+        # the failure mode is an unresolvable app-server binary.
+        from unittest.mock import patch
+
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from kestrel_sovereign.llm.codex_app_server import CodexAppServerError
 
         adapter = CodexAdapter()
-
-        with pytest.raises(RuntimeError, match="requires an OAuth token"):
-            asyncio.run(adapter.get_response(
-                client=None, model="gpt-5.4", messages=[]
-            ))
+        with patch(
+            "kestrel_sovereign.llm.codex_app_server.resolve_codex_binary",
+            side_effect=CodexAppServerError("codex binary not found"),
+        ):
+            with pytest.raises(CodexAppServerError, match="codex binary not found"):
+                asyncio.run(adapter.get_response(
+                    client=None, model="gpt-5.4",
+                    messages=[{"role": "user", "content": "hi"}],
+                ))
 
     def test_codex_adapter_does_not_list_models(self):
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
@@ -458,9 +467,12 @@ class TestOpenAIPlanProviderRegistry:
     """Contract: openai:plan can be initialized via provider_registry."""
 
     def test_registry_initializes_openai_plan(self, monkeypatch):
+        from unittest.mock import patch
+
         from kestrel_sovereign.llm.provider_registry import ProviderRegistry
 
-        monkeypatch.setenv("CODEX_AUTH_TOKEN", "test-token")
+        # Auth is delegated to the codex binary now; the registry only
+        # needs to resolve it (no token).
         config = {
             "route_priority": ["openai:plan"],
             "vendors": {
@@ -469,19 +481,20 @@ class TestOpenAIPlanProviderRegistry:
                     "routes": {
                         "plan": {
                             "adapter": "CodexAdapter",
-                            "auth_token_env": "CODEX_AUTH_TOKEN",
                             "model": "gpt-5.4",
                         },
                     },
                 },
             },
         }
-        registry = ProviderRegistry(config)
-        providers = registry.initialize_providers()
+        with patch(
+            "kestrel_sovereign.llm.codex_app_server.resolve_codex_binary",
+            return_value="/path/to/codex",
+        ):
+            registry = ProviderRegistry(config)
+            providers = registry.initialize_providers()
 
-        assert len(providers) == 1
-        provider = providers[0]
-        assert provider.name == "openai:plan"
+        provider = next(p for p in providers if p.name == "openai:plan")
         assert provider.vendor == "openai"
         assert provider.route == "plan"
         assert provider.model == "gpt-5.4"

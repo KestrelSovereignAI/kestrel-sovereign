@@ -256,17 +256,25 @@ class TestNellieFailureModes:
         assert "anthropic:api" in error_msg
         assert "openai:api" in error_msg
 
-    def test_codex_adapter_requires_client(self):
+    def test_codex_adapter_fails_clearly_without_app_server(self):
+        # ``client`` is unused now (auth delegated to the codex binary);
+        # the real failure mode is an unresolvable app-server binary.
+        from unittest.mock import patch
+
         from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from kestrel_sovereign.llm.codex_app_server import CodexAppServerError
 
         adapter = CodexAdapter()
-
-        with pytest.raises(RuntimeError, match="requires an OAuth token"):
-            asyncio.run(adapter.get_response(
-                client=None,
-                model="gpt-5.4",
-                messages=[{"role": "user", "content": "hi"}],
-            ))
+        with patch(
+            "kestrel_sovereign.llm.codex_app_server.resolve_codex_binary",
+            side_effect=CodexAppServerError("codex binary not found"),
+        ):
+            with pytest.raises(CodexAppServerError, match="codex binary not found"):
+                asyncio.run(adapter.get_response(
+                    client=None,
+                    model="gpt-5.4",
+                    messages=[{"role": "user", "content": "hi"}],
+                ))
 
     def test_anthropic_plan_route_requires_auth_token(self):
         """anthropic:plan needs either ANTHROPIC_AUTH_TOKEN or an inline auth_token."""
@@ -297,8 +305,13 @@ class TestNellieFailureModes:
         env.pop("ANTHROPIC_API_KEY", None)
         with patch.dict("os.environ", env, clear=True):
             registry = ProviderRegistry(config)
-            with pytest.raises(ProviderInitializationError):
-                registry.initialize_providers()
+            # ``ProviderInitializationError`` only fires when EVERY route
+            # fails — when entry-point plugins (kimi/xai/deepseek) are
+            # installed they register successfully and the registry no
+            # longer raises. The invariant we actually care about is that
+            # anthropic:plan itself is absent without credentials.
+            providers = registry.initialize_providers()
+        assert not any(p.name == "anthropic:plan" for p in providers)
 
 
 class TestNellieBackendSwitch:

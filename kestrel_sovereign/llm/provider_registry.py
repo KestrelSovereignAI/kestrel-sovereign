@@ -264,18 +264,25 @@ class ProviderRegistry:
                 )
             return client, adapter_cls()
 
-        # --- Codex / ChatGPT subscription backend (raw OAuth token string) ---
+        # --- Codex / ChatGPT subscription via the official codex app-server ---
+        # Auth is delegated entirely to the codex binary (~/.codex/auth.json,
+        # written by `codex login`); the adapter spawns/manages the
+        # app-server itself. We fail fast here if the binary can't be
+        # located, and pass its path as the (otherwise-unused) client
+        # slot so the route registers (a None client would skip the
+        # route).
         if adapter_cls is CodexAdapter:
-            token = self._resolve_secret(route_cfg, "auth_token_env", "auth_token")
-            if not token:
-                token, _ = self._read_codex_auth_file()
-            if not token:
+            from .codex_app_server import (
+                CodexAppServerError,
+                resolve_codex_binary,
+            )
+            try:
+                binary = resolve_codex_binary()
+            except CodexAppServerError as e:
                 raise ValueError(
-                    f"{vendor}:{route} OAuth token not found. "
-                    "Run `codex login` or set CODEX_AUTH_TOKEN."
-                )
-            # Adapter uses httpx directly; client slot holds the token string.
-            return token, adapter_cls()
+                    f"{vendor}:{route} codex app-server unavailable: {e}"
+                ) from e
+            return binary, adapter_cls()
 
         # --- OpenRouter (OpenAI-compatible client, custom adapter) ---
         if adapter_cls is OpenRouterAdapter:
@@ -377,27 +384,6 @@ class ProviderRegistry:
                 return val
         inline = route_cfg.get(inline_key)
         return inline or None
-
-    @staticmethod
-    def _read_codex_auth_file() -> tuple:
-        """Read OAuth token from ~/.codex/auth.json (written by `codex login`).
-
-        Returns (token, auth_mode) tuple or (None, None) if not found/readable.
-        """
-        auth_path = Path.home() / ".codex" / "auth.json"
-        if not auth_path.exists():
-            return None, None
-        try:
-            data = _json.loads(auth_path.read_text())
-            auth_mode = data.get("auth_mode", "")
-            tokens = data.get("tokens", {})
-            token = tokens.get("access_token") or data.get("access_token")
-            if token:
-                return token, auth_mode or "oauth"
-            return None, None
-        except Exception as e:
-            logger.warning(f"Failed to read codex auth file: {e}")
-            return None, None
 
     # ------------------------------------------------------ entry-point providers
 

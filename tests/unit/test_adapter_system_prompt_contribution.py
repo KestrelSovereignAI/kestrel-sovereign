@@ -138,45 +138,57 @@ class TestApplySystemPromptContributionToMessages:
 
 
 class TestCodexInstructionsAugmentation:
-    """Verify the codex flow: extract → contribute → goes into request body."""
+    """Verify the codex flow: extract → contribute → sent to the app-server.
 
-    def test_instructions_carry_overlay_for_gpt5(self):
+    The app-server-backed adapter passes the (overlaid) system prompt as
+    ``developerInstructions`` on ``thread/start``. These assert the same
+    extract→contribute→wire chain the old ``_build_request_body`` test
+    covered, just at the new boundary.
+    """
+
+    class _CaptureApp:
+        def __init__(self):
+            self.thread_start_params = None
+
+        async def ensure_started(self):
+            pass
+
+        async def request(self, method, params=None, *, timeout=120):
+            if method == "thread/start":
+                self.thread_start_params = params
+                return {"thread": {"id": "t1"}}
+            return {}
+
+    @pytest.mark.asyncio
+    async def test_instructions_carry_overlay_for_gpt5(self):
         from kestrel_sovereign.llm.codex_adapter import (
-            _build_request_body,
             _extract_instructions_and_input,
         )
 
         adapter = CodexAdapter()
-        messages = [
-            {"role": "system", "content": "You are Kestrel."},
-            {"role": "user", "content": "hi"},
-        ]
-        instructions, input_messages = _extract_instructions_and_input(messages)
+        instructions, _ = _extract_instructions_and_input(
+            [{"role": "system", "content": "You are Kestrel."},
+             {"role": "user", "content": "hi"}]
+        )
         instructions = adapter.contribute_system_prompt("gpt-5.4", instructions)
-        body = _build_request_body(
-            model="gpt-5.4",
-            input_messages=input_messages,
-            instructions=instructions,
-        )
-        assert body["instructions"].startswith("<persona_latch>")
-        assert body["instructions"].endswith("You are Kestrel.")
+        app = self._CaptureApp()
+        await adapter._ensure_thread(app, "s", "gpt-5.4", instructions, None)
+        sent = app.thread_start_params["developerInstructions"]
+        assert sent.startswith("<persona_latch>")
+        assert sent.endswith("You are Kestrel.")
 
-    def test_instructions_unchanged_for_non_gpt5(self):
+    @pytest.mark.asyncio
+    async def test_instructions_unchanged_for_non_gpt5(self):
         from kestrel_sovereign.llm.codex_adapter import (
-            _build_request_body,
             _extract_instructions_and_input,
         )
 
         adapter = CodexAdapter()
-        messages = [
-            {"role": "system", "content": "You are Kestrel."},
-            {"role": "user", "content": "hi"},
-        ]
-        instructions, input_messages = _extract_instructions_and_input(messages)
-        instructions = adapter.contribute_system_prompt("gpt-4o", instructions)
-        body = _build_request_body(
-            model="gpt-4o",
-            input_messages=input_messages,
-            instructions=instructions,
+        instructions, _ = _extract_instructions_and_input(
+            [{"role": "system", "content": "You are Kestrel."},
+             {"role": "user", "content": "hi"}]
         )
-        assert body["instructions"] == "You are Kestrel."
+        instructions = adapter.contribute_system_prompt("gpt-4o", instructions)
+        app = self._CaptureApp()
+        await adapter._ensure_thread(app, "s", "gpt-4o", instructions, None)
+        assert app.thread_start_params["developerInstructions"] == "You are Kestrel."
