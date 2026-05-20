@@ -260,6 +260,13 @@ budget that *is* borrowable. The split between mandatory and optional
 system content lives in `token_budget.py` + the system-prompt assembler.
 Localized; no persistence change.
 
+**Fail-closed degraded mode (Emma 2026-05-20 hardening):** when the
+mandatory floor cannot fit, the system **fails closed** before prompt
+assembly issues a model call under a false "normal" status. It must not
+silently drop governance, tools, memories, or conversation to make the
+call appear valid. The breakdown surface (D) reports the degraded-mode
+condition explicitly.
+
 **Acceptance:**
 - Mandatory system content is measured per agent/model and treated as a
   non-borrowable floor. Below-floor is a hard-failure / degraded-mode
@@ -374,6 +381,14 @@ number *correct*, not compatible.
 saved this" when only the silent-prune path executed and no durable fold
 exists.** Out-of-window spans are labeled out-of-window, not folded.
 
+**Auto-detection invariant (Emma 2026-05-20 hardening):** while C is not
+yet shipped, the breakdown surface must **automatically detect** that
+the legacy silent-prune path is an active implementation state — not
+merely offer the label as a possibility. If the running builder can
+still drop out-of-window spans without a synchronous salvage record, the
+UI surfaces `silently-pruned path still active` unconditionally for that
+agent/model/turn, until C closes the gap.
+
 **Performance:** keep the cheap frequent footer poll cheap. If measuring
 RAG/episodes on every poll is too expensive (to be measured, not
 guessed), the poll returns everything except RAG and the popup makes one
@@ -432,9 +447,23 @@ refinements folded into the sections above:
    that no surface may imply "compression saved this" when only
    silent-prune happened. → folded into [D](#d--legible-context-clickable-breakdown-popup).
 
-Pending: explicit ack from Emma that the folded revisions match her
-intent. Once acknowledged, the sub-tickets #1308 / #1309 / #1310 are
-unblocked for claim. #1311 remains design-first.
+**Ack received (Emma, 2026-05-20):** confirmed reading head `ac26c324`
+(blob SHA `0dd8680e…` verified); the folded text matches intent on all
+four points. Sub-tickets **#1308 / #1309 / #1310 are unblocked for
+claim**. **#1311 remains design-first** and must not be treated as
+implemented by A/B/D.
+
+In the same ack, Emma added two hardening invariants — explicitly
+"refinements, not blockers." Both folded in above:
+
+- **Fail-closed degraded mode** (in [B](#b--elastic-token-budget)) —
+  if the mandatory floor cannot fit, fail closed before prompt assembly
+  issues a model call under a false "normal" status; never silently drop
+  governance/tools/memories/conversation to make the call appear valid.
+- **Auto-detection of the legacy silent-prune path** (in
+  [D](#d--legible-context-clickable-breakdown-popup)) — while C is not
+  yet shipped, the breakdown UI must *automatically* surface
+  `silently-pruned path still active`, not merely offer the label.
 
 ---
 
