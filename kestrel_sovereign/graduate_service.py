@@ -92,6 +92,20 @@ class ValidationChecklist:
         print("=" * 60)
 
 
+def _resolve_did(agent_node) -> str:
+    """Return the agent's DID.
+
+    Canonical layout: the agent's ``node_id`` *is* the DID
+    (kestrel_agent.py:530 uses ``AsyncStorage(path, agent_id=self.did)`` and
+    inception writes the agent graph node with ``node_id=did``). Some agents
+    additionally carry a ``properties['did']`` field; prefer that when set,
+    otherwise fall back to ``node_id``. The validator originally only
+    consulted ``properties['did']`` and so failed three gates on Emma's live
+    DB even though her DID is right there on the node_id.
+    """
+    return agent_node.properties.get("did") or agent_node.node_id
+
+
 async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist:
     """Run validation checks on the agent."""
     checklist = ValidationChecklist()
@@ -110,6 +124,8 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         return checklist
 
     checklist.add_check("Is test instance", True)
+
+    did = _resolve_did(agent_node)
 
     # 2. Constitution anchored — agent has an outgoing 'governed_by' edge
     out_edges = await storage.graph.get_edges(agent_id, direction="out")
@@ -130,7 +146,6 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
     # filtered by the agent's DID — that's the tenant the agent uses at boot
     # (kestrel_agent.py:530 instantiates ``AsyncStorage(path, agent_id=self.did)``).
     try:
-        did = agent_node.properties.get("did", "")
         row = await storage.db.fetchone(
             "SELECT COUNT(*) FROM conversation_history "
             "WHERE agent_id = ? AND deleted_at IS NULL",
@@ -147,7 +162,6 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         checklist.add_check("Has conversation history", False, f"Error: {e}")
 
     # 4. DID document exists on disk
-    did = agent_node.properties.get("did", "")
     address = did.split(":")[-1] if did else None
     db_path = Path(storage.db_path)
     if address:
@@ -162,7 +176,7 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         checklist.add_check(
             "DID document exists",
             False,
-            "Could not parse DID" if did else "No DID in agent properties"
+            "Could not parse DID from agent node",
         )
 
     # 5. Encrypted key file exists on disk
@@ -306,7 +320,7 @@ async def graduate_agent(
         print(f"""
 Date: {now_iso}
 Agent: {agent_name}
-DID: {agent_node.properties.get('did', 'N/A')}
+DID: {_resolve_did(agent_node)}
 Previous Status: Test Instance
 New Status: Permanent Agent
 
