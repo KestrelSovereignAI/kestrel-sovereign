@@ -485,7 +485,10 @@ class CodexAdapter(LLMAdapter):
                     if delta:
                         text_parts.append(delta)
                         yield {"text": delta}
-                elif method and method.endswith("/reasoning/delta"):
+                elif method in (
+                    "item/reasoning/textDelta",
+                    "item/reasoning/summaryTextDelta",
+                ):
                     d = p.get("delta") or ""
                     if d:
                         yield {"thinking": d}
@@ -494,8 +497,16 @@ class CodexAdapter(LLMAdapter):
                     itype = item.get("type")
                     if itype == "agentMessage":
                         final_text = item.get("text") or final_text
-                    elif itype in ("functionCall", "toolCall", "function_call",
-                                   "mcpToolCall", "customToolCall"):
+                    elif itype in (
+                        # ``dynamicToolCall`` is what the app-server emits
+                        # for kestrel-registered ``dynamicTools`` (the
+                        # primary kestrel path). Other variants surface
+                        # native tool subtypes; accept all so a future
+                        # mix doesn't silently drop ToolCallStarted.
+                        "dynamicToolCall",
+                        "functionCall", "toolCall", "function_call",
+                        "mcpToolCall", "customToolCall",
+                    ):
                         cid = item.get("id") or item.get("callId") or ""
                         if cid in seen_tool_ids:
                             continue

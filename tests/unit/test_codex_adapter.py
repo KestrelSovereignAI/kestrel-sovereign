@@ -490,6 +490,65 @@ class TestToolExecutorBridge:
         assert {r[0] for r in results} == {"first", "second"}
 
     @pytest.mark.asyncio
+    async def test_dynamic_tool_call_item_surfaces_as_tool_call_event(self):
+        """The app-server emits inline-executed tool items with type
+        ``dynamicToolCall`` — historically I only matched
+        functionCall/toolCall and dropped these silently."""
+        events = [
+            {"method": "item/completed", "params": {"item": {
+                "type": "dynamicToolCall", "id": "c1",
+                "name": "get_weather", "arguments": '{"city": "SF"}'}}},
+            {"method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "ok"}}},
+            {"method": "turn/completed", "params": {}},
+        ]
+        a = _adapter_with(events)
+
+        async def exe(name, args):
+            return {"success": True, "result": "sunny"}
+
+        seen = [
+            c async for c in a.get_streaming_response_with_tools(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[{"type": "function", "function": {
+                    "name": "get_weather", "description": "d",
+                    "parameters": {"type": "object"}}}],
+                session_id="s", tool_executor=exe,
+            )
+        ]
+        starts = [c for c in seen if isinstance(c, ToolCallStarted)]
+        assert starts and starts[0].name == "get_weather"
+
+    @pytest.mark.asyncio
+    async def test_reasoning_delta_method_names_match_live_protocol(self):
+        """The app-server emits reasoning as
+        ``item/reasoning/textDelta`` and ``item/reasoning/summaryTextDelta``,
+        not the generic ``/reasoning/delta`` suffix the earlier code
+        guessed at."""
+        from kestrel_sovereign.llm.adapter import ThinkingDelta
+
+        events = [
+            {"method": "item/reasoning/textDelta",
+             "params": {"delta": "thinking-one"}},
+            {"method": "item/reasoning/summaryTextDelta",
+             "params": {"delta": "summary-two"}},
+            {"method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "final"}}},
+            {"method": "turn/completed", "params": {}},
+        ]
+        a = _adapter_with(events)
+        out = [
+            c async for c in a.get_streaming_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="s",
+            )
+        ]
+        deltas = [c for c in out if isinstance(c, ThinkingDelta)]
+        assert [d.content for d in deltas] == ["thinking-one", "summary-two"]
+
+    @pytest.mark.asyncio
     async def test_inline_executed_tools_absent_from_final_response(self):
         """Regression: the app-server runs tools inline via our handler.
         Surfacing those calls in LLMResponse.tool_calls would make the
