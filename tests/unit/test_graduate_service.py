@@ -83,6 +83,62 @@ def test_graduate_service_signature_has_no_council_session():
     )
 
 
+def test_resolve_did_prefers_property_then_falls_back_to_node_id():
+    """The agent's DID lives on ``node_id`` by convention. ``properties['did']``
+    is an optional shadow some agents carry. Resolver must prefer the
+    property when present, otherwise fall back to the node_id.
+
+    Regression for Emma's live DB shape (no ``did`` property; DID lives
+    only on node_id) — three validator gates failed before this fallback
+    landed.
+    """
+    DID = "did:pkh:eip155:1:0xABC"
+
+    # Case A: only node_id is set
+    node_a = GraphNode(node_id=DID, node_type="agent", label="A", properties={})
+    assert graduate_service._resolve_did(node_a) == DID
+
+    # Case B: properties has a DID, node_id is something legacy/arbitrary;
+    # the property wins so explicit migrations are honored
+    node_b = GraphNode(
+        node_id="agent:legacy",
+        node_type="agent",
+        label="B",
+        properties={"did": DID},
+    )
+    assert graduate_service._resolve_did(node_b) == DID
+
+    # Case C: properties has empty-string did — treated as absent, fall back
+    node_c = GraphNode(node_id=DID, node_type="agent", label="C", properties={"did": ""})
+    assert graduate_service._resolve_did(node_c) == DID
+
+
+def test_resolve_did_refuses_non_did_node_id_when_property_missing():
+    """If neither the property nor the node_id is actually a DID, the
+    resolver returns ``""`` instead of laundering an arbitrary id through.
+
+    Without this guard, an agent with ``node_id="agent:test-emma"`` and
+    no ``did`` property would have its non-DID id used for on-disk
+    file lookups (``kestrel_test-emma.json``) and conversation tenant
+    queries — letting any matching files / rows satisfy the gates and
+    weakening graduation. Codex caught this on #1325 round 2.
+    """
+    # node_id is not a DID, no property
+    node_legacy = GraphNode(
+        node_id="agent:test-emma", node_type="agent", label="L", properties={},
+    )
+    assert graduate_service._resolve_did(node_legacy) == ""
+
+    # node_id is not a DID, property is also not a DID
+    node_double_bad = GraphNode(
+        node_id="agent:legacy",
+        node_type="agent",
+        label="DB",
+        properties={"did": "not-a-did-either"},
+    )
+    assert graduate_service._resolve_did(node_double_bad) == ""
+
+
 # ----------------------------------------------------------------------
 # Functional test — full graduate flow against a real SQLite fixture.
 # ----------------------------------------------------------------------
@@ -91,35 +147,36 @@ def test_graduate_service_signature_has_no_council_session():
 async def graduate_ready_db(tmp_path):
     """Build a graduate-ready agent DB with all 8 validation gates passing.
 
-    Conversations are written under ``agent_id=did`` so the test exercises
-    the same per-tenant path a live ``KestrelAgent`` uses. The validator
-    must query under that tenant; passing this fixture means the validator
-    is reaching the right tenant, not the empty default. (Codex caught the
-    original cross-tenant bug in PR review.)
+    Layout mirrors what a live ``KestrelAgent`` produces:
+
+    - The agent node's ``node_id`` *is* the DID. There is no
+      ``properties['did']`` field — that mirrors Emma's live DB shape
+      where the DID lives only on the node_id. The validator must fall
+      back to ``node_id`` when the property is absent.
+    - Conversations are written under ``agent_id=did`` so the
+      cross-tenant gate exercises the same path the live agent uses.
     """
     db_path = tmp_path / "kestrel_prime.db"
     address = "0xTESTADDRESS"
     did = f"did:pkh:eip155:1:{address}"
+    agent_id = did  # node_id IS the DID, per the canonical layout
 
     # On-disk files the validator looks for
     (tmp_path / f"kestrel_{address}.json").write_text('{"id": "did-doc"}')
     (tmp_path / f"kestrel_{address}.key.enc").write_bytes(b"encrypted")
 
-    # Open storage scoped to the agent's DID so conversation rows land under
-    # the same tenant a live agent would use.
     from kestrel_sovereign.storage.async_storage import AsyncStorage
     storage = AsyncStorage(db_path=str(db_path), agent_id=did)
     await storage.initialize()
     try:
-        # Agent node, marked test instance
-        agent_id = "agent:test-emma"
+        # Agent node — note: no ``did`` property. The validator must use
+        # ``node_id`` as the DID source.
         await storage.graph.add_node(GraphNode(
             node_id=agent_id,
             node_type="agent",
             label="Test Emma",
             properties={
                 "name": "TestEmma",
-                "did": did,
                 "is_test_instance": True,
             },
         ))
@@ -232,6 +289,121 @@ async def test_graduate_agent_live_run_flips_flag_and_writes_event(graduate_read
         lifecycle_edges = [e for e in out_edges if e.label == "lifecycle_event"]
         assert len(lifecycle_edges) == 1
         assert lifecycle_edges[0].target_id == grad_event.node_id
+
+
+SYNC_MANIFEST_NAMES = [
+    ".gcs_manifest_{did}.json",          # storage/sync/gcs_target.py
+    ".lighthouse_manifest_{did}.json",   # storage/sync/lighthouse_target.py
+    ".sovereign_ipfs_manifest_{did}.json",  # storage/sync/sovereign_ipfs_target.py
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("manifest_template", SYNC_MANIFEST_NAMES)
+async def test_sovereignty_gate_accepts_disk_manifest_without_backup_artifact(
+    tmp_path, manifest_template
+):
+    """Gate #6 ('Has sovereignty backup') must accept any of the disk sync
+    manifests as proof of sovereignty backup — not require a discrete
+    ``backup_artifact`` graph node, and not be limited to one sync target.
+
+    Parametrised across every sync-target manifest filename in the codebase
+    so a future sync target that's added without updating this gate fails
+    explicitly. (Codex caught the original gap: I only listed two of the
+    three manifest filenames in the first draft.)
+    """
+    db_path = tmp_path / "kestrel_prime.db"
+    address = "0xMANIFEST"
+    did = f"did:pkh:eip155:1:{address}"
+    agent_id = did
+
+    # On-disk DID artifacts
+    (tmp_path / f"kestrel_{address}.json").write_text('{"id": "did-doc"}')
+    (tmp_path / f"kestrel_{address}.key.enc").write_bytes(b"encrypted")
+    # Sync manifest (proof of continuous sovereignty mirroring) — but
+    # deliberately NO backup_artifact graph node.
+    manifest_name = manifest_template.format(did=did)
+    (tmp_path / manifest_name).write_text('{"manifest": "yes"}')
+
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    storage = AsyncStorage(db_path=str(db_path), agent_id=did)
+    await storage.initialize()
+    try:
+        await storage.graph.add_node(GraphNode(
+            node_id=agent_id, node_type="agent", label="Manifest Test",
+            properties={"name": "ManifestTest", "is_test_instance": True},
+        ))
+        constitution_id = "constitution:test"
+        await storage.graph.add_node(GraphNode(
+            node_id=constitution_id, node_type="constitution",
+            label="Constitution", properties={},
+        ))
+        await storage.graph.add_edge(
+            source_id=agent_id, target_id=constitution_id, label="governed_by",
+        )
+        # Pad node count so gate #8 also passes
+        await storage.graph.add_node(GraphNode(
+            node_id="pad:1", node_type="concept", label="Pad", properties={},
+        ))
+        await storage.add_conversation(role="user", content="hi", session_id="s1")
+
+        checklist = await graduate_service.validate_agent(storage, agent_id)
+
+        # All 8 gates pass — including sovereignty gate via disk manifest
+        assert checklist.all_passed, (
+            f"Gate #6 must accept disk manifest as sovereignty proof. "
+            f"Failed: {checklist.failed}"
+        )
+        backup_check = next(
+            c for c in checklist.checks if c["name"] == "Has sovereignty backup"
+        )
+        assert backup_check["passed"]
+        assert manifest_name in backup_check["details"], (
+            f"Details line should name the {manifest_name} that satisfied the gate."
+        )
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_sovereignty_gate_fails_when_neither_surface_present(tmp_path):
+    """Gate #6 must still fail when neither a ``backup_artifact`` node nor a
+    sync manifest is present. Broadening shouldn't degenerate the gate.
+    """
+    db_path = tmp_path / "kestrel_prime.db"
+    address = "0xNOBACKUP"
+    did = f"did:pkh:eip155:1:{address}"
+    agent_id = did
+
+    (tmp_path / f"kestrel_{address}.json").write_text('{}')
+    (tmp_path / f"kestrel_{address}.key.enc").write_bytes(b"x")
+
+    from kestrel_sovereign.storage.async_storage import AsyncStorage
+    storage = AsyncStorage(db_path=str(db_path), agent_id=did)
+    await storage.initialize()
+    try:
+        await storage.graph.add_node(GraphNode(
+            node_id=agent_id, node_type="agent", label="NoBackup",
+            properties={"name": "NoBackup", "is_test_instance": True},
+        ))
+        await storage.graph.add_node(GraphNode(
+            node_id="constitution:test", node_type="constitution",
+            label="Constitution", properties={},
+        ))
+        await storage.graph.add_edge(
+            source_id=agent_id, target_id="constitution:test", label="governed_by",
+        )
+        await storage.add_conversation(role="user", content="hi", session_id="s1")
+
+        checklist = await graduate_service.validate_agent(storage, agent_id)
+        backup_check = next(
+            c for c in checklist.checks if c["name"] == "Has sovereignty backup"
+        )
+        assert backup_check["passed"] is False
+        assert "no backup_artifact nodes" in backup_check["details"]
+        assert "no sync manifests on disk" in backup_check["details"]
+    finally:
+        await storage.close()
 
 
 @pytest.mark.asyncio

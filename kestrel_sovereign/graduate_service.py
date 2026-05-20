@@ -92,6 +92,29 @@ class ValidationChecklist:
         print("=" * 60)
 
 
+def _resolve_did(agent_node) -> str:
+    """Return the agent's DID, or an empty string if the node does not
+    actually carry one.
+
+    Canonical layout: the agent's ``node_id`` *is* the DID
+    (kestrel_agent.py:530 uses ``AsyncStorage(path, agent_id=self.did)`` and
+    inception writes the agent graph node with ``node_id=did``). Some agents
+    additionally carry a ``properties['did']`` field; prefer that when set,
+    otherwise fall back to ``node_id``. The validator originally only
+    consulted ``properties['did']`` and so failed three gates on Emma's live
+    DB even though her DID is right there on the node_id.
+
+    The fallback is gated on ``node_id`` actually looking like a DID
+    (``"did:"`` prefix) — otherwise a legacy non-DID node_id such as
+    ``"agent:test-emma"`` would be treated as a DID, allowing the on-disk and
+    tenant-scoped gates to be satisfied by arbitrary files / rows named after
+    that non-DID ID. Better to fail the gate honestly than launder a non-DID
+    through it. Codex caught this on PR #1325 review round 2.
+    """
+    candidate = agent_node.properties.get("did") or agent_node.node_id or ""
+    return candidate if candidate.startswith("did:") else ""
+
+
 async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist:
     """Run validation checks on the agent."""
     checklist = ValidationChecklist()
@@ -110,6 +133,8 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         return checklist
 
     checklist.add_check("Is test instance", True)
+
+    did = _resolve_did(agent_node)
 
     # 2. Constitution anchored — agent has an outgoing 'governed_by' edge
     out_edges = await storage.graph.get_edges(agent_id, direction="out")
@@ -130,7 +155,6 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
     # filtered by the agent's DID — that's the tenant the agent uses at boot
     # (kestrel_agent.py:530 instantiates ``AsyncStorage(path, agent_id=self.did)``).
     try:
-        did = agent_node.properties.get("did", "")
         row = await storage.db.fetchone(
             "SELECT COUNT(*) FROM conversation_history "
             "WHERE agent_id = ? AND deleted_at IS NULL",
@@ -147,7 +171,6 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         checklist.add_check("Has conversation history", False, f"Error: {e}")
 
     # 4. DID document exists on disk
-    did = agent_node.properties.get("did", "")
     address = did.split(":")[-1] if did else None
     db_path = Path(storage.db_path)
     if address:
@@ -162,7 +185,7 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
         checklist.add_check(
             "DID document exists",
             False,
-            "Could not parse DID" if did else "No DID in agent properties"
+            "Could not parse DID from agent node",
         )
 
     # 5. Encrypted key file exists on disk
@@ -177,14 +200,41 @@ async def validate_agent(storage: Storage, agent_id: str) -> ValidationChecklist
     else:
         checklist.add_check("Encrypted key file exists", False, "No DID address available")
 
-    # 6. Sovereignty backup exists in graph
+    # 6. Sovereignty backup exists — accept either surface:
+    #    (a) backup_artifact graph nodes (discrete sovereignty exports via
+    #        SovereigntyFeature -> record_backup_artifact), OR
+    #    (b) on-disk storage-sync manifests written by the sync targets
+    #        (continuous mirroring). Each sync target writes a manifest named
+    #        after itself; enumerate every target that can be configured so
+    #        sovereign-IPFS-only agents aren't blocked just because they don't
+    #        also run GCS / Lighthouse. Sources:
+    #        - storage/sync/gcs_target.py            -> .gcs_manifest_<did>.json
+    #        - storage/sync/lighthouse_target.py     -> .lighthouse_manifest_<did>.json
+    #        - storage/sync/sovereign_ipfs_target.py -> .sovereign_ipfs_manifest_<did>.json
+    # Both prove "the agent's sovereign state is recoverable". The validator
+    # originally required (a) only — Emma's live DB has 5 months of continuous
+    # mirroring via (b) but zero discrete exports, so the strict graph-only
+    # check blocked an agent whose sovereignty was demonstrably backed up.
     backup_nodes = await storage.graph.get_nodes_by_type("backup_artifact")
-    has_backup = len(backup_nodes) > 0
-    checklist.add_check(
-        "Has sovereignty backup",
-        has_backup,
-        f"{len(backup_nodes)} backup(s)" if has_backup else "No backups found"
-    )
+    manifest_filenames = [
+        f".gcs_manifest_{did}.json",
+        f".lighthouse_manifest_{did}.json",
+        f".sovereign_ipfs_manifest_{did}.json",
+    ]
+    manifests_present = [
+        n for n in manifest_filenames if (db_path.parent / n).exists()
+    ]
+    has_backup = bool(backup_nodes) or bool(manifests_present)
+    if has_backup:
+        parts = []
+        if backup_nodes:
+            parts.append(f"{len(backup_nodes)} backup_artifact node(s)")
+        if manifests_present:
+            parts.append(f"sync manifest(s): {', '.join(manifests_present)}")
+        details = "; ".join(parts)
+    else:
+        details = "no backup_artifact nodes; no sync manifests on disk"
+    checklist.add_check("Has sovereignty backup", has_backup, details)
 
     # 7. Knowledge graph populated — at least agent + 2 other nodes (any type)
     total_row = await storage.db.fetchone("SELECT COUNT(*) FROM graph_nodes")
@@ -306,7 +356,7 @@ async def graduate_agent(
         print(f"""
 Date: {now_iso}
 Agent: {agent_name}
-DID: {agent_node.properties.get('did', 'N/A')}
+DID: {_resolve_did(agent_node)}
 Previous Status: Test Instance
 New Status: Permanent Agent
 
