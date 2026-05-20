@@ -305,12 +305,17 @@ class TestNellieFailureModes:
         env.pop("ANTHROPIC_API_KEY", None)
         with patch.dict("os.environ", env, clear=True):
             registry = ProviderRegistry(config)
-            # ``ProviderInitializationError`` only fires when EVERY route
-            # fails — when entry-point plugins (kimi/xai/deepseek) are
-            # installed they register successfully and the registry no
-            # longer raises. The invariant we actually care about is that
-            # anthropic:plan itself is absent without credentials.
-            providers = registry.initialize_providers()
+            # ``ProviderInitializationError`` fires when EVERY route fails.
+            # In environments with entry-point plugins (kimi/xai/deepseek)
+            # other routes register and ``initialize_providers`` returns
+            # without anthropic:plan in the list; in clean CI environments
+            # only anthropic:plan is configured, so the registry raises.
+            # Either outcome satisfies the invariant: the route is unusable
+            # without credentials.
+            try:
+                providers = registry.initialize_providers()
+            except ProviderInitializationError:
+                providers = []
         assert not any(p.name == "anthropic:plan" for p in providers)
 
 
