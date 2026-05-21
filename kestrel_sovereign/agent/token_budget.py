@@ -557,6 +557,11 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
         small constitutions; the floor is still a guarantee, not a
         consumption record).
 
+        ``allocation.budget`` is **not** mutated by this call — the
+        original adaptive allocation stays visible in the summary so
+        operators can see what was planned vs what was spent
+        (``used``) vs what was redistributed (``elastic_pool_remaining``).
+
         Returns the number of tokens released into the pool.
         """
         if source not in self.allocations:
@@ -572,9 +577,6 @@ class ElasticTokenBudget(AdaptiveTokenBudget):
         slack = max(0, allocation.budget - protected)
         if slack > 0:
             self._elastic_pool += slack
-            # Lower the section's budget so the breakdown reports the
-            # post-finalization figure accurately.
-            allocation.budget = protected
             logger.debug(
                 f"{source} released {slack} tokens into elastic pool "
                 f"(pool now {self._elastic_pool})"
