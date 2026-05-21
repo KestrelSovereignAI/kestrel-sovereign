@@ -1,5 +1,6 @@
 """Regression coverage for premature turn-yield repair (#1237)."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -26,6 +27,47 @@ def _bind_turn_completion_helpers(agent):
     )
     agent._signals_unfinished_tool_work = OrchestratorEngineMixin._signals_unfinished_tool_work
     agent._append_missing_tool_call_repair = OrchestratorEngineMixin._append_missing_tool_call_repair
+
+
+def test_assistant_tool_history_preserves_provider_reasoning_from_raw_dict():
+    agent = MagicMock()
+    agent._build_tool_calls_msg = OrchestratorEngineMixin._build_tool_calls_msg
+    agent._extract_response_reasoning_content = (
+        OrchestratorEngineMixin._extract_response_reasoning_content
+    )
+    agent._build_assistant_tool_history_msg = (
+        OrchestratorEngineMixin._build_assistant_tool_history_msg.__get__(agent)
+    )
+
+    msg = agent._build_assistant_tool_history_msg(
+        LLMResponse(
+            content=None,
+            tool_calls=[ToolCall(id="call_1", name="lookup", arguments={"q": "hi"})],
+            raw={"reasoning_content": "I need to call lookup."},
+        )
+    )
+
+    assert msg["reasoning_content"] == "I need to call lookup."
+    assert msg["tool_calls"][0]["function"]["arguments"] == {"q": "hi"}
+
+
+def test_assistant_tool_history_preserves_provider_reasoning_from_openai_response():
+    raw = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(reasoning_content="Use the tool.")
+            )
+        ]
+    )
+
+    response = LLMResponse(
+        tool_calls=[ToolCall(id="call_1", name="lookup", arguments={})],
+        raw=raw,
+    )
+
+    reasoning = OrchestratorEngineMixin._extract_response_reasoning_content(response)
+
+    assert reasoning == "Use the tool."
 
 
 @pytest.mark.asyncio
