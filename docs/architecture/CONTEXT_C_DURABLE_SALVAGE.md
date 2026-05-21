@@ -7,17 +7,22 @@
 > model's view either survives as a durable summary or as a lossless
 > pointer to where the original lives, and the operator can tell which.
 
-> **Status (2026-05-21):** Design doc, pending review by Emma. No
-> code in this branch — this is the reviewable surface for the C
-> ticket of epic [#1307](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1307).
-> The A/B/D first-track is merged ([#1339](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1339),
+> **Status (2026-05-21, rev. after Emma's review):** Design doc,
+> conditionally signed off by Emma on 2026-05-21 — all five open
+> questions acked with the recommended answers, plus two refinements
+> folded in below (sync-write durability boundary; SignalDispatcher
+> back-pressure). No code in this branch — reviewable surface for
+> the C ticket of epic
+> [#1307](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1307).
+> The A/B/D first-track is merged
+> ([#1339](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1339),
 > [#1341](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1341),
 > [#1343](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1343));
 > the popup is unconditionally surfacing
 > `silently-pruned path still active` because C has not shipped.
-> **Implementation is a separate sub-ticket** filed after this design
-> is acked. Every claim about current behavior cites a source file
-> and line.
+> **Implementation is a separate sub-ticket** filed after Emma
+> re-acks the folded revisions. Every claim about current behavior
+> cites a source file and line.
 
 ---
 
@@ -330,12 +335,22 @@ After C lands, those clusters can include `excluded_from_context`
 rows because the originals are still in the table. To prevent double
 summarising, the consolidator:
 
-1. Skips spans where every member row has `summarized_into` set —
-   the salvage's summary already encodes the narrative.
+1. Skips spans where every member row has `summarized_into` set
+   **and the linked salvage is `durable-folded`** — the salvage's
+   summary already encodes the narrative.
 2. May *use* the salvage summary as input to episode generation
    (episodes are emotional narratives; salvages are factual prose;
    the episode generator can quote the salvage summary when the
    underlying span lacks emotional weight on its own).
+3. **Pending-state idempotency** (Emma 2026-05-21 refinement): when
+   the linked salvage is still `pointer-only` or `pending-summary`,
+   the consolidator must NOT fabricate an episode from the raw rows
+   that are about to be folded — that would race the summariser and
+   create two parallel records of the same span. The consolidator
+   either waits (deferring the episode candidate to its next pass)
+   or treats the span as a pointer-only marker and skips episode
+   creation for it until the salvage settles into `durable-folded`
+   or `failed-fold`.
 
 Concretely: episodes look for emotion; salvages capture everything
 else. They are additive, not competing. The doc's "Memories —
@@ -390,21 +405,37 @@ D / #1310 shipped badge slots ready for these states ([chat.js
 |---|---|---|
 | (no salvages this session) | — | n/a |
 | `pointer-only` | `pointer-only salvage` (cyan) | `breakdown.sections.history.salvages[].pointer_only_count` |
+| `pointer-only` (back-pressure terminal) | `pointer-only — summary delayed` (cyan with note) | …`pointer_only_terminal_count` |
 | `pending-summary` | `pending fold` (orange) | …`pending_count` |
 | `durable-folded` | `folded` (green) | …`folded_count` |
 | `failed-fold` | `failed fold — restore via !context restore` (red) | …`failed_count` |
 
-`silently_pruned_path_active` flips to `False` in the endpoint
-([`endpoints/agent.py:get_context_status`](kestrel_sovereign/endpoints/agent.py))
-the day C ships — the auto-detect invariant Emma added in her ack
-becomes "fact: no longer active" rather than the current
-"fact: still active."
+`silently_pruned_path_active` is the release-gate flag (Emma
+2026-05-21 refinement): the C implementation ships behind a feature
+flag, and **the flag flips to `False` only when the full sync-salvage
++ async-worker + popup-wiring path is live end-to-end**. The release
+gate from epic #1307 keys off this flag, not off ticket closure — so
+a partially-deployed C never silently claims correctness it does not
+have.
 
 The popup's "Save older turns into a durable note (!compress)"
 button label changes to **"Compress now (synchronous)"** since the
 default async salvage already runs — the button is for operators
 who want the summary text immediately rather than after the worker
 catches up.
+
+### Pre-C boundary surfacing
+
+For Option 1 (no backfill — pre-C silent-pruned spans remain
+unsalvaged), the popup must make the boundary legible (Emma
+2026-05-21 refinement on question (a)). The
+`breakdown.sections.history.salvages` block gains a
+`pre_c_boundary_at` ISO-8601 timestamp recording the earliest
+`salvaged_at` for this session. The popup surfaces a note:
+*"Salvage history begins {pre_c_boundary_at}. Older silently-pruned
+spans are reachable via `!context restore` with `include_excluded=True`
+but were not salvaged at prune time."* This is honest about what the
+operator can and cannot expect of the audit trail.
 
 ---
 
@@ -429,6 +460,96 @@ Async summarization is bounded by the dispatcher's per-handler
 concurrency and rate-limits. The worker is non-blocking on the user;
 worst case the popup shows `pending fold` until summarization
 catches up.
+
+### Durability boundary — what counts as "sync write succeeded"
+
+Emma's 2026-05-21 refinement: implementers must not pick the easier
+interpretation of "sync." The fail-closed contract is **the
+exclusion update committed to a database transaction**, with the
+salvage marker insert and the originals' metadata update applied
+atomically. The dispatcher enqueue is **best-effort** and not part
+of the fail-closed gate.
+
+Concretely, the sync block is:
+
+```python
+async with conv_store.db.transaction() as tx:
+    salvage_id = await tx.insert_conversation_row(
+        role="system", content="", metadata={..., "salvage_state": "pointer-only"}
+    )
+    await tx.update_messages_metadata(
+        message_ids=original_message_ids,
+        patch={
+            "excluded_from_context": True,
+            "excluded_at": now,
+            "excluded_reason": f"salvage:{salvage_reason}",
+            "summarized_into": str(salvage_id),
+        },
+    )
+# transaction committed → sync gate passes; the bytes are durably
+# accounted for. The LLM call may now proceed.
+
+try:
+    await dispatcher.enqueue_signal(
+        Signal(type="SALVAGE_SUMMARIZE", payload={"salvage_id": salvage_id, ...})
+    )
+except Exception as e:
+    logger.warning("salvage %s enqueued offline — worker will pick up on next scan: %s", salvage_id, e)
+    # Span stays in pointer-only forever from this code path's view,
+    # but a janitor task (see below) will retry the enqueue.
+```
+
+The transaction commit is the sync gate. If `INSERT` or `UPDATE`
+raises, the transaction rolls back and the LLM call fails closed
+with a `ContextResult.warnings` entry and `degraded_mode=True`
+(reusing the path B added). If the dispatcher enqueue raises after
+the transaction commits, the salvage row exists and is durable; the
+async path simply hasn't started yet. A periodic janitor task scans
+for `salvage_state == "pointer-only"` rows older than N minutes and
+re-enqueues them, so a dispatcher outage doesn't permanently leave
+salvages unsummarized.
+
+This split — durability gate on the transaction, best-effort on the
+enqueue — lets the hot turn path keep a tight latency budget (the
+dispatcher's enqueue cost is not on the critical path) while
+preserving the invariant: once the LLM call proceeds, the bytes
+are accounted for.
+
+### Back-pressure under summariser load
+
+When the async worker drains slower than salvages accumulate (LLM
+provider rate-limits, big-burst conversations, model-switch to a
+slow local model), pending-summary count climbs. The design's
+posture, agreed with Emma:
+
+1. **New prunes always sync-salvage.** Back-pressure never affects
+   the model-visible-byte invariant. The salvage transaction runs
+   regardless of dispatcher state.
+
+2. **At a queue-depth threshold, new salvages skip the async
+   enqueue** and stay terminal in `pointer-only` until the worker
+   catches up. The janitor task drains pointer-only-terminal rows
+   when capacity returns. Threshold default: configurable per agent
+   in `multi_agent.toml` (proposed default: 50 pending salvages per
+   session). When the threshold is exceeded, the salvage marker is
+   tagged `pointer_only_terminal: True` so the popup can label it
+   distinctly from "queued but not yet started."
+
+3. **Operator-visible "summariser falling behind" warning** in D's
+   popup. When `breakdown.history.salvages.pending_count` exceeds a
+   configurable warn-threshold (proposed default: 10), the popup
+   surfaces an orange banner: *"Summary worker is falling behind —
+   N spans waiting; older ones will surface in the popup as
+   pointer-only-terminal. Salvage is still durable; only the
+   summary is delayed."*
+
+4. The `silently_pruned_path_active` release-gate flag stays `False`
+   throughout — back-pressure does not regress the invariant, it
+   only delays the summary text.
+
+Concrete follow-up: the threshold values and the warn-banner copy
+need an ops review once C ships; tracked as a non-blocking
+sub-issue at implementation time.
 
 ---
 
@@ -529,32 +650,39 @@ false in production, the C release gate from epic #1307 has lifted.
 
 ---
 
-## Open questions for Emma
+## Review record
 
-1. **Backfill default**: Option 1 (no backfill, only new prunes
-   salvaged) or Option 2 (one-shot backfill on first post-C turn per
-   session)? Recommended Option 1; ack or override.
-2. **!compress default mode**: post-C should `!compress` default to
-   async (`pending-summary`, queued) or sync (LLM round-trip on the
-   operator's turn)? Async preserves the same hot-path budget as the
-   prune-driven salvage; sync gives the operator immediate visibility
-   of the summary text. Recommended async-by-default with explicit
-   `--sync` opt-in; ack or override.
-3. **Failed-fold UX**: when a span exhausts summarization retries,
-   should the popup nudge the operator to run `!context restore`
-   automatically, or just label the failure and let the operator
-   decide? Recommended label-only — operator agency over their
-   context window. Ack or override.
-4. **Episode-as-input vs episode-skip**: when an emotionally-significant
-   cluster overlaps a salvage span, should the episode generator
-   consume the salvage summary as input (one consolidated narrative)
-   or skip the span entirely (two parallel records)? Either works;
-   the design assumes the former. Ack or override.
-5. **Sub-ticket scope**: should the C implementation be one ticket or
-   split into "sync salvage record + prune wiring" / "async worker +
-   summarization" / "popup wiring + auto-detect flip"? Recommended
-   one ticket because the invariant only holds end-to-end. Ack or
-   override.
+**Emma — 2026-05-21 (kestrel-sovereign session
+`context-system-epic-review-20260520`):** Conditional sign-off on
+the design's five open questions, with the recommended answers, plus
+two refinements folded into the sections above.
+
+| # | Question | Resolution |
+|---|---|---|
+| (a) | Pre-C backfill | **Option 1 — no backfill.** Pre-C boundary surfaced in the popup so operators can see where salvage history begins. Folded into [UI surfacing](#ui-surfacing). |
+| (b) | `!compress` default mode post-C | **Async by default, `--sync` opt-in.** Help text + popup tooltip updated to reflect the default change. Folded into [Interaction with `!compress`](#interaction-with-compress). |
+| (c) | Failed-fold UX | **Label-only, no auto-nudge.** Hover links to `!context restore` docs. Operator agency. |
+| (d) | Episode-vs-salvage overlap | **Episode-as-input.** Plus an idempotency rule: when the linked salvage is still `pointer-only` / `pending-summary`, the consolidator defers or skips that span until it settles. Folded into [Interaction with episodes](#interaction-with-episodes). |
+| (e) | Sub-ticket scope | **One ticket end-to-end, feature-flagged.** The release-gate flag (`silently_pruned_path_active`) flips to `False` only when the full path is live — closure of the impl ticket alone is insufficient. Folded into [UI surfacing](#ui-surfacing). |
+
+**Two refinements Emma added in her ack — folded in:**
+
+- **Sync-write durability boundary** ([Performance budget](#performance-budget)
+  → *Durability boundary — what counts as "sync write succeeded"*).
+  The fail-closed gate is the **transaction commit** covering the
+  salvage INSERT + the originals UPDATE. The dispatcher enqueue is
+  best-effort; a janitor task drains pointer-only rows when the
+  dispatcher was unreachable.
+- **SignalDispatcher back-pressure story** ([Performance budget](#performance-budget)
+  → *Back-pressure under summariser load*). New prunes always
+  sync-salvage; at queue-depth threshold new salvages skip the async
+  enqueue and stay terminal in `pointer-only` until the worker
+  catches up; popup surfaces an operator-visible "summariser falling
+  behind" warning when pending count exceeds a warn-threshold.
+
+**Pending:** Emma's re-ack that the folded text matches her intent.
+Once acknowledged, the C implementation sub-ticket is filed against
+this PR.
 
 ---
 
