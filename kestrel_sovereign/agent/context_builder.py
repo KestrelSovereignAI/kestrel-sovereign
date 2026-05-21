@@ -11,14 +11,62 @@ This module handles the assembly of context for LLM prompts, including:
 - Episode integration for long conversations
 """
 
+import json
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import List, Dict, Optional, Any, TYPE_CHECKING
+from typing import Awaitable, Callable, List, Dict, Optional, Any, Tuple, TYPE_CHECKING
 
 from .token_counter import TokenCounter, get_token_counter
-from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget
+from .token_budget import TokenBudget, AdaptiveTokenBudget, create_budget, RESPONSE_RESERVE
 from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+
+# Per-message overhead used by format_conversation_history and the
+# effective-history estimator. Centralised here so the measurement path
+# stays in lock-step with the LLM call path.
+_MESSAGE_OVERHEAD = 4
+
+# Conversation length at which the production LLM path
+# (``ContextManager.build_context``) starts admitting episode summaries
+# into the prompt. Pinned to the same value as
+# ``ContextManager.EPISODE_THRESHOLD_MESSAGES`` so the measurement path
+# cannot drift below that boundary. Codex round 1 #2 (PR #1308) caught
+# this drift — measurement was using 10, production was using 20, so the
+# popup over-attributed episode tokens for 10-19 message conversations.
+EPISODE_THRESHOLD_MESSAGES = 20
+
+
+def _count_tool_schema_tokens(
+    counter: TokenCounter,
+    tools: Optional[List[Dict[str, Any]]],
+) -> int:
+    """Estimate tokens for an LLM-bound tool schema list.
+
+    Tool definitions are sent alongside ``messages`` on every turn but
+    are not counted anywhere in the legacy budget machinery. We serialise
+    each schema the way an HTTP payload would (compact JSON with sorted
+    keys for stability) and count the resulting string. This is an
+    estimate — provider tokenisation of tool calls is opaque — but it is
+    materially closer to the real wire cost than the previous ``0``.
+
+    Args:
+        counter: Token counter for the active model.
+        tools: Tool schema dicts (OpenAI function-calling shape); may
+            be ``None`` or empty.
+
+    Returns:
+        Total estimated tokens for the serialised tool list. ``0`` when
+        ``tools`` is falsy.
+    """
+    if not tools:
+        return 0
+    try:
+        payload = json.dumps(tools, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as e:
+        logger.warning(f"tool-schema serialisation failed during measurement: {e}")
+        return 0
+    return counter.count(payload)
 
 
 def extract_raw_user_content(content: str) -> str:
@@ -461,11 +509,10 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         )
 
         # Count using the same formula format_conversation_history uses internally:
-        # content tokens + MESSAGE_OVERHEAD per message. This keeps the estimate
+        # content tokens + _MESSAGE_OVERHEAD per message. This keeps the estimate
         # consistent with the limit format_conversation_history honored.
-        MESSAGE_OVERHEAD = 4
         effective = sum(
-            counter.count(m.get('content', '') or '') + MESSAGE_OVERHEAD
+            counter.count(m.get('content', '') or '') + _MESSAGE_OVERHEAD
             for m in formatted
         )
         raw = sum(counter.count(m.get('content', '') or '') for m in history)
@@ -478,6 +525,136 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             'messages_kept': len(formatted),
             'messages_total': len(history),
         }
+
+    def _collect_system_prompt_parts(
+        self,
+        constitution: str,
+        include_briefing: bool = True,
+        additional_context: Optional[str] = None,
+        prompt_adaptation: Optional['PromptAdaptation'] = None,
+        state_of_mind: Optional['StateOfMind'] = None,
+        system_prompt_addendum: Optional[str] = None,
+    ) -> List[Tuple[str, List[str]]]:
+        """Collect named groups of system-prompt parts.
+
+        Single source of truth for *what* the system prompt contains.
+        ``build_system_prompt`` joins these with ``"\\n\\n"`` to produce
+        the final string; ``measure_context_breakdown`` counts each
+        group to attribute tokens to subsections without drifting from
+        what the LLM actually receives.
+
+        Returns ``[(group_name, parts), ...]`` in the same order
+        ``build_system_prompt`` would emit them. Empty groups are
+        omitted. Byte-for-byte equivalent to the previous in-line
+        construction (see ``project_anthropic_cache_markers`` —
+        prompt-cache prefixes are position-indexed and must not shift).
+        """
+        groups: List[Tuple[str, List[str]]] = []
+
+        # Bootstrap files — emit one group per file in iteration order
+        # so the assembled bytes remain identical to the legacy
+        # ``build_system_prompt`` (AGENTS.md before SOUL.md before
+        # USER.md, etc. — see ``test_bootstrap_files.test_multiple_files_ordering``).
+        # SOUL.md gets the special "YOUR IDENTITY" wrapper and the
+        # subsection name ``soul``; other files use filename-based
+        # wrappers and ``bootstrap_<lowercase-stem>`` subsection names.
+        # HEARTBEAT.md is intentionally skipped (heartbeat runner owns it).
+        for filename, content in self._bootstrap_files.items():
+            if filename == "HEARTBEAT.md":
+                continue
+            if filename == "SOUL.md":
+                groups.append(
+                    (
+                        "soul",
+                        ["--- YOUR IDENTITY ---", content, "--- END IDENTITY ---"],
+                    )
+                )
+            else:
+                label = filename.replace(".md", "").upper()
+                subsection = f"bootstrap_{filename.replace('.md', '').lower()}"
+                groups.append(
+                    (
+                        subsection,
+                        [f"--- {label} ---", content, f"--- END {label} ---"],
+                    )
+                )
+
+        if include_briefing:
+            briefing = self.get_session_briefing()
+            if briefing:
+                groups.append(("session_briefing", [briefing]))
+
+        if prompt_adaptation and prompt_adaptation.preamble:
+            groups.append(
+                ("prompt_adaptation", [prompt_adaptation.preamble.strip()])
+            )
+
+        groups.append(
+            (
+                "constitution",
+                [
+                    "--- GOVERNING CONSTITUTION ---",
+                    constitution,
+                    "--- END CONSTITUTION ---",
+                ],
+            )
+        )
+
+        if state_of_mind:
+            som_inner: List[str] = ["--- STATE OF MIND ---"]
+            som_inner.append(
+                f"Governance Mode: {state_of_mind.governance_mode.upper()}"
+            )
+            if state_of_mind.active_conflicts:
+                som_inner.append("\nActive Constitutional Conflicts:")
+                for conflict in state_of_mind.active_conflicts:
+                    principle = conflict.get("principle", "unknown")
+                    description = conflict.get("description", "")
+                    som_inner.append(f"  - {principle}: {description}")
+            if state_of_mind.delegated_principles:
+                som_inner.append("\nDelegated to Model (natively satisfied):")
+                for principle in state_of_mind.delegated_principles:
+                    som_inner.append(f"  - {principle}")
+            som_inner.append("--- END STATE OF MIND ---")
+            # Legacy shape: the inner block is joined with "\n", then the
+            # outer build_system_prompt appends a redundant
+            # ``"--- END STATE OF MIND ---"`` separator as its own part.
+            # Preserved byte-for-byte (#1308 round 2).
+            groups.append(
+                (
+                    "state_of_mind",
+                    ["\n".join(som_inner), "--- END STATE OF MIND ---"],
+                )
+            )
+
+        if self._bootstrap_files.get("SOUL.md"):
+            groups.append(
+                (
+                    "style_reminder",
+                    [
+                        "\n--- STYLE REMINDER (IMPORTANT) ---",
+                        "When answering personal questions, respond naturally in paragraphs. DO NOT use numbered lists or bullet points. Talk like a person, not a document.",
+                        "--- END REMINDER ---",
+                    ],
+                )
+            )
+
+        if additional_context:
+            groups.append(
+                (
+                    "additional_context",
+                    [
+                        "\n--- ADDITIONAL CONTEXT ---",
+                        additional_context,
+                        "--- END CONTEXT ---",
+                    ],
+                )
+            )
+
+        if system_prompt_addendum:
+            groups.append(("system_prompt_addendum", [system_prompt_addendum]))
+
+        return groups
 
     def build_system_prompt(
         self,
@@ -514,75 +691,20 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         Returns:
             Complete system prompt string
         """
-        parts = []
-
-        # Bootstrap files — injected into system prompt in order.
-        # SOUL.md gets special "YOUR IDENTITY" wrapper; others use filename-based wrappers.
-        # AGENTS.md goes first (if present), then SOUL.md, then the rest.
-        for filename, content in self._bootstrap_files.items():
-            if filename == "SOUL.md":
-                parts.append("--- YOUR IDENTITY ---")
-                parts.append(content)
-                parts.append("--- END IDENTITY ---")
-            elif filename == "HEARTBEAT.md":
-                # HEARTBEAT.md is loaded by the heartbeat runner separately;
-                # skip it in the normal system prompt to avoid duplication.
-                continue
-            else:
-                label = filename.replace(".md", "").upper()
-                parts.append(f"--- {label} ---")
-                parts.append(content)
-                parts.append(f"--- END {label} ---")
-
-        if include_briefing:
-            parts.append(self.get_session_briefing())
-
-        # Add constitutional preamble if provided
-        if prompt_adaptation and prompt_adaptation.preamble:
-            parts.append(prompt_adaptation.preamble.strip())
-
-        parts.append("--- GOVERNING CONSTITUTION ---")
-        parts.append(constitution)
-        parts.append("--- END CONSTITUTION ---")
-
-        # Add state of mind section if available
-        if state_of_mind:
-            state_parts = []
-            state_parts.append("--- STATE OF MIND ---")
-            state_parts.append(f"Governance Mode: {state_of_mind.governance_mode.upper()}")
-            if state_of_mind.active_conflicts:
-                state_parts.append("\nActive Constitutional Conflicts:")
-                for conflict in state_of_mind.active_conflicts:
-                    principle = conflict.get("principle", "unknown")
-                    description = conflict.get("description", "")
-                    state_parts.append(f"  - {principle}: {description}")
-            if state_of_mind.delegated_principles:
-                state_parts.append("\nDelegated to Model (natively satisfied):")
-                for principle in state_of_mind.delegated_principles:
-                    state_parts.append(f"  - {principle}")
-            parts.append("\n".join(state_parts))
-            parts.append("--- END STATE OF MIND ---")
-
-        # Add style reminder at the end (models pay more attention to end of context)
-        if self._bootstrap_files.get("SOUL.md"):
-            parts.append("\n--- STYLE REMINDER (IMPORTANT) ---")
-            parts.append("When answering personal questions, respond naturally in paragraphs. DO NOT use numbered lists or bullet points. Talk like a person, not a document.")
-            parts.append("--- END REMINDER ---")
-
-        if additional_context:
-            parts.append("\n--- ADDITIONAL CONTEXT ---")
-            parts.append(additional_context)
-            parts.append("--- END CONTEXT ---")
-
-        # Per-turn addendum (e.g. constitutional echo-canary directive
-        # from the SignalDispatcher). Appended last so the cache-stable
-        # prefix above is unchanged when no addendum is supplied —
-        # legacy callers passing system_prompt_addendum=None get
-        # byte-identical output to the previous version of this method.
-        if system_prompt_addendum:
-            parts.append(system_prompt_addendum)
-
-        return "\n\n".join(parts)
+        # Single source of truth: collect named groups, then join. Both
+        # this method and ``measure_context_breakdown`` read from
+        # ``_collect_system_prompt_parts`` so per-subsection attribution
+        # cannot drift from the assembled bytes.
+        groups = self._collect_system_prompt_parts(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            additional_context=additional_context,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=system_prompt_addendum,
+        )
+        flat_parts: List[str] = [p for _, parts in groups for p in parts]
+        return "\n\n".join(flat_parts)
 
     def build_system_prompt_with_tracking(
         self,
@@ -706,6 +828,67 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             logger.error(f"Error retrieving RAG context: {e}")
             return None
 
+    async def get_episodes_for_context(
+        self,
+        max_tokens: int = 2000,
+        max_episodes: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return the raw episode list the context builder would use.
+
+        Exposed separately from ``get_episode_context`` so callers that
+        need an accurate episode count can use ``len(episodes)`` instead
+        of the legacy ``"**".count() // 2`` heuristic (see
+        ``measure_context_breakdown`` and ``ContextManager.build_context``).
+
+        Args:
+            max_tokens: Token budget for episode content
+            max_episodes: Maximum episodes to include
+
+        Returns:
+            List of episode dicts (possibly empty); never None. Returns
+            an empty list when no consolidator is configured or the
+            consolidator raises — errors are logged.
+        """
+        if not self.consolidator:
+            return []
+        try:
+            episodes = await self.consolidator.get_recent_episodes_for_context(
+                max_tokens=max_tokens,
+                max_episodes=max_episodes,
+            )
+            return list(episodes) if episodes else []
+        except Exception as e:
+            logger.error(f"Error retrieving episode list: {e}")
+            return []
+
+    @staticmethod
+    def format_episodes_for_context(episodes: List[Dict[str, Any]]) -> Optional[str]:
+        """Format a raw episode list into the in-prompt episode block.
+
+        Pure helper — no I/O, no side effects. The output is
+        byte-identical to the previous in-line formatter inside
+        ``get_episode_context`` so prompt-cache prefixes stay stable
+        (see ``project_anthropic_cache_markers`` in agent memory).
+
+        Args:
+            episodes: List of episode dicts as returned by
+                ``get_episodes_for_context``.
+
+        Returns:
+            Formatted block, or ``None`` when ``episodes`` is empty.
+        """
+        if not episodes:
+            return None
+        parts = ["--- CONVERSATION EPISODES (Narrative Summaries) ---"]
+        for ep in episodes:
+            parts.append(
+                f"\n**{ep['title']}** ({ep['timespan']})\n"
+                f"{ep['summary']}\n"
+                f"Emotional arc: {ep['emotional_arc']}"
+            )
+        parts.append("\n--- END EPISODES ---")
+        return "\n".join(parts)
+
     async def get_episode_context(
         self,
         max_tokens: int = 2000,
@@ -725,32 +908,10 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         Returns:
             Formatted episode context string or None if no episodes
         """
-        if not self.consolidator:
-            return None
-
-        try:
-            episodes = await self.consolidator.get_recent_episodes_for_context(
-                max_tokens=max_tokens,
-                max_episodes=max_episodes
-            )
-
-            if not episodes:
-                return None
-
-            parts = ["--- CONVERSATION EPISODES (Narrative Summaries) ---"]
-            for ep in episodes:
-                parts.append(
-                    f"\n**{ep['title']}** ({ep['timespan']})\n"
-                    f"{ep['summary']}\n"
-                    f"Emotional arc: {ep['emotional_arc']}"
-                )
-            parts.append("\n--- END EPISODES ---")
-
-            return "\n".join(parts)
-
-        except Exception as e:
-            logger.error(f"Error retrieving episode context: {e}")
-            return None
+        episodes = await self.get_episodes_for_context(
+            max_tokens=max_tokens, max_episodes=max_episodes
+        )
+        return self.format_episodes_for_context(episodes)
 
     async def build_full_context(
         self,
@@ -766,6 +927,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         Assembles all context sources (system prompt, history, episodes,
         RAG) within the model's token budget using adaptive allocation.
 
+        Delegates to ``measure_context_breakdown`` so the assembled
+        bytes and the per-section measurement come from a single source
+        and **cannot drift** (#1308 / PR #1306). RAG is now wrapped in
+        the same ``<retrieved_context><documents>…</documents></retrieved_context>``
+        envelope ``ContextManager.build_context`` uses, replacing the
+        legacy ``--- RELEVANT DOCUMENTS ---`` markers — the per-section
+        token count was previously off-by-wrapper from production.
+
         COUNCIL CONDITION: Wellness metrics are telemetry-only.
         Do NOT add wellness data to any part of the context.
         Wellness is accessible to the agent via tool calls only.
@@ -776,63 +945,412 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             history: Conversation history
             constitution: Constitution text
             include_briefing: Include session briefing
-            message_count: Total messages in conversation (for adaptive budget)
+            message_count: Total messages in conversation (for adaptive
+                budget and episode gating; the episode threshold is the
+                production ``EPISODE_THRESHOLD_MESSAGES``).
 
         Returns:
-            Dict with 'system_prompt', 'messages', 'budget_summary'
+            Dict with 'system_prompt', 'messages', 'budget_summary'.
         """
-        # Create adaptive budget based on conversation length
-        budget = create_budget(self.model, message_count, adaptive=True)
-
-        # 1. Build system prompt (uses 'system' allocation)
-        system_prompt = self.build_system_prompt(
-            constitution=constitution,
-            include_briefing=include_briefing
-        )
-        system_tokens = self.counter.count(system_prompt)
-        budget.use("system", system_tokens)
-
-        # 2. Get episodes for long conversations (uses 'episodes' allocation)
-        episode_context = None
-        if message_count >= 10 and self.consolidator:
-            episode_context = await self.get_episode_context(
-                max_tokens=budget.episodes,
-                max_episodes=5
-            )
-            if episode_context:
-                episode_tokens = self.counter.count(episode_context)
-                budget.use("episodes", episode_tokens)
-                # Append episodes to system prompt
-                system_prompt = f"{system_prompt}\n\n{episode_context}"
-
-        # 3. Format conversation history (uses 'history' allocation)
-        formatted_history = self.format_conversation_history(
+        breakdown = await self.measure_context_breakdown(
+            query=query,
             history=history,
-            max_tokens=budget.history
+            constitution=constitution,
+            include_briefing=include_briefing,
+            message_count=message_count,
         )
-        history_tokens = self.counter.count_messages(formatted_history)
-        budget.use("history", history_tokens, items=len(formatted_history))
-
-        # 4. Retrieve RAG context (uses 'rag' allocation)
-        rag_context = await self.retrieve_context(query)
-        if rag_context:
-            rag_tokens = self.counter.count(rag_context)
-            if budget.can_fit("rag", rag_tokens):
-                budget.use("rag", rag_tokens)
-                # Add RAG to system prompt
-                system_prompt = (
-                    f"{system_prompt}\n\n"
-                    f"--- RELEVANT DOCUMENTS ---\n{rag_context}\n--- END DOCUMENTS ---"
-                )
+        artifacts = breakdown["_artifacts"]
+        system_prompt = artifacts["system_prompt"]
+        if artifacts["dynamic_user_context"]:
+            # ``ContextManager.build_context`` keeps dynamic context out
+            # of the system prompt (so the cacheable prefix stays
+            # stable); ``build_full_context`` is a legacy convenience
+            # that returns a single combined prompt. Folding the dynamic
+            # envelope onto the end preserves byte-identical token cost
+            # to what ``measure_context_breakdown`` reports.
+            system_prompt = f"{system_prompt}\n\n{artifacts['dynamic_user_context']}"
 
         logger.debug(
-            f"Context built: {budget.total_used}/{budget.total_budget} tokens "
-            f"({len(formatted_history)} messages, "
-            f"{'with' if episode_context else 'no'} episodes)"
+            f"Context built: {breakdown['total_measured']}/{breakdown['total_budget']} tokens "
+            f"({len(artifacts['formatted_history'])} messages, "
+            f"{breakdown['sections']['episodes']['count']} episodes)"
         )
 
         return {
             "system_prompt": system_prompt,
-            "messages": formatted_history,
+            "messages": artifacts["formatted_history"],
+            "budget_summary": breakdown["budget_summary"],
+        }
+
+    async def measure_context_breakdown(
+        self,
+        query: str,
+        history: List[Dict],
+        constitution: str,
+        *,
+        include_briefing: bool = True,
+        message_count: Optional[int] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        prompt_adaptation: Optional['PromptAdaptation'] = None,
+        state_of_mind: Optional["StateOfMind"] = None,
+        reflection_guidance: Optional[List[str]] = None,
+        system_prompt_addendum: Optional[str] = None,
+        additional_context: Optional[str] = None,
+        include_rag: bool = True,
+        memory_retriever: Optional[Callable[[str, int], Awaitable[Optional[str]]]] = None,
+    ) -> Dict[str, Any]:
+        """Measure context composition the LLM call would actually see.
+
+        **Read-only.** No LLM call. No DB writes. The caller is
+        responsible for passing only side-effect-free helpers (see
+        ``memory_retriever`` below — the production
+        ``MemoryManager.retrieve_memories`` schedules access-count writes
+        as a rehearsal-effect side effect and MUST NOT be passed in
+        unmodified; wrap it in a side-effect-free adapter).
+
+        Single source of truth for per-section token measurement: the
+        breakdown popup (#1310), elastic budget (#1309), and any future
+        introspection caller all read from this method so the surface
+        and the live call path cannot drift. ``build_full_context`` now
+        calls this method directly to obtain its per-section counts.
+
+        Per-section accuracy:
+
+        - **system** — sub-rows attributed from
+          ``_collect_system_prompt_parts``; the *same* parts
+          ``build_system_prompt`` joins. Each subsection's token count
+          equals counting the parts of that group joined with
+          ``"\\n\\n"``. The whole-system total is computed by counting
+          the fully assembled prompt so it matches the LLM-visible bytes
+          exactly.
+        - **tools** — JSON-serialised tool schemas; previously
+          *never measured*. Caller passes the same list it would hand
+          to the LLM adapter.
+        - **history** — runs ``format_conversation_history`` as a
+          dry-run; reports ``messages_kept_after_pruning`` and the
+          unpruned raw sum so the popup can distinguish "lots of stored
+          history" from "lots of history the LLM will actually see."
+        - **episodes** — uses ``len(episodes)`` (no ``"**"`` heuristic).
+          Gated at ``EPISODE_THRESHOLD_MESSAGES`` (=20), matching the
+          production ``ContextManager.build_context`` path.
+        - **memories** — wrapped by the production
+          ``<retrieved_context><memories>…</memories></retrieved_context>``
+          envelope and gated by the per-section ``can_fit`` check, so
+          the figure equals the byte-cost the LLM would actually see.
+          Measured when ``memory_retriever`` is supplied (and is
+          side-effect-free).
+        - **rag** — wrapped by the production
+          ``<retrieved_context><documents>…</documents></retrieved_context>``
+          envelope and gated by ``can_fit``; query-dependent, so the
+          section is flagged ``estimated=True``.
+
+        Args:
+            query: Current user query (drives RAG retrieval).
+            history: Raw conversation history rows.
+            constitution: Constitution text.
+            include_briefing: Include the session briefing.
+            message_count: Effective conversation length for adaptive
+                budgeting and episode gating; defaults to
+                ``len(history)``.
+            tools: Tool schemas the agent would send this turn.
+            prompt_adaptation: Optional constitutional preamble.
+            state_of_mind: Optional ``StateOfMind`` block.
+            reflection_guidance: Optional active-reflection lines.
+            system_prompt_addendum: Optional per-turn addendum.
+            additional_context: Optional extra-context block (matches
+                ``build_system_prompt``'s ``additional_context`` arg).
+            include_rag: Skip RAG retrieval when ``False`` (used by the
+                cheap footer poll; the popup makes a second on-demand
+                call with this flag flipped on).
+            memory_retriever: Async ``(query, max_tokens) -> Optional[str]``
+                callable returning a pre-formatted memory block. **Must
+                be side-effect-free.** Wrap the production retriever
+                yourself; do not pass it raw.
+
+        Returns:
+            Dict with ``model``, ``context_limit``, ``response_reserve``,
+            ``total_budget``, ``total_measured`` (sum of section
+            tokens), ``utilization_percent`` (honest whole-window
+            utilization for #1310's pill), ``budget_summary`` (legacy
+            ``TokenBudget`` shape preserved), ``sections`` (canonical
+            per-section breakdown with ``budget`` / ``tokens`` /
+            per-section extras), and ``notes`` (free-form measurement
+            caveats — e.g. when memories or RAG are skipped/excluded).
+        """
+        effective_msg_count = len(history) if message_count is None else message_count
+
+        budget = create_budget(self.model, effective_msg_count, adaptive=True)
+        notes: List[str] = []
+
+        # ----- system: shared with build_system_prompt (no drift) -----
+        groups = self._collect_system_prompt_parts(
+            constitution=constitution,
+            include_briefing=include_briefing,
+            additional_context=additional_context,
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=system_prompt_addendum,
+        )
+        # Per-subsection: count "\n\n".join(group_parts) for that group
+        # in isolation. The inter-group "\n\n" joins are shared and live
+        # in the whole-system count below.
+        system_sub: List[Dict[str, Any]] = [
+            {"name": name, "tokens": self.counter.count("\n\n".join(parts))}
+            for name, parts in groups
+        ]
+        # Whole-system count from the assembled bytes — guarantees this
+        # equals what the LLM receives. Reflection-guidance lives in
+        # ``ContextManager.build_context`` (not in
+        # ``build_system_prompt``); when supplied it is appended after
+        # the joined prompt with "\n\n" separator, so we count it here
+        # the same way and add it as its own sub-row.
+        assembled_system = "\n\n".join(p for _, parts in groups for p in parts)
+        system_tokens = self.counter.count(assembled_system)
+        if reflection_guidance:
+            guidance_block = (
+                "\n--- ACTIVE REFLECTION GUIDANCE ---\n"
+                + "Based on self-reflection, keep these insights in mind:\n"
+                + "".join(f"- {item}\n" for item in reflection_guidance)
+                + "--- END GUIDANCE ---"
+            )
+            guidance_tokens = self.counter.count(guidance_block)
+            # Production appends with "\n\n". Recompute system_tokens
+            # from the final assembled bytes so the invariant
+            # "whole-system tokens come from the assembled bytes" holds
+            # literally (Codex round 2 #2). The algebraic shortcut
+            # ``system_tokens += guidance_tokens`` happened to produce
+            # the same number for current tokenisers, but the literal
+            # form removes the assumption.
+            assembled_system = f"{assembled_system}\n\n{guidance_block}"
+            system_tokens = self.counter.count(assembled_system)
+            system_sub.append(
+                {"name": "reflection_guidance", "tokens": guidance_tokens}
+            )
+
+        # ----- tools (previously never measured) -----
+        tools_tokens = _count_tool_schema_tokens(self.counter, tools)
+        tools_count = len(tools) if tools else 0
+
+        # ----- history (dry-run through the real formatter) -----
+        formatted_history = self.format_conversation_history(
+            history=history,
+            max_tokens=budget.history,
+        )
+        history_tokens = sum(
+            self.counter.count(m.get("content", "") or "") + _MESSAGE_OVERHEAD
+            for m in formatted_history
+        )
+        raw_history_tokens = sum(
+            self.counter.count(m.get("content", "") or "") for m in history
+        )
+        budget.use("history", history_tokens, items=len(formatted_history))
+
+        # ----- episodes (real count, production threshold) -----
+        episodes_list: List[Dict[str, Any]] = []
+        episodes_tokens = 0
+        if effective_msg_count >= EPISODE_THRESHOLD_MESSAGES and self.consolidator:
+            episodes_list = await self.get_episodes_for_context(
+                max_tokens=budget.episodes, max_episodes=5
+            )
+            episode_block = self.format_episodes_for_context(episodes_list)
+            if episode_block:
+                episodes_tokens = self.counter.count(episode_block)
+                budget.use("episodes", episodes_tokens, items=len(episodes_list))
+
+        # ----- memories: gate on RAW (production semantics), report
+        # inner-wrapper tokens for the per-section figure. The outer
+        # <retrieved_context> envelope is shared with RAG and counted
+        # once below as ``dynamic_context_overhead``. Codex round 2 #1
+        # caught the earlier version gating on the wrapped block, which
+        # could exclude blocks production would include, and could
+        # double-count the outer wrapper when both memories and RAG
+        # were present.
+        memories_tokens = 0
+        memories_count = 0
+        memories_excluded = False
+        memory_block: Optional[str] = None
+        if memory_retriever is not None:
+            try:
+                memory_block = await memory_retriever(query, budget.memories)
+            except Exception as e:
+                memory_block = None
+                notes.append(f"memory retrieval failed during measurement: {e}")
+            if memory_block:
+                memories_count = memory_block.count("[Memory")
+                raw_tokens = self.counter.count(memory_block)
+                if budget.can_fit("memories", raw_tokens):
+                    budget.use("memories", raw_tokens, items=memories_count)
+                    memories_tokens = self.counter.count(
+                        f"<memories>\n{memory_block}\n</memories>"
+                    )
+                else:
+                    memories_excluded = True
+                    memory_block = None
+                    notes.append(
+                        "memories excluded from measurement: would exceed "
+                        "memories budget (matches production can_fit gate "
+                        "on the raw block)"
+                    )
+        else:
+            notes.append("memories not measured (no memory_retriever supplied)")
+
+        # ----- rag: same raw/wrapped split as memories above -----
+        rag_tokens = 0
+        rag_chunks = 0
+        rag_excluded = False
+        rag_context: Optional[str] = None
+        if include_rag:
+            try:
+                rag_context = await self.retrieve_context(query)
+            except Exception as e:
+                rag_context = None
+                notes.append(f"rag retrieval failed during measurement: {e}")
+            if rag_context:
+                rag_chunks = rag_context.count("[Document") or rag_context.count(
+                    "Source:"
+                )
+                raw_tokens = self.counter.count(rag_context)
+                if budget.can_fit("rag", raw_tokens):
+                    budget.use("rag", raw_tokens, items=rag_chunks)
+                    rag_tokens = self.counter.count(
+                        f"<documents>\n{rag_context}\n</documents>"
+                    )
+                else:
+                    rag_excluded = True
+                    rag_context = None
+                    notes.append(
+                        "rag excluded from measurement: would exceed rag "
+                        "budget (matches production can_fit gate on the raw block)"
+                    )
+        else:
+            notes.append("rag skipped (include_rag=False — popup should fetch on demand)")
+
+        # Shared <retrieved_context>…</retrieved_context> envelope —
+        # counted once when at least one dynamic block is included,
+        # mirroring ``ContextManager.build_context``'s single-wrapper
+        # behavior (codex round 2 #1: do not double-charge the outer
+        # wrapper across sections). #1310's popup attributes this to
+        # "Reserve / Overhead" in Emma's canonical taxonomy.
+        dynamic_blocks_present = bool(memory_block) or bool(rag_context)
+        if dynamic_blocks_present:
+            dynamic_context_overhead = self.counter.count(
+                "<retrieved_context>\n\n</retrieved_context>"
+            )
+        else:
+            dynamic_context_overhead = 0
+
+        # ----- assemble breakdown -----
+        sections: Dict[str, Dict[str, Any]] = {
+            "system": {
+                "tokens": system_tokens,
+                "budget": budget.system,
+                "subsections": system_sub,
+            },
+            "tools": {
+                "tokens": tools_tokens,
+                "count": tools_count,
+                "estimated": True,
+                "estimation_method": "json-serialized-schemas",
+            },
+            "history": {
+                "tokens": history_tokens,
+                "budget": budget.history,
+                "messages_total": len(history),
+                "messages_kept_after_pruning": len(formatted_history),
+                "raw_tokens": raw_history_tokens,
+            },
+            "episodes": {
+                "tokens": episodes_tokens,
+                "budget": budget.episodes,
+                "count": len(episodes_list),
+                "threshold": EPISODE_THRESHOLD_MESSAGES,
+            },
+            "memories": {
+                "tokens": memories_tokens,
+                "budget": budget.memories,
+                "count": memories_count,
+                "wired": memory_retriever is not None,
+                "excluded": memories_excluded,
+            },
+            "rag": {
+                "tokens": rag_tokens,
+                "budget": budget.rag,
+                "chunks": rag_chunks,
+                "estimated": True,
+                "estimation_method": "live-search-against-current-store",
+                "skipped": not include_rag,
+                "excluded": rag_excluded,
+            },
+            # Shared overhead: a single <retrieved_context>…</retrieved_context>
+            # envelope wraps memories AND rag when either is present
+            # (production behavior — see ``ContextManager.build_context``).
+            # Surfaced here as its own row so the per-section ``tokens``
+            # figures stay attributable, and the popup (#1310) can show
+            # this under Emma's "Reserve / Overhead" taxonomy slice
+            # without double-charging memories or rag.
+            "dynamic_context_overhead": {
+                "tokens": dynamic_context_overhead,
+                "applies_when": "memories or rag included",
+                "applied": dynamic_blocks_present,
+            },
+        }
+
+        total_measured = (
+            system_tokens
+            + tools_tokens
+            + history_tokens
+            + episodes_tokens
+            + memories_tokens
+            + rag_tokens
+            + dynamic_context_overhead
+        )
+        context_limit = self.counter.get_context_limit()
+        response_reserve = RESPONSE_RESERVE
+        total_budget = context_limit - response_reserve
+        utilization_percent = (
+            (total_measured / total_budget * 100.0) if total_budget > 0 else 0.0
+        )
+        # Cap at 100 for display — tiny overshoots from per-section
+        # rounding should not read as 120%.
+        utilization_percent = min(utilization_percent, 100.0)
+
+        # Assembled artifacts — same bytes the LLM would see, in the
+        # same wrapper format ``ContextManager.build_context`` uses. The
+        # underscore prefix signals these are internal; consumers should
+        # read top-level ``sections`` for measurement and reach into
+        # ``_artifacts`` only when they need to re-use the assembled
+        # text (``build_full_context`` does, for example, to share the
+        # measurement path).
+        dynamic_blocks: List[str] = []
+        if memory_block:
+            dynamic_blocks.append(f"<memories>\n{memory_block}\n</memories>")
+        if rag_context:
+            dynamic_blocks.append(f"<documents>\n{rag_context}\n</documents>")
+        dynamic_user_context = (
+            "<retrieved_context>\n" + "\n".join(dynamic_blocks) + "\n</retrieved_context>"
+            if dynamic_blocks
+            else ""
+        )
+        episode_block_for_artifacts = self.format_episodes_for_context(episodes_list)
+        artifacts_system_prompt = assembled_system
+        if episode_block_for_artifacts:
+            artifacts_system_prompt = (
+                f"{artifacts_system_prompt}\n\n{episode_block_for_artifacts}"
+            )
+
+        return {
+            "model": self.model,
+            "context_limit": context_limit,
+            "response_reserve": response_reserve,
+            "total_budget": total_budget,
+            "total_measured": total_measured,
+            "utilization_percent": round(utilization_percent, 1),
             "budget_summary": budget.get_summary(),
+            "sections": sections,
+            "notes": notes,
+            "_artifacts": {
+                "system_prompt": artifacts_system_prompt,
+                "formatted_history": formatted_history,
+                "dynamic_user_context": dynamic_user_context,
+            },
         }

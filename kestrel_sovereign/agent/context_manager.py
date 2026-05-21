@@ -405,12 +405,19 @@ class ContextManager:
         if microcompact_savings > 0:
             logger.info(f"Microcompact cleared {microcompact_savings} stale tool results")
 
-        # 2. Add episodes for long conversations
+        # 2. Add episodes for long conversations.
+        # Use the get/format split (#1308) so episode_count is an
+        # accurate ``len(episodes)`` instead of the legacy
+        # ``"**".count() // 2`` heuristic — the formatted block contains
+        # bold markers for emotional-arc lines and other ``**``-bearing
+        # substrings that made the heuristic over- and under-count
+        # depending on episode content.
         if message_count >= self.EPISODE_THRESHOLD_MESSAGES and self.consolidator:
-            episode_context = await self.context_builder.get_episode_context(
+            episodes = await self.context_builder.get_episodes_for_context(
                 max_tokens=budget.episodes,
-                max_episodes=5
+                max_episodes=5,
             )
+            episode_context = self.context_builder.format_episodes_for_context(episodes)
             if episode_context:
                 # Codex round-15 P2: same budget guard as reflection
                 # guidance. Skip episode append if it would push the
@@ -432,10 +439,9 @@ class ContextManager:
 
                 if episode_context:
                     episode_tokens = self.counter.count(episode_context)
-                    budget.use("episodes", episode_tokens)
+                    budget.use("episodes", episode_tokens, items=len(episodes))
                     system_prompt = f"{system_prompt}\n\n{episode_context}"
-                    # Count episodes (rough estimate from formatting)
-                    episode_count = episode_context.count("**") // 2
+                    episode_count = len(episodes)
                     logger.debug(f"Added {episode_count} episodes to context")
 
         # 3. Retrieve emotionally-weighted memories (placed in dynamic user
