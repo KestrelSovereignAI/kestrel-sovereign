@@ -587,23 +587,35 @@ async def notifications_sse(request: Request):
 @router.get("/context-status")
 async def get_context_status(
     request: Request,
-    session_id: Optional[str] = Query(None, description="Session ID to get context for")
+    session_id: Optional[str] = Query(None, description="Session ID to get context for"),
+    full: bool = Query(
+        False,
+        description=(
+            "When True, run the full breakdown including RAG retrieval. "
+            "The frequent footer poll passes False (cheap path); the "
+            "breakdown popup (#1310) passes True on open."
+        ),
+    ),
 ):
-    """
-    Get current context window status including token usage and budget.
+    """Honest whole-window context status + per-section breakdown.
 
-    Args:
-        session_id: Optional session ID to get context for specific session
+    The pill in the chat footer (chat.js) reads ``utilization_percent``
+    and renders the ● N msgs · X% indicator. The popup (#1310) reads
+    ``breakdown`` for the layered taxonomy. Both come from a single
+    source of truth: ``ContextBuilder.measure_context_breakdown``
+    (introduced by #1308). The ``breakdown`` field is the entire
+    measurement dict, with Emma's canonical sections (system, tools,
+    history, episodes, memories, rag, dynamic_context_overhead) plus
+    the elastic-budget snapshot from #1309.
 
-    Returns:
-        - model: Current active model (respects mandate/preference system)
-        - message_count: Total messages in conversation history
-        - total_tokens: Actual token count of conversation history
-        - context_limit: Model's context window limit
-        - total_budget: Available budget after response reserve
-        - utilization_percent: Overall context utilization percentage
-        - compression_recommended: Whether compression is recommended
-        - status: healthy/normal/warning/critical
+    Two modes:
+
+    - ``full=False`` (default): cheap path for the frequent footer
+      poll. RAG retrieval is skipped; the section is flagged
+      ``skipped=true``. Memories are also off unless the agent supplies
+      a side-effect-free retriever.
+    - ``full=True``: invoked once when the popup opens. RAG is
+      retrieved live; the popup labels it as ``estimated``.
     """
     try:
         agent = get_agent(request)
@@ -638,68 +650,166 @@ async def get_context_status(
                 "compression_recommended": False,
                 "status": "idle",
                 "warnings": [],
+                "breakdown": None,
+                "silently_pruned_path_active": False,
             }
 
         # 3. Get conversation history for the specified session
-        history = await agent.storage.get_conversation_history(limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id)
+        history = await agent.storage.get_conversation_history(
+            limit=MAX_CONVERSATION_HISTORY_LIMIT, session_id=session_id
+        )
         message_count = len(history)
 
-        # 4. Compute effective tokens the LLM call path would actually send
-        # (uses the same pruning + per-message cap as format_conversation_history)
+        # 4. Run the canonical per-section measurement (A / #1308).
+        # ``measure_context_breakdown`` is the single source of truth
+        # for what the LLM call would actually see — popup and pill
+        # cannot drift from production accounting (Emma's "popup must
+        # reflect what the model sees" invariant from PR #1306).
         ctx_builder = getattr(agent, 'context_builder', None)
         if ctx_builder is None:
             from kestrel_sovereign.agent.context_builder import ContextBuilder
             ctx_builder = ContextBuilder(storage=agent.storage)
 
-        est = ctx_builder.estimate_effective_history_tokens(history, current_model)
+        # Constitution and state-of-mind for the measurement match the
+        # production call path. Best-effort fetch — failure here only
+        # affects measurement accuracy, not the pill rendering.
+        constitution_text = ""
+        get_const = getattr(agent, "get_constitution", None)
+        if callable(get_const):
+            try:
+                got = get_const()
+                constitution_text = await got if hasattr(got, "__await__") else got
+                constitution_text = constitution_text or ""
+            except Exception as e:
+                logger.debug(f"constitution fetch failed for breakdown: {e}")
 
-        # 5. Utilization is based on what the next LLM call would actually send,
-        # not naive raw history. This matches what the user will experience.
-        effective_tokens = est['effective_tokens']
-        raw_tokens = est['raw_tokens']
-        history_budget = est['history_budget']
+        state_of_mind = None
+        llm_service = getattr(agent, "llm_service", None)
+        if llm_service is not None and hasattr(llm_service, "get_state_of_mind"):
+            try:
+                state_of_mind = llm_service.get_state_of_mind()
+            except Exception as e:
+                logger.debug(f"state_of_mind fetch failed for breakdown: {e}")
 
-        response_reserve = RESPONSE_RESERVE
-        total_budget = context_limit - response_reserve
+        # Tool schemas the agent would send. Best-effort — surfaces the
+        # previously-invisible slice; if the registry isn't reachable,
+        # tool tokens stay at 0 and the popup labels them not-counted.
+        tool_schemas: Optional[List[Dict[str, Any]]] = None
+        registry = getattr(agent, "tool_registry", None)
+        if registry is not None and hasattr(registry, "_build_all_tools"):
+            try:
+                tool_schemas = list(registry._build_all_tools())
+            except Exception as e:
+                logger.debug(f"tool schema fetch failed for breakdown: {e}")
 
-        # Utilization of the history slice. Cap at 100% for display —
-        # tiny overshoots from truncation markers should not read as 120%.
-        history_utilization = (effective_tokens / history_budget * 100) if history_budget > 0 else 0
-        history_utilization = min(history_utilization, 100.0)
+        # When the popup runs the full breakdown (RAG included), use
+        # the most recent user turn as the query so the RAG figure
+        # approximates what the next LLM turn would see (codex round
+        # 1 P2 caught the previous empty-query path overstating
+        # accuracy). When no user turn is available, label the row
+        # so the popup does not pretend the figure is representative.
+        rag_query = ""
+        rag_query_label: Optional[str] = None
+        if full:
+            try:
+                from kestrel_sovereign.agent.context_builder import (
+                    extract_raw_user_content,
+                )
+                for row in reversed(history):
+                    if (row.get("role") or "").lower() == "user":
+                        rag_query = extract_raw_user_content(
+                            row.get("content", "") or ""
+                        )
+                        break
+            except Exception as e:
+                logger.debug(f"last-user-query lookup failed for breakdown: {e}")
+            if not rag_query:
+                rag_query_label = (
+                    "estimated against latest stored chunks — no recent user "
+                    "turn available for query-specific retrieval"
+                )
 
-        # 6. Determine status and warnings based on effective (post-pruning) figures
-        warnings = []
-        if history_utilization < 50:
+        breakdown = await ctx_builder.measure_context_breakdown(
+            query=rag_query,
+            history=history,
+            constitution=constitution_text,
+            include_briefing=True,
+            message_count=message_count,
+            tools=tool_schemas,
+            state_of_mind=state_of_mind,
+            include_rag=full,
+            memory_retriever=None,
+        )
+
+        # Drop the internal artifacts blob — it's the assembled bytes,
+        # only useful to ``build_full_context``; the popup doesn't need
+        # the bodies, only the per-section figures.
+        breakdown.pop("_artifacts", None)
+
+        # Attach the "no current query" annotation when RAG was run
+        # without one; the popup renders it under the RAG row so the
+        # operator can tell estimated-with-query from estimated-without.
+        if full and rag_query_label and "sections" in breakdown:
+            rag_section = breakdown["sections"].get("rag")
+            if isinstance(rag_section, dict):
+                rag_section["query_used_label"] = rag_query_label
+
+        # 5. Pill % = honest whole-window utilization (the design's
+        # core correctness fix: previously the pill reported history
+        # slice utilization, which was misleading whenever other
+        # sections dominated). Greenfield — no compat constraint
+        # (Emma's 2026-05-20 review: "make the number correct").
+        utilization_percent = float(breakdown["utilization_percent"])
+        total_measured = int(breakdown["total_measured"])
+        total_budget = int(breakdown["total_budget"])
+
+        # 6. Status + warnings keyed off the whole-window figure.
+        warnings: List[str] = []
+        if utilization_percent < 50:
             status_str = "healthy"
-        elif history_utilization < 70:
+        elif utilization_percent < 70:
             status_str = "normal"
-        elif history_utilization < 85:
+        elif utilization_percent < 85:
             status_str = "warning"
-            warnings.append(f"History budget {history_utilization:.0f}% full - consider using !compress")
+            warnings.append(
+                f"Context window {utilization_percent:.0f}% full - "
+                "consider !compress to save older turns into a durable summary"
+            )
         else:
             status_str = "critical"
-            warnings.append(f"History budget {history_utilization:.0f}% full - compression strongly recommended")
+            warnings.append(
+                f"Context window {utilization_percent:.0f}% full - "
+                "compression strongly recommended"
+            )
 
-        # Note: raw tokens >> effective tokens means oversized messages were
-        # capped or old messages pruned. That's expected behavior, not a warning.
-        if raw_tokens > total_budget and effective_tokens <= history_budget:
-            # Informational: some messages were pruned/capped, but the call is fine
-            pass
+        # 7. Auto-detect the legacy silent-prune path (Emma's
+        # 2026-05-20 hardening, design doc §"D auto-detect invariant"):
+        # while C / #1311 has not shipped, the production builder can
+        # still drop out-of-window history without a durable salvage
+        # record. The popup uses this flag to surface the
+        # "silently-pruned path still active" label unconditionally.
+        silently_pruned_path_active = True
 
         return {
             "model": current_model,
             "message_count": message_count,
-            "messages_kept_after_pruning": est['messages_kept'],
-            "total_tokens": effective_tokens,  # what LLM will actually see
-            "total_tokens_raw": raw_tokens,     # unpruned sum (debug)
+            "total_tokens": total_measured,  # honest whole-window total
             "context_limit": context_limit,
-            "response_reserve": response_reserve,
+            "response_reserve": breakdown["response_reserve"],
             "total_budget": total_budget,
-            "history_budget": history_budget,
-            "utilization_percent": round(history_utilization, 1),
-            "compression_recommended": history_utilization >= 70,
+            "utilization_percent": utilization_percent,
+            "compression_recommended": utilization_percent >= 70,
             "status": status_str,
-            "warnings": warnings
+            "warnings": warnings,
+            # Layered breakdown the popup renders. Sections include
+            # system (with subsections), tools, history (with
+            # messages_kept_after_pruning + raw_tokens), episodes,
+            # memories, rag, and dynamic_context_overhead.
+            "breakdown": breakdown,
+            # While C has not shipped, this stays True per the
+            # auto-detection invariant. When C lands and the prune
+            # path emits sync salvage records, flip this to False.
+            "silently_pruned_path_active": silently_pruned_path_active,
         }
     except Exception as e:
         logger.error(f"Error getting context status: {e}", exc_info=True)

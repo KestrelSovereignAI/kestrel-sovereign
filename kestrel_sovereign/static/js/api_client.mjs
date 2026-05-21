@@ -649,9 +649,12 @@ export function createApiClient({
         buildAgentUrl(path) {
             return applyHostAgentPrefix(path, state.selectedHostAgent);
         },
-        getContextStatus: (sessionId = null) => {
-            const params = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
-            return client.request(`/api/agent/context-status${params}`);
+        getContextStatus: (sessionId = null, { full = false } = {}) => {
+            const parts = [];
+            if (sessionId) parts.push(`session_id=${encodeURIComponent(sessionId)}`);
+            if (full) parts.push('full=true');
+            const qs = parts.length ? `?${parts.join('&')}` : '';
+            return client.request(`/api/agent/context-status${qs}`);
         },
         _getState() {
             return { ...state };

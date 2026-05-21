@@ -48,7 +48,51 @@ class _CounterStub:
         return self._context_limit
 
 
-def test_context_status_reports_token_budget_and_warning_band():
+def _breakdown_payload(total_measured, total_budget, response_reserve=1024, *, sections_overrides=None):
+    """Build a ``measure_context_breakdown``-shaped dict for endpoint tests.
+
+    The endpoint cares about ``total_measured`` / ``total_budget`` /
+    ``utilization_percent`` / ``response_reserve`` and the ``sections``
+    block; build a minimal valid shape and let callers override.
+    """
+    util = min(100.0, (total_measured / total_budget * 100.0) if total_budget else 0.0)
+    sections = {
+        "system": {"tokens": 0, "budget": 0, "subsections": []},
+        "tools": {"tokens": 0, "count": 0, "estimated": True, "estimation_method": ""},
+        "history": {
+            "tokens": total_measured,
+            "budget": total_budget,
+            "messages_total": 0,
+            "messages_kept_after_pruning": 0,
+            "raw_tokens": total_measured,
+        },
+        "episodes": {"tokens": 0, "budget": 0, "count": 0, "threshold": 20},
+        "memories": {"tokens": 0, "budget": 0, "count": 0, "wired": False, "excluded": False},
+        "rag": {"tokens": 0, "budget": 0, "chunks": 0, "estimated": True, "estimation_method": "", "skipped": True, "excluded": False},
+        "dynamic_context_overhead": {"tokens": 0, "applies_when": "memories or rag included", "applied": False},
+    }
+    if sections_overrides:
+        for k, v in sections_overrides.items():
+            sections[k] = {**sections.get(k, {}), **v}
+    return {
+        "model": "gpt-5",
+        "context_limit": total_budget + response_reserve,
+        "response_reserve": response_reserve,
+        "total_budget": total_budget,
+        "total_measured": total_measured,
+        "utilization_percent": round(util, 1),
+        "budget_summary": {},
+        "sections": sections,
+        "notes": [],
+        "_artifacts": {"system_prompt": "", "formatted_history": [], "dynamic_user_context": ""},
+    }
+
+
+def test_context_status_reports_whole_window_utilization_and_warning_band():
+    """#1310: the pill % now reflects whole-window utilization (sum of
+    all measured sections / total budget), not history-only. Status
+    bands key off the whole-window figure. Codex-reviewed change to
+    the endpoint contract (PR #1306, Emma-acked)."""
     history = [
         {"content": "a" * 1000},
         {"content": "b" * 1200},
@@ -57,16 +101,17 @@ def test_context_status_reports_token_budget_and_warning_band():
     agent = MagicMock()
     agent.get_current_model = MagicMock(return_value="gpt-5")
     agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
 
-    # endpoints/agent.py now delegates to ContextBuilder.estimate_effective_history_tokens
-    # for the pruning + per-message cap accounting. Stub it here.
+    # Endpoint now delegates to ContextBuilder.measure_context_breakdown
+    # (#1308 source of truth). Stub it to a payload that produces ~97%
+    # utilization so the critical-band logic kicks in.
     ctx_builder = MagicMock()
-    ctx_builder.estimate_effective_history_tokens = MagicMock(return_value={
-        "effective_tokens": 2900,
-        "raw_tokens": 2900,
-        "history_budget": 2976,   # 4000 - 1024 response reserve
-        "messages_kept": 3,
-    })
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(2900, 2976)
+    )
     agent.context_builder = ctx_builder
 
     app, original = _prepare_app(agent)
@@ -92,13 +137,174 @@ def test_context_status_reports_token_budget_and_warning_band():
         assert payload["status"] == "critical"
         assert payload["compression_recommended"] is True
         assert "compression strongly recommended" in payload["warnings"][0]
+        # New for #1310: full breakdown block surfaced for the popup.
+        assert "breakdown" in payload
+        assert payload["breakdown"]["total_measured"] == 2900
+        assert "sections" in payload["breakdown"]
+        # Auto-detection of legacy silent-prune (Emma 2026-05-20
+        # hardening): unconditionally True until #1311 ships.
+        assert payload["silently_pruned_path_active"] is True
         agent.storage.get_conversation_history.assert_awaited_once_with(
             limit=10000,
             session_id="session-1",
         )
-        ctx_builder.estimate_effective_history_tokens.assert_called_once_with(
-            history, "gpt-5",
-        )
+        # ``include_rag=False`` is the cheap-poll default.
+        ctx_builder.measure_context_breakdown.assert_awaited_once()
+        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        assert kw["include_rag"] is False
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_full_query_param_runs_rag():
+    """``?full=true`` makes the endpoint pass ``include_rag=True`` to
+    the breakdown — the on-demand call the popup makes when it opens."""
+    history = [{"content": "x"}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(100, 2976)
+    )
+    agent.context_builder = ctx_builder
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    resp = client.get(
+                        "/api/agent/context-status?session_id=session-1&full=true",
+                        headers=_api_headers(),
+                    )
+        assert resp.status_code == 200
+        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        assert kw["include_rag"] is True
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_full_path_uses_last_user_turn_as_rag_query():
+    """Codex round 1 P2: ``full=true`` must seed the RAG query from
+    the most recent user turn so the figure approximates what the
+    next LLM turn would see — otherwise we overstate accuracy.
+    """
+    history = [
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "<user_input>\nlatest user question\n</user_input>"},
+        {"role": "assistant", "content": "last answer"},
+    ]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(50, 2976)
+    )
+    agent.context_builder = ctx_builder
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    resp = client.get(
+                        "/api/agent/context-status?session_id=session-1&full=true",
+                        headers=_api_headers(),
+                    )
+        assert resp.status_code == 200
+        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        # The latest user turn is wrapped in sent-form; the endpoint
+        # unwraps it via ``extract_raw_user_content``. Either form
+        # (raw or unwrapped "latest user question") is acceptable —
+        # the point is it's not empty.
+        assert kw["query"], "full=true must seed RAG query from latest user turn"
+        assert "latest user question" in kw["query"]
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_full_path_labels_rag_when_no_user_turn_available():
+    """Codex round 1 P2: when ``full=true`` cannot find a recent user
+    turn for the query, the response annotates the RAG section so the
+    popup can label it ``estimated with no current query`` instead of
+    pretending the figure is representative."""
+    history = [{"role": "assistant", "content": "only an assistant turn"}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(50, 2976)
+    )
+    agent.context_builder = ctx_builder
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    resp = client.get(
+                        "/api/agent/context-status?session_id=session-1&full=true",
+                        headers=_api_headers(),
+                    )
+        payload = resp.json()
+        rag = payload["breakdown"]["sections"]["rag"]
+        assert "query_used_label" in rag
+        assert "no recent user turn" in rag["query_used_label"]
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_idle_shape_includes_silently_pruned_flag():
+    """Idle path (no session_id) must still surface the flags the
+    popup expects, so a session-less open does not throw on missing
+    keys."""
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    agent.storage.get_conversation_history = AsyncMock(
+        side_effect=AssertionError("must not be called for idle path")
+    )
+    agent.context_builder = MagicMock()
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    resp = client.get(
+                        "/api/agent/context-status",
+                        headers=_api_headers(),
+                    )
+        payload = resp.json()
+        assert payload["status"] == "idle"
+        assert payload["breakdown"] is None
+        assert payload["silently_pruned_path_active"] is False
     finally:
         _restore_app(app, original)
 
