@@ -431,6 +431,7 @@ test.describe('Voice UI shell', () => {
     expect(parsed.instructions).toContain('sympathetic pirate');
   });
 
+
   test('spacebar push-to-talk does not steal keystrokes from the message input', async ({ page }) => {
     await installRoutes(page);
     await page.goto(BASE_URL);
