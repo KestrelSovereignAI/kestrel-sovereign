@@ -1069,6 +1069,18 @@ class KestrelAgent(
 
             # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
+        # C / #1311 durable salvage worker — only starts when the
+        # feature flag is enabled (otherwise no-op). Wired here so
+        # both ``ContextManager.build_context`` (which schedules
+        # summaries on every prune) and the periodic janitor have a
+        # live worker to talk to. Without this hook the salvage rows
+        # would stay in ``pointer-only`` forever — codex round 1 #3.
+        if hasattr(self, "context_manager") and self.context_manager:
+            try:
+                await self.context_manager.start_salvage_worker()
+            except Exception as e:
+                logging.warning(f"failed to start salvage worker: {e}")
+
         # Lifecycle hardening (#377): refuse to declare initialization
         # successful when no LLM provider came up. Lives here rather than in
         # the server lifespan so single-agent, multi-agent (AgentManager),
@@ -1860,6 +1872,32 @@ Expected Duration: {expected_duration}
             anchored_doctrine=anchored_doctrine,
         )
 
+        # B / #1309 + C / #1311: degraded-mode fail-closed.
+        # ``build_context`` returns ``degraded_mode=True`` when (1) the
+        # measured mandatory governance floor (#1309) doesn't fit the
+        # model window, or (2) the durable-salvage write (#1311) fails
+        # or the conv_store is unreachable while salvage is enabled.
+        # In both cases the LLM call MUST NOT proceed — Emma's
+        # 2026-05-20 hardening invariant. Surface the warnings to the
+        # caller and return a refusal response rather than building
+        # a prompt and hitting the model.
+        # Explicit ``is True`` so MagicMock-returning test fixtures
+        # don't trip the gate inadvertently.
+        if getattr(context_result, "degraded_mode", False) is True:
+            warn_text = " | ".join(context_result.warnings or ["context build degraded"])
+            self._last_context_warnings = context_result.warnings or []
+            self._last_context_summary = context_result.budget_summary
+            logging.error(
+                "DEGRADED MODE on LLM-bound build_context — refusing to "
+                "issue the model call. Warnings: %s",
+                warn_text,
+            )
+            return (
+                "I cannot continue this turn safely: the context window "
+                "is in a degraded state. Details: "
+                f"{warn_text}"
+            )
+
         self._session_briefed = True
 
         # Log budget usage for monitoring and store for API access
@@ -2439,6 +2477,14 @@ Expected Duration: {expected_duration}
                 await self.heartbeat_runner.stop()
             except Exception as e:
                 logging.warning(f"Error stopping heartbeat: {e}")
+
+        # Stop C / #1311 durable salvage worker. Drains in-flight
+        # summary tasks; the janitor catches up the rest on next start.
+        if hasattr(self, "context_manager") and self.context_manager:
+            try:
+                await self.context_manager.stop_salvage_worker()
+            except Exception as e:
+                logging.warning(f"Error stopping salvage worker: {e}")
 
         # Shutdown security feature if it exists
         security_feature = self.features.get("SecurityFeature")

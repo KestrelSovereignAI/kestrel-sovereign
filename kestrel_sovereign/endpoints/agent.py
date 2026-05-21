@@ -754,6 +754,34 @@ async def get_context_status(
             if isinstance(rag_section, dict):
                 rag_section["query_used_label"] = rag_query_label
 
+        # C / #1311: attach salvage-state counts so the popup can
+        # render the layered taxonomy (pointer-only / pending-fold /
+        # folded / failed-fold) and surface back-pressure warnings.
+        # Best-effort — failure to load counts must not break the
+        # endpoint, just degrade the popup's salvage row to zeros.
+        try:
+            from kestrel_sovereign.agent.salvage import (
+                DEFAULT_PENDING_WARN_THRESHOLD,
+                get_salvage_state_counts,
+            )
+            conv_store_for_counts = (
+                getattr(agent.conversation_manager, "_get_conversation_store", lambda: None)()
+                if hasattr(agent, "conversation_manager")
+                else None
+            )
+            if conv_store_for_counts is not None and "sections" in breakdown:
+                salvage_counts = await get_salvage_state_counts(
+                    conv_store_for_counts, session_id=session_id
+                )
+                hist_section = breakdown["sections"].get("history")
+                if isinstance(hist_section, dict):
+                    hist_section["salvages"] = salvage_counts
+                    hist_section["salvages"]["warn_threshold"] = (
+                        DEFAULT_PENDING_WARN_THRESHOLD
+                    )
+        except Exception as e:
+            logger.debug(f"salvage counts fetch failed for breakdown: {e}")
+
         # 5. Pill % = honest whole-window utilization (the design's
         # core correctness fix: previously the pill reported history
         # slice utilization, which was misleading whenever other
@@ -783,12 +811,21 @@ async def get_context_status(
             )
 
         # 7. Auto-detect the legacy silent-prune path (Emma's
-        # 2026-05-20 hardening, design doc §"D auto-detect invariant"):
-        # while C / #1311 has not shipped, the production builder can
-        # still drop out-of-window history without a durable salvage
-        # record. The popup uses this flag to surface the
-        # "silently-pruned path still active" label unconditionally.
-        silently_pruned_path_active = True
+        # 2026-05-20 hardening, design doc §"D auto-detect invariant").
+        # When C / #1311's feature flag is enabled in production, the
+        # prune path emits sync salvage records and this flag flips
+        # to False — which is the release-gate signal for epic #1307
+        # (Emma 2026-05-21: gate keys off this flag, not off ticket
+        # closure). When the flag is disabled the legacy silent-prune
+        # remains active and the popup unconditionally surfaces the
+        # warning.
+        try:
+            from kestrel_sovereign.agent.salvage import (
+                is_durable_salvage_enabled,
+            )
+            silently_pruned_path_active = not is_durable_salvage_enabled()
+        except Exception:
+            silently_pruned_path_active = True
 
         return {
             "model": current_model,
