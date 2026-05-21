@@ -18,6 +18,14 @@ from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional, Tuple
 
+# ``SalvageState`` lives in ``kestrel_sovereign.agent.salvage``;
+# importing it here would create a circular import via
+# ``agent/__init__.py`` → ``context_builder`` → ``features.bootstrap``
+# → ``features.base``. Inline the canonical state strings instead.
+_SALVAGE_STATE_POINTER_ONLY = "pointer-only"
+_SALVAGE_STATE_PENDING_SUMMARY = "pending-summary"
+_SALVAGE_STATE_DURABLE_FOLDED = "durable-folded"
+
 from .memory_models import MemoryEpisode, TemporalPattern
 from .async_database import AsyncDatabase
 from .memory_retriever import calculate_decay
@@ -195,6 +203,24 @@ class MemoryConsolidator:
             if avg_intensity < 0.3 and avg_importance < 0.6:
                 continue
 
+            # C / #1311 pending-state idempotency (Emma 2026-05-21):
+            # when every message in the cluster has a linked salvage
+            # that is still ``pointer-only`` or ``pending-summary``,
+            # the salvage summariser is about to fold the same span.
+            # Fabricating an episode from the raw rows now would race
+            # the summariser and create two parallel records of the
+            # same span with no causal link. Defer this cluster — the
+            # next consolidator pass picks it up after the salvage
+            # settles into ``durable-folded`` or ``failed-fold``.
+            if await self._all_messages_have_pending_salvage(messages):
+                logger.debug(
+                    "consolidator: deferring cluster %s — every message "
+                    "has a pending salvage; episode will fire after the "
+                    "salvage settles",
+                    date_key,
+                )
+                continue
+
             # Create episode
             episode = await self._create_episode_from_messages(
                 date_key, messages, avg_intensity
@@ -204,6 +230,82 @@ class MemoryConsolidator:
                 await self._save_episode(episode)
 
         return episodes
+
+    async def _all_messages_have_pending_salvage(
+        self, messages: List[Dict[str, Any]]
+    ) -> bool:
+        """C / #1311 helper — return True when every message in the
+        cluster has a ``summarized_into`` link AND the linked marker
+        is still in a *pre-folded* state (``pointer-only`` or
+        ``pending-summary``).
+
+        Codex round 1 #5 caught a regression in the earlier sync
+        version of this helper: it returned True for any cluster
+        where every row had ``summarized_into`` set — but legacy
+        ``compress_session`` markers ALSO set that field and are
+        already ``durable-folded``. The consolidator would have
+        skipped clusters whose narrative the salvage summariser is
+        not about to write, with no recovery path. We now load each
+        marker and check its actual ``salvage_state``.
+
+        ``durable-folded`` and ``failed-fold`` (and the legacy
+        ``compress_session`` markers, which carry ``type ==
+        "compression"`` and no ``salvage_state``) are treated as
+        settled — the consolidator may run its emotional-cluster
+        logic for those spans, using the summary marker as input on
+        Emma's "episode-as-input" preference (deferred to a follow-up
+        as long as the consolidator at least doesn't skip wrongly).
+        """
+        if not messages:
+            return False
+        pending_states = {
+            _SALVAGE_STATE_POINTER_ONLY,
+            _SALVAGE_STATE_PENDING_SUMMARY,
+        }
+        seen_marker_ids: set = set()
+        for msg in messages:
+            meta = msg.get("metadata") or {}
+            marker_id = meta.get("summarized_into")
+            if not marker_id:
+                return False
+            try:
+                marker_id = int(marker_id)
+            except (TypeError, ValueError):
+                return False
+            seen_marker_ids.add(marker_id)
+        for mid in seen_marker_ids:
+            state = await self._load_marker_state(mid)
+            if state not in pending_states:
+                return False
+        return True
+
+    async def _load_marker_state(self, marker_id: int) -> Optional[str]:
+        """Return the linked marker's ``salvage_state``, or None when
+        the row is missing or is a legacy ``compression`` marker that
+        has no salvage_state field (treated as ``durable-folded`` for
+        the pending-check above)."""
+        try:
+            row = await self.db.fetchone(
+                "SELECT metadata FROM conversation_history WHERE id = ?",
+                (marker_id,),
+            )
+        except Exception as e:
+            logger.debug("consolidator: marker %s state lookup failed: %s", marker_id, e)
+            return None
+        if not row:
+            return None
+        raw = row[0] if row else None
+        if not raw:
+            return None
+        try:
+            meta = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        # Legacy compression markers don't have ``salvage_state``; they
+        # are durable-folded by construction.
+        if meta.get("type") == "compression":
+            return _SALVAGE_STATE_DURABLE_FOLDED
+        return meta.get("salvage_state")
 
     async def _create_episode_from_messages(
         self,

@@ -1575,13 +1575,58 @@ function renderContextBreakdown(status) {
     // slots render unconditionally so the popup is ready when C ships,
     // and a "silently-pruned path still active" warning fires while
     // C is unshipped (auto-detect invariant).
+    // C / #1311: salvage-state badges come from
+    // ``history.salvages`` which the endpoint attaches once C's
+    // feature flag is enabled. Until then ``hist.salvages`` is
+    // absent (or all-zero) and the badge row stays empty.
     const histBadges = [];
+    const salv = (hist && hist.salvages) || {};
+    if (salv.pointer_only_count) {
+        histBadges.push(badge(`pointer-only salvage · ${salv.pointer_only_count}`, '#0891b2'));
+    }
+    if (salv.pointer_only_terminal_count) {
+        histBadges.push(badge(`pointer-only — summary delayed · ${salv.pointer_only_terminal_count}`, '#0e7490'));
+    }
+    if (salv.pending_count) {
+        histBadges.push(badge(`pending fold · ${salv.pending_count}`, '#f97316'));
+    }
+    if (salv.folded_count) {
+        histBadges.push(badge(`folded · ${salv.folded_count}`, '#16a34a'));
+    }
+    if (salv.failed_count) {
+        histBadges.push(badge(`failed fold · ${salv.failed_count}`, '#dc2626'));
+    }
+    // Legacy slot names retained for back-compat with D's existing
+    // test fixtures (hist.pending_fold / hist.failed_fold). When the
+    // backend rolls over fully to `history.salvages`, the legacy
+    // slots will be unused and these two lines become dead code.
     if (hist.pending_fold) histBadges.push(badge('pending fold', '#f97316'));
     if (hist.failed_fold) histBadges.push(badge('failed fold', '#dc2626'));
-    const histExtrasFull = histBadges.join('') + histExtras;
-    const histWarning = status.silently_pruned_path_active
-        ? 'silently-pruned path still active — older messages may have been dropped without a durable summary (until #1311 ships)'
+    // Pre-C boundary annotation (Emma 2026-05-21 refinement on
+    // question (a) — Option 1, no backfill, surfaces the boundary
+    // honestly so the operator can see where salvage history begins).
+    const preCNote = salv.pre_c_boundary_at
+        ? `<div style="font-size:0.7rem;color:var(--text-secondary);margin-top:0.15rem">Salvage history begins ${_esc(salv.pre_c_boundary_at)} — older silently-pruned spans reachable via <code>!context restore</code> with <code>include_excluded=True</code> but were not salvaged at prune time.</div>`
         : '';
+    const histExtrasFull = histBadges.join('') + histExtras + preCNote;
+    // Compose the warning row. Two independent triggers:
+    //   1. Legacy silent-prune still active (feature flag off / pre-C).
+    //   2. Summariser falling behind: pending_count above the
+    //      warn-threshold the backend surfaces (Emma 2026-05-21
+    //      refinement on back-pressure).
+    const warningParts = [];
+    if (status.silently_pruned_path_active) {
+        warningParts.push(
+            'silently-pruned path still active — older messages may have been dropped without a durable summary (until #1311 ships)'
+        );
+    }
+    const warnThreshold = salv.warn_threshold || 10;
+    if (salv.pending_count && salv.pending_count > warnThreshold) {
+        warningParts.push(
+            `Summary worker is falling behind — ${salv.pending_count} spans waiting; older ones may surface as pointer-only-terminal. Salvage is still durable; only the summary is delayed.`
+        );
+    }
+    const histWarning = warningParts.join(' · ');
 
     const ep = sections.episodes || {};
     const epExtras = (ep.count || 0) > 0

@@ -1069,6 +1069,18 @@ class KestrelAgent(
 
             # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
+        # C / #1311 durable salvage worker — only starts when the
+        # feature flag is enabled (otherwise no-op). Wired here so
+        # both ``ContextManager.build_context`` (which schedules
+        # summaries on every prune) and the periodic janitor have a
+        # live worker to talk to. Without this hook the salvage rows
+        # would stay in ``pointer-only`` forever — codex round 1 #3.
+        if hasattr(self, "context_manager") and self.context_manager:
+            try:
+                await self.context_manager.start_salvage_worker()
+            except Exception as e:
+                logging.warning(f"failed to start salvage worker: {e}")
+
         # Lifecycle hardening (#377): refuse to declare initialization
         # successful when no LLM provider came up. Lives here rather than in
         # the server lifespan so single-agent, multi-agent (AgentManager),
@@ -2439,6 +2451,14 @@ Expected Duration: {expected_duration}
                 await self.heartbeat_runner.stop()
             except Exception as e:
                 logging.warning(f"Error stopping heartbeat: {e}")
+
+        # Stop C / #1311 durable salvage worker. Drains in-flight
+        # summary tasks; the janitor catches up the rest on next start.
+        if hasattr(self, "context_manager") and self.context_manager:
+            try:
+                await self.context_manager.stop_salvage_worker()
+            except Exception as e:
+                logging.warning(f"Error stopping salvage worker: {e}")
 
         # Shutdown security feature if it exists
         security_feature = self.features.get("SecurityFeature")

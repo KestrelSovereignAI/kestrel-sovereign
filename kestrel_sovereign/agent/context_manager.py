@@ -26,6 +26,13 @@ from .context_builder import ContextBuilder
 from .token_counter import TokenCounter, get_token_counter
 from .token_budget import TokenBudget, create_budget, DegradedModeError
 from .conversation_manager import ConversationManager
+from .salvage import (
+    SalvageReason,
+    SalvageWriteError,
+    get_pending_count,
+    is_durable_salvage_enabled,
+    salvage_messages,
+)
 from .memory_manager import MemoryManager
 from .tool_context_manager import ToolContextManager
 
@@ -195,6 +202,70 @@ class ContextManager:
             agent_id=agent_id,
             llm_service=llm_service,
         )
+
+        # C / #1311 durable salvage worker. Lazily started — the
+        # janitor only runs when ``start_salvage_worker()`` is
+        # invoked by the agent's lifecycle (KestrelAgent.startup
+        # hook). When ``is_durable_salvage_enabled()`` is False the
+        # worker stays None and the build_context salvage branch
+        # is a no-op. Codex round 1 #3 caught the earlier version
+        # that left this slot empty in production.
+        self.salvage_worker = None
+        self._salvage_worker_started = False
+
+    async def start_salvage_worker(self) -> None:
+        """Start the C / #1311 durable-salvage background worker.
+
+        Idempotent. Called by the agent's startup hook. When the
+        feature flag is disabled, this is a no-op so legacy
+        deployments do not spin a janitor task they will never use.
+        """
+        from .salvage import SalvageWorker, is_durable_salvage_enabled
+
+        if self._salvage_worker_started:
+            return
+        if not is_durable_salvage_enabled():
+            return
+        conv_store = getattr(
+            self.conversation_manager, "_get_conversation_store", lambda: None
+        )()
+        if conv_store is None:
+            logger.warning(
+                "salvage worker not started: no conversation store available"
+            )
+            return
+        if self.llm_service is None or not hasattr(self.llm_service, "generate"):
+            logger.warning(
+                "salvage worker not started: llm_service.generate not available"
+            )
+            return
+
+        async def _llm_completion(**kwargs):
+            # Adapter to LLMService.generate's canonical signature
+            # (user_prompt + system_prompt). The SalvageWorker
+            # introspects the callable and prefers user_prompt,
+            # so we accept either.
+            user_prompt = kwargs.pop("user_prompt", None) or kwargs.pop("prompt", "")
+            system_prompt = kwargs.pop("system_prompt", None)
+            return await self.llm_service.generate(
+                user_prompt=user_prompt,
+                system_prompt=system_prompt,
+            )
+
+        self.salvage_worker = SalvageWorker(
+            conv_store=conv_store,
+            llm_completion=_llm_completion,
+        )
+        await self.salvage_worker.start()
+        self._salvage_worker_started = True
+        logger.info("salvage worker started (C / #1311 feature flag enabled)")
+
+    async def stop_salvage_worker(self) -> None:
+        """Stop the salvage worker; called by the agent's shutdown hook."""
+        if self.salvage_worker is not None:
+            await self.salvage_worker.stop()
+        self.salvage_worker = None
+        self._salvage_worker_started = False
 
     @property
     def model(self) -> str:
@@ -683,6 +754,131 @@ class ContextManager:
             warnings.append(
                 f"Auto-pruned {pruned_tokens} tokens from history to fit budget"
             )
+
+        # === C / #1311: durable salvage of pruned spans ===
+        # Any messages that were in the raw history but did not survive
+        # the prune pipeline (format_conversation_history's per-message
+        # budget, pre-trim from B, or the legacy post-budget overflow
+        # guard) are about to leave the model-visible slice. Emma's
+        # invariant: no model-visible pruning without a sync durable
+        # artifact. If the feature flag is enabled, write a salvage
+        # marker BEFORE returning the ContextResult — the LLM call
+        # downstream will not see these bytes, so the salvage must
+        # commit first. Sync write failure is fail-closed (Emma 2026-05-20
+        # hardening): we drop into degraded-mode rather than silently
+        # proceed.
+        if (
+            is_durable_salvage_enabled()
+            and len(formatted_history) < len(history)
+        ):
+            dropped_count = len(history) - len(formatted_history)
+            dropped = history[:dropped_count]
+            dropped_ids = [m["id"] for m in dropped if m.get("id") is not None]
+            if dropped_ids:
+                token_estimate = sum(
+                    self.counter.count(m.get("content", "") or "")
+                    + 4  # _MESSAGE_OVERHEAD; mirrors estimate_effective_history_tokens
+                    for m in dropped
+                )
+                # Derive session_id from the dropped messages' own
+                # metadata when present (rows written by add_conversation
+                # carry it). Falls back to None for legacy un-tagged
+                # rows; the salvage row stores it for non-leakage on
+                # the popup query path (#713).
+                salvage_session_id: Optional[str] = None
+                for m in dropped:
+                    meta = m.get("metadata")
+                    if isinstance(meta, dict):
+                        sid = meta.get("session_id")
+                        if sid:
+                            salvage_session_id = sid
+                            break
+                conv_store = (
+                    self.conversation_manager._get_conversation_store()
+                    if hasattr(self.conversation_manager, "_get_conversation_store")
+                    else None
+                )
+                if conv_store is None:
+                    # Feature flag is on (we got into this branch),
+                    # but no conv_store is available. We cannot write
+                    # a durable record — fail closed rather than
+                    # silently let bytes leave the model view
+                    # without one (codex round 1 #7).
+                    logger.error(
+                        "DEGRADED MODE: durable salvage feature flag "
+                        "is ON but no conversation store is reachable; "
+                        "the LLM call MUST NOT proceed"
+                    )
+                    warnings.append(
+                        "DEGRADED MODE: durable salvage feature flag "
+                        "is enabled but the conversation store is not "
+                        "reachable. The LLM call MUST NOT proceed."
+                    )
+                    return ContextResult(
+                        system_prompt="",
+                        messages=[],
+                        total_tokens=0,
+                        budget_summary={
+                            "mode": "degraded",
+                            "reason": "salvage-conv-store-unavailable",
+                        },
+                        warnings=warnings,
+                        degraded_mode=True,
+                        mandatory_system_tokens=mandatory_system_tokens,
+                    )
+                if conv_store is not None:
+                    try:
+                        pending = await get_pending_count(
+                            conv_store, session_id=salvage_session_id
+                        )
+                        salvage = await salvage_messages(
+                            conv_store=conv_store,
+                            original_messages=dropped,
+                            reason=SalvageReason.AUTO_PRUNE_POSTBUDGET,
+                            model=self.model,
+                            session_id=salvage_session_id,
+                            token_estimate=token_estimate,
+                            pending_count=pending,
+                        )
+                        worker = getattr(self, "salvage_worker", None)
+                        if (
+                            worker is not None
+                            and not salvage.pointer_only_terminal
+                        ):
+                            worker.schedule_summary(salvage.salvage_id)
+                        warnings.append(
+                            f"context-salvage: {len(dropped_ids)} messages "
+                            f"folded into salvage marker {salvage.salvage_id} "
+                            f"({'pointer-only-terminal' if salvage.pointer_only_terminal else 'pointer-only — async summary scheduled'})"
+                        )
+                    except SalvageWriteError as e:
+                        # Fail closed (Emma 2026-05-20 hardening): the
+                        # bytes would leave the model view without a
+                        # durable record, which violates C's invariant.
+                        # Surface the failure and return a degraded
+                        # ContextResult rather than issue the LLM call.
+                        logger.error(
+                            "DEGRADED MODE: salvage write failed (%s); "
+                            "LLM call MUST NOT proceed",
+                            e,
+                        )
+                        warnings.append(
+                            f"DEGRADED MODE: durable salvage write failed "
+                            f"({e}). The LLM call MUST NOT proceed — "
+                            "see logs and consider !context restore."
+                        )
+                        return ContextResult(
+                            system_prompt="",
+                            messages=[],
+                            total_tokens=0,
+                            budget_summary={
+                                "mode": "degraded",
+                                "reason": f"salvage-write-failed: {e}",
+                            },
+                            warnings=warnings,
+                            degraded_mode=True,
+                            mandatory_system_tokens=mandatory_system_tokens,
+                        )
 
         logger.info(
             f"Context built: {budget.total_used}/{budget.total_budget} tokens "
