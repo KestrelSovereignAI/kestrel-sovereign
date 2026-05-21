@@ -416,6 +416,44 @@ class TestToolActivityMarkers:
         assert stream.count("✓ shell complete") == 1
 
     @pytest.mark.asyncio
+    async def test_idless_items_dont_collapse_into_one_dedupe_slot(self):
+        """Codex review P2 (PR #1334): the empty-string fallback for
+        missing ``id``/``callId`` would have put every id-less item in
+        the same dedupe slot, dropping all but the first marker. The
+        real protocol always sends ids, but defensive coding matters —
+        if a future build ever omits one, the rest of the chat shouldn't
+        go dark."""
+        events = [
+            {"method": "item/started", "params": {"item": {
+                "type": "commandExecution", "command": "ls",
+                # NO id field — exercises the fallback path.
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "type": "commandExecution", "command": "ls",
+                "status": "succeeded",
+            }}},
+            {"method": "item/started", "params": {"item": {
+                "type": "commandExecution", "command": "pwd",
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "type": "commandExecution", "command": "pwd",
+                "status": "succeeded",
+            }}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        a = _adapter_with(events)
+        chunks = [
+            c async for c in a.get_streaming_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "go"}], session_id="s",
+            )
+        ]
+        stream = "".join(c for c in chunks if isinstance(c, str))
+        # Both calls must appear — start + complete each.
+        assert stream.count("\U0001f527 Calling shell") == 2
+        assert stream.count("✓ shell complete") == 2
+
+    @pytest.mark.asyncio
     async def test_dynamic_tool_emits_marker_and_preserves_executed_log(self):
         """Kestrel-dispatched tools (dynamicToolCall): the start/complete
         markers must fire AND the executed_tool_calls record the

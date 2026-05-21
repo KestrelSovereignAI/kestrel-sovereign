@@ -644,8 +644,14 @@ class CodexAdapter(LLMAdapter):
                     item = p.get("item") or {}
                     itype = item.get("type") or ""
                     iid = item.get("id") or item.get("callId") or ""
-                    if itype in _TOOL_ITEM_TYPES and iid not in started_item_ids:
-                        started_item_ids.add(iid)
+                    # Only dedupe when the protocol gives us an id;
+                    # falling back to ``""`` would collapse every
+                    # id-less item into one dedupe slot and silently
+                    # drop subsequent start markers (codex P2).
+                    already_started = bool(iid) and iid in started_item_ids
+                    if itype in _TOOL_ITEM_TYPES and not already_started:
+                        if iid:
+                            started_item_ids.add(iid)
                         label = _item_display_label(item)
                         # Shell items get a one-line command preview so
                         # the user sees what's running, not just "shell"
@@ -681,11 +687,17 @@ class CodexAdapter(LLMAdapter):
                         # collapse start+complete for very fast items)
                         # — without a completion line the chat-UI parser
                         # leaves the card in a "running" state forever.
-                        if iid in completed_item_ids:
+                        # Same dedupe carve-out as item/started: only
+                        # gate on iid when one was supplied; missing-id
+                        # items always emit so they're not collapsed
+                        # into a single phantom (codex P2).
+                        already_completed = bool(iid) and iid in completed_item_ids
+                        if already_completed:
                             # Defensive: never two ✓ lines for one item.
                             pass
                         else:
-                            completed_item_ids.add(iid)
+                            if iid:
+                                completed_item_ids.add(iid)
                             label = _item_display_label(item)
                             status = (
                                 item.get("status")
@@ -713,9 +725,15 @@ class CodexAdapter(LLMAdapter):
                         # marker-only — those execute inside the
                         # app-server and have no kestrel-side audit row.
                         if itype in _KESTREL_DISPATCHED_TOOL_ITEM_TYPES:
-                            if iid in seen_tool_ids:
+                            # See dedupe carve-out above. The
+                            # ``ToolCallStarted`` honesty-layer signal
+                            # MUST fire per tool — collapsing two
+                            # id-less calls into one would silently
+                            # break narration auditing.
+                            if iid and iid in seen_tool_ids:
                                 continue
-                            seen_tool_ids.add(iid)
+                            if iid:
+                                seen_tool_ids.add(iid)
                             raw_args = item.get("arguments")
                             if isinstance(raw_args, str):
                                 try:
