@@ -166,6 +166,49 @@ class Feature(_SdkFeature):
         repaired.append({"role": "user", "content": TURN_COMPLETION_REPAIR_PROMPT})
         return repaired
 
+    @staticmethod
+    def _extract_response_reasoning_content(response: Any) -> Optional[str]:
+        """Return provider reasoning that must be replayed with tool history."""
+        raw = getattr(response, "raw", None)
+        if isinstance(raw, dict):
+            reasoning = raw.get("reasoning_content")
+            return reasoning if isinstance(reasoning, str) and reasoning else None
+
+        try:
+            message = raw.choices[0].message
+        except (AttributeError, IndexError, TypeError):
+            return None
+
+        reasoning = getattr(message, "reasoning_content", None)
+        return reasoning if isinstance(reasoning, str) and reasoning else None
+
+    def _build_subagent_assistant_tool_history_msg(self, response: Any) -> dict:
+        """Build assistant tool-call history for feature subagent loops."""
+        message = {
+            "role": "assistant",
+            "content": getattr(response, "content", None) or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.name,
+                        "arguments": (
+                            tc.arguments if isinstance(tc.arguments, dict)
+                            else json.loads(tc.arguments) if tc.arguments else {}
+                        ),
+                    },
+                }
+                for tc in response.tool_calls
+            ],
+        }
+
+        reasoning_content = self._extract_response_reasoning_content(response)
+        if reasoning_content and getattr(response, "tool_calls", None):
+            message["reasoning_content"] = reasoning_content
+
+        return message
+
     async def _repair_subagent_premature_yield(
         self,
         response: Any,
@@ -727,25 +770,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
             if not hasattr(response, 'tool_calls') or not response.tool_calls:
                 return response.content or ""
 
-        messages.append({
-            "role": "assistant",
-            "content": response.content,
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.name,
-                        "arguments": (
-                            json.dumps(tc.arguments)
-                            if isinstance(tc.arguments, dict)
-                            else tc.arguments
-                        ),
-                    }
-                }
-                for tc in response.tool_calls
-            ],
-        })
+        messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         # Get tools by name for execution
         tools_by_name = {tool.name: tool for tool in self.get_tools()}
@@ -839,44 +864,12 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 if isinstance(response, str):
                     return response
                 if hasattr(response, 'tool_calls') and response.tool_calls:
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content,
-                        "tool_calls": [
-                            {
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": (
-                                        json.dumps(tc.arguments)
-                                        if isinstance(tc.arguments, dict)
-                                        else tc.arguments
-                                    ),
-                                }
-                            }
-                            for tc in response.tool_calls
-                        ]
-                    })
+                    messages.append(self._build_subagent_assistant_tool_history_msg(response))
                     continue
                 return response.content or ""
 
             # Add assistant response with new tool calls to messages
-            messages.append({
-                "role": "assistant",
-                "content": response.content,
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.name,
-                            "arguments": json.dumps(tc.arguments) if isinstance(tc.arguments, dict) else tc.arguments
-                        }
-                    }
-                    for tc in response.tool_calls
-                ]
-            })
+            messages.append(self._build_subagent_assistant_tool_history_msg(response))
 
         return "Error: Maximum tool call iterations exceeded"
 
