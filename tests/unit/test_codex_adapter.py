@@ -549,6 +549,94 @@ class TestToolExecutorBridge:
         assert [d.content for d in deltas] == ["thinking-one", "summary-two"]
 
     @pytest.mark.asyncio
+    async def test_executed_tool_calls_attached_with_app_server_callid(self):
+        """The adapter records every inline-executed tool call (with
+        the app-server's own ``callId`` for audit alignment) on the
+        returned LLMResponse via the ``executed_tool_calls`` runtime
+        attribute. The orchestrator reads this generically (any
+        inline-executing adapter sets it) to render chat-history
+        breadcrumbs without re-dispatching."""
+
+        class _AppWithToolCall:
+            def __init__(self):
+                self.registered = {}
+                self.requests = []
+                self.dynamic_tools = None
+
+            async def ensure_started(self):
+                pass
+
+            async def request(self, method, params=None, *, timeout=120):
+                self.requests.append((method, params))
+                if method == "thread/start":
+                    self.dynamic_tools = (params or {}).get("dynamicTools")
+                    return {"thread": {"id": "thr-x"}}
+                if method == "turn/start":
+                    # Simulate the app-server issuing item/tool/call
+                    # mid-turn — the handler stamps the executed_log.
+                    handler = self.registered.get(("item/tool/call", "thr-x"))
+                    assert handler is not None, "tool-call handler missing"
+                    await handler({
+                        "threadId": "thr-x",
+                        "callId": "call_abc",
+                        "tool": "get_weather",
+                        "arguments": '{"city": "SF"}',
+                    })
+                    return {"turn": {"id": "turn-x"}}
+                return {}
+
+            def register_server_request_handler(self, m, h, *, thread_id=None):
+                self.registered[(m, thread_id)] = h
+                return lambda: self.registered.pop((m, thread_id), None)
+
+            def open_turn_sink(self, key):
+                return key
+
+            def close_turn_sink(self, key):
+                pass
+
+            async def iter_turn_events(self, sink, *, idle_timeout=120):
+                for ev in [
+                    {"method": "item/completed",
+                     "params": {"item": {
+                         "type": "dynamicToolCall",
+                         "id": "call_abc",
+                         "name": "get_weather",
+                         "arguments": '{"city": "SF"}',
+                     }}},
+                    {"method": "item/completed",
+                     "params": {"item": {
+                         "type": "agentMessage", "text": "It's sunny.",
+                     }}},
+                    {"method": "turn/completed", "params": {}},
+                ]:
+                    yield ev
+
+        async def exe(name, args):
+            return {"success": True, "result": "sunny"}
+
+        a = CodexAdapter()
+        a._client = _AppWithToolCall()
+        r = await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "weather?"}],
+            tools=[{"type": "function", "function": {
+                "name": "get_weather", "description": "d",
+                "parameters": {"type": "object"}}}],
+            session_id="brd-test", tool_executor=exe,
+        )
+        # No re-dispatch surface.
+        assert not r.tool_calls
+        # New: orchestrator-readable breadcrumb data with the app-server's
+        # OWN callId (so audit trails align with codex-side identifiers).
+        executed = getattr(r, "executed_tool_calls", None)
+        assert executed and len(executed) == 1
+        assert executed[0]["id"] == "call_abc"
+        assert executed[0]["name"] == "get_weather"
+        assert executed[0]["arguments"] == {"city": "SF"}
+        assert executed[0]["result"] == {"success": True, "result": "sunny"}
+
+    @pytest.mark.asyncio
     async def test_inline_executed_tools_absent_from_final_response(self):
         """Regression: the app-server runs tools inline via our handler.
         Surfacing those calls in LLMResponse.tool_calls would make the
@@ -581,6 +669,58 @@ class TestToolExecutorBridge:
             "tool was inline-executed; surfacing it would make the "
             "orchestrator re-dispatch and duplicate side effects"
         )
+
+    @pytest.mark.asyncio
+    async def test_handler_records_post_hook_effective_args_not_pre_hook(self):
+        """If a PRE_TOOL_USE hook rewrites args (PII redact, normalize)
+        the breadcrumb must record what actually RAN, not what the
+        model sent. The kestrel-side executor returns
+        ``(effective_args, result)`` for exactly this — pre-hook args
+        leaking into audit would undo the hook's purpose.
+        """
+        a = CodexAdapter()
+
+        async def exe_with_hook(name, args):
+            # Simulate a hook that redacts a sensitive field.
+            redacted = {k: ("[REDACTED]" if k == "email" else v) for k, v in args.items()}
+            return redacted, {"success": True, "result": "ok"}
+
+        log: list = []
+        handler = a._make_tool_call_handler(
+            exe_with_hook, "thr", frozenset({"send"}), log,
+        )
+        await handler({
+            "threadId": "thr", "callId": "c1", "tool": "send",
+            "arguments": {"email": "secret@example.com", "body": "hi"},
+        })
+        assert log and log[0]["arguments"] == {
+            "email": "[REDACTED]", "body": "hi",
+        }, "breadcrumb leaked pre-hook arguments"
+
+    @pytest.mark.asyncio
+    async def test_handler_records_failed_inline_executions(self):
+        """Mirrors the orchestrator-dispatched path: tool failures
+        appear in audit / STOP / UI surfaces, not silently dropped."""
+        a = CodexAdapter()
+
+        async def exe_that_raises(name, args):
+            raise RuntimeError("backend down")
+
+        log: list = []
+        handler = a._make_tool_call_handler(
+            exe_that_raises, "thr", frozenset({"t"}), log,
+        )
+        reply = await handler({
+            "threadId": "thr", "callId": "c-fail", "tool": "t",
+            "arguments": {},
+        })
+        # App-server gets a failure reply (existing behavior).
+        assert reply["success"] is False
+        # Breadcrumb records the failed call so audit isn't blind.
+        assert log and log[0] == {
+            "id": "c-fail", "name": "t", "arguments": {},
+            "result": {"success": False, "error": "backend down"},
+        }
 
     @pytest.mark.asyncio
     async def test_handler_executor_exception_becomes_failure_reply(self):

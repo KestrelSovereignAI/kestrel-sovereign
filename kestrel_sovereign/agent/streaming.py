@@ -396,6 +396,15 @@ class StreamingMixin:
         # Log LLM response
         llm_duration = int((time.time() - llm_start) * 1000)
         has_tool_calls = tool_response is not None and tool_response.has_tool_calls
+        # Inline-executing adapters (codex app-server today; potentially
+        # MCP/voice realtime tomorrow) execute tools INSIDE the LLM call
+        # and report what they did via an ``executed_tool_calls`` runtime
+        # attribute on LLMResponse. Surface that to the same persisted
+        # ``tool_events`` metadata channel the chat UI subscribes to.
+        inline_executed = (
+            getattr(tool_response, "executed_tool_calls", None)
+            if tool_response is not None else None
+        )
 
         logging.info(f"[AGENTIC-STREAM] LLM stream complete: has_tool_calls={has_tool_calls}, text_chunks={len(full_response)}")
 
@@ -531,6 +540,48 @@ class StreamingMixin:
                 stop_tool_calls = list(tool_calls_payload)
             else:
                 stop_tool_calls = None
+        elif inline_executed:
+            # Inline-executed branch: the adapter ran tools mid-call
+            # (codex app-server's item/tool/call RPC). No
+            # ``_dispatch_tool_call`` ran, so synthesize the same
+            # ``tool_events`` / ``tool_results`` envelopes the
+            # orchestrator-dispatched path would have produced and
+            # persist via the metadata path the chat UI already reads.
+            from kestrel_sovereign.features.base import _serialize_tool_result
+            from kestrel_sovereign.security.narration_check import (
+                summarize_tool_result_for_audit,
+            )
+            synth_tool_events = []
+            tool_results: list = []
+            for e in inline_executed:
+                synth_tool_events.append({"type": "start", "tool": e["name"]})
+                synth_tool_events.append({"type": "complete", "tool": e["name"], "ms": 0})
+                serialized = _serialize_tool_result(e["result"])
+                tool_results.append({
+                    "tool_call_id": e["id"],
+                    "name": e["name"],
+                    "arguments": e["arguments"],
+                    "result": summarize_tool_result_for_audit(serialized),
+                })
+            final_text = "".join(full_response)
+            tool_calls_payload = [
+                {"id": e["id"], "name": e["name"], "arguments": e["arguments"]}
+                for e in inline_executed
+            ]
+            final_text = await self._fire_post_response_hook(
+                final_text, session_id,
+                pre_tool_prose=pre_tool_prose_snapshot or "",
+                tool_calls=tool_calls_payload,
+                tool_results=tool_results,
+            )
+            await self._persist_assistant_turn_safely(
+                final_text,
+                metadata={"tool_events": synth_tool_events},
+                session_id=session_id, request_id=request_id,
+            )
+            final_assistant_text = final_text
+            stop_tool_results = tool_results
+            stop_tool_calls = tool_calls_payload
         else:
             # No tool calls - text was already streamed above. Pre-tool
             # prose / tool_calls / tool_results all stay None: a hook

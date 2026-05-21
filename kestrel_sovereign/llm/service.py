@@ -1270,11 +1270,23 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         duration_ms = int((time.time() - start_time) * 1000)
         response_text = response.content if isinstance(response, LLMResponse) else str(response)
         tool_calls_data = None
-        if isinstance(response, LLMResponse) and response.tool_calls:
-            tool_calls_data = [
-                {"name": tc.name, "arguments": tc.arguments}
-                for tc in response.tool_calls
-            ]
+        if isinstance(response, LLMResponse):
+            if response.tool_calls:
+                tool_calls_data = [
+                    {"name": tc.name, "arguments": tc.arguments}
+                    for tc in response.tool_calls
+                ]
+            else:
+                # Inline-executing adapters (codex app-server) populate
+                # ``executed_tool_calls`` instead of ``tool_calls`` —
+                # the LLM call still used tools, so the audit log
+                # should reflect them.
+                executed = getattr(response, "executed_tool_calls", None)
+                if executed:
+                    tool_calls_data = [
+                        {"name": e["name"], "arguments": e["arguments"]}
+                        for e in executed
+                    ]
 
         # Extract token counts from response for billing
         input_tokens = None

@@ -476,11 +476,78 @@ class OrchestratorEngineMixin:
         """
 
         async def _exec(name: str, args: dict):
-            return await self.execute_named_tool(
+            # Capture the post-hook args so the inline adapter's
+            # breadcrumb records what actually ran (PRE_TOOL_USE
+            # redactors stay applied in audit/UI/STOP-hook
+            # surfaces — pre-hook args would leak redacted values).
+            capture: Dict[str, Any] = {}
+            result = await self.execute_named_tool(
                 name, args, session_id=session_id, source="codex_app_server",
+                _capture=capture,
             )
+            return capture.get("effective_args", args), result
 
         return _exec
+
+    def _append_executed_tool_breadcrumbs(
+        self, messages: list,
+        executed: list,
+        tool_results: Optional[list] = None,
+    ) -> None:
+        """Persist inline-executed tool calls into the same chat-history
+        shape the orchestrator's normal tool loop produces, so the UI
+        renders calls + results and observability sees them.
+
+        Generic over adapter: any adapter that runs tools inline
+        (codex's ``item/tool/call`` RPC today; potentially MCP / voice
+        realtime tomorrow) attaches an ``executed_tool_calls`` list to
+        its returned ``LLMResponse``. Each entry is a dict of
+        ``{id, name, arguments, result}``. This helper translates them
+        into ``{role:"assistant", tool_calls:[...]}`` + one
+        ``{role:"tool", tool_call_id, content}`` per call — the same
+        message sequence ``_execute_tool_batch`` produces for the
+        orchestrator-dispatched path.
+
+        Call this BEFORE appending the LLMResponse's final assistant
+        text to ``messages`` so the chat history reads left-to-right
+        as: tool calls advertised → tool results returned → model's
+        synthesized reply.
+        """
+        if not executed:
+            return
+        from kestrel_sovereign.features.base import _serialize_tool_result
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+
+        tool_calls_msg = [
+            {
+                "id": e["id"],
+                "type": "function",
+                "function": {
+                    "name": e["name"],
+                    "arguments": json.dumps(e["arguments"]),
+                },
+            }
+            for e in executed
+        ]
+        messages.append({
+            "role": "assistant", "content": "", "tool_calls": tool_calls_msg,
+        })
+        for e in executed:
+            serialized = _serialize_tool_result(e["result"])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": e["id"],
+                "content": json.dumps(serialized),
+            })
+            if tool_results is not None:
+                tool_results.append({
+                    "tool_call_id": e["id"],
+                    "name": e["name"],
+                    "arguments": e["arguments"],
+                    "result": summarize_tool_result_for_audit(serialized),
+                })
 
     async def execute_named_tool(
         self,
@@ -489,6 +556,7 @@ class OrchestratorEngineMixin:
         *,
         session_id: str,
         source: str = "external",
+        _capture: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Transport-agnostic governed tool dispatch.
 
@@ -593,6 +661,19 @@ class OrchestratorEngineMixin:
         pre_output = await self.hooks_manager.execute_hooks(
             HookEvent.PRE_TOOL_USE, pre_input,
         )
+        # Resolve effective args (post-hook) BEFORE the deny/ASK
+        # branches so the inline-executor wrapper's audit reflects
+        # the hook-rewritten arguments even when the dispatch is
+        # blocked. A PRE_TOOL_USE redactor running before a denial
+        # must not be undone by the breadcrumb.
+        post_hook_args = (
+            pre_output.updated_input
+            if pre_output.updated_input is not None
+            else pre_input.tool_input
+        )
+        if _capture is not None:
+            _capture["effective_args"] = post_hook_args
+
         # ASK is just as blocking as DENY — a hook returning ASK is
         # routing the call to an approval queue and the tool MUST NOT
         # run until that approval lands.  Surfaced to the caller as a
@@ -621,10 +702,7 @@ class OrchestratorEngineMixin:
         # the single-hook short-circuit shape;  ``pre_input.tool_input``
         # carries the real HookManager's MODIFY accumulation across a
         # multi-hook chain (and defaults to ``args`` when no MODIFY ran).
-        if pre_output.updated_input is not None:
-            effective_args = pre_output.updated_input
-        else:
-            effective_args = pre_input.tool_input
+        effective_args = post_hook_args
 
         # --- Execute the tool ---
         exec_start = time.time()
@@ -1414,6 +1492,23 @@ class OrchestratorEngineMixin:
                 if isinstance(response, str):
                     return response
             if not response.has_tool_calls:
+                # Inline-executing adapters (codex app-server today)
+                # surface what they ran via ``executed_tool_calls`` on
+                # the response. Even when no orchestrator-dispatched
+                # tool_calls follow, record those into the chat-history
+                # ``messages`` and the STOP hook's ``tool_results`` so
+                # the rest of the system (audit log, reflection #1238,
+                # downstream hooks) sees the same envelopes it would for
+                # the orchestrator-dispatched path.
+                executed = getattr(response, "executed_tool_calls", None)
+                if executed:
+                    self._append_executed_tool_breadcrumbs(
+                        messages, executed, tool_results,
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content or "",
+                    })
                 return response.content or ""
 
         # Add initial assistant response with tool calls

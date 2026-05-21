@@ -56,7 +56,15 @@ logger = logging.getLogger(__name__)
 # Signature of the kestrel-side tool executor the orchestrator wires in.
 # Returns a dict with at minimum ``success: bool``; ``result`` carries
 # the tool's payload (already passed through POST_TOOL_USE hooks).
-ToolExecutor = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+# Async ``(name, args) -> (effective_args, result)``. The kestrel-side
+# wrapper returns the post-hook args alongside the result so the
+# adapter can record the *actually-executed* arguments into audit /
+# UI breadcrumbs — pre-hook args may carry values a PRE_TOOL_USE
+# redactor intentionally stripped.
+ToolExecutor = Callable[
+    [str, Dict[str, Any]],
+    Awaitable[Tuple[Dict[str, Any], Any]],
+]
 
 
 def _extract_instructions_and_input(messages):
@@ -325,6 +333,7 @@ class CodexAdapter(LLMAdapter):
     def _make_tool_call_handler(
         self, executor: ToolExecutor, thread_id: str,
         allowed_tools: frozenset,
+        executed_log: Optional[List[Dict[str, Any]]] = None,
     ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
         """Wrap ``executor`` into an app-server ``item/tool/call``
         handler scoped to this turn's thread.
@@ -340,6 +349,12 @@ class CodexAdapter(LLMAdapter):
           resolve through the orchestrator's full registry, bypassing
           per-turn restrictions (denied-tool stripping, capability
           gating).
+
+        ``executed_log`` (optional): each successful execution appends
+        ``{id, name, arguments, result}`` so callers can surface the
+        same chat-history breadcrumbs the orchestrator-dispatched path
+        produces. ``id`` is the app-server's own ``callId`` so audit
+        trails align with codex-side ids.
         """
 
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -372,10 +387,28 @@ class CodexAdapter(LLMAdapter):
                     args = json.loads(args)
                 except ValueError:
                     args = {"_raw": args}
+            call_id = params.get("callId") or params.get("id") or ""
+            # The executor returns (effective_args, result) — effective
+            # args are what actually ran after PRE_TOOL_USE hooks, so
+            # the breadcrumb reflects the redacted/rewritten payload,
+            # not the model's pre-hook arguments.
+            effective_args: Dict[str, Any] = (
+                args if isinstance(args, dict) else {}
+            )
             try:
-                result = await executor(name, args)
+                ret = await executor(name, args)
             except Exception as e:
                 logger.warning("tool_executor(%s) raised: %s", name, e)
+                err_result = {"success": False, "error": f"{e}"}
+                # Failed inline tool calls must remain observable —
+                # mirrors the orchestrator-dispatched path, which
+                # records error results in tool_results/tool_events.
+                if executed_log is not None:
+                    executed_log.append({
+                        "id": call_id, "name": name,
+                        "arguments": effective_args,
+                        "result": err_result,
+                    })
                 return {
                     "contentItems": [{
                         "type": "inputText",
@@ -383,6 +416,22 @@ class CodexAdapter(LLMAdapter):
                     }],
                     "success": False,
                 }
+            # Real orchestrator-side executor returns (effective_args,
+            # result). Permissive: simpler tools/tests may return just
+            # the result — in which case effective_args == args.
+            if (
+                isinstance(ret, tuple) and len(ret) == 2
+                and isinstance(ret[0], dict)
+            ):
+                effective_args, result = ret
+            else:
+                result = ret
+            if executed_log is not None:
+                executed_log.append({
+                    "id": call_id, "name": name,
+                    "arguments": effective_args,
+                    "result": result,
+                })
             return _result_to_codex_response(result)
 
         return handler
@@ -439,6 +488,11 @@ class CodexAdapter(LLMAdapter):
         lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
         await lock.acquire()
 
+        # Per-turn record of every inline-executed tool call. Surfaced
+        # on the final LLMResponse so the orchestrator can render
+        # chat-history breadcrumbs generically (any adapter that runs
+        # tools inline uses this same channel).
+        executed_log: List[Dict[str, Any]] = []
         unregister = None
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
@@ -457,7 +511,7 @@ class CodexAdapter(LLMAdapter):
             unregister = app.register_server_request_handler(
                 "item/tool/call",
                 self._make_tool_call_handler(
-                    tool_executor, thread_id, allowed_tools,
+                    tool_executor, thread_id, allowed_tools, executed_log,
                 ),
                 thread_id=thread_id,
             )
@@ -541,7 +595,13 @@ class CodexAdapter(LLMAdapter):
                 # turn/completed terminates iter_turn_events.
 
             content = final_text if final_text is not None else "".join(text_parts)
-            yield {"final": (content or None, tool_calls or None, usage)}
+            yield {
+                "final": (content or None, tool_calls or None, usage),
+                # The orchestrator reads this via getattr(response,
+                # "executed_tool_calls", None) and produces standard
+                # chat-history breadcrumbs from it.
+                "executed": list(executed_log),
+            }
         finally:
             app.close_turn_sink(thread_id)
             if unregister is not None:
@@ -564,12 +624,14 @@ class CodexAdapter(LLMAdapter):
         content: Optional[str] = None
         tool_calls: Optional[List[ToolCall]] = None
         usage: Dict[str, Optional[int]] = {}
+        executed: List[Dict[str, Any]] = []
         async for ev in self._run_turn(
             model, messages, tools, session_id, tool_executor
         ):
             if "final" in ev:
                 content, tool_calls, usage = ev["final"]
-        return LLMResponse(
+                executed = ev.get("executed") or []
+        resp = LLMResponse(
             content=content,
             tool_calls=tool_calls,
             input_tokens=usage.get("input_tokens"),
@@ -577,6 +639,15 @@ class CodexAdapter(LLMAdapter):
             total_tokens=usage.get("total_tokens"),
             cache_read_input_tokens=usage.get("cache_read_input_tokens"),
         )
+        # Attach inline-executed tool record as a runtime attribute. The
+        # SDK ``LLMResponse`` dataclass is not frozen, so this is a
+        # legal (if currently undocumented) extension. A follow-up SDK
+        # release will formalize ``executed_tool_calls`` as a typed
+        # field; the orchestrator already reads via ``getattr`` so the
+        # typed upgrade is a no-op behaviorally.
+        if executed:
+            resp.executed_tool_calls = executed
+        return resp
 
     async def get_streaming_response(
         self,
@@ -620,7 +691,7 @@ class CodexAdapter(LLMAdapter):
                 idx += 1
             elif "final" in ev:
                 content, tcs, usage = ev["final"]
-                yield LLMResponse(
+                resp = LLMResponse(
                     content=content,
                     tool_calls=tcs,
                     input_tokens=usage.get("input_tokens"),
@@ -628,6 +699,10 @@ class CodexAdapter(LLMAdapter):
                     total_tokens=usage.get("total_tokens"),
                     cache_read_input_tokens=usage.get("cache_read_input_tokens"),
                 )
+                executed = ev.get("executed") or []
+                if executed:
+                    resp.executed_tool_calls = executed
+                yield resp
 
     async def list_models(self, client: Any = None) -> List[ModelInfo]:
         """Model discovery is the canonical openai provider's job.
