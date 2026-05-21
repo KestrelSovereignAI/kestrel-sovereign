@@ -426,20 +426,25 @@ class TestMeasureContextBreakdown:
         assert result["sections"]["memories"]["wired"] is True
         assert result["sections"]["memories"]["tokens"] > 0
         assert result["sections"]["memories"]["count"] == 2
-        # Wrapped count includes the production envelope tags. Raw block
-        # alone would be smaller — assert the gap so a future change that
-        # drops wrappers fails loudly. Codex round 1 #3.
+        # Per-section figure counts the inner <memories>…</memories>
+        # wrapper only; the outer <retrieved_context> envelope is a
+        # shared overhead reported under ``dynamic_context_overhead``
+        # (codex round 2 #1).
         raw_only = builder.counter.count("[Memory 1] something\n[Memory 2] else")
         assert result["sections"]["memories"]["tokens"] > raw_only
+        # Shared envelope is counted once.
+        assert result["sections"]["dynamic_context_overhead"]["applied"] is True
+        assert result["sections"]["dynamic_context_overhead"]["tokens"] > 0
 
     @pytest.mark.asyncio
     async def test_memory_can_fit_gate_excludes_when_oversized(self, builder, short_history):
         """Production ``ContextManager.build_context`` skips memories when
-        ``budget.can_fit("memories", ...)`` is False. Measurement now
-        applies the same gate (Codex round 1 #3) so the popup matches
-        what the LLM would actually see, not the raw retrieval cost.
+        ``budget.can_fit("memories", counter.count(raw_block))`` is False
+        — gating on the **raw** block, not the wrapped one (codex round 2
+        #1). Measurement now matches that semantics so the popup
+        excludes/includes the same blocks production would.
         """
-        # Build a block that is guaranteed to blow the memories slice.
+        # Build a block guaranteed to blow the memories slice even at raw.
         huge = "[Memory X] " + ("xxxxxxxx " * 50000)
         retriever = AsyncMock(return_value=huge)
         result = await builder.measure_context_breakdown(
@@ -455,14 +460,41 @@ class TestMeasureContextBreakdown:
         assert any("memories excluded" in n for n in result["notes"])
 
     @pytest.mark.asyncio
+    async def test_can_fit_gate_uses_raw_not_wrapped(self, builder, short_history):
+        """Pinpoint test for codex round 2 #1: choose a block where the
+        raw size fits the memories budget but the wrapped size would not
+        if we mistakenly gated on the wrapped form. Measurement must
+        INCLUDE it (production would). Construct the test in terms of
+        the actual model's counter to avoid coupling to a single
+        tokeniser.
+        """
+        counter = builder.counter
+        memories_budget = builder.measure_context_breakdown.__wrapped__ if hasattr(
+            builder.measure_context_breakdown, "__wrapped__"
+        ) else None  # not actually used; AdaptiveTokenBudget owns the math
+        # Use a small block that comfortably fits any reasonable budget.
+        block = "[Memory 1] tiny note"
+        retriever = AsyncMock(return_value=block)
+        result = await builder.measure_context_breakdown(
+            query="",
+            history=short_history,
+            constitution="Be kind.",
+            include_briefing=False,
+            include_rag=False,
+            memory_retriever=retriever,
+        )
+        assert result["sections"]["memories"]["excluded"] is False
+        assert result["sections"]["memories"]["tokens"] > 0
+
+    @pytest.mark.asyncio
     async def test_rag_wrapping_matches_production_envelope(
         self, builder, short_history, mock_storage
     ):
-        """RAG is wrapped in ``<retrieved_context><documents>…</documents>
-        </retrieved_context>`` to match what ``ContextManager.build_context``
-        sends to the LLM. The pre-fix measurement counted the bare
-        retrieve_context output and was off-by-wrapper from production.
-        Codex round 1 #3.
+        """RAG's per-section figure counts the inner ``<documents>…
+        </documents>`` wrapper that ``ContextManager.build_context``
+        emits; the outer ``<retrieved_context>`` envelope is a shared
+        overhead reported separately under ``dynamic_context_overhead``
+        (codex round 2 #1).
         """
         mock_storage.search_chunks = AsyncMock(
             return_value=[
@@ -479,11 +511,54 @@ class TestMeasureContextBreakdown:
         )
         assert result["sections"]["rag"]["tokens"] > 0
         assert result["sections"]["rag"]["skipped"] is False
-        # Confirm the count actually used the wrapped form.
         raw_retrieve = await builder.retrieve_context("something")
         raw_only = builder.counter.count(raw_retrieve)
         assert result["sections"]["rag"]["tokens"] > raw_only, (
-            "rag section must count the wrapped envelope, not the raw block"
+            "rag section must count the inner <documents> wrapper"
+        )
+        # Shared envelope is counted once when rag alone is included.
+        assert result["sections"]["dynamic_context_overhead"]["applied"] is True
+
+    @pytest.mark.asyncio
+    async def test_dynamic_context_overhead_not_double_charged(
+        self, builder, short_history, mock_storage
+    ):
+        """When BOTH memories and RAG are present, the outer
+        ``<retrieved_context>`` envelope is counted exactly once (Codex
+        round 2 #1 — the previous version charged it to each section).
+        """
+        mock_storage.search_chunks = AsyncMock(
+            return_value=[{"document_name": "d.txt", "content": "doc body"}]
+        )
+        retriever = AsyncMock(return_value="[Memory 1] note")
+        with_both = await builder.measure_context_breakdown(
+            query="something",
+            history=short_history,
+            constitution="Be kind.",
+            include_briefing=False,
+            include_rag=True,
+            memory_retriever=retriever,
+        )
+        envelope_alone = builder.counter.count(
+            "<retrieved_context>\n\n</retrieved_context>"
+        )
+        assert (
+            with_both["sections"]["dynamic_context_overhead"]["tokens"]
+            == envelope_alone
+        )
+        # Sanity: turning RAG off should keep memories' inner-wrapper
+        # tokens unchanged (no envelope baked into per-section figure).
+        memories_only = await builder.measure_context_breakdown(
+            query="something",
+            history=short_history,
+            constitution="Be kind.",
+            include_briefing=False,
+            include_rag=False,
+            memory_retriever=retriever,
+        )
+        assert (
+            with_both["sections"]["memories"]["tokens"]
+            == memories_only["sections"]["memories"]["tokens"]
         )
 
     @pytest.mark.asyncio

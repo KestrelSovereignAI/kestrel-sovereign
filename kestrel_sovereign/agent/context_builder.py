@@ -1114,10 +1114,15 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 + "--- END GUIDANCE ---"
             )
             guidance_tokens = self.counter.count(guidance_block)
-            # Production appends with "\n\n"; the additional separator
-            # is small (2 chars) and absorbed by the assembled count.
+            # Production appends with "\n\n". Recompute system_tokens
+            # from the final assembled bytes so the invariant
+            # "whole-system tokens come from the assembled bytes" holds
+            # literally (Codex round 2 #2). The algebraic shortcut
+            # ``system_tokens += guidance_tokens`` happened to produce
+            # the same number for current tokenisers, but the literal
+            # form removes the assumption.
             assembled_system = f"{assembled_system}\n\n{guidance_block}"
-            system_tokens += guidance_tokens
+            system_tokens = self.counter.count(assembled_system)
             system_sub.append(
                 {"name": "reflection_guidance", "tokens": guidance_tokens}
             )
@@ -1152,7 +1157,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 episodes_tokens = self.counter.count(episode_block)
                 budget.use("episodes", episodes_tokens, items=len(episodes_list))
 
-        # ----- memories: wrap as production does, then can_fit gate -----
+        # ----- memories: gate on RAW (production semantics), report
+        # inner-wrapper tokens for the per-section figure. The outer
+        # <retrieved_context> envelope is shared with RAG and counted
+        # once below as ``dynamic_context_overhead``. Codex round 2 #1
+        # caught the earlier version gating on the wrapped block, which
+        # could exclude blocks production would include, and could
+        # double-count the outer wrapper when both memories and RAG
+        # were present.
         memories_tokens = 0
         memories_count = 0
         memories_excluded = False
@@ -1165,31 +1177,24 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 notes.append(f"memory retrieval failed during measurement: {e}")
             if memory_block:
                 memories_count = memory_block.count("[Memory")
-                # Production wraps as <memories>…</memories> inside the
-                # <retrieved_context> envelope. The envelope itself only
-                # opens/closes when at least one dynamic block exists;
-                # since memories alone justifies the envelope here, we
-                # include both the inner and outer wrappers.
-                wrapped = (
-                    "<retrieved_context>\n"
-                    + f"<memories>\n{memory_block}\n</memories>"
-                    + "\n</retrieved_context>"
-                )
-                candidate = self.counter.count(wrapped)
-                if budget.can_fit("memories", candidate):
-                    memories_tokens = candidate
-                    budget.use("memories", candidate, items=memories_count)
+                raw_tokens = self.counter.count(memory_block)
+                if budget.can_fit("memories", raw_tokens):
+                    budget.use("memories", raw_tokens, items=memories_count)
+                    memories_tokens = self.counter.count(
+                        f"<memories>\n{memory_block}\n</memories>"
+                    )
                 else:
                     memories_excluded = True
                     memory_block = None
                     notes.append(
                         "memories excluded from measurement: would exceed "
-                        "memories budget (matches production can_fit gate)"
+                        "memories budget (matches production can_fit gate "
+                        "on the raw block)"
                     )
         else:
             notes.append("memories not measured (no memory_retriever supplied)")
 
-        # ----- rag: wrap as production does, then can_fit gate -----
+        # ----- rag: same raw/wrapped split as memories above -----
         rag_tokens = 0
         rag_chunks = 0
         rag_excluded = False
@@ -1204,31 +1209,35 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 rag_chunks = rag_context.count("[Document") or rag_context.count(
                     "Source:"
                 )
-                # Production wraps as <documents>…</documents> inside the
-                # <retrieved_context> envelope. If memories already
-                # opened the envelope this turn, the cost of the outer
-                # wrappers is shared; for measurement we count the
-                # documents-only path the conservative way (with its
-                # own envelope), matching what the popup needs to show
-                # as the rag-only slice.
-                wrapped = (
-                    "<retrieved_context>\n"
-                    + f"<documents>\n{rag_context}\n</documents>"
-                    + "\n</retrieved_context>"
-                )
-                candidate = self.counter.count(wrapped)
-                if budget.can_fit("rag", candidate):
-                    rag_tokens = candidate
-                    budget.use("rag", candidate, items=rag_chunks)
+                raw_tokens = self.counter.count(rag_context)
+                if budget.can_fit("rag", raw_tokens):
+                    budget.use("rag", raw_tokens, items=rag_chunks)
+                    rag_tokens = self.counter.count(
+                        f"<documents>\n{rag_context}\n</documents>"
+                    )
                 else:
                     rag_excluded = True
                     rag_context = None
                     notes.append(
                         "rag excluded from measurement: would exceed rag "
-                        "budget (matches production can_fit gate)"
+                        "budget (matches production can_fit gate on the raw block)"
                     )
         else:
             notes.append("rag skipped (include_rag=False — popup should fetch on demand)")
+
+        # Shared <retrieved_context>…</retrieved_context> envelope —
+        # counted once when at least one dynamic block is included,
+        # mirroring ``ContextManager.build_context``'s single-wrapper
+        # behavior (codex round 2 #1: do not double-charge the outer
+        # wrapper across sections). #1310's popup attributes this to
+        # "Reserve / Overhead" in Emma's canonical taxonomy.
+        dynamic_blocks_present = bool(memory_block) or bool(rag_context)
+        if dynamic_blocks_present:
+            dynamic_context_overhead = self.counter.count(
+                "<retrieved_context>\n\n</retrieved_context>"
+            )
+        else:
+            dynamic_context_overhead = 0
 
         # ----- assemble breakdown -----
         sections: Dict[str, Dict[str, Any]] = {
@@ -1272,6 +1281,18 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 "skipped": not include_rag,
                 "excluded": rag_excluded,
             },
+            # Shared overhead: a single <retrieved_context>…</retrieved_context>
+            # envelope wraps memories AND rag when either is present
+            # (production behavior — see ``ContextManager.build_context``).
+            # Surfaced here as its own row so the per-section ``tokens``
+            # figures stay attributable, and the popup (#1310) can show
+            # this under Emma's "Reserve / Overhead" taxonomy slice
+            # without double-charging memories or rag.
+            "dynamic_context_overhead": {
+                "tokens": dynamic_context_overhead,
+                "applies_when": "memories or rag included",
+                "applied": dynamic_blocks_present,
+            },
         }
 
         total_measured = (
@@ -1281,6 +1302,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             + episodes_tokens
             + memories_tokens
             + rag_tokens
+            + dynamic_context_overhead
         )
         context_limit = self.counter.get_context_limit()
         response_reserve = RESPONSE_RESERVE
