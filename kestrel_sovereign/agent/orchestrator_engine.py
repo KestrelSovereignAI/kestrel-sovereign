@@ -482,6 +482,66 @@ class OrchestratorEngineMixin:
 
         return _exec
 
+    def _append_executed_tool_breadcrumbs(
+        self, messages: list,
+        executed: list,
+        tool_results: Optional[list] = None,
+    ) -> None:
+        """Persist inline-executed tool calls into the same chat-history
+        shape the orchestrator's normal tool loop produces, so the UI
+        renders calls + results and observability sees them.
+
+        Generic over adapter: any adapter that runs tools inline
+        (codex's ``item/tool/call`` RPC today; potentially MCP / voice
+        realtime tomorrow) attaches an ``executed_tool_calls`` list to
+        its returned ``LLMResponse``. Each entry is a dict of
+        ``{id, name, arguments, result}``. This helper translates them
+        into ``{role:"assistant", tool_calls:[...]}`` + one
+        ``{role:"tool", tool_call_id, content}`` per call — the same
+        message sequence ``_execute_tool_batch`` produces for the
+        orchestrator-dispatched path.
+
+        Call this BEFORE appending the LLMResponse's final assistant
+        text to ``messages`` so the chat history reads left-to-right
+        as: tool calls advertised → tool results returned → model's
+        synthesized reply.
+        """
+        if not executed:
+            return
+        from kestrel_sovereign.features.base import _serialize_tool_result
+        from kestrel_sovereign.security.narration_check import (
+            summarize_tool_result_for_audit,
+        )
+
+        tool_calls_msg = [
+            {
+                "id": e["id"],
+                "type": "function",
+                "function": {
+                    "name": e["name"],
+                    "arguments": json.dumps(e["arguments"]),
+                },
+            }
+            for e in executed
+        ]
+        messages.append({
+            "role": "assistant", "content": "", "tool_calls": tool_calls_msg,
+        })
+        for e in executed:
+            serialized = _serialize_tool_result(e["result"])
+            messages.append({
+                "role": "tool",
+                "tool_call_id": e["id"],
+                "content": json.dumps(serialized),
+            })
+            if tool_results is not None:
+                tool_results.append({
+                    "tool_call_id": e["id"],
+                    "name": e["name"],
+                    "arguments": e["arguments"],
+                    "result": summarize_tool_result_for_audit(serialized),
+                })
+
     async def execute_named_tool(
         self,
         tool_name: str,
@@ -1384,6 +1444,23 @@ class OrchestratorEngineMixin:
                 if isinstance(response, str):
                     return response
             if not response.has_tool_calls:
+                # Inline-executing adapters (codex app-server today)
+                # surface what they ran via ``executed_tool_calls`` on
+                # the response. Even when no orchestrator-dispatched
+                # tool_calls follow, record those into the chat-history
+                # ``messages`` and the STOP hook's ``tool_results`` so
+                # the rest of the system (audit log, reflection #1238,
+                # downstream hooks) sees the same envelopes it would for
+                # the orchestrator-dispatched path.
+                executed = getattr(response, "executed_tool_calls", None)
+                if executed:
+                    self._append_executed_tool_breadcrumbs(
+                        messages, executed, tool_results,
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content or "",
+                    })
                 return response.content or ""
 
         # Add initial assistant response with tool calls

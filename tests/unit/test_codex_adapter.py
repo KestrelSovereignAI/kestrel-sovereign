@@ -549,6 +549,94 @@ class TestToolExecutorBridge:
         assert [d.content for d in deltas] == ["thinking-one", "summary-two"]
 
     @pytest.mark.asyncio
+    async def test_executed_tool_calls_attached_with_app_server_callid(self):
+        """The adapter records every inline-executed tool call (with
+        the app-server's own ``callId`` for audit alignment) on the
+        returned LLMResponse via the ``executed_tool_calls`` runtime
+        attribute. The orchestrator reads this generically (any
+        inline-executing adapter sets it) to render chat-history
+        breadcrumbs without re-dispatching."""
+
+        class _AppWithToolCall:
+            def __init__(self):
+                self.registered = {}
+                self.requests = []
+                self.dynamic_tools = None
+
+            async def ensure_started(self):
+                pass
+
+            async def request(self, method, params=None, *, timeout=120):
+                self.requests.append((method, params))
+                if method == "thread/start":
+                    self.dynamic_tools = (params or {}).get("dynamicTools")
+                    return {"thread": {"id": "thr-x"}}
+                if method == "turn/start":
+                    # Simulate the app-server issuing item/tool/call
+                    # mid-turn — the handler stamps the executed_log.
+                    handler = self.registered.get(("item/tool/call", "thr-x"))
+                    assert handler is not None, "tool-call handler missing"
+                    await handler({
+                        "threadId": "thr-x",
+                        "callId": "call_abc",
+                        "tool": "get_weather",
+                        "arguments": '{"city": "SF"}',
+                    })
+                    return {"turn": {"id": "turn-x"}}
+                return {}
+
+            def register_server_request_handler(self, m, h, *, thread_id=None):
+                self.registered[(m, thread_id)] = h
+                return lambda: self.registered.pop((m, thread_id), None)
+
+            def open_turn_sink(self, key):
+                return key
+
+            def close_turn_sink(self, key):
+                pass
+
+            async def iter_turn_events(self, sink, *, idle_timeout=120):
+                for ev in [
+                    {"method": "item/completed",
+                     "params": {"item": {
+                         "type": "dynamicToolCall",
+                         "id": "call_abc",
+                         "name": "get_weather",
+                         "arguments": '{"city": "SF"}',
+                     }}},
+                    {"method": "item/completed",
+                     "params": {"item": {
+                         "type": "agentMessage", "text": "It's sunny.",
+                     }}},
+                    {"method": "turn/completed", "params": {}},
+                ]:
+                    yield ev
+
+        async def exe(name, args):
+            return {"success": True, "result": "sunny"}
+
+        a = CodexAdapter()
+        a._client = _AppWithToolCall()
+        r = await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "weather?"}],
+            tools=[{"type": "function", "function": {
+                "name": "get_weather", "description": "d",
+                "parameters": {"type": "object"}}}],
+            session_id="brd-test", tool_executor=exe,
+        )
+        # No re-dispatch surface.
+        assert not r.tool_calls
+        # New: orchestrator-readable breadcrumb data with the app-server's
+        # OWN callId (so audit trails align with codex-side identifiers).
+        executed = getattr(r, "executed_tool_calls", None)
+        assert executed and len(executed) == 1
+        assert executed[0]["id"] == "call_abc"
+        assert executed[0]["name"] == "get_weather"
+        assert executed[0]["arguments"] == {"city": "SF"}
+        assert executed[0]["result"] == {"success": True, "result": "sunny"}
+
+    @pytest.mark.asyncio
     async def test_inline_executed_tools_absent_from_final_response(self):
         """Regression: the app-server runs tools inline via our handler.
         Surfacing those calls in LLMResponse.tool_calls would make the
