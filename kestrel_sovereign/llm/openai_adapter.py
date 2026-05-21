@@ -394,6 +394,7 @@ class OpenAIAdapter(LLMAdapter):
             tool_calls_accumulator: Dict[int, Dict[str, Any]] = {}
             splitter = _ThinkingContentSplitter(provider=self.name)
             text_content = ""
+            reasoning_content = ""
             chunk_count = 0
             input_tokens = None
             output_tokens = None
@@ -413,9 +414,10 @@ class OpenAIAdapter(LLMAdapter):
                 delta = chunk.choices[0].delta
 
                 # Handle text content - yield immediately for real-time streaming
-                reasoning_content = getattr(delta, "reasoning_content", None)
-                if isinstance(reasoning_content, str) and reasoning_content:
-                    yield ThinkingDelta(reasoning_content, provider=self.name)
+                delta_reasoning_content = getattr(delta, "reasoning_content", None)
+                if isinstance(delta_reasoning_content, str) and delta_reasoning_content:
+                    reasoning_content += delta_reasoning_content
+                    yield ThinkingDelta(delta_reasoning_content, provider=self.name)
 
                 content_delta = getattr(delta, "content", None)
                 if isinstance(content_delta, str) and content_delta:
@@ -504,7 +506,7 @@ class OpenAIAdapter(LLMAdapter):
                 yield LLMResponse(
                     content=text_content if text_content else None,
                     tool_calls=parsed_tool_calls,
-                    raw=None,  # No raw response for streaming
+                    raw={"reasoning_content": reasoning_content} if reasoning_content else None,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     total_tokens=total_tokens,

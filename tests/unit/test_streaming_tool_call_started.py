@@ -344,6 +344,30 @@ class TestOpenAIEmitsToolCallStarted:
         assert len(starts) == 1
         assert starts[0] == ToolCallStarted(index=0, id="call_1", name="lookup")
 
+    def test_preserves_reasoning_content_on_final_tool_call_response(self):
+        """DeepSeek-style thinking APIs require reasoning_content to be
+        replayed with assistant tool-call history on the next request."""
+        from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+
+        chunks = [
+            _openai_chunk(content=None),
+            _openai_chunk(content=None),
+            _openai_chunk(
+                tool_calls=[
+                    _openai_tc_delta(
+                        index=0, id="call_1", name="lookup", arguments="{}"
+                    )
+                ]
+            ),
+        ]
+        chunks[0].choices[0].delta.reasoning_content = "Need the tool."
+        chunks[1].choices[0].delta.reasoning_content = " Then answer."
+
+        items = _drive_openai(OpenAIAdapter(), chunks)
+        final = next(i for i in items if isinstance(i, LLMResponse))
+
+        assert final.raw == {"reasoning_content": "Need the tool. Then answer."}
+
     def test_emits_with_none_when_first_delta_lacks_id_and_name(self):
         """The OPEN spec question codex flagged: when does
         ToolCallStarted fire if OpenAI's first delta carries only the
