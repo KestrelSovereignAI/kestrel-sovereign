@@ -37,6 +37,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+from pathlib import Path
 from typing import (
     Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
 )
@@ -170,6 +172,74 @@ def _usage_from(tu: dict) -> Dict[str, Optional[int]]:
         "total_tokens": tot,
         "cache_read_input_tokens": total.get("cachedInputTokens"),
     }
+
+
+# Item types the app-server emits for a "the model invoked a tool" lifecycle.
+# These all surface tool activity to the user — whether they ran inside the
+# app-server (commandExecution, fileChange, webSearch) or were dispatched
+# back to kestrel via item/tool/call (dynamicToolCall, mcpToolCall,
+# functionCall, customToolCall). The chat-UI activity parser keys on the
+# 🔧 / ✓ / ❌ marker lines we yield as TEXT for each of these — same wire
+# protocol the orchestrator-dispatched path uses (see
+# ``orchestrator_engine._stream_with_tools`` line "Calling {tc.name}...").
+_TOOL_ITEM_TYPES = frozenset({
+    "dynamicToolCall", "mcpToolCall", "functionCall", "function_call",
+    "toolCall", "customToolCall",
+    "commandExecution", "fileChange", "webSearch",
+})
+
+# These item types resolve to an inline kestrel tool-call (via the
+# ``item/tool/call`` server→client RPC). They MUST be tracked in
+# ``executed_tool_calls`` so the orchestrator can fold them into the
+# persisted chat-history breadcrumbs. Other tool item types
+# (commandExecution, fileChange, webSearch) run INSIDE the app-server's
+# native sandbox — kestrel's hook stack never sees them, so they appear
+# only as on-screen markers, never as executed_tool_calls entries.
+_KESTREL_DISPATCHED_TOOL_ITEM_TYPES = frozenset({
+    "dynamicToolCall", "mcpToolCall", "functionCall", "function_call",
+    "toolCall", "customToolCall",
+})
+
+
+def _item_display_label(item: Dict[str, Any]) -> str:
+    """Human label for an item/started or item/completed marker.
+
+    Tools dispatched back to kestrel use the tool name; codex-native
+    items (commandExecution, fileChange) use a stable short label so the
+    chat-UI parser groups successive output lines under one card.
+    """
+    itype = item.get("type") or ""
+    if itype == "commandExecution":
+        return "shell"
+    if itype == "fileChange":
+        return "apply_patch"
+    if itype == "webSearch":
+        return "web_search"
+    return item.get("name") or item.get("tool") or itype or "tool"
+
+
+def _format_command_summary(command: Any) -> Optional[str]:
+    """One-line preview of a shell command for the start marker.
+
+    Strings stay as-is (truncated); list shapes (``["bash","-lc","..."]``)
+    are joined with spaces so the user sees the actual command, not a
+    JSON literal. Returns ``None`` when there is nothing worth showing.
+    """
+    if isinstance(command, str):
+        text = command
+    elif isinstance(command, list):
+        text = " ".join(str(c) for c in command if c is not None)
+    else:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    # Single-line, capped — fits one marker line in chat without
+    # collapsing a multi-line heredoc into noise.
+    text = text.replace("\n", " ").replace("\r", " ")
+    if len(text) > 200:
+        text = text[:197] + "..."
+    return text
 
 
 def _result_to_codex_response(result: Any) -> Dict[str, Any]:
@@ -310,7 +380,16 @@ class CodexAdapter(LLMAdapter):
                 )
                 # Cached thread no longer matches; drop it.
                 self._session_threads.pop(session_id, None)
-            params: Dict[str, Any] = {"sandbox": "read-only"}
+            # cwd: codex's native shell tool runs `cd` and resolves relative
+            # paths against the thread cwd, not the process cwd. Without
+            # this, ``pwd`` inside a shell tool returns whatever directory
+            # the kestrel process happened to start in (often the install
+            # prefix). Anchor the thread to the user's current working
+            # directory so file lookups behave like an editor session.
+            # ``KESTREL_CODEX_CWD`` overrides for daemon/agent runtimes
+            # where ``Path.cwd()`` may not match the intended workspace.
+            cwd = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
+            params: Dict[str, Any] = {"sandbox": "read-only", "cwd": cwd}
             if m:
                 params["model"] = m
             if instructions:
@@ -530,6 +609,12 @@ class CodexAdapter(LLMAdapter):
             tool_calls: List[ToolCall] = []
             usage: Dict[str, Optional[int]] = {}
             seen_tool_ids: set = set()
+            # Tool items the user has seen a "🔧 Calling X..." line for.
+            # We dedupe BOTH on start and on complete so retries or
+            # split-event quirks can't produce a stray marker line that
+            # the chat-UI parser would group into a phantom card.
+            started_item_ids: set = set()
+            completed_item_ids: set = set()
 
             async for ev in app.iter_turn_events(sink):
                 method = ev.get("method")
@@ -546,44 +631,130 @@ class CodexAdapter(LLMAdapter):
                     d = p.get("delta") or ""
                     if d:
                         yield {"thinking": d}
+                elif method == "item/started":
+                    # Tool activity marker for the chat-UI parser. Fires
+                    # BEFORE the kestrel-dispatched ``item/tool/call`` RPC
+                    # AND before codex-native tool execution
+                    # (commandExecution / fileChange / webSearch), so the
+                    # user sees "🔧 Calling X..." right as codex commits
+                    # to using the tool — same UX timing as the
+                    # orchestrator-dispatched path (which yields the same
+                    # marker shape immediately after a tool_calls
+                    # detection).
+                    item = p.get("item") or {}
+                    itype = item.get("type") or ""
+                    iid = item.get("id") or item.get("callId") or ""
+                    # Only dedupe when the protocol gives us an id;
+                    # falling back to ``""`` would collapse every
+                    # id-less item into one dedupe slot and silently
+                    # drop subsequent start markers (codex P2).
+                    already_started = bool(iid) and iid in started_item_ids
+                    if itype in _TOOL_ITEM_TYPES and not already_started:
+                        if iid:
+                            started_item_ids.add(iid)
+                        label = _item_display_label(item)
+                        # Shell items get a one-line command preview so
+                        # the user sees what's running, not just "shell"
+                        # — codex's native shell is the dominant tool in
+                        # this surface, and a bare "shell" marker is the
+                        # bulk of what made the chat feel opaque in
+                        # Nellie's session.
+                        detail = (
+                            _format_command_summary(item.get("command"))
+                            if itype == "commandExecution" else None
+                        )
+                        line = (
+                            f"\U0001f527 Calling {label}: {detail}...\n"
+                            if detail else f"\U0001f527 Calling {label}...\n"
+                        )
+                        # NOT appended to ``text_parts`` — those rebuild
+                        # ``LLMResponse.content`` as a clean string when
+                        # the app-server doesn't deliver an agentMessage
+                        # item/completed. Wire markers leaking into
+                        # ``content`` would surface as literal "🔧"
+                        # characters in audit logs, narration checks,
+                        # and any non-chat reader of the response.
+                        yield {"text": line}
                 elif method == "item/completed":
                     item = p.get("item") or {}
                     itype = item.get("type")
+                    iid = item.get("id") or item.get("callId") or ""
                     if itype == "agentMessage":
                         final_text = item.get("text") or final_text
-                    elif itype in (
-                        # ``dynamicToolCall`` is what the app-server emits
-                        # for kestrel-registered ``dynamicTools`` (the
-                        # primary kestrel path). Other variants surface
-                        # native tool subtypes; accept all so a future
-                        # mix doesn't silently drop ToolCallStarted.
-                        "dynamicToolCall",
-                        "functionCall", "toolCall", "function_call",
-                        "mcpToolCall", "customToolCall",
-                    ):
-                        cid = item.get("id") or item.get("callId") or ""
-                        if cid in seen_tool_ids:
-                            continue
-                        seen_tool_ids.add(cid)
-                        raw_args = item.get("arguments")
-                        if isinstance(raw_args, str):
-                            try:
-                                raw_args = json.loads(raw_args)
-                            except ValueError:
-                                raw_args = {"_raw": raw_args}
-                        tc = ToolCall(
-                            id=cid,
-                            name=item.get("name") or item.get("tool") or "",
-                            arguments=raw_args if isinstance(raw_args, dict) else {},
-                        )
-                        # Critical: the app-server has ALREADY executed
-                        # this tool inline via our item/tool/call handler.
-                        # Yield ToolCallStarted for UI/honesty-layer
-                        # signaling, but DO NOT add to ``tool_calls`` —
-                        # surfacing it would make the orchestrator
-                        # re-dispatch through ``_execute_tool_batch`` and
-                        # duplicate every tool's side effects.
-                        yield {"tool_call": tc}
+                    elif itype in _TOOL_ITEM_TYPES:
+                        # Completion marker. Emit even if we missed the
+                        # paired item/started (some app-server builds
+                        # collapse start+complete for very fast items)
+                        # — without a completion line the chat-UI parser
+                        # leaves the card in a "running" state forever.
+                        # Same dedupe carve-out as item/started: only
+                        # gate on iid when one was supplied; missing-id
+                        # items always emit so they're not collapsed
+                        # into a single phantom (codex P2).
+                        already_completed = bool(iid) and iid in completed_item_ids
+                        if already_completed:
+                            # Defensive: never two ✓ lines for one item.
+                            pass
+                        else:
+                            if iid:
+                                completed_item_ids.add(iid)
+                            label = _item_display_label(item)
+                            status = (
+                                item.get("status")
+                                or item.get("state")
+                                or ""
+                            )
+                            failed = (
+                                isinstance(status, str)
+                                and status.lower() in ("failed", "error", "blocked")
+                            ) or bool(item.get("error"))
+                            line = (
+                                f"❌ {label} failed\n"
+                                if failed
+                                else f"✓ {label} complete\n"
+                            )
+                            # See start-marker note: NOT appended to
+                            # ``text_parts``; markers stay on the wire,
+                            # not in LLMResponse.content.
+                            yield {"text": line}
+                        # The kestrel-dispatched subset additionally
+                        # surfaces ToolCallStarted for the honesty-layer
+                        # revising sentinel + populates the executed_log
+                        # the orchestrator folds into chat history. The
+                        # codex-native subset (shell/patch/web) stays
+                        # marker-only — those execute inside the
+                        # app-server and have no kestrel-side audit row.
+                        if itype in _KESTREL_DISPATCHED_TOOL_ITEM_TYPES:
+                            # See dedupe carve-out above. The
+                            # ``ToolCallStarted`` honesty-layer signal
+                            # MUST fire per tool — collapsing two
+                            # id-less calls into one would silently
+                            # break narration auditing.
+                            if iid and iid in seen_tool_ids:
+                                continue
+                            if iid:
+                                seen_tool_ids.add(iid)
+                            raw_args = item.get("arguments")
+                            if isinstance(raw_args, str):
+                                try:
+                                    raw_args = json.loads(raw_args)
+                                except ValueError:
+                                    raw_args = {"_raw": raw_args}
+                            tc = ToolCall(
+                                id=iid,
+                                name=item.get("name") or item.get("tool") or "",
+                                arguments=(
+                                    raw_args if isinstance(raw_args, dict) else {}
+                                ),
+                            )
+                            # Critical: the app-server has ALREADY executed
+                            # this tool inline via our item/tool/call handler.
+                            # Yield ToolCallStarted for UI/honesty-layer
+                            # signaling, but DO NOT add to ``tool_calls`` —
+                            # surfacing it would make the orchestrator
+                            # re-dispatch through ``_execute_tool_batch`` and
+                            # duplicate every tool's side effects.
+                            yield {"tool_call": tc}
                 elif method == "thread/tokenUsage/updated":
                     usage = _usage_from(p.get("tokenUsage") or {})
                 elif method == "turn/failed":
