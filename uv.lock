@@ -2390,7 +2390,7 @@ wheels = [
 
 [[package]]
 name = "kestrel-llm-deepseek"
-version = "0.1.6"
+version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kestrel-llm-openai-compat" },
@@ -2398,14 +2398,14 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/06/d9/8ba969a47608e5402c599ef49604d4aec14ea514cc38dee2f931cd452a4f/kestrel_llm_deepseek-0.1.6.tar.gz", hash = "sha256:930d9debb2294e7736836b44963fe6b389865ec872d2aec6678faff8f2806d73", size = 1866, upload-time = "2026-05-21T15:16:18.831Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/57/a1/17108610692f3fd12c0fd1e497b9013e27b3b60dd2eacf90e59631fde3cf/kestrel_llm_deepseek-0.1.7.tar.gz", hash = "sha256:ac6ba474ede0f5c2a1fdad24bd2df1a01565406c2007a143716b9b856b1f247f", size = 1864, upload-time = "2026-05-21T16:56:40.381Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ee/c9/4e417410f3c2e42f89280a2e006888b42e6a727e5408e83595b616acc6e5/kestrel_llm_deepseek-0.1.6-py3-none-any.whl", hash = "sha256:33aac3917a555b0b760d14eb28c0cc3a87a7dc7bd6b90a46e43a63dcee244837", size = 2735, upload-time = "2026-05-21T15:16:17.417Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/31/6dd20e458a2755f09d433641de4daffdea1333a1c0939d71c99bd89db68c/kestrel_llm_deepseek-0.1.7-py3-none-any.whl", hash = "sha256:eaa0dce5c265c1285bd793da8c0ada12f7a27b7830c633bcaf18730344e1a84a", size = 2733, upload-time = "2026-05-21T16:56:39.128Z" },
 ]
 
 [[package]]
 name = "kestrel-llm-kimi"
-version = "0.1.6"
+version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kestrel-llm-openai-compat" },
@@ -2413,27 +2413,27 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c7/c7/0c2af78f898a4b6cea23178f65161291ff1e55d94758469e050303eb95e8/kestrel_llm_kimi-0.1.6.tar.gz", hash = "sha256:60f5cd1dd372a915e25690265e82c37b0b69cd1a35ab9ed8048c5bf66ff94bf7", size = 1991, upload-time = "2026-05-21T15:16:27.659Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/99/2d/14ae21882f4cb8a7e7aed5d1fc82f60f206f85a4879d36ae3a7ada799005/kestrel_llm_kimi-0.1.7.tar.gz", hash = "sha256:d2b230ffbbf034b4cbe981595c6f475e6f7e1d6cbe2d2d8be6c5017cface1ea3", size = 1991, upload-time = "2026-05-21T16:59:00.185Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5d/be/329e2ccdc0bb26480f0d06303d75a2f0d4233eaabac56f9fd98f38a8de81/kestrel_llm_kimi-0.1.6-py3-none-any.whl", hash = "sha256:2ad8b42c0b7966b0234d772e8a4809980d4a5b40052fd23a6c75e9e723aae75e", size = 2819, upload-time = "2026-05-21T15:16:26.478Z" },
+    { url = "https://files.pythonhosted.org/packages/60/19/b3c0938bc642de98c7358d833f8128f34527fb65f70912b8790bdf4b1720/kestrel_llm_kimi-0.1.7-py3-none-any.whl", hash = "sha256:293f23257a3f26a33f405c19d203a2bb5bd443b35d84e5100fead6e2dc43eaf8", size = 2820, upload-time = "2026-05-21T16:58:58.891Z" },
 ]
 
 [[package]]
 name = "kestrel-llm-openai-compat"
-version = "0.1.5"
+version = "0.1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kestrel-sovereign-sdk" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/7a/20793ca11dcc814caf3546f4ae1e71586311a8b8c7d6915a61f606f71b1e/kestrel_llm_openai_compat-0.1.5.tar.gz", hash = "sha256:1c921e48c7a84b6865f651d89de3511a75349242611c149589e79719f5bac3a5", size = 2771, upload-time = "2026-05-21T15:16:05.796Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bf/8b/f929689185f21683521b7a09f0c31d444b94ce3547cd4778550424efb9cf/kestrel_llm_openai_compat-0.1.6.tar.gz", hash = "sha256:9aa319374be01c8c8c151ee43d927bf94919a3a089660fa6ccb36d4e01656eb0", size = 3031, upload-time = "2026-05-21T16:55:23.569Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/87/44/ce78d0fe5433a97554cd235999a4728ec98e6dbffd698f3c0c6f3645bbce/kestrel_llm_openai_compat-0.1.5-py3-none-any.whl", hash = "sha256:687f6be4859603a0d2a99504bf84f11a75c2d3cdf303901f315f9958d6709012", size = 3381, upload-time = "2026-05-21T15:16:04.457Z" },
+    { url = "https://files.pythonhosted.org/packages/07/ea/b4aa429b9a943796c965ad6431fcbb90f4d8d9c6f6c2d319f93fabe8018b/kestrel_llm_openai_compat-0.1.6-py3-none-any.whl", hash = "sha256:175642dde66d46052a169fadf27ec49ecebe994a7fa98794cf060e5457f9506b", size = 3656, upload-time = "2026-05-21T16:55:19.063Z" },
 ]
 
 [[package]]
 name = "kestrel-llm-xai"
-version = "0.1.6"
+version = "0.1.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kestrel-llm-openai-compat" },
@@ -2441,21 +2441,21 @@ dependencies = [
     { name = "openai" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/06/0d76b8211334efd08f750b000db16c9ea77fdb02b87ee648a371c2f2dbbb/kestrel_llm_xai-0.1.6.tar.gz", hash = "sha256:c6d77bc0bf6355076790f30ea18c0c4fae041dc6d407ef167fecd4786b0f4758", size = 1862, upload-time = "2026-05-21T15:16:13.971Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8c/73/87e5ccfb5e627dc8467af5fff309f9b4816211d04ea21c9f0efd7277150d/kestrel_llm_xai-0.1.7.tar.gz", hash = "sha256:749958237cf06e5cdff68bf6cd594f921f8347f573150e86190ec24676b46a6a", size = 1858, upload-time = "2026-05-21T16:57:53.203Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d1/b3/5a840f53c2c41fcdc0a6707ec015f8bb66af85187d19b418c06a69108681/kestrel_llm_xai-0.1.6-py3-none-any.whl", hash = "sha256:0df3f9ce9e737ed6fa74e94173bb25f8cfe36662eebb29ff9ae99f9b7a5dcf8c", size = 2673, upload-time = "2026-05-21T15:16:12.815Z" },
+    { url = "https://files.pythonhosted.org/packages/82/60/e6c16f274afdada8fd135e99c42d439c35dd16e92ee7003c1093e2c639a6/kestrel_llm_xai-0.1.7-py3-none-any.whl", hash = "sha256:0340d98eab4bfc083c53b99a84e9db4e3e4316b6eb9de33ae4619281539479fa", size = 2672, upload-time = "2026-05-21T16:57:52.023Z" },
 ]
 
 [[package]]
 name = "kestrel-llms"
-version = "0.1.4"
+version = "0.1.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kestrel-sovereign-sdk" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/da/50/1315fb04997c737f31c3cd264393861d2ee184b681c16e8b90213ef118ce/kestrel_llms-0.1.4.tar.gz", hash = "sha256:ce6493a1318a7e6afbb20735fb950620e9855480fc0ee20a1e41023bdb56c1f1", size = 749, upload-time = "2026-05-21T15:16:20.952Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7a/fe/fb6efc7539208994b62e5cba1952e83922edb6da9cb9728df545e7fd267a/kestrel_llms-0.1.5.tar.gz", hash = "sha256:c1eb642df259ada35d496a99de81632d13888c1d14f8e180c3cd98754cd91a85", size = 750, upload-time = "2026-05-21T17:00:13.346Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/35/7d/4b9e57867f42f5a100115f51ffa963e8c783ac5755fb95badf6142a43c9b/kestrel_llms-0.1.4-py3-none-any.whl", hash = "sha256:3424daff2515c0d8e248bdd9fb132d651a1f6adb884c56545ad8ec3198acac80", size = 1219, upload-time = "2026-05-21T15:16:19.47Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/26/91fb2406b2de681da5aeced31dfd888229930cb2ebb8a32ded695d3c4151/kestrel_llms-0.1.5-py3-none-any.whl", hash = "sha256:98ac1c33759cc4faf47d6bdb921d96554ed25abb59b62c9b78efe592ca5b9adc", size = 1219, upload-time = "2026-05-21T17:00:12.162Z" },
 ]
 
 [package.optional-dependencies]
@@ -2690,7 +2690,7 @@ requires-dist = [
     { name = "iniconfig", specifier = "==2.1.0" },
     { name = "itsdangerous", specifier = ">=2.2.0" },
     { name = "jsonschema", specifier = ">=4.20" },
-    { name = "kestrel-llms", extras = ["all"], specifier = "==0.1.4" },
+    { name = "kestrel-llms", extras = ["all"], specifier = "==0.1.5" },
     { name = "kestrel-sovereign", extras = ["all-features"], marker = "extra == 'full'" },
     { name = "kestrel-sovereign", extras = ["cloud"], marker = "extra == 'all-features'" },
     { name = "kestrel-sovereign", extras = ["delivery"], marker = "extra == 'all-features'" },
