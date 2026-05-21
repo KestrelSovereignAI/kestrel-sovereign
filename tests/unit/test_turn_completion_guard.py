@@ -192,6 +192,43 @@ class _FeatureForTurnCompletion(Feature):
 
 
 @pytest.mark.asyncio
+async def test_feature_subagent_tool_history_preserves_provider_reasoning():
+    tool = MagicMock()
+    tool.name = "health_check"
+    tool.execute = AsyncMock(return_value={"status": "ok"})
+
+    agent = MagicMock()
+    agent.hooks_manager = None
+    agent.llm_service = MagicMock()
+    agent.llm_service.generate_with_messages = AsyncMock(
+        return_value=LLMResponse(content="Health is ok.", tool_calls=None)
+    )
+    feature = _FeatureForTurnCompletion(agent)
+    feature.get_tools = MagicMock(return_value=[tool])
+
+    result = await feature._handle_feature_tool_calls(
+        response=LLMResponse(
+            content=None,
+            tool_calls=[ToolCall(id="call_1", name="health_check", arguments={})],
+            raw={"reasoning_content": "Need a health probe."},
+        ),
+        tools=[_tool_schema("health_check")],
+        system_prompt="sys",
+        user_prompt="Task: health",
+    )
+
+    assert result == "Health is ok."
+    continuation_messages = agent.llm_service.generate_with_messages.await_args.kwargs[
+        "messages"
+    ]
+    assert continuation_messages[2]["role"] == "assistant"
+    assert continuation_messages[2]["reasoning_content"] == "Need a health probe."
+    assert continuation_messages[2]["content"] == ""
+    assert continuation_messages[2]["tool_calls"][0]["function"]["arguments"] == {}
+    tool.execute.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_feature_subagent_no_tool_continuation_gets_repair_step():
     tool = MagicMock()
     tool.name = "talon_claim"
