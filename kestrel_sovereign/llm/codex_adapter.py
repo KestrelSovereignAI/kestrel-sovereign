@@ -56,7 +56,15 @@ logger = logging.getLogger(__name__)
 # Signature of the kestrel-side tool executor the orchestrator wires in.
 # Returns a dict with at minimum ``success: bool``; ``result`` carries
 # the tool's payload (already passed through POST_TOOL_USE hooks).
-ToolExecutor = Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]
+# Async ``(name, args) -> (effective_args, result)``. The kestrel-side
+# wrapper returns the post-hook args alongside the result so the
+# adapter can record the *actually-executed* arguments into audit /
+# UI breadcrumbs — pre-hook args may carry values a PRE_TOOL_USE
+# redactor intentionally stripped.
+ToolExecutor = Callable[
+    [str, Dict[str, Any]],
+    Awaitable[Tuple[Dict[str, Any], Any]],
+]
 
 
 def _extract_instructions_and_input(messages):
@@ -379,10 +387,28 @@ class CodexAdapter(LLMAdapter):
                     args = json.loads(args)
                 except ValueError:
                     args = {"_raw": args}
+            call_id = params.get("callId") or params.get("id") or ""
+            # The executor returns (effective_args, result) — effective
+            # args are what actually ran after PRE_TOOL_USE hooks, so
+            # the breadcrumb reflects the redacted/rewritten payload,
+            # not the model's pre-hook arguments.
+            effective_args: Dict[str, Any] = (
+                args if isinstance(args, dict) else {}
+            )
             try:
-                result = await executor(name, args)
+                ret = await executor(name, args)
             except Exception as e:
                 logger.warning("tool_executor(%s) raised: %s", name, e)
+                err_result = {"success": False, "error": f"{e}"}
+                # Failed inline tool calls must remain observable —
+                # mirrors the orchestrator-dispatched path, which
+                # records error results in tool_results/tool_events.
+                if executed_log is not None:
+                    executed_log.append({
+                        "id": call_id, "name": name,
+                        "arguments": effective_args,
+                        "result": err_result,
+                    })
                 return {
                     "contentItems": [{
                         "type": "inputText",
@@ -390,11 +416,20 @@ class CodexAdapter(LLMAdapter):
                     }],
                     "success": False,
                 }
+            # Real orchestrator-side executor returns (effective_args,
+            # result). Permissive: simpler tools/tests may return just
+            # the result — in which case effective_args == args.
+            if (
+                isinstance(ret, tuple) and len(ret) == 2
+                and isinstance(ret[0], dict)
+            ):
+                effective_args, result = ret
+            else:
+                result = ret
             if executed_log is not None:
                 executed_log.append({
-                    "id": params.get("callId") or params.get("id") or "",
-                    "name": name,
-                    "arguments": args if isinstance(args, dict) else {},
+                    "id": call_id, "name": name,
+                    "arguments": effective_args,
                     "result": result,
                 })
             return _result_to_codex_response(result)

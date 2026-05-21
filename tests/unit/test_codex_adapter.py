@@ -671,6 +671,58 @@ class TestToolExecutorBridge:
         )
 
     @pytest.mark.asyncio
+    async def test_handler_records_post_hook_effective_args_not_pre_hook(self):
+        """If a PRE_TOOL_USE hook rewrites args (PII redact, normalize)
+        the breadcrumb must record what actually RAN, not what the
+        model sent. The kestrel-side executor returns
+        ``(effective_args, result)`` for exactly this — pre-hook args
+        leaking into audit would undo the hook's purpose.
+        """
+        a = CodexAdapter()
+
+        async def exe_with_hook(name, args):
+            # Simulate a hook that redacts a sensitive field.
+            redacted = {k: ("[REDACTED]" if k == "email" else v) for k, v in args.items()}
+            return redacted, {"success": True, "result": "ok"}
+
+        log: list = []
+        handler = a._make_tool_call_handler(
+            exe_with_hook, "thr", frozenset({"send"}), log,
+        )
+        await handler({
+            "threadId": "thr", "callId": "c1", "tool": "send",
+            "arguments": {"email": "secret@example.com", "body": "hi"},
+        })
+        assert log and log[0]["arguments"] == {
+            "email": "[REDACTED]", "body": "hi",
+        }, "breadcrumb leaked pre-hook arguments"
+
+    @pytest.mark.asyncio
+    async def test_handler_records_failed_inline_executions(self):
+        """Mirrors the orchestrator-dispatched path: tool failures
+        appear in audit / STOP / UI surfaces, not silently dropped."""
+        a = CodexAdapter()
+
+        async def exe_that_raises(name, args):
+            raise RuntimeError("backend down")
+
+        log: list = []
+        handler = a._make_tool_call_handler(
+            exe_that_raises, "thr", frozenset({"t"}), log,
+        )
+        reply = await handler({
+            "threadId": "thr", "callId": "c-fail", "tool": "t",
+            "arguments": {},
+        })
+        # App-server gets a failure reply (existing behavior).
+        assert reply["success"] is False
+        # Breadcrumb records the failed call so audit isn't blind.
+        assert log and log[0] == {
+            "id": "c-fail", "name": "t", "arguments": {},
+            "result": {"success": False, "error": "backend down"},
+        }
+
+    @pytest.mark.asyncio
     async def test_handler_executor_exception_becomes_failure_reply(self):
         a = CodexAdapter()
 
