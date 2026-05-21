@@ -8,17 +8,24 @@ Manages token allocation across different context sources:
 - Memory retrieval (emotionally-weighted past)
 - RAG documents
 
-Based on approved allocation:
-- System: 15%
-- History: 40%
-- Episodes: 20%
-- Memories: 10%
-- RAG: 15%
+Two shapes are available:
+
+- ``TokenBudget`` / ``AdaptiveTokenBudget`` — legacy static-percentage
+  allocation (15 / 40 / 20 / 10 / 15). Kept for back-compat with all
+  existing callers.
+- ``ElasticTokenBudget`` — the #1309 contract Emma signed off on in
+  PR #1306. Mandatory governance content is a **non-borrowable
+  measured floor**; idle section budget flows to any over-demanded
+  eligible section by turn-intent priority (default: history-first,
+  then episodes, memories, rag); if the mandatory floor cannot fit
+  for this model, the budget raises ``DegradedModeError`` — never
+  silently drops governance content to make the call appear "normal"
+  (Emma's 2026-05-20 hardening invariant).
 """
 
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, List, Optional
 
 from .token_counter import TokenCounter, get_token_counter
 
@@ -36,6 +43,47 @@ DEFAULT_ALLOCATION = {
 
 # Reserve tokens for response generation
 RESPONSE_RESERVE = 1024
+
+# Default turn-intent priority for elastic slack distribution. History
+# is the default beneficiary because that is where the silent-prune
+# correctness hole hurts most (Emma's 2026-05-20 review, addressed by
+# C/#1311); RAG-heavy or memory-recall turns can legitimately deserve
+# slack too, so callers can override.
+DEFAULT_ELASTIC_PRIORITY: List[str] = ["history", "episodes", "memories", "rag"]
+
+
+class DegradedModeError(Exception):
+    """Raised when the mandatory governance floor cannot fit the
+    model's context window.
+
+    Emma's 2026-05-20 hardening invariant (PR #1306): mandatory
+    governance content is **non-borrowable**. If the measured floor
+    exceeds the available budget for an agent/model, that is a
+    hard-failure / degraded-mode condition — never silently absorbed
+    by crowding out history, RAG, memories, etc. Production callers
+    must surface this loudly (UI, telemetry, structured warning)
+    instead of pretending the call is "normal."
+    """
+
+    def __init__(
+        self,
+        mandatory_system_tokens: int,
+        total_budget: int,
+        model: str,
+        *,
+        detail: Optional[str] = None,
+    ):
+        self.mandatory_system_tokens = mandatory_system_tokens
+        self.total_budget = total_budget
+        self.model = model
+        msg = (
+            f"degraded-mode: mandatory governance floor "
+            f"({mandatory_system_tokens} tokens) does not fit context "
+            f"budget ({total_budget} tokens) for model {model!r}"
+        )
+        if detail:
+            msg = f"{msg} ({detail})"
+        super().__init__(msg)
 
 
 @dataclass
@@ -305,18 +353,298 @@ class AdaptiveTokenBudget(TokenBudget):
         )
 
 
-def create_budget(model: str, message_count: int = 0, adaptive: bool = True) -> TokenBudget:
+class ElasticTokenBudget(AdaptiveTokenBudget):
+    """Elastic budget per #1309 (epic #1307).
+
+    Two contracts that distinguish this from the legacy adaptive shape:
+
+    1. **Mandatory governance floor is non-borrowable.** The caller
+       passes ``mandatory_system_tokens`` (measured per-agent /
+       per-model — typically constitution + identity + state-of-mind +
+       any AGENTS.md operator policy the agent must obey). That floor
+       carves a hard quota out of the available budget before any
+       section is allocated. ``can_fit("system", n)`` always allows up
+       to the mandatory floor regardless of consumption elsewhere; the
+       slack/elastic pool can never pull below the floor. If the floor
+       exceeds the total budget, the constructor raises
+       ``DegradedModeError`` — fail closed, never silently absorbed.
+    2. **Idle section budget flows to over-demanded eligible
+       sections.** As production assembly progresses through sections,
+       ``mark_section_finalized(name)`` releases any unused budget into
+       the elastic pool. Subsequent sections whose own remaining budget
+       is short can borrow from the pool transparently via the normal
+       ``can_fit`` / ``use`` API. The order in which sections borrow is
+       the constructor's ``demand_priority`` (default
+       ``DEFAULT_ELASTIC_PRIORITY`` — history first, then episodes,
+       memories, rag). Operators can override per turn-intent (e.g. a
+       RAG-heavy turn can pass ``["rag", "history", ...]``).
+    """
+
+    # Names that may not be trimmed to fund the mandatory floor and
+    # may not appear in the elastic priority — the floor lives in
+    # ``system``, so trimming ``system`` to fund itself is a bug.
+    _NON_TRIMMABLE_SOURCES = frozenset({"system"})
+
+    def __init__(
+        self,
+        model: str,
+        message_count: int = 0,
+        *,
+        mandatory_system_tokens: int = 0,
+        demand_priority: Optional[List[str]] = None,
+    ):
+        if mandatory_system_tokens < 0:
+            raise ValueError("mandatory_system_tokens must be non-negative")
+        self._mandatory_system_tokens = mandatory_system_tokens
+        self._elastic_pool: int = 0
+        self._finalized: set = set()
+        # Validate priority: dedupe, strip non-trimmable / unknown
+        # sources, then extend with any missing borrowable sources so
+        # floor funding can always fall back to the full set (codex
+        # round 1 #3). A caller passing ``["rag"]`` should not cause a
+        # spurious DegradedModeError when the floor could fit by
+        # trimming history/episodes/memories.
+        raw = list(demand_priority) if demand_priority else list(DEFAULT_ELASTIC_PRIORITY)
+        seen: set = set()
+        cleaned: List[str] = []
+        for name in raw:
+            if (
+                name in self._NON_TRIMMABLE_SOURCES
+                or name in seen
+                or name not in DEFAULT_ALLOCATION
+            ):
+                continue
+            seen.add(name)
+            cleaned.append(name)
+        # Extend with any borrowable sections the caller omitted so
+        # trim-for-floor has the full toolkit. Order is stable —
+        # caller-specified sections retain priority.
+        for name in DEFAULT_ELASTIC_PRIORITY:
+            if name not in seen and name in DEFAULT_ALLOCATION:
+                cleaned.append(name)
+                seen.add(name)
+        self._priority: List[str] = cleaned
+        super().__init__(model, message_count)
+
+    @property
+    def mandatory_system_tokens(self) -> int:
+        return self._mandatory_system_tokens
+
+    @property
+    def elastic_pool(self) -> int:
+        return self._elastic_pool
+
+    def _compute_allocations(self):
+        """Adaptive allocation + non-borrowable mandatory system floor.
+
+        After the adaptive percentages produce per-section budgets, the
+        system slice is raised to ``max(system, mandatory_system_tokens)``.
+        The bump (if any) is funded by trimming proportionally from
+        eligible sections in the elastic priority list, in reverse
+        order (so the lowest-priority section gives up budget first
+        before history is asked to). If even after trimming every
+        elastic source the mandatory floor still doesn't fit, raise
+        ``DegradedModeError``.
+        """
+        super()._compute_allocations()
+        available = self.total_budget
+        if self._mandatory_system_tokens > available:
+            raise DegradedModeError(
+                self._mandatory_system_tokens,
+                available,
+                self.model,
+                detail="mandatory floor exceeds the entire post-reserve budget",
+            )
+        system_alloc = self.allocations["system"]
+        if self._mandatory_system_tokens > system_alloc.budget:
+            shortfall = self._mandatory_system_tokens - system_alloc.budget
+            # Trim from lowest priority first (last entries of
+            # ``self._priority``). The default order is
+            # ["history", "episodes", "memories", "rag"]; trimming
+            # reverse-order means rag → memories → episodes → history.
+            for source in reversed(self._priority):
+                if shortfall <= 0:
+                    break
+                if source not in self.allocations:
+                    continue
+                give = min(shortfall, self.allocations[source].budget)
+                self.allocations[source].budget -= give
+                shortfall -= give
+            if shortfall > 0:
+                raise DegradedModeError(
+                    self._mandatory_system_tokens,
+                    available,
+                    self.model,
+                    detail=(
+                        f"after trimming elastic sections, {shortfall} tokens "
+                        "still short of the mandatory floor"
+                    ),
+                )
+            system_alloc.budget = self._mandatory_system_tokens
+
+    def can_fit(self, source: str, tokens: int) -> bool:
+        """Allow borrowing from the elastic pool when the source's own
+        remaining is short.
+
+        The system slice never borrows below the mandatory floor: any
+        ``use("system", …)`` past ``mandatory_system_tokens`` will be
+        treated as borrowable but the floor itself stays protected.
+        """
+        if source not in self.allocations:
+            return False
+        local = self.allocations[source].remaining
+        if tokens <= local:
+            return True
+        deficit = tokens - local
+        # The pool is the sum of (1) explicitly-released slack from
+        # finalized sections and (2) currently-unused budget from
+        # sections we haven't entered yet (those not in finalized AND
+        # not in `source` and below their priority). The simpler model:
+        # we only let sections borrow from the explicitly-released pool.
+        # That's predictable and matches the "mark_section_finalized"
+        # API. Sections that haven't been entered yet keep their full
+        # quota for themselves.
+        return deficit <= self._elastic_pool
+
+    def use(self, source: str, tokens: int, items: int = 1) -> bool:
+        """Record usage; auto-borrow from the elastic pool when needed.
+
+        Returns True when the tokens were accepted (either from the
+        section's own quota or from the elastic pool). Returns False
+        only when neither the section quota nor the elastic pool can
+        cover the request — that's the signal to caller code that the
+        section must be skipped (matches the legacy ``TokenBudget.use``
+        return semantics).
+        """
+        if source not in self.allocations:
+            logger.warning(f"Unknown source: {source}")
+            return False
+        allocation = self.allocations[source]
+        local = allocation.remaining
+        if tokens <= local:
+            allocation.used += tokens
+            allocation.items += items
+            return True
+        # Need to borrow from the pool
+        deficit = tokens - local
+        if deficit > self._elastic_pool:
+            logger.warning(
+                f"{source} cannot fit {tokens}: local remaining {local}, "
+                f"elastic pool {self._elastic_pool}"
+            )
+            return False
+        # Take the deficit from the pool — bump the section's budget so
+        # used / remaining math stays consistent for callers.
+        self._elastic_pool -= deficit
+        allocation.budget += deficit
+        allocation.used += tokens
+        allocation.items += items
+        logger.debug(
+            f"{source} borrowed {deficit} tokens from elastic pool "
+            f"(pool now {self._elastic_pool})"
+        )
+        return True
+
+    def mark_section_finalized(self, source: str) -> int:
+        """Release ``source``'s unused budget into the elastic pool.
+
+        Production assembly calls this when it moves past a section so
+        later sections can borrow the slack. The system section
+        specifically respects the mandatory floor: slack released is
+        ``budget - max(used, mandatory_system_tokens)`` — the floor's
+        bytes are never returned to the pool, even when system used
+        less than the floor (which can happen on agents with very
+        small constitutions; the floor is still a guarantee, not a
+        consumption record).
+
+        Returns the number of tokens released into the pool.
+        """
+        if source not in self.allocations:
+            return 0
+        if source in self._finalized:
+            return 0
+        self._finalized.add(source)
+        allocation = self.allocations[source]
+        if source == "system":
+            protected = max(allocation.used, self._mandatory_system_tokens)
+        else:
+            protected = allocation.used
+        slack = max(0, allocation.budget - protected)
+        if slack > 0:
+            self._elastic_pool += slack
+            # Lower the section's budget so the breakdown reports the
+            # post-finalization figure accurately.
+            allocation.budget = protected
+            logger.debug(
+                f"{source} released {slack} tokens into elastic pool "
+                f"(pool now {self._elastic_pool})"
+            )
+        return slack
+
+    def effective_budget(self, source: str) -> int:
+        """Spend-ceiling for ``source`` including the elastic pool.
+
+        Callers that size a downstream operation against the budget
+        (for example, ``format_conversation_history(max_tokens=…)``)
+        should pass this instead of ``budget.<source>`` so the section
+        can actually grow into the slack released by earlier
+        finalized sections.
+
+        Without this method the legacy
+        ``format_conversation_history(max_tokens=budget.history)`` call
+        would never *ask* for more messages than the static history
+        slice, so released slack would sit unused — defeating the
+        whole #1309 contract. Codex round 1 #2 caught this.
+        """
+        if source not in self.allocations:
+            return 0
+        return self.allocations[source].remaining + self._elastic_pool
+
+    def get_summary(self) -> dict:
+        summary = super().get_summary()
+        summary["mandatory_system_tokens"] = self._mandatory_system_tokens
+        summary["elastic_pool_remaining"] = self._elastic_pool
+        summary["elastic_priority"] = list(self._priority)
+        summary["finalized_sections"] = sorted(self._finalized)
+        return summary
+
+
+def create_budget(
+    model: str,
+    message_count: int = 0,
+    adaptive: bool = True,
+    *,
+    elastic: bool = False,
+    mandatory_system_tokens: int = 0,
+    demand_priority: Optional[List[str]] = None,
+) -> TokenBudget:
     """
     Factory function to create appropriate token budget.
 
     Args:
         model: Model name
         message_count: Current message count in conversation
-        adaptive: Whether to use adaptive allocation
+        adaptive: Whether to use adaptive allocation (legacy contract)
+        elastic: When True, return an ``ElasticTokenBudget`` honoring
+            the non-borrowable mandatory floor and slack redistribution
+            described in #1309. Implies ``adaptive=True`` (mandatory
+            content needs the conversation-length-aware splits).
+        mandatory_system_tokens: Measured non-borrowable floor for
+            mandatory governance content. Ignored when ``elastic`` is
+            False.
+        demand_priority: Override the elastic slack-distribution order.
+            Ignored when ``elastic`` is False.
 
     Returns:
         TokenBudget instance
     """
+    if elastic:
+        return ElasticTokenBudget(
+            model,
+            message_count,
+            mandatory_system_tokens=mandatory_system_tokens,
+            demand_priority=demand_priority,
+        )
     if adaptive:
         return AdaptiveTokenBudget(model, message_count)
     return TokenBudget(model)

@@ -36,6 +36,22 @@ _MESSAGE_OVERHEAD = 4
 # popup over-attributed episode tokens for 10-19 message conversations.
 EPISODE_THRESHOLD_MESSAGES = 20
 
+# Subsection names that count as mandatory governance content for the
+# #1309 elastic-budget non-borrowable floor (Emma 2026-05-20). The rest
+# of ``_collect_system_prompt_parts``'s output (session_briefing, style
+# reminder, additional_context, addenda, etc.) is optional and lives
+# under the borrowable system budget.
+#
+# Bootstrap-file subsections use the ``bootstrap_<stem>`` naming
+# convention from ``_collect_system_prompt_parts``; AGENTS.md is
+# mandatory operator policy. SOUL.md is the identity block (its own
+# ``soul`` subsection). Everything else is optional unless the agent
+# config promotes it later — a follow-up can let the operator declare
+# additional mandatory subsections per-agent.
+MANDATORY_SYSTEM_SUBSECTIONS = frozenset(
+    {"constitution", "soul", "bootstrap_agents", "state_of_mind"}
+)
+
 
 def _count_tool_schema_tokens(
     counter: TokenCounter,
@@ -655,6 +671,53 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             groups.append(("system_prompt_addendum", [system_prompt_addendum]))
 
         return groups
+
+    def measure_mandatory_system_tokens(
+        self,
+        constitution: str,
+        *,
+        state_of_mind: Optional["StateOfMind"] = None,
+        prompt_adaptation: Optional["PromptAdaptation"] = None,
+    ) -> int:
+        """Measured non-borrowable floor for the #1309 elastic budget.
+
+        Sums the tokens of the mandatory subsections — constitution,
+        identity (SOUL.md), operator policy (AGENTS.md), and any
+        active state-of-mind block — as joined by
+        ``_collect_system_prompt_parts``. The result is what the
+        ``ElasticTokenBudget`` carves out as a non-borrowable hard
+        floor (Emma's 2026-05-20 hardening). Optional system content
+        (session briefing, style reminder, addenda, etc.) is excluded
+        — it lives under the borrowable system slice.
+
+        Args:
+            constitution: Constitution text.
+            state_of_mind: Optional ``StateOfMind`` to include in the
+                floor when present (governance signaling).
+            prompt_adaptation: Optional preamble; not currently part
+                of the mandatory floor.
+
+        Returns:
+            Token count for the mandatory subsections, including the
+            ``"\\n\\n"`` separators that would join them in the
+            assembled prompt — so the floor reflects what the LLM
+            actually receives.
+        """
+        groups = self._collect_system_prompt_parts(
+            constitution=constitution,
+            include_briefing=False,  # briefing is optional
+            additional_context=None,  # optional
+            prompt_adaptation=prompt_adaptation,
+            state_of_mind=state_of_mind,
+            system_prompt_addendum=None,  # optional
+        )
+        mandatory_parts: List[str] = []
+        for name, parts in groups:
+            if name in MANDATORY_SYSTEM_SUBSECTIONS:
+                mandatory_parts.extend(parts)
+        if not mandatory_parts:
+            return 0
+        return self.counter.count("\n\n".join(mandatory_parts))
 
     def build_system_prompt(
         self,
