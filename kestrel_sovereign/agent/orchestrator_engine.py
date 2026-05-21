@@ -726,6 +726,8 @@ class OrchestratorEngineMixin:
             assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
 
         reasoning_content = self._extract_response_reasoning_content(response)
+        # Reasoning replay is only valid for assistant tool-call history.
+        # Text-only answers keep provider reasoning out of follow-up context.
         if reasoning_content and response.tool_calls:
             assistant_msg["reasoning_content"] = reasoning_content
 

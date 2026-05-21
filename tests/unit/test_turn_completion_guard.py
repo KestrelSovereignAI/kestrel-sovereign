@@ -70,6 +70,47 @@ def test_assistant_tool_history_preserves_provider_reasoning_from_openai_respons
     assert reasoning == "Use the tool."
 
 
+def test_assistant_tool_history_omits_empty_provider_reasoning():
+    agent = MagicMock()
+    agent._build_tool_calls_msg = OrchestratorEngineMixin._build_tool_calls_msg
+    agent._extract_response_reasoning_content = (
+        OrchestratorEngineMixin._extract_response_reasoning_content
+    )
+    agent._build_assistant_tool_history_msg = (
+        OrchestratorEngineMixin._build_assistant_tool_history_msg.__get__(agent)
+    )
+
+    msg = agent._build_assistant_tool_history_msg(
+        LLMResponse(
+            tool_calls=[ToolCall(id="call_1", name="lookup", arguments={})],
+            raw={"reasoning_content": ""},
+        )
+    )
+
+    assert "reasoning_content" not in msg
+
+
+def test_assistant_tool_history_omits_reasoning_without_tool_calls():
+    agent = MagicMock()
+    agent._build_tool_calls_msg = OrchestratorEngineMixin._build_tool_calls_msg
+    agent._extract_response_reasoning_content = (
+        OrchestratorEngineMixin._extract_response_reasoning_content
+    )
+    agent._build_assistant_tool_history_msg = (
+        OrchestratorEngineMixin._build_assistant_tool_history_msg.__get__(agent)
+    )
+
+    msg = agent._build_assistant_tool_history_msg(
+        LLMResponse(
+            content="done",
+            tool_calls=None,
+            raw={"reasoning_content": "No replay for text-only turns."},
+        )
+    )
+
+    assert msg == {"role": "assistant", "content": "done"}
+
+
 @pytest.mark.asyncio
 async def test_no_tool_continuation_gets_one_repair_step():
     agent = MagicMock()
