@@ -85,12 +85,53 @@ let client = null;       // active createRealtimeClient or createPipelineClient
 let currentState = State.IDLE;
 
 // User-overridable session settings, persisted to localStorage so they survive
-// page reloads. Voice is picked from the provider's list; instructions is the
+// page reloads.  Voice is picked from the provider's list; instructions is the
 // free-form steering directive forwarded to gpt-4o-mini-tts / Realtime
 // session.instructions.
-const SETTINGS_KEY = 'kestrel.voice.settings';
-let settings = loadSettings();
+//
+// Voice is identity — each agent has its own persona, voice, and steering
+// directive.  Settings are therefore keyed by the currently-selected host
+// agent (``API.getHostAgent()``); switching agents in multi-agent mode picks
+// up a different localStorage slot rather than leaking the prior agent's
+// picker state across the tenant.  See #1347.
+//
+// First-load order on each agent:
+//   1. per-agent localStorage key (operator's most recent override)
+//   2. hydrate from ``GET /voice/config`` (agent's persisted voice_config)
+//   3. hardcoded defaults
+//
+// (2) is async and happens on first picker open via
+// ``hydrateSettingsFromServer()`` so we don't block module init on a network
+// call.  Reads before hydration completes get the localStorage / defaults.
+const SETTINGS_KEY_PREFIX = 'kestrel.voice.settings';
+const _settingsByAgent = new Map();
+const _serverHydrated = new Set();
 let pickerRequestId = 0;
+
+function settingsKeyForAgent(agentName) {
+  // ``null`` host-agent (standalone single-agent mode) gets the unscoped
+  // key, matching the pre-#1347 storage shape so existing single-agent
+  // installs see their settings carry over.
+  return agentName ? `${SETTINGS_KEY_PREFIX}.${agentName}` : SETTINGS_KEY_PREFIX;
+}
+
+function currentAgentKey() {
+  try { return API.getHostAgent() || null; } catch (_) { return null; }
+}
+
+function settings() {
+  // Lazy accessor — always resolves against the CURRENT host agent.
+  // Caches by agent so repeated reads in a single render don't re-parse
+  // localStorage, but a host-agent switch picks up the new agent's slot
+  // on the next access without explicit invalidation.
+  const agent = currentAgentKey();
+  let s = _settingsByAgent.get(agent);
+  if (!s) {
+    s = loadSettings(agent);
+    _settingsByAgent.set(agent, s);
+  }
+  return s;
+}
 
 
 // ---------------------------------------------------------------------------
@@ -271,7 +312,7 @@ async function startSession() {
   const onEvent = handleClientEvent;
 
   // Apply user picker overrides (mode + TTS) to drive routing.
-  const overrides = pickerOverridesFromUI(settings.mode || 'auto', settings.preferred_tts || '');
+  const overrides = pickerOverridesFromUI(settings().mode || 'auto', settings().preferred_tts || '');
 
   // If the user explicitly picked Pipeline, skip Realtime entirely. The
   // previous flow round-tripped to /voice/realtime/session, ate a 409,
@@ -287,8 +328,8 @@ async function startSession() {
         endpoint: API.buildAgentUrl('/voice/realtime/session'),
         getAuthHeaders: voiceAuthHeaders,
         sessionRequestBody: {
-          voice: settings.voice || '',
-          user_instructions: settings.instructions || '',
+          voice: settings().voice || '',
+          user_instructions: settings().instructions || '',
           prefer_realtime: overrides.prefer_realtime,
           preferred_tts: overrides.preferred_tts || '',
         },
@@ -330,8 +371,8 @@ async function startSession() {
       wsPath: API.buildAgentUrl('/voice/chat'),
       // Honor the picker's voice + provider choice. Without these the server
       // falls back to its config-file voice and the picker is decorative.
-      voiceId: settings.voice || '',
-      preferredTts: (overrides && overrides.preferred_tts) || settings.preferred_tts || '',
+      voiceId: settings().voice || '',
+      preferredTts: (overrides && overrides.preferred_tts) || settings().preferred_tts || '',
       // Pin STT to the browser's primary language tag (e.g. "en-US" → "en")
       // so Whisper doesn't hallucinate language switches mid-utterance.
       language: (navigator.language || 'en').split('-')[0],
@@ -660,14 +701,59 @@ async function openPicker() {
   const instructionsEl = document.getElementById('voice-picker-instructions');
 
   voiceSel.innerHTML = '<option value="">Loading voices...</option>';
-  modeSel.value = settings.mode || 'auto';
-  instructionsEl.value = settings.instructions || '';
+  modeSel.value = settings().mode || 'auto';
+  instructionsEl.value = settings().instructions || '';
+  // Reset the TTS dropdown from THIS agent's settings.  The select
+  // element is reused across picker opens, so without this reset
+  // ``refreshRoutePreview()`` reads the prior agent's provider out of
+  // the stale DOM value and resolves voice for the wrong agent.
+  // Codex round-4 catch on #1347.
+  ttsSel.value = settings().preferred_tts || '';
 
   // Show the modal before provider calls finish. A slow auth bootstrap,
   // rate-limit, or provider probe should render as a loading/error state in
   // the picker, not as an apparently frozen right-click.
   pickerModalEl.hidden = false;
   instructionsEl.focus();
+
+  // Hydrate this agent's settings from the server's persisted
+  // ``voice_config`` so first-open shows the agent's identity-set voice
+  // instead of empty defaults.  Fire-and-forget so a slow / stalled
+  // ``/voice/config`` doesn't keep the picker invisible — modal is
+  // already rendered above.  When hydration lands:
+  //   * re-apply ``voice`` and ``preferred_tts`` to the rendered fields,
+  //   * if hydration CHANGED ``preferred_tts``, re-run the route
+  //     preview + voice list refresh so the picker isn't showing the
+  //     wrong provider's options/badge (codex round-2 catch on #1347).
+  // Pin the agent-id we captured at open time — if the operator
+  // switched host agents during the hydration fetch, this picker is
+  // stale and we should NOT paint it with another agent's config.
+  const pinnedAgent = currentAgentKey();
+  hydrateSettingsFromServer()
+    .then(({ changedTts } = { changedTts: false }) => {
+      // Picker was closed / reopened, OR host agent switched —
+      // earlier requestId is stale, don't paint.
+      if (requestId !== pickerRequestId || pickerModalEl.hidden) return;
+      if (currentAgentKey() !== pinnedAgent) return;
+      const s = settings();
+      if (s.voice) {
+        for (const opt of voiceSel.options) {
+          if (opt.value === s.voice) { voiceSel.value = s.voice; break; }
+        }
+      }
+      if (s.preferred_tts) {
+        for (const opt of ttsSel.options) {
+          if (opt.value === s.preferred_tts) { ttsSel.value = s.preferred_tts; break; }
+        }
+      }
+      if (changedTts) {
+        // Provider changed — the route badge + voice catalog scoped to
+        // the prior provider need a fresh resolve so the user sees the
+        // right voices and the right "Realtime / Pipeline" path.
+        refreshRoutePreview(++pickerRequestId);
+      }
+    })
+    .catch(() => {});
 
   // Route preview + TTS provider list (both come from /voice/realtime/route).
   refreshRoutePreview(requestId);
@@ -682,7 +768,7 @@ async function refreshRoutePreview(requestId = pickerRequestId) {
   const ttsSel = document.getElementById('voice-picker-tts');
   const modeSel = document.getElementById('voice-picker-mode');
   const voiceSel = document.getElementById('voice-picker-select');
-  const previousTts = ttsSel.value || settings.preferred_tts || '';
+  const previousTts = ttsSel.value || settings().preferred_tts || '';
   previewEl.textContent = 'Resolving...';
 
   const overrides = pickerOverridesFromUI(modeSel.value, previousTts);
@@ -795,7 +881,7 @@ async function refreshVoiceList(selectEl, providerName, requestId = pickerReques
       // multi-provider mix; redundant when scoped to one.
       const providerLabel = providerName ? '' : ` · ${v.provider}`;
       opt.textContent = `${v.name} (${v.gender}, ${v.accent})${providerLabel}`;
-      if (v.voice_id === settings.voice) opt.selected = true;
+      if (v.voice_id === settings().voice) opt.selected = true;
       selectEl.appendChild(opt);
     }
   } catch (err) {
@@ -840,8 +926,14 @@ function savePicker() {
   const instructions = document.getElementById('voice-picker-instructions').value;
   const mode = document.getElementById('voice-picker-mode').value || 'auto';
   const preferredTts = document.getElementById('voice-picker-tts').value || '';
-  settings = { voice, instructions, mode, preferred_tts: preferredTts };
-  saveSettings();
+  // Per-agent storage: the cache for the current host agent gets the
+  // new picker state in-place, then we persist to that agent's
+  // localStorage slot.  Other agents' caches are untouched — switching
+  // to a different agent later shows that agent's own settings.
+  const agent = currentAgentKey();
+  const next = { voice, instructions, mode, preferred_tts: preferredTts };
+  _settingsByAgent.set(agent, next);
+  saveSettings(agent, next);
   // If a session is active, push the new instructions immediately —
   // Realtime accepts session.update mid-call. Voice/path change requires a
   // new session (OpenAI Realtime can't hot-swap voice or model).
@@ -943,10 +1035,10 @@ function isTypingTarget(el) {
 // ---------------------------------------------------------------------------
 
 
-function loadSettings() {
+function loadSettings(agentName) {
   const defaults = { voice: '', instructions: '', mode: 'auto', preferred_tts: '' };
   try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
+    const raw = localStorage.getItem(settingsKeyForAgent(agentName));
     if (!raw) return defaults;
     const parsed = JSON.parse(raw);
     return {
@@ -963,12 +1055,74 @@ function loadSettings() {
 }
 
 
-function saveSettings() {
+function saveSettings(agentName, value) {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    localStorage.setItem(settingsKeyForAgent(agentName), JSON.stringify(value));
   } catch (_) {
     // Quota or disabled storage — ignore; settings stay in-memory for the
     // current session.
+  }
+}
+
+
+async function hydrateSettingsFromServer() {
+  // First time the picker opens for an agent in this browser session,
+  // pull the agent's persisted ``voice_config`` from the server and seed
+  // the in-memory picker cache.  This makes the picker reflect the
+  // agent's identity-set voice rather than showing empty defaults that
+  // look like "no voice configured."
+  //
+  // CRITICAL: hydrated values land in the in-memory ``_settingsByAgent``
+  // cache only — NEVER in localStorage.  localStorage holds operator
+  // overrides; if we persisted server defaults there, a later server-
+  // side change to ``voice_config`` would be silently shadowed by the
+  // cached snapshot forever (the next hydration call sees non-empty
+  // local fields and refuses to update them).  Only ``savePicker`` —
+  // when the operator clicks Save — writes to localStorage.  On a fresh
+  // page load, hydration runs again and picks up the current server
+  // config.  Codex round-3 catch on #1347.
+  //
+  // Returns ``{ changedTts }`` so callers can re-run dependent
+  // refreshes (route preview, voice list) only when the hydration
+  // actually altered the TTS provider.
+  //
+  // The ``_serverHydrated`` flag is set ONLY after a successful read so
+  // a transient first-open failure (401 during auth bootstrap, brief
+  // network error) leaves the agent open to retry on the next picker
+  // open instead of being stuck on defaults until a full page reload.
+  // Codex round-3 catch on #1347.
+  const agent = currentAgentKey();
+  if (_serverHydrated.has(agent)) return { changedTts: false };
+  try {
+    const url = API.buildAgentUrl('/voice/config');
+    const resp = await fetch(url, { headers: await voiceAuthHeaders() });
+    if (!resp.ok) return { changedTts: false };
+    const cfg = await resp.json();
+    // Pin the read+write to the agent we captured BEFORE the await.
+    // If the operator switched host agents while ``/voice/config`` was
+    // in flight, ``currentAgentKey()`` now points at the new agent —
+    // re-resolving ``settings()`` here would mutate the new agent's
+    // entry with the OLD agent's config.  Codex round-2 catch on #1347.
+    let s = _settingsByAgent.get(agent);
+    if (!s) {
+      s = loadSettings(agent);
+      _settingsByAgent.set(agent, s);
+    }
+    let changedTts = false;
+    if (!s.voice && typeof cfg.tts_voice_id === 'string' && cfg.tts_voice_id) {
+      s.voice = cfg.tts_voice_id;
+    }
+    if (!s.preferred_tts && typeof cfg.tts_provider === 'string' && cfg.tts_provider) {
+      s.preferred_tts = cfg.tts_provider;
+      changedTts = true;
+    }
+    _serverHydrated.add(agent);
+    return { changedTts };
+  } catch (_) {
+    // Hydration is best-effort — a network blip leaves the picker on the
+    // localStorage / defaults path, which is still per-agent.  Don't
+    // mark hydrated so the next open retries.
+    return { changedTts: false };
   }
 }
 
