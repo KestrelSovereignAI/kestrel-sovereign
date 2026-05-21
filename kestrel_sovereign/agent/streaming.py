@@ -246,6 +246,28 @@ class StreamingMixin:
             reflection_guidance=reflection_guidance,
         )
 
+        # B / #1309 + C / #1311 degraded-mode fail-closed (streaming
+        # path). When ``build_context`` returns ``degraded_mode=True``
+        # (mandatory governance floor doesn't fit, or durable-salvage
+        # write failed under C's feature flag), the LLM call MUST NOT
+        # proceed. Yield a refusal chunk so the stream consumer sees
+        # the failure and stops, instead of silently proceeding to
+        # ``stream_with_tool_detection`` against an empty context.
+        # Explicit ``is True`` so MagicMock-returning test fixtures
+        # don't trip the gate inadvertently.
+        if getattr(context_result, "degraded_mode", False) is True:
+            warn_text = " | ".join(context_result.warnings or ["context build degraded"])
+            logging.error(
+                "DEGRADED MODE on streaming build_context — refusing to "
+                "issue the model call. Warnings: %s",
+                warn_text,
+            )
+            yield (
+                "I cannot continue this turn safely: the context window "
+                f"is in a degraded state. Details: {warn_text}"
+            )
+            return
+
         # Build user prompt. `context` carries the per-turn retrieved content
         # (memories + RAG) — kept OUT of the system message so the system prefix
         # is stable across turns and prompt caches can hit (see issue #703).
