@@ -24,7 +24,7 @@ from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 from .context_builder import ContextBuilder
 from .token_counter import TokenCounter, get_token_counter
-from .token_budget import TokenBudget, create_budget
+from .token_budget import TokenBudget, create_budget, DegradedModeError
 from .conversation_manager import ConversationManager
 from .memory_manager import MemoryManager
 from .tool_context_manager import ToolContextManager
@@ -98,6 +98,14 @@ class ContextResult:
     # `signal_log.injected_clauses_json` / `dropped_clauses_json`.
     injected_clauses: Optional[List[str]] = None
     dropped_clauses: Optional[List[str]] = None
+    # Set to True when the elastic budget (#1309) raised
+    # ``DegradedModeError`` because the measured mandatory governance
+    # floor could not fit the model's context window. The caller MUST
+    # surface this to the operator (UI, telemetry) instead of issuing
+    # the LLM call under a false "normal" status — Emma's 2026-05-20
+    # hardening invariant (Review record, PR #1306).
+    degraded_mode: bool = False
+    mandatory_system_tokens: int = 0
 
 
 class ContextManager:
@@ -276,10 +284,9 @@ class ContextManager:
             history = await self.conversation_manager.get_conversation_history()
         message_count = len(history)
 
-        # Create adaptive budget
-        budget = create_budget(self.model, message_count, adaptive=True)
-
-        # Get constitutional awareness (state of mind includes prompt adaptation)
+        # Get constitutional awareness (state of mind includes prompt adaptation).
+        # Resolved BEFORE the budget so the elastic budget can include
+        # state-of-mind tokens in the measured mandatory floor.
         prompt_adaptation = None
         state_of_mind = None
         if self.llm_service and hasattr(self.llm_service, 'get_state_of_mind'):
@@ -288,6 +295,61 @@ class ContextManager:
                 prompt_adaptation = state_of_mind.prompt_adaptation
             except Exception as e:
                 logger.warning(f"Failed to get constitutional state of mind: {e}")
+
+        # Measure the non-borrowable mandatory governance floor for the
+        # #1309 elastic budget (Emma 2026-05-20). When the floor cannot
+        # fit, the elastic budget raises DegradedModeError; surface
+        # this as a degraded-mode ContextResult so the caller does not
+        # issue the LLM call under a false "normal" status. The guard
+        # below is narrow: it only swallows ``TypeError`` from test
+        # stubs that mock the token counter (MagicMock returns when
+        # casted to int blow up here, not in production). Any other
+        # exception — including ``ValueError`` indicating a real
+        # measurement error — propagates so a broken measurement path
+        # is loud, not silent. Codex round 1 #4.
+        raw_mandatory = self.context_builder.measure_mandatory_system_tokens(
+            constitution=constitution,
+            state_of_mind=state_of_mind,
+            prompt_adaptation=prompt_adaptation,
+        )
+        try:
+            mandatory_system_tokens = int(raw_mandatory)
+        except TypeError:
+            logger.error(
+                "measure_mandatory_system_tokens returned non-numeric (type=%s); "
+                "treating mandatory floor as 0 — production token counters always "
+                "return int, so this signals a test-stub or broken counter wiring",
+                type(raw_mandatory).__name__,
+            )
+            mandatory_system_tokens = 0
+        try:
+            budget = create_budget(
+                self.model,
+                message_count,
+                elastic=True,
+                mandatory_system_tokens=mandatory_system_tokens,
+            )
+        except DegradedModeError as e:
+            logger.error(
+                "degraded-mode: %s — returning empty ContextResult; caller "
+                "MUST surface this and refuse the LLM call",
+                e,
+            )
+            warnings.append(
+                f"DEGRADED MODE: mandatory governance floor ({e.mandatory_system_tokens} "
+                f"tokens) does not fit context budget ({e.total_budget} tokens) "
+                f"for model {e.model!r}. The LLM call MUST NOT proceed — surface "
+                "this to the operator."
+            )
+            return ContextResult(
+                system_prompt="",
+                messages=[],
+                total_tokens=0,
+                budget_summary={"mode": "degraded", "reason": str(e)},
+                warnings=warnings,
+                degraded_mode=True,
+                mandatory_system_tokens=mandatory_system_tokens,
+            )
 
         # 1. Build system prompt. When the caller sets
         # `system_prompt_budget_bytes` (a per-source registration knob
@@ -353,7 +415,28 @@ class ContextManager:
                 system_prompt_addendum=system_prompt_addendum,
             )
         system_tokens = self.counter.count(system_prompt)
-        budget.use("system", system_tokens)
+        # System is mandatory governance content: we have already
+        # committed to sending it. Record usage; if accounting cannot
+        # absorb it (system_tokens > local + elastic pool), bump the
+        # allocation to match what we're actually sending and log
+        # loudly. Better to over-report system usage than to send
+        # bytes we don't account for (codex round 1 #1).
+        if not budget.use("system", system_tokens):
+            allocation = budget.allocations.get("system")
+            if allocation is not None:
+                allocation.budget = max(allocation.budget, system_tokens)
+                allocation.used = system_tokens
+            warnings.append(
+                f"system content ({system_tokens} tokens) exceeded its slice "
+                "plus elastic pool; budget accounting forced to match the "
+                "bytes already committed for this turn"
+            )
+            logger.warning(
+                "system slice over budget by %s tokens — forcing allocation "
+                "to match what is being sent (no silent drift)",
+                system_tokens
+                - (budget.allocations.get("system").budget if allocation else 0),
+            )
 
         # Track what we include
         episode_count = 0
@@ -405,6 +488,13 @@ class ContextManager:
         if microcompact_savings > 0:
             logger.info(f"Microcompact cleared {microcompact_savings} stale tool results")
 
+        # Finalize the system slice: any unused budget above the
+        # mandatory floor flows into the elastic pool so later sections
+        # (episodes, memories, RAG, history) can borrow it. The
+        # mandatory floor is preserved — never returned to the pool.
+        if hasattr(budget, "mark_section_finalized"):
+            budget.mark_section_finalized("system")
+
         # 2. Add episodes for long conversations.
         # Use the get/format split (#1308) so episode_count is an
         # accurate ``len(episodes)`` instead of the legacy
@@ -439,10 +529,30 @@ class ContextManager:
 
                 if episode_context:
                     episode_tokens = self.counter.count(episode_context)
-                    budget.use("episodes", episode_tokens, items=len(episodes))
-                    system_prompt = f"{system_prompt}\n\n{episode_context}"
-                    episode_count = len(episodes)
-                    logger.debug(f"Added {episode_count} episodes to context")
+                    # Only append episodes when the budget can absorb
+                    # them — otherwise the block is dropped to preserve
+                    # the accounting invariant (codex round 1 #1).
+                    # The selector inside ``get_episodes_for_context``
+                    # already capped by ``budget.episodes``; this is a
+                    # defensive check against pool exhaustion.
+                    if budget.use("episodes", episode_tokens, items=len(episodes)):
+                        system_prompt = f"{system_prompt}\n\n{episode_context}"
+                        episode_count = len(episodes)
+                        logger.debug(f"Added {episode_count} episodes to context")
+                    else:
+                        warnings.append(
+                            f"episode block ({episode_tokens} tokens) skipped — "
+                            "exceeded episodes slice plus elastic pool"
+                        )
+                        logger.warning(
+                            "episode block skipped: %s tokens did not fit episodes "
+                            "slice plus pool",
+                            episode_tokens,
+                        )
+        # Episodes finalized — release any unused episode budget into
+        # the elastic pool for later sections.
+        if hasattr(budget, "mark_section_finalized"):
+            budget.mark_section_finalized("episodes")
 
         # 3. Retrieve emotionally-weighted memories (placed in dynamic user
         # context, not system, so the system prefix stays cacheable).
@@ -464,6 +574,9 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"Memory retrieval failed: {e}")
                 warnings.append(f"Memory retrieval unavailable: {e}")
+        # Memories finalized — release slack into the elastic pool.
+        if hasattr(budget, "mark_section_finalized"):
+            budget.mark_section_finalized("memories")
 
         # 4. Retrieve RAG context (placed in dynamic user context, not system).
         if include_rag:
@@ -483,6 +596,11 @@ class ContextManager:
             except Exception as e:
                 logger.warning(f"RAG retrieval failed: {e}")
                 warnings.append(f"Document search unavailable: {e}")
+        # RAG finalized — release slack into the pool so the history
+        # slice (the section the silent-prune correctness hole hurts
+        # most until C ships) can borrow it.
+        if hasattr(budget, "mark_section_finalized"):
+            budget.mark_section_finalized("rag")
 
         # Assemble the per-turn retrieved-context block. Empty string when
         # nothing was retrieved — caller can use this as-is in a format()
@@ -496,13 +614,49 @@ class ContextManager:
         else:
             dynamic_user_context = ""
 
-        # 5. Format conversation history with remaining budget
+        # 5. Format conversation history with remaining budget. When the
+        # elastic budget (#1309) is in use, history sizes against its
+        # *effective* ceiling (own remaining + pool) so released slack
+        # from finalized sections actually grows the conversation slice
+        # — codex round 1 #2 caught the previous version capping at the
+        # static ``budget.history`` and never asking for the slack.
+        if hasattr(budget, "effective_budget"):
+            history_max_tokens = budget.effective_budget("history")
+        else:
+            history_max_tokens = budget.history
         formatted_history = self.context_builder.format_conversation_history(
             history=history,
-            max_tokens=budget.history
+            max_tokens=history_max_tokens,
         )
         history_tokens = self.counter.count_messages(formatted_history)
-        budget.use("history", history_tokens, items=len(formatted_history))
+        if not budget.use("history", history_tokens, items=len(formatted_history)):
+            # ``format_conversation_history`` overshot ``max_tokens``
+            # (wrap-overhead is added after its own per-message budget
+            # check at context_builder.py:462-468). The legacy
+            # post-budget prune later in this function compares
+            # ``total_used`` to ``total_budget``, but
+            # ``ElasticTokenBudget.use`` returns False *without*
+            # recording usage, so the legacy prune never sees the
+            # rejected bytes. Trim oldest until the byte cost fits the
+            # effective ceiling, then re-record (codex round 2 P1).
+            target = history_max_tokens
+            while formatted_history and history_tokens > target:
+                dropped = formatted_history.pop(0)
+                dropped_tokens = (
+                    self.counter.count(dropped.get("content", "") or "") + 4
+                )
+                history_tokens -= dropped_tokens
+            warnings.append(
+                f"history wrap-overhead overshot ceiling — pre-trimmed to "
+                f"{len(formatted_history)} messages ({history_tokens} tokens)"
+            )
+            logger.warning(
+                "history pre-trimmed: %s tokens, %s messages",
+                history_tokens,
+                len(formatted_history),
+            )
+            # Re-record the trimmed cost so budget accounting is honest.
+            budget.use("history", history_tokens, items=len(formatted_history))
 
         # Check if we had to truncate significantly
         if len(formatted_history) < len(history) * 0.5:
@@ -556,6 +710,8 @@ class ContextManager:
             dynamic_user_context=dynamic_user_context,
             injected_clauses=injected_clauses_for_audit,
             dropped_clauses=dropped_clauses_for_audit,
+            degraded_mode=False,
+            mandatory_system_tokens=mandatory_system_tokens,
         )
 
     async def _build_ephemeral_context(

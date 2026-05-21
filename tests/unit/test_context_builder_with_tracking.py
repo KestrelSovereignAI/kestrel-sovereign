@@ -60,6 +60,13 @@ def _stub_builder(bootstrap: dict) -> ContextBuilder:
         side_effect=lambda name: bootstrap.get(name)
     )
     cb.storage = MagicMock()
+    # ``ContextManager.build_context`` (#1309 elastic budget) calls
+    # ``measure_mandatory_system_tokens`` to size the non-borrowable
+    # governance floor. The MagicMock counter in this stub returns
+    # MagicMock from ``count()``, which would propagate into the
+    # ElasticTokenBudget constructor as a non-int. Override with a
+    # zero-floor stub so the tests focus on the tracking assembler.
+    cb.measure_mandatory_system_tokens = lambda *a, **kw: 0
     return cb
 
 
@@ -228,12 +235,11 @@ async def test_context_manager_budget_includes_addendum_bytes(tmp_path):
 
     from kestrel_sovereign.agent.context_manager import ContextManager
 
-    # Build a real ContextBuilder stub
+    # Build a real ContextBuilder stub. ``_stub_builder`` already
+    # stubs ``measure_mandatory_system_tokens`` to zero (so the
+    # ElasticTokenBudget #1309 doesn't trip on the MagicMock counter).
     cb = _stub_builder({"SOUL.md": "soul body"})
     cb.get_session_briefing = lambda: ""
-    # Tracking method exists on the real ContextBuilder; the stub
-    # `_stub_builder` builds a real ContextBuilder via __new__, so
-    # the method is callable.
 
     # ContextManager wired against the stub.
     cm = ContextManager(
