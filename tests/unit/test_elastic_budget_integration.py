@@ -145,6 +145,55 @@ class TestDegradedModeFlow:
 # ---------------------------------------------------------------------------
 
 
+class TestHistoryOverBudgetPrune:
+    """Codex round 2 P1: when format_conversation_history overshoots
+    its max_tokens (wrap overhead added after the per-message budget
+    check), ``budget.use(\"history\", …)`` returns False without
+    recording usage. ContextManager must pre-trim the formatted
+    history so the LLM call does not send bytes the budget never
+    accounted for — and so the legacy ``total_used > total_budget``
+    prune isn't relied on for a case it cannot see.
+    """
+
+    @pytest.mark.asyncio
+    async def test_history_pre_trim_runs_when_use_rejects(self):
+        cb = _real_builder_with_bootstrap({})
+        cb.get_session_briefing = lambda: ""
+        cb.measure_mandatory_system_tokens = lambda *a, **kw: 0
+        cb.get_episodes_for_context = AsyncMock(return_value=[])
+        cb.retrieve_context = AsyncMock(return_value=None)
+        cb.build_system_prompt = lambda **kw: "sys"
+
+        # Force the formatter to return a giant history that blows
+        # both the static slice and the elastic pool. Return a fresh
+        # copy each call so the production pre-trim's ``.pop(0)``
+        # doesn't mutate the fixture.
+        original_count = 20
+        cb.format_conversation_history = lambda history, max_tokens=None, **kw: [
+            {"role": "user", "content": "X" * 50_000} for _ in range(original_count)
+        ]
+
+        cm = ContextManager(storage=MagicMock(), context_builder=cb)
+        cm.conversation_manager = MagicMock()
+        cm.conversation_manager.get_conversation_history = AsyncMock(return_value=[])
+        cm.llm_service = None
+        cm._microcompact_tool_results = lambda hist: 0
+        cm.memory_retriever = None
+        cm.memory_manager = None
+
+        result = await cm.build_context(
+            query="anything",
+            constitution="Be kind.",
+            include_memories=False,
+            include_rag=False,
+            conversation_history=[],
+        )
+        # Pre-trim must have run — fewer messages than the formatter
+        # returned, and a warning surfaced.
+        assert len(result.messages) < original_count
+        assert any("pre-trimmed" in w or "auto-pruned" in w.lower() for w in result.warnings)
+
+
 class TestHistoryAbsorbsReleasedSlack:
     @pytest.mark.asyncio
     async def test_history_max_tokens_reflects_pool(self):

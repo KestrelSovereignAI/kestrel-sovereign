@@ -630,15 +630,33 @@ class ContextManager:
         )
         history_tokens = self.counter.count_messages(formatted_history)
         if not budget.use("history", history_tokens, items=len(formatted_history)):
-            # Pool exhausted mid-history; trim the oldest until it fits.
-            # The legacy post-budget prune below still runs as final
-            # safety, but try a soft pre-prune here so warnings are
-            # accurate (codex round 1 #1).
-            logger.warning(
-                "history use() rejected %s tokens — relying on legacy "
-                "post-budget auto-prune to bring back under budget",
-                history_tokens,
+            # ``format_conversation_history`` overshot ``max_tokens``
+            # (wrap-overhead is added after its own per-message budget
+            # check at context_builder.py:462-468). The legacy
+            # post-budget prune later in this function compares
+            # ``total_used`` to ``total_budget``, but
+            # ``ElasticTokenBudget.use`` returns False *without*
+            # recording usage, so the legacy prune never sees the
+            # rejected bytes. Trim oldest until the byte cost fits the
+            # effective ceiling, then re-record (codex round 2 P1).
+            target = history_max_tokens
+            while formatted_history and history_tokens > target:
+                dropped = formatted_history.pop(0)
+                dropped_tokens = (
+                    self.counter.count(dropped.get("content", "") or "") + 4
+                )
+                history_tokens -= dropped_tokens
+            warnings.append(
+                f"history wrap-overhead overshot ceiling — pre-trimmed to "
+                f"{len(formatted_history)} messages ({history_tokens} tokens)"
             )
+            logger.warning(
+                "history pre-trimmed: %s tokens, %s messages",
+                history_tokens,
+                len(formatted_history),
+            )
+            # Re-record the trimmed cost so budget accounting is honest.
+            budget.use("history", history_tokens, items=len(formatted_history))
 
         # Check if we had to truncate significantly
         if len(formatted_history) < len(history) * 0.5:
