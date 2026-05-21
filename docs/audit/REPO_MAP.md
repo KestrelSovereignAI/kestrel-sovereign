@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-20
-**Scope:** 1544 tracked files (998 `.py`, 260 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-21
+**Scope:** 1542 tracked files (1001 `.py`, 259 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -122,7 +122,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/model_preference.py** — Model preference and solvency mixin for KestrelAgent.
   - `class ModelPreferenceMixin`
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
-  - `class IterationTracker`; `class ContextStats`; `class OrchestratorEngineMixin`
+  - `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
 - **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
   - `async def build_preturn_state_block(agent)`
 - **kestrel_sovereign/agent/request_lifecycle.py** — Request lifecycle mixin for KestrelAgent.
@@ -539,7 +539,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/filecoin_adapter.py** — Filecoin/IPFS adapter for Kestrel's sovereign storage system.
   - `class FilecoinAdapter`
 - **kestrel_sovereign/graduate_service.py** — Graduate Service - Promote a test agent to permanent status.
-  - `class GraduationError`; `class ValidationChecklist`; `async def validate_agent(storage, agent_id)`; `async def graduate_agent(db_path, council_session, dry_run)`; `def main()`
+  - `class GraduationError`; `class ValidationChecklist`; `async def validate_agent(storage, agent_id)`; `async def graduate_agent(db_path, dry_run)`; `def main()`
 - **kestrel_sovereign/health_check.py** — —
   - `def run_health_check()`
 - **kestrel_sovereign/heartbeat.py** — Heartbeat system for Kestrel Sovereign.
@@ -610,8 +610,10 @@ Repo entry points and standard project files.
   - `class AnthropicAdapter`
 - **kestrel_sovereign/llm/claude_max_adapter.py** — Claude Max Subscription Adapter
   - `class ClaudeMaxAdapter`
-- **kestrel_sovereign/llm/codex_adapter.py** — Codex Provider Adapter (OpenAI ChatGPT Backend)
+- **kestrel_sovereign/llm/codex_adapter.py** — Codex Provider Adapter — OpenAI ChatGPT subscription via the official ``@openai/codex`` app-server.
   - `class CodexAdapter`
+- **kestrel_sovereign/llm/codex_app_server.py** — Codex app-server JSON-RPC client.
+  - `class CodexAppServerError`; `class CodexAppServerConnectionClosed`; `def resolve_codex_binary()`; `class CodexAppServerClient`
 - **kestrel_sovereign/llm/constitutional_awareness.py** — Constitutional awareness for LLM Service.
   - `class ConstitutionalAwarenessMixin`
 - **kestrel_sovereign/llm/constitutional_profile.py** — Constitutional Profile Service
@@ -1483,6 +1485,8 @@ Repo entry points and standard project files.
   - `def clean_sse_connections()`; `def live_server()`; `async def test_real_http_sse_delivers_approval_and_decision_resolves_caller(live_server)`; `async def test_real_http_denying_posts_404_after_request_times_out(live_server)`
 - **tests/integration/test_approval_sse_e2e.py** — End-to-end test for the approval-request SSE path with real infrastructure.
   - `def clean_sse_connections()`; `async def test_approval_request_reaches_sse_and_decision_resolves_caller()`
+- **tests/integration/test_atomic_increment_metadata.py** — Integration tests for ``AsyncConversationStore.atomic_increment_metadata_counter``.
+  - `async def test_increment_creates_counter_when_absent(tmp_path)`; `async def test_increment_is_monotonic_across_serial_calls(tmp_path)`; `async def test_increment_does_not_collide_concurrent_calls(tmp_path)`; `async def test_increment_preserves_other_metadata_fields(tmp_path)`; `async def test_postgres_sql_shape_uses_jsonb_cast(tmp_path)`; `async def test_increment_returns_false_for_unknown_message(tmp_path)`; `async def test_increment_returns_true_for_real_message(tmp_path)`; `async def test_increment_without_timestamp_field(tmp_path)`
 - **tests/integration/test_avatar_api_e2e.py** — Integration tests for avatar API endpoints
   - `def client(monkeypatch)`; `class TestFileEndpoint`; `class TestIdentityEndpoint`; `class TestAvatarStorageIntegration`; `class TestVisualIdentityFeatureIntegration`; `class TestFileServing`
 - **tests/integration/test_backup_e2e.py** — —
@@ -1493,8 +1497,8 @@ Repo entry points and standard project files.
   - `class MockLLMResponse`; `class MockLLMService`; `def temp_dir()`; `def mock_db()`; `class TestBootstrapIntegrationFlow`; `class TestBootstrapWithExistingAgents`; `class TestBootstrapErrorHandling`
 - **tests/integration/test_cache_prompt_wire.py** — Integration test: `cache_prompt` reaches the wire (issue #704).
   - `async def test_cache_prompt_reaches_wire_for_llama_cpp()`; `async def test_cache_prompt_absent_from_wire_for_other_vendors(vendor)`; `async def test_real_llama_server_accepts_cache_prompt()`
-- **tests/integration/test_codex_real.py** — Integration tests: CodexAdapter against the live ChatGPT-backend Responses API.
-  - `async def test_codex_single_turn_text_real_api()`; `async def test_codex_tool_call_round_trip_real_api()`; `async def test_codex_tool_call_with_session_id_real_api()`; `async def test_codex_text_only_reasoning_replay_real_api()`; `async def test_codex_two_separate_agent_loops_share_session_real_api()`; `async def test_codex_continuation_cursor_written_real_api()`
+- **tests/integration/test_codex_real.py** — Integration tests: CodexAdapter against the real ``codex app-server``.
+  - `async def test_single_turn_text_real()`; `async def test_session_reuses_thread_real()`; `async def test_streaming_text_real()`; `async def test_tool_call_round_trip_real()`
 - **tests/integration/test_compress_e2e.py** — E2E Tests for Session Compression Functionality.
   - `async def agent_with_messages(temp_dir)`; `async def agent_with_few_messages(temp_dir)`; `class TestCompressCommand`; `class TestCompressionCheckNeeded`; `class TestCompressionSession`; `class TestContextManagerNoLLM`
 - **tests/integration/test_compute_security_integration.py** — Integration tests for Compute + Security feature interaction.
@@ -1766,14 +1770,10 @@ Repo entry points and standard project files.
   - `def test_argparse_deploy_defaults()`; `def test_argparse_deploy_overrides()`; `def test_argparse_deploy_unknown_target_rejected()`; `def test_argparse_status_stop_kill()`; `def test_kestrel_cli_registers_runpod()`; `def test_cmd_runpod_no_subverb_prints_usage(capsys)`; `def test_deploy_without_api_key_errors_with_hint(monkeypatch, capsys)`; `def test_status_without_api_key_errors(monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli_verify_install.py** — ``kestrel verify-install`` CLI tests — sub-PR 2.2 of epic #1050 (bash-to-Python port of ``scripts/verify_clean_install.sh``).
   - `def test_argparse_no_tests_is_empty_list()`; `def test_argparse_single_test()`; `def test_argparse_multiple_tests_preserve_order()`; `def test_kestrel_cli_registers_verify_install()`; `def test_cmd_all_pass_exits_zero(monkeypatch)`; `def test_cmd_any_fail_exits_one(monkeypatch)`; `def test_cmd_selection_narrows_runs(monkeypatch)`; `def test_cmd_selection_preserves_user_order(monkeypatch)`; `…`
-- **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter and registry integration.
-  - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestAccountIdExtraction`; `class TestBuildHeaders`; `class TestOpenAIPlanProviderRegistry`; `class TestReadCodexAuthFile`
-- **tests/unit/test_codex_continuation.py** — Codex adapter cursor-tracking tests.
-  - `class TestComputeRequestSignature`; `class TestCodexCursorRecordingE2E`
-- **tests/unit/test_codex_responses_format.py** — Tests for Chat-Completions → Responses-API message conversion (#828).
-  - `class TestContentToText`; `class TestConvertMessagesToResponsesFormat`; `class TestCodexAdapterAppliesConverter`
-- **tests/unit/test_codex_token_refresh.py** — CodexAdapter OAuth token-refresh recovery tests (#887).
-  - `class TestExternalRefreshAdoption`; `async def test_codex_streaming_emits_reasoning_summary_as_thinking_delta()`; `async def test_codex_streaming_splits_think_tags_from_output_text()`; `class TestOAuthRefreshFlow`; `class TestRefreshFailurePropagates`; `class TestRefreshCacheReuse`
+- **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter (app-server backed) and registry.
+  - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestDynamicToolsSpec`; `class TestTurnInputBuilder`; `class TestUsageProjection`; `class TestResultMarshalling`; `class TestAdapterTextPath`; `…`
+- **tests/unit/test_codex_app_server.py** — Tests for the codex app-server JSON-RPC client.
+  - `class TestVersionGate`; `class TestBinaryResolution`; `class TestDispatchLogic`; `class TestServerRequestHandlerRegistration`; `class TestTurnIteration`
 - **tests/unit/test_command_handler_async_boundary_contracts.py** — Contracts for explicit sync/async boundaries in CommandHandler.
   - `def test_privacy_save_handler_is_explicitly_async()`; `async def test_handle_awaits_privacy_save_without_leaking_coroutine()`; `async def test_handle_accepts_custom_awaitable_results_via_isawaitable()`; `def test_create_agent_handler_is_explicitly_async()`; `async def test_handle_awaits_create_agent_command()`; `def test_anchor_handler_is_explicitly_async()`; `async def test_handle_awaits_anchor_command()`
 - **tests/unit/test_command_handler_constitution_contracts.py** — Command-handler contracts for constitution verification commands.
@@ -1910,6 +1910,8 @@ Repo entry points and standard project files.
   - `class TestMemoryMetadataEpistemicFields`; `class TestEpistemicDetection`; `class TestExtractEpistemicFields`; `async def router()`; `class TestSchemaRouterEpistemicProvenance`; `class TestMarkSuperseded`; `class TestRecallSupersededFilter`; `class TestRetrieverCertaintyWeighting`; `…`
 - **tests/unit/test_example_model_config_contracts.py** — Contracts for example model config files and catalog source-of-truth shape.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`
+- **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
+  - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`
 - **tests/unit/test_extract_raw_user_content.py** — Tests for ``context_builder.extract_raw_user_content``.
   - `def test_strips_full_sent_form_with_retrieved_context()`; `def test_strips_sent_form_without_retrieved_context()`; `def test_strips_sent_form_round_trips_wrap_user_input()`; `def test_legacy_raw_content_unchanged()`; `def test_preserves_inner_newlines_in_raw()`; `def test_preserves_inner_tag_like_content()`; `def test_malformed_partial_wrappers_left_alone()`; `def test_retrieved_context_only_no_user_input_wrap()`
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
@@ -1944,6 +1946,8 @@ Repo entry points and standard project files.
   - `class TestIsGpt5ModelId`; `class TestPrependGpt5Overlay`
 - **tests/unit/test_graceful_degradation.py** — Unit tests for the Graceful Degradation module.
   - `class TestSeverityLevel`; `class TestCapabilityLoss`; `class TestDegradationReport`; `class TestGracefulDegradationHandler`; `class TestConvenienceFunctions`; `class TestCapabilityImpacts`
+- **tests/unit/test_graduate_service.py** — Regression tests for ``kestrel_sovereign.graduate_service``.
+  - `async def test_graduate_service_required_graph_methods_present()`; `async def test_graduate_service_required_storage_methods_present()`; `def test_graduate_service_signature_has_no_council_session()`; `def test_resolve_did_prefers_property_then_falls_back_to_node_id()`; `def test_resolve_did_refuses_non_did_node_id_when_property_missing()`; `async def graduate_ready_db(tmp_path)`; `async def test_validate_agent_all_eight_gates_pass(graduate_ready_db)`; `async def test_graduate_agent_dry_run_returns_true_without_mutation(graduate_ready_db)`; `…`
 - **tests/unit/test_graduated_hooks.py** — Tests for graduated hook decisions (warning fields on HookOutput).
   - `class AllowHook`; `class WarnHook`; `class DenyHook`; `class TestHookOutputWarnFactory`; `class TestHookOutputSerialization`; `class TestWarningAccumulation`
 - **tests/unit/test_graph_property_indexes.py** — Tests for JSON-path property indexes and query_nodes_by_type_and_property.
@@ -1972,6 +1976,8 @@ Repo entry points and standard project files.
   - `class MockNode`; `class MockStorage`; `class MockFileStore`; `class MockDB`; `class MockAgent`; `class TestRenameAgentCore`; `class TestUpdateIdentityRequest`; `class TestGenerateAvatarRequest`; `…`
 - **tests/unit/test_identity_feature.py** — ToolResult contract tests for IdentityFeature (#1085).
   - `async def test_migration_history_db_unavailable_returns_error()`; `async def test_migration_history_empty_returns_ok()`; `async def test_migration_history_malformed_row_partial()`; `async def test_assess_substrate_unknown_is_partial(monkeypatch)`; `def test_unique_export_filename_does_not_collide()`; `async def test_verify_identity_unsigned_is_partial(monkeypatch, tmp_path)`; `async def test_export_identity_tier_downgrade_is_partial(monkeypatch, tmp_path)`; `async def test_assess_substrate_anthropic_is_ok(monkeypatch)`
+- **tests/unit/test_identity_lifecycle_status.py** — Tests for IdentityFeature.lifecycle_status and the migration_history schema-bitrot regression.
+  - `async def test_migration_history_queries_label_column_not_edge_type()`; `async def test_lifecycle_status_db_unavailable_returns_error()`; `async def test_lifecycle_status_test_instance_standing()`; `async def test_lifecycle_status_graduated_standing_with_event()`; `async def test_lifecycle_status_born_permanent_no_transitions()`; `async def test_lifecycle_status_retired_via_retirement_event()`; `async def test_lifecycle_status_retired_overrides_graduated()`; `async def test_lifecycle_status_confirmation_distinguishes_from_emancipation()`; `…`
 - **tests/unit/test_identity_package.py** — Unit tests for the Identity Package module.
   - `class TestPersonalityFingerprint`; `class TestRelationshipRecord`; `class TestSkillRecord`; `class TestMigrationRecord`; `class TestAgentIdentityPackage`; `class TestSubstrateType`; `class TestHelperFunctions`; `class TestDIDDocumentVerification`
 - **tests/unit/test_identity_package_v2.py** — Identity package v2 schema tests — Wave 1 sub-PR 3 (#916).
