@@ -126,15 +126,17 @@ class TestRealStreaming:
             content="",
             tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={"task": "do something"})]
         )
-        second_response = LLMResponse(content="Final response", tool_calls=[])
-
-        mock_agent.llm_service.generate_with_messages = AsyncMock(return_value=second_response)
+        second_response = LLMResponse(content="Final streamed response", tool_calls=[])
 
         async def mock_stream(**kwargs):
+            # stream_with_tool_detection: yield text chunks as they
+            # arrive, then a final LLMResponse carrying detected
+            # tool_calls (empty here = no further iteration).
             for word in ["Final", " ", "streamed", " ", "response"]:
                 yield word
+            yield second_response
 
-        mock_agent.llm_service.stream_with_messages = mock_stream
+        mock_agent.llm_service.stream_with_tool_detection = mock_stream
 
         # Bind all orchestrator engine and tool registry mixin methods
         for method_name in (
