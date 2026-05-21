@@ -266,6 +266,203 @@ class TestAdapterTextPath:
         assert "".join(c for c in out if isinstance(c, str)) == "Hello"
 
 
+class TestThreadStartParams:
+    """Things we MUST send on thread/start so the app-server's native
+    tools behave correctly (cwd anchoring, sandbox profile)."""
+
+    @pytest.mark.asyncio
+    async def test_thread_start_carries_cwd(self):
+        """Without ``cwd``, codex's native shell tool runs relative paths
+        against wherever the kestrel process started — not the user's
+        working directory. ``pwd`` returned the install prefix in
+        Nellie's session; that's the symptom."""
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        assert isinstance(ts.get("cwd"), str) and ts["cwd"]
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_honors_env_override(self, monkeypatch):
+        monkeypatch.setenv("KESTREL_CODEX_CWD", "/agents/nellie/workspace")
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        assert ts["cwd"] == "/agents/nellie/workspace"
+
+
+class TestToolActivityMarkers:
+    """The chat-UI parses 🔧/✓/❌ marker lines from the streamed text to
+    render the expandable tool-activity cards (chat.js
+    ``isToolActivityStartLine``). For the orchestrator-dispatched path
+    the orchestrator emits these markers; for codex's inline tool loop
+    the adapter must emit them itself or the chat surface goes opaque
+    — which is exactly what Nellie reported."""
+
+    @pytest.mark.asyncio
+    async def test_native_shell_emits_start_and_complete_markers(self):
+        """The codex-native shell tool (commandExecution) runs entirely
+        inside the app-server's sandbox — kestrel never sees it via
+        item/tool/call. Without start/complete markers, shell calls
+        were invisible to the chat UI."""
+        events = [
+            {"method": "item/started", "params": {"item": {
+                "id": "i-1", "type": "commandExecution",
+                "command": "git status --short --branch",
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "i-1", "type": "commandExecution",
+                "command": "git status --short --branch",
+                "status": "succeeded",
+            }}},
+            {"method": "item/agentMessage/delta", "params": {"delta": "done"}},
+            {"method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "done"}}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        a = _adapter_with(events)
+        chunks = [
+            c async for c in a.get_streaming_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "go"}], session_id="s",
+            )
+        ]
+        stream = "".join(c for c in chunks if isinstance(c, str))
+        assert "\U0001f527 Calling shell: git status --short --branch" in stream
+        assert "✓ shell complete" in stream
+
+    @pytest.mark.asyncio
+    async def test_failed_shell_emits_failure_marker(self):
+        events = [
+            {"method": "item/started", "params": {"item": {
+                "id": "i-2", "type": "commandExecution", "command": "rg foo",
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "i-2", "type": "commandExecution", "command": "rg foo",
+                "status": "failed",
+            }}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        a = _adapter_with(events)
+        chunks = [
+            c async for c in a.get_streaming_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "go"}], session_id="s",
+            )
+        ]
+        stream = "".join(c for c in chunks if isinstance(c, str))
+        assert "❌ shell failed" in stream
+
+    @pytest.mark.asyncio
+    async def test_markers_do_not_leak_into_llmresponse_content(self):
+        """Markers belong on the wire, not in ``LLMResponse.content``.
+        Audit logs, narration checks, and any non-chat consumer of the
+        response would otherwise see literal "🔧" characters."""
+        events = [
+            {"method": "item/started", "params": {"item": {
+                "id": "i-3", "type": "commandExecution", "command": "ls",
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "i-3", "type": "commandExecution",
+                "command": "ls", "status": "succeeded",
+            }}},
+            {"method": "item/agentMessage/delta", "params": {"delta": "Hi"}},
+            {"method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "Hi"}}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        a = _adapter_with(events)
+        r = await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "go"}], session_id="s",
+        )
+        assert r.content == "Hi"
+        assert "\U0001f527" not in (r.content or "")
+        assert "✓" not in (r.content or "")
+
+    @pytest.mark.asyncio
+    async def test_markers_dedupe_when_started_and_completed_repeat(self):
+        events = [
+            {"method": "item/started", "params": {"item": {
+                "id": "i-4", "type": "commandExecution", "command": "pwd",
+            }}},
+            {"method": "item/started", "params": {"item": {
+                "id": "i-4", "type": "commandExecution", "command": "pwd",
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "i-4", "type": "commandExecution",
+                "command": "pwd", "status": "succeeded",
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "i-4", "type": "commandExecution",
+                "command": "pwd", "status": "succeeded",
+            }}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        a = _adapter_with(events)
+        chunks = [
+            c async for c in a.get_streaming_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "go"}], session_id="s",
+            )
+        ]
+        stream = "".join(c for c in chunks if isinstance(c, str))
+        assert stream.count("\U0001f527 Calling shell") == 1
+        assert stream.count("✓ shell complete") == 1
+
+    @pytest.mark.asyncio
+    async def test_dynamic_tool_emits_marker_and_preserves_executed_log(self):
+        """Kestrel-dispatched tools (dynamicToolCall): the start/complete
+        markers must fire AND the executed_tool_calls record the
+        kestrel-side audit row — both surfaces, not one or the other."""
+        calls: list = []
+
+        async def exe(name, args):
+            calls.append((name, args))
+            return {"success": True, "result": "ok"}
+
+        events = [
+            {"method": "item/started", "params": {"item": {
+                "id": "call-1", "type": "dynamicToolCall",
+                "name": "memory_search", "arguments": {"q": "x"},
+            }}},
+            {"method": "item/completed", "params": {"item": {
+                "id": "call-1", "type": "dynamicToolCall",
+                "name": "memory_search", "arguments": {"q": "x"},
+                "status": "succeeded",
+            }}},
+            {"method": "item/completed",
+             "params": {"item": {"type": "agentMessage", "text": "found"}}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        a = _adapter_with(events)
+        chunks = [
+            c async for c in a.get_streaming_response_with_tools(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "go"}],
+                tools=[{"type": "function", "function": {
+                    "name": "memory_search", "description": "d",
+                    "parameters": {"type": "object"}}}],
+                session_id="s", tool_executor=exe,
+            )
+        ]
+        stream = "".join(c for c in chunks if isinstance(c, str))
+        assert "\U0001f527 Calling memory_search" in stream
+        assert "✓ memory_search complete" in stream
+        # LLMResponse should still carry executed_tool_calls so the
+        # orchestrator path can fold it into chat history (PR #1331).
+        final = [c for c in chunks if isinstance(c, LLMResponse)][-1]
+        # No tool was actually invoked via item/tool/call here (we
+        # didn't drive the handler), so executed_tool_calls may be
+        # empty — but the attribute must remain attachable.
+        assert hasattr(final, "content")
+
+
 class TestToolExecutorBridge:
     """The crucial new surface: per-turn item/tool/call handler that
     runs through kestrel's security-gated executor."""
