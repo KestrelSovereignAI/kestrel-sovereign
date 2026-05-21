@@ -755,6 +755,215 @@ async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_loop_timeout_marker_precedes_separator():
+    """Codex P2 on PR #1346: chat.js's ``splitToolActivity`` groups
+    everything BEFORE the first ``\\n---\\n`` into the tool-activity
+    block and everything AFTER as response. The timeout failure marker
+    must land in the tool-activity block — emitting it after the
+    separator would render it as response prose instead of the tool
+    card's error state.
+
+    The implementation defers separator emission until the first text
+    chunk arrives; a timeout BEFORE any text leaves the separator
+    un-emitted, so the ❌ marker is alone in the activity block."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    import kestrel_sovereign.agent.orchestrator_engine as oe
+
+    monkeypatch_undo = None
+    oe_original_timeout = oe.ORCHESTRATOR_TURN_TIMEOUT_SECS
+    oe.ORCHESTRATOR_TURN_TIMEOUT_SECS = 0.2
+    try:
+        mock_feature = MagicMock()
+        mock_feature.tool_name = "test_tool"
+        mock_feature.name = "test_feature"
+        mock_feature.execute_as_subagent = AsyncMock(
+            return_value={"success": True}
+        )
+        mock_feature.to_orchestrator_tool.return_value = {
+            "type": "function",
+            "function": {"name": "test_tool", "description": "", "parameters": {}},
+        }
+
+        mock_agent = MagicMock()
+        mock_agent.did = "did:test"
+        mock_agent.features = {"test_feature": mock_feature}
+        mock_agent.observability_store = MagicMock()
+        mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
+        mock_agent.observability_store.log_tool_response = AsyncMock()
+        mock_agent.observability_store.log_metric = AsyncMock()
+        mock_agent._direct_tools = {}
+        mock_agent._tool_to_feature = {}
+        from kestrel_sovereign.hooks import HooksManager
+        mock_agent.hooks_manager = HooksManager()
+        mock_agent.is_request_cancelled = MagicMock(return_value=False)
+        mock_agent._explored_features = {}
+        mock_agent._direct_tool_defs = []
+        mock_agent._register_explored_feature_tools = MagicMock()
+
+        async def stuck_followup(**_kw):
+            await asyncio.sleep(10)
+            yield "never"
+
+        mock_agent.llm_service = MagicMock()
+        mock_agent.llm_service.stream_with_tool_detection = stuck_followup
+
+        for method_name in (
+            "_handle_orchestrator_response_streaming",
+            "_execute_tool_with_hooks", "_execute_tool_batch",
+            "_partition_tool_calls", "_dispatch_tool_call",
+            "_dispatch_feature_tool", "_dispatch_direct_tool",
+            "_get_denied_tools", "_handle_feature_error",
+            "_prune_orchestrator_messages", "_build_all_tools",
+            "_build_feature_tools", "_visible_features_by_tool_name",
+            "_visible_known_tool_names", "_hidden_context_features",
+            "_hidden_context_tools", "_feature_hidden_from_context",
+            "_direct_tool_hidden_from_context",
+        ):
+            setattr(
+                mock_agent, method_name,
+                getattr(KestrelAgent, method_name).__get__(mock_agent),
+            )
+        mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
+
+        first_response = LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
+        )
+
+        chunks = []
+        async for chunk in mock_agent._handle_orchestrator_response_streaming(
+            response=first_response, feature_tools=[],
+            system_prompt="sys", force_local_only=False,
+            effective_model="m", user_message="hi",
+        ):
+            chunks.append(chunk)
+
+        text = "".join(c for c in chunks if isinstance(c, str))
+        # No separator should have been emitted (no text chunk arrived
+        # before the timeout). The ❌ marker is in the tool-activity
+        # block where chat.js will style it as a tool-card error.
+        assert "\n---\n" not in text, (
+            f"separator must NOT precede timeout marker (chat.js would "
+            f"then render timeout as response prose, not tool-card error). "
+            f"Got: {text!r}"
+        )
+        assert "❌" in text and "timeout" in text
+    finally:
+        oe.ORCHESTRATOR_TURN_TIMEOUT_SECS = oe_original_timeout
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_loop_follow_up_tool_call_emits_revise_sentinel():
+    """Codex P1 on PR #1346: a follow-up iteration's stream can yield
+    text BEFORE another ToolCallStarted. That mid-stream tool start
+    must fire the same honesty-layer revise sentinel the first-level
+    streaming path does, so the chat client can clear any speculative
+    pre-tool prose for THIS tool call. Without this, the model's
+    "I'll check Y" text stays on screen unverified before Y runs."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+    from kestrel_sdk.llm import ToolCallStarted as TCS
+
+    mock_feature = MagicMock()
+    mock_feature.tool_name = "test_tool"
+    mock_feature.name = "test_feature"
+    mock_feature.execute_as_subagent = AsyncMock(
+        return_value={"success": True}
+    )
+    mock_feature.to_orchestrator_tool.return_value = {
+        "type": "function",
+        "function": {"name": "test_tool", "description": "", "parameters": {}},
+    }
+
+    mock_agent = MagicMock()
+    mock_agent.did = "did:test"
+    mock_agent.features = {"test_feature": mock_feature}
+    mock_agent.observability_store = MagicMock()
+    mock_agent.observability_store.log_tool_call = AsyncMock(return_value="e1")
+    mock_agent.observability_store.log_tool_response = AsyncMock()
+    mock_agent.observability_store.log_metric = AsyncMock()
+    mock_agent._direct_tools = {}
+    mock_agent._tool_to_feature = {}
+    from kestrel_sovereign.hooks import HooksManager
+    mock_agent.hooks_manager = HooksManager()
+    mock_agent.is_request_cancelled = MagicMock(return_value=False)
+    mock_agent._explored_features = {}
+    mock_agent._direct_tool_defs = []
+    mock_agent._register_explored_feature_tools = MagicMock()
+    # Stub the SSE emit — we only care that the in-band sentinel
+    # makes it into the stream.
+    mock_agent._emit_revising_event = AsyncMock()
+
+    async def streamed_followup(**_kw):
+        # Pre-tool prose, then a ToolCallStarted, then the terminal
+        # LLMResponse carrying that tool call.
+        yield "Let me also check Y "
+        yield TCS(index=0, id="tc2", name="other_tool")
+        yield LLMResponse(
+            content="Let me also check Y ",
+            tool_calls=[ToolCall(id="tc2", name="test_tool", arguments={})],
+        )
+
+    mock_agent.llm_service = MagicMock()
+    mock_agent.llm_service.stream_with_tool_detection = streamed_followup
+
+    for method_name in (
+        "_handle_orchestrator_response_streaming",
+        "_execute_tool_with_hooks", "_execute_tool_batch",
+        "_partition_tool_calls", "_dispatch_tool_call",
+        "_dispatch_feature_tool", "_dispatch_direct_tool",
+        "_get_denied_tools", "_handle_feature_error",
+        "_prune_orchestrator_messages", "_build_all_tools",
+        "_build_feature_tools", "_visible_features_by_tool_name",
+        "_visible_known_tool_names", "_hidden_context_features",
+        "_hidden_context_tools", "_feature_hidden_from_context",
+        "_direct_tool_hidden_from_context",
+    ):
+        setattr(
+            mock_agent, method_name,
+            getattr(KestrelAgent, method_name).__get__(mock_agent),
+        )
+    mock_agent._build_tool_calls_msg = KestrelAgent._build_tool_calls_msg
+    mock_agent._build_assistant_tool_history_msg = (
+        KestrelAgent._build_assistant_tool_history_msg.__get__(mock_agent)
+    )
+
+    first_response = LLMResponse(
+        content="",
+        tool_calls=[ToolCall(id="tc1", name="test_tool", arguments={})],
+    )
+
+    chunks = []
+    try:
+        async for chunk in mock_agent._handle_orchestrator_response_streaming(
+            response=first_response, feature_tools=[],
+            system_prompt="sys", force_local_only=False,
+            effective_model="m", user_message="hi",
+            request_id="req-rev-followup",
+        ):
+            chunks.append(chunk)
+            # Stop after we observe enough to assert on — the iteration
+            # would otherwise loop into another tool batch that has no
+            # stub. (The fake feature would keep being invoked.)
+            if mock_feature.execute_as_subagent.await_count >= 2:
+                break
+    except Exception:
+        pass
+
+    text = "".join(c for c in chunks if isinstance(c, str))
+    # In-band revise sentinel for the follow-up tool call must appear
+    # in the stream. The chat client uses this to clear the
+    # "Let me also check Y" bubble before the tool runs.
+    assert "\x1eKESTREL:REVISE:" in text, (
+        f"follow-up ToolCallStarted must emit the in-band revise "
+        f"sentinel for the chat client to clear speculative pre-tool "
+        f"prose. Got stream: {text!r}"
+    )
+    # The corresponding SSE emit should also have been invoked at
+    # least once (parity with first-level honesty-layer signaling).
+    assert mock_agent._emit_revising_event.await_count >= 1
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_loop_followup_separator_emitted_once_per_turn():
     """The "\\n---\\n" separator is the chat UI's wire-protocol marker
     between tool activity and final synthesis. Pre-rewrite it fired

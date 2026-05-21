@@ -28,6 +28,12 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
 )
 from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sdk.llm import ToolCallStarted
+# Re-use streaming.py's in-band sentinel builders for follow-up
+# ToolCallStarted events so the chat UI's revise-on-tool semantic
+# applies uniformly to first-level AND multi-iteration tool calls
+# (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
+# the honesty-layer clear).
+from kestrel_sovereign.agent.streaming import _build_revise_sentinel
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import optional_span
 
@@ -1796,12 +1802,20 @@ class OrchestratorEngineMixin:
             # and the per-iteration asyncio.timeout below surfaces a
             # hang as a visible failure marker rather than silent dead
             # air.
-            if not followup_separator_emitted:
-                yield "\n---\n"
-                followup_separator_emitted = True
             iter_text_chunks: List[str] = []
             response = None
             timed_out = False
+            # Separator emission is deferred until the first TEXT chunk
+            # arrives. Two reasons:
+            #   1. If the iteration goes straight to another tool_call
+            #      (no continuation text), no separator should appear —
+            #      we're still in "tool activity" territory.
+            #   2. If the iteration TIMES OUT before text, the ❌ marker
+            #      must land in the tool-activity block (chat.js
+            #      ``splitToolActivity`` puts everything AFTER the first
+            #      ``\n---\n`` into "response", not "toolActivity" — a
+            #      timeout marker rendered as response prose loses its
+            #      tool-card error styling).
             try:
                 async with asyncio.timeout(ORCHESTRATOR_TURN_TIMEOUT_SECS):
                     async for item in self.llm_service.stream_with_tool_detection(
@@ -1815,6 +1829,16 @@ class OrchestratorEngineMixin:
                         if _cancelled():
                             break
                         if isinstance(item, str):
+                            # Lazy-emit the separator the first time any
+                            # text arrives in any iteration. Keeps the
+                            # pre-rewrite "exactly once per turn" semantic
+                            # AND positions it as the boundary between
+                            # the tool activity block and the model's
+                            # streamed continuation (matching the chat-UI
+                            # parser's expectations).
+                            if not followup_separator_emitted:
+                                yield "\n---\n"
+                                followup_separator_emitted = True
                             iter_text_chunks.append(item)
                             yield item
                         elif isinstance(item, ThinkingDelta):
@@ -1822,14 +1846,23 @@ class OrchestratorEngineMixin:
                             # to the in-band think sentinel; pass through.
                             yield item
                         elif isinstance(item, ToolCallStarted):
-                            # The honesty-layer revising sentinel is fired
-                            # by the outer streaming.py loop for the first-
-                            # level call. For follow-up iterations the
-                            # outer "🔧 Calling X..." marker (yielded at
-                            # the top of the next iteration) is sufficient
-                            # — emitting another revise sentinel here
-                            # would clear the user's just-rendered text.
-                            continue
+                            # Honesty-layer revise sentinel for follow-up
+                            # tool starts. Mirrors streaming.py's first-
+                            # level handling (lines 363-391): when a tool
+                            # is about to fire, the model's pre-tool
+                            # prose for THIS tool may have been
+                            # speculative — fire the SSE revising event
+                            # and yield the in-band revise sentinel so
+                            # the chat client can clear the in-flight
+                            # bubble. Without this, a follow-up tool
+                            # call's pre-tool prose stays on screen
+                            # unverified (codex P1 on PR #1346).
+                            await self._emit_revising_event(
+                                item,
+                                session_id=session_id,
+                                request_id=request_id,
+                            )
+                            yield _build_revise_sentinel(item)
                         elif isinstance(item, LLMResponse):
                             response = item
             except TimeoutError:
@@ -1839,9 +1872,11 @@ class OrchestratorEngineMixin:
                 return
 
             if timed_out:
-                # Visible failure surface — the chat-UI parser treats
-                # ❌ <name> failed lines as the tool-card error state, so
-                # the user sees a card rather than silent dead air.
+                # ❌ marker BEFORE any separator: chat.js's
+                # ``splitToolActivity`` groups everything before the
+                # first ``\n---\n`` as tool activity, so the failure
+                # renders in the tool-card error state instead of as
+                # response prose (codex P2 on PR #1346).
                 logging.warning(
                     "[ORCHESTRATOR-STREAM] follow-up LLM call timed out after %ss",
                     ORCHESTRATOR_TURN_TIMEOUT_SECS,
