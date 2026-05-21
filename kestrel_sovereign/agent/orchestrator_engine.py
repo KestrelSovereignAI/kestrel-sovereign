@@ -703,6 +703,36 @@ class OrchestratorEngineMixin:
             for tc in tool_calls
         ]
 
+    @staticmethod
+    def _extract_response_reasoning_content(response: LLMResponse) -> Optional[str]:
+        """Return provider reasoning that must be replayed with tool history."""
+        raw = getattr(response, "raw", None)
+        if isinstance(raw, dict):
+            reasoning = raw.get("reasoning_content")
+            return reasoning if isinstance(reasoning, str) and reasoning else None
+
+        try:
+            message = raw.choices[0].message
+        except (AttributeError, IndexError, TypeError):
+            return None
+
+        reasoning = getattr(message, "reasoning_content", None)
+        return reasoning if isinstance(reasoning, str) and reasoning else None
+
+    def _build_assistant_tool_history_msg(self, response: LLMResponse) -> dict:
+        """Build an assistant history message for replaying tool calls."""
+        assistant_msg = {"role": "assistant", "content": response.content or ""}
+        if response.tool_calls:
+            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
+
+        reasoning_content = self._extract_response_reasoning_content(response)
+        # Reasoning replay is only valid for assistant tool-call history.
+        # Text-only answers keep provider reasoning out of follow-up context.
+        if reasoning_content and response.tool_calls:
+            assistant_msg["reasoning_content"] = reasoning_content
+
+        return assistant_msg
+
     async def _dispatch_tool_call(
         self,
         tool_call,
@@ -1387,10 +1417,7 @@ class OrchestratorEngineMixin:
                 return response.content or ""
 
         # Add initial assistant response with tool calls
-        assistant_msg = {"role": "assistant", "content": response.content or ""}
-        if response.tool_calls:
-            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
-        messages.append(assistant_msg)
+        messages.append(self._build_assistant_tool_history_msg(response))
 
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
@@ -1442,10 +1469,7 @@ class OrchestratorEngineMixin:
                         logging.info(f"[ORCHESTRATOR] Final response after repair (string): {response[:300]}...")
                         return response
                     if response.has_tool_calls:
-                        assistant_msg = {"role": "assistant", "content": response.content or ""}
-                        if response.tool_calls:
-                            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
-                        messages.append(assistant_msg)
+                        messages.append(self._build_assistant_tool_history_msg(response))
                         continue
                 final_content = response.content or ""
                 logging.info(f"[ORCHESTRATOR] Final response (no more tool calls): {final_content[:300]}...")
@@ -1460,10 +1484,7 @@ class OrchestratorEngineMixin:
                 )
                 return response.content or "Stopped: diminishing returns detected"
 
-            assistant_msg = {"role": "assistant", "content": response.content or ""}
-            if response.tool_calls:
-                assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
-            messages.append(assistant_msg)
+            messages.append(self._build_assistant_tool_history_msg(response))
 
         logging.warning("Max tool call iterations reached")
         return response.content or "Error: Maximum tool call iterations exceeded"
@@ -1598,10 +1619,7 @@ class OrchestratorEngineMixin:
                 yield response.content or ""
                 return
 
-        assistant_msg = {"role": "assistant", "content": response.content or ""}
-        if response.tool_calls:
-            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
-        messages.append(assistant_msg)
+        messages.append(self._build_assistant_tool_history_msg(response))
 
         tracker = IterationTracker(
             threshold=KESTREL_DIMINISHING_THRESHOLD,
@@ -1679,10 +1697,7 @@ class OrchestratorEngineMixin:
                         yield response
                         return
                     if response.has_tool_calls:
-                        assistant_msg = {"role": "assistant", "content": response.content or ""}
-                        if response.tool_calls:
-                            assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
-                        messages.append(assistant_msg)
+                        messages.append(self._build_assistant_tool_history_msg(response))
                         continue
                     yield response.content or ""
                     return
@@ -1711,10 +1726,7 @@ class OrchestratorEngineMixin:
                 yield response.content or "Stopped: diminishing returns detected"
                 return
 
-            assistant_msg = {"role": "assistant", "content": response.content or ""}
-            if response.tool_calls:
-                assistant_msg["tool_calls"] = self._build_tool_calls_msg(response.tool_calls)
-            messages.append(assistant_msg)
+            messages.append(self._build_assistant_tool_history_msg(response))
 
         logging.warning("Max tool call iterations reached")
         yield "Error: Maximum tool call iterations exceeded"
