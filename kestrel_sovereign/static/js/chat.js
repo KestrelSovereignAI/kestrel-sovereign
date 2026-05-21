@@ -1462,9 +1462,13 @@ window.openContextBreakdownPopup = async function () {
     try {
         status = await API.getContextStatus(sessionId, { full: true });
     } catch (e) {
+        // Backend error.detail from a non-OK response is surfaced as
+        // ``e.message`` by the API client; that string is **not**
+        // trusted (could contain HTML from a proxy / framework error
+        // page). Escape before injecting (codex round 2 residual P1).
         Modal.show({
             title: 'Context breakdown',
-            content: `<p style="margin:0;color:var(--error)">Could not load breakdown: ${String(e.message || e)}</p>`,
+            content: `<p style="margin:0;color:var(--error)">Could not load breakdown: ${_esc(e && e.message ? e.message : e)}</p>`,
         });
         return;
     }
