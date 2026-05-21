@@ -71,7 +71,7 @@ creates / updates secret versions per the `[profiles.*.secrets]` map in
 | `kestrel-data-key` | Encryption key for agent data |
 | `kestrel-session-secret` | Session cookie signing |
 | `kestrel-google-client-id` / `-secret` | Google OAuth |
-| `kestrel-lighthouse-key` | Lighthouse pricing/oversight feed |
+| `kestrel-lighthouse-key` | Optional Lighthouse IPFS/Filecoin storage key |
 | `github-read-kestrel` | GitHub PAT for private package installs |
 | `github-app-id` | Kestrel GitHub App ID |
 | `github-app-private-key` | Kestrel GitHub App PEM |
