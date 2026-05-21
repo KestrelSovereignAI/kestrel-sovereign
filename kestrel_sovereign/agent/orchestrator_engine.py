@@ -26,7 +26,8 @@ from kestrel_sovereign.a2a.stores.unified.observability_store import (
     infer_tool_result_status,
     tool_result_size_bytes,
 )
-from kestrel_sovereign.llm.adapter import LLMResponse
+from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
+from kestrel_sdk.llm import ToolCallStarted
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import optional_span
 
@@ -40,6 +41,16 @@ KESTREL_DIMINISHING_THRESHOLD = None
 KESTREL_MAX_LOW_DELTA = None
 KESTREL_BUDGET_STOP_PCT = None
 MAX_TOOL_CONCURRENCY = int(os.environ.get("KESTREL_MAX_TOOL_CONCURRENCY", "10"))
+
+# Per-LLM-call timeout for the orchestrator's multi-iteration tool loop.
+# Wraps each follow-up ``stream_with_tool_detection`` so a hung upstream
+# (anthropic 429 backoff, network blip, frozen provider queue) surfaces
+# as a visible "❌ failed: timeout" marker instead of silent dead air.
+# A turn can run multiple iterations; the timeout applies PER iteration,
+# not to the whole turn — long but progressing turns aren't killed.
+ORCHESTRATOR_TURN_TIMEOUT_SECS = float(
+    os.environ.get("KESTREL_ORCHESTRATOR_TURN_TIMEOUT_SECS", "180")
+)
 
 
 CONTINUATION_INTENT_RE = re.compile(
@@ -1731,6 +1742,13 @@ class OrchestratorEngineMixin:
             # round-trip from firing.
             return bool(request_id) and self.is_request_cancelled(request_id)
 
+        # The "\n---\n" separator is part of the chat UI's wire protocol
+        # (chat.js splits on it to delimit tool activity from synthesis).
+        # Pre-rewrite it fired exactly once, before the FIRST follow-up
+        # LLM call after tool execution. Preserve that semantic across
+        # multi-iteration turns: emit once per turn, not per iteration.
+        followup_separator_emitted = False
+
         for iteration in range(max_iterations):
             if _cancelled():
                 return
@@ -1760,14 +1778,86 @@ class OrchestratorEngineMixin:
             messages = self._prune_orchestrator_messages(messages, all_tools)
 
             logging.info(f"[ORCHESTRATOR-STREAM] Checking for more tool calls with {len(messages)} messages, {len(all_tools)} tools")
-            response = await self.llm_service.generate_with_messages(
-                messages=messages,
-                tools=all_tools or None,
-                force_local_only=force_local_only,
-                model_override=effective_model,
-                session_id=session_id,
-                tool_executor=self._make_inline_tool_executor(session_id),
-            )
+            # Replaced the prior generate_with_messages → stream_with_messages
+            # ("double LLM call per iteration") pattern with a single
+            # stream_with_tool_detection call. The old shape buffered the
+            # entire follow-up response BEFORE yielding any byte to the
+            # user, then made a second identical request to actually
+            # stream the answer. Two consequences the user reported:
+            #   1. Visibility: between batches the chat went silent for
+            #      the entire round-trip of the buffered call — Emma's
+            #      "🔧 Calling mesh_inbox..." then nothing was this gap.
+            #   2. Hang surface: a slow/stuck upstream (anthropic rate-
+            #      limit retry, network blip, queue backup) had no
+            #      bounding; the buffered await just sat.
+            # The streaming primitive yields text/thinking/tool-start
+            # events as they arrive AND a final LLMResponse with any
+            # detected tool_calls — single pass, no double-call waste,
+            # and the per-iteration asyncio.timeout below surfaces a
+            # hang as a visible failure marker rather than silent dead
+            # air.
+            if not followup_separator_emitted:
+                yield "\n---\n"
+                followup_separator_emitted = True
+            iter_text_chunks: List[str] = []
+            response = None
+            timed_out = False
+            try:
+                async with asyncio.timeout(ORCHESTRATOR_TURN_TIMEOUT_SECS):
+                    async for item in self.llm_service.stream_with_tool_detection(
+                        messages=messages,
+                        tools=all_tools or None,
+                        force_local_only=force_local_only,
+                        model_override=effective_model,
+                        session_id=session_id,
+                        tool_executor=self._make_inline_tool_executor(session_id),
+                    ):
+                        if _cancelled():
+                            break
+                        if isinstance(item, str):
+                            iter_text_chunks.append(item)
+                            yield item
+                        elif isinstance(item, ThinkingDelta):
+                            # streaming.py's wrapper converts ThinkingDelta
+                            # to the in-band think sentinel; pass through.
+                            yield item
+                        elif isinstance(item, ToolCallStarted):
+                            # The honesty-layer revising sentinel is fired
+                            # by the outer streaming.py loop for the first-
+                            # level call. For follow-up iterations the
+                            # outer "🔧 Calling X..." marker (yielded at
+                            # the top of the next iteration) is sufficient
+                            # — emitting another revise sentinel here
+                            # would clear the user's just-rendered text.
+                            continue
+                        elif isinstance(item, LLMResponse):
+                            response = item
+            except TimeoutError:
+                timed_out = True
+
+            if _cancelled():
+                return
+
+            if timed_out:
+                # Visible failure surface — the chat-UI parser treats
+                # ❌ <name> failed lines as the tool-card error state, so
+                # the user sees a card rather than silent dead air.
+                logging.warning(
+                    "[ORCHESTRATOR-STREAM] follow-up LLM call timed out after %ss",
+                    ORCHESTRATOR_TURN_TIMEOUT_SECS,
+                )
+                yield (
+                    f"❌ llm call failed: timeout after "
+                    f"{int(ORCHESTRATOR_TURN_TIMEOUT_SECS)}s\n"
+                )
+                return
+
+            if response is None:
+                # Stream produced no LLMResponse — either an empty stream
+                # or an adapter that doesn't emit one. Whatever text
+                # arrived is already in iter_text_chunks (yielded to the
+                # user); nothing further to do for this turn.
+                return
 
             if isinstance(response, str):
                 yield response
@@ -1776,7 +1866,9 @@ class OrchestratorEngineMixin:
             if not response.has_tool_calls:
                 repaired_missing_tool_call = (
                     bool(all_tools)
-                    and OrchestratorEngineMixin._signals_unfinished_tool_work(response.content or "")
+                    and OrchestratorEngineMixin._signals_unfinished_tool_work(
+                        "".join(iter_text_chunks) or response.content or ""
+                    )
                 )
                 if repaired_missing_tool_call:
                     response = await self._repair_premature_turn_yield(
@@ -1794,21 +1886,14 @@ class OrchestratorEngineMixin:
                     if response.has_tool_calls:
                         messages.append(self._build_assistant_tool_history_msg(response))
                         continue
+                    # Repair is non-streaming (buffered LLMResponse); yield
+                    # its text so the user sees the repaired completion.
                     yield response.content or ""
                     return
-                logging.info("[ORCHESTRATOR-STREAM] Streaming final response")
-                yield "\n---\n"
-                async for chunk in self.llm_service.stream_with_messages(
-                    messages=messages,
-                    force_local_only=force_local_only,
-                    model_override=effective_model,
-                    session_id=session_id,
-                ):
-                    if _cancelled():
-                        # #1256: stop pulling tokens from the synthesis
-                        # call when the user hit stop mid-stream.
-                        break
-                    yield chunk
+                # Text-only response: already streamed to user during the
+                # tool-detection pass. No second LLM round-trip needed —
+                # that was the wasted call the previous architecture
+                # made.
                 return
 
             # Track diminishing returns on this response before continuing

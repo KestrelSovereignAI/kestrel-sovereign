@@ -510,7 +510,22 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
-            meta = {'tool_events': tool_events} if tool_events else None
+            # tool_results carry the structured call/result envelopes;
+            # persisting them alongside tool_events means a future
+            # conversation-history reader can reconstruct *which tools
+            # produced which output*, not just *that some tool ran*.
+            # Without this the actual result content was lost after the
+            # turn — same gap the other-agent diagnosis flagged for the
+            # codex inline_executed branch, but it applied identically
+            # here (every adapter that goes through the multi-iteration
+            # tool loop). Close it in both branches uniformly.
+            meta: Optional[Dict[str, Any]] = None
+            if tool_events or tool_results:
+                meta = {}
+                if tool_events:
+                    meta['tool_events'] = tool_events
+                if tool_results:
+                    meta['tool_results'] = tool_results
             await self._persist_assistant_turn_safely(
                 tool_final_text, metadata=meta, session_id=session_id,
                 request_id=request_id,
@@ -574,9 +589,17 @@ class StreamingMixin:
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
+            # See parallel comment in the has_tool_calls branch above:
+            # tool_results in the persisted metadata preserves the
+            # actual call envelopes (id, name, arguments, summarized
+            # result) so a future loader can see what produced what,
+            # not just *that* something ran.
             await self._persist_assistant_turn_safely(
                 final_text,
-                metadata={"tool_events": synth_tool_events},
+                metadata={
+                    "tool_events": synth_tool_events,
+                    "tool_results": tool_results,
+                },
                 session_id=session_id, request_id=request_id,
             )
             final_assistant_text = final_text
