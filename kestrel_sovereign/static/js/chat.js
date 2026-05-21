@@ -1336,7 +1336,12 @@ export async function updateContextStatus() {
         // Show compress button when utilization is 70%+
         const showCompress = utilization_percent >= 70;
         const compressButton = showCompress
-            ? `<button onclick="window.compressContext()" style="
+            // The Compress button lives inside the clickable pill
+            // span, so its click would bubble up to the pill's
+            // ``openContextBreakdownPopup`` handler. Stop propagation
+            // so clicking Compress only sends !compress (codex round
+            // 1 P2 caught this regression).
+            ? `<button onclick="event.stopPropagation(); window.compressContext()" style="
                     margin-left: 0.5rem;
                     padding: 0.125rem 0.375rem;
                     font-size: 0.625rem;
@@ -1349,8 +1354,20 @@ export async function updateContextStatus() {
                 " title="Compress older messages to free up context space">Compress</button>`
             : '';
 
+        // Pill is clickable — opens the breakdown popup (#1310) which
+        // renders the layered context taxonomy + warning labels +
+        // silently-pruned auto-detect. ``onclick`` lives in a global
+        // (``window.openContextBreakdownPopup``) so the popup module
+        // can lazy-load without forcing a dependency cycle through
+        // chat.js' export surface.
         contextStatusElement.innerHTML = `
-            <span title="Context window: ${message_count} messages, ${utilization_percent.toFixed(1)}% used${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}">
+            <span class="context-pill"
+                  role="button"
+                  tabindex="0"
+                  onclick="window.openContextBreakdownPopup()"
+                  onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
+                  style="cursor: pointer; user-select: none;"
+                  title="Click for per-section context breakdown · ${message_count} messages · ${utilization_percent.toFixed(1)}% of window used${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}">
                 ${icon} ${message_count} msgs · ${utilization_percent.toFixed(0)}%${compressButton}
             </span>
         `;
@@ -1403,6 +1420,243 @@ function showContextWarning(warnings, paneElement = null) {
     target.appendChild(div);
     const c = getChatContainer();
     if (c) c.scrollTop = c.scrollHeight;
+}
+
+/**
+ * Open the context-breakdown popup (#1310 / epic #1307).
+ *
+ * Reads ``/api/agent/context-status?full=true`` so RAG retrieval runs
+ * for this on-demand call (the frequent footer poll passes
+ * ``full=false`` and skips RAG). Renders the layered taxonomy Emma
+ * signed off on in PR #1306:
+ *
+ *   System / Governance — mandatory (non-borrowable) vs optional rows
+ *   Tools — schemas + scaffolding, "estimated" badge
+ *   Conversation — total / kept-after-pruning / raw vs effective
+ *   Memories — count + "not counted" badge if no retriever wired
+ *   Retrieval / RAG — chunks + "estimated" badge, "skipped" when poll
+ *   Reserve / Overhead — dynamic_context_overhead + response_reserve
+ *
+ * UI honesty invariant (Emma): never imply "compression saved this"
+ * when only the silent-prune path executed. While #1311 is unshipped,
+ * the popup unconditionally surfaces "silently-pruned path still
+ * active" — the auto-detect invariant from the design doc.
+ */
+window.openContextBreakdownPopup = async function () {
+    const { Modal } = await import('./ui.js');
+    const sessionId = state.currentSessionId || null;
+    if (!sessionId) {
+        Modal.show({
+            title: 'Context breakdown',
+            content: '<p style="margin:0;color:var(--text-secondary)">No active conversation — context breakdown is only meaningful within a session.</p>',
+        });
+        return;
+    }
+
+    Modal.show({
+        title: 'Context breakdown',
+        content: '<p style="margin:0;color:var(--text-secondary)">Loading…</p>',
+    });
+
+    let status;
+    try {
+        status = await API.getContextStatus(sessionId, { full: true });
+    } catch (e) {
+        Modal.show({
+            title: 'Context breakdown',
+            content: `<p style="margin:0;color:var(--error)">Could not load breakdown: ${String(e.message || e)}</p>`,
+        });
+        return;
+    }
+
+    Modal.show({
+        title: 'Context breakdown',
+        content: renderContextBreakdown(status),
+        buttons: [
+            ...((status.compression_recommended)
+                ? [{
+                    label: 'Save older turns into a durable note (!compress)',
+                    type: 'primary',
+                    onClick: () => {
+                        Modal.hide();
+                        window.compressContext();
+                    },
+                }]
+                : []),
+            { label: 'Close', type: 'secondary', onClick: () => Modal.hide() },
+        ],
+    });
+};
+
+/** Escape a string for safe injection into HTML.
+ *
+ * Codex round 1 P1 caught a real XSS surface: backend strings
+ * (subsection names, exception messages in ``breakdown.notes``, model
+ * name) were being interpolated into a template literal handed to
+ * ``Modal.show``, which calls ``innerHTML``. Any string that contains
+ * ``<script>`` or event-handler-bearing tags would execute. All
+ * dynamic text in ``renderContextBreakdown`` now flows through this.
+ */
+function _esc(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/** Render the layered breakdown HTML for ``openContextBreakdownPopup``. */
+function renderContextBreakdown(status) {
+    const fmt = (n) => Number(n || 0).toLocaleString();
+    const breakdown = status.breakdown;
+    if (!breakdown) {
+        return '<p style="margin:0;color:var(--text-secondary)">Breakdown unavailable for this session.</p>';
+    }
+    const sections = breakdown.sections || {};
+    const total = breakdown.total_measured || 0;
+    const budget = breakdown.total_budget || 1;
+    const pct = (n) => ((n / budget) * 100).toFixed(1);
+
+    // ``badge`` text is hard-coded by the renderer (never user-supplied)
+    // — colors come from the renderer too. Safe to inline.
+    const badge = (text, color) => `<span style="
+        font-size: 0.625rem; font-weight: 600; padding: 0.125rem 0.375rem;
+        border-radius: 999px; background: ${color}; color: white;
+        margin-left: 0.5rem;">${_esc(text)}</span>`;
+
+    // ``sectionRow`` ``name`` is hard-coded by callers; ``extras`` is
+    // assembled from safe badge() output + escaped fragments; ``warning``
+    // is renderer-supplied static text. Tokens are coerced to Number.
+    const sectionRow = (name, tokens, extras = '', warning = '') => `
+        <div style="display:flex; justify-content:space-between; align-items:center; padding:0.4rem 0; border-bottom:1px solid var(--border-color);">
+            <div>
+                <span style="font-weight:500">${name}</span>
+                ${extras}
+                ${warning ? `<div style="font-size:0.7rem;color:#f97316;margin-top:0.15rem">${_esc(warning)}</div>` : ''}
+            </div>
+            <div style="font-variant-numeric: tabular-nums; color: var(--text-secondary);">
+                <span style="color:var(--text-primary); font-weight:500">${fmt(tokens)}</span>
+                <span style="margin-left:0.5rem; font-size:0.75rem">(${pct(tokens)}%)</span>
+            </div>
+        </div>`;
+
+    // System sub-rows. Mandatory vs optional split per Emma's
+    // taxonomy: anything in MANDATORY_SYSTEM_SUBSECTIONS (from B) is
+    // marked non-borrowable.
+    const MANDATORY = new Set(['constitution', 'soul', 'bootstrap_agents', 'state_of_mind']);
+    const sys = sections.system || {};
+    const sysSubs = (sys.subsections || []).map(s => `
+        <div style="display:flex; justify-content:space-between; padding:0.2rem 0 0.2rem 1.5rem; font-size:0.85rem; color:var(--text-secondary)">
+            <span>
+                ${_esc(s.name)}
+                ${MANDATORY.has(s.name) ? badge('mandatory', '#7c3aed') : badge('optional', '#64748b')}
+            </span>
+            <span style="font-variant-numeric: tabular-nums">${fmt(s.tokens)}</span>
+        </div>
+    `).join('');
+
+    const tools = sections.tools || {};
+    const toolsBadge = (tools.tokens || 0) > 0 ? badge('estimated', '#0891b2') : badge('not counted', '#64748b');
+
+    const hist = sections.history || {};
+    const histExtras = `<div style="font-size:0.7rem;color:var(--text-secondary);margin-top:0.15rem">
+        ${fmt(hist.messages_kept_after_pruning || 0)} of ${fmt(hist.messages_total || 0)} messages kept after pruning ·
+        raw ${fmt(hist.raw_tokens || 0)} tokens
+    </div>`;
+    // Per Emma's canonical taxonomy and the design doc's UI honesty
+    // invariant, the conversation row can show four state badges
+    // depending on what the section reports. ``pending fold`` and
+    // ``failed fold`` are reserved for C/#1311 (durable salvage); the
+    // slots render unconditionally so the popup is ready when C ships,
+    // and a "silently-pruned path still active" warning fires while
+    // C is unshipped (auto-detect invariant).
+    const histBadges = [];
+    if (hist.pending_fold) histBadges.push(badge('pending fold', '#f97316'));
+    if (hist.failed_fold) histBadges.push(badge('failed fold', '#dc2626'));
+    const histExtrasFull = histBadges.join('') + histExtras;
+    const histWarning = status.silently_pruned_path_active
+        ? 'silently-pruned path still active — older messages may have been dropped without a durable summary (until #1311 ships)'
+        : '';
+
+    const ep = sections.episodes || {};
+    const epExtras = (ep.count || 0) > 0
+        ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${ep.count} ${ep.count === 1 ? 'episode' : 'episodes'}</span>`
+        : '';
+
+    const mem = sections.memories || {};
+    const memBadge = mem.wired ? '' : badge('not counted', '#64748b');
+    const memExcluded = mem.excluded ? badge('excluded — over budget', '#dc2626') : '';
+    const memExtras = (mem.wired
+        ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${mem.count || 0} memories</span>`
+        : memBadge) + memExcluded;
+
+    const rag = sections.rag || {};
+    const ragBadge = rag.skipped
+        ? badge('skipped (cheap poll)', '#64748b')
+        : (rag.excluded ? badge('excluded — over budget', '#dc2626') : badge('estimated', '#0891b2'));
+    // Codex round 1 P2 caught the empty-query gap: the popup's
+    // ``full=true`` call runs RAG against the last user turn (so the
+    // figure matches what the next LLM turn would see). If we couldn't
+    // reach a last-user-turn at request time, the endpoint passes an
+    // empty query and the popup labels the row to avoid overstating
+    // accuracy. ``rag.query_used_label`` is the explicit annotation
+    // the endpoint surfaces; rendered only when present.
+    const ragQueryLabel = rag.query_used_label
+        ? `<div style="font-size:0.7rem;color:var(--text-secondary);margin-top:0.15rem">${_esc(rag.query_used_label)}</div>`
+        : '';
+    const ragExtras = ragBadge + (rag.chunks ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${rag.chunks} chunks</span>` : '') + ragQueryLabel;
+
+    const dyn = sections.dynamic_context_overhead || {};
+    const overheadRow = (dyn.applied)
+        ? sectionRow('Reserve / Overhead — &lt;retrieved_context&gt; envelope', dyn.tokens)
+        : '';
+
+    const dynamicSection = `
+        ${sectionRow('System / Governance', sys.tokens || 0)}
+        ${sysSubs}
+        ${sectionRow('Tools', tools.tokens || 0, toolsBadge + (tools.count ? `<span style="font-size:0.75rem;color:var(--text-secondary)"> · ${tools.count} ${tools.count === 1 ? 'tool' : 'tools'}</span>` : ''))}
+        ${sectionRow('Conversation', hist.tokens || 0, histExtrasFull, histWarning)}
+        ${sectionRow('Memories — episodes', ep.tokens || 0, epExtras)}
+        ${sectionRow('Memories — retrieved', mem.tokens || 0, memExtras)}
+        ${sectionRow('Retrieval / RAG', rag.tokens || 0, ragExtras)}
+        ${overheadRow}
+    `;
+
+    const notes = (breakdown.notes || []).filter(Boolean);
+    const notesBlock = notes.length
+        ? `<details style="margin-top:1rem; font-size:0.8rem; color:var(--text-secondary)">
+              <summary style="cursor:pointer">Measurement notes (${notes.length})</summary>
+              <ul style="margin:0.5rem 0 0; padding-left:1.25rem">${notes.map(n => `<li>${_esc(n)}</li>`).join('')}</ul>
+           </details>`
+        : '';
+
+    // Soft-session note: Emma's review explicitly asked to surface
+    // that Kestrel sessions are tag filters on continuous agent
+    // memory, not hard threads.
+    const sessionNote = `
+        <div style="margin-top:1rem; padding:0.75rem; background:var(--bg-tertiary, rgba(0,0,0,0.05)); border-radius:8px; font-size:0.75rem; color:var(--text-secondary)">
+            This is one session's slice of context. Kestrel agents carry continuous cross-session episodic + semantic memory — sessions are tag filters on the same conversation store, not hard threads.
+        </div>
+    `;
+
+    return `
+        <div style="font-size:0.875rem">
+            <div style="display:flex; justify-content:space-between; align-items:baseline; padding-bottom:0.75rem; border-bottom:2px solid var(--border-color); margin-bottom:0.5rem">
+                <div>
+                    <div style="font-size:0.7rem; color:var(--text-secondary); text-transform:uppercase">Window utilization</div>
+                    <div style="font-size:1.5rem; font-weight:600">${(breakdown.utilization_percent || 0).toFixed(1)}%</div>
+                </div>
+                <div style="text-align:right; color:var(--text-secondary)">
+                    <div>${fmt(total)} / ${fmt(budget)} tokens</div>
+                    <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(breakdown.model || '')} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
+                </div>
+            </div>
+            ${dynamicSection}
+            ${notesBlock}
+            ${sessionNote}
+        </div>
+    `;
 }
 
 /**
