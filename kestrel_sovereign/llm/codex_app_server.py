@@ -171,6 +171,14 @@ class CodexAppServerClient:
             )
         except OSError as e:
             raise CodexAppServerError(f"Failed to spawn {self._binary}: {e}") from e
+        # Clear the prior-instance closed error so callers don't see
+        # the OLD process's exit reported on the NEW process's first
+        # request. Paired with the ``_initialized = False`` reset at
+        # the end of ``_read_loop`` — together they enable recovery
+        # from an involuntary app-server exit without restarting
+        # kestrel.
+        self._closed_error = None
+        self._stderr_tail = []
         self._reader_task = asyncio.create_task(self._read_loop())
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
@@ -262,6 +270,17 @@ class CodexAppServerClient:
                     + (f": {tail}" if tail else "")
                 )
             )
+            # Reset connection state so the NEXT request can spawn a
+            # fresh process. Without this, an unexpected app-server
+            # exit (e.g. duplicate-tool-handler panic, segfault,
+            # OOM-kill) left ``_initialized`` stuck at True with a
+            # dead ``_proc``; ``ensure_started`` short-circuited and
+            # every subsequent request raised CONNECTION_CLOSED until
+            # kestrel itself was restarted. ``aclose()`` does this
+            # same reset for the explicit-shutdown path; mirror it for
+            # the involuntary-exit path.
+            self._initialized = False
+            self._proc = None
 
     def _dispatch(self, msg: dict) -> None:
         mid = msg.get("id")

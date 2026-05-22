@@ -4,7 +4,7 @@ Pure-logic tests run everywhere; the live test spawns the real
 ``codex app-server`` binary and is skipped when it (or auth) is absent.
 """
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -277,6 +277,93 @@ class TestTurnIteration:
         with pytest.raises(CodexAppServerError, match="gone"):
             async for _ in c.iter_turn_events(q, idle_timeout=2):
                 pass
+
+
+class TestInvoluntaryExitRecovery:
+    """When the codex app-server process exits unexpectedly (panic on
+    duplicate-handler registration, segfault, OOM-kill, ENV-toxic
+    binary), the client must reset its state so a SUBSEQUENT request
+    can spawn a fresh process. Without the reset, ``_initialized``
+    stuck at True + dead ``_proc`` meant every request after the
+    crash kept failing with the OLD instance's CONNECTION_CLOSED
+    error until kestrel itself was restarted — observed live when
+    codex panicked on ``spawn_agent`` namespace collision (#1334
+    follow-up; see commit history)."""
+
+    @pytest.mark.asyncio
+    async def test_read_loop_exit_resets_initialized_and_proc(self):
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._proc = MagicMock()
+        c._proc.returncode = 0
+        c._proc.stdout = _AsyncIterableMock([])  # ends immediately
+        c._initialized = True
+        c._pending = {}
+        c._turn_sinks = {}
+        c._stderr_tail = []
+        c._closed_error = None
+
+        await c._read_loop()
+
+        assert c._initialized is False, (
+            "after the read loop exits, ``_initialized`` must reset so "
+            "the next ``ensure_started`` spawns a fresh process"
+        )
+        assert c._proc is None, (
+            "_proc must clear after involuntary exit so the next spawn "
+            "writes a fresh handle"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_clears_prior_instance_closed_error(self, monkeypatch):
+        import asyncio
+
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._binary = "/usr/bin/true"  # cheap, exits immediately
+        c._closed_error = CodexAppServerError("prior-instance gone")
+        c._pending = {}
+        c._turn_sinks = {}
+        c._stderr_tail = ["old stderr line"]
+
+        # Replace create_subprocess_exec with a stub so we don't shell
+        # out — we only care that ``_spawn`` clears the prior error.
+        fake_proc = MagicMock()
+        fake_proc.stdout = _AsyncIterableMock([])
+        fake_proc.stderr = _AsyncIterableMock([])
+        fake_proc.stdin = MagicMock()
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            return fake_proc
+
+        monkeypatch.setattr(
+            asyncio, "create_subprocess_exec", fake_create_subprocess_exec,
+        )
+
+        await c._spawn()
+
+        assert c._closed_error is None, (
+            "_spawn must clear the prior instance's closed_error so the "
+            "next request doesn't see the OLD process's exit reported"
+        )
+        # cleanup tasks created by _spawn
+        if c._reader_task:
+            c._reader_task.cancel()
+        if c._stderr_task:
+            c._stderr_task.cancel()
+
+
+class _AsyncIterableMock:
+    """Minimal async-iterable for tests — yields bytes-lines and ends."""
+
+    def __init__(self, items):
+        self._items = list(items)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self._items:
+            raise StopAsyncIteration
+        return self._items.pop(0)
 
 
 # Live handshake against the real binary lives in

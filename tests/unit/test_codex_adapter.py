@@ -84,6 +84,7 @@ class TestDynamicToolsSpec:
             "name": "get_weather",
             "description": "Get weather",
             "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+            "namespace": "kestrel",
         }]
         assert "type" not in result[0]
         assert "parameters" not in result[0]
@@ -91,6 +92,32 @@ class TestDynamicToolsSpec:
     def test_none_and_empty(self):
         assert _convert_tools_to_codex_dynamic_tools(None) is None
         assert _convert_tools_to_codex_dynamic_tools([]) is None
+
+    def test_namespace_attached_to_every_tool(self):
+        """Codex's ``codex_core`` registers dynamicTools in a process-
+        global handler registry keyed by ``(namespace, name)``. Without
+        a kestrel namespace, our ``spawn_agent`` (from SpawnFeature,
+        core=true) collides with codex's native ``spawn_agent`` —
+        the SECOND ``thread/start`` call into the same app-server
+        process panics with "handler for tool spawn_agent already
+        registered" and the process exits. Namespacing under
+        ``"kestrel"`` keeps every kestrel tool in its own slot, so
+        codex's built-ins and our tools coexist."""
+        result = _convert_tools_to_codex_dynamic_tools([
+            {"type": "function", "function": {
+                "name": "spawn_agent", "description": "",
+                "parameters": {"type": "object"}}},
+            {"type": "function", "function": {
+                "name": "shell", "description": "",
+                "parameters": {"type": "object"}}},
+            {"type": "function", "function": {
+                "name": "memory_search", "description": "",
+                "parameters": {"type": "object"}}},
+        ])
+        assert all(spec["namespace"] == "kestrel" for spec in result), (
+            "every dynamicTool spec must carry namespace='kestrel' so "
+            "kestrel's tools register in their own codex_core slot"
+        )
 
 
 class TestTurnInputBuilder:
@@ -558,6 +585,7 @@ class TestToolExecutorBridge:
         assert a._client.dynamic_tools == [{
             "name": "get_weather", "description": "d",
             "inputSchema": {"type": "object"},
+            "namespace": "kestrel",
         }]
 
     @pytest.mark.asyncio
