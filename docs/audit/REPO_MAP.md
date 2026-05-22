@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-21
-**Scope:** 1542 tracked files (1001 `.py`, 259 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-22
+**Scope:** 1553 tracked files (1006 `.py`, 265 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -127,6 +127,8 @@ Repo entry points and standard project files.
   - `async def build_preturn_state_block(agent)`
 - **kestrel_sovereign/agent/request_lifecycle.py** — Request lifecycle mixin for KestrelAgent.
   - `class RequestLifecycleMixin`
+- **kestrel_sovereign/agent/salvage.py** — Durable salvage primitive for the context system (epic #1307 / C).
+  - `class SalvageReason`; `class SalvageState`; `class SalvageResult`; `class SalvageWriteError`; `async def salvage_messages()`; `class SalvageWorker`; `async def get_salvage_state_counts(conv_store, session_id)`; `async def get_pending_count(conv_store, session_id)`; `…`
 - **kestrel_sovereign/agent/sleep.py** — Sleep functionality for Kestrel Agent.
   - `class SleepReport`; `class SleepMixin`
 - **kestrel_sovereign/agent/streaming.py** — Streaming response handling for Kestrel Agent.
@@ -134,7 +136,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/system_prompt_assembler.py** — System-prompt assembler — priority-ordered clause composition.
   - `class SystemPromptResult`; `def section_name_for_anchored_file(filename)`; `def assemble_system_prompt()`
 - **kestrel_sovereign/agent/token_budget.py** — Token budget allocation for context management.
-  - `class TokenAllocation`; `class TokenBudget`; `class AdaptiveTokenBudget`; `def create_budget(model, message_count, adaptive)`
+  - `class DegradedModeError`; `class TokenAllocation`; `class TokenBudget`; `class AdaptiveTokenBudget`; `class ElasticTokenBudget`; `def create_budget(model, message_count, adaptive)`
 - **kestrel_sovereign/agent/token_counter.py** — Token counting for context management.
   - `def register_discovered_limits(models)`; `class TokenCounter`; `def get_token_counter(model)`
 - **kestrel_sovereign/agent/tool_context_manager.py** — Tool Context Manager for Kestrel Agent.
@@ -1141,6 +1143,8 @@ Repo entry points and standard project files.
 - **docs/architecture/AGENT_IDENTITY_CONTRACT.md** — Agent Identity Contract — ## Summary
 - **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — Kestrel Compute Feature - Architecture Design — ## Executive Summary
 - **docs/architecture/CONSTITUTION_INJECTION.md** — SignalDispatcher Constitutional Injection — Architecture Design — > Draft v1.
+- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C — Unify Auto-Prune With Durable Compression — > Auto-prune is a silent decision.
+- **docs/architecture/CONTEXT_SYSTEM_DESIGN.md** — Kestrel Context System — Assessment & Redesign — > A context window is not a buffer you fill until it overflows.
 - **docs/architecture/DYNAMIC_TOOL_LOADING.md** — Dynamic Tool Loading — **Status:** Implemented **Author:** Design review **Date:** 2026-02-16 **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`, `kestrel_sovereign/prompts/syste…
 - **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
 - **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
@@ -1269,6 +1273,10 @@ Repo entry points and standard project files.
 - **docs/audit/issues/spawn-lifecycle-guard.md** — ## Problem
 - **docs/audit/worktree-plan.md** — Audit Worktree Plan — Use dedicated worktrees to keep domain audits isolated and parallelizable.
 - **docs/code_reviews/README.md** — Code Reviews — Code quality reviews, audit findings, and remediation tracking.
+- **docs/code_reviews/claude-pr-1330.md** — Claude Review: PR #1330 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1330 - Title: fix: replay provider reasoning through tool loops - Reviewed: 2026-05-21T15:23:32Z
+- **docs/code_reviews/claude-pr-1333.md** — Claude Review: PR #1333 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333 - Title: fix: preserve OpenAI-compatible reasoning on tool streams - Reviewed: 2026-05-21T16:15:38Z
+- **docs/code_reviews/claude-pr-1337.md** — Good — both adapters handle dict arguments correctly.
+- **docs/code_reviews/claude-pr-1338.md** — Looks clean.
 - **docs/concepts/designing-emancipation.md** — Designing an Emancipation Contract — Amendment VIII of the Kestrel Constitution ships **dormant by default**.
 - **docs/demos/DEMO_SCRIPT.md** — Kestrel Sovereign - Demo Script — **Issue #133 — Track A: Technical Demo** **Duration:** ~2 minutes automated, 10-12 minutes with live narration **Closer:** *"In 30 minutes you can have your own agent running with all of this active.…
 - **docs/deployment/README.md** — Deployment Operations — How to build, deploy, and update Kestrel Sovereign on Cloud Run.
@@ -1682,7 +1690,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
   - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
-  - `def test_context_status_reports_token_budget_and_warning_band()`; `def test_context_status_returns_idle_shape_when_no_session_id()`; `def test_context_status_returns_idle_shape_for_empty_session_id()`; `def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history()`; `def test_tasks_endpoint_filters_by_status_and_rejects_invalid_values()`; `def test_task_detail_endpoint_returns_task_with_artifacts()`; `def test_task_detail_endpoint_returns_404_when_task_missing()`; `def test_task_detail_endpoint_returns_404_when_task_manager_absent()`; `…`
+  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_idle_shape_includes_silently_pruned_flag()`; `def test_context_status_returns_idle_shape_when_no_session_id()`; `def test_context_status_returns_idle_shape_for_empty_session_id()`; `def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history()`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_apply_cache_control_marks_all_three_positions()`; `…`
 - **tests/unit/test_api_key_query_param.py** — Unit tests for API key query parameter restriction (GitHub issue #149).
@@ -1816,6 +1824,8 @@ Repo entry points and standard project files.
   - `def profile_service()`; `def test_load_profiles(profile_service)`; `def test_get_profile_anthropic(profile_service)`; `def test_get_profile_openai(profile_service)`; `def test_get_profile_ollama(profile_service)`; `def test_get_profile_unknown_provider(profile_service)`; `def test_get_profile_for_model(profile_service)`; `def test_get_state_of_mind(profile_service)`; `…`
 - **tests/unit/test_context_analysis.py** — Tests for context analysis: duplicate detection and token attribution by source.
   - `class TestContextStatsBasic`; `class TestContextStatsNormalization`; `class TestContextStatsIntegrationWithToolContextManager`; `class TestContextStatsIntegrationWithContextManager`; `class TestContextStatsResetOnCompression`; `class TestDispatchToolCallRecording`; `class TestContextStatsSessionReset`
+- **tests/unit/test_context_breakdown_measurement.py** — Tests for ``ContextBuilder.measure_context_breakdown`` and friends.
+  - `def mock_storage()`; `def builder(mock_storage)`; `def sample_episodes()`; `def short_history()`; `class TestCountToolSchemaTokens`; `class TestEpisodeGetFormatSplit`; `class TestMeasureContextBreakdown`; `class TestDriftGuard`; `…`
 - **tests/unit/test_context_builder.py** — Tests for the ContextBuilder module.
   - `class TestContextBuilder`; `class TestContextBuilderIntegration`
 - **tests/unit/test_context_builder_with_tracking.py** — Tests for `ContextBuilder.build_system_prompt_with_tracking`.
@@ -1886,12 +1896,18 @@ Repo entry points and standard project files.
   - `def test_doctor_reports_ready_when_everything_set(tmp_path)`; `def test_doctor_blocks_on_missing_data_key(tmp_path)`; `def test_doctor_blocks_on_empty_route_priority(tmp_path)`; `def test_doctor_blocks_on_missing_api_key_env(tmp_path)`; `def test_doctor_blocks_when_no_agents(tmp_path)`; `def test_doctor_blocks_when_agent_db_missing(tmp_path)`; `def test_format_report_renders_lines(tmp_path)`; `def test_format_report_says_not_ready_when_blocked(tmp_path)`; `…`
 - **tests/unit/test_doctrine_bundle.py** — Unit tests for kestrel_sovereign.agent.doctrine_bundle.
   - `def test_hash_is_deterministic_for_same_inputs(tmp_path)`; `def test_hash_changes_when_anchored_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_file_content_changes(tmp_path)`; `def test_hash_changes_when_bootstrap_order_changes(tmp_path)`; `def test_missing_anchored_files_are_skipped_not_errors(tmp_path)`; `def test_total_bytes_reflects_only_contributing_content(tmp_path)`; `def test_per_file_sha256_in_section_header(tmp_path)`; `def test_default_paths_are_three_canonical_files()`; `…`
+- **tests/unit/test_durable_salvage.py** — Tests for the durable-salvage primitive + background worker (C / #1311).
+  - `def conv_store()`; `class TestSalvageMessagesSync`; `class TestSyncSalvageThenCrashBeforeEnqueue`; `class TestQueueDepthThresholdExceeded`; `class TestConsolidatorWhileSalvagePending`; `class TestFeatureFlag`; `class TestStateCountsAndBoundary`
 - **tests/unit/test_dynamic_tool_execute_toolresult.py** — DynamicTool.execute() must serialize a ToolResult-returning @tool at the wrap site (#1070).
   - `def feature()`; `async def test_ok_serializes_to_dict_and_keeps_success_true(feature)`; `async def test_ok_wire_payload_is_json_clean(feature)`; `async def test_failed_flips_wrapper_success_to_false(feature)`; `async def test_failed_wire_payload_is_json_clean(feature)`; `async def test_partial_keeps_success_true_and_surfaces_error(feature)`; `async def test_partial_wire_payload_is_json_clean(feature)`; `async def test_legacy_dict_return_keeps_original_wrapper(feature)`; `…`
 - **tests/unit/test_dynamic_tool_loading.py** — Unit tests for dynamic tool loading.
   - `class ToolOnlyFeature`; `def agent()`; `class TestDynamicToolLoadingInit`; `class TestRegisterExploredFeatureTools`; `class TestNameCollision`; `class TestBuildAllTools`; `class TestDirectToolExecution`; `class TestEviction`; `…`
 - **tests/unit/test_ed25519_suite.py** — Ed25519Suite tests — Wave 2 sub-PR 1 (#917).
   - `def test_ed25519_suite_self_registers_at_import()`; `def test_ed25519_suite_listed_alongside_secp256k1()`; `def test_ed25519_classified_as_classical()`; `def suite()`; `def keypair(suite)`; `def test_keypair_carries_correct_suite_id(keypair)`; `def test_sign_verify_round_trip(suite, keypair)`; `def test_sign_verify_round_trip_empty(suite, keypair)`; `…`
+- **tests/unit/test_elastic_budget_integration.py** — Integration tests for the elastic budget (#1309) wired into the production assembly path.
+  - `class TestMeasureMandatoryFloor`; `class TestDegradedModeFlow`; `class TestHistoryOverBudgetPrune`; `class TestHistoryAbsorbsReleasedSlack`
+- **tests/unit/test_elastic_token_budget.py** — Tests for the elastic token budget (#1309).
+  - `class TestBackCompat`; `class TestMandatoryFloor`; `class TestSlackDistribution`; `class TestPriorityValidation`; `class TestEffectiveBudget`; `class TestSummarySurfacing`
 - **tests/unit/test_emancipation_contract.py** — Unit tests for ``kestrel_sovereign.constitution.emancipation``.
   - `def test_parse_returns_none_when_block_absent()`; `def test_parse_dormant_when_disabled_explicitly()`; `def test_parse_active_minimal()`; `def test_parse_active_full()`; `def test_parse_active_requires_terms()`; `def test_parse_active_rejects_empty_terms()`; `def test_parse_rejects_non_string_terms()`; `def test_parse_rejects_non_list_proofs()`; `…`
 - **tests/unit/test_embedding_service_missing_model.py** — Soften the first-run UX when Ollama hasn't pulled the embedding model yet — #657.
@@ -2351,7 +2367,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_training_adapter_hygiene.py** — —
   - `async def test_runpod_cleanup_pauses_persistent_pod()`; `async def test_runpod_cleanup_terminates_on_demand_pod()`; `def test_replicate_training_zip_contains_avatar_bytes()`; `async def test_replicate_training_uses_client_file_input(monkeypatch)`
 - **tests/unit/test_turn_completion_guard.py** — Regression coverage for premature turn-yield repair (#1237).
-  - `async def test_no_tool_continuation_gets_one_repair_step()`; `async def test_final_no_tool_answer_does_not_repair()`; `async def test_feature_subagent_no_tool_continuation_gets_repair_step()`
+  - `def test_assistant_tool_history_preserves_provider_reasoning_from_raw_dict()`; `def test_assistant_tool_history_preserves_provider_reasoning_from_openai_response()`; `def test_assistant_tool_history_omits_empty_provider_reasoning()`; `def test_assistant_tool_history_omits_reasoning_without_tool_calls()`; `async def test_no_tool_continuation_gets_one_repair_step()`; `async def test_final_no_tool_answer_does_not_repair()`; `async def test_feature_subagent_tool_history_preserves_provider_reasoning()`; `async def test_feature_subagent_no_tool_continuation_gets_repair_step()`
 - **tests/unit/test_turn_lifecycle.py** — Race regression tests for the shared turn lifecycle.
   - `async def test_two_concurrent_turns_serialize()`; `async def test_three_concurrent_turns_serialize_in_order()`; `async def test_exception_in_turn_body_releases_lock()`; `async def test_conversation_lock_is_held_inside_turn()`; `async def test_turn_id_is_unique_per_call()`; `async def test_process_input_enters_lifecycle_before_bootstrap_and_commands()`; `async def test_lifecycle_shares_lock_manager_with_dispatcher()`; `async def test_concurrent_set_current_chain_is_task_local()`; `…`
 - **tests/unit/test_ui_theme_endpoint.py** — Contract tests for the /api/ui/theme endpoint (epic #986, sub-issue #989).
