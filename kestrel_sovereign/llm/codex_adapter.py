@@ -87,14 +87,44 @@ def _extract_instructions_and_input(messages):
     return instructions, input_messages
 
 
+# Codex dynamicTool namespace for kestrel tools. The codex app-server
+# has its own native tool surface (``spawn_agent``, ``shell``,
+# ``apply_patch``, ``web_search``, ``read_file``, …) registered in a
+# process-global handler registry inside ``codex_core``. Advertising a
+# dynamicTool with the same name but no namespace collides with codex's
+# own — the second registration panics with
+# ``handler for tool <name> already registered`` and the app-server
+# exits. Kestrel hit this with the SpawnFeature (``spawn_agent``,
+# ``core = true`` in feature_registry.toml) as soon as a session
+# triggered a second ``thread/start`` (model switch / config change
+# / fingerprint mismatch).
+#
+# OpenClaw solves the same class of collision by namespacing every
+# dynamicToolSpec under ``"openclaw"`` (kestrel-claw
+# extensions/codex/src/app-server/dynamic-tools.ts:64). We follow the
+# same pattern with ``"kestrel"``. The codex protocol's
+# ``CodexDynamicToolCallParams`` carries ``namespace`` back to us on
+# every ``item/tool/call``; the tool ``name`` field stays as-is, so
+# kestrel-side dispatch via ``execute_named_tool`` continues to work
+# without a stripping step.
+_KESTREL_TOOL_NAMESPACE = "kestrel"
+
+
 def _convert_tools_to_codex_dynamic_tools(tools):
     """Convert OpenAI function-tool defs to the app-server's
-    ``CodexDynamicToolSpec`` shape: ``{name, description, inputSchema}``.
+    ``CodexDynamicToolSpec`` shape: ``{name, description, inputSchema,
+    namespace}``.
 
     The field name diverges from the Responses-API ``parameters`` and the
     wrapper ``{"type":"function", "function":{…}}`` is dropped — the
     app-server tool spec is its own protocol (see ``protocol.ts:67-71``
     in ``kestrel-claw/extensions/codex``).
+
+    ``namespace`` is set to ``"kestrel"`` on every entry so our tools
+    register in their own slot inside ``codex_core``'s tool handler
+    registry, avoiding collisions with codex-native built-ins (most
+    visibly ``spawn_agent``, which kestrel also exposes via the
+    SpawnFeature).
     """
     if not tools:
         return None
@@ -106,6 +136,7 @@ def _convert_tools_to_codex_dynamic_tools(tools):
                 "name": func["name"],
                 "description": func.get("description", ""),
                 "inputSchema": func.get("parameters", {"type": "object"}),
+                "namespace": _KESTREL_TOOL_NAMESPACE,
             })
     return out or None
 
