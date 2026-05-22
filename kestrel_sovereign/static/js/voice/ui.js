@@ -106,6 +106,24 @@ let currentState = State.IDLE;
 const SETTINGS_KEY_PREFIX = 'kestrel.voice.settings';
 const _settingsByAgent = new Map();
 const _serverHydrated = new Set();
+// Per-agent monotonic counter bumped on every ``savePicker``.  Hydration
+// captures the counter when its GET starts; if it differs when the GET
+// returns, the operator saved during the fetch and we must NOT overlay
+// stale server data on top of their just-saved state.  In particular:
+// without this, a "clear the directive" save that races with a slow
+// hydration GET would see ``s.instructions`` blank, treat it as
+// "no local override," and write the OLD ``cfg.voice_directive`` back
+// — resurrecting the cleared persona.  See #1352 codex round-2.
+const _saveGenByAgent = new Map();
+
+// In-flight ``POST /voice/config`` promise per agent.  Hydration awaits
+// this before issuing its GET so a save→reopen flow doesn't race the
+// POST commit and resurrect stale server state.  Without it, the
+// sequence (1) clear directive → (2) Save (POST in flight) →
+// (3) reopen picker → hydration GET fires → might land before POST
+// commits → reads OLD ``voice_directive`` → resurrects the cleared
+// persona.  Codex round-6 catch on #1352.
+const _pendingSaveByAgent = new Map();
 let pickerRequestId = 0;
 
 function settingsKeyForAgent(agentName) {
@@ -703,6 +721,15 @@ async function openPicker() {
   voiceSel.innerHTML = '<option value="">Loading voices...</option>';
   modeSel.value = settings().mode || 'auto';
   instructionsEl.value = settings().instructions || '';
+  // Stash the textarea's seeded value (a) so the hydration .then()
+  // below can distinguish "still untouched" (safe to repaint) from
+  // "operator already edited" (must preserve), AND (b) so savePicker
+  // knows whether the operator saw a non-empty value before clicking
+  // Save with a blank textarea — that turns the otherwise-ambiguous
+  // pre-hydration empty save into an explicit clear of a seen
+  // value.  Codex round-4/5 catches on #1352.
+  const instructionsSeededValue = instructionsEl.value;
+  instructionsEl.dataset.seededValue = instructionsSeededValue;
   // Reset the TTS dropdown from THIS agent's settings.  The select
   // element is reused across picker opens, so without this reset
   // ``refreshRoutePreview()`` reads the prior agent's provider out of
@@ -745,6 +772,20 @@ async function openPicker() {
         for (const opt of ttsSel.options) {
           if (opt.value === s.preferred_tts) { ttsSel.value = s.preferred_tts; break; }
         }
+      }
+      // #1352 — repaint the instructions textarea after hydration so
+      // the operator sees the agent's persisted ``voice_directive``
+      // before they hit Save.  Without this, a fresh-browser open
+      // shows a blank persona field (the textarea was seeded BEFORE
+      // hydration ran), and Save would POST ``voice_directive: ""``
+      // — silently clearing the identity directive.
+      //
+      // Only paint when the textarea is STILL at its seeded value —
+      // checking against ``''`` alone would stomp a mid-edit clear
+      // (operator deleted the persona while the GET was in flight).
+      // Codex round-4 catch.
+      if (instructionsEl.value === instructionsSeededValue && s.instructions) {
+        instructionsEl.value = s.instructions;
       }
       if (changedTts) {
         // Provider changed — the route badge + voice catalog scoped to
@@ -934,6 +975,70 @@ function savePicker() {
   const next = { voice, instructions, mode, preferred_tts: preferredTts };
   _settingsByAgent.set(agent, next);
   saveSettings(agent, next);
+  // Bump the save generation so any hydration that started before this
+  // save returns and skips writing stale server data on top of the
+  // operator's just-saved intent.  See #1352 codex round-2.
+  _saveGenByAgent.set(agent, (_saveGenByAgent.get(agent) || 0) + 1);
+  // #1352 — also persist the directive to the agent's IDENTITY so the
+  // persona survives browser changes / operator changes / A2A peer
+  // interactions.  ``instructions`` in the picker is the operator-facing
+  // surface for ``voice_config.voice_directive``.  Persist VOICE and TTS
+  // provider through the same write — they're identity-shaped too.
+  // Fire-and-forget; failures shouldn't block the modal close (operator
+  // explicitly hit Save, the localStorage write above already happened).
+  //
+  // Include ``voice_directive`` in the POST unless we're in the ONE
+  // truly ambiguous case: textarea is empty AND it was seeded blank
+  // AND hydration hasn't returned yet — in that combination we
+  // genuinely can't tell whether the operator wants to clear the
+  // persona or hasn't seen the persisted server value yet.  Omit
+  // the field so the server preserves whatever's there.
+  //
+  // Other combinations are all safe to send — the operator has seen
+  // SOMETHING (either the local-seeded value OR the server-hydrated
+  // value) and the current textarea content reflects their intent:
+  //   * non-empty current → operator typed/kept content; persist it
+  //   * empty + seeded non-empty → operator EXPLICITLY cleared the
+  //     value they saw; persist the clear.  Without this case,
+  //     codex round-5 caught the scenario where a localStorage-
+  //     seeded directive gets cleared, save fires pre-hydration,
+  //     the field gets omitted, and the next hydration resurrects
+  //     the value the operator just deleted.
+  //   * empty + hydrated → operator cleared after seeing server
+  //     value; persist the clear.
+  //
+  // ``tts_voice_id`` and ``tts_provider`` send the operator's
+  // current selection unconditionally — including empty strings.
+  // The current kestrel-feature-voice 0.4.0 endpoint preserves
+  // empty (legacy ``or prev`` semantics for those fields) so
+  // sending "" is a no-op today; once
+  // KestrelSovereignAI/kestrel-feature-voice#6 ships explicit-clear
+  // semantics for these fields too, sending "" will properly clear.
+  // Forward-compatible.  Codex round-5 catch on #1352.
+  const seeded = document.getElementById('voice-picker-instructions').dataset.seededValue || '';
+  const operatorHasSeenSomething = (
+    seeded !== '' || _serverHydrated.has(agent)
+  );
+  const payload = {
+    tts_voice_id: voice,
+    tts_provider: preferredTts,
+  };
+  if (instructions !== '' || operatorHasSeenSomething) {
+    payload.voice_directive = instructions;
+  }
+  // Track the in-flight POST so hydration on a quick reopen awaits
+  // the commit before issuing its GET — see ``_pendingSaveByAgent``.
+  const inflight = persistConfigToIdentity(agent, payload)
+    .catch(() => {})
+    .finally(() => {
+      // Only clear if THIS save is still the in-flight one — another
+      // save fired during this one would have replaced the entry
+      // already and we shouldn't trample its tracking.
+      if (_pendingSaveByAgent.get(agent) === inflight) {
+        _pendingSaveByAgent.delete(agent);
+      }
+    });
+  _pendingSaveByAgent.set(agent, inflight);
   // If a session is active, push the new instructions immediately —
   // Realtime accepts session.update mid-call. Voice/path change requires a
   // new session (OpenAI Realtime can't hot-swap voice or model).
@@ -941,6 +1046,29 @@ function savePicker() {
     try { client.updateInstructions(instructions); } catch (_) {}
   }
   closePicker();
+}
+
+
+async function persistConfigToIdentity(pinnedAgent, payload) {
+  // POST /voice/config with the agent's persistent voice fields so the
+  // identity-side directive (and chosen voice/provider) survives across
+  // browsers, operators, and A2A peer interactions.  See #1352.
+  //
+  // Pin the agent to the one we captured at savePicker-time — if the
+  // operator switched host agents while the POST was in flight, the
+  // ``API.buildAgentUrl`` prefix would route to the WRONG agent and
+  // write into the wrong identity.  Skip the write if the pinned agent
+  // no longer matches the active host.  (Operator can still re-save
+  // on the right agent.)
+  if (pinnedAgent !== currentAgentKey()) return;
+  const url = API.buildAgentUrl('/voice/config');
+  const headers = await voiceAuthHeaders();
+  headers['Content-Type'] = 'application/json';
+  await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(payload),
+  });
 }
 
 
@@ -1093,11 +1221,37 @@ async function hydrateSettingsFromServer() {
   // Codex round-3 catch on #1347.
   const agent = currentAgentKey();
   if (_serverHydrated.has(agent)) return { changedTts: false };
+  // Drain ALL in-flight ``POST /voice/config`` saves before issuing
+  // our GET.  A single ``await`` of the current entry wouldn't be
+  // enough: if a second save fires while we're awaiting the first,
+  // ``_pendingSaveByAgent`` gets replaced with the newer POST and the
+  // GET would race that one.  Loop until the map entry settles to
+  // ``undefined``, then proceed.  Best-effort: the POST's own
+  // ``.catch`` swallows errors so awaits can't reject.
+  // Codex round-6/7 catches on #1352.
+  while (_pendingSaveByAgent.has(agent)) {
+    const pendingSave = _pendingSaveByAgent.get(agent);
+    try { await pendingSave; } catch (_) { /* swallowed above */ }
+  }
+  // Capture the save generation BEFORE the fetch.  If ``savePicker``
+  // fires for this agent while the GET is in flight, ``_saveGenByAgent``
+  // increments — the post-await check below skips applying the stale
+  // server payload over the operator's just-saved state.  Particularly
+  // protects "clear the directive" saves from being undone by a slow
+  // first-open hydration GET.  Codex round-2 catch on #1352.
+  const saveGenAtStart = _saveGenByAgent.get(agent) || 0;
   try {
     const url = API.buildAgentUrl('/voice/config');
     const resp = await fetch(url, { headers: await voiceAuthHeaders() });
     if (!resp.ok) return { changedTts: false };
     const cfg = await resp.json();
+    // Operator saved during the fetch — their just-saved state is the
+    // ground truth.  Skip applying the now-stale GET response, and
+    // skip marking hydrated so the NEXT picker open will retry the
+    // GET (which will then return the post-save server state cleanly).
+    if ((_saveGenByAgent.get(agent) || 0) !== saveGenAtStart) {
+      return { changedTts: false };
+    }
     // Pin the read+write to the agent we captured BEFORE the await.
     // If the operator switched host agents while ``/voice/config`` was
     // in flight, ``currentAgentKey()`` now points at the new agent —
@@ -1115,6 +1269,16 @@ async function hydrateSettingsFromServer() {
     if (!s.preferred_tts && typeof cfg.tts_provider === 'string' && cfg.tts_provider) {
       s.preferred_tts = cfg.tts_provider;
       changedTts = true;
+    }
+    // #1352 — agent's persisted ``voice_directive`` IS the persona;
+    // the picker's ``instructions`` textarea is the operator-facing
+    // surface for it.  Hydrate when the local picker doesn't already
+    // have an operator override.  Empty server values don't override
+    // a non-empty local one — same rule as the other fields.
+    if (!s.instructions
+        && typeof cfg.voice_directive === 'string'
+        && cfg.voice_directive) {
+      s.instructions = cfg.voice_directive;
     }
     _serverHydrated.add(agent);
     return { changedTts };
