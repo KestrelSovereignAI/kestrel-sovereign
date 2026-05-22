@@ -47,7 +47,13 @@
 
 import { Events, makeEvent } from './events.js';
 
-const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime';
+// GA WebRTC endpoint.  The Beta path was ``/v1/realtime`` (with the
+// model as a query string), but OpenAI's GA Realtime moved WebRTC SDP
+// exchange under ``/v1/realtime/calls`` (the SDK exposes it as
+// ``client.realtime.calls.create``).  Posting to the old path now
+// 400s with the SDP body — the browser sees "SDP exchange failed:
+// HTTP 400".  See kestrel-voice-openai#16 (Beta -> GA migration).
+const REALTIME_SDP_URL = 'https://api.openai.com/v1/realtime/calls';
 
 /**
  * @param {Object} opts
