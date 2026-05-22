@@ -910,6 +910,21 @@ export async function loadConversations(_agentName) {
         if (pane) pane.style.display = 'none';
         return;
     }
+    // Capture the host agent BEFORE the fetch.  The auto-load below
+    // pins to whichever agent's list this call actually retrieved.
+    // Reading ``selectedAgentName`` (or ``API.getHostAgent()``) AFTER
+    // the await would catch the mutated value if a concurrent
+    // selectAgent(B) flipped it — that's the codex round-1 race on
+    // #1358: the list is A's, but the guard pins to B, and the
+    // auto-load fires A's session_id under B's URL.
+    //
+    // Use the ROUTING key (``API.getHostAgent()``), NOT the display
+    // name passed via ``_agentName``.  In standalone single-agent
+    // mode ``getHostAgent()`` returns null and the chat pane is
+    // keyed by null too; using ``_agentName`` (a display string)
+    // would miss the null-keyed pane and ``paneIsCold`` would read
+    // false, regressing the standalone auto-load.  Codex round-2 catch.
+    const requestAgent = API.getHostAgent();
     // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
     try {
         const data = await API.getConversations();
@@ -1000,7 +1015,12 @@ export async function loadConversations(_agentName) {
         // here and the actual wipe inside loadConversation. The auto path
         // re-checks post-await; see the {auto: true} branch in
         // window.loadConversation below.
-        const autoTargetAgent = selectedAgentName;
+        // ``autoTargetAgent`` was previously read from the mutable
+        // ``selectedAgentName`` at response time — codex round-1 P2 on
+        // #1358 — which captured the LATEST agent rather than the one
+        // whose conversation list we actually fetched.  Pin to the
+        // request-time agent captured before the await above.
+        const autoTargetAgent = requestAgent;
         const autoTargetPane = state.chatPanes.get(autoTargetAgent);
         const paneIsCold = autoTargetPane
             && !autoTargetPane.streamingMsgDiv
@@ -1016,7 +1036,14 @@ export async function loadConversations(_agentName) {
                 // loadConversation to re-check pane coldness after its
                 // own fetch resolves and abort the wipe if the user has
                 // begun a turn in the meantime.
-                window.loadConversation(mostRecent.session_id, { auto: true });
+                //
+                // ``expectedAgent`` is pinned to the agent the LIST was
+                // fetched for — loadConversation drops the load if
+                // ``API.getHostAgent()`` has since switched.  See #1358.
+                window.loadConversation(mostRecent.session_id, {
+                    auto: true,
+                    expectedAgent: autoTargetAgent,
+                });
             }
         }
     } catch (e) {
@@ -1102,6 +1129,16 @@ function beginRenameConversation(previewEl, conv) {
 
 
 window.loadConversation = async function(sessionId, options = {}) {
+    // Stale-auto-load guard: when an auto-load was queued for one agent
+    // and the operator has since selectAgent'd to a different host, the
+    // queued session_id is no longer addressable on the new agent —
+    // running this would issue a 404'ing GET against the new agent's
+    // URL with the prior agent's session_id.  Drop the load.  See #1358.
+    if (options.auto && options.expectedAgent
+        && options.expectedAgent !== API.getHostAgent()) {
+        return;
+    }
+
     activeConversationId = sessionId;
 
     // Update selection UI
@@ -1113,6 +1150,18 @@ window.loadConversation = async function(sessionId, options = {}) {
     try {
         const data = await API.getConversation(sessionId);
         const messages = data.messages || [];
+
+        // Post-await stale-agent re-check: the operator may have
+        // switched host agents while ``getConversation`` was in flight.
+        // Without this, an auto-load that started on agent A would
+        // wipe + render A's history into B's pane after the user
+        // switched.  The pre-await guard above catches the case where
+        // the switch happened BEFORE the fetch; this one catches a
+        // switch DURING.  Codex round-3 catch on #1358.
+        if (options.auto && options.expectedAgent
+            && options.expectedAgent !== API.getHostAgent()) {
+            return;
+        }
 
         const currentAgent = API.getHostAgent();
 
