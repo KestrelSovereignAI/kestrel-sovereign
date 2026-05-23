@@ -241,13 +241,17 @@ async def test_grant_names_different_source_rejected(
 
 
 @pytest.mark.asyncio
-async def test_revoked_grant_rejected(
+async def test_revoked_grant_ids_rejects(
     test_db, stub_package_sig_ok, signed_package, signed_grant, host,
 ):
-    from dataclasses import replace
-    revoked = replace(signed_grant, revoked=True)
+    from kestrel_sovereign.identity.access_grant import compute_grant_id
+
+    canonical_id = compute_grant_id(signed_grant)
     importer = IdentityImporter(test_db, target_agent_id=host["did"])
-    result = await importer.import_package(signed_package, grant=revoked)
+    result = await importer.import_package(
+        signed_package, grant=signed_grant,
+        revoked_grant_ids={canonical_id},
+    )
     assert result.success is False
     assert any("grant_expired_or_revoked" in e for e in result.errors)
 

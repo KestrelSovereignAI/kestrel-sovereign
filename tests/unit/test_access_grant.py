@@ -286,22 +286,65 @@ async def test_grant_targets_different_host_rejected(
 
 
 @pytest.mark.asyncio
-async def test_revoked_grant_rejected(
+async def test_revoked_grant_ids_rejects_match(
     package_signed_ok, signed_grant, source, host,
 ):
-    from dataclasses import replace
-    revoked = replace(signed_grant, revoked=True)
-    # revoked is NOT a signed field, so the signature still verifies
-    # but the consent gate fails.
+    """Revocation is enforced via an external set of canonical grant
+    ids, NOT a flag inside the grant payload (that would be unsigned
+    and trivially spoofable — codex P2 #1273 R2).
+    """
+    canonical_id = compute_grant_id(signed_grant)
     result = await verify_import_consent(
         _StubPackage(did=source["did"]),
-        revoked,
+        signed_grant,
         host_did=host["did"],
+        revoked_grant_ids={canonical_id},
     )
     assert result.ok is False
-    assert result.grant_signed_by_owner is True  # signature unaffected
+    assert result.grant_signed_by_owner is True  # signature still verifies
     assert result.grant_not_expired_or_revoked is False
     assert REJECT_GRANT_EXPIRED_OR_REVOKED in result.reason
+    # Verifier surfaces the canonical id it actually evaluated.
+    assert result.canonical_grant_id == canonical_id
+
+
+@pytest.mark.asyncio
+async def test_revoked_grant_ids_other_ids_dont_revoke(
+    package_signed_ok, signed_grant, source, host,
+):
+    """A revocation set NOT containing the canonical id has no effect."""
+    result = await verify_import_consent(
+        _StubPackage(did=source["did"]),
+        signed_grant,
+        host_did=host["did"],
+        revoked_grant_ids={"some-other-id"},
+    )
+    assert result.ok is True
+
+
+@pytest.mark.asyncio
+async def test_spoofed_grant_id_does_not_fool_canonical_id(
+    package_signed_ok, signed_grant, source, host,
+):
+    """The verifier always recomputes the canonical id from the
+    signable payload — a caller setting ``grant.grant_id`` to a
+    spoofed/allowlisted value MUST NOT change what verifier-derived
+    code (host_policy / audit) sees as the trustworthy id. Regression
+    for codex P2 #1273 R2 (id 2 of 2).
+    """
+    from dataclasses import replace
+    real_canonical = compute_grant_id(signed_grant)
+    spoofed = replace(signed_grant, grant_id="i-am-an-allowlisted-id")
+    result = await verify_import_consent(
+        _StubPackage(did=source["did"]),
+        spoofed,
+        host_did=host["did"],
+    )
+    assert result.ok is True
+    # Crucially: the canonical id surfaced to host_policy / audit is
+    # the verifier-recomputed value, NOT the spoofed payload field.
+    assert result.canonical_grant_id == real_canonical
+    assert result.canonical_grant_id != "i-am-an-allowlisted-id"
 
 
 @pytest.mark.asyncio

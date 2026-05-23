@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from .access_grant import (
     DataAccessGrant,
@@ -107,6 +107,7 @@ class IdentityImporter:
         grant: Optional[DataAccessGrant] = None,
         host_policy: Optional[Callable[[DataAccessGrant], bool]] = None,
         grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
+        revoked_grant_ids: Optional[Iterable[str]] = None,
     ) -> ImportResult:
         """
         Import agent identity from a package.
@@ -142,6 +143,16 @@ class IdentityImporter:
                 here when accepting hybrid-owner grants. ``did:pkh:``
                 / ``did:key:`` owners need no resolver. Ignored when
                 ``grant`` is ``None``.
+            revoked_grant_ids: Optional iterable of canonical grant
+                ids (as returned by
+                :func:`access_grant.compute_grant_id`) that are
+                currently revoked. The recomputed canonical id of
+                ``grant`` is compared against this set; matches are
+                rejected with ``grant_expired_or_revoked``. Sourced
+                from a trusted revocation registry — never from the
+                grant payload itself (an in-grant flag would be
+                unsigned and spoofable). Ignored when ``grant`` is
+                ``None``.
 
         Returns:
             ImportResult with success status and statistics
@@ -183,6 +194,7 @@ class IdentityImporter:
                 return self._build_result(False, agent_id)
             consent = await verify_import_consent(
                 package, grant, host_did=self.target_agent_id,
+                revoked_grant_ids=revoked_grant_ids,
                 did_web_resolver=grant_did_web_resolver,
             )
             if not consent.ok:

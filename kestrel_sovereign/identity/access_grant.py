@@ -101,14 +101,27 @@ DidWebResolver = "Callable[[str], Mapping[str, Any]]"
 class DataAccessGrant:
     """An immutable owner-signed authorization to import data.
 
-    Each non-signature field is committed in the canonical signable
-    payload (see :func:`signable_payload`). ``grant_id`` is content-
-    addressed by SHA-256 over that payload, so any change to a signed
-    field changes the id. ``created_at`` is informational and is
-    excluded from the payload so timestamp drift between the signer
-    and the archiver doesn't invalidate the signature — the binding
-    timestamps are ``issued_at`` (and optionally ``expires_at``),
-    both of which ARE in the payload.
+    Every signed field is committed in the canonical signable payload
+    (see :func:`signable_payload`). ``grant_id`` is content-addressed
+    by SHA-256 over that payload, so any change to a signed field
+    changes the id; ``created_at`` is informational and excluded from
+    the payload so timestamp drift between the signer and the archiver
+    doesn't invalidate the signature — the binding timestamps are
+    ``issued_at`` and the optional ``expires_at``, both of which ARE
+    in the signed payload.
+
+    There is NO ``revoked`` field. Revocation is a runtime state of
+    the issuing context, not part of the issued credential, and an
+    in-grant flag would be unsigned / spoofable (codex P2 #1273 R2).
+    Revocation is supplied to :func:`verify_import_consent` via the
+    ``revoked_grant_ids`` set, sourced from a trusted registry.
+
+    ``grant_id`` is carried on the dataclass for human-readable
+    diagnostics only. The verifier ALWAYS recomputes the canonical id
+    from the signable payload and exposes it on
+    :class:`ConsentVerification` — host policies and audit logs must
+    use ``ConsentVerification.canonical_grant_id`` rather than this
+    field, which a caller could spoof at the serialization boundary.
     """
 
     owner_did: str
@@ -119,7 +132,6 @@ class DataAccessGrant:
     purpose: str = ""
     owner_verification_methods: List[dict] = field(default_factory=list)
     owner_signatures: List[dict] = field(default_factory=list)
-    revoked: bool = False
     grant_id: str = ""
     created_at: str = ""
 
@@ -140,7 +152,6 @@ class DataAccessGrant:
                 dict(m) for m in self.owner_verification_methods
             ],
             "owner_signatures": [dict(s) for s in self.owner_signatures],
-            "revoked": self.revoked,
             "grant_id": self.grant_id,
             "created_at": self.created_at,
         }
@@ -158,7 +169,6 @@ class DataAccessGrant:
                 data.get("owner_verification_methods") or []
             ),
             owner_signatures=list(data.get("owner_signatures") or []),
-            revoked=bool(data.get("revoked", False)),
             grant_id=data.get("grant_id", ""),
             created_at=data.get("created_at", ""),
         )
@@ -279,6 +289,11 @@ class ConsentVerification:
     record precise failure reasons in audit logs (the
     ``agent_import_log.reject_reason`` field uses these names).
 
+    ``canonical_grant_id`` is the content-addressed id the verifier
+    recomputed from the signable payload — host policies and audit
+    logs MUST reference this rather than ``grant.grant_id`` (which a
+    caller could spoof at the serialization boundary).
+
     ``reason`` is a human-readable joined explanation of failing
     checks, suitable for log lines and error messages.
     """
@@ -289,6 +304,7 @@ class ConsentVerification:
     grant_names_source: bool
     grant_targets_host: bool
     grant_not_expired_or_revoked: bool
+    canonical_grant_id: str
     reason: str
 
 
@@ -415,6 +431,7 @@ async def verify_import_consent(
     grant: DataAccessGrant,
     *,
     host_did: str,
+    revoked_grant_ids: Optional[Iterable[str]] = None,
     did_web_resolver: Optional[Any] = None,
     now: Optional[datetime] = None,
 ) -> ConsentVerification:
@@ -438,6 +455,14 @@ async def verify_import_consent(
             ``host_did`` field MUST equal this; otherwise an attacker
             could replay a grant minted for one agent against another
             on the same deployment.
+        revoked_grant_ids: Optional iterable of canonical grant ids
+            (as returned by :func:`compute_grant_id`) that are
+            currently revoked. If the recomputed canonical id of
+            ``grant`` is in this set, the grant is rejected with
+            ``grant_expired_or_revoked``. Revocation lives OUTSIDE
+            the grant payload by design — an in-grant flag would be
+            unsigned and trivially spoofable in serialized flows
+            (codex P2 #1273 R2). Sourced from a trusted registry.
         did_web_resolver: Optional resolver passed through to
             :func:`verify_did_binding` for ``did:web:`` owners. The
             binding helper refuses-by-default when an owner_did is
@@ -449,6 +474,11 @@ async def verify_import_consent(
         now: Optional clock override (UTC datetime). Defaults to
             ``datetime.now(timezone.utc)``. Tests pass a fixed value.
     """
+    # Always recompute the content-addressed id from the signable
+    # payload — never trust ``grant.grant_id`` (unsigned, spoofable
+    # at the serialization boundary; codex P2 #1273 R2).
+    canonical_grant_id = compute_grant_id(grant)
+
     # Check 1 — package signed by its declared source DID.
     pkg_ok, pkg_reason = await _verify_package_signed_by_source(package)
 
@@ -464,17 +494,36 @@ async def verify_import_consent(
     # Check 4 — grant's host_did matches the receiving agent's DID.
     targets_host = bool(host_did) and grant.host_did == host_did
 
-    # Check 5 — grant not revoked and not expired.
-    revocation_ok = not grant.revoked
+    # Check 5 — grant not revoked (per external registry) and not
+    # expired. Revocation is checked against the recomputed canonical
+    # id; expiry is checked against ``grant.expires_at`` which IS in
+    # the signed payload.
+    revocation_ok = True
+    revocation_detail = ""
+    if revoked_grant_ids is not None:
+        revoked_set = set(revoked_grant_ids)
+        if canonical_grant_id in revoked_set:
+            revocation_ok = False
+            revocation_detail = (
+                f"canonical grant_id {canonical_grant_id[:16]}… is in "
+                f"the revocation set"
+            )
     expiry_ok = True
+    expiry_detail = ""
     if grant.expires_at:
         exp = _parse_iso_utc(grant.expires_at)
         if exp is None:
-            # Malformed expires_at — treat as expired (fail-closed).
             expiry_ok = False
+            expiry_detail = (
+                f"expires_at={grant.expires_at!r} is malformed"
+            )
         else:
             current = now if now is not None else datetime.now(timezone.utc)
-            expiry_ok = exp > current
+            if exp <= current:
+                expiry_ok = False
+                expiry_detail = (
+                    f"expires_at={grant.expires_at!r} is in the past"
+                )
     not_expired_or_revoked = revocation_ok and expiry_ok
 
     reasons: List[str] = []
@@ -495,13 +544,8 @@ async def verify_import_consent(
             f"did={host_did!r}"
         )
     if not not_expired_or_revoked:
-        if grant.revoked:
-            reasons.append(f"{REJECT_GRANT_EXPIRED_OR_REVOKED}: grant is revoked")
-        else:
-            reasons.append(
-                f"{REJECT_GRANT_EXPIRED_OR_REVOKED}: grant expires_at="
-                f"{grant.expires_at!r} is in the past or malformed"
-            )
+        detail = revocation_detail or expiry_detail or "expired or revoked"
+        reasons.append(f"{REJECT_GRANT_EXPIRED_OR_REVOKED}: {detail}")
 
     ok = (
         pkg_ok
@@ -517,6 +561,7 @@ async def verify_import_consent(
         grant_names_source=names_source,
         grant_targets_host=targets_host,
         grant_not_expired_or_revoked=not_expired_or_revoked,
+        canonical_grant_id=canonical_grant_id,
         reason="; ".join(reasons) if reasons else "consent verified",
     )
 
