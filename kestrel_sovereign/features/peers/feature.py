@@ -321,6 +321,31 @@ class PeersFeature(Feature):
         task_id = uuid4().hex
         sess_id = session_id or uuid4().hex
         url = f"{self._host_url}/api/agents/{recipient}/api/agent/tasks/send"
+        outbound_metadata: Dict[str, Any] = {
+            "sender": self._own_name,
+        }
+        if skill_id:
+            outbound_metadata["skill"] = skill_id
+        # Attach the in-flight signal-driven turn's causation chain so
+        # the receiving agent's a2a.task_submitted signal carries the
+        # lineage. Without this, A→B→A ping-pong loops bypass the
+        # dispatcher's cycle detection (every inbound task starts
+        # fresh at depth 1). Codex P1 on PR #1366. Pulled via the
+        # agent's ``_provide_causation_chain`` if available — same
+        # accessor TaskManager.create_task uses for outbound chain
+        # attachment.
+        chain_provider = getattr(self.agent, "_provide_causation_chain", None)
+        if callable(chain_provider):
+            try:
+                chain = chain_provider()
+            except Exception as e:
+                logger.debug(
+                    "Failed to read causation chain for outbound A2A task: %s",
+                    e,
+                )
+                chain = None
+            if chain:
+                outbound_metadata["causation_chain"] = chain
         payload = {
             "id": task_id,
             "sessionId": sess_id,
@@ -328,10 +353,7 @@ class PeersFeature(Feature):
                 "role": "user",
                 "parts": [{"type": "text", "text": message}],
             },
-            "metadata": {
-                "sender": self._own_name,
-                **({"skill": skill_id} if skill_id else {}),
-            },
+            "metadata": outbound_metadata,
         }
 
         try:

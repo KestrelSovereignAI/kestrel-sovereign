@@ -495,6 +495,81 @@ class TestA2ATaskSubmittedSignalSource:
         with pytest.raises(ValueError, match="missing required key"):
             reg.schema({})
 
+    def test_signal_rehydrates_causation_chain_from_metadata(self):
+        """Codex P1 on PR #1366: without rehydration, A→B→A task-
+        submission ping-pong bypasses cycle detection — every inbound
+        task starts fresh at depth 1. Inbound signal MUST deserialize
+        ``task.metadata["causation_chain"]`` the way the complete-
+        direction signal does (`a2a.py:build_signal_for_completed_task`).
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        # Construct metadata in the same serialized shape
+        # ``serialize_chain_for_metadata`` produces (list of dicts).
+        causation_chain = [
+            {
+                "agent_id": "did:agent:emma",
+                "source": "channel.message",
+                "signal_id": "sig-1",
+                "turn_id": "turn-1",
+                "depth": 1,
+                "emitted_at": "2026-05-23T10:00:00+00:00",
+            },
+            {
+                "agent_id": "did:agent:meridian",
+                "source": "a2a.task_submitted",
+                "signal_id": "sig-2",
+                "turn_id": "turn-2",
+                "depth": 2,
+                "emitted_at": "2026-05-23T10:00:05+00:00",
+            },
+        ]
+
+        class _FakeTask:
+            id = "task-789"
+            sessionId = "sess-abc"
+            metadata = {
+                "skill": "workflow.assign",
+                "sender": "emma",
+                "causation_chain": causation_chain,
+            }
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="emma-did", sender="meridian",
+        )
+        # Chain must be present and have both upstream frames so the
+        # dispatcher's cycle detector sees the prior emma→meridian
+        # hop and rejects emma→meridian→emma at depth 2.
+        assert len(sig.causation_chain) == 2, (
+            "rehydrated causation chain must carry every upstream "
+            f"frame; got: {sig.causation_chain!r}"
+        )
+        assert sig.causation_chain[0].agent_id == "did:agent:emma"
+        assert sig.causation_chain[1].agent_id == "did:agent:meridian"
+
+    def test_signal_empty_chain_when_metadata_missing(self):
+        """When the upstream task was created without dispatcher
+        context (e.g. local self-spawn, or pre-causation-chain code),
+        the signal carries an empty chain — not a crash."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        class _FakeTask:
+            id = "task-noscope"
+            sessionId = "sess"
+            metadata = {}  # no causation_chain key
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="x-did", sender="",
+        )
+        assert sig.causation_chain == [], (
+            "empty metadata must yield an empty chain (not None, not "
+            "raise) so dispatcher signal validation passes"
+        )
+
 
 # =============================================================================
 # TaskWorker Tests

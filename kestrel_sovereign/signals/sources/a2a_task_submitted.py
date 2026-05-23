@@ -134,13 +134,26 @@ def build_signal_for_submitted_task(
     objects. ``sender`` is the calling agent's identifier (DID or
     name) — defaults to empty when the task wasn't created via an
     inter-agent send path (e.g. local agent spawning its own
-    background task)."""
+    background task).
+
+    Causation chain: rehydrated from ``task.metadata["causation_chain"]``
+    (serialized form, same shape ``serialize_chain_for_metadata``
+    produces). Threading the chain into the Signal lets the dispatcher's
+    cycle detection catch A→B→A ping-pong at depth 2 — without it,
+    every inbound task started fresh at depth 1 and the loop bound
+    was only the per-source rate limit (codex P1 on PR #1366).
+    """
+    # Import locally to avoid a circular dependency between this
+    # source module and a2a.py.
+    from kestrel_sovereign.signals.sources.a2a import _deserialize_chain
+
     task_id = str(getattr(task, "id", "<unknown>"))
     session_id = str(getattr(task, "sessionId", "") or "")
     metadata = getattr(task, "metadata", {}) or {}
     skill_id = ""
     if isinstance(metadata, dict):
         skill_id = str(metadata.get("skill") or metadata.get("skill_id") or "")
+    chain = _deserialize_chain(metadata if isinstance(metadata, dict) else {})
     return Signal(
         source=SOURCE_NAME,
         kind="inbound",
@@ -158,6 +171,9 @@ def build_signal_for_submitted_task(
         # Idempotency retries (same task_id resubmitted) collapse to
         # one wake within the registration's coalescing window.
         dedupe_key=task_id,
+        # Carry the lineage from the upstream turn that spawned this
+        # task so cycle detection rejects A→B→A loops at depth 2.
+        causation_chain=list(chain),
     )
 
 
