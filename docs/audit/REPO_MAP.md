@@ -3,7 +3,7 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-22
+**Generated:** 2026-05-23
 **Scope:** 1553 tracked files (1006 `.py`, 265 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
@@ -1781,7 +1781,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter (app-server backed) and registry.
   - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestDynamicToolsSpec`; `class TestTurnInputBuilder`; `class TestUsageProjection`; `class TestResultMarshalling`; `class TestAdapterTextPath`; `…`
 - **tests/unit/test_codex_app_server.py** — Tests for the codex app-server JSON-RPC client.
-  - `class TestVersionGate`; `class TestBinaryResolution`; `class TestDispatchLogic`; `class TestServerRequestHandlerRegistration`; `class TestTurnIteration`
+  - `class TestVersionGate`; `class TestBinaryResolution`; `class TestDispatchLogic`; `class TestServerRequestHandlerRegistration`; `class TestTurnIteration`; `class TestInvoluntaryExitRecovery`
 - **tests/unit/test_command_handler_async_boundary_contracts.py** — Contracts for explicit sync/async boundaries in CommandHandler.
   - `def test_privacy_save_handler_is_explicitly_async()`; `async def test_handle_awaits_privacy_save_without_leaking_coroutine()`; `async def test_handle_accepts_custom_awaitable_results_via_isawaitable()`; `def test_create_agent_handler_is_explicitly_async()`; `async def test_handle_awaits_create_agent_command()`; `def test_anchor_handler_is_explicitly_async()`; `async def test_handle_awaits_anchor_command()`
 - **tests/unit/test_command_handler_constitution_contracts.py** — Command-handler contracts for constitution verification commands.
