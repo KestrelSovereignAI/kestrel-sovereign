@@ -454,6 +454,24 @@ async def test_malformed_signature_entry_does_not_crash(
     assert result2.grant_signed_by_owner is False
     assert REJECT_GRANT_SIGNATURE in result2.reason
 
+    # And a structurally-valid entry whose ``sig`` is a non-string
+    # (JSON number / bool) must NOT raise TypeError from
+    # bytes.fromhex. Regression for codex P2 #1273 R4.
+    non_string_sig = replace(
+        grant,
+        owner_signatures=[
+            {"alg": grant.owner_signatures[0]["alg"],
+             "kid": owner["kid"], "sig": 42},
+        ],
+    )
+    result3 = await verify_import_consent(
+        _StubPackage(did=source["did"]),
+        non_string_sig,
+        host_did=host["did"],
+    )
+    assert result3.ok is False
+    assert result3.grant_signed_by_owner is False
+
 
 @pytest.mark.asyncio
 async def test_did_web_owner_requires_resolver_and_verifies_with_one(

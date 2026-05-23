@@ -399,6 +399,12 @@ def _verify_owner_signatures(
             # an attacker substituting a different VM under the same
             # kid would land here. Reject this attempt.
             continue
+        # ``sig_hex`` must be a hex string. A non-string truthy value
+        # (e.g. JSON 42 or true at the import boundary) would slip past
+        # the falsy guard above and raise TypeError from fromhex.
+        # codex P2 #1273 R4.
+        if not isinstance(sig_hex, str):
+            continue
         try:
             sig_bytes = bytes.fromhex(sig_hex)
         except ValueError:
