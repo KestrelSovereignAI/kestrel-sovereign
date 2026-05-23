@@ -912,18 +912,131 @@ class OrchestratorEngineMixin:
                 feature_name, denied_tools,
             )
 
-        exec_start = time.time()
-        with optional_span("agent.feature_dispatch", {
-            "feature.name": getattr(feature, "tool_name", feature_name),
-            "tool.source": source,
-        }):
-            result = await feature.execute_as_subagent(
-                task=task, context=context, denied_tools=denied_tools,
+        # Parity with chat path's ``_dispatch_feature_tool``: it fires
+        # the inner PRE_TOOL_USE / POST_TOOL_USE envelope around the
+        # actual ``execute_as_subagent`` call (via
+        # ``_execute_tool_with_hooks``). Hooks registered only for
+        # PRE_TOOL_USE that today observe chat-path feature dispatches
+        # (audit / observability / argument-redactor hooks) must see
+        # the same call on the codex inline-executor path — otherwise
+        # this fix would create a transport-side asymmetry in the
+        # governance envelope (codex review P1 on PR #1385).
+        inner_pre = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.PRE_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=effective_args,
+            feature_name=feature_name,
+        )
+        inner_pre_output = await self.hooks_manager.execute_hooks(
+            HookEvent.PRE_TOOL_USE, inner_pre,
+        )
+        # PRE_TOOL_USE can also DENY/ASK (e.g. SecurityHook enforcing
+        # a deny-list per-tool); honor that even though the outer
+        # PRE_SUBAGENT_CALL already passed.
+        if inner_pre_output.permission_decision == PermissionDecision.DENY:
+            reason = inner_pre_output.permission_reason or "Blocked by security policy"
+            await self._fire_post_subagent_hook(
+                session_id=session_id, tool_name=tool_name,
+                feature_name=feature_name, effective_args=effective_args,
+                result={"success": False, "error": f"Permission denied: {reason}"},
+                exec_duration_ms=0,
             )
+            return {"success": False, "error": f"Permission denied: {reason}"}
+        if inner_pre_output.permission_decision == PermissionDecision.ASK:
+            reason = inner_pre_output.permission_reason or "Requires approval"
+            await self._fire_post_subagent_hook(
+                session_id=session_id, tool_name=tool_name,
+                feature_name=feature_name, effective_args=effective_args,
+                result={"success": False, "error": f"Approval required: {reason}"},
+                exec_duration_ms=0,
+            )
+            return {"success": False, "error": f"Approval required: {reason}"}
+        # Honor inner-MODIFY rewrites for the same reason the outer
+        # hook does — a PRE_TOOL_USE redactor on subagent args must
+        # apply to the call that actually runs.
+        inner_effective = (
+            inner_pre_output.updated_input
+            if inner_pre_output.updated_input is not None
+            else inner_pre.tool_input
+        )
+        if isinstance(inner_effective, dict):
+            task = inner_effective.get("task", task)
+            context = inner_effective.get("context", context)
+
+        exec_start = time.time()
+        # Codex P2 on PR #1385: chat-path ``_dispatch_feature_tool``
+        # catches subagent exceptions and returns a tool-shaped error
+        # envelope (via ``_handle_feature_error``) instead of letting
+        # them propagate. For the codex inline-executor path the same
+        # contract matters: an exception should become a
+        # model-visible failure result, not a transport-level error
+        # that kills the whole stream. POST_SUBAGENT_CALL still fires
+        # on the failure path so observability/audit hooks see every
+        # dispatch outcome.
+        try:
+            with optional_span("agent.feature_dispatch", {
+                "feature.name": getattr(feature, "tool_name", feature_name),
+                "tool.source": source,
+            }):
+                result = await feature.execute_as_subagent(
+                    task=task, context=context, denied_tools=denied_tools,
+                )
+        except Exception as e:  # noqa: BLE001 — boundary catch is the contract
+            logging.warning(
+                "[GOVERNED-DISPATCH] subagent execute raised source=%s feature=%s err=%s",
+                source, feature_name, e, exc_info=True,
+            )
+            exec_duration_ms = int((time.time() - exec_start) * 1000)
+            err_result = {
+                "success": False,
+                "error": f"Subagent {feature_name} failed: {e}",
+            }
+            await self._fire_post_subagent_hook(
+                session_id=session_id, tool_name=tool_name,
+                feature_name=feature_name, effective_args=effective_args,
+                result=err_result, exec_duration_ms=exec_duration_ms,
+            )
+            return err_result
         exec_duration_ms = int((time.time() - exec_start) * 1000)
         self._register_explored_feature_tools(feature)
 
-        # --- POST_SUBAGENT_CALL hook (parallel, non-blocking) ---
+        # --- POST_TOOL_USE hook (inner envelope; parity with chat path) ---
+        inner_post = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.POST_TOOL_USE.value,
+            tool_name=tool_name,
+            tool_input=effective_args,
+            feature_name=feature_name,
+            tool_response=result if isinstance(result, dict) else {"result": str(result)},
+            execution_time_ms=exec_duration_ms,
+        )
+        await self.hooks_manager.execute_hooks_parallel(
+            HookEvent.POST_TOOL_USE, inner_post,
+        )
+
+        # --- POST_SUBAGENT_CALL hook (outer envelope) ---
+        await self._fire_post_subagent_hook(
+            session_id=session_id, tool_name=tool_name,
+            feature_name=feature_name, effective_args=effective_args,
+            result=result, exec_duration_ms=exec_duration_ms,
+        )
+
+        return result
+
+    async def _fire_post_subagent_hook(
+        self,
+        *,
+        session_id: str,
+        tool_name: str,
+        feature_name: str,
+        effective_args: dict,
+        result: Any,
+        exec_duration_ms: int,
+    ) -> None:
+        """Emit POST_SUBAGENT_CALL. Factored out so failure paths
+        (PRE_TOOL_USE deny, subagent exception) can still fire it
+        without duplicating the HookInput construction."""
         post_input = HookInput(
             session_id=session_id,
             hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
@@ -936,8 +1049,6 @@ class OrchestratorEngineMixin:
         await self.hooks_manager.execute_hooks_parallel(
             HookEvent.POST_SUBAGENT_CALL, post_input,
         )
-
-        return result
 
     # ------------------------------------------------------------------
     # Shared helpers used by both streaming and non-streaming loops

@@ -602,16 +602,22 @@ class TestExecuteNamedToolSubagentDispatch:
             "memory_feature", {"task": "ping"},
             session_id="s", source="codex_app_server",
         )
-        assert len(hooks.pre_calls) == 1
-        pre = hooks.pre_calls[0]
-        assert pre.hook_event_name == HookEvent.PRE_SUBAGENT_CALL.value, (
-            "subagent dispatch must use PRE_SUBAGENT_CALL — different "
-            "governance envelope than individual tool calls"
-        )
+        # Subagent dispatch fires the OUTER PRE_SUBAGENT_CALL envelope.
+        # The inner PRE_TOOL_USE envelope is asserted separately in
+        # ``test_dispatch_also_fires_pre_and_post_tool_use_inner_envelope``.
+        pre_subagent_calls = [
+            c for c in hooks.pre_calls
+            if c.hook_event_name == HookEvent.PRE_SUBAGENT_CALL.value
+        ]
+        assert len(pre_subagent_calls) == 1
+        pre = pre_subagent_calls[0]
         assert pre.tool_name == "memory_feature"
         assert pre.feature_name == "_SubagentFeature"
-        assert len(hooks.post_calls) == 1
-        assert hooks.post_calls[0].hook_event_name == HookEvent.POST_SUBAGENT_CALL.value
+        post_subagent_calls = [
+            c for c in hooks.post_calls
+            if c.hook_event_name == HookEvent.POST_SUBAGENT_CALL.value
+        ]
+        assert len(post_subagent_calls) == 1
 
     @pytest.mark.asyncio
     async def test_pre_subagent_deny_blocks_dispatch(self):
@@ -677,6 +683,110 @@ class TestExecuteNamedToolSubagentDispatch:
             session_id="s", source="codex_app_server",
         )
         assert feature.subagent_calls[0]["denied_tools"] == ["dangerous_skill"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_also_fires_pre_and_post_tool_use_inner_envelope(self):
+        """Codex P1 on PR #1385: chat-path ``_dispatch_feature_tool``
+        wraps ``execute_as_subagent`` in ``_execute_tool_with_hooks``
+        which fires PRE_TOOL_USE/POST_TOOL_USE inside the
+        PRE_SUBAGENT_CALL/POST_SUBAGENT_CALL outer envelope. Hooks
+        registered only for PRE_TOOL_USE today observe feature
+        dispatches on the chat path; the codex inline-executor path
+        must see the same envelope or the governance contract diverges
+        per transport. This test pins both event types fire."""
+        feature = _SubagentFeature("memory_feature", returns={"success": True})
+        hooks = _FakeHooksManager()
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        await agent.execute_named_tool(
+            "memory_feature", {"task": "ping"},
+            session_id="s", source="codex_app_server",
+        )
+        pre_events = [
+            call.hook_event_name for call in hooks.pre_calls
+        ]
+        post_events = [
+            call.hook_event_name for call in hooks.post_calls
+        ]
+        assert HookEvent.PRE_SUBAGENT_CALL.value in pre_events
+        assert HookEvent.PRE_TOOL_USE.value in pre_events, (
+            "subagent dispatch must ALSO fire the inner PRE_TOOL_USE "
+            "envelope so per-tool hooks (deny-list, redactors) apply"
+        )
+        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
+        assert HookEvent.POST_TOOL_USE.value in post_events
+
+    @pytest.mark.asyncio
+    async def test_subagent_exception_returns_tool_shaped_error(self):
+        """Codex P2 on PR #1385: chat-path catches subagent exceptions
+        and returns a tool-shaped error envelope (the LLM sees a
+        failure result instead of a transport crash). The inline-
+        executor path must do the same — otherwise a subagent runtime
+        failure kills the codex stream instead of letting the LLM
+        recover."""
+        feature = _SubagentFeature(
+            "memory_feature",
+            side_effect=RuntimeError("DB connection lost"),
+        )
+        hooks = _FakeHooksManager()
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature", {"task": "search"},
+            session_id="s", source="codex_app_server",
+        )
+        # Tool-shaped failure envelope, not exception propagation.
+        assert isinstance(result, dict)
+        assert result["success"] is False
+        assert "DB connection lost" in result["error"]
+        # POST_SUBAGENT_CALL STILL fires on the failure path so
+        # observability sees every dispatch outcome.
+        post_events = [c.hook_event_name for c in hooks.post_calls]
+        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
+
+    @pytest.mark.asyncio
+    async def test_inner_pre_tool_use_deny_blocks_dispatch(self):
+        """A PRE_TOOL_USE hook denying the dispatch (e.g. per-tool
+        deny-list applied to the subagent dispatcher) must block
+        execute_as_subagent even if the outer PRE_SUBAGENT_CALL
+        allowed. POST_SUBAGENT_CALL still fires for observability."""
+        feature = _SubagentFeature("memory_feature", returns={"ok": True})
+        # Hook fixture allows PRE_SUBAGENT_CALL (default), but we want
+        # PRE_TOOL_USE to DENY. The fake fixture's pre_decision is
+        # shared across event types — override via patching the
+        # second-call behavior at the test layer.
+        hooks = _FakeHooksManager()
+        original_execute = hooks.execute_hooks
+        call_count = {"n": 0}
+
+        async def execute_hooks_with_inner_deny(event, hook_input):
+            call_count["n"] += 1
+            result = await original_execute(event, hook_input)
+            if event == HookEvent.PRE_TOOL_USE:
+                return HookOutput(
+                    permission_decision=PermissionDecision.DENY,
+                    permission_reason="tool denied by per-tool policy",
+                )
+            return result
+
+        hooks.execute_hooks = execute_hooks_with_inner_deny
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature", {"task": "do thing"},
+            session_id="s", source="codex_app_server",
+        )
+        assert result == {
+            "success": False,
+            "error": "Permission denied: tool denied by per-tool policy",
+        }
+        assert feature.subagent_calls == []
+        # POST_SUBAGENT_CALL fires on the deny path.
+        post_events = [c.hook_event_name for c in hooks.post_calls]
+        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
 
     @pytest.mark.asyncio
     async def test_still_raises_for_unknown_name(self):
