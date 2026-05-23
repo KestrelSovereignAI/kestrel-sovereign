@@ -88,6 +88,7 @@ class TaskManager:
         feedback_store: Optional[FeedbackStore] = None,
         hooks_manager: Optional["HooksManager"] = None,
         on_task_complete: Optional[Callable[[Task], None]] = None,
+        on_task_submitted: Optional[Callable[[Task], None]] = None,
         causation_chain_provider: Optional[Callable[[], Optional[list]]] = None,
     ):
         self.task_store = task_store
@@ -99,6 +100,16 @@ class TaskManager:
 
         # Callback for task completion notifications (for chat notifications)
         self._on_task_complete = on_task_complete
+
+        # Callback for task creation. Mirrors `on_task_complete`; fires
+        # synchronously from ``create_task`` immediately after the task
+        # is persisted, BEFORE the SSE notify_status_update. Agents set
+        # this in ``initialize()`` to bridge an inbound task into the
+        # signal/dispatcher system — the cognition equivalent of the
+        # ``channels.feature.py`` inbound-message wake. Without it, a
+        # task created by a peer agent sits SUBMITTED in the store with
+        # nobody acting on it until the next user-driven chat turn.
+        self._on_task_submitted = on_task_submitted
 
         # Callback returning the in-flight cognition turn's causation
         # chain (already serialized as list of dicts) or None when no
@@ -609,6 +620,23 @@ class TaskManager:
             session_id=params.sessionId,
             metadata={"task_id": task.id}
         )
+
+        # Inbound-task callback: agent bridges this into the signal
+        # dispatcher so the cognition loop wakes up and acts on the new
+        # task. Mirrors `_on_task_complete` for the complete-direction
+        # signal; without this hook, a peer-submitted task sits
+        # SUBMITTED with no one processing it (the Emma/Meridian
+        # symptom). Synchronous callback; agent-side handler dispatches
+        # the actual async enqueue via background-task tracking
+        # (see KestrelAgent._on_task_submitted).
+        if self._on_task_submitted is not None:
+            try:
+                self._on_task_submitted(task)
+            except Exception as e:
+                logger.warning(
+                    "on_task_submitted callback failed for %s: %s",
+                    task.id, e, exc_info=True,
+                )
 
         # Notify subscribers
         await self._notify_status_update(task, final=False)

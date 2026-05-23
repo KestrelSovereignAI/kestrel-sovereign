@@ -122,6 +122,71 @@ class EventManagerMixin:
                 task_id, e, exc_info=True,
             )
 
+    def _on_task_submitted(self, task) -> None:
+        """
+        Callback invoked when a peer agent creates a new A2A task
+        addressed to this agent.
+
+        Closes the inbound wakeup gap: the matching counterpart to
+        ``_on_background_task_complete`` for the SUBMITTED direction.
+        Without this, a peer-submitted task sits in the local task
+        store with no one acting on it until the next user-driven chat
+        turn — the Emma/Meridian symptom (#645 missing piece).
+
+        Mirrors `channels.feature.py:425` — the proven inbound-signal
+        pattern: dispatch a COGNITION signal and let the dispatcher
+        wake the cognition loop. The new turn sees the task in
+        context and decides what to do.
+
+        Called by TaskManager from ``create_task`` (synchronous
+        callback). The actual ``dispatcher.enqueue_signal`` await is
+        wrapped in a tracked background task so exceptions land in
+        logs and shutdown drains it cleanly.
+        """
+        dispatcher = getattr(self, "dispatcher", None)
+        if dispatcher is None:
+            # Pre-dispatcher agents (or test fixtures without one) get
+            # the persisted task but no wake. The TaskStore row still
+            # exists, so a subsequent reading turn can see it; just no
+            # autonomous trigger. Same backward-compat posture as
+            # ``_on_background_task_complete``.
+            return
+
+        task_id = getattr(task, "id", "<unknown>")
+        try:
+            from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+                build_signal_for_submitted_task,
+            )
+
+            # ``sender`` lives in task.metadata when the create came
+            # via the inter-agent HTTP send path. Local self-spawn
+            # paths leave it blank, which is fine — the signal still
+            # fires (allow_self_loops=False prevents the degenerate
+            # case at dispatch time).
+            metadata = getattr(task, "metadata", None) or {}
+            sender = str(metadata.get("sender", "") or "") if isinstance(metadata, dict) else ""
+
+            signal = build_signal_for_submitted_task(
+                task=task,
+                target_agent=getattr(self, "did", ""),
+                sender=sender,
+            )
+
+            async def _enqueue():
+                await dispatcher.enqueue_signal(signal)
+
+            self._track_background_task(
+                _enqueue(), name=f"a2a_submitted:{str(task_id)[:8]}",
+            )
+        except Exception as e:
+            # Same posture as task_complete: never let a dispatcher
+            # failure break task creation. Log and continue — the
+            # task IS persisted; only the wake was missed.
+            logging.warning(
+                "Failed to enqueue a2a.task_submitted signal for %s: %s",
+                task_id, e, exc_info=True,
+            )
+
     def get_pending_notifications(self) -> List[str]:
         """
         Get and clear pending task completion notifications.

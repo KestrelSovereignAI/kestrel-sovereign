@@ -591,6 +591,13 @@ class KestrelAgent(
                 feedback_store=feedback_store,
                 hooks_manager=self.hooks_manager,  # Pass hooks manager for security
                 on_task_complete=self._on_background_task_complete,  # For notifications
+                # Inbound-task callback: when a peer creates a task
+                # addressed to this agent, wake the cognition loop via
+                # the dispatcher. Without this, peer-submitted tasks
+                # sat SUBMITTED in the store with no autonomous trigger
+                # — the missing piece behind every "I sent it, did you
+                # get it?" thread (#645 / Emma↔Meridian).
+                on_task_submitted=self._on_task_submitted,
                 # Provider returns the in-flight cognition turn's
                 # causation chain (serialized) so outbound A2A tasks
                 # carry the lineage. The dispatcher sets the chain on
@@ -646,6 +653,20 @@ class KestrelAgent(
             )
             self.signal_registry.register(
                 build_a2a_task_complete_registration()
+            )
+
+            # Register the a2a.task_submitted source — the inbound-
+            # direction wake (#645 missing piece). When a peer creates
+            # a task addressed to this agent, TaskManager.create_task
+            # fires ``_on_task_submitted`` which builds a Signal from
+            # this registration and enqueues it via the dispatcher.
+            # Mirrors `channels.feature.py:425` — the proven inbound
+            # wake pattern.
+            from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+                build_a2a_task_submitted_registration,
+            )
+            self.signal_registry.register(
+                build_a2a_task_submitted_registration()
             )
 
             # Register the Stripe deposit-complete webhook source
