@@ -2443,12 +2443,16 @@ def _talon_issue_numbers(payload: dict[str, Any]) -> list[int]:
 
 
 def _talon_job_ids(payload: dict[str, Any]) -> list[str]:
+    # Accept all three id shapes from the dispatch paths:
+    # CLI-background → ``job_id``; A2A → ``task_id`` (post-#1368);
+    # legacy mesh → ``message_id`` (mesh deleted; kept only for any
+    # in-flight serialized state during rollout).
     job_ids: list[str] = []
-    for key in ("talon_job_id", "job_id", "message_id"):
+    for key in ("talon_job_id", "job_id", "task_id", "message_id"):
         value = _payload_string(payload, key)
         if value is not None:
             job_ids.append(value)
-    for key in ("talon_job_ids", "job_ids"):
+    for key in ("talon_job_ids", "job_ids", "task_ids"):
         value = payload.get(key)
         if isinstance(value, str):
             value = [item.strip() for item in value.split(",")]
@@ -2458,7 +2462,7 @@ def _talon_job_ids(payload: dict[str, Any]) -> list[str]:
             if isinstance(item, str) and item.strip():
                 job_ids.append(item.strip())
     for dispatch in _talon_dispatches(payload):
-        for key in ("job_id", "message_id"):
+        for key in ("job_id", "task_id", "message_id"):
             value = dispatch.get(key)
             if isinstance(value, str) and value.strip():
                 job_ids.append(value.strip())

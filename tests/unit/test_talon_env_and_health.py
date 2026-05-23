@@ -411,7 +411,7 @@ async def test_claim_refuses_unsafe_workspace_root(monkeypatch):
     )
     feat = _make_feature()
     with patch.object(
-        TalonCoordinatorFeature, "_dispatch_via_mesh",
+        TalonCoordinatorFeature, "_dispatch_via_a2a",
         new_callable=AsyncMock,
         return_value={"dispatched": False},
     ):

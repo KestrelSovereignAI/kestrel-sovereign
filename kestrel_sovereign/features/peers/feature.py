@@ -2,23 +2,23 @@
 Peers Feature — Inter-agent communication for multi_agent environments.
 
 Allows agents to discover sibling agents and send messages to them
-through the multi_agent host proxy. Works in both local and cloud deployments.
+through the multi_agent host proxy. Works in both local and cloud
+deployments. Two transports:
 
-Includes the Agent Mesh Protocol for structured message exchange between
-Falconer agents (Claws, Talon, Eye, Flight).
+* ``ask_agent`` — synchronous Q&A via ``/api/agent/invoke``. Legacy
+  surface kept until Epic #1367 reroutes it onto the A2A path as
+  ``send_a2a_question``.
 
-Architecture:
-    Agent A → PeersFeature.ask_agent("emma", "What do you think?")
-        → POST http://{host}/api/agents/emma/agent/invoke
-            → Host proxy → Emma's /agent/invoke endpoint
-                → Emma processes, returns response
-            ← Response flows back through proxy
-        ← Agent A receives Emma's answer
+* ``send_a2a_task`` — asynchronous A2A task submission via
+  ``/api/agent/tasks/send``. Persists to the recipient's TaskStore,
+  fires the ``a2a.task_submitted`` signal so the recipient wakes,
+  carries causation chain for cycle detection.
 
-    Mesh Protocol:
-        Claws → send_mesh_message(talon, assign, {issue: 42})
-            → POST http://{host}/api/agents/talon/agent/mesh
-            ← Talon acknowledges receipt
+The legacy Mesh Protocol (send_mesh_message / mesh_inbox / receive_mesh_message
++ /agent/mesh endpoint + features/peers/mesh.py) was retired in #1367.
+All Falconer workflow events (assign, review_needed, complete, etc.)
+now go through send_a2a_task with ``metadata["skill"]`` set to the
+corresponding ``workflow.*`` skill id.
 """
 
 import json
@@ -92,8 +92,6 @@ class PeersFeature(Feature):
         self._host_url = _discover_host_url()
         self._api_key = os.environ.get("KESTREL_API_KEY", "")
         self._own_name = self._get_own_name()
-        self._mesh_inbox: List[Dict[str, Any]] = []
-        self._mesh_log: List[Dict[str, Any]] = []
 
         if self._host_url:
             logger.info(f"PeersFeature initialized: host={self._host_url}, self={self._own_name}")
@@ -275,12 +273,14 @@ class PeersFeature(Feature):
     @tool(
         name="send_a2a_task",
         description=(
-            "Create an A2A task on a peer agent. Unlike send_mesh_message "
-            "(which stores fire-and-forget in the recipient's inbox and "
-            "doesn't wake them), this fires the a2a.task_submitted signal "
-            "on the recipient's dispatcher so they actually pick up and "
-            "process the task. Returns the task_id so the caller can "
-            "later poll status via get_a2a_task."
+            "Submit an A2A task to another agent. Persists the task in "
+            "the recipient's TaskStore and fires the "
+            "a2a.task_submitted signal on their dispatcher so they "
+            "actually wake up and process it. Returns the task_id; "
+            "caller can later poll status via get_a2a_task or receive "
+            "the result via the a2a.task_complete signal when the "
+            "recipient finishes. This is the only inter-agent comms "
+            "verb for async work — there is no parallel mesh path."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a send",
@@ -421,194 +421,10 @@ class PeersFeature(Feature):
             },
         )
 
-    # ------------------------------------------------------------------
-    # Agent Mesh Protocol (legacy; superseded by send_a2a_task per #645)
-    # ------------------------------------------------------------------
-
-    @tool(
-        name="send_mesh_message",
-        description="Send a structured mesh message to a peer agent. Use for task assignments, review requests, completions, and rejections between Falconer agents.",
-        category=ToolCategory.COMMUNICATION,
-        command_prefix="!mesh send",
-    )
-    async def send_mesh_message(
-        self,
-        recipient: str,
-        message_type: str,
-        payload_json: str,
-        priority: str = "normal",
-        repo: str = "",
-        correlation_id: str = "",
-    ) -> ToolResult:
-        """
-        Send a structured mesh message to a peer agent.
-
-        The message is delivered to the recipient's /agent/mesh endpoint
-        via the multi_agent host proxy. The recipient stores it in their
-        mesh inbox for processing.
-
-        Args:
-            recipient: Name of the target agent (e.g. "talon", "eye")
-            message_type: One of: assign, review_needed, complete, reject, status_update
-            payload_json: JSON string with type-specific data
-            priority: Priority level: critical, high, normal, low
-            repo: GitHub repo in "owner/name" format (optional)
-            correlation_id: Links to a previous message (for replies)
-        """
-        from .mesh import MeshMessage, MeshMessageType, MeshPriority
-
-        if not self._host_url:
-            return ToolResult.failed(
-                "Not running in a multi_agent environment",
-                data={"sent": False, "recipient": recipient},
-            )
-
-        try:
-            msg_type = MeshMessageType(message_type)
-        except ValueError:
-            valid = [t.value for t in MeshMessageType]
-            return ToolResult.failed(
-                f"Invalid message_type. Must be one of: {valid}",
-                data={"sent": False, "message_type": message_type},
-            )
-
-        try:
-            msg_priority = MeshPriority(priority)
-        except ValueError:
-            valid = [p.value for p in MeshPriority]
-            return ToolResult.failed(
-                f"Invalid priority. Must be one of: {valid}",
-                data={"sent": False, "priority": priority},
-            )
-
-        try:
-            payload = json.loads(payload_json) if isinstance(payload_json, str) else payload_json
-        except json.JSONDecodeError as e:
-            return ToolResult.failed(
-                f"Invalid payload_json: {e}",
-                data={"sent": False},
-            )
-
-        msg = MeshMessage(
-            type=msg_type,
-            sender=self._own_name,
-            recipient=recipient,
-            priority=msg_priority,
-            payload=payload,
-            repo=repo or None,
-            correlation_id=correlation_id or None,
-        )
-
-        url = f"{self._host_url}/api/agents/{recipient}/api/agent/mesh"
-
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.post(
-                    url,
-                    json=msg.to_dict(),
-                    headers=self._build_headers(),
-                    timeout=httpx.Timeout(
-                        connect=PEER_CONNECT_TIMEOUT,
-                        read=PEER_READ_TIMEOUT,
-                        write=PEER_READ_TIMEOUT,
-                        pool=PEER_CONNECT_TIMEOUT,
-                    ),
-                )
-        except httpx.ConnectError:
-            return ToolResult.failed(
-                f"Could not reach agent '{recipient}'",
-                data={"sent": False, "recipient": recipient},
-            )
-        except httpx.TimeoutException:
-            return ToolResult.failed(
-                f"Agent '{recipient}' timed out",
-                data={"sent": False, "recipient": recipient},
-            )
-        except Exception as e:
-            logger.error(f"Mesh send to '{recipient}' failed: {e}")
-            return ToolResult.failed(
-                str(e),
-                data={"sent": False, "recipient": recipient},
-            )
-
-        if resp.status_code == 404:
-            return ToolResult.failed(
-                f"Agent '{recipient}' not found or mesh endpoint not available",
-                data={"sent": False, "recipient": recipient},
-            )
-        if resp.status_code == 503:
-            return ToolResult.failed(
-                f"Agent '{recipient}' is offline",
-                data={"sent": False, "recipient": recipient},
-            )
-
-        try:
-            resp.raise_for_status()
-        except Exception as e:
-            return ToolResult.failed(
-                str(e),
-                data={"sent": False, "recipient": recipient},
-            )
-
-        self._mesh_log.append(msg.to_dict())
-        logger.info(f"Mesh message sent: {msg.type.value} → {recipient} (id={msg.id})")
-
-        return ToolResult.ok(
-            confirmation=(
-                f"Sent mesh {msg.type.value} → {recipient} (id={msg.id})"
-            ),
-            data={
-                "sent": True,
-                "message_id": msg.id,
-                "type": msg.type.value,
-                "recipient": recipient,
-            },
-        )
-
-    @tool(
-        name="mesh_inbox",
-        description="View incoming mesh messages from peer agents. Shows assignments, review requests, and status updates.",
-        category=ToolCategory.COMMUNICATION,
-        command_prefix="!mesh inbox",
-    )
-    async def mesh_inbox(self, limit: int = 20) -> ToolResult:
-        """
-        View recent incoming mesh messages.
-
-        Args:
-            limit: Maximum number of messages to return (default 20).
-        """
-        messages = self._mesh_inbox[-limit:] if limit > 0 else self._mesh_inbox
-        return ToolResult.ok(
-            confirmation=(
-                f"{len(messages)} mesh message(s) shown "
-                f"(total inbox: {len(self._mesh_inbox)})"
-            ),
-            data={
-                "messages": messages,
-                "count": len(messages),
-                "total": len(self._mesh_inbox),
-            },
-        )
-
-    def receive_mesh_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Receive and store an incoming mesh message (called by the /agent/mesh endpoint).
-
-        Returns acknowledgement dict.
-        """
-        from .mesh import MeshMessage
-
-        try:
-            msg = MeshMessage.from_dict(data)
-        except (KeyError, ValueError) as e:
-            return {"accepted": False, "error": f"Invalid mesh message: {e}"}
-
-        self._mesh_inbox.append(msg.to_dict())
-        logger.info(f"Mesh message received: {msg.type.value} from {msg.sender} (id={msg.id})")
-
-        return {
-            "accepted": True,
-            "message_id": msg.id,
-            "type": msg.type.value,
-        }
+    # Agent Mesh Protocol retired in #1367. The send_mesh_message /
+    # mesh_inbox / receive_mesh_message tools and the /agent/mesh
+    # endpoint were replaced by send_a2a_task above (and the wider
+    # send_a2a_* family in the follow-up epic). All inter-agent
+    # communication now goes through /api/agent/tasks/send so it gets
+    # persistence (TaskStore), lifecycle (SUBMITTED→WORKING→COMPLETED),
+    # and dispatcher-driven inbound wake (a2a.task_submitted signal).

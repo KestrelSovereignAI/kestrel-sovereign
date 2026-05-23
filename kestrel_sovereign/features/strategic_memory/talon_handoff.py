@@ -21,7 +21,9 @@ import urllib.error
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from kestrel_sovereign.features.peers.mesh import make_assign_message
+# Mesh retired (#1367 phase 5). Dispatch now uses A2A task submission
+# via the recipient's /api/agent/tasks/send endpoint — same wire path
+# PeersFeature.send_a2a_task uses, just called inline from the handoff.
 from kestrel_sovereign.features.strategic_memory.github_integration import (
     fetch_github_signal,
     get_github_token,
@@ -243,35 +245,49 @@ async def dispatch_to_talon(
             f"{issue['issue_title']}) but no multi_agent host URL configured."
         )
 
-    # Build the mesh assign message
-    msg = make_assign_message(
-        sender=sender,
-        recipient=recipient,
-        repo=issue["repo"],
-        issue_number=issue["issue_number"],
-        issue_title=issue["issue_title"],
-        priority=issue["priority"],
-        context=issue.get("context", ""),
+    # Build an A2A TaskSendParams payload. The receiving agent's
+    # TaskManager.create_task persists the task + fires the
+    # ``a2a.task_submitted`` signal that wakes its cognition loop.
+    from uuid import uuid4
+    task_id = uuid4().hex
+    body = (
+        f"Assignment: {issue['repo']}#{issue['issue_number']} "
+        f"({issue['issue_title']}). Priority: {issue['priority']}. "
+        f"{issue.get('context', '')}".strip()
     )
+    a2a_payload = json.dumps({
+        "id": task_id,
+        "sessionId": uuid4().hex,
+        "message": {
+            "role": "user",
+            "parts": [{"type": "text", "text": body}],
+        },
+        "metadata": {
+            "sender": sender,
+            "skill": "workflow.assign",
+            "repo": issue["repo"],
+            "issue_number": issue["issue_number"],
+            "issue_title": issue["issue_title"],
+            "priority": issue["priority"],
+            **({"context": issue["context"]} if issue.get("context") else {}),
+        },
+    }).encode("utf-8")
 
-    # POST to recipient's mesh endpoint via multi_agent
-    url = f"{host_url}/api/agents/{recipient}/api/agent/mesh"
-    payload = json.dumps(msg.to_dict()).encode("utf-8")
+    url = f"{host_url}/api/agents/{recipient}/api/agent/tasks/send"
     req = urllib.request.Request(
         url,
-        data=payload,
+        data=a2a_payload,
         method="POST",
         headers={"Content-Type": "application/json", "User-Agent": "kestrel-agent"},
     )
     try:
-        resp = await asyncio.to_thread(
+        await asyncio.to_thread(
             lambda: urllib.request.urlopen(req, timeout=10).read()
         )
-        result = json.loads(resp)
         return (
             f"Dispatched to {recipient}: {issue['repo']}#{issue['issue_number']} "
             f"({issue['issue_title']}) — priority: {issue['priority']}. "
-            f"Mesh ID: {msg.id}"
+            f"Task ID: {task_id}"
         )
     except (urllib.error.URLError, urllib.error.HTTPError) as e:
         return (

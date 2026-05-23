@@ -3761,7 +3761,11 @@ def _feature_feature_talon_output_params(
             output["talon_dispatches"] = clean_dispatches
             job_ids: list[str] = []
             for dispatch in clean_dispatches:
-                for key in ("job_id", "message_id"):
+                # Accept all three id shapes from the dispatch paths:
+                # CLI-background → ``job_id``; A2A → ``task_id``;
+                # legacy mesh → ``message_id`` (mesh deleted in #1368,
+                # left in chain only for in-flight serialized state).
+                for key in ("job_id", "task_id", "message_id"):
                     value = dispatch.get(key)
                     if isinstance(value, str) and value.strip():
                         job_ids.append(value.strip())

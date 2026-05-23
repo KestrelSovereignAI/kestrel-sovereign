@@ -130,27 +130,46 @@ async def _scheduled_section(agent: Any) -> Optional[str]:
     )
 
 
-async def _mesh_section(agent: Any) -> Optional[str]:
-    feat = _get_feature(agent, "PeersFeature")
-    inbox = getattr(feat, "_mesh_inbox", None) if feat is not None else None
-    if inbox is None:
+async def _a2a_inbox_section(agent: Any) -> Optional[str]:
+    """Show non-terminal A2A tasks addressed to this agent.
+
+    Replaces the prior ``_mesh_section`` which read PeersFeature's
+    in-memory ``_mesh_inbox`` list. Mesh was retired in #1367; the
+    durable equivalent is the agent's TaskStore. SUBMITTED and WORKING
+    tasks where this agent is the receiver are the "pending inbox"
+    semantic the prior surface tried to convey.
+    """
+    task_manager = getattr(agent, "task_manager", None)
+    if task_manager is None:
         return None
-    n = len(inbox)
+    try:
+        from kestrel_sovereign.a2a.types import TaskState
+        tasks = await task_manager.task_store.list_tasks(limit=50)
+    except Exception:
+        return None
+    pending = [
+        t for t in tasks
+        if t.status.state in (TaskState.SUBMITTED, TaskState.WORKING)
+    ]
+    n = len(pending)
     if n == 0:
-        return "Mesh inbox: empty"
-    lines = [f"Mesh inbox: {n} pending message(s); last 3:"]
-    for msg in list(inbox)[-3:][::-1]:
-        if not isinstance(msg, dict):
-            continue
-        sender = msg.get("sender") or msg.get("from") or "?"
-        mtype = msg.get("type") or "message"
-        body = str(
-            msg.get("summary")
-            or msg.get("content")
-            or msg.get("body")
-            or ""
-        ).strip().replace("\n", " ")
-        lines.append(f"  - {mtype} from {sender}: {body[:90]}")
+        return "A2A inbox: no pending tasks"
+    lines = [f"A2A inbox: {n} pending task(s); last 3:"]
+    for task in pending[-3:][::-1]:
+        meta = task.metadata or {}
+        sender = str(meta.get("sender") or "?")
+        skill = str(meta.get("skill") or "")
+        first_text = ""
+        if task.history:
+            for part in task.history[0].parts:
+                if hasattr(part, "text"):
+                    first_text = part.text
+                    break
+        first_text = first_text.replace("\n", " ").strip()
+        label = f"{skill or 'task'} from {sender}"
+        lines.append(
+            f"  - [{task.status.state.value}] {label}: {first_text[:90]}"
+        )
     return "\n".join(lines)
 
 
@@ -213,7 +232,7 @@ async def build_preturn_state_block(agent: Any) -> Optional[str]:
     try:
         sections.append(_strategy_section(agent))
         sections.append(await _scheduled_section(agent))
-        sections.append(await _mesh_section(agent))
+        sections.append(await _a2a_inbox_section(agent))
         sections.append(await _approvals_section(agent))
         sections.append(await _pinned_section(agent))
     except Exception as exc:  # noqa: BLE001 - never break a turn

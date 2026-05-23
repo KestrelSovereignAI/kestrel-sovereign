@@ -37,15 +37,15 @@ class TestTalonClaim:
         """When mesh dispatch works, returns dispatched=True."""
         monkeypatch.setenv("KESTREL_HOME", str(tmp_path))
         feature = TalonCoordinatorFeature(_make_agent())
-        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh:
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh:
             mock_mesh.return_value = {
-                "dispatched": True, "method": "mesh",
-                "message_id": "abc", "repo": "org/repo", "issue": 42,
+                "dispatched": True, "method": "a2a",
+                "task_id": "abc", "repo": "org/repo", "issue": 42,
             }
             result = await feature.talon_claim(repo="org/repo", issue=42)
             assert result.status is ToolResultStatus.OK
             assert result.data["dispatched"] is True
-            assert result.data["method"] == "mesh"
+            assert result.data["method"] == "a2a"
             mock_mesh.assert_awaited_once_with("org/repo", 42)
 
     @pytest.mark.asyncio
@@ -71,10 +71,10 @@ class TestTalonClaim:
             "last_fetch_at": None,
             "safe": True,
         }
-        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
              patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
              patch.object(TalonCoordinatorFeature, "_workspace_state", return_value=ready_state):
-            mock_mesh.return_value = {"dispatched": False, "reason": "no_mesh_host"}
+            mock_mesh.return_value = {"dispatched": False, "reason": "no_a2a_host"}
             mock_bg.return_value = {
                 "dispatched": True,
                 "method": "cli_background",
@@ -111,10 +111,10 @@ class TestTalonClaim:
             "last_fetch_at": None,
             "safe": True,
         }
-        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
              patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
              patch.object(TalonCoordinatorFeature, "_workspace_state", return_value=ready_state):
-            mock_mesh.return_value = {"dispatched": False, "reason": "no_mesh_host"}
+            mock_mesh.return_value = {"dispatched": False, "reason": "no_a2a_host"}
             mock_bg.return_value = {
                 "dispatched": True,
                 "method": "cli_background",
@@ -193,10 +193,10 @@ class TestTalonClaim:
             "last_fetch_at": None,
             "safe": True,
         }
-        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
              patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
              patch.object(TalonCoordinatorFeature, "_workspace_state", return_value=ready_state):
-            mock_mesh.return_value = {"dispatched": False, "reason": "no_mesh_host"}
+            mock_mesh.return_value = {"dispatched": False, "reason": "no_a2a_host"}
             mock_bg.return_value = {
                 "dispatched": True,
                 "method": "cli_background",
@@ -225,7 +225,7 @@ class TestTalonClaim:
         agent must call ``talon_setup_workspace`` first.
         """
         feature = TalonCoordinatorFeature(_make_agent())
-        with patch.object(feature, "_dispatch_via_mesh", new_callable=AsyncMock) as mock_mesh, \
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
              patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
              patch.object(TalonCoordinatorFeature, "_workspace_state", return_value={
                  "exists": False, "is_git": False, "safe": True,
@@ -315,14 +315,14 @@ class TestTalonPauseResume:
         agent._scheduler.add_schedule.assert_called_once()
 
 
-class TestMeshDispatch:
+class TestA2ADispatch:
     @pytest.mark.asyncio
     async def test_no_host_url(self):
         feature = TalonCoordinatorFeature(_make_agent())
         with patch.object(feature, "_discover_host_url", return_value=None):
-            result = await feature._dispatch_via_mesh("org/repo", 42)
+            result = await feature._dispatch_via_a2a("org/repo", 42)
             assert result["dispatched"] is False
-            assert result["reason"] == "no_mesh_host"
+            assert result["reason"] == "no_a2a_host"
 
 
 class TestCLIDispatch:

@@ -1238,58 +1238,13 @@ async def agent_health_trigger(request: Request):
 
 
 # =========================================================================
-# Agent Mesh Protocol
+# Agent Mesh Protocol — RETIRED (#1367 phase 5).
+#
+# The legacy POST /agent/mesh and GET /agent/mesh/inbox endpoints have
+# been removed. All inter-agent messaging now goes through the A2A
+# task path (POST /api/agent/tasks/send + GET /api/agent/tasks/{id}),
+# which provides persistence, lifecycle states, and signal-driven
+# inbound wake (a2a.task_submitted). Falconer workflow events that
+# used to be MeshMessage(type=ASSIGN|REVIEW_NEEDED|...) are now A2A
+# tasks with metadata["skill"]="workflow.assign" (etc.).
 # =========================================================================
-
-
-@router.post("/mesh")
-@limiter.limit("120/minute")
-async def receive_mesh_message(request: Request):
-    """
-    Receive a structured mesh message from a peer agent.
-
-    This endpoint accepts MeshMessage payloads (assign, review_needed,
-    complete, reject, status_update) and stores them in the agent's
-    mesh inbox via PeersFeature.
-
-    Used by the Falconer agent mesh for Claws → Talon → Eye communication.
-    """
-    agent = get_agent(request)
-    body = await _parse_json_body(request)
-
-    peers = agent.features.get("PeersFeature")
-    if not peers:
-        raise HTTPException(
-            status_code=503,
-            detail="PeersFeature not loaded — agent cannot receive mesh messages",
-        )
-
-    result = peers.receive_mesh_message(body)
-
-    if not result.get("accepted"):
-        raise HTTPException(status_code=400, detail=result.get("error", "Invalid mesh message"))
-
-    return result
-
-
-@router.get("/mesh/inbox")
-async def get_mesh_inbox(request: Request, limit: int = Query(default=20, ge=1, le=100)):
-    """
-    Retrieve recent mesh messages from this agent's inbox.
-
-    Useful for dashboards and debugging the mesh protocol.
-    """
-    agent = get_agent(request)
-
-    peers = agent.features.get("PeersFeature")
-    if not peers:
-        raise HTTPException(
-            status_code=503,
-            detail="PeersFeature not loaded",
-        )
-
-    # mesh_inbox returns a ToolResult envelope (#1061 wave 16); the
-    # legacy {"messages": [...], "count": N, "total": N} dict lives
-    # under .data and is the documented API response shape.
-    envelope = await peers.mesh_inbox(limit=limit)
-    return envelope.data or {"messages": [], "count": 0, "total": 0}
