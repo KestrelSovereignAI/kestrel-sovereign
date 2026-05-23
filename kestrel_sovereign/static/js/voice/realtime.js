@@ -141,11 +141,20 @@ export async function createRealtimeClient({
       case 'response.created':
         onEvent(makeEvent(Events.SPEAKING_STARTED, {}));
         break;
-      case 'response.audio_transcript.delta':
+      // GA renamed audio-transcript events to the `output_audio_transcript`
+      // namespace; the text-modality stream is `output_text`. Without these
+      // the agent's spoken reply never reaches the chat window because the
+      // delta events fall through to the default branch.  See
+      // kestrel-voice-openai#16 (Beta -> GA migration).
+      case 'response.output_audio_transcript.delta':
+      case 'response.output_text.delta':
         onEvent(makeEvent(Events.AGENT_TEXT_DELTA, { text: raw.delta ?? '' }));
         break;
-      case 'response.audio_transcript.done':
-        onEvent(makeEvent(Events.AGENT_TEXT_FINAL, { text: raw.transcript ?? '' }));
+      case 'response.output_audio_transcript.done':
+      case 'response.output_text.done':
+        onEvent(makeEvent(Events.AGENT_TEXT_FINAL, {
+          text: raw.transcript ?? raw.text ?? '',
+        }));
         break;
       case 'response.done':
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));

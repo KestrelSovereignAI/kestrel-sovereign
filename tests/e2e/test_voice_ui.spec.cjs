@@ -281,12 +281,12 @@ test.describe('Voice UI shell', () => {
       window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_started' });
       window.__voiceStub.pushRtc({ type: 'input_audio_buffer.speech_stopped' });
       window.__voiceStub.pushRtc({ type: 'response.created' });
-      window.__voiceStub.pushRtc({ type: 'response.audio_transcript.delta', delta: 'Agent answer first.' });
+      window.__voiceStub.pushRtc({ type: 'response.output_audio_transcript.delta', delta: 'Agent answer first.' });
       window.__voiceStub.pushRtc({
         type: 'conversation.item.input_audio_transcription.completed',
         transcript: 'User question arrived late.',
       });
-      window.__voiceStub.pushRtc({ type: 'response.audio_transcript.done', transcript: 'Agent answer first.' });
+      window.__voiceStub.pushRtc({ type: 'response.output_audio_transcript.done', transcript: 'Agent answer first.' });
       window.__voiceStub.pushRtc({ type: 'response.done' });
     });
 
