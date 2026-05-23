@@ -219,12 +219,11 @@ agent feature packages and should not be listed in
   - `GET /api/agent/reflection/status`
   - `GET /api/agent/tasks`
   - `GET /api/agent/tasks/{task_id}`
+  - `POST /api/agent/tasks/send`
   - `GET /api/agent/heartbeat/status`
   - `POST /api/agent/heartbeat/trigger`
   - `GET /api/agent/health/status`
   - `POST /api/agent/health/trigger`
-  - `POST /api/agent/mesh`
-  - `GET /api/agent/mesh/inbox`
 - [`kestrel_sovereign/endpoints/conversations.py`](kestrel_sovereign/endpoints/conversations.py)
   - `GET /api/sessions`
   - `GET /api/conversations`

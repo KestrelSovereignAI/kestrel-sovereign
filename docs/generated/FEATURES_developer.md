@@ -184,10 +184,9 @@ Audited snapshot: **34** discoverable modules · **34** exported `Feature` subcl
 | `GET` | `/agent/context-status` |
 | `GET` | `/agent/reflection/status` |
 | `GET` | `/agent/tasks` |
+| `POST` | `/agent/tasks/send` |
 | `GET` | `/agent/heartbeat/status` |
 | `POST` | `/agent/heartbeat/trigger` |
-| `POST` | `/agent/mesh` |
-| `GET` | `/agent/mesh/inbox` |
 
 #### [`endpoints/conversations.py`](endpoints/conversations.py)
 
