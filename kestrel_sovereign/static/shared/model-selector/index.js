@@ -66,6 +66,16 @@ class ModelSelector {
         this.selectedRoute = '';
         this.isInitialLoad = true;
 
+        // Model IDs the user must not be able to pick from the dropdown — e.g.
+        // the OpenAI Realtime model, which is owned by the mic button. Rendered
+        // as <option disabled> with a 🎙 prefix. See kestrel-sovereign#1371.
+        this._unpickableModels = new Set();
+        // Voice-owned lock state. Non-null while the mic button has taken the
+        // selector. Stores prior selection so we can restore on every voice
+        // exit path. Lock state is intentionally NOT persisted to localStorage:
+        // it is transient UI ownership, not a user choice.
+        this._voiceLock = null;
+
         this._loadState();
     }
 
@@ -285,11 +295,17 @@ class ModelSelector {
             return (a.display_name || a.id).localeCompare(b.display_name || b.id);
         });
 
-        // Build model options
+        // Build model options.  Unpickable models render as <option disabled>
+        // with a 🎙 prefix so the operator can see they exist but cannot
+        // select them by hand (the mic button drives them).  Selecting the
+        // option programmatically still works — see lockToVoiceModel().
         this.modelSelect.innerHTML = models.map(m => {
+            const isUnpickable = this._unpickableModels.has(m.id);
             const star = m.is_featured ? '★ ' : '';
+            const glyph = isUnpickable ? '🎙 ' : '';
             const displayName = m.display_name || m.id;
-            return `<option value="${m.id}">${star}${displayName}</option>`;
+            const disabled = isUnpickable ? ' disabled' : '';
+            return `<option value="${m.id}"${disabled}>${star}${glyph}${displayName}</option>`;
         }).join('');
 
         // Seed order: saved model > server default > alphabetical first.
@@ -650,6 +666,139 @@ class ModelSelector {
         if (triggerCallback) {
             this.onModelChange(this.selectedProvider, this.selectedModel);
         }
+    }
+
+    /**
+     * Declare which model IDs are not user-pickable.  They render in the
+     * dropdown as <option disabled> with a 🎙 prefix; programmatic selection
+     * via lockToVoiceModel() still works.  Typical caller: chat.js, after
+     * resolving the voice route's ``voice_model``.
+     *
+     * @param {Iterable<string>} modelIds  Replaces any prior set.
+     */
+    setUnpickableModels(modelIds) {
+        this._unpickableModels = new Set(modelIds || []);
+        // Re-render so any visible options pick up the disabled state.
+        if (this.providerSelect?.value && this.allModelsData) {
+            this._populateModels();
+        }
+    }
+
+    /**
+     * Voice took ownership of the selector for the lifetime of one mic
+     * engagement.  Captures the prior selection, switches the visible
+     * vendor + model to the given Realtime model, and disables every select
+     * (provider / route / model) until ``unlockToPrior`` runs.  No localStorage
+     * write — the lock is transient UI state.
+     *
+     * If the target model isn't present in any vendor bucket (e.g. discovery
+     * hasn't surfaced it yet), a transient <option> is injected so the value
+     * can still be displayed; that option is removed on unlock.
+     *
+     * @param {Object} target
+     * @param {string} target.vendor   Vendor key the Realtime model lives under.
+     * @param {string} target.model    Model id (e.g. ``gpt-realtime-2``).
+     * @param {string} [target.route]  Optional route id.
+     * @param {string} [reason]        Human-readable tooltip explaining the lock.
+     */
+    lockToVoiceModel(target, reason) {
+        if (this._voiceLock) return;  // re-entrant: keep the first capture
+        const { vendor, model, route } = target || {};
+        if (!model) return;
+
+        this._voiceLock = {
+            priorProvider: this.selectedProvider,
+            priorModel: this.selectedModel,
+            priorRoute: this.selectedRoute,
+            injectedOption: false,
+        };
+
+        // Flip the visible vendor first so _populateModels rebuilds the bucket.
+        if (vendor && this.providerSelect) {
+            this.providerSelect.value = vendor;
+            this.selectedProvider = vendor;
+            this._populateModels();
+        }
+        if (route && this.routeSelect) {
+            this.routeSelect.value = route;
+            this.selectedRoute = route;
+        }
+        // If the target model isn't in the rebuilt option list, inject a
+        // transient marker option.  Tagged so we can find + remove it.
+        if (this.modelSelect) {
+            const existing = Array.from(this.modelSelect.options).some(o => o.value === model);
+            if (!existing) {
+                const opt = document.createElement('option');
+                opt.value = model;
+                opt.textContent = `🎙 ${model}`;
+                opt.dataset.voiceInjected = 'true';
+                opt.disabled = true;  // unpickable, but value-assignable
+                this.modelSelect.appendChild(opt);
+                this._voiceLock.injectedOption = true;
+            }
+            this.modelSelect.value = model;
+            this.selectedModel = model;
+        }
+
+        // Disable every select.  ``disabled`` keeps the value visible while
+        // blocking user interaction; aria-disabled + title make the reason
+        // discoverable.
+        for (const el of [this.providerSelect, this.routeSelect, this.modelSelect]) {
+            if (!el) continue;
+            el.disabled = true;
+            el.setAttribute('aria-disabled', 'true');
+            if (reason) el.title = reason;
+        }
+    }
+
+    /**
+     * Release the voice lock and restore the captured prior selection.
+     * Idempotent — safe to call from every exit path (close, fatal error,
+     * page unload, agent switch) without bookkeeping.
+     */
+    unlockToPrior() {
+        if (!this._voiceLock) return;
+        const { priorProvider, priorModel, priorRoute, injectedOption } = this._voiceLock;
+        this._voiceLock = null;
+
+        // Re-enable selects + clear the lock tooltip.
+        for (const el of [this.providerSelect, this.routeSelect, this.modelSelect]) {
+            if (!el) continue;
+            el.disabled = false;
+            el.removeAttribute('aria-disabled');
+            el.removeAttribute('title');
+        }
+
+        // Restore prior selection.  setSelection writes localStorage; voice
+        // never wrote anything, so this just restores the pre-engage value.
+        if (priorProvider && this.providerSelect) {
+            this.providerSelect.value = priorProvider;
+            this.selectedProvider = priorProvider;
+            this._populateModels();
+        }
+        if (priorRoute !== undefined && this.routeSelect) {
+            this.routeSelect.value = priorRoute || '';
+            this.selectedRoute = priorRoute || '';
+        }
+        if (priorModel && this.modelSelect) {
+            this.modelSelect.value = priorModel;
+            this.selectedModel = priorModel;
+        }
+
+        // Drop any transient option we injected so re-engagements re-inject
+        // cleanly and the dropdown doesn't grow stale entries.
+        if (injectedOption && this.modelSelect) {
+            for (const opt of Array.from(this.modelSelect.options)) {
+                if (opt.dataset && opt.dataset.voiceInjected === 'true') {
+                    opt.remove();
+                }
+            }
+        }
+    }
+
+    /** True while the voice lock is engaged. */
+    isVoiceLocked() {
+        return this._voiceLock !== null;
     }
 }
 
