@@ -991,7 +991,7 @@ async def list_tasks(
 @limiter.limit("120/minute")
 async def send_task(request: Request):
     """
-    Receive an A2A task creation request from a peer agent.
+    Receive an A2A task creation request from another agent.
 
     Inbound shape (matches A2A ``TaskSendParams``):
 
@@ -1003,7 +1003,7 @@ async def send_task(request: Request):
             "parts": [{"type":"text", "text": "..."}]
           },
           "metadata": {                  # optional
-            "sender": "<peer agent name or did>",
+            "sender": "<agent name or did>",
             "skill": "<workflow.* skill id>",
             ...
           }
@@ -1013,9 +1013,24 @@ async def send_task(request: Request):
     task AND fires the ``on_task_submitted`` callback. That callback
     builds a ``a2a.task_submitted`` Signal and enqueues it via the
     dispatcher so this agent wakes up and acts on the new task. Without
-    this endpoint, peer agents had no wire-level way to submit a task —
+    this endpoint, agents had no wire-level way to submit a task —
     only the local agent's own code could call create_task — which made
     inter-agent A2A submission impossible to surface from a tool.
+
+    TODO (v2, separate epic): cryptographic sender verification. Today
+    we accept ``metadata["sender"]`` as a plain string claim — v1 trust
+    model is same-host shared-API-key boundary, where all callers are
+    inside the kestrel multi_agent host. For federation / cross-
+    environment agents (different orgs, different trust tiers), this
+    endpoint needs:
+      * Signed envelope: ``{sender_did, signature, body, timestamp}``
+        validated against the sender's DID public key.
+      * Reuse the SLH-DSA infrastructure from #921 (quantum hardening
+        already provisioned the keypair format + verification path).
+      * Identity-injection middleware: after verification, the cognition
+        turn fires with a system-context note ("Message from agent X,
+        verified DID Y") so the LLM applies the right governance tier.
+    See follow-up epic for the full peer-attribution layer.
     """
     agent = get_agent(request)
     body = await _parse_json_body(request)
