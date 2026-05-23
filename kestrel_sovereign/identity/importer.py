@@ -106,6 +106,7 @@ class IdentityImporter:
         allow_unsigned: bool = False,
         grant: Optional[DataAccessGrant] = None,
         host_policy: Optional[Callable[[DataAccessGrant], bool]] = None,
+        grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
     ) -> ImportResult:
         """
         Import agent identity from a package.
@@ -133,6 +134,14 @@ class IdentityImporter:
                 distinct ``host_policy_rejected`` reason. Never a
                 substitute for the grant — runs only when the grant
                 already verifies. Ignored when ``grant`` is ``None``.
+            grant_did_web_resolver: Optional ``did:web:`` resolver
+                forwarded to :func:`verify_import_consent` so hybrid
+                owners on ``did:web:`` DIDs can have their grant
+                signatures verified. The binding helper refuses-by-
+                default for ``did:web:`` without a resolver; pass one
+                here when accepting hybrid-owner grants. ``did:pkh:``
+                / ``did:key:`` owners need no resolver. Ignored when
+                ``grant`` is ``None``.
 
         Returns:
             ImportResult with success status and statistics
@@ -174,6 +183,7 @@ class IdentityImporter:
                 return self._build_result(False, agent_id)
             consent = await verify_import_consent(
                 package, grant, host_did=self.target_agent_id,
+                did_web_resolver=grant_did_web_resolver,
             )
             if not consent.ok:
                 self.errors.append(

@@ -84,6 +84,14 @@ from kestrel_sovereign.security.crypto_suite import (
 )
 from kestrel_sovereign.security.multikey import multibase_to_public_key
 
+# A ``did:web:`` resolver: ``Callable[[str did], Mapping[str, Any]]``
+# returning the DID document (typically the same shape published at
+# ``https://<domain>/.well-known/did.json``). Callers MUST pass one
+# explicitly when accepting did:web owners — refusing-by-default
+# prevents an attacker from getting a "free pass" by claiming a
+# did:web that no resolver knows about.
+DidWebResolver = "Callable[[str], Mapping[str, Any]]"
+
 
 # ---------------------------------------------------------------------------
 # Data structure
@@ -310,11 +318,19 @@ def _parse_iso_utc(s: str) -> Optional[datetime]:
     return dt
 
 
-def _verify_owner_signatures(grant: DataAccessGrant) -> Tuple[bool, str]:
+def _verify_owner_signatures(
+    grant: DataAccessGrant,
+    *,
+    did_web_resolver: Optional[Any] = None,
+) -> Tuple[bool, str]:
     """At least one ``owner_signature`` must crypto-verify against the
     owner's embedded verification methods, AND the owner DID must
     bind cryptographically to those VMs (so an attacker can't embed
     their own VMs alongside the owner's DID).
+
+    ``did_web_resolver`` is forwarded to :func:`verify_did_binding`.
+    Without it, ``did:web:`` owners are refused fail-closed (the
+    documented refuse-by-default contract on the binding helper).
     """
     if not grant.owner_signatures:
         return False, "grant has no owner_signatures"
@@ -322,7 +338,9 @@ def _verify_owner_signatures(grant: DataAccessGrant) -> Tuple[bool, str]:
         return False, "grant has no owner_verification_methods"
 
     bound_ok, bound_reason = verify_did_binding(
-        grant.owner_did, grant.owner_verification_methods
+        grant.owner_did,
+        grant.owner_verification_methods,
+        did_web_resolver=did_web_resolver,
     )
     if not bound_ok:
         return False, f"owner DID not bound to its VMs: {bound_reason}"
@@ -397,6 +415,7 @@ async def verify_import_consent(
     grant: DataAccessGrant,
     *,
     host_did: str,
+    did_web_resolver: Optional[Any] = None,
     now: Optional[datetime] = None,
 ) -> ConsentVerification:
     """Verify a :class:`DataAccessGrant` authorizes importing *package*
@@ -419,6 +438,14 @@ async def verify_import_consent(
             ``host_did`` field MUST equal this; otherwise an attacker
             could replay a grant minted for one agent against another
             on the same deployment.
+        did_web_resolver: Optional resolver passed through to
+            :func:`verify_did_binding` for ``did:web:`` owners. The
+            binding helper refuses-by-default when an owner_did is
+            ``did:web:`` and no resolver is provided — without this
+            parameter, hybrid (Ed25519 + ML-DSA-65) owners on
+            ``did:web:`` would have their grants rejected as
+            ``grant_signature_invalid`` even when correctly signed.
+            ``did:pkh:`` / ``did:key:`` owners need no resolver.
         now: Optional clock override (UTC datetime). Defaults to
             ``datetime.now(timezone.utc)``. Tests pass a fixed value.
     """
@@ -426,7 +453,9 @@ async def verify_import_consent(
     pkg_ok, pkg_reason = await _verify_package_signed_by_source(package)
 
     # Check 2 — grant signed by its declared owner DID.
-    grant_ok, grant_reason = _verify_owner_signatures(grant)
+    grant_ok, grant_reason = _verify_owner_signatures(
+        grant, did_web_resolver=did_web_resolver,
+    )
 
     # Check 3 — grant's source_did matches the package's DID.
     pkg_did = getattr(package, "did", None)

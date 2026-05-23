@@ -370,6 +370,68 @@ async def test_malformed_expires_at_treated_as_expired(
 
 
 @pytest.mark.asyncio
+async def test_did_web_owner_requires_resolver_and_verifies_with_one(
+    package_signed_ok, source, host,
+):
+    """Hybrid owners on ``did:web:`` need a resolver passed through to
+    :func:`verify_did_binding`. Without one, the binding helper
+    refuses fail-closed → grant_signed_by_owner=False. With a
+    matching resolver, the grant verifies. Regression for codex #1273
+    R1 [P2].
+    """
+    from kestrel_sovereign.identity.hybrid_keypair import (
+        generate_hybrid_keypair,
+        sign_hybrid,
+    )
+    from dataclasses import replace as _dc_replace
+
+    hybrid = generate_hybrid_keypair()
+    owner_did = "did:web:example.com:owner-1"
+    owner_vms = build_verification_methods(owner_did, hybrid.public_keys())
+    classical_kid = owner_vms[0]["id"].rsplit("#", 1)[-1]
+    pq_kid = owner_vms[1]["id"].rsplit("#", 1)[-1]
+
+    grant = DataAccessGrant(
+        owner_did=owner_did,
+        source_did=source["did"], host_did=host["did"],
+        issued_at="2026-05-23T00:00:00+00:00",
+        owner_verification_methods=owner_vms,
+    )
+    # Sign hybrid: emit BOTH Ed25519 + ML-DSA-65 entries over the
+    # canonical payload, so any one of them satisfies the "at least
+    # one signature verifies" rule even before the resolver lands.
+    payload = signable_payload(grant)
+    grant = _dc_replace(
+        grant,
+        owner_signatures=sign_hybrid(
+            payload, hybrid,
+            classical_kid=classical_kid, pq_kid=pq_kid,
+        ),
+    )
+    grant = finalize(grant)
+
+    package = _StubPackage(did=source["did"])
+
+    # Without a resolver: grant_signed_by_owner=False (refused fail-closed).
+    without = await verify_import_consent(package, grant, host_did=host["did"])
+    assert without.ok is False
+    assert without.grant_signed_by_owner is False
+
+    # With a resolver that returns the matching DID document: ok.
+    def resolver(did: str):
+        assert did == owner_did
+        return {
+            "id": owner_did,
+            "verificationMethod": owner_vms,
+        }
+    with_resolver = await verify_import_consent(
+        package, grant, host_did=host["did"], did_web_resolver=resolver,
+    )
+    assert with_resolver.ok is True, with_resolver.reason
+    assert with_resolver.grant_signed_by_owner is True
+
+
+@pytest.mark.asyncio
 async def test_owner_did_not_bound_to_vms_rejected(
     package_signed_ok, source, host,
 ):
