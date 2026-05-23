@@ -94,6 +94,151 @@ _TALON_RESERVED_LABELS = frozenset({
 })
 
 
+# Discriminated reason codes for ``talon_file_and_claim`` failures.
+# Each one names a distinct fix path the agent (or the operator) can act
+# on. They're public values, not just internal hints — every failed
+# ToolResult carries one in ``data['reason_code']`` AND in the top-level
+# error string, so the model's narration can surface "MISSING_GH_AUTH —
+# please authenticate" instead of the historical catch-all "may have
+# been denied at the approval gate, gh is not authenticated, or it
+# failed for a non-label reason" (#1383).
+TALON_FAC_REASONS = {
+    "MISSING_COMPUTER_USE",  # ComputerUseFeature not enabled
+    "GATE_DENIED",           # approval gate refused the shell
+    "MISSING_GH_AUTH",       # `gh` not authenticated / no token
+    "GH_NOT_INSTALLED",      # the `gh` binary itself is absent
+    "REPO_NOT_FOUND",        # repo not visible to the auth'd user
+    "LABEL_REJECTED",        # label unknown/invalid even after retry
+    "SHELL_TIMEOUT",         # shell call hit the 120s wall
+    "URL_PARSE_FAILED",      # gh exited 0 but URL regex missed
+    "DISPATCH_FAILED",       # talon_claim never reported dispatched
+    "UNKNOWN_FAILURE",       # fallthrough
+}
+
+
+def _gh_failure_reason(
+    shell_res,
+    stdout: str,
+    stderr: str,
+    *,
+    succeeded: bool,
+    parsed_url: bool,
+) -> tuple[str, str]:
+    """Classify a ``gh issue create`` failure into a stable reason code.
+
+    The shell call goes through ``ComputerUseFeature.shell``, which
+    returns:
+      * ``ok``      — rc=0  (stdout/stderr on ``data``)
+      * ``partial`` — ran but rc!=0 (caveat in ``error``; ``data`` has rc/timeout)
+      * ``failed``  — gate denied / backend exception / empty argv
+
+    We sniff stderr/stdout/error for the patterns the actual ``gh`` CLI
+    emits (and the gate's ``denied_reason``) and pick the most specific
+    code. The returned ``(code, hint)`` tuple is rendered into the
+    ``ToolResult.failed`` error string so the agent's narration carries
+    something actionable.
+    """
+    error_blob = (shell_res.error or "") if shell_res else ""
+    full = f"{stderr}\n{stdout}\n{error_blob}".lower()
+    timed_out = bool(
+        getattr(shell_res, "data", None)
+        and shell_res.data.get("timed_out")
+    )
+
+    if timed_out:
+        return (
+            "SHELL_TIMEOUT",
+            "`gh issue create` exceeded the 120s wall. Retry, or check "
+            "network reachability to api.github.com.",
+        )
+
+    # Stderr/stdout patterns are checked BEFORE shell-status branches so
+    # that a non-zero exit (partial) with "Bad credentials" in stderr is
+    # classified as MISSING_GH_AUTH instead of falling through to a
+    # generic UNKNOWN_FAILURE. The patterns are ordered most-specific
+    # first.
+    if "gh: command not found" in full or (
+        "no such file" in full and "gh" in full
+    ):
+        return (
+            "GH_NOT_INSTALLED",
+            "the `gh` CLI is not on PATH for this agent. Install gh in "
+            "the host environment.",
+        )
+
+    if (
+        "bad credentials" in full
+        or "gh auth login" in full
+        or "no github token" in full
+        or "authentication required" in full
+        or "http 401" in full
+        or " 401" in full
+        or "401 unauthorized" in full
+    ):
+        return (
+            "MISSING_GH_AUTH",
+            "`gh` is not authenticated. Set GH_TOKEN / GITHUB_TOKEN, or "
+            "run `gh auth login` in the host environment.",
+        )
+
+    if (
+        "could not resolve to a repository" in full
+        or ("not found" in full and "repository" in full)
+        or "http 404" in full
+        or "404 not found" in full
+    ):
+        return (
+            "REPO_NOT_FOUND",
+            "GitHub returned 404 / not-found for the repo. Verify the "
+            "owner/name and that the auth'd user has access.",
+        )
+
+    if "label" in full and (
+        "not found" in full
+        or "could not add" in full
+        or "not a valid" in full
+        or "no label" in full
+    ):
+        return (
+            "LABEL_REJECTED",
+            "gh rejected one of the labels even after the no-label retry. "
+            "Check that the repo accepts the labels you passed.",
+        )
+
+    if shell_res is not None and str(shell_res.status) in (
+        "error", "failed", "ToolResultStatus.ERROR",
+    ):
+        # Backend exception, empty argv, or gate denial — surface via
+        # ``shell_res.error`` when ``data`` was empty. (ToolResult.failed
+        # maps to status "error"; we accept "failed" too so test fakes
+        # that pass the historical string still classify correctly.)
+        elow = error_blob.lower()
+        if "denied" in elow or "approval" in elow or "policy" in elow:
+            return (
+                "GATE_DENIED",
+                "the approval-gate denied the shell. Allowlist the "
+                "`gh issue create` pattern or escalate to the operator.",
+            )
+        if "empty command" in elow:
+            return (
+                "GH_NOT_INSTALLED",
+                "shell argv was empty — likely shlex parse failure.",
+            )
+
+    if succeeded and not parsed_url:
+        return (
+            "URL_PARSE_FAILED",
+            "`gh issue create` exited 0 but stdout did not contain a "
+            "parseable issue URL. The repo may use an unusual gh config.",
+        )
+
+    return (
+        "UNKNOWN_FAILURE",
+        "shell ran but did not produce a parseable issue URL. Inspect "
+        "stderr_tail / stdout_tail / shell_error in the structured data.",
+    )
+
+
 def _path_contains(parent: Path, child: Path) -> bool:
     """True iff ``child`` is ``parent`` or under it. Resolves both."""
     try:
@@ -425,11 +570,24 @@ class TalonCoordinatorFeature(Feature):
             else None
         )
         if cu is None:
+            await self._log_fac_outcome(
+                decision="missing_computer_use",
+                reason_code="MISSING_COMPUTER_USE",
+                repo=repo_resolved,
+                filed=False,
+                dispatched=False,
+            )
             return ToolResult.failed(
-                "ComputerUseFeature unavailable — refusing to file the "
+                "talon_file_and_claim: MISSING_COMPUTER_USE — "
+                "ComputerUseFeature unavailable, refusing to file the "
                 "issue via an unaudited shell. Enable computer_use so the "
                 "scoped auto-approve policy and audit row apply.",
-                data={"filed": False, "dispatched": False},
+                data={
+                    "filed": False,
+                    "dispatched": False,
+                    "reason_code": "MISSING_COMPUTER_USE",
+                    "repo": repo_resolved,
+                },
             )
 
         # Drop Talon's reserved lifecycle labels (esp. ``agent-claimed``).
@@ -501,16 +659,39 @@ class TalonCoordinatorFeature(Feature):
                 )
 
         if not succeeded or m is None:
+            reason_code, hint = _gh_failure_reason(
+                shell_res, stdout, stderr,
+                succeeded=succeeded, parsed_url=m is not None,
+            )
+            shell_data = shell_res.data or {}
+            shell_returncode = shell_data.get("returncode")
+            shell_timed_out = bool(shell_data.get("timed_out"))
+            await self._log_fac_outcome(
+                decision="filing_failed",
+                reason_code=reason_code,
+                repo=repo_resolved,
+                filed=False,
+                dispatched=False,
+                extra={
+                    "shell_status": str(shell_res.status),
+                    "shell_returncode": shell_returncode,
+                    "shell_timed_out": shell_timed_out,
+                    "label_retry": label_retry,
+                    "dropped_unknown_labels": dropped_unknown_labels,
+                },
+            )
             return ToolResult.failed(
-                "gh issue create did not return a parseable issue URL "
-                f"(status={shell_res.status}). The command may have been "
-                "denied at the approval gate, `gh` is not authenticated, "
-                "or it failed for a non-label reason.",
+                f"talon_file_and_claim: {reason_code} — {hint}",
                 data={
                     "filed": False,
                     "dispatched": False,
+                    "reason_code": reason_code,
+                    "remediation": hint,
+                    "repo": repo_resolved,
                     "shell_status": str(shell_res.status),
                     "shell_error": shell_res.error,
+                    "shell_returncode": shell_returncode,
+                    "shell_timed_out": shell_timed_out,
                     "stderr_tail": stderr[-300:],
                     "stdout_tail": stdout[-300:],
                     "label_retry": label_retry,
@@ -562,6 +743,15 @@ class TalonCoordinatorFeature(Feature):
             )
         stripped_note = f" ({'; '.join(notes)})" if notes else ""
         if dispatched:
+            await self._log_fac_outcome(
+                decision="filed_and_dispatched",
+                reason_code="OK",
+                repo=repo_resolved,
+                filed=True,
+                dispatched=True,
+                issue_number=issue_number,
+                job_id=job_id,
+            )
             return ToolResult.ok(
                 confirmation=(
                     f"Filed {repo_resolved}#{issue_number} ({issue_url}) "
@@ -570,14 +760,99 @@ class TalonCoordinatorFeature(Feature):
                 ),
                 data=result_data,
             )
+        # Issue filed but dispatch didn't take — surface as PARTIAL with
+        # a discriminated reason code so the operator can tell "issue is
+        # live, please claim by hand" from "everything broke." This is
+        # the asymmetric-outcome case the partial-only-when-both-layers-
+        # attempted rule was written for.
+        result_data["reason_code"] = "DISPATCH_FAILED"
+        result_data["remediation"] = (
+            "the GitHub issue exists; call talon_claim(repo, issue) "
+            "manually or investigate why the dispatch path returned "
+            "dispatched=False."
+        )
+        await self._log_fac_outcome(
+            decision="filed_dispatch_failed",
+            reason_code="DISPATCH_FAILED",
+            repo=repo_resolved,
+            filed=True,
+            dispatched=False,
+            issue_number=issue_number,
+        )
         return ToolResult.partial(
             confirmation=(
                 f"Filed {repo_resolved}#{issue_number} ({issue_url}) but "
                 f"the Talon dispatch did not take."
             ),
-            error=claim.error or "talon_claim did not report dispatched",
+            error=(
+                "talon_file_and_claim: DISPATCH_FAILED — "
+                + (claim.error or "talon_claim did not report dispatched")
+            ),
             data=result_data,
         )
+
+    # ------------------------------------------------------------------
+    # Internal: outcome audit row
+    # ------------------------------------------------------------------
+
+    async def _log_fac_outcome(
+        self,
+        *,
+        decision: str,
+        reason_code: str,
+        repo: str,
+        filed: bool,
+        dispatched: bool,
+        issue_number: Optional[int] = None,
+        job_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Append an after-execution outcome row to ``security_audit_log``.
+
+        The gate's pre-execution row records only the DECISION
+        (auto_mode_allowed). #1383 demands that the OUTCOME of the tool
+        run be recorded too — without that, an operator scanning the
+        audit log can see "allowed" but not "what actually happened."
+
+        Writes are best-effort: a missing SecurityFeature must not
+        crash the loop-closing primitive. We log warnings instead.
+        """
+        security = self._get_security_feature()
+        store = getattr(security, "permission_store", None) if security else None
+        if store is None or not hasattr(store, "log_decision"):
+            logger.debug(
+                "talon_file_and_claim outcome not audited "
+                f"(SecurityFeature/permission_store unavailable): "
+                f"decision={decision} reason={reason_code} repo={repo}"
+            )
+            return
+
+        summary: Dict[str, Any] = {
+            "reason_code": reason_code,
+            "repo": repo,
+            "filed": filed,
+            "dispatched": dispatched,
+        }
+        if issue_number is not None:
+            summary["issue_number"] = issue_number
+        if job_id is not None:
+            summary["job_id"] = job_id
+        if extra:
+            summary.update(extra)
+        try:
+            await store.log_decision(
+                feature_name="talon_feature",
+                tool_name="talon_file_and_claim.outcome",
+                action="tool_outcome",
+                decision=decision,
+                user_choice=None,
+                args_summary=json.dumps(summary, default=str)[:1000],
+            )
+        except Exception as e:  # noqa: BLE001 — never break the caller
+            logger.warning(
+                f"Failed to write talon_file_and_claim outcome audit "
+                f"row (reason_code={reason_code}): {e}"
+            )
 
     @tool(
         name="talon_get_config",

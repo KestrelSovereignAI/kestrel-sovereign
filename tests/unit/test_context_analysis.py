@@ -331,6 +331,65 @@ class TestContextStatsResetOnCompression:
         assert stats.get_analysis()["total_tool_calls"] == 0
 
 
+class TestContextFeatureLateBoundContextManager:
+    """#1382 — ``ContextFeature.initialize()`` used to snapshot
+    ``agent.context_manager`` into ``self.context_manager``, but the
+    agent constructs its ``ContextManager`` AFTER registering features
+    (kestrel_agent.py:819 vs 1034). The snapshot was always ``None``,
+    so every @tool returned "Context manager not available" — including
+    on multi-agent satellites where Nellie hit the bug.
+
+    Fix: ``context_manager`` is now a property that reads
+    ``self.agent.context_manager`` at call time. These tests pin that.
+    """
+
+    @pytest.mark.asyncio
+    async def test_status_resolves_after_late_attach(self):
+        """initialize() runs FIRST with no context_manager attached, the
+        agent attaches one later, and the tool then succeeds — the
+        registration-vs-init race that #1382 surfaced."""
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.features.context.feature import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        agent = SimpleNamespace()  # No context_manager attribute yet.
+        feature = ContextFeature(agent)
+        await feature.initialize()
+        assert feature.context_manager is None
+
+        # Agent attaches its real ContextManager — same ordering the
+        # production init has in kestrel_agent.py:1034.
+        cm = AsyncMock()
+        cm.get_status = AsyncMock(return_value={
+            "utilization_percent": 12,
+            "message_count": 4,
+        })
+        agent.context_manager = cm
+        agent.context_stats = None
+
+        result = await feature.context_status()
+        assert result.status is ToolResultStatus.OK
+        assert result.data["utilization_percent"] == 12
+
+    @pytest.mark.asyncio
+    async def test_status_reports_missing_when_genuinely_unattached(self):
+        """If the agent really never attaches a context_manager, the
+        tool surfaces a precise error (not the historical opaque
+        'Context manager not available')."""
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.features.context.feature import ContextFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        feature = ContextFeature(SimpleNamespace())
+        await feature.initialize()
+
+        result = await feature.context_status()
+        assert result.status is ToolResultStatus.ERROR
+        assert "context_manager is not attached" in (result.error or "")
+
+
 class TestDispatchToolCallRecording:
     """Test that _dispatch_tool_call records into context_stats."""
 
