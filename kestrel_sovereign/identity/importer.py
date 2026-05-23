@@ -16,8 +16,13 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, Iterable, List, Optional, TYPE_CHECKING
 
+from .access_grant import (
+    DataAccessGrant,
+    REJECT_HOST_POLICY,
+    verify_import_consent,
+)
 from .identity_package import (
     AgentIdentityPackage,
     MigrationRecord,
@@ -99,6 +104,12 @@ class IdentityImporter:
         verify_constitution: bool = True,
         merge_mode: str = "replace",  # replace, merge, skip_existing
         allow_unsigned: bool = False,
+        grant: Optional[DataAccessGrant] = None,
+        host_policy: Optional[
+            Callable[[DataAccessGrant, str], bool]
+        ] = None,
+        grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
+        revoked_grant_ids: Optional[Iterable[str]] = None,
     ) -> ImportResult:
         """
         Import agent identity from a package.
@@ -114,6 +125,42 @@ class IdentityImporter:
             allow_unsigned: If True, allow importing unsigned packages.
                 Defaults to False for security. Set to True only for
                 development/testing use cases.
+            grant: Optional owner-signed :class:`DataAccessGrant`
+                authorizing this import. When provided, consent is
+                verified BEFORE signature verification — a valid
+                package signature without owner consent is still
+                unauthorized. Default ``None`` preserves the pre-#1273
+                behavior (no consent gate).
+            host_policy: Optional host-side filter callable evaluated
+                AFTER consent verification returns ``ok=True``. The
+                callable receives ``(grant, canonical_grant_id)`` —
+                policies that allowlist or audit by id MUST use
+                ``canonical_grant_id`` (the verifier-recomputed,
+                trustworthy value), not the ``grant.grant_id`` field
+                on the dataclass (which is unsigned and spoofable).
+                If the callable returns ``False`` the import is
+                refused with a distinct ``host_policy_rejected``
+                reason. Never a substitute for the grant — runs only
+                when the grant already verifies. Ignored when
+                ``grant`` is ``None``.
+            grant_did_web_resolver: Optional ``did:web:`` resolver
+                forwarded to :func:`verify_import_consent` so hybrid
+                owners on ``did:web:`` DIDs can have their grant
+                signatures verified. The binding helper refuses-by-
+                default for ``did:web:`` without a resolver; pass one
+                here when accepting hybrid-owner grants. ``did:pkh:``
+                / ``did:key:`` owners need no resolver. Ignored when
+                ``grant`` is ``None``.
+            revoked_grant_ids: Optional iterable of canonical grant
+                ids (as returned by
+                :func:`access_grant.compute_grant_id`) that are
+                currently revoked. The recomputed canonical id of
+                ``grant`` is compared against this set; matches are
+                rejected with ``grant_expired_or_revoked``. Sourced
+                from a trusted revocation registry — never from the
+                grant payload itself (an in-grant flag would be
+                unsigned and spoofable). Ignored when ``grant`` is
+                ``None``.
 
         Returns:
             ImportResult with success status and statistics
@@ -138,6 +185,39 @@ class IdentityImporter:
         if package.content_hash:
             if not package.verify_content_hash():
                 self.errors.append("Content hash verification failed")
+                return self._build_result(False, agent_id)
+
+        # Consent gate (#1273) — when a grant is provided, owner
+        # authorization is checked BEFORE signature verification. A
+        # valid signature without owner consent is still unauthorized.
+        # An optional ``host_policy`` callable runs only AFTER consent
+        # verifies; it's a filter on top of a valid grant, never a
+        # substitute for one.
+        if grant is not None:
+            if not self.target_agent_id:
+                self.errors.append(
+                    "consent grant requires target_agent_id (host_did) "
+                    "to be set on the IdentityImporter"
+                )
+                return self._build_result(False, agent_id)
+            consent = await verify_import_consent(
+                package, grant, host_did=self.target_agent_id,
+                revoked_grant_ids=revoked_grant_ids,
+                did_web_resolver=grant_did_web_resolver,
+            )
+            if not consent.ok:
+                self.errors.append(
+                    f"consent verification failed: {consent.reason}"
+                )
+                return self._build_result(False, agent_id)
+            if host_policy is not None and not host_policy(
+                grant, consent.canonical_grant_id
+            ):
+                self.errors.append(
+                    f"{REJECT_HOST_POLICY}: host policy rejected an "
+                    f"otherwise-valid grant "
+                    f"{consent.canonical_grant_id[:16]}"
+                )
                 return self._build_result(False, agent_id)
 
         if verify_signature:
