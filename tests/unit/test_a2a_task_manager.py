@@ -367,6 +367,210 @@ class TestTaskManager:
         assert len(session_tasks) == 2
 
 
+class TestOnTaskSubmittedCallback:
+    """The ``on_task_submitted`` callback fires inside ``create_task``
+    AFTER the task is persisted and BEFORE the SSE notify path. This is
+    the missing piece behind every "I sent it, did you get it?" thread
+    (#645 / Emma↔Meridian): without the callback, a peer-submitted task
+    sat SUBMITTED in the store with no autonomous trigger. The agent's
+    handler (KestrelAgent._on_task_submitted) bridges the callback into
+    the signal/dispatcher system so the cognition loop wakes."""
+
+    @pytest.mark.asyncio
+    async def test_callback_fires_on_create_task(self, db_path):
+        """The callback receives the task as its single argument."""
+        from kestrel_sovereign.a2a.task_manager import create_task_manager
+
+        received = []
+        manager = await create_task_manager(db_path)
+        manager._on_task_submitted = lambda t: received.append(t)
+        track_manager(manager)
+
+        params = TaskSendParams(
+            message=Message(role="user", parts=[TextPart(text="hello")]),
+            metadata={"sender": "peer-agent"},
+        )
+        task = await manager.create_task(params, agent_name="test-agent")
+
+        assert len(received) == 1, "callback must fire exactly once"
+        assert received[0].id == task.id
+        assert received[0].status.state == TaskState.SUBMITTED, (
+            "callback fires while task is still SUBMITTED, before any "
+            "status transition"
+        )
+
+    @pytest.mark.asyncio
+    async def test_callback_exception_does_not_break_create_task(self, db_path):
+        """A failing on_task_submitted callback must NOT roll back the
+        task creation. The task is the source of truth; the callback
+        is best-effort (matches `_on_task_complete` posture)."""
+        from kestrel_sovereign.a2a.task_manager import create_task_manager
+
+        def boom(_t):
+            raise RuntimeError("dispatcher down")
+
+        manager = await create_task_manager(db_path)
+        manager._on_task_submitted = boom
+        track_manager(manager)
+
+        params = TaskSendParams(
+            message=Message(role="user", parts=[TextPart(text="hi")]),
+        )
+        # MUST NOT raise — task creation completes even when the
+        # signal-emit hook fails.
+        task = await manager.create_task(params, agent_name="test-agent")
+        assert task is not None
+        # And the task IS persisted.
+        loaded = await manager.task_store.get(task.id)
+        assert loaded is not None
+
+    @pytest.mark.asyncio
+    async def test_no_callback_set_is_fine(self, db_path):
+        """Backward-compat: when no callback is wired (legacy code, test
+        fixtures), create_task behaves exactly as before."""
+        from kestrel_sovereign.a2a.task_manager import create_task_manager
+
+        manager = await create_task_manager(db_path)
+        assert manager._on_task_submitted is None
+        track_manager(manager)
+
+        params = TaskSendParams(
+            message=Message(role="user", parts=[TextPart(text="hi")]),
+        )
+        task = await manager.create_task(params, agent_name="test-agent")
+        assert task is not None
+
+
+class TestA2ATaskSubmittedSignalSource:
+    """The signal-source registration must declare the right semantics
+    so the dispatcher routes correctly. Mirrors the assertions on the
+    `a2a.task_complete` registration."""
+
+    def test_registration_shape(self):
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            SOURCE_NAME,
+            build_a2a_task_submitted_registration,
+        )
+        from kestrel_sdk.signals import SignalMode, Trust
+
+        reg = build_a2a_task_submitted_registration()
+        assert reg.name == SOURCE_NAME == "a2a.task_submitted"
+        assert reg.default_mode == SignalMode.COGNITION
+        assert reg.trust == Trust.TRUSTED
+        assert reg.allow_self_loops is False, (
+            "A→B→A would loop without bound; cycle detection requires "
+            "self-loop block at the source registration"
+        )
+
+    def test_signal_builder_payload(self):
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            SOURCE_NAME,
+            build_signal_for_submitted_task,
+        )
+
+        # Duck-type a Task (the helper doesn't require a real pydantic
+        # object, matching `build_signal_for_completed_task`).
+        class _FakeTask:
+            id = "task-123"
+            sessionId = "sess-abc"
+            metadata = {"skill": "workflow.assign", "sender": "emma"}
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="meridian-did", sender="emma",
+        )
+        assert sig.source == SOURCE_NAME
+        assert sig.target_agent == "meridian-did"
+        assert sig.payload["task_id"] == "task-123"
+        assert sig.payload["sender"] == "emma"
+        assert sig.payload["skill_id"] == "workflow.assign"
+        # Dedupe by task_id so idempotency retries collapse to one wake.
+        assert sig.dedupe_key == "task-123"
+
+    def test_schema_rejects_missing_keys(self):
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_a2a_task_submitted_registration,
+        )
+        reg = build_a2a_task_submitted_registration()
+        # Missing all required keys.
+        with pytest.raises(ValueError, match="missing required key"):
+            reg.schema({})
+
+    def test_signal_rehydrates_causation_chain_from_metadata(self):
+        """Codex P1 on PR #1366: without rehydration, A→B→A task-
+        submission ping-pong bypasses cycle detection — every inbound
+        task starts fresh at depth 1. Inbound signal MUST deserialize
+        ``task.metadata["causation_chain"]`` the way the complete-
+        direction signal does (`a2a.py:build_signal_for_completed_task`).
+        """
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        # Construct metadata in the same serialized shape
+        # ``serialize_chain_for_metadata`` produces (list of dicts).
+        causation_chain = [
+            {
+                "agent_id": "did:agent:emma",
+                "source": "channel.message",
+                "signal_id": "sig-1",
+                "turn_id": "turn-1",
+                "depth": 1,
+                "emitted_at": "2026-05-23T10:00:00+00:00",
+            },
+            {
+                "agent_id": "did:agent:meridian",
+                "source": "a2a.task_submitted",
+                "signal_id": "sig-2",
+                "turn_id": "turn-2",
+                "depth": 2,
+                "emitted_at": "2026-05-23T10:00:05+00:00",
+            },
+        ]
+
+        class _FakeTask:
+            id = "task-789"
+            sessionId = "sess-abc"
+            metadata = {
+                "skill": "workflow.assign",
+                "sender": "emma",
+                "causation_chain": causation_chain,
+            }
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="emma-did", sender="meridian",
+        )
+        # Chain must be present and have both upstream frames so the
+        # dispatcher's cycle detector sees the prior emma→meridian
+        # hop and rejects emma→meridian→emma at depth 2.
+        assert len(sig.causation_chain) == 2, (
+            "rehydrated causation chain must carry every upstream "
+            f"frame; got: {sig.causation_chain!r}"
+        )
+        assert sig.causation_chain[0].agent_id == "did:agent:emma"
+        assert sig.causation_chain[1].agent_id == "did:agent:meridian"
+
+    def test_signal_empty_chain_when_metadata_missing(self):
+        """When the upstream task was created without dispatcher
+        context (e.g. local self-spawn, or pre-causation-chain code),
+        the signal carries an empty chain — not a crash."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        class _FakeTask:
+            id = "task-noscope"
+            sessionId = "sess"
+            metadata = {}  # no causation_chain key
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="x-did", sender="",
+        )
+        assert sig.causation_chain == [], (
+            "empty metadata must yield an empty chain (not None, not "
+            "raise) so dispatcher signal validation passes"
+        )
+
+
 # =============================================================================
 # TaskWorker Tests
 # =============================================================================

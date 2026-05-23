@@ -987,6 +987,129 @@ async def list_tasks(
         raise HTTPException(status_code=500, detail="Error listing tasks.")
 
 
+@router.post("/tasks/send")
+@limiter.limit("120/minute")
+async def send_task(request: Request):
+    """
+    Receive an A2A task creation request from another agent.
+
+    Inbound shape (matches A2A ``TaskSendParams``):
+
+        {
+          "id": "<uuid>",                # caller-assigned task id
+          "sessionId": "<uuid>",
+          "message": {
+            "role": "user",
+            "parts": [{"type":"text", "text": "..."}]
+          },
+          "metadata": {                  # optional
+            "sender": "<agent name or did>",
+            "skill": "<workflow.* skill id>",
+            ...
+          }
+        }
+
+    The endpoint calls ``task_manager.create_task`` which persists the
+    task AND fires the ``on_task_submitted`` callback. That callback
+    builds a ``a2a.task_submitted`` Signal and enqueues it via the
+    dispatcher so this agent wakes up and acts on the new task. Without
+    this endpoint, agents had no wire-level way to submit a task —
+    only the local agent's own code could call create_task — which made
+    inter-agent A2A submission impossible to surface from a tool.
+
+    TODO (v2, separate epic): cryptographic sender verification. Today
+    we accept ``metadata["sender"]`` as a plain string claim — v1 trust
+    model is same-host shared-API-key boundary, where all callers are
+    inside the kestrel multi_agent host. For federation / cross-
+    environment agents (different orgs, different trust tiers), this
+    endpoint needs:
+      * Signed envelope: ``{sender_did, signature, body, timestamp}``
+        validated against the sender's DID public key.
+      * Reuse the SLH-DSA infrastructure from #921 (quantum hardening
+        already provisioned the keypair format + verification path).
+      * Identity-injection middleware: after verification, the cognition
+        turn fires with a system-context note ("Message from agent X,
+        verified DID Y") so the LLM applies the right governance tier.
+    See follow-up epic for the full peer-attribution layer.
+    """
+    agent = get_agent(request)
+    body = await _parse_json_body(request)
+
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(
+            status_code=503,
+            detail="TaskManager not available — agent cannot accept A2A tasks",
+        )
+
+    from kestrel_sovereign.a2a.types import (
+        Message,
+        TextPart,
+        TaskSendParams,
+    )
+    try:
+        # Parse body into TaskSendParams. Sender-side already validated
+        # the shape, but we re-validate here because this is the only
+        # untrusted-input boundary.
+        message_data = body.get("message") or {}
+        parts_data = message_data.get("parts") or []
+        parts = []
+        for p in parts_data:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(TextPart(text=str(p.get("text", ""))))
+        if not parts:
+            raise HTTPException(
+                status_code=400,
+                detail="task message must contain at least one text part",
+            )
+        message = Message(
+            role=str(message_data.get("role", "user")),
+            parts=parts,
+        )
+        params = TaskSendParams(
+            id=str(body.get("id") or ""),
+            sessionId=str(body.get("sessionId") or ""),
+            message=message,
+            metadata=body.get("metadata") or {},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid TaskSendParams: {e}",
+        )
+
+    if not params.id or not params.sessionId:
+        raise HTTPException(
+            status_code=400,
+            detail="TaskSendParams.id and TaskSendParams.sessionId are required",
+        )
+
+    # ``agent_name`` here is the local (recipient) agent's identifier —
+    # the same value `create_task` logs as ``agent_name`` for the
+    # observability row. Use the agent's DID for stable identity.
+    local_name = (
+        getattr(agent, "did", None)
+        or getattr(agent, "_agent_name", None)
+        or "unknown"
+    )
+
+    try:
+        task = await agent.task_manager.create_task(
+            params=params, agent_name=local_name,
+        )
+    except Exception as e:
+        logger.error(
+            "Failed to create A2A task from peer submission: %s",
+            e, exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to create task")
+
+    # Return the canonical A2A Task envelope (model_dump produces the
+    # standard JSON-RPC-friendly shape).
+    return task.model_dump()
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(request: Request, task_id: str):
     """

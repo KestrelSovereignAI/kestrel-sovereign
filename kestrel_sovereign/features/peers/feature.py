@@ -264,7 +264,165 @@ class PeersFeature(Feature):
         )
 
     # ------------------------------------------------------------------
-    # Agent Mesh Protocol
+    # A2A: send a task to a peer agent (with inbound-wake semantics).
+    # This is the supersedes-mesh direction (#645): peer-addressed
+    # tasks land in the recipient's task_store AND trigger an
+    # ``a2a.task_submitted`` signal that wakes their cognition loop,
+    # so the recipient autonomously acts on the task rather than
+    # waiting for a human-driven chat turn to notice it.
+    # ------------------------------------------------------------------
+
+    @tool(
+        name="send_a2a_task",
+        description=(
+            "Create an A2A task on a peer agent. Unlike send_mesh_message "
+            "(which stores fire-and-forget in the recipient's inbox and "
+            "doesn't wake them), this fires the a2a.task_submitted signal "
+            "on the recipient's dispatcher so they actually pick up and "
+            "process the task. Returns the task_id so the caller can "
+            "later poll status via get_a2a_task."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a send",
+    )
+    async def send_a2a_task(
+        self,
+        recipient: str,
+        message: str,
+        skill_id: str = "",
+        session_id: str = "",
+    ) -> ToolResult:
+        """
+        Submit an A2A task to a peer agent and wake their cognition loop.
+
+        Args:
+            recipient: Peer agent name (e.g. "Meridian").
+            message: The task description / prompt for the recipient.
+            skill_id: Optional A2A skill id from the receiver's
+                AgentCard (e.g. ``"workflow.assign"``). Defaults to
+                empty — the receiver routes via their default handler.
+            session_id: Optional A2A session id; auto-generated when
+                empty so multiple sends are independent sessions.
+        """
+        from uuid import uuid4
+
+        if not self._host_url:
+            return ToolResult.failed(
+                "Not running in a multi_agent environment — no host to proxy through",
+                data={"sent": False, "recipient": recipient},
+            )
+
+        if recipient.lower() == self._own_name.lower():
+            return ToolResult.failed(
+                "Cannot send an A2A task to yourself",
+                data={"sent": False, "recipient": recipient},
+            )
+
+        task_id = uuid4().hex
+        sess_id = session_id or uuid4().hex
+        url = f"{self._host_url}/api/agents/{recipient}/api/agent/tasks/send"
+        outbound_metadata: Dict[str, Any] = {
+            "sender": self._own_name,
+        }
+        if skill_id:
+            outbound_metadata["skill"] = skill_id
+        # Attach the in-flight signal-driven turn's causation chain so
+        # the receiving agent's a2a.task_submitted signal carries the
+        # lineage. Without this, A→B→A ping-pong loops bypass the
+        # dispatcher's cycle detection (every inbound task starts
+        # fresh at depth 1). Codex P1 on PR #1366. Pulled via the
+        # agent's ``_provide_causation_chain`` if available — same
+        # accessor TaskManager.create_task uses for outbound chain
+        # attachment.
+        chain_provider = getattr(self.agent, "_provide_causation_chain", None)
+        if callable(chain_provider):
+            try:
+                chain = chain_provider()
+            except Exception as e:
+                logger.debug(
+                    "Failed to read causation chain for outbound A2A task: %s",
+                    e,
+                )
+                chain = None
+            if chain:
+                outbound_metadata["causation_chain"] = chain
+        payload = {
+            "id": task_id,
+            "sessionId": sess_id,
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": message}],
+            },
+            "metadata": outbound_metadata,
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    url,
+                    json=payload,
+                    headers=self._build_headers(),
+                    timeout=httpx.Timeout(
+                        connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_READ_TIMEOUT,
+                        write=PEER_READ_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT,
+                    ),
+                )
+        except httpx.ConnectError:
+            return ToolResult.failed(
+                f"Could not reach agent '{recipient}'",
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+        except httpx.TimeoutException:
+            return ToolResult.failed(
+                f"Agent '{recipient}' timed out",
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+        except Exception as e:
+            logger.error(f"A2A send to '{recipient}' failed: {e}")
+            return ToolResult.failed(
+                str(e),
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+
+        if resp.status_code == 404:
+            return ToolResult.failed(
+                f"Agent '{recipient}' not found or A2A endpoint missing",
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+        if resp.status_code == 503:
+            return ToolResult.failed(
+                f"Agent '{recipient}' is offline or TaskManager unavailable",
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+
+        try:
+            resp.raise_for_status()
+            task_data = resp.json()
+        except Exception as e:
+            return ToolResult.failed(
+                str(e),
+                data={"sent": False, "recipient": recipient, "task_id": task_id},
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"A2A task {task_id} submitted to {recipient} "
+                f"(state={task_data.get('status',{}).get('state','?')}). "
+                f"Recipient's dispatcher has been signaled."
+            ),
+            data={
+                "sent": True,
+                "task_id": task_data.get("id", task_id),
+                "session_id": task_data.get("sessionId", sess_id),
+                "state": task_data.get("status", {}).get("state"),
+                "recipient": recipient,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Agent Mesh Protocol (legacy; superseded by send_a2a_task per #645)
     # ------------------------------------------------------------------
 
     @tool(
