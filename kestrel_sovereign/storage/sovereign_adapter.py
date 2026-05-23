@@ -15,7 +15,9 @@ import logging
 import hashlib
 import hmac
 import os
-from typing import Dict, List, Optional, Any, Tuple
+from typing import (
+    TYPE_CHECKING, Callable, Dict, Iterable, List, Optional, Any, Tuple,
+)
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, UTC
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -23,6 +25,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from kestrel_sovereign.filecoin_adapter import FilecoinAdapter, StorageTier, StorageResult
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
+
+# Lazy-imported below inside import_agent — identity/__init__ pulls in
+# the exporter chain which transitively loads features.bootstrap, and
+# that chain imports back into storage. Type-only references can use
+# the TYPE_CHECKING guard without triggering the circular load.
+if TYPE_CHECKING:
+    from kestrel_sovereign.identity.access_grant import DataAccessGrant
 
 # Constants
 SHARD_SIZE_LIMIT = 5 * 1024 * 1024  # 5MB per shard
@@ -460,6 +469,13 @@ class SovereignStorageAdapter:
         verify_continuity: bool = True,
         continuity_threshold: float = 0.7,
         target_db_path: Optional[str] = None,
+        grant: Optional["DataAccessGrant"] = None,
+        host_did: Optional[str] = None,
+        host_policy: Optional[
+            Callable[["DataAccessGrant", str], bool]
+        ] = None,
+        grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
+        revoked_grant_ids: Optional[Iterable[str]] = None,
     ) -> SovereignImportResult:
         """
         Import (restore) an agent from a sovereignty CAR archive.
@@ -478,6 +494,43 @@ class SovereignStorageAdapter:
         Every attempt — imported, rejected, or errored — appends exactly
         one row to the append-only ``agent_import_log``, keyed by agent
         DID + source DID + package hash + continuity score + timestamp.
+
+        Consent gate (#1379, follow-up to #1273): when ``grant`` is
+        provided, owner-consent is verified AFTER CAR integrity but
+        BEFORE any host-DB mutation. The CAR's structural integrity
+        (block-hash + keyring decryptability) is the source-attestation
+        equivalent of an AgentIdentityPackage signature; the grant adds
+        the owner-side authorization (signed by the owner, names the
+        manifest's source DID, targets the receiving agent's DID, not
+        expired, not revoked). On consent rejection the import is
+        refused with a distinct ``consent_*`` reject reason and the
+        host DB is left untouched. ``grant=None`` preserves the
+        pre-#1379 unauthenticated-host-trust behavior.
+
+        Args:
+            grant: Optional owner-signed :class:`DataAccessGrant`
+                authorizing this import. Required to be paired with
+                ``host_did`` so the grant has a receiver DID to bind
+                against; ``host_did`` without ``grant`` is ignored.
+            host_did: The receiving agent's own DID. Compared against
+                ``grant.host_did`` during consent verification. Required
+                when ``grant`` is provided.
+            host_policy: Optional host-side filter callable evaluated
+                AFTER consent verification returns ``ok=True``. Receives
+                ``(grant, canonical_grant_id)``; the canonical id is the
+                verifier-recomputed value, never ``grant.grant_id``.
+                Returning ``False`` rejects the import with
+                ``host_policy_rejected``. Ignored when ``grant`` is
+                ``None``.
+            grant_did_web_resolver: Optional resolver forwarded to
+                :func:`verify_did_binding` for ``did:web:`` owners. The
+                binding helper refuses-by-default without one for
+                ``did:web:`` owners. Ignored when ``grant`` is ``None``.
+            revoked_grant_ids: Optional iterable of canonical grant ids
+                that are currently revoked. The recomputed canonical id
+                is compared against this set. Sourced from a trusted
+                registry — never from the grant payload. Ignored when
+                ``grant`` is ``None``.
         """
         source_cid: Optional[str] = None
         try:
@@ -535,6 +588,104 @@ class SovereignStorageAdapter:
                 source_cid=source_cid,
             )
 
+        # Consent gate (#1379) — runs AFTER CAR integrity (so the
+        # caller's CAR-side attestation contract is satisfied) and
+        # BEFORE any host-DB mutation (so a rejected grant leaves the
+        # host DB untouched, same invariant as the continuity gate).
+        # Lazy-import to break the storage→identity circular at module
+        # load time (identity/__init__ pulls in the exporter chain
+        # which transitively imports storage).
+        consent_grant_id: Optional[str] = None
+        if grant is not None:
+            from kestrel_sovereign.identity.access_grant import (
+                REJECT_HOST_POLICY,
+            )
+            from kestrel_sovereign.storage.sovereign_import_consent import (
+                verify_car_import_consent,
+            )
+            if not host_did:
+                consent_reason = (
+                    "consent grant requires host_did to be passed to "
+                    "import_agent so the grant's host_did field has a "
+                    "receiver DID to bind against"
+                )
+                await self._log_import_attempt(
+                    agent_did=agent_did, source_did=src_did,
+                    package_hash=package_hash,
+                    continuity_score=continuity.overall_score,
+                    status="rejected", reject_reason=consent_reason,
+                    messages_restored=0, shards_restored=0,
+                    manifest_version=manifest_version, source_cid=source_cid,
+                    grant_id=None,
+                )
+                return SovereignImportResult(
+                    success=False, agent_did=agent_did,
+                    package_hash=package_hash, continuity=continuity,
+                    status="rejected", reject_reason=consent_reason,
+                    manifest_version=manifest_version,
+                    timestamp=(manifest.timestamp if manifest else ""),
+                    source_cid=source_cid,
+                )
+            consent = await verify_car_import_consent(
+                manifest, grant,
+                host_did=host_did,
+                revoked_grant_ids=revoked_grant_ids,
+                did_web_resolver=grant_did_web_resolver,
+            )
+            consent_grant_id = consent.canonical_grant_id
+            if not consent.ok:
+                consent_reason = f"consent verification failed: {consent.reason}"
+                self.logger.warning(
+                    f"⛔ Sovereignty import rejected ({consent_reason}); "
+                    f"host DB untouched"
+                )
+                await self._log_import_attempt(
+                    agent_did=agent_did, source_did=src_did,
+                    package_hash=package_hash,
+                    continuity_score=continuity.overall_score,
+                    status="rejected", reject_reason=consent_reason,
+                    messages_restored=0, shards_restored=0,
+                    manifest_version=manifest_version, source_cid=source_cid,
+                    grant_id=consent_grant_id,
+                )
+                return SovereignImportResult(
+                    success=False, agent_did=agent_did,
+                    package_hash=package_hash, continuity=continuity,
+                    status="rejected", reject_reason=consent_reason,
+                    manifest_version=manifest_version,
+                    timestamp=(manifest.timestamp if manifest else ""),
+                    source_cid=source_cid,
+                )
+            if host_policy is not None and not host_policy(
+                grant, consent.canonical_grant_id
+            ):
+                consent_reason = (
+                    f"{REJECT_HOST_POLICY}: host policy rejected an "
+                    f"otherwise-valid grant "
+                    f"{consent.canonical_grant_id[:16]}"
+                )
+                self.logger.warning(
+                    f"⛔ Sovereignty import rejected ({consent_reason}); "
+                    f"host DB untouched"
+                )
+                await self._log_import_attempt(
+                    agent_did=agent_did, source_did=src_did,
+                    package_hash=package_hash,
+                    continuity_score=continuity.overall_score,
+                    status="rejected", reject_reason=consent_reason,
+                    messages_restored=0, shards_restored=0,
+                    manifest_version=manifest_version, source_cid=source_cid,
+                    grant_id=consent_grant_id,
+                )
+                return SovereignImportResult(
+                    success=False, agent_did=agent_did,
+                    package_hash=package_hash, continuity=continuity,
+                    status="rejected", reject_reason=consent_reason,
+                    manifest_version=manifest_version,
+                    timestamp=(manifest.timestamp if manifest else ""),
+                    source_cid=source_cid,
+                )
+
         try:
             if manifest is None or reader is None:
                 raise RuntimeError("package has no readable manifest")
@@ -575,6 +726,7 @@ class SovereignStorageAdapter:
                 status="error", reject_reason=f"restore_failed: {e}",
                 messages_restored=0, shards_restored=0,
                 manifest_version=manifest_version, source_cid=source_cid,
+                grant_id=consent_grant_id,
             )
             raise
 
@@ -586,6 +738,7 @@ class SovereignStorageAdapter:
             messages_restored=len(all_conversations),
             shards_restored=len(manifest.shards),
             manifest_version=manifest_version, source_cid=source_cid,
+            grant_id=consent_grant_id,
         )
         self.logger.info(
             f"✅ Sovereignty import complete: {len(all_conversations)} messages, "
@@ -631,6 +784,7 @@ class SovereignStorageAdapter:
                 messages_restored INTEGER DEFAULT 0,
                 shards_restored INTEGER DEFAULT 0,
                 source_cid TEXT,
+                grant_id TEXT,
                 created_at {self._import_log_ts_col()}
             )
             """
@@ -641,12 +795,24 @@ class SovereignStorageAdapter:
         await self.db.execute(
             "CREATE INDEX IF NOT EXISTS idx_import_log_source ON agent_import_log(source_did)"
         )
+        # Additive migration for DBs created before #1379 introduced
+        # the grant_id column. Both backends tolerate ADD COLUMN IF NOT
+        # EXISTS, but SQLite older than 3.35 doesn't — so feature-check.
+        try:
+            await self.db.execute(
+                "ALTER TABLE agent_import_log ADD COLUMN grant_id TEXT"
+            )
+        except Exception:
+            # Column already exists (or backend refuses) — both are
+            # benign for an additive migration.
+            pass
 
     async def _log_import_attempt(
         self, *, agent_did: str, source_did: str, package_hash: str,
         continuity_score: float, status: str, reject_reason: Optional[str],
         messages_restored: int, shards_restored: int,
         manifest_version: str, source_cid: Optional[str],
+        grant_id: Optional[str] = None,
     ) -> None:
         """Append exactly one row per import attempt.
 
@@ -661,12 +827,12 @@ class SovereignStorageAdapter:
                 INSERT INTO agent_import_log
                   (agent_did, source_did, host_agent_id, package_hash,
                    continuity_score, status, reject_reason, manifest_version,
-                   messages_restored, shards_restored, source_cid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   messages_restored, shards_restored, source_cid, grant_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (agent_did, source_did, self.agent_id, package_hash,
                  continuity_score, status, reject_reason, manifest_version,
-                 messages_restored, shards_restored, source_cid),
+                 messages_restored, shards_restored, source_cid, grant_id),
             )
         except Exception as e:
             self.logger.error(f"Failed to write agent_import_log row: {e}")
@@ -679,7 +845,8 @@ class SovereignStorageAdapter:
         cols = [
             "id", "agent_did", "source_did", "host_agent_id", "package_hash",
             "continuity_score", "status", "reject_reason", "manifest_version",
-            "messages_restored", "shards_restored", "source_cid", "created_at",
+            "messages_restored", "shards_restored", "source_cid", "grant_id",
+            "created_at",
         ]
         col_sql = ", ".join(cols)
         if agent_did is None:

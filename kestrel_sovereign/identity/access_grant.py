@@ -440,70 +440,68 @@ async def _verify_package_signed_by_source(package: Any) -> Tuple[bool, str]:
     return ok, reason
 
 
-async def verify_import_consent(
-    package: Any,
+async def verify_grant(
     grant: DataAccessGrant,
     *,
+    source_did: str,
     host_did: str,
+    package_signed_by_source: bool = True,
+    package_signed_reason: str = "",
     revoked_grant_ids: Optional[Iterable[str]] = None,
     did_web_resolver: Optional[Any] = None,
     now: Optional[datetime] = None,
 ) -> ConsentVerification:
-    """Verify a :class:`DataAccessGrant` authorizes importing *package*
-    into the agent identified by *host_did*.
+    """Grant-only consent verification (checks 2–5 of the five-tuple).
 
-    Runs five named checks (the acceptance-criteria contract) and
-    composes a :class:`ConsentVerification` result. The function does
-    NOT short-circuit on the first failure — every check runs so audit
-    consumers see the full surface, which is useful when a single
-    misconfiguration produces multiple symptoms (e.g. a tampered
-    grant trips both signature AND host-binding checks).
+    The package-side "signed by source" attestation is supplied by the
+    caller as a boolean — this lets callers whose package-integrity is
+    established by a different mechanism than
+    :func:`identity.signing.verify_package_signature` (notably the
+    sovereignty-CAR import path, where source-attestation is proved
+    structurally via CAR block-hash + keyring decryptability) compose
+    the same grant-side checks without re-implementing them.
+
+    :func:`verify_import_consent` is the AgentIdentityPackage wrapper;
+    :func:`storage.sovereign_import_consent.verify_car_import_consent`
+    is the sovereignty-CAR wrapper. Both compose on top of this.
 
     Args:
-        package: The inbound package whose ``did``, ``signature`` /
-            ``signatures``, and ``verification_methods`` fields are
-            inspected. Any object whose attribute shape matches
-            :class:`AgentIdentityPackage` works.
         grant: The owner-signed :class:`DataAccessGrant`.
-        host_did: The receiving agent's own DID. The grant's
-            ``host_did`` field MUST equal this; otherwise an attacker
-            could replay a grant minted for one agent against another
-            on the same deployment.
-        revoked_grant_ids: Optional iterable of canonical grant ids
-            (as returned by :func:`compute_grant_id`) that are
-            currently revoked. If the recomputed canonical id of
-            ``grant`` is in this set, the grant is rejected with
-            ``grant_expired_or_revoked``. Revocation lives OUTSIDE
-            the grant payload by design — an in-grant flag would be
-            unsigned and trivially spoofable in serialized flows
-            (codex P2 #1273 R2). Sourced from a trusted registry.
-        did_web_resolver: Optional resolver passed through to
-            :func:`verify_did_binding` for ``did:web:`` owners. The
-            binding helper refuses-by-default when an owner_did is
-            ``did:web:`` and no resolver is provided — without this
-            parameter, hybrid (Ed25519 + ML-DSA-65) owners on
-            ``did:web:`` would have their grants rejected as
-            ``grant_signature_invalid`` even when correctly signed.
-            ``did:pkh:`` / ``did:key:`` owners need no resolver.
-        now: Optional clock override (UTC datetime). Defaults to
-            ``datetime.now(timezone.utc)``. Tests pass a fixed value.
+        source_did: The DID of the source agent whose package is being
+            imported. Compared against ``grant.source_did``.
+        host_did: The receiving agent's own DID. Compared against
+            ``grant.host_did``.
+        package_signed_by_source: Result of the caller's own
+            package-attestation check. ``True`` means the caller has
+            established that the package was produced by ``source_did``
+            (whether via signature, structural integrity, or other
+            mechanism). ``False`` means the package failed that check
+            and the rejection is surfaced with
+            :data:`REJECT_PACKAGE_SIGNATURE`.
+        package_signed_reason: Human-readable detail for the
+            package-attestation result. Joined into the failure reason
+            when ``package_signed_by_source`` is ``False``.
+        revoked_grant_ids: See :func:`verify_import_consent`.
+        did_web_resolver: See :func:`verify_import_consent`.
+        now: See :func:`verify_import_consent`.
     """
     # Always recompute the content-addressed id from the signable
     # payload — never trust ``grant.grant_id`` (unsigned, spoofable
     # at the serialization boundary; codex P2 #1273 R2).
     canonical_grant_id = compute_grant_id(grant)
 
-    # Check 1 — package signed by its declared source DID.
-    pkg_ok, pkg_reason = await _verify_package_signed_by_source(package)
+    # Check 1 — package signed by its declared source DID (delegated to
+    # the caller, who established it via the appropriate mechanism).
+    pkg_ok = package_signed_by_source
+    pkg_reason = package_signed_reason
 
     # Check 2 — grant signed by its declared owner DID.
     grant_ok, grant_reason = _verify_owner_signatures(
         grant, did_web_resolver=did_web_resolver,
     )
 
-    # Check 3 — grant's source_did matches the package's DID.
-    pkg_did = getattr(package, "did", None)
-    names_source = bool(pkg_did) and grant.source_did == pkg_did
+    # Check 3 — grant's source_did matches the package's source DID.
+    names_source = bool(source_did) and grant.source_did == source_did
 
     # Check 4 — grant's host_did matches the receiving agent's DID.
     targets_host = bool(host_did) and grant.host_did == host_did
@@ -549,7 +547,7 @@ async def verify_import_consent(
         reasons.append(
             f"{REJECT_GRANT_NAMES_DIFFERENT_SOURCE}: grant names "
             f"source_did={grant.source_did!r} but package is "
-            f"signed by did={pkg_did!r}"
+            f"signed by did={source_did!r}"
         )
     if not targets_host:
         reasons.append(
@@ -580,6 +578,76 @@ async def verify_import_consent(
     )
 
 
+async def verify_import_consent(
+    package: Any,
+    grant: DataAccessGrant,
+    *,
+    host_did: str,
+    revoked_grant_ids: Optional[Iterable[str]] = None,
+    did_web_resolver: Optional[Any] = None,
+    now: Optional[datetime] = None,
+) -> ConsentVerification:
+    """Verify a :class:`DataAccessGrant` authorizes importing *package*
+    into the agent identified by *host_did*.
+
+    Runs five named checks (the acceptance-criteria contract) and
+    composes a :class:`ConsentVerification` result. The function does
+    NOT short-circuit on the first failure — every check runs so audit
+    consumers see the full surface, which is useful when a single
+    misconfiguration produces multiple symptoms (e.g. a tampered
+    grant trips both signature AND host-binding checks).
+
+    The package-side check (signed by the declared source DID) is
+    delegated to :func:`identity.signing.verify_package_signature`.
+    For sovereignty-CAR imports — whose integrity proof is structural
+    (CAR block-hash + keyring decryptability) rather than a signature
+    field — use
+    :func:`storage.sovereign_import_consent.verify_car_import_consent`
+    instead.
+
+    Args:
+        package: The inbound package whose ``did``, ``signature`` /
+            ``signatures``, and ``verification_methods`` fields are
+            inspected. Any object whose attribute shape matches
+            :class:`AgentIdentityPackage` works.
+        grant: The owner-signed :class:`DataAccessGrant`.
+        host_did: The receiving agent's own DID. The grant's
+            ``host_did`` field MUST equal this; otherwise an attacker
+            could replay a grant minted for one agent against another
+            on the same deployment.
+        revoked_grant_ids: Optional iterable of canonical grant ids
+            (as returned by :func:`compute_grant_id`) that are
+            currently revoked. If the recomputed canonical id of
+            ``grant`` is in this set, the grant is rejected with
+            ``grant_expired_or_revoked``. Revocation lives OUTSIDE
+            the grant payload by design — an in-grant flag would be
+            unsigned and trivially spoofable in serialized flows
+            (codex P2 #1273 R2). Sourced from a trusted registry.
+        did_web_resolver: Optional resolver passed through to
+            :func:`verify_did_binding` for ``did:web:`` owners. The
+            binding helper refuses-by-default when an owner_did is
+            ``did:web:`` and no resolver is provided — without this
+            parameter, hybrid (Ed25519 + ML-DSA-65) owners on
+            ``did:web:`` would have their grants rejected as
+            ``grant_signature_invalid`` even when correctly signed.
+            ``did:pkh:`` / ``did:key:`` owners need no resolver.
+        now: Optional clock override (UTC datetime). Defaults to
+            ``datetime.now(timezone.utc)``. Tests pass a fixed value.
+    """
+    pkg_ok, pkg_reason = await _verify_package_signed_by_source(package)
+    pkg_did = getattr(package, "did", None) or ""
+    return await verify_grant(
+        grant,
+        source_did=pkg_did,
+        host_did=host_did,
+        package_signed_by_source=pkg_ok,
+        package_signed_reason=pkg_reason,
+        revoked_grant_ids=revoked_grant_ids,
+        did_web_resolver=did_web_resolver,
+        now=now,
+    )
+
+
 __all__ = [
     "DataAccessGrant",
     "ConsentVerification",
@@ -593,5 +661,6 @@ __all__ = [
     "compute_grant_id",
     "sign_owner",
     "finalize",
+    "verify_grant",
     "verify_import_consent",
 ]
