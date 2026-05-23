@@ -363,6 +363,8 @@ def _verify_owner_signatures(
 
     methods_by_kid: dict = {}
     for vm in grant.owner_verification_methods:
+        if not isinstance(vm, Mapping):
+            continue
         vm_id = vm.get("id") or ""
         kid = vm_id.rsplit("#", 1)[-1] if "#" in vm_id else vm_id
         if kid:
@@ -371,6 +373,12 @@ def _verify_owner_signatures(
     payload = signable_payload(grant)
     any_verified = False
     for entry in grant.owner_signatures:
+        # Tolerate malformed serialized input: a non-mapping entry
+        # (e.g. a stray string from bad deserialization) is just an
+        # invalid signature — skip it rather than crashing the
+        # caller with AttributeError on .get(). codex P2 #1273 R3.
+        if not isinstance(entry, Mapping):
+            continue
         alg = entry.get("alg")
         kid = entry.get("kid")
         sig_hex = entry.get("sig")

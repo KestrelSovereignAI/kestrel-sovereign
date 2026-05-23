@@ -105,7 +105,9 @@ class IdentityImporter:
         merge_mode: str = "replace",  # replace, merge, skip_existing
         allow_unsigned: bool = False,
         grant: Optional[DataAccessGrant] = None,
-        host_policy: Optional[Callable[[DataAccessGrant], bool]] = None,
+        host_policy: Optional[
+            Callable[[DataAccessGrant, str], bool]
+        ] = None,
         grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
         revoked_grant_ids: Optional[Iterable[str]] = None,
     ) -> ImportResult:
@@ -130,11 +132,17 @@ class IdentityImporter:
                 unauthorized. Default ``None`` preserves the pre-#1273
                 behavior (no consent gate).
             host_policy: Optional host-side filter callable evaluated
-                AFTER consent verification returns ``ok=True``. If it
-                returns ``False`` the import is refused with a
-                distinct ``host_policy_rejected`` reason. Never a
-                substitute for the grant — runs only when the grant
-                already verifies. Ignored when ``grant`` is ``None``.
+                AFTER consent verification returns ``ok=True``. The
+                callable receives ``(grant, canonical_grant_id)`` —
+                policies that allowlist or audit by id MUST use
+                ``canonical_grant_id`` (the verifier-recomputed,
+                trustworthy value), not the ``grant.grant_id`` field
+                on the dataclass (which is unsigned and spoofable).
+                If the callable returns ``False`` the import is
+                refused with a distinct ``host_policy_rejected``
+                reason. Never a substitute for the grant — runs only
+                when the grant already verifies. Ignored when
+                ``grant`` is ``None``.
             grant_did_web_resolver: Optional ``did:web:`` resolver
                 forwarded to :func:`verify_import_consent` so hybrid
                 owners on ``did:web:`` DIDs can have their grant
@@ -202,11 +210,13 @@ class IdentityImporter:
                     f"consent verification failed: {consent.reason}"
                 )
                 return self._build_result(False, agent_id)
-            if host_policy is not None and not host_policy(grant):
+            if host_policy is not None and not host_policy(
+                grant, consent.canonical_grant_id
+            ):
                 self.errors.append(
                     f"{REJECT_HOST_POLICY}: host policy rejected an "
                     f"otherwise-valid grant "
-                    f"{grant.grant_id[:16] or '<unfinalized>'}"
+                    f"{consent.canonical_grant_id[:16]}"
                 )
                 return self._build_result(False, agent_id)
 

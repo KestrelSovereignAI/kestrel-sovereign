@@ -413,6 +413,49 @@ async def test_malformed_expires_at_treated_as_expired(
 
 
 @pytest.mark.asyncio
+async def test_malformed_signature_entry_does_not_crash(
+    package_signed_ok, owner, source, host,
+):
+    """A non-mapping entry in ``owner_signatures`` (e.g. a stray
+    string from bad deserialization) must be skipped as invalid, not
+    raise ``AttributeError`` out of the verifier. Regression for
+    codex P2 #1273 R3.
+    """
+    from dataclasses import replace
+    grant = DataAccessGrant(
+        owner_did=owner["did"], source_did=source["did"], host_did=host["did"],
+        issued_at="2026-05-23T00:00:00+00:00",
+        owner_verification_methods=owner["vms"],
+    )
+    grant = sign_owner(grant, [(owner["kp"], owner["kid"])])
+    # Splice a non-mapping junk entry into the signatures array.
+    tampered = replace(
+        grant,
+        owner_signatures=["not-a-mapping"] + list(grant.owner_signatures),
+    )
+    # Must not raise — the junk entry is skipped; the real signature
+    # still verifies → ok=True.
+    result = await verify_import_consent(
+        _StubPackage(did=source["did"]),
+        tampered,
+        host_did=host["did"],
+    )
+    assert result.ok is True
+
+    # And a grant with ONLY junk entries cleanly returns
+    # grant_signature_invalid, not crashes.
+    only_junk = replace(grant, owner_signatures=["junk", 42, None])
+    result2 = await verify_import_consent(
+        _StubPackage(did=source["did"]),
+        only_junk,
+        host_did=host["did"],
+    )
+    assert result2.ok is False
+    assert result2.grant_signed_by_owner is False
+    assert REJECT_GRANT_SIGNATURE in result2.reason
+
+
+@pytest.mark.asyncio
 async def test_did_web_owner_requires_resolver_and_verifies_with_one(
     package_signed_ok, source, host,
 ):

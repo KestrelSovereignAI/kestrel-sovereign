@@ -279,7 +279,10 @@ async def test_host_policy_rejects_otherwise_valid_grant(
     False, the import is rejected with a distinct host_policy_rejected
     reason.
     """
-    def deny_all(grant):
+    seen: dict = {}
+    def deny_all(grant, canonical_id):
+        seen["canonical_id"] = canonical_id
+        seen["spoofed_id"] = grant.grant_id
         return False
     importer = IdentityImporter(test_db, target_agent_id=host["did"])
     result = await importer.import_package(
@@ -287,6 +290,10 @@ async def test_host_policy_rejects_otherwise_valid_grant(
     )
     assert result.success is False
     assert any("host_policy_rejected" in e for e in result.errors)
+    # Policy received the verifier-recomputed canonical id (not the
+    # untrusted grant.grant_id field).
+    from kestrel_sovereign.identity.access_grant import compute_grant_id
+    assert seen["canonical_id"] == compute_grant_id(signed_grant)
 
 
 @pytest.mark.asyncio
@@ -299,7 +306,7 @@ async def test_host_policy_not_consulted_when_consent_fails(
     """
     other_host = "did:pkh:eip155:1:0x" + "33" * 20
     called = {"n": 0}
-    def policy(grant):
+    def policy(grant, canonical_id):
         called["n"] += 1
         return True
     importer = IdentityImporter(test_db, target_agent_id=other_host)
