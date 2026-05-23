@@ -286,6 +286,100 @@ async def test_send_a2a_question_partial_on_timeout():
 
 
 @pytest.mark.asyncio
+async def test_send_a2a_question_handles_kestrel_flattened_response_shape():
+    """Codex P1 on PR #1380: the real GET /tasks/{task_id} endpoint
+    in endpoints/agent.py returns a FLATTENED shape ({"status":
+    "completed", "message": "...", ...}), not the canonical A2A
+    envelope ({"status": {"state": ..., "message": {"parts":
+    [...]}}}). send_a2a_question must handle both — the prior code
+    raised AttributeError on .get('state') against a string."""
+    feature = _make_a2a_feature()
+    post_resp = _mock_post_response(task_id="qF1", state="submitted")
+    # Flattened shape (the actual kestrel endpoint output).
+    get_flattened_done = MagicMock(status_code=200)
+    get_flattened_done.json.return_value = {
+        "id": "qF1",
+        "status": "completed",         # STRING, not dict
+        "message": "found three PRs",  # top-level string
+        "artifacts": [],
+        "metadata": {},
+    }
+    client = _async_client_with(
+        post_resp=post_resp, get_resp=get_flattened_done,
+    )
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_question(
+            "meridian", "any open PRs?", timeout_seconds=5,
+        )
+
+    assert result.status is ToolResultStatus.OK, (
+        f"flattened response must yield ok, got {result.status}: "
+        f"{result.error}"
+    )
+    assert result.data["answer"] == "found three PRs"
+    assert result.data["state"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_question_stamps_a2a_verb_metadata():
+    """Codex P2 on PR #1380: receiver-side verb discrimination must
+    not depend solely on skill_id / reply_expected. Add explicit
+    a2a_verb='question' so the inbound signal payload tells the
+    receiver's cognition prompt how to frame the response."""
+    feature = _make_a2a_feature()
+    post_resp = _mock_post_response(task_id="qV1", state="submitted")
+    get_done = MagicMock(status_code=200)
+    get_done.json.return_value = {
+        "id": "qV1", "status": "completed", "message": "ok",
+    }
+    client = _async_client_with(post_resp=post_resp, get_resp=get_done)
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        await feature.send_a2a_question("meridian", "ping", timeout_seconds=5)
+
+    posted_body = client.post.call_args.kwargs["json"]
+    assert posted_body["metadata"]["a2a_verb"] == "question"
+    assert posted_body["metadata"]["reply_expected"] is True
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_message_stamps_a2a_verb_metadata():
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="mV1"))
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        await feature.send_a2a_message("meridian", "FYI shipped")
+    posted_body = client.post.call_args.kwargs["json"]
+    assert posted_body["metadata"]["a2a_verb"] == "message"
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_task_stamps_a2a_verb_metadata():
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="tV1"))
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        await feature.send_a2a_task(
+            "talon", "claim issue 42",
+            skill_id="workflow.assign",
+        )
+    posted_body = client.post.call_args.kwargs["json"]
+    assert posted_body["metadata"]["a2a_verb"] == "task"
+    assert posted_body["metadata"]["skill"] == "workflow.assign"
+
+
+@pytest.mark.asyncio
 async def test_send_a2a_task_carries_skill_id_and_returns_task_id():
     """``send_a2a_task`` is the work-delegation verb — skill_id IS
     attached to metadata (distinguishing it from send_a2a_message).

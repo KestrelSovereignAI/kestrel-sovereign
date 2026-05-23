@@ -428,6 +428,7 @@ class PeersFeature(Feature):
         task_data, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id="", session_id=session_id,
+            extra_metadata={"a2a_verb": "message"},
         )
         if err is not None:
             return err
@@ -488,7 +489,10 @@ class PeersFeature(Feature):
         task_data, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id="", session_id=session_id,
-            extra_metadata={"reply_expected": True},
+            extra_metadata={
+                "a2a_verb": "question",
+                "reply_expected": True,
+            },
         )
         if err is not None:
             return err
@@ -502,14 +506,21 @@ class PeersFeature(Feature):
         # Polling cadence: tight at first (responsive for quick
         # answers), then back off to reduce load on long waits.
         poll_intervals = [0.5, 0.5, 1.0, 1.0, 1.5, 2.0, 2.5, 3.0]
-        elapsed = 0.0
+        # Wall-clock deadline rather than accumulated-sleep elapsed —
+        # codex P2: each GET can spend up to PEER_CONNECT_TIMEOUT
+        # before returning, so summing sleeps drifted the effective
+        # timeout well past timeout_seconds during dropped responses.
+        # time.monotonic() gives us the real-time deadline.
+        import time
+        deadline = time.monotonic() + float(timeout_seconds)
+        poll_idx = 0
 
-        while elapsed < timeout_seconds:
-            interval = poll_intervals[min(
-                int(elapsed / 5), len(poll_intervals) - 1
-            )]
+        while time.monotonic() < deadline:
+            interval = poll_intervals[
+                min(poll_idx, len(poll_intervals) - 1)
+            ]
+            poll_idx += 1
             await asyncio.sleep(interval)
-            elapsed += interval
 
             try:
                 async with httpx.AsyncClient() as client:
@@ -524,7 +535,7 @@ class PeersFeature(Feature):
                         ),
                     )
             except (httpx.ConnectError, httpx.TimeoutException):
-                # Transient — keep waiting until the outer timeout.
+                # Transient — keep waiting until the wall-clock deadline.
                 continue
             except Exception as e:
                 logger.warning(
@@ -539,24 +550,43 @@ class PeersFeature(Feature):
                 state_data = poll_resp.json()
             except ValueError:
                 continue
-            current_state = (
-                (state_data.get("status") or {}).get("state")
-                or state_data.get("status")
-            )
+            # Codex P1: the real GET /tasks/{task_id} endpoint in
+            # endpoints/agent.py FLATTENS the task envelope:
+            # ``{"status": "completed", "message": "...", ...}`` —
+            # ``status`` is a string, ``message`` is at the top level.
+            # The canonical A2A spec shape is
+            # ``{"status": {"state": "completed", "message": {"parts":
+            # [...]}}}``. Support BOTH so the tool works against the
+            # current kestrel endpoint AND any future spec-compliant
+            # receiver. Same dual-shape handling for answer extraction
+            # below.
+            raw_status = state_data.get("status")
+            if isinstance(raw_status, dict):
+                current_state = raw_status.get("state")
+            else:
+                current_state = raw_status
             if current_state not in terminal_states:
                 continue
 
-            # Terminal state reached — extract the answer from either
-            # ``message.parts[].text`` on the status (the canonical
-            # A2A spot for the agent's final reply), or from any
-            # ``artifacts``.
+            # Terminal state reached — extract answer text from each
+            # of three locations the receiver might use:
+            # 1. ``status.message.parts[].text`` (canonical A2A)
+            # 2. Top-level ``"message"`` string (kestrel's flattened
+            #    endpoint at endpoints/agent.py:1010)
+            # 3. ``artifacts[].parts[].text`` (canonical A2A artifact
+            #    payload — used when the agent's final answer is
+            #    structured rather than chat-shaped)
             answer_text = ""
-            status = state_data.get("status") or {}
-            msg = status.get("message") or {}
-            for part in (msg.get("parts") or []):
-                if isinstance(part, dict) and "text" in part:
-                    answer_text = part["text"]
-                    break
+            if isinstance(raw_status, dict):
+                msg = raw_status.get("message") or {}
+                for part in (msg.get("parts") or []):
+                    if isinstance(part, dict) and "text" in part:
+                        answer_text = part["text"]
+                        break
+            if not answer_text:
+                top_msg = state_data.get("message")
+                if isinstance(top_msg, str) and top_msg:
+                    answer_text = top_msg
             if not answer_text:
                 for artifact in (state_data.get("artifacts") or []):
                     if isinstance(artifact, dict):
@@ -653,6 +683,7 @@ class PeersFeature(Feature):
         task_data, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id=skill_id, session_id=session_id,
+            extra_metadata={"a2a_verb": "task"},
         )
         if err is not None:
             return err
