@@ -26,11 +26,10 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.peers.mesh import (
-    MeshMessage,
-    MeshMessageType,
-    make_assign_message,
-)
+# Mesh is gone (#1367 phase 5). Talon dispatch now uses the A2A
+# task-submission path — same wire endpoint as send_a2a_task on
+# PeersFeature, but called directly because coordinator dispatch
+# happens at the feature level (not from an LLM tool turn).
 from kestrel_sovereign.features.talon.runtime import (
     TalonExecution,
     TalonPolicy,
@@ -227,9 +226,9 @@ class TalonCoordinatorFeature(Feature):
                 },
             )
 
-        # Mesh dispatch only carries repo/issue today, so using it for a
+        # A2A dispatch only carries repo/issue today, so using it for a
         # non-default runtime would silently ignore the agent's Talon controls.
-        use_mesh = (
+        use_a2a = (
             resolved_backend == "claude"
             and resolved_model == "opus"
             and resolved_auth_lane == "oauth"
@@ -237,22 +236,20 @@ class TalonCoordinatorFeature(Feature):
             and model is None
             and auth_lane is None
         )
-        if use_mesh:
-            mesh_result = await self._dispatch_via_mesh(repo, issue)
-            if mesh_result.get("dispatched"):
-                # Mesh dispatch returns ``message_id`` (not ``job_id``) —
-                # that's the tracking id the agent/user needs to follow up.
+        if use_a2a:
+            a2a_result = await self._dispatch_via_a2a(repo, issue)
+            if a2a_result.get("dispatched"):
                 tracking_id = (
-                    mesh_result.get("job_id")
-                    or mesh_result.get("message_id")
+                    a2a_result.get("job_id")
+                    or a2a_result.get("task_id")
                     or "?"
                 )
                 return ToolResult.ok(
                     confirmation=(
-                        f"Dispatched {repo}#{issue} to talon via mesh "
-                        f"(message_id={tracking_id})"
+                        f"Dispatched {repo}#{issue} to talon via A2A "
+                        f"(task_id={tracking_id})"
                     ),
-                    data=mesh_result,
+                    data=a2a_result,
                 )
 
         repo_resolved = self._resolve_repo(repo)
@@ -1135,22 +1132,16 @@ class TalonCoordinatorFeature(Feature):
             info["returncode"] = rc
             info["completed_at"] = datetime.now(timezone.utc).isoformat()
 
-        # Then layer on mesh inbox completions for jobs dispatched via mesh.
-        # peers.mesh_inbox is async and now returns a ToolResult envelope
-        # (#1061 wave 16); the legacy {"messages": [...]} dict lives under
-        # .data. The pre-migration code was missing the `await` here —
-        # restore correctness now that we're touching this call site.
-        peers = self._get_peers_feature()
-        if peers:
-            inbox_envelope = await peers.mesh_inbox(limit=50)
-            inbox_data = inbox_envelope.data or {}
-            for msg_data in inbox_data.get("messages", []):
-                msg_type = msg_data.get("type", "")
-                if msg_type in ("complete", "reject"):
-                    job_id = msg_data.get("correlation_id", "")
-                    if job_id in self._jobs:
-                        self._jobs[job_id]["status"] = msg_type
-                        self._jobs[job_id]["result"] = msg_data.get("payload", {})
+        # Mesh inbox completion polling was retired with mesh in
+        # #1367 phase 5. For A2A-dispatched jobs (method="a2a"),
+        # completion now arrives via the local ``a2a.task_complete``
+        # signal — when Talon transitions its task to COMPLETED,
+        # _on_task_complete fires here too and the dispatcher wakes
+        # the cognition turn. Coordinator-side job-state reconciliation
+        # against the signal (or against Talon's task_store via
+        # ``GET /api/agents/talon/api/agent/tasks/{id}``) is a separate
+        # follow-up; this PR keeps the dispatched-only ``self._jobs``
+        # row honest rather than guessing completion state.
 
         def _public(info: Dict[str, Any]) -> Dict[str, Any]:
             # Strip non-serialisable fields (the asyncio Process handle).
@@ -1426,24 +1417,52 @@ class TalonCoordinatorFeature(Feature):
     # Internal: Mesh dispatch (preferred)
     # ------------------------------------------------------------------
 
-    async def _dispatch_via_mesh(
+    async def _dispatch_via_a2a(
         self, repo: str, issue_number: int, title: str = ""
     ) -> Dict[str, Any]:
-        """Send an assign message to Talon via mesh protocol."""
+        """Submit an A2A task to Talon — the replacement for mesh dispatch.
+
+        Builds a ``TaskSendParams``-shaped payload and POSTs it to
+        Talon's ``/api/agent/tasks/send`` endpoint. The receiving side
+        creates the task, fires ``a2a.task_submitted`` so Talon's
+        cognition loop wakes up, and acts on the assignment. Same
+        functional contract as the prior mesh dispatch but with
+        durable persistence (TaskStore vs in-memory inbox), lifecycle
+        states (SUBMITTED → WORKING → COMPLETED), and signal-driven
+        wakeup (#1366 / #1367)."""
+        from uuid import uuid4
+
         host_url = self._discover_host_url()
         if not host_url:
-            return {"dispatched": False, "reason": "no_mesh_host"}
+            return {"dispatched": False, "reason": "no_a2a_host"}
 
-        msg = make_assign_message(
-            sender=getattr(self.agent, 'agent_name', 'kestrel'),
-            recipient="talon",
-            repo=repo,
-            issue_number=issue_number,
-            issue_title=title or f"#{issue_number}",
+        sender = getattr(self.agent, "agent_name", None) or getattr(
+            self.agent, "did", "kestrel",
         )
+        task_id = uuid4().hex
+        session_id = uuid4().hex
+        body = (
+            f"Assignment: implement issue {repo}#{issue_number} "
+            f"({title or 'no title'}). Take the work and report back "
+            f"via task completion."
+        )
+        payload = json.dumps({
+            "id": task_id,
+            "sessionId": session_id,
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": body}],
+            },
+            "metadata": {
+                "sender": sender,
+                "skill": "workflow.assign",
+                "repo": repo,
+                "issue_number": issue_number,
+                "issue_title": title or f"#{issue_number}",
+            },
+        }).encode("utf-8")
 
-        url = f"{host_url}/api/agents/talon/api/agent/mesh"
-        payload = json.dumps(msg.to_dict()).encode("utf-8")
+        url = f"{host_url}/api/agents/talon/api/agent/tasks/send"
         req = urllib.request.Request(
             url,
             data=payload,
@@ -1451,20 +1470,20 @@ class TalonCoordinatorFeature(Feature):
             headers={"Content-Type": "application/json"},
         )
         try:
-            resp = await asyncio.to_thread(
+            await asyncio.to_thread(
                 lambda: urllib.request.urlopen(req, timeout=10).read()
             )
-            self._jobs[msg.id] = {
+            self._jobs[task_id] = {
                 "repo": repo, "issue": issue_number,
-                "status": "dispatched", "method": "mesh",
+                "status": "dispatched", "method": "a2a",
             }
             return {
-                "dispatched": True, "method": "mesh",
-                "message_id": msg.id, "repo": repo, "issue": issue_number,
+                "dispatched": True, "method": "a2a",
+                "task_id": task_id, "repo": repo, "issue": issue_number,
             }
         except (urllib.error.URLError, urllib.error.HTTPError) as e:
-            logger.debug(f"Mesh dispatch failed: {e}")
-            return {"dispatched": False, "reason": "mesh_unavailable", "error": str(e)}
+            logger.debug(f"A2A dispatch failed: {e}")
+            return {"dispatched": False, "reason": "a2a_unavailable", "error": str(e)}
 
     # ------------------------------------------------------------------
     # Internal: CLI fallback
