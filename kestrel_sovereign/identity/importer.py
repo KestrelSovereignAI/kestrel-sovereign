@@ -16,8 +16,13 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
+from .access_grant import (
+    DataAccessGrant,
+    REJECT_HOST_POLICY,
+    verify_import_consent,
+)
 from .identity_package import (
     AgentIdentityPackage,
     MigrationRecord,
@@ -99,6 +104,8 @@ class IdentityImporter:
         verify_constitution: bool = True,
         merge_mode: str = "replace",  # replace, merge, skip_existing
         allow_unsigned: bool = False,
+        grant: Optional[DataAccessGrant] = None,
+        host_policy: Optional[Callable[[DataAccessGrant], bool]] = None,
     ) -> ImportResult:
         """
         Import agent identity from a package.
@@ -114,6 +121,18 @@ class IdentityImporter:
             allow_unsigned: If True, allow importing unsigned packages.
                 Defaults to False for security. Set to True only for
                 development/testing use cases.
+            grant: Optional owner-signed :class:`DataAccessGrant`
+                authorizing this import. When provided, consent is
+                verified BEFORE signature verification — a valid
+                package signature without owner consent is still
+                unauthorized. Default ``None`` preserves the pre-#1273
+                behavior (no consent gate).
+            host_policy: Optional host-side filter callable evaluated
+                AFTER consent verification returns ``ok=True``. If it
+                returns ``False`` the import is refused with a
+                distinct ``host_policy_rejected`` reason. Never a
+                substitute for the grant — runs only when the grant
+                already verifies. Ignored when ``grant`` is ``None``.
 
         Returns:
             ImportResult with success status and statistics
@@ -138,6 +157,35 @@ class IdentityImporter:
         if package.content_hash:
             if not package.verify_content_hash():
                 self.errors.append("Content hash verification failed")
+                return self._build_result(False, agent_id)
+
+        # Consent gate (#1273) — when a grant is provided, owner
+        # authorization is checked BEFORE signature verification. A
+        # valid signature without owner consent is still unauthorized.
+        # An optional ``host_policy`` callable runs only AFTER consent
+        # verifies; it's a filter on top of a valid grant, never a
+        # substitute for one.
+        if grant is not None:
+            if not self.target_agent_id:
+                self.errors.append(
+                    "consent grant requires target_agent_id (host_did) "
+                    "to be set on the IdentityImporter"
+                )
+                return self._build_result(False, agent_id)
+            consent = await verify_import_consent(
+                package, grant, host_did=self.target_agent_id,
+            )
+            if not consent.ok:
+                self.errors.append(
+                    f"consent verification failed: {consent.reason}"
+                )
+                return self._build_result(False, agent_id)
+            if host_policy is not None and not host_policy(grant):
+                self.errors.append(
+                    f"{REJECT_HOST_POLICY}: host policy rejected an "
+                    f"otherwise-valid grant "
+                    f"{grant.grant_id[:16] or '<unfinalized>'}"
+                )
                 return self._build_result(False, agent_id)
 
         if verify_signature:
