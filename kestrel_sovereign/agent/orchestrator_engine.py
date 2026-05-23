@@ -626,6 +626,29 @@ class OrchestratorEngineMixin:
         """
         found_tool, found_feature = self._resolve_named_tool(tool_name)
         if found_tool is None:
+            # Subagent-dispatcher fallback. Every feature that supports
+            # subagent dispatch is advertised to the LLM as a tool named
+            # ``feature.tool_name`` (e.g. ``memory_feature``,
+            # ``security_feature``, ``peers_feature``) — the orchestrator
+            # tool def comes from ``Feature.to_orchestrator_tool``. The
+            # chat path resolves these via ``_visible_features_by_tool_name``
+            # and dispatches through ``_dispatch_feature_tool``. Before
+            # this fallback existed, ``execute_named_tool`` only walked
+            # ``feature.get_tools()`` (the @tool-decorated methods inside
+            # a feature) and missed the dispatcher tool entirely — so
+            # any external transport (codex inline-executor, voice
+            # realtime, future MCP/A2A) that received a ``memory_feature``
+            # call from the LLM raised ToolNotRegisteredError even
+            # though the LLM had been explicitly told the tool exists.
+            # Emma confirmed the symptom: she could see the tool in her
+            # advertised set, the workflow path could invoke it, but
+            # direct invocation via the inline executor failed.
+            subagent_feature = self._resolve_named_subagent(tool_name)
+            if subagent_feature is not None:
+                return await self._execute_named_subagent(
+                    subagent_feature, tool_name=tool_name, args=args,
+                    session_id=session_id, source=source, _capture=_capture,
+                )
             raise ToolNotRegisteredError(
                 f"Tool {tool_name!r} is not registered with any enabled "
                 f"feature on this agent"
@@ -761,7 +784,8 @@ class OrchestratorEngineMixin:
 
         Returns ``(None, None)`` when no feature exposes a tool by that
         name; the public ``execute_named_tool`` turns that into a
-        ``ValueError``.
+        ``ValueError`` (or, for subagent-dispatcher names, falls through
+        to ``_resolve_named_subagent``).
         """
         features = getattr(self, "features", {}) or {}
         for feature in features.values():
@@ -776,6 +800,144 @@ class OrchestratorEngineMixin:
                 if getattr(tool, "name", None) == tool_name:
                     return tool, feature
         return None, None
+
+    def _resolve_named_subagent(self, tool_name: str) -> Optional[Any]:
+        """Find a Feature whose subagent-dispatcher tool name matches.
+
+        Each feature that supports subagent dispatch is advertised to
+        the LLM with the orchestrator-tool def from
+        ``Feature.to_orchestrator_tool()`` — its ``name`` is
+        ``feature.tool_name`` (snake_case class name, e.g.
+        ``memory_feature``). The chat path resolves these via
+        ``_visible_features_by_tool_name``; this helper is the
+        equivalent for ``execute_named_tool`` so external transports
+        can also dispatch them.
+
+        Returns ``None`` when no feature claims this name or when no
+        feature supports subagent dispatch (matches the visibility
+        rules the chat path uses).
+        """
+        features_by_name = getattr(self, "_visible_features_by_tool_name", None)
+        if not callable(features_by_name):
+            return None
+        try:
+            visible = features_by_name() or {}
+        except Exception:  # noqa: BLE001 — diagnostics elsewhere
+            return None
+        return visible.get(tool_name)
+
+    async def _execute_named_subagent(
+        self,
+        feature: Any,
+        *,
+        tool_name: str,
+        args: dict,
+        session_id: str,
+        source: str,
+        _capture: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """Run a feature subagent through the governance stack.
+
+        Mirrors ``_dispatch_feature_tool`` (the chat path) but in the
+        ``execute_named_tool`` shape: no streaming/event-emit side
+        channels, no dispatch_meta, no observability_store coupling.
+        The hooks (``PRE_SUBAGENT_CALL`` / ``POST_SUBAGENT_CALL``) and
+        denied-tools stripping ARE applied — that's the security
+        envelope subagent dispatch sits inside, separate from the
+        ``PRE_TOOL_USE`` / ``POST_TOOL_USE`` envelope individual tools
+        sit inside.
+
+        Args:
+            feature: The Feature subagent to dispatch to.
+            tool_name: Original tool name the caller invoked (passed
+                into hook context).
+            args: Dispatch args. The LLM-facing tool def declares
+                ``task`` (required) and ``context`` (optional); we
+                surface both.
+            session_id / source / _capture: Same as ``execute_named_tool``.
+        """
+        feature_name = type(feature).__name__
+
+        # Same arg-validation guardrail individual tools get.
+        is_valid, validation_error = validate_tool_arguments(tool_name, args)
+        if not is_valid:
+            logging.warning(
+                "[GOVERNED-DISPATCH] subagent arg validation failed source=%s feature=%s err=%s",
+                source, feature_name, validation_error,
+            )
+            return {"success": False, "error": f"Invalid tool arguments: {validation_error}"}
+
+        logging.info(
+            "[GOVERNED-DISPATCH] source=%s session=%s subagent=%s",
+            source, session_id, feature_name,
+        )
+
+        # --- PRE_SUBAGENT_CALL hook ---
+        pre_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.PRE_SUBAGENT_CALL.value,
+            tool_name=tool_name,
+            tool_input=args,
+            feature_name=feature_name,
+        )
+        pre_output = await self.hooks_manager.execute_hooks(
+            HookEvent.PRE_SUBAGENT_CALL, pre_input,
+        )
+        post_hook_args = (
+            pre_output.updated_input
+            if pre_output.updated_input is not None
+            else pre_input.tool_input
+        )
+        if _capture is not None:
+            _capture["effective_args"] = post_hook_args
+
+        if pre_output.permission_decision == PermissionDecision.DENY:
+            reason = pre_output.permission_reason or "Blocked by security policy"
+            logging.info(
+                "[GOVERNED-DISPATCH] subagent denied source=%s feature=%s reason=%s",
+                source, feature_name, reason,
+            )
+            return {"success": False, "error": f"Permission denied: {reason}"}
+        if pre_output.permission_decision == PermissionDecision.ASK:
+            reason = pre_output.permission_reason or "Requires approval"
+            return {"success": False, "error": f"Approval required: {reason}"}
+
+        effective_args = post_hook_args if isinstance(post_hook_args, dict) else args
+        task = effective_args.get("task", "")
+        context = effective_args.get("context")
+        denied_tools = await self._get_denied_tools(feature_name)
+        if denied_tools:
+            logging.info(
+                "[SECURITY] stripping denied tools from subagent %s: %s",
+                feature_name, denied_tools,
+            )
+
+        exec_start = time.time()
+        with optional_span("agent.feature_dispatch", {
+            "feature.name": getattr(feature, "tool_name", feature_name),
+            "tool.source": source,
+        }):
+            result = await feature.execute_as_subagent(
+                task=task, context=context, denied_tools=denied_tools,
+            )
+        exec_duration_ms = int((time.time() - exec_start) * 1000)
+        self._register_explored_feature_tools(feature)
+
+        # --- POST_SUBAGENT_CALL hook (parallel, non-blocking) ---
+        post_input = HookInput(
+            session_id=session_id,
+            hook_event_name=HookEvent.POST_SUBAGENT_CALL.value,
+            tool_name=tool_name,
+            tool_input=effective_args,
+            feature_name=feature_name,
+            tool_response=result if isinstance(result, dict) else {"result": str(result)},
+            execution_time_ms=exec_duration_ms,
+        )
+        await self.hooks_manager.execute_hooks_parallel(
+            HookEvent.POST_SUBAGENT_CALL, post_input,
+        )
+
+        return result
 
     # ------------------------------------------------------------------
     # Shared helpers used by both streaming and non-streaming loops
