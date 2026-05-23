@@ -174,6 +174,17 @@ export function initVoiceUI() {
 
   // Push-to-talk: hold spacebar (when not in a text input) to start voice.
   bindGlobalShortcuts();
+
+  // Crash-recovery: if the tab is hidden / unloaded while a session is live,
+  // the SESSION_CLOSED event may not reach us before teardown.  Release the
+  // chat-model selector lock so the next page load isn't stuck on the
+  // Realtime model.  See #1371.  ``pagehide`` is the bfcache-safe spelling
+  // of unload; ``visibilitychange``→hidden catches mobile background.
+  const onLeave = () => releaseSelectorOwnership();
+  window.addEventListener('pagehide', onLeave);
+  window.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') onLeave();
+  });
 }
 
 
@@ -322,6 +333,48 @@ async function toggleSession() {
 }
 
 
+// ---------------------------------------------------------------------------
+// Chat-model selector ownership (#1371).
+//
+// When a Realtime voice session engages, the chat-LLM selector in the chat
+// header stops being honest — the user's selected text model is bypassed,
+// and the Realtime model (e.g. ``gpt-realtime-2``) is what actually produces
+// every turn.  acquire/release flip the selector to display the Realtime
+// model and lock it, then restore the user's prior selection on every exit
+// path (clean close, fatal error, fallback-to-pipeline, page unload).
+//
+// Release is idempotent: multiple exit paths may fire for the same session
+// (e.g. ``close()`` then SESSION_CLOSED then page-unload), and only the
+// first non-noop call actually restores.
+// ---------------------------------------------------------------------------
+
+
+function _chatModelSelector() {
+  // Exposed by chat.js loadModels().  Returns null when chat isn't initialized
+  // (e.g. headless dev pages), in which case ownership becomes a noop.
+  return (typeof window !== 'undefined' && window._sharedModelSelector) || null;
+}
+
+
+function acquireSelectorOwnership(realtimeModelId) {
+  const sel = _chatModelSelector();
+  if (!sel || typeof sel.lockToVoiceModel !== 'function') return;
+  // OpenAI is the only Realtime vendor today; if that ever changes the
+  // session payload should carry the vendor so we can pass it through here.
+  sel.lockToVoiceModel(
+    { vendor: 'openai', model: realtimeModelId },
+    '🎙 voice owns this — stop voice to change',
+  );
+}
+
+
+function releaseSelectorOwnership() {
+  const sel = _chatModelSelector();
+  if (!sel || typeof sel.unlockToPrior !== 'function') return;
+  sel.unlockToPrior();
+}
+
+
 async function startSession() {
   setState(State.CONNECTING);
   resetTurnState();
@@ -354,6 +407,10 @@ async function startSession() {
       });
       await client.start();
       const realtimeModel = client.session?.model || 'gpt-realtime';
+      // Take ownership of the chat-model selector for the lifetime of this
+      // session.  Acquired AFTER ``start()`` so a failed mint doesn't strand
+      // the selector locked.  See #1371.
+      acquireSelectorOwnership(realtimeModel);
       setPathBadge(
         `Realtime · ${realtimeModel}`,
         `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`,
@@ -407,6 +464,11 @@ async function stopSession() {
   const c = client;
   client = null;
   setState(State.IDLE);
+  // Release the chat-model selector lock BEFORE awaiting close so the user
+  // sees their text model restored immediately, even if the WebRTC teardown
+  // hangs.  Release is idempotent: the SESSION_CLOSED handler below will be
+  // a noop if this already restored.
+  releaseSelectorOwnership();
   if (c) {
     try { await c.close(); } catch (_) {}
   }
@@ -419,6 +481,10 @@ function surfaceFatalError(err) {
   // Surface as an agent message so the user sees it inline with the chat.
   addMessage('agent', `⚠ Voice error: ${formatVoiceError(err)}`);
   client = null;
+  // Restore the chat-model selector — fatal errors take a different code
+  // path than stopSession() but the lock still needs releasing or the user
+  // is stranded on the Realtime model for the next text turn.  See #1371.
+  releaseSelectorOwnership();
 }
 
 
@@ -518,6 +584,12 @@ function handleClientEvent(ev) {
       // sees what they got even if the session ended mid-response.
       if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
       if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
+      // Belt-and-suspenders selector restore.  ``stopSession`` and
+      // ``surfaceFatalError`` already release, but events like
+      // ``data_channel_closed`` (network drop, server-side close) reach us
+      // through here without going through either site.  Idempotent — see
+      // #1371.
+      releaseSelectorOwnership();
       break;
 
     case Events.ERROR:

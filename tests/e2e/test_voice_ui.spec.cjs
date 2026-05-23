@@ -221,6 +221,21 @@ async function installRoutes(page, { realtimeStatus = 200, realtime409Body = MOC
       body: JSON.stringify(realtimeStatus === 409 ? realtime409Body : MOCK_REALTIME_SESSION),
     }),
   );
+  // chat.js loadModels() probes the voice route to learn the realtime model
+  // id so it can mark the dropdown option unpickable (see #1371).  Return a
+  // stable mock so the probe doesn't 404 in tests.
+  await page.route('**/voice/realtime/route**', (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        path: 'realtime',
+        voice_model: 'gpt-realtime-stub',
+        conversation_provider: 'openai_realtime',
+        available_tts_providers: ['openai'],
+      }),
+    }),
+  );
   // /voice/config + /voice/chat are the existing endpoints; let the WS stub
   // handle /voice/chat upgrade. /voice/config not exercised here.
 }
@@ -266,6 +281,35 @@ test.describe('Voice UI shell', () => {
 
     // Mic button transitions to listening once the stub fires session.created.
     await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+  });
+
+  test('Realtime engagement locks the chat-model selector and restores on stop (#1371)', async ({ page }) => {
+    await installRoutes(page, { realtimeStatus: 200 });
+    await page.goto(BASE_URL);
+    await page.waitForLoadState('domcontentloaded');
+    await openChatPanel(page);
+
+    // Wait for chat.js to mount the model selector (it is async, behind /api/models).
+    const modelSelect = page.locator('#model-selector');
+    await expect(modelSelect).toBeVisible({ timeout: 10000 });
+    // Ownership starts released — selector is interactive.
+    await expect(modelSelect).not.toBeDisabled();
+    const priorValue = await modelSelect.inputValue();
+
+    // Engage Realtime.  After session.created (auto-fired by the stub) the
+    // selector should be locked and display the Realtime model id.
+    await page.locator('#voice-toggle-btn').click();
+    await expect(page.locator('#voice-toggle-btn')).toHaveAttribute('data-state', 'listening', { timeout: 5000 });
+    await expect(modelSelect).toBeDisabled({ timeout: 5000 });
+    await expect(modelSelect).toHaveValue('gpt-realtime-stub');
+    await expect(modelSelect).toHaveAttribute('title', /voice owns this/i);
+
+    // Stop voice — selector must restore to the prior value and become
+    // interactive again.  Critical: without this, the operator types into the
+    // chat assuming gpt-5.x but the UI is still showing the Realtime model.
+    await page.locator('#voice-toggle-btn').click();
+    await expect(modelSelect).not.toBeDisabled({ timeout: 5000 });
+    await expect(modelSelect).toHaveValue(priorValue);
   });
 
   test('Realtime path keeps user transcript before agent response when events race', async ({ page }) => {
