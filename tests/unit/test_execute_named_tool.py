@@ -102,7 +102,10 @@ class _FakeHooksManager:
         self.post_calls: list[HookInput] = []
 
     async def execute_hooks(self, event: HookEvent, hook_input: HookInput) -> HookOutput:
-        assert event is HookEvent.PRE_TOOL_USE
+        # Subagent dispatch uses ``PRE_SUBAGENT_CALL``; tool dispatch
+        # uses ``PRE_TOOL_USE``. This fake serves both surfaces — the
+        # ``hook_event_name`` on the recorded HookInput discriminates.
+        assert event in (HookEvent.PRE_TOOL_USE, HookEvent.PRE_SUBAGENT_CALL)
         # Record the input AS IT ARRIVED, not after mutation, so tests
         # can still see the pre-modify args.
         self.pre_calls.append(
@@ -124,8 +127,40 @@ class _FakeHooksManager:
         )
 
     async def execute_hooks_parallel(self, event: HookEvent, hook_input: HookInput) -> None:
-        assert event is HookEvent.POST_TOOL_USE
+        assert event in (HookEvent.POST_TOOL_USE, HookEvent.POST_SUBAGENT_CALL)
         self.post_calls.append(hook_input)
+
+
+class _SubagentFeature:
+    """A feature that supports subagent dispatch via the
+    ``Feature.to_orchestrator_tool`` path. The orchestrator-level tool
+    name equals ``self.tool_name`` (snake_case class name in real
+    code); calling ``execute_as_subagent(task=..., context=...)``
+    delegates to the subagent's logic."""
+
+    def __init__(self, tool_name: str, *, returns: Any = None, side_effect=None):
+        self.name = tool_name
+        self.tool_name = tool_name
+        self._returns = returns
+        self._side_effect = side_effect
+        self.subagent_calls: list[dict] = []
+
+    def get_tools(self):
+        # No @tool methods — the subagent dispatcher is the ONLY way
+        # to reach this feature (mirrors MemoryFeature in practice
+        # where Emma's tool surface only sees ``memory_feature`` as a
+        # task-string dispatcher, not the individual @tool methods).
+        return []
+
+    async def execute_as_subagent(self, task: str, context=None, denied_tools=None):
+        self.subagent_calls.append({
+            "task": task,
+            "context": context,
+            "denied_tools": list(denied_tools or []),
+        })
+        if self._side_effect is not None:
+            raise self._side_effect
+        return self._returns
 
 
 class _MinimalOrchestrator(OrchestratorEngineMixin):
@@ -134,6 +169,30 @@ class _MinimalOrchestrator(OrchestratorEngineMixin):
     def __init__(self, features: dict, hooks_manager: _FakeHooksManager):
         self.features = features
         self.hooks_manager = hooks_manager
+        self._explored_features: set[str] = set()
+
+    # The subagent-dispatch fallback path consults
+    # ``_visible_features_by_tool_name`` (tool_registry mixin in real
+    # code). Stand-in here returns every feature with a ``tool_name``
+    # — no visibility filtering — which is the right scope for these
+    # unit tests.
+    def _visible_features_by_tool_name(self):
+        return {
+            feat.tool_name: feat
+            for feat in self.features.values()
+            if hasattr(feat, "tool_name") and hasattr(feat, "execute_as_subagent")
+        }
+
+    async def _get_denied_tools(self, feature_name: str) -> list:
+        # Default to none; tests that exercise denied-tool stripping
+        # override this directly on the instance.
+        return []
+
+    def _register_explored_feature_tools(self, feature) -> None:
+        # Real implementation registers @tool methods for direct call
+        # after first subagent hop. The dispatch path is what we test
+        # here; just record the call so tests can assert it ran.
+        self._explored_features.add(getattr(feature, "tool_name", ""))
 
 
 @pytest.fixture
@@ -495,3 +554,254 @@ class TestExecuteNamedToolGovernance:
             session_id="s", source="voice_realtime",
         )
         assert result == {"success": True, "message_id": "abc"}
+
+
+class TestExecuteNamedToolSubagentDispatch:
+    """Features without @tool-decorated methods (like MemoryFeature in
+    Emma's tool surface) are reached only via the subagent-dispatcher
+    name (``memory_feature(task="...")``). Before this PR,
+    ``execute_named_tool`` walked only ``feature.get_tools()`` and
+    raised ToolNotRegisteredError on the dispatcher name even though
+    the LLM had been told the tool exists. Codex inline-executor + any
+    future voice/MCP/A2A transport were all affected — Emma's chat
+    surfaced the symptom."""
+
+    @pytest.mark.asyncio
+    async def test_dispatches_subagent_when_no_tool_match(self):
+        feature = _SubagentFeature(
+            "memory_feature", returns={"success": True, "result": "200 msgs"},
+        )
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=_FakeHooksManager(),
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature",
+            {"task": "show me recent memory", "context": "for debugging"},
+            session_id="codex-inline-1", source="codex_app_server",
+        )
+        assert result == {"success": True, "result": "200 msgs"}
+        # Subagent received the task/context unchanged.
+        assert len(feature.subagent_calls) == 1
+        call = feature.subagent_calls[0]
+        assert call["task"] == "show me recent memory"
+        assert call["context"] == "for debugging"
+        # First-time dispatch marked the feature explored (same
+        # bookkeeping the chat path does so subsequent direct-tool
+        # calls into the same feature can short-circuit the subagent
+        # hop).
+        assert "memory_feature" in agent._explored_features
+
+    @pytest.mark.asyncio
+    async def test_dispatch_fires_pre_and_post_subagent_hooks(self):
+        feature = _SubagentFeature("memory_feature", returns={"success": True})
+        hooks = _FakeHooksManager()
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        await agent.execute_named_tool(
+            "memory_feature", {"task": "ping"},
+            session_id="s", source="codex_app_server",
+        )
+        # Subagent dispatch fires the OUTER PRE_SUBAGENT_CALL envelope.
+        # The inner PRE_TOOL_USE envelope is asserted separately in
+        # ``test_dispatch_also_fires_pre_and_post_tool_use_inner_envelope``.
+        pre_subagent_calls = [
+            c for c in hooks.pre_calls
+            if c.hook_event_name == HookEvent.PRE_SUBAGENT_CALL.value
+        ]
+        assert len(pre_subagent_calls) == 1
+        pre = pre_subagent_calls[0]
+        assert pre.tool_name == "memory_feature"
+        assert pre.feature_name == "_SubagentFeature"
+        post_subagent_calls = [
+            c for c in hooks.post_calls
+            if c.hook_event_name == HookEvent.POST_SUBAGENT_CALL.value
+        ]
+        assert len(post_subagent_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_pre_subagent_deny_blocks_dispatch(self):
+        feature = _SubagentFeature("memory_feature", returns={"success": True})
+        agent = _MinimalOrchestrator(
+            features={"memory": feature},
+            hooks_manager=_FakeHooksManager(
+                pre_decision=PermissionDecision.DENY,
+                pre_reason="memory access revoked for this session",
+            ),
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature", {"task": "show secrets"},
+            session_id="s", source="codex_app_server",
+        )
+        assert result == {
+            "success": False,
+            "error": "Permission denied: memory access revoked for this session",
+        }
+        # Subagent NOT called.
+        assert feature.subagent_calls == []
+
+    @pytest.mark.asyncio
+    async def test_pre_subagent_ask_blocks_dispatch(self):
+        """ASK is just as blocking as DENY at this surface — the
+        external transport gets an approval-required envelope and the
+        subagent does NOT run. (The approval queue is the chat path's
+        side channel; external transports don't sit on it.)"""
+        feature = _SubagentFeature("memory_feature", returns={"success": True})
+        agent = _MinimalOrchestrator(
+            features={"memory": feature},
+            hooks_manager=_FakeHooksManager(
+                pre_decision=PermissionDecision.ASK,
+                pre_reason="needs sovereign approval",
+            ),
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature", {"task": "delete all"},
+            session_id="s", source="codex_app_server",
+        )
+        assert result == {
+            "success": False,
+            "error": "Approval required: needs sovereign approval",
+        }
+        assert feature.subagent_calls == []
+
+    @pytest.mark.asyncio
+    async def test_denied_tools_threaded_to_subagent(self):
+        """Per-feature deny-list is honored: the dispatcher fetches
+        denied tools and passes them to ``execute_as_subagent`` so the
+        inner subagent loop can strip them from its advertised set."""
+        feature = _SubagentFeature("memory_feature", returns={"success": True})
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=_FakeHooksManager(),
+        )
+
+        async def fake_denied(_name):
+            return ["dangerous_skill"]
+
+        agent._get_denied_tools = fake_denied  # type: ignore[assignment]
+        await agent.execute_named_tool(
+            "memory_feature", {"task": "do safe thing"},
+            session_id="s", source="codex_app_server",
+        )
+        assert feature.subagent_calls[0]["denied_tools"] == ["dangerous_skill"]
+
+    @pytest.mark.asyncio
+    async def test_dispatch_also_fires_pre_and_post_tool_use_inner_envelope(self):
+        """Codex P1 on PR #1385: chat-path ``_dispatch_feature_tool``
+        wraps ``execute_as_subagent`` in ``_execute_tool_with_hooks``
+        which fires PRE_TOOL_USE/POST_TOOL_USE inside the
+        PRE_SUBAGENT_CALL/POST_SUBAGENT_CALL outer envelope. Hooks
+        registered only for PRE_TOOL_USE today observe feature
+        dispatches on the chat path; the codex inline-executor path
+        must see the same envelope or the governance contract diverges
+        per transport. This test pins both event types fire."""
+        feature = _SubagentFeature("memory_feature", returns={"success": True})
+        hooks = _FakeHooksManager()
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        await agent.execute_named_tool(
+            "memory_feature", {"task": "ping"},
+            session_id="s", source="codex_app_server",
+        )
+        pre_events = [
+            call.hook_event_name for call in hooks.pre_calls
+        ]
+        post_events = [
+            call.hook_event_name for call in hooks.post_calls
+        ]
+        assert HookEvent.PRE_SUBAGENT_CALL.value in pre_events
+        assert HookEvent.PRE_TOOL_USE.value in pre_events, (
+            "subagent dispatch must ALSO fire the inner PRE_TOOL_USE "
+            "envelope so per-tool hooks (deny-list, redactors) apply"
+        )
+        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
+        assert HookEvent.POST_TOOL_USE.value in post_events
+
+    @pytest.mark.asyncio
+    async def test_subagent_exception_returns_tool_shaped_error(self):
+        """Codex P2 on PR #1385: chat-path catches subagent exceptions
+        and returns a tool-shaped error envelope (the LLM sees a
+        failure result instead of a transport crash). The inline-
+        executor path must do the same — otherwise a subagent runtime
+        failure kills the codex stream instead of letting the LLM
+        recover."""
+        feature = _SubagentFeature(
+            "memory_feature",
+            side_effect=RuntimeError("DB connection lost"),
+        )
+        hooks = _FakeHooksManager()
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature", {"task": "search"},
+            session_id="s", source="codex_app_server",
+        )
+        # Tool-shaped failure envelope, not exception propagation.
+        assert isinstance(result, dict)
+        assert result["success"] is False
+        assert "DB connection lost" in result["error"]
+        # POST_SUBAGENT_CALL STILL fires on the failure path so
+        # observability sees every dispatch outcome.
+        post_events = [c.hook_event_name for c in hooks.post_calls]
+        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
+
+    @pytest.mark.asyncio
+    async def test_inner_pre_tool_use_deny_blocks_dispatch(self):
+        """A PRE_TOOL_USE hook denying the dispatch (e.g. per-tool
+        deny-list applied to the subagent dispatcher) must block
+        execute_as_subagent even if the outer PRE_SUBAGENT_CALL
+        allowed. POST_SUBAGENT_CALL still fires for observability."""
+        feature = _SubagentFeature("memory_feature", returns={"ok": True})
+        # Hook fixture allows PRE_SUBAGENT_CALL (default), but we want
+        # PRE_TOOL_USE to DENY. The fake fixture's pre_decision is
+        # shared across event types — override via patching the
+        # second-call behavior at the test layer.
+        hooks = _FakeHooksManager()
+        original_execute = hooks.execute_hooks
+        call_count = {"n": 0}
+
+        async def execute_hooks_with_inner_deny(event, hook_input):
+            call_count["n"] += 1
+            result = await original_execute(event, hook_input)
+            if event == HookEvent.PRE_TOOL_USE:
+                return HookOutput(
+                    permission_decision=PermissionDecision.DENY,
+                    permission_reason="tool denied by per-tool policy",
+                )
+            return result
+
+        hooks.execute_hooks = execute_hooks_with_inner_deny
+        agent = _MinimalOrchestrator(
+            features={"memory": feature}, hooks_manager=hooks,
+        )
+        result = await agent.execute_named_tool(
+            "memory_feature", {"task": "do thing"},
+            session_id="s", source="codex_app_server",
+        )
+        assert result == {
+            "success": False,
+            "error": "Permission denied: tool denied by per-tool policy",
+        }
+        assert feature.subagent_calls == []
+        # POST_SUBAGENT_CALL fires on the deny path.
+        post_events = [c.hook_event_name for c in hooks.post_calls]
+        assert HookEvent.POST_SUBAGENT_CALL.value in post_events
+
+    @pytest.mark.asyncio
+    async def test_still_raises_for_unknown_name(self):
+        """When neither a @tool match nor a subagent match exists,
+        ToolNotRegisteredError still raises — backward compat with the
+        prior behavior so callers' error handling is unchanged."""
+        agent = _MinimalOrchestrator(
+            features={"memory": _SubagentFeature("memory_feature")},
+            hooks_manager=_FakeHooksManager(),
+        )
+        from kestrel_sovereign.agent.orchestrator_engine import (
+            ToolNotRegisteredError,
+        )
+        with pytest.raises(ToolNotRegisteredError):
+            await agent.execute_named_tool(
+                "nonexistent_tool", {},
+                session_id="s", source="voice_realtime",
+            )
