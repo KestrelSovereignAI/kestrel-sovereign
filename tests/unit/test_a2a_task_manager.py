@@ -495,6 +495,57 @@ class TestA2ATaskSubmittedSignalSource:
         with pytest.raises(ValueError, match="missing required key"):
             reg.schema({})
 
+    def test_signal_surfaces_a2a_verb_and_reply_expected(self):
+        """Codex P2 on PR #1380: receiver-side verb discrimination
+        must not depend on inferring from skill_id alone. The signal
+        payload must carry the sender's stated verb so the cognition
+        prompt can frame the response appropriately."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        class _FakeTaskQuestion:
+            id = "task-q"
+            sessionId = "sess-q"
+            metadata = {
+                "sender": "emma",
+                "a2a_verb": "question",
+                "reply_expected": True,
+            }
+
+        sig = build_signal_for_submitted_task(
+            _FakeTaskQuestion(), target_agent="meridian-did", sender="emma",
+        )
+        assert sig.payload["a2a_verb"] == "question"
+        assert sig.payload["reply_expected"] is True
+
+        # And the schema validator accepts the enriched payload.
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_a2a_task_submitted_registration,
+        )
+        reg = build_a2a_task_submitted_registration()
+        reg.schema(sig.payload)  # must not raise
+
+    def test_signal_empty_a2a_verb_when_metadata_missing(self):
+        """Legacy / non-PeersFeature task creators leave a2a_verb
+        empty. Signal still builds; payload has empty strings rather
+        than missing keys (so downstream consumers can rely on the
+        keys being present)."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        class _FakeLegacyTask:
+            id = "task-legacy"
+            sessionId = "sess-legacy"
+            metadata = {}
+
+        sig = build_signal_for_submitted_task(
+            _FakeLegacyTask(), target_agent="x", sender="",
+        )
+        assert sig.payload["a2a_verb"] == ""
+        assert sig.payload["reply_expected"] is False
+
     def test_signal_rehydrates_causation_chain_from_metadata(self):
         """Codex P1 on PR #1366: without rehydration, A→B→A task-
         submission ping-pong bypasses cycle detection — every inbound

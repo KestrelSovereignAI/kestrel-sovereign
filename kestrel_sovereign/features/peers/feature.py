@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -270,50 +270,38 @@ class PeersFeature(Feature):
     # waiting for a human-driven chat turn to notice it.
     # ------------------------------------------------------------------
 
-    @tool(
-        name="send_a2a_task",
-        description=(
-            "Submit an A2A task to another agent. Persists the task in "
-            "the recipient's TaskStore and fires the "
-            "a2a.task_submitted signal on their dispatcher so they "
-            "actually wake up and process it. Returns the task_id; "
-            "caller can later poll status via get_a2a_task or receive "
-            "the result via the a2a.task_complete signal when the "
-            "recipient finishes. This is the only inter-agent comms "
-            "verb for async work — there is no parallel mesh path."
-        ),
-        category=ToolCategory.COMMUNICATION,
-        command_prefix="!a2a send",
-    )
-    async def send_a2a_task(
+    async def _post_a2a_task(
         self,
         recipient: str,
         message: str,
         skill_id: str = "",
         session_id: str = "",
-    ) -> ToolResult:
-        """
-        Submit an A2A task to a peer agent and wake their cognition loop.
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[ToolResult]]:
+        """Shared POST helper for all three a2a verbs.
 
-        Args:
-            recipient: Peer agent name (e.g. "Meridian").
-            message: The task description / prompt for the recipient.
-            skill_id: Optional A2A skill id from the receiver's
-                AgentCard (e.g. ``"workflow.assign"``). Defaults to
-                empty — the receiver routes via their default handler.
-            session_id: Optional A2A session id; auto-generated when
-                empty so multiple sends are independent sessions.
+        Returns ``(task_data, error_result)``. Exactly one is non-None:
+        on success, ``task_data`` is the Task envelope from the
+        recipient (with ``id``, ``status``, etc.); on failure
+        ``error_result`` is a populated ToolResult.failed envelope the
+        caller returns directly.
+
+        Centralizing this means the three verbs (send_a2a_message,
+        send_a2a_question, send_a2a_task) share identical wire
+        semantics, causation-chain attachment, and error handling —
+        the difference between them is only what the caller does with
+        the result (fire-and-forget vs sync-wait vs return task_id).
         """
         from uuid import uuid4
 
         if not self._host_url:
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 "Not running in a multi_agent environment — no host to proxy through",
                 data={"sent": False, "recipient": recipient},
             )
 
         if recipient.lower() == self._own_name.lower():
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 "Cannot send an A2A task to yourself",
                 data={"sent": False, "recipient": recipient},
             )
@@ -321,19 +309,16 @@ class PeersFeature(Feature):
         task_id = uuid4().hex
         sess_id = session_id or uuid4().hex
         url = f"{self._host_url}/api/agents/{recipient}/api/agent/tasks/send"
-        outbound_metadata: Dict[str, Any] = {
-            "sender": self._own_name,
-        }
+        outbound_metadata: Dict[str, Any] = {"sender": self._own_name}
         if skill_id:
             outbound_metadata["skill"] = skill_id
+        if extra_metadata:
+            outbound_metadata.update(extra_metadata)
         # Attach the in-flight signal-driven turn's causation chain so
         # the receiving agent's a2a.task_submitted signal carries the
         # lineage. Without this, A→B→A ping-pong loops bypass the
         # dispatcher's cycle detection (every inbound task starts
-        # fresh at depth 1). Codex P1 on PR #1366. Pulled via the
-        # agent's ``_provide_causation_chain`` if available — same
-        # accessor TaskManager.create_task uses for outbound chain
-        # attachment.
+        # fresh at depth 1). Codex P1 on PR #1366.
         chain_provider = getattr(self.agent, "_provide_causation_chain", None)
         if callable(chain_provider):
             try:
@@ -370,29 +355,29 @@ class PeersFeature(Feature):
                     ),
                 )
         except httpx.ConnectError:
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except httpx.TimeoutException:
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 f"Agent '{recipient}' timed out",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except Exception as e:
             logger.error(f"A2A send to '{recipient}' failed: {e}")
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 str(e),
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
 
         if resp.status_code == 404:
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 f"Agent '{recipient}' not found or A2A endpoint missing",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         if resp.status_code == 503:
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 f"Agent '{recipient}' is offline or TaskManager unavailable",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
@@ -401,22 +386,318 @@ class PeersFeature(Feature):
             resp.raise_for_status()
             task_data = resp.json()
         except Exception as e:
-            return ToolResult.failed(
+            return None, ToolResult.failed(
                 str(e),
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
 
+        # Ensure id/sessionId always populate (older recipients might
+        # echo only one or the other).
+        task_data.setdefault("id", task_id)
+        task_data.setdefault("sessionId", sess_id)
+        return task_data, None
+
+    @tool(
+        name="send_a2a_message",
+        description=(
+            "Send an async message to another agent — fire-and-forget, "
+            "no reply expected. Persists in the recipient's TaskStore "
+            "and fires the a2a.task_submitted signal so they wake and "
+            "see it on their next cognition turn, but the caller does "
+            "NOT track lifecycle. Use this for notifications, FYIs, "
+            "status updates ('I just shipped PR 42'). For a tracked "
+            "work assignment use send_a2a_task; for a synchronous "
+            "Q&A use send_a2a_question."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a tell",
+    )
+    async def send_a2a_message(
+        self,
+        recipient: str,
+        message: str,
+        session_id: str = "",
+    ) -> ToolResult:
+        """
+        Send an async fire-and-forget A2A message. The recipient's
+        cognition loop wakes (a2a.task_submitted), they see the
+        message, they decide whether to act — but the caller doesn't
+        wait or track. Same wire as send_a2a_task but no skill_id is
+        attached (signals "informational, not work assignment").
+        """
+        task_data, err = await self._post_a2a_task(
+            recipient=recipient, message=message,
+            skill_id="", session_id=session_id,
+            extra_metadata={"a2a_verb": "message"},
+        )
+        if err is not None:
+            return err
         return ToolResult.ok(
             confirmation=(
-                f"A2A task {task_id} submitted to {recipient} "
-                f"(state={task_data.get('status',{}).get('state','?')}). "
+                f"A2A message sent to {recipient} "
+                f"(task_id={task_data['id']}). Recipient has been signaled."
+            ),
+            data={
+                "sent": True,
+                "task_id": task_data["id"],
+                "session_id": task_data["sessionId"],
+                "recipient": recipient,
+            },
+        )
+
+    @tool(
+        name="send_a2a_question",
+        description=(
+            "Ask another agent a question synchronously and return "
+            "their answer. Wraps an A2A task and waits for it to "
+            "reach a terminal state (COMPLETED, FAILED, or CANCELED), "
+            "polling the recipient's task endpoint. Use this when you "
+            "need the answer right now to continue your own turn. For "
+            "fire-and-forget use send_a2a_message; for delegating "
+            "tracked work you'll check on later use send_a2a_task. "
+            "Note: this is the proper agent-to-agent path. ask_agent "
+            "(legacy) goes through the sovereign chat endpoint, which "
+            "doesn't carry sender attribution — prefer this verb."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a ask",
+    )
+    async def send_a2a_question(
+        self,
+        recipient: str,
+        message: str,
+        session_id: str = "",
+        timeout_seconds: int = 60,
+    ) -> ToolResult:
+        """
+        Submit an A2A task and wait synchronously for it to terminate,
+        returning the recipient's answer.
+
+        Polls ``GET /api/agents/{recipient}/api/agent/tasks/{task_id}``
+        at ~1s intervals (longer as the wait extends) until the task
+        reaches a terminal state or ``timeout_seconds`` elapses.
+
+        Args:
+            recipient: Peer agent name (e.g. "Meridian").
+            message: The question / prompt.
+            session_id: Optional A2A session id.
+            timeout_seconds: Maximum wait. Default 60s; long-running
+                analyses should use send_a2a_task and check back later.
+        """
+        import asyncio
+
+        task_data, err = await self._post_a2a_task(
+            recipient=recipient, message=message,
+            skill_id="", session_id=session_id,
+            extra_metadata={
+                "a2a_verb": "question",
+                "reply_expected": True,
+            },
+        )
+        if err is not None:
+            return err
+
+        task_id = task_data["id"]
+        sess_id = task_data["sessionId"]
+        get_url = (
+            f"{self._host_url}/api/agents/{recipient}/api/agent/tasks/{task_id}"
+        )
+        terminal_states = ("completed", "failed", "canceled")
+        # Polling cadence: tight at first (responsive for quick
+        # answers), then back off to reduce load on long waits.
+        poll_intervals = [0.5, 0.5, 1.0, 1.0, 1.5, 2.0, 2.5, 3.0]
+        # Wall-clock deadline rather than accumulated-sleep elapsed —
+        # codex P2: each GET can spend up to PEER_CONNECT_TIMEOUT
+        # before returning, so summing sleeps drifted the effective
+        # timeout well past timeout_seconds during dropped responses.
+        # time.monotonic() gives us the real-time deadline.
+        import time
+        deadline = time.monotonic() + float(timeout_seconds)
+        poll_idx = 0
+
+        while time.monotonic() < deadline:
+            interval = poll_intervals[
+                min(poll_idx, len(poll_intervals) - 1)
+            ]
+            poll_idx += 1
+            await asyncio.sleep(interval)
+
+            try:
+                async with httpx.AsyncClient() as client:
+                    poll_resp = await client.get(
+                        get_url,
+                        headers=self._build_headers(),
+                        timeout=httpx.Timeout(
+                            connect=PEER_CONNECT_TIMEOUT,
+                            read=PEER_CONNECT_TIMEOUT,
+                            write=PEER_CONNECT_TIMEOUT,
+                            pool=PEER_CONNECT_TIMEOUT,
+                        ),
+                    )
+            except (httpx.ConnectError, httpx.TimeoutException):
+                # Transient — keep waiting until the wall-clock deadline.
+                continue
+            except Exception as e:
+                logger.warning(
+                    "A2A poll for %s/%s failed: %s",
+                    recipient, task_id, e,
+                )
+                continue
+
+            if poll_resp.status_code != 200:
+                continue
+            try:
+                state_data = poll_resp.json()
+            except ValueError:
+                continue
+            # Codex P1: the real GET /tasks/{task_id} endpoint in
+            # endpoints/agent.py FLATTENS the task envelope:
+            # ``{"status": "completed", "message": "...", ...}`` —
+            # ``status`` is a string, ``message`` is at the top level.
+            # The canonical A2A spec shape is
+            # ``{"status": {"state": "completed", "message": {"parts":
+            # [...]}}}``. Support BOTH so the tool works against the
+            # current kestrel endpoint AND any future spec-compliant
+            # receiver. Same dual-shape handling for answer extraction
+            # below.
+            raw_status = state_data.get("status")
+            if isinstance(raw_status, dict):
+                current_state = raw_status.get("state")
+            else:
+                current_state = raw_status
+            if current_state not in terminal_states:
+                continue
+
+            # Terminal state reached — extract answer text from each
+            # of three locations the receiver might use:
+            # 1. ``status.message.parts[].text`` (canonical A2A)
+            # 2. Top-level ``"message"`` string (kestrel's flattened
+            #    endpoint at endpoints/agent.py:1010)
+            # 3. ``artifacts[].parts[].text`` (canonical A2A artifact
+            #    payload — used when the agent's final answer is
+            #    structured rather than chat-shaped)
+            answer_text = ""
+            if isinstance(raw_status, dict):
+                msg = raw_status.get("message") or {}
+                for part in (msg.get("parts") or []):
+                    if isinstance(part, dict) and "text" in part:
+                        answer_text = part["text"]
+                        break
+            if not answer_text:
+                top_msg = state_data.get("message")
+                if isinstance(top_msg, str) and top_msg:
+                    answer_text = top_msg
+            if not answer_text:
+                for artifact in (state_data.get("artifacts") or []):
+                    if isinstance(artifact, dict):
+                        for part in (artifact.get("parts") or []):
+                            if isinstance(part, dict) and "text" in part:
+                                answer_text = part["text"]
+                                break
+                    if answer_text:
+                        break
+
+            if current_state == "completed":
+                return ToolResult.ok(
+                    confirmation=(
+                        f"Got answer from {recipient} "
+                        f"(task_id={task_id})"
+                    ),
+                    data={
+                        "answered": True,
+                        "task_id": task_id,
+                        "session_id": sess_id,
+                        "recipient": recipient,
+                        "answer": answer_text,
+                        "state": current_state,
+                    },
+                )
+            return ToolResult.failed(
+                f"Agent '{recipient}' returned terminal state "
+                f"{current_state!r}: {answer_text or '(no message)'}",
+                data={
+                    "answered": False,
+                    "task_id": task_id,
+                    "session_id": sess_id,
+                    "recipient": recipient,
+                    "answer": answer_text,
+                    "state": current_state,
+                },
+            )
+
+        # Timeout — the task may still complete later; the caller can
+        # poll the task_id manually via the receiver's /tasks/{id}
+        # endpoint, or switch to send_a2a_task for tracked async work.
+        return ToolResult.partial(
+            confirmation=(
+                f"A2A question to {recipient} (task_id={task_id}) did "
+                f"not reach a terminal state within "
+                f"{timeout_seconds}s. The task is still live; switch "
+                f"to send_a2a_task for tracked async work, or retry "
+                f"with a larger timeout_seconds."
+            ),
+            error="timeout",
+            data={
+                "answered": False,
+                "task_id": task_id,
+                "session_id": sess_id,
+                "recipient": recipient,
+                "state": "timeout",
+            },
+        )
+
+    @tool(
+        name="send_a2a_task",
+        description=(
+            "Submit a tracked A2A task to another agent. Persists in "
+            "the recipient's TaskStore, fires the a2a.task_submitted "
+            "signal so they wake and process it, returns the task_id "
+            "for tracking. Caller can poll status via get_a2a_task "
+            "(or receive the a2a.task_complete signal). Use this for "
+            "delegated work you'll check on later. For an answer "
+            "now use send_a2a_question; for a fire-and-forget "
+            "notification use send_a2a_message."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a send",
+    )
+    async def send_a2a_task(
+        self,
+        recipient: str,
+        message: str,
+        skill_id: str = "",
+        session_id: str = "",
+    ) -> ToolResult:
+        """
+        Submit an A2A task to a peer agent and wake their cognition loop.
+
+        Args:
+            recipient: Peer agent name (e.g. "Meridian").
+            message: The task description / prompt for the recipient.
+            skill_id: Optional A2A skill id from the receiver's
+                AgentCard (e.g. ``"workflow.assign"``). Defaults to
+                empty — the receiver routes via their default handler.
+            session_id: Optional A2A session id; auto-generated when
+                empty so multiple sends are independent sessions.
+        """
+        task_data, err = await self._post_a2a_task(
+            recipient=recipient, message=message,
+            skill_id=skill_id, session_id=session_id,
+            extra_metadata={"a2a_verb": "task"},
+        )
+        if err is not None:
+            return err
+        return ToolResult.ok(
+            confirmation=(
+                f"A2A task {task_data['id']} submitted to {recipient} "
+                f"(state={(task_data.get('status') or {}).get('state','?')}). "
                 f"Recipient's dispatcher has been signaled."
             ),
             data={
                 "sent": True,
-                "task_id": task_data.get("id", task_id),
-                "session_id": task_data.get("sessionId", sess_id),
-                "state": task_data.get("status", {}).get("state"),
+                "task_id": task_data["id"],
+                "session_id": task_data["sessionId"],
+                "state": (task_data.get("status") or {}).get("state"),
                 "recipient": recipient,
             },
         )

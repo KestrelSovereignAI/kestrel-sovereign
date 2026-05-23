@@ -74,6 +74,18 @@ def _a2a_submitted_schema(payload: dict) -> dict:
             raise ValueError(
                 f"a2a.task_submitted payload {key} must be a string"
             )
+    # Optional discriminator fields (added in #1380). Empty strings are
+    # valid (legacy / non-PeersFeature task creators leave them blank).
+    if "a2a_verb" in payload and not isinstance(payload["a2a_verb"], str):
+        raise ValueError(
+            "a2a.task_submitted payload a2a_verb must be a string"
+        )
+    if "reply_expected" in payload and not isinstance(
+        payload["reply_expected"], bool
+    ):
+        raise ValueError(
+            "a2a.task_submitted payload reply_expected must be a bool"
+        )
     return payload
 
 
@@ -85,6 +97,7 @@ def _a2a_submitted_redact(payload: dict) -> str:
         f"a2a.task_submitted "
         f"task_id={payload.get('task_id','?')} "
         f"sender={payload.get('sender','?')} "
+        f"verb={payload.get('a2a_verb','?')} "
         f"skill={payload.get('skill_id','?')}"
     )
 
@@ -151,8 +164,19 @@ def build_signal_for_submitted_task(
     session_id = str(getattr(task, "sessionId", "") or "")
     metadata = getattr(task, "metadata", {}) or {}
     skill_id = ""
+    # ``a2a_verb`` discriminates message vs question vs task at the
+    # cognition-prompt level — codex P2 on PR #1380. Without this, an
+    # empty-skill message looks indistinguishable from an empty-skill
+    # task to the receiver. The PeersFeature send_a2a_* tools each
+    # stamp it; tasks created via other paths (local self-spawn,
+    # subagent dispatch, etc.) leave it empty and the prompt falls
+    # back to generic "task" framing.
+    a2a_verb = ""
+    reply_expected = False
     if isinstance(metadata, dict):
         skill_id = str(metadata.get("skill") or metadata.get("skill_id") or "")
+        a2a_verb = str(metadata.get("a2a_verb") or "")
+        reply_expected = bool(metadata.get("reply_expected", False))
     chain = _deserialize_chain(metadata if isinstance(metadata, dict) else {})
     return Signal(
         source=SOURCE_NAME,
@@ -163,6 +187,8 @@ def build_signal_for_submitted_task(
             "session_id": session_id,
             "sender": sender or str(metadata.get("sender", "") or ""),
             "skill_id": skill_id,
+            "a2a_verb": a2a_verb,
+            "reply_expected": reply_expected,
         },
         target_agent=target_agent,
         visibility=Visibility.INTERNAL,
