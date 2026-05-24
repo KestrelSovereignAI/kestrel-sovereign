@@ -157,14 +157,51 @@ class ContextFeature(Feature):
         return "Manage context window - check status, summarize sections, mark content priority, compress, exclude/restore content"
 
     async def initialize(self):
-        """Initialize the context feature with required references."""
-        self.context_manager = getattr(self.agent, 'context_manager', None)
-        self.llm_service = getattr(self.agent, 'llm_service', None)
+        """Initialize the context feature.
 
-        if not self.context_manager:
-            logger.warning("ContextFeature initialized without context_manager - some tools may not work")
-
+        ``context_manager`` and ``llm_service`` are exposed as properties
+        that read from ``self.agent`` at call time. The agent's
+        ``initialize()`` creates the ContextManager (kestrel_agent.py:1034)
+        AFTER it discovers and registers features (line 819), so a
+        snapshot taken here would be ``None`` forever — including on
+        multi-agent satellites, which is how the bug surfaced in #1382.
+        Reading through ``self.agent`` at tool-call time fixes that
+        without depending on registration order.
+        """
         logger.info("ContextFeature initialized")
+
+    @property
+    def context_manager(self):
+        """Resolve the agent's ContextManager at call time.
+
+        Returns ``None`` until the agent finishes ``initialize()`` and
+        attaches one. Each tool below checks for ``None`` and surfaces a
+        precise error rather than relying on a snapshot captured during
+        feature registration (which races the agent's own init order).
+        """
+        return getattr(getattr(self, "agent", None), "context_manager", None)
+
+    @context_manager.setter
+    def context_manager(self, value):
+        # Test-only setter: a few unit tests construct a feature shell
+        # with ``ContextFeature.__new__`` (no __init__) and then assign
+        # a mock here. We push the mock onto the agent so the
+        # property's read path still returns it.
+        if getattr(self, "agent", None) is None:
+            self.agent = type("AgentStub", (), {})()
+        self.agent.context_manager = value
+
+    @property
+    def llm_service(self):
+        """Resolve the agent's LLM service at call time. See
+        ``context_manager`` above — same race, same fix."""
+        return getattr(getattr(self, "agent", None), "llm_service", None)
+
+    @llm_service.setter
+    def llm_service(self, value):
+        if getattr(self, "agent", None) is None:
+            self.agent = type("AgentStub", (), {})()
+        self.agent.llm_service = value
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -224,7 +261,18 @@ class ContextFeature(Feature):
     async def context_status(self) -> ToolResult:
         """Get detailed context window status."""
         if not self.context_manager:
-            return ToolResult.failed("Context manager not available")
+            # The property reads ``self.agent.context_manager`` at call
+            # time; ``None`` here means the agent really has no manager
+            # attached, not that registration ran before init. Tell the
+            # operator which side is missing instead of the historical
+            # opaque "not available".
+            agent_kind = type(self.agent).__name__ if self.agent else "None"
+            return ToolResult.failed(
+                "context_manager is not attached to this agent "
+                f"(agent={agent_kind}); the agent's initialize() did "
+                "not construct a ContextManager. This tool is "
+                "unavailable until that wiring is in place."
+            )
 
         try:
             context_stats = getattr(self.agent, 'context_stats', None)

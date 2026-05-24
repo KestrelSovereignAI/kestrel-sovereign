@@ -480,3 +480,263 @@ async def test_talon_file_and_claim_refuses_without_computer_use():
     res = await feat.talon_file_and_claim(title="x", body="y")
     assert res.data["filed"] is False
     assert "ComputerUseFeature unavailable" in (res.error or "")
+    # #1383: reason_code must be set even on the no-CU short-circuit
+    # so the audit trail and the model's narration can carry it.
+    assert res.data["reason_code"] == "MISSING_COMPUTER_USE"
+
+
+# --------------------------------------------------------------------------
+# #1383 - talon_file_and_claim discriminated reason codes + outcome audit
+# --------------------------------------------------------------------------
+
+
+def _file_and_claim_feat_with(shell_factory, claim_data=None, security=None):
+    """Build a TalonCoordinatorFeature wired with a fake CU.shell and
+    optionally a fake SecurityFeature for outcome-audit assertions.
+
+    ``shell_factory`` is a callable receiving (command, timeout) that
+    returns a ToolResult — used to simulate the various failure modes
+    the classifier must distinguish (#1383)."""
+    from types import SimpleNamespace
+
+    from kestrel_sovereign.features.talon.coordinator import (
+        TalonCoordinatorFeature,
+    )
+
+    feat = TalonCoordinatorFeature.__new__(TalonCoordinatorFeature)
+
+    class FakeCU:
+        async def shell(self, command, timeout=60):
+            return await shell_factory(command, timeout)
+
+    def _get_feature(name):
+        if name == "ComputerUseFeature":
+            return FakeCU()
+        if name == "SecurityFeature":
+            return security
+        return None
+
+    feat.agent = SimpleNamespace(get_feature=_get_feature)
+
+    async def fake_claim(repo, issue):
+        from kestrel_sdk.tools.result import ToolResult
+        if claim_data is None:
+            return ToolResult.failed("not dispatched", data={"dispatched": False})
+        return ToolResult.ok("dispatched", data=claim_data)
+
+    feat.talon_claim = fake_claim
+    return feat
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_classifies_missing_gh_auth():
+    """gh exiting with 'Bad credentials' must surface MISSING_GH_AUTH —
+    not the historical catch-all "may have been denied at the approval
+    gate, gh is not authenticated, or it failed for a non-label
+    reason."""
+    from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
+
+    async def _shell(cmd, timeout):
+        return ToolResult.partial(
+            "ran but failed",
+            "exit 1",
+            data={
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "HTTP 401: Bad credentials",
+            },
+        )
+
+    feat = _file_and_claim_feat_with(_shell)
+    res = await feat.talon_file_and_claim(
+        title="t", body="b", labels="bug", repo="o/r",
+    )
+    assert res.status is ToolResultStatus.ERROR
+    assert res.data["reason_code"] == "MISSING_GH_AUTH"
+    assert "MISSING_GH_AUTH" in (res.error or "")
+    assert "GH_TOKEN" in (res.error or "") or "auth" in (res.error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_classifies_repo_not_found():
+    from kestrel_sdk.tools.result import ToolResult
+
+    async def _shell(cmd, timeout):
+        return ToolResult.partial(
+            "ran but failed",
+            "exit 1",
+            data={
+                "returncode": 1,
+                "stdout": "",
+                "stderr": (
+                    "GraphQL: Could not resolve to a Repository with the "
+                    "name 'o/r'."
+                ),
+            },
+        )
+
+    feat = _file_and_claim_feat_with(_shell)
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["reason_code"] == "REPO_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_classifies_shell_timeout():
+    from kestrel_sdk.tools.result import ToolResult
+
+    async def _shell(cmd, timeout):
+        return ToolResult.partial(
+            "timed out",
+            "exit -1",
+            data={
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "",
+                "timed_out": True,
+            },
+        )
+
+    feat = _file_and_claim_feat_with(_shell)
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["reason_code"] == "SHELL_TIMEOUT"
+    assert res.data["shell_timed_out"] is True
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_classifies_gate_denied():
+    from kestrel_sdk.tools.result import ToolResult
+
+    async def _shell(cmd, timeout):
+        # cu.shell returns failed (no data) when the approval gate
+        # refuses the command.
+        return ToolResult.failed(
+            "approval-gate denied shell_execution_host: not allowlisted",
+        )
+
+    feat = _file_and_claim_feat_with(_shell)
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["reason_code"] == "GATE_DENIED"
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_url_parse_failed_when_gh_ok_but_no_url():
+    """gh exited 0 but stdout was empty — URL_PARSE_FAILED, NOT a
+    generic UNKNOWN_FAILURE."""
+    from kestrel_sdk.tools.result import ToolResult
+
+    async def _shell(cmd, timeout):
+        return ToolResult.ok(
+            "created",
+            data={"returncode": 0, "stdout": "(nothing useful)\n"},
+        )
+
+    feat = _file_and_claim_feat_with(_shell)
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["reason_code"] == "URL_PARSE_FAILED"
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_writes_outcome_audit_row_on_failure():
+    """#1383: the gate's pre-execution row logs the DECISION; the tool
+    must ALSO append an OUTCOME row so audits show what happened, not
+    just what was allowed."""
+    from kestrel_sdk.tools.result import ToolResult
+    from types import SimpleNamespace
+
+    rows = []
+
+    class FakeStore:
+        async def log_decision(self, **kwargs):
+            rows.append(kwargs)
+
+    fake_security = SimpleNamespace(permission_store=FakeStore())
+
+    async def _shell(cmd, timeout):
+        return ToolResult.partial(
+            "ran but failed", "exit 1",
+            data={
+                "returncode": 1, "stdout": "",
+                "stderr": "HTTP 401: Bad credentials",
+            },
+        )
+
+    feat = _file_and_claim_feat_with(_shell, security=fake_security)
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["reason_code"] == "MISSING_GH_AUTH"
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["action"] == "tool_outcome"
+    assert row["tool_name"] == "talon_file_and_claim.outcome"
+    assert row["feature_name"] == "talon_feature"
+    # The summary carries enough for triage without parsing the data.
+    summary = row["args_summary"]
+    assert "MISSING_GH_AUTH" in summary
+    assert "o/r" in summary
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_writes_outcome_audit_row_on_success():
+    from kestrel_sdk.tools.result import ToolResult
+    from types import SimpleNamespace
+
+    rows = []
+
+    class FakeStore:
+        async def log_decision(self, **kwargs):
+            rows.append(kwargs)
+
+    fake_security = SimpleNamespace(permission_store=FakeStore())
+
+    async def _shell(cmd, timeout):
+        return ToolResult.ok(
+            "created",
+            data={
+                "returncode": 0,
+                "stdout": "https://github.com/o/r/issues/1234\n",
+            },
+        )
+
+    feat = _file_and_claim_feat_with(
+        _shell,
+        claim_data={"dispatched": True, "job_id": "j-1"},
+        security=fake_security,
+    )
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["dispatched"] is True
+    # Success path also writes an outcome row — the audit log is the
+    # ledger of WHAT HAPPENED, not just of failures.
+    assert len(rows) == 1
+    assert rows[0]["decision"] == "filed_and_dispatched"
+    assert "1234" in rows[0]["args_summary"]
+
+
+@pytest.mark.asyncio
+async def test_file_and_claim_outcome_audit_is_best_effort():
+    """A failure inside the audit-row write must NOT crash the loop-
+    closing primitive — the tool still returns its real result."""
+    from kestrel_sdk.tools.result import ToolResult
+    from types import SimpleNamespace
+
+    class BrokenStore:
+        async def log_decision(self, **kwargs):
+            raise RuntimeError("disk full")
+
+    fake_security = SimpleNamespace(permission_store=BrokenStore())
+
+    async def _shell(cmd, timeout):
+        return ToolResult.ok(
+            "created",
+            data={
+                "returncode": 0,
+                "stdout": "https://github.com/o/r/issues/42\n",
+            },
+        )
+
+    feat = _file_and_claim_feat_with(
+        _shell,
+        claim_data={"dispatched": True, "job_id": "j"},
+        security=fake_security,
+    )
+    res = await feat.talon_file_and_claim(title="t", body="b", repo="o/r")
+    assert res.data["dispatched"] is True
+    assert res.data["issue_number"] == 42
