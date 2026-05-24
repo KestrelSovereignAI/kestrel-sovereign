@@ -420,7 +420,32 @@ class CodexAdapter(LLMAdapter):
             # ``KESTREL_CODEX_CWD`` overrides for daemon/agent runtimes
             # where ``Path.cwd()`` may not match the intended workspace.
             cwd = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
-            params: Dict[str, Any] = {"sandbox": "read-only", "cwd": cwd}
+            # Parity with kestrel-claw's thread-lifecycle.ts:599-619:
+            # ``experimentalRawEvents`` flips codex's notification stream from
+            # the legacy aggregated shape (which our adapter never wired up)
+            # to the granular ``item/agentMessage/delta`` /
+            # ``item/reasoning/textDelta`` / ``item/tool/call`` events that
+            # ``_run_turn`` reads. Without it, codex enters ``session_loop``
+            # and the response surfaces via a different channel, so kestrel
+            # sees zero events and trips the 300s idle timeout.
+            # ``persistExtendedHistory`` mirrors what claw asks for so
+            # multi-turn sessions retain the full prior context server-side.
+            params: Dict[str, Any] = {
+                "sandbox": "read-only",
+                "cwd": cwd,
+                "experimentalRawEvents": True,
+                "persistExtendedHistory": True,
+                # Matches kestrel-claw's CODEX_CODE_MODE_DISABLED_THREAD_CONFIG
+                # — kestrel uses dynamicTools for its own dispatch, not
+                # codex's native code-mode bridge. Without this field,
+                # codex 0.131+ enters session_loop on turn/start and never
+                # makes the upstream Responses API call (hangs indefinitely
+                # at thread-lifecycle.ts:599).
+                "config": {
+                    "features.code_mode": False,
+                    "features.code_mode_only": False,
+                },
+            }
             if m:
                 params["model"] = m
             if instructions:
@@ -628,12 +653,27 @@ class CodexAdapter(LLMAdapter):
 
         sink = app.open_turn_sink(thread_id)
         try:
-            # dynamicTools are registered at thread/start (above); turn/start
-            # only carries the user input.
-            await app.request("turn/start", {
+            # dynamicTools are registered at thread/start; turn/start carries
+            # the user input plus per-turn overrides that mirror what
+            # kestrel-claw's working client sends (run-attempt.ts:2313).
+            # Without these, codex 0.131.0+ in app-server mode hangs after
+            # ``session_loop: enter`` — the model/cwd/effort defaults from
+            # thread/start aren't picked up by the turn pipeline.
+            turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": turn_input}],
-            }, timeout=60)
+                "cwd": os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd()),
+            }
+            # Reuse _model_param's sentinel filter — "auto"/"default" are
+            # kestrel-side route placeholders, not real model ids; the
+            # app-server rejects them. Codex review (#1388 P1) caught
+            # that the previous unconditional pass would break
+            # ``openai:plan`` agents whose route was configured with
+            # ``model = "auto"``.
+            m_for_turn = self._model_param(model)
+            if m_for_turn:
+                turn_params["model"] = m_for_turn
+            await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
             final_text: Optional[str] = None
