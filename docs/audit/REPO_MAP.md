@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-23
-**Scope:** 1553 tracked files (1006 `.py`, 265 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-24
+**Scope:** 1559 tracked files (1011 `.py`, 266 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -403,8 +403,6 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/peers/__init__.py** — —
 - **kestrel_sovereign/features/peers/feature.py** — Peers Feature — Inter-agent communication for multi_agent environments.
   - `class PeersFeature`
-- **kestrel_sovereign/features/peers/mesh.py** — Agent Mesh Protocol — structured message types for inter-agent communication.
-  - `class MeshMessageType`; `class MeshPriority`; `class RedActionRisk`; `def is_critical_path(changed_files)`; `class MeshMessage`; `def make_assign_message(sender, recipient, repo, issue_number, …)`; `def make_complete_message(sender, recipient, correlation_id, repo, …)`; `def make_review_message(sender, recipient, repo, pr_number, …)`; `…`
 - **kestrel_sovereign/features/privacy/__init__.py** — —
 - **kestrel_sovereign/features/privacy/component.yaml** — (configuration)
 - **kestrel_sovereign/features/privacy/feature.py** — —
@@ -552,6 +550,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/host.py** — Kestrel Host - Thin FastAPI proxy + static file server + process manager.
   - `def get_api_key()`; `def load_multi_agent_config()`; `async def lifespan(app)`; `async def auth_middleware(request, call_next)`; `async def serve_index()`; `async def get_bootstrap_key(request)`; `async def github_proxy(path, request)`; `async def health_check(request)`; `…`
 - **kestrel_sovereign/identity/__init__.py** — Kestrel Identity Module: Substrate-Independent Agent Portability.
+- **kestrel_sovereign/identity/access_grant.py** — Data-access grants — owner-signed consent for cross-agent imports (kestrel-sovereign #1273, prerequisite for kestrel-feature-healthcare Phase D / Frinz #163).
+  - `class DataAccessGrant`; `def signable_payload(grant)`; `def compute_grant_id(grant)`; `def sign_owner(grant, owner_keypairs)`; `def finalize(grant)`; `class ConsentVerification`; `async def verify_grant(grant)`; `async def verify_import_consent(package, grant)`
 - **kestrel_sovereign/identity/continuity_verifier.py** — Continuity Verifier: Verify agent identity continuity across migrations.
   - `class ChallengeType`; `class IdentityChallenge`; `class ChallengeResult`; `class ContinuityScore`; `class MigrationCertificate`; `class ChallengeGenerator`; `class ContinuityVerifier`; `class AuditTrail`; `…`
 - **kestrel_sovereign/identity/did_web.py** — did:web producer + resolver — Wave 2 sub-PR 3 of Quantum Hardening (#921, #917).
@@ -785,6 +785,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/signals/sources/__init__.py** — Built-in signal source registrations.
 - **kestrel_sovereign/signals/sources/a2a.py** — Source registration for A2A task completion (Phase 5 of #889).
   - `def build_a2a_task_complete_registration()`; `def build_signal_for_completed_task(task, target_agent)`; `def serialize_chain_for_metadata(chain)`
+- **kestrel_sovereign/signals/sources/a2a_task_submitted.py** — Signal source for inbound A2A task submission.
+  - `def build_a2a_task_submitted_registration()`; `def build_signal_for_submitted_task(task, target_agent, sender)`
 - **kestrel_sovereign/signals/sources/channels.py** — Signal source for inbound channel messages.
   - `def build_channel_message_registration()`; `def build_signal_for_channel_message(message, target_agent)`
 - **kestrel_sovereign/signals/sources/heartbeat.py** — Source registration for the heartbeat (Phase 3 of #889).
@@ -921,6 +923,8 @@ Repo entry points and standard project files.
   - `class ActionItem`; `class PersonMatch`; `class PersonResolver`; `class ActionItemExtractor`; `class DecisionExtractor`; `def extract_interaction_sentiment(content)`; `class SchemaRouter`
 - **kestrel_sovereign/storage/sovereign_adapter.py** — Sovereign Storage Adapter V2 - The Encrypted Merkle Forest.
   - `class ShardMetadata`; `class AssetDescriptor`; `class AssetMetadata`; `class AssetCollector`; `class RootManifest`; `class ImportCheck`; `class ImportContinuity`; `class SovereignImportResult`; `…`
+- **kestrel_sovereign/storage/sovereign_import_consent.py** — Sovereignty-CAR import-consent wiring (#1379, follow-up to #1273).
+  - `async def verify_car_import_consent(manifest, grant)`
 - **kestrel_sovereign/storage/sync/__init__.py** — SQLite-First Sync Layer
 - **kestrel_sovereign/storage/sync/gcs_target.py** — GCS Sync Target
   - `class GCSTarget`
@@ -1555,6 +1559,8 @@ Repo entry points and standard project files.
   - `def mock_agent_app()`; `def integration_config(tmp_path)`; `class TestHostAgentIntegration`
 - **tests/integration/test_identity_export_import.py** — Integration tests for Identity Export/Import functionality.
   - `async def test_db()`; `async def populated_db(test_db)`; `class TestIdentityExporter`; `class TestIdentityImporter`; `class TestExportImportRoundTrip`
+- **tests/integration/test_identity_import_consent.py** — Integration tests for #1273 — `verify_import_consent` wired into `IdentityImporter.import_package`.
+  - `async def test_db()`; `def owner()`; `def source()`; `def host()`; `def signed_package(source)`; `def signed_grant(owner, source, host)`; `def stub_package_sig_ok(monkeypatch)`; `async def test_grant_none_preserves_existing_behavior(test_db, signed_package)`; `…`
 - **tests/integration/test_inception.py** — —
   - `async def test_successful_inception(tmp_path)`
 - **tests/integration/test_key_management.py** — Integration Tests for API Key Management System.
@@ -1607,6 +1613,8 @@ Repo entry points and standard project files.
   - `async def test_soft_delete_filters_from_default_reads(tmp_path)`; `async def test_soft_delete_then_restore(tmp_path)`; `async def test_soft_delete_re_stamping_is_a_noop(tmp_path)`; `async def test_purge_message_destroys_row(tmp_path)`; `async def test_clear_history_is_soft(tmp_path)`; `async def test_purge_all_destroys_everything(tmp_path)`; `async def test_session_round_trip_through_privacy_wrapper(tmp_path)`
 - **tests/integration/test_solvency.py** — —
   - `def temp_db()`; `async def agent(temp_db)`; `async def test_solvency_green_zone(agent)`; `async def test_solvency_yellow_zone(agent)`; `async def test_solvency_red_zone(agent)`; `async def test_solvency_transitions(agent)`
+- **tests/integration/test_sovereign_import_consent.py** — Integration tests for #1379 — sovereignty-CAR consent gate wired into ``SovereignStorageAdapter.import_agent(grant=...)``.
+  - `def temp_db()`; `def owner()`; `async def test_grant_none_preserves_existing_behavior(temp_db)`; `async def test_valid_grant_passes_and_audit_records_grant_id(temp_db, owner)`; `async def test_grant_host_mismatch_rejected_db_untouched(temp_db, owner)`; `async def test_grant_source_mismatch_rejected(temp_db, owner)`; `async def test_revoked_grant_rejected(temp_db, owner)`; `async def test_grant_without_host_did_fails_closed(temp_db, owner)`; `…`
 - **tests/integration/test_sovereign_import_receiver.py** — Real export→import round-trip tests for the verification-gated, audit-logged sovereignty *import receiver* (issue #1272).
   - `def db_path(tmp_path)`; `def user_secret()`; `async def test_verified_ingest_happy_path(db_path, user_secret)`; `async def test_import_accepts_raw_bytes(db_path, user_secret)`; `async def test_rejected_import_leaves_db_untouched_and_logs(db_path, user_secret)`; `async def test_continuity_threshold_gate(db_path, user_secret)`; `async def test_append_only_audit_log_accumulates(db_path, user_secret)`; `async def test_partial_shard_package_is_structured_reject(db_path, user_secret)`
 - **tests/integration/test_sovereignty_context.py** — End-to-end tests for Context Preservation during Sovereignty Export/Import.
@@ -1668,7 +1676,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_a2a_stores.py** — Unit tests for A2A Protocol Stores.
   - `def db_path()`; `def track_store(store)`; `class TestTaskStore`; `class TestSessionService`; `class TestMemoryService`; `class TestObservabilityStore`; `class TestOrchestrationStore`; `class TestFeedbackStore`
 - **tests/unit/test_a2a_task_manager.py** — Unit tests for A2A TaskManager and TaskWorker.
-  - `def db_path()`; `def track_manager(manager)`; `async def task_manager(db_path)`; `class TestTaskManager`; `class TestTaskWorker`; `class TestTaskManagerWorkerIntegration`
+  - `def db_path()`; `def track_manager(manager)`; `async def task_manager(db_path)`; `class TestTaskManager`; `class TestOnTaskSubmittedCallback`; `class TestA2ATaskSubmittedSignalSource`; `class TestTaskWorker`; `class TestTaskManagerWorkerIntegration`
+- **tests/unit/test_access_grant.py** — Data-access grant schema + verification tests (#1273).
+  - `def owner()`; `def source()`; `def host()`; `def signed_grant(owner, source, host)`; `def package_signed_ok(monkeypatch)`; `def package_signed_invalid(monkeypatch)`; `def test_signable_payload_is_deterministic(signed_grant)`; `def test_compute_grant_id_excludes_id_and_created_at(owner, source, host)`; `…`
 - **tests/unit/test_adapter_cache_stability.py** — Per-adapter cache-stability tests.
   - `async def test_adapter_preserves_system_stability_across_turns(runner, label)`; `async def test_openai_compatible_adapter_preserves_history_prefix(runner, label)`; `async def test_anthropic_preserves_history_prefix_after_role_conversion()`; `async def test_openai_adapter_is_deterministic_on_identical_input()`; `async def test_anthropic_adapter_is_deterministic_on_identical_input()`
 - **tests/unit/test_adapter_list_models.py** — Unit tests for adapter list_models() methods.
@@ -1734,6 +1744,8 @@ Repo entry points and standard project files.
 - **tests/unit/test_canonical_inventory_sync.py** — (unparseable Python source)
 - **tests/unit/test_car_builder.py** — Tests for CAR v1 builder and reader.
   - `class TestVarint`; `class TestCID`; `class TestCARBuilder`; `class TestCARReader`; `class TestCARRoundTrip`
+- **tests/unit/test_car_import_consent.py** — Unit tests for #1379 — CAR-side consent verification.
+  - `def owner()`; `def source()`; `def host()`; `def signed_grant(owner, source, host)`; `async def test_verify_grant_happy_path(signed_grant, source, host)`; `async def test_verify_grant_caller_signals_package_failed(signed_grant, source, host)`; `async def test_verify_grant_source_mismatch(signed_grant, host)`; `async def test_verify_grant_host_mismatch(signed_grant, source)`; `…`
 - **tests/unit/test_catalog_guard_contracts.py** — Contract tests for the model-in-catalog guard.
   - `def svc_with_catalog()`; `def test_guard_accepts_model_in_vendor_catalog(svc_with_catalog)`; `def test_guard_rejects_cross_vendor_model(svc_with_catalog)`; `def test_guard_rejects_fake_model_on_local_route(svc_with_catalog)`; `def test_guard_accepts_routes_own_configured_model(svc_with_catalog)`; `def test_guard_permits_when_cache_empty()`; `def test_model_not_available_for_route_exception_shape()`
 - **tests/unit/test_channels_feature.py** — Unit Tests for the Channels Feature.
@@ -1927,7 +1939,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_example_model_config_contracts.py** — Contracts for example model config files and catalog source-of-truth shape.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
-  - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`
+  - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`; `class TestExecuteNamedToolSubagentDispatch`
 - **tests/unit/test_extract_raw_user_content.py** — Tests for ``context_builder.extract_raw_user_content``.
   - `def test_strips_full_sent_form_with_retrieved_context()`; `def test_strips_sent_form_without_retrieved_context()`; `def test_strips_sent_form_round_trips_wrap_user_input()`; `def test_legacy_raw_content_unchanged()`; `def test_preserves_inner_newlines_in_raw()`; `def test_preserves_inner_tag_like_content()`; `def test_malformed_partial_wrappers_left_alone()`; `def test_retrieved_context_only_no_user_input_wrap()`
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
@@ -2050,8 +2062,6 @@ Repo entry points and standard project files.
   - `class TestUpdateAccessActuallyWrites`; `class TestRetrieveTriggersAccessUpdate`; `class TestMemoryConsolidateToolExists`; `class TestSchedulerDefaultsIncludeConsolidation`
 - **tests/unit/test_memory_wiring_integration.py** — Tests requested by Nellie on PR #633 review:
   - `class TestMemoryConsolidateEndToEnd`; `class TestRetrievalScoreChangesWithAccess`; `class TestNoStraySessionGapDefinitions`
-- **tests/unit/test_mesh_protocol.py** — Unit tests for the Agent Mesh Protocol.
-  - `class TestMeshMessage`; `class TestFactoryFunctions`; `class TestPeersFeatureMesh`; `class TestTalonHandoff`
 - **tests/unit/test_microcompact.py** — Tests for microcompact — zero-cost stale tool result clearing.
   - `def context_manager()`; `class TestMicrocompactBasic`; `class TestMicrocompactProtection`; `class TestMicrocompactMarkerFormat`; `class TestMicrocompactMixedHistory`
 - **tests/unit/test_migrate_llm_config.py** — Unit tests for kestrel_sovereign.setup.migrate_llm_config (#939).
@@ -2101,7 +2111,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_payer_resolver_mint.py** — Unit tests for FoundationPayerResolver's HOST_MASTER_PROVISIONED OpenRouter minting side-effect.
   - `async def db(tmp_path)`; `class TestMintOpenRouterChild`
 - **tests/unit/test_peers_feature.py** — Direct contracts for the Peers feature.
-  - `def test_discover_host_url_from_env(monkeypatch)`; `async def test_list_peers_filters_out_self()`; `async def test_ask_agent_rejects_self_target()`; `async def test_ask_agent_reports_offline_peer()`; `async def test_ask_agent_returns_peer_response()`
+  - `def test_discover_host_url_from_env(monkeypatch)`; `async def test_list_peers_filters_out_self()`; `async def test_ask_agent_rejects_self_target()`; `async def test_ask_agent_reports_offline_peer()`; `async def test_ask_agent_returns_peer_response()`; `async def test_send_a2a_message_fire_and_forget()`; `async def test_send_a2a_message_rejects_self_target()`; `async def test_send_a2a_question_waits_for_terminal_state_and_returns_answer()`; `…`
 - **tests/unit/test_per_agent_constitution_overlay.py** — Per-agent CONSTITUTION.md overlay loading (#898).
   - `class TestPerAgentOverlayLoading`; `class TestComputerUseFeaturePicksUpOverlay`
 - **tests/unit/test_permission_seam_contracts.py** — Permission seam contracts across command, A2A, and tool execution paths.
@@ -2339,7 +2349,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_system_prompt_assembler.py** — Unit tests for the priority-ordered system-prompt assembler.
   - `def test_section_name_strips_md_and_uppercases()`; `def test_assemble_minimal_has_constitution_only()`; `def test_assemble_full_combination_clause_order()`; `def test_assemble_skips_heartbeat_md()`; `def test_assemble_skips_agents_when_anchored_supplies_it()`; `def test_assemble_includes_agents_from_bootstrap_when_no_anchor()`; `def test_soul_fence_uses_your_identity_label()`; `def test_other_bootstrap_fence_uses_uppercase_basename()`; `…`
 - **tests/unit/test_talon_coordinator.py** — Tests for TalonCoordinatorFeature.
-  - `class TestTalonCoordinatorInit`; `class TestTalonClaim`; `class TestTalonBatch`; `class TestTalonStatus`; `class TestTalonPauseResume`; `class TestMeshDispatch`; `class TestCLIDispatch`
+  - `class TestTalonCoordinatorInit`; `class TestTalonClaim`; `class TestTalonBatch`; `class TestTalonStatus`; `class TestTalonPauseResume`; `class TestA2ADispatch`; `class TestCLIDispatch`
 - **tests/unit/test_talon_daemon_runtime.py** — Daemon command contracts for backend-aware Talon runtime.
   - `def test_daemon_builds_codex_command(monkeypatch)`; `def test_daemon_loads_single_model_field_for_codex(tmp_path)`
 - **tests/unit/test_talon_env_and_health.py** — Tests for talon coordinator env handling and the new talon_health tool.
@@ -2466,6 +2476,7 @@ Repo entry points and standard project files.
 
 - **prompts/companion_system_prompt.md** — Companion System Prompt — ## Platform Awareness
 - **prompts/signals/a2a_task_complete.md** — [A2A_COMPLETE] An A2A task you spawned has reached a terminal state.
+- **prompts/signals/a2a_task_submitted.md** — [A2A_TASK_SUBMITTED] Agent `{payload[sender]}` submitted A2A task `{payload[task_id]}` (verb `{payload[a2a_verb]}`, skill `{payload[skill_id]}`) to you.
 - **prompts/signals/heartbeat.md** — [HEARTBEAT] Read HEARTBEAT.md if it exists.
 - **prompts/signals/webhook_stripe_deposit.md** — [STRIPE_DEPOSIT] An external Stripe webhook has reported a crypto deposit.
 - **prompts/system_prompt.md** — Kestrel System Prompt — You are Kestrel, a sovereign AI agent.
