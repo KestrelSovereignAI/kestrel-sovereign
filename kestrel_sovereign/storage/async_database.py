@@ -554,6 +554,19 @@ class AsyncDatabase:
     async def execute_many(self, sql: str, params_list: List[tuple]) -> int:
         """Execute query with multiple parameter sets."""
         return await self._backend.execute_many(sql, params_list)
+
+    async def execute_script(self, script: str) -> None:
+        """Execute a multi-statement SQL script (table creation, migrations).
+
+        Pass-through to the underlying DatabaseBackend. Feature stores
+        resolved via :func:`resolve_feature_database` get an AsyncDatabase
+        (not the raw backend) and rely on this method for CREATE TABLE
+        IF NOT EXISTS blocks. Without it, every feature with a schema
+        bootstrap (e.g. kestrel-feature-healthcare's FhirResourceStore)
+        raises AttributeError at agent init and the whole agent fails to
+        load.
+        """
+        await self._backend.execute_script(script)
     
     async def fetchone(self, sql: str, params: tuple = ()) -> Optional[Tuple[Any, ...]]:
         """Fetch a single row."""
