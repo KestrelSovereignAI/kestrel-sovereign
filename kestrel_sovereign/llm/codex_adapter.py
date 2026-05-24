@@ -664,8 +664,15 @@ class CodexAdapter(LLMAdapter):
                 "input": [{"type": "text", "text": turn_input}],
                 "cwd": os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd()),
             }
-            if model:
-                turn_params["model"] = model
+            # Reuse _model_param's sentinel filter — "auto"/"default" are
+            # kestrel-side route placeholders, not real model ids; the
+            # app-server rejects them. Codex review (#1388 P1) caught
+            # that the previous unconditional pass would break
+            # ``openai:plan`` agents whose route was configured with
+            # ``model = "auto"``.
+            m_for_turn = self._model_param(model)
+            if m_for_turn:
+                turn_params["model"] = m_for_turn
             await app.request("turn/start", turn_params, timeout=60)
 
             text_parts: List[str] = []
