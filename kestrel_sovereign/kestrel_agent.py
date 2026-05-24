@@ -2032,12 +2032,21 @@ Expected Duration: {expected_duration}
         # threads through to stateful adapters (e.g. CodexAdapter), letting
         # them anchor on ``previous_response_id`` and preserve encrypted
         # reasoning across turns. #806 / #821.
+        #
+        # ``tool_executor`` is required by adapters that run an inline tool
+        # loop inside one LLM turn (the codex app-server's
+        # ``item/tool/call`` RPC is the current consumer). Without it,
+        # openai:plan hard-fails when tools are advertised. Stateless
+        # adapters (anthropic, openai:api) ignore the callable, so passing
+        # it unconditionally is safe and keeps the non-streaming path
+        # parity with the streaming path (orchestrator_engine:1836).
         response = await self.llm_service.generate_with_messages(
             messages=messages,
             force_local_only=force_local_only,
             model_override=effective_model,
             tools=feature_tools if feature_tools else None,
             session_id=session_id,
+            tool_executor=self._make_inline_tool_executor(session_id or ""),
         )
 
         # Log LLM response timing
