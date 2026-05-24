@@ -818,6 +818,152 @@ class TaskFeature(Feature):
         )
 
     @tool(
+        name="respond_to_a2a_task",
+        description=(
+            "Respond to an incoming A2A task in your inbox by transitioning "
+            "it to a terminal state with your reply text. Use this when "
+            "another agent sent you a task via send_a2a_question (sync, "
+            "waits for your answer), send_a2a_message (FYI, brief receipt), "
+            "or send_a2a_task (delegated work, full result). The sender's "
+            "polling against /tasks/{id} will pick up your transition + "
+            "answer text. Without this tool the sender's send_a2a_question "
+            "call sits in WORKING forever and times out."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a respond",
+    )
+    async def respond_to_a2a_task(
+        self,
+        task_id: str,
+        content: str,
+        state: str = "completed",
+    ) -> ToolResult:
+        """
+        Receiver-side completion of an A2A task.
+
+        Transitions the named task to a terminal state (COMPLETED by
+        default; FAILED or CANCELED via the ``state`` argument) and
+        attaches ``content`` as the response text in
+        ``status.message.parts[].text``. The sender polling via
+        ``send_a2a_question`` extracts this text as their answer.
+
+        A2A state machine constraint: SUBMITTED cannot go directly to
+        COMPLETED — it must pass through WORKING first. This tool
+        chains the two transitions automatically when the current
+        state is SUBMITTED, so the caller can ignore the intermediate
+        bookkeeping.
+
+        Args:
+            task_id: The id of the incoming task to respond to.
+                Find it via ``list_my_tasks(status='submitted')``
+                or directly from the ``a2a.task_submitted`` signal
+                payload that woke this cognition turn.
+            content: The response text (one part, plain text).
+                Becomes ``status.message.parts[0].text`` on the task.
+            state: Terminal state. ``"completed"`` (default) for
+                normal success; ``"failed"`` if you couldn't fulfill
+                the request and want the sender to see the error;
+                ``"canceled"`` to decline the task.
+        """
+        from kestrel_sovereign.a2a.types import (
+            Message,
+            TaskState,
+            TextPart,
+        )
+
+        if not self.task_manager:
+            return ToolResult.failed("Task manager not available")
+
+        normalized_state = (state or "completed").strip().lower()
+        try:
+            terminal = TaskState(normalized_state)
+        except ValueError:
+            return ToolResult.failed(
+                f"Invalid state {state!r}. Use 'completed', 'failed', or 'canceled'.",
+                data={"task_id": task_id, "state": state},
+            )
+        if terminal not in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED):
+            return ToolResult.failed(
+                f"State {terminal.value!r} is not terminal — must be "
+                f"completed, failed, or canceled.",
+                data={"task_id": task_id, "state": terminal.value},
+            )
+
+        try:
+            task = await self.task_manager.get_task(task_id)
+        except Exception as e:
+            logger.error(f"Failed to fetch task {task_id} for respond: {e}")
+            return ToolResult.failed(str(e))
+        if not task:
+            return ToolResult.failed(
+                f"Task {task_id} not found in this agent's task store. "
+                f"(Senders see their own outbound; you can only respond "
+                f"to incoming tasks that landed in YOUR store.)",
+                data={"task_id": task_id},
+            )
+
+        current = task.status.state
+        if current in (TaskState.COMPLETED, TaskState.FAILED, TaskState.CANCELED):
+            return ToolResult.failed(
+                f"Task {task_id} is already terminal: {current.value}",
+                data={"task_id": task_id, "state": current.value},
+            )
+
+        agent_name = getattr(self.agent, "did", None) or type(self.agent).__name__
+        response_message = Message(
+            role="agent",
+            parts=[TextPart(text=content)],
+        )
+
+        # SUBMITTED → COMPLETED is not a valid direct transition
+        # (VALID_TRANSITIONS in task_manager); SUBMITTED must pass
+        # through WORKING first. Chain automatically so the receiver
+        # doesn't need to know about the intermediate step.
+        try:
+            if current == TaskState.SUBMITTED:
+                await self.task_manager.update_status(
+                    task_id=task_id,
+                    new_state=TaskState.WORKING,
+                    agent_name=agent_name,
+                )
+            updated = await self.task_manager.update_status(
+                task_id=task_id,
+                new_state=terminal,
+                message=response_message,
+                agent_name=agent_name,
+            )
+        except ValueError as e:
+            # Transition validator caught an illegal sequence (rare —
+            # only happens if another path mutates the task between
+            # our get_task and update_status).
+            return ToolResult.failed(
+                str(e),
+                data={"task_id": task_id, "state_before": current.value},
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to respond to task {task_id}: {e}", exc_info=True,
+            )
+            return ToolResult.failed(
+                str(e),
+                data={"task_id": task_id, "state_before": current.value},
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Responded to task {task_id[:8]} "
+                f"({current.value} → {updated.status.state.value}); "
+                f"sender's poll will now see your answer."
+            ),
+            data={
+                "task_id": task_id,
+                "state": updated.status.state.value,
+                "state_before": current.value,
+                "response": content,
+            },
+        )
+
+    @tool(
         name="cancel_task",
         description="Cancel a pending or running task.",
         category=ToolCategory.UTILITY,

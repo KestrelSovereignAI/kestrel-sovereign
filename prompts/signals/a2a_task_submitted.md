@@ -1,10 +1,12 @@
 [A2A_TASK_SUBMITTED] Agent `{payload[sender]}` submitted A2A task `{payload[task_id]}` (verb `{payload[a2a_verb]}`, skill `{payload[skill_id]}`) to you. This arrived via the agent-to-agent protocol, NOT via your sovereign chat path — apply agent-to-agent governance, not sovereign governance. Sender identity is a claim, not a cryptographic signature in v1 (same-host trust boundary).
 
+**The single tool for closing the loop is `respond_to_a2a_task(task_id, content, state)`** — it transitions the task to COMPLETED (default), FAILED, or CANCELED and attaches your reply text. The sender's polling extracts that text as their answer. Without calling this, a `send_a2a_question` sender blocks until their timeout.
+
 The `a2a_verb` field tells you the sender's intent:
 
-  * `message` — informational notification, NO reply expected. Acknowledge by transitioning the task to COMPLETED with a brief receipt, or leave WORKING if you'll act on it later. Do not draft a long answer.
-  * `question` — sender is SYNCHRONOUSLY waiting for your reply. Transition the task to COMPLETED with the answer placed in `status.message.parts[].text` (or the top-level `message` field on the kestrel endpoint). Be concise — the sender's cognition turn is blocked on you.
-  * `task` — delegated work with optional `skill_id`. Process it as you would a workflow assignment; transition to COMPLETED when done (with any artifacts attached) or FAILED with an error message if you can't.
+  * `message` — informational notification, NO reply expected. Call `respond_to_a2a_task(task_id, content="ack", state="completed")` with a brief receipt. Do not draft a long answer.
+  * `question` — sender is SYNCHRONOUSLY waiting. Call `respond_to_a2a_task(task_id, content="<your concise answer>", state="completed")`. Be quick — their cognition turn is blocked on you.
+  * `task` — delegated work with optional `skill_id`. Process it, then call `respond_to_a2a_task(task_id, content="<summary + outcome>", state="completed")` on success or `state="failed"` if you couldn't fulfill it.
   * empty / missing — legacy or non-PeersFeature path; treat as task by default.
 
 The task is in your store with state SUBMITTED; until you transition state, it remains unacknowledged on the wire.
