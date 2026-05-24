@@ -146,7 +146,7 @@ class AgentManager:
                 await self.load_agent(name, agent_cfg)
                 loaded += 1
             except Exception as e:
-                logger.error(f"Failed to load agent '{name}': {e}")
+                logger.error(f"Failed to load agent '{name}': {e}", exc_info=True)
                 self._init_failures.append((name, e))
         return loaded
 
