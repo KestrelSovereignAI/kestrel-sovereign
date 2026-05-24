@@ -185,6 +185,32 @@ async def test_already_terminal_task_rejected():
 
 
 @pytest.mark.asyncio
+async def test_update_status_value_error_becomes_tool_failure():
+    """Codex review (non-blocking) on PR #1387: explicit race-contract
+    coverage. Between this tool's ``get_task`` and ``update_status``,
+    another caller could mutate the task. ``update_status`` re-reads
+    and re-validates the transition; if it now violates VALID_TRANSITIONS
+    it raises ValueError. The tool must convert that into a ToolResult
+    failure (not let it propagate) — matches the behavior of every
+    other ``@tool``-decorated method that interacts with task_manager."""
+    feature, _ = _make_feature(initial_state=TaskState.WORKING)
+    # Simulate the race by having update_status raise ValueError on the
+    # terminal transition. (Real cause would be another caller having
+    # already moved the task to a terminal state in the gap.)
+    feature.task_manager.update_status = AsyncMock(
+        side_effect=ValueError(
+            "Invalid state transition: TaskState.WORKING -> TaskState.COMPLETED. "
+            "Valid transitions: set()"
+        ),
+    )
+    result = await feature.respond_to_a2a_task(
+        task_id="task-1", content="answer", state="completed",
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "invalid state transition" in result.error.lower()
+
+
+@pytest.mark.asyncio
 async def test_task_manager_unavailable():
     """Feature instantiated without a task_manager (e.g. agent
     without A2A configured). Tool returns a clean failure rather
