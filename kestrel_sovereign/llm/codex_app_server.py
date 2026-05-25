@@ -161,13 +161,70 @@ class CodexAppServerClient:
             self._initialized = True
 
     async def _spawn(self) -> None:
+        # Isolate ``CODEX_HOME`` to a kestrel-managed directory so codex
+        # does not auto-load the user's globally-configured plugins
+        # (computer-use, codex_apps, browser-use, …). Without isolation,
+        # those plugins are mounted as MCP servers on every thread; some
+        # (notably ``codex_apps``) hang on ``status=starting`` and block
+        # the session_loop's upstream Responses API call indefinitely.
+        # Same mechanism kestrel-claw uses
+        # (extensions/codex/src/app-server/auth-bridge.ts —
+        # ``withAgentCodexHomeEnvironment``): point CODEX_HOME at an
+        # isolated dir, then bridge the user's ChatGPT auth across by
+        # symlinking auth.json so the subscription sign-in still works.
+        kestrel_codex_home = Path.home() / ".kestrel" / "codex-home"
+        kestrel_codex_home.mkdir(parents=True, exist_ok=True)
+        # Bridge auth.json + installation_id from the user's real
+        # ~/.codex so codex sees the same ChatGPT identity it would
+        # see when run normally. Symlink rather than copy so token
+        # refreshes propagate to the source.
+        for fname in ("auth.json", "installation_id"):
+            user_file = Path.home() / ".codex" / fname
+            bridged_file = kestrel_codex_home / fname
+            if user_file.exists() and not bridged_file.exists():
+                try:
+                    bridged_file.symlink_to(user_file)
+                except (OSError, FileExistsError):
+                    pass
+        # Minimal config.toml — trust the kestrel workspace + cwd so
+        # codex doesn't refuse to run, but ship NO ``[plugins.*]`` blocks
+        # so the user's globally-enabled MCP plugins
+        # (computer-use, codex_apps, etc.) stay un-mounted in our
+        # sessions. Kestrel runs its own computer-use feature; codex's
+        # bundled one would be a duplicate-mount anyway.
+        cwd_for_codex = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
+        bridged_config = kestrel_codex_home / "config.toml"
+        if not bridged_config.exists():
+            try:
+                bridged_config.write_text(
+                    f'model = "gpt-5.5"\n\n'
+                    f'[projects."{cwd_for_codex}"]\n'
+                    f'trust_level = "trusted"\n'
+                )
+            except OSError:
+                pass
+        # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env so
+        # codex picks the ChatGPT-subscription path via the bridged
+        # auth.json rather than the API-key path (also matches claw's
+        # ``CODEX_APP_SERVER_API_KEY_ENV_VARS`` clearing in
+        # ``auth-bridge.ts``).
+        spawn_env = {**os.environ, "CODEX_HOME": str(kestrel_codex_home)}
+        spawn_env.pop("OPENAI_API_KEY", None)
+        spawn_env.pop("CODEX_API_KEY", None)
         try:
+            # ``--disable apps``: codex's bundled ``codex_apps`` MCP
+            # is built-in and tries to fetch ChatGPT app metadata on
+            # every thread. For our session it consistently exceeds
+            # the 30s MCP startup_timeout, leaving session_loop
+            # blocked. Kestrel has its own app/tool surface — we
+            # don't need codex's bundled directory.
             self._proc = await asyncio.create_subprocess_exec(
-                self._binary, "app-server", "--listen", "stdio://",
+                self._binary, "--disable", "apps",
+                "app-server", "--listen", "stdio://",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ},
+                env=spawn_env,
             )
         except OSError as e:
             raise CodexAppServerError(f"Failed to spawn {self._binary}: {e}") from e
@@ -183,7 +240,7 @@ class CodexAppServerClient:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _handshake(self) -> None:
-        result = await self.request(
+        result = await self._request_unguarded(
             "initialize",
             {
                 "clientInfo": {
@@ -206,6 +263,81 @@ class CodexAppServerClient:
                 f"detected {detected}. Update the Codex app/CLI."
             )
         self.notify("initialized")
+        # Match kestrel-claw's auth-bridge.ts: after initialize +
+        # initialized notification, explicitly drive
+        # ``account/login/start`` with the user's ChatGPT tokens.
+        # Without this the app-server's session_loop hangs before
+        # making the upstream Responses API call — auth.json on disk
+        # in CODEX_HOME is consulted by ``codex exec`` but the
+        # app-server path requires an explicit login RPC to wire the
+        # account into the session (claw's
+        # ``applyCodexAppServerAuthProfile`` in
+        # ``extensions/codex/src/app-server/shared-client.ts``).
+        login_params = self._load_chatgpt_login_params()
+        if login_params is not None:
+            try:
+                await self._request_unguarded(
+                    "account/login/start", login_params, timeout=30,
+                )
+            except CodexAppServerError as e:
+                logger.warning(
+                    "codex account/login/start failed (continuing — auth "
+                    "may still resolve from auth.json): %s", e,
+                )
+
+    def _load_chatgpt_login_params(self) -> Optional[dict]:
+        """Read the user's codex auth.json and shape it as the
+        ``account/login/start`` RPC param for the ChatGPT subscription
+        path. Returns ``None`` when no chatgpt OAuth tokens are present
+        (e.g. an API-key-only setup) — the caller proceeds without the
+        login RPC in that case."""
+        auth_path = Path.home() / ".codex" / "auth.json"
+        if not auth_path.exists():
+            return None
+        try:
+            import json
+            data = json.loads(auth_path.read_text())
+        except (OSError, ValueError):
+            return None
+        tokens = data.get("tokens") or {}
+        access = (tokens.get("access_token") or "").strip()
+        account_id = (tokens.get("account_id") or "").strip()
+        if not access:
+            return None
+        # Plan type lives inside the id_token JWT claims under the
+        # OpenAI ``auth.chatgpt_plan_type`` namespace. Decode the
+        # payload portion only (signature unchecked — we trust the
+        # local file). Falls back to ``None`` when absent; codex
+        # accepts a null plan_type.
+        plan_type: Optional[str] = None
+        id_token = (tokens.get("id_token") or "").strip()
+        if id_token:
+            try:
+                import base64
+                parts = id_token.split(".")
+                if len(parts) >= 2:
+                    payload_b64 = parts[1]
+                    payload_b64 += "=" * (-len(payload_b64) % 4)
+                    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+                    auth_claim = claims.get(
+                        "https://api.openai.com/auth"
+                    ) or {}
+                    plan_type = (
+                        auth_claim.get("chatgpt_plan_type")
+                        or claims.get("chatgpt_plan_type")
+                        or None
+                    )
+            except (ValueError, OSError, KeyError):
+                plan_type = None
+        params: Dict[str, Any] = {
+            "type": "chatgptAuthTokens",
+            "accessToken": access,
+        }
+        if account_id:
+            params["chatgptAccountId"] = account_id
+        if plan_type:
+            params["chatgptPlanType"] = plan_type
+        return params
 
     async def aclose(self) -> None:
         proc = self._proc
@@ -405,6 +537,15 @@ class CodexAppServerClient:
             await self.ensure_started()
         if self._closed_error and method != "initialize":
             raise self._closed_error
+        return await self._request_unguarded(method, params, timeout=timeout)
+
+    async def _request_unguarded(
+        self, method: str, params: Optional[dict] = None, *, timeout: float = 120,
+    ) -> Any:
+        """Send a request without going through ``ensure_started``.
+        For use from inside ``_handshake`` where the start lock is
+        already held — calling ``request`` from there would deadlock.
+        """
         mid = self._next_id
         self._next_id += 1
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
