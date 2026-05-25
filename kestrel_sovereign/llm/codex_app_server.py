@@ -174,12 +174,23 @@ class CodexAppServerClient:
         # symlinking auth.json so the subscription sign-in still works.
         kestrel_codex_home = Path.home() / ".kestrel" / "codex-home"
         kestrel_codex_home.mkdir(parents=True, exist_ok=True)
-        # Bridge auth.json + installation_id from the user's real
-        # ~/.codex so codex sees the same ChatGPT identity it would
-        # see when run normally. Symlink rather than copy so token
-        # refreshes propagate to the source.
+        # Source the user's REAL codex home from the environment when set
+        # (e.g. operator overrode ``CODEX_HOME``), not the default
+        # ``~/.codex``. Without this an operator on a non-default codex
+        # home would have the app-server start unauthenticated because
+        # we'd be linking from an empty ``~/.codex``. Codex review
+        # #1394 P2.
+        user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+        user_codex_home = (
+            Path(user_codex_home_env) if user_codex_home_env
+            else Path.home() / ".codex"
+        )
+        # Bridge auth.json + installation_id from the user's real codex
+        # home so codex sees the same ChatGPT identity it would see when
+        # run normally. Symlink rather than copy so token refreshes
+        # propagate to the source.
         for fname in ("auth.json", "installation_id"):
-            user_file = Path.home() / ".codex" / fname
+            user_file = user_codex_home / fname
             bridged_file = kestrel_codex_home / fname
             if user_file.exists() and not bridged_file.exists():
                 try:
@@ -192,17 +203,20 @@ class CodexAppServerClient:
         # (computer-use, codex_apps, etc.) stay un-mounted in our
         # sessions. Kestrel runs its own computer-use feature; codex's
         # bundled one would be a duplicate-mount anyway.
+        # Rewrite every spawn so a cwd change (different KESTREL_CODEX_CWD
+        # or process cwd) is reflected in the trusted-projects list —
+        # otherwise codex rejects/blocks the workspace until the user
+        # manually deletes the stale config. Codex review #1394 P2.
         cwd_for_codex = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
         bridged_config = kestrel_codex_home / "config.toml"
-        if not bridged_config.exists():
-            try:
-                bridged_config.write_text(
-                    f'model = "gpt-5.5"\n\n'
-                    f'[projects."{cwd_for_codex}"]\n'
-                    f'trust_level = "trusted"\n'
-                )
-            except OSError:
-                pass
+        try:
+            bridged_config.write_text(
+                f'model = "gpt-5.5"\n\n'
+                f'[projects."{cwd_for_codex}"]\n'
+                f'trust_level = "trusted"\n'
+            )
+        except OSError:
+            pass
         # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env so
         # codex picks the ChatGPT-subscription path via the bridged
         # auth.json rather than the API-key path (also matches claw's
@@ -291,7 +305,16 @@ class CodexAppServerClient:
         path. Returns ``None`` when no chatgpt OAuth tokens are present
         (e.g. an API-key-only setup) — the caller proceeds without the
         login RPC in that case."""
-        auth_path = Path.home() / ".codex" / "auth.json"
+        # Source from the user's real codex home — ``CODEX_HOME`` env var
+        # overrides ``~/.codex`` when set. Matches the same resolution in
+        # ``_spawn``; without this, an operator on a non-default codex
+        # home gets an unauthenticated app-server.
+        user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+        user_codex_home = (
+            Path(user_codex_home_env) if user_codex_home_env
+            else Path.home() / ".codex"
+        )
+        auth_path = user_codex_home / "auth.json"
         if not auth_path.exists():
             return None
         try:
