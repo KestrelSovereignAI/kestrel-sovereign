@@ -245,9 +245,14 @@ class CodexAppServerClient:
         # review #1394 P2.
         cwd_escaped = cwd_for_codex.replace("\\", "\\\\").replace('"', '\\"')
         bridged_config = kestrel_codex_home / "config.toml"
+        # Don't pin a default model here — the per-thread/turn model
+        # is selected by the orchestrator via ``_model_param`` (which
+        # intentionally omits the model for ``auto``/``default`` so
+        # codex uses its own configured default). Hard-coding ``model
+        # = "gpt-5.5"`` in this config would override that for every
+        # turn. Codex review #1394 P2.
         try:
             bridged_config.write_text(
-                f'model = "gpt-5.5"\n\n'
                 f'[projects."{cwd_escaped}"]\n'
                 f'trust_level = "trusted"\n'
             )
@@ -403,6 +408,104 @@ class CodexAppServerClient:
             params["chatgptPlanType"] = plan_type
         return params
 
+    async def _refresh_chatgpt_tokens(self) -> Optional[dict]:
+        """Drive the OAuth refresh-token flow against the OpenAI auth
+        endpoint, persist the new tokens back to ``auth.json``, and
+        return the same shape as :meth:`_load_chatgpt_login_params`.
+
+        Codex CLI runs this same refresh on its own schedule when it
+        is the active process. In a long-running kestrel host that is
+        the only app-server client, nobody is refreshing for us — so
+        re-reading ``auth.json`` from
+        ``account/chatgptAuthTokens/refresh`` would return the same
+        expired token and codex would 401 again. This method runs the
+        OAuth grant_type=refresh_token exchange so we can hand codex
+        a real fresh token. Codex review #1394 P1.
+
+        Returns ``None`` when there are no usable OAuth credentials on
+        disk or the refresh exchange fails — the caller should error
+        out cleanly in that case rather than send an empty token.
+        """
+        user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+        user_codex_home = (
+            Path(user_codex_home_env) if user_codex_home_env
+            else Path.home() / ".codex"
+        )
+        auth_path = user_codex_home / "auth.json"
+        if not auth_path.exists():
+            return None
+        try:
+            import json
+            data = json.loads(auth_path.read_text())
+        except (OSError, ValueError):
+            return None
+        tokens = data.get("tokens") or {}
+        refresh_token = (tokens.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return None
+        token_url = os.environ.get(
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            "https://auth.openai.com/oauth/token",
+        )
+        # Codex's own client_id — visible as an unredacted string in
+        # the codex binary. Required by OpenAI's OAuth endpoint to
+        # accept the refresh; using kestrel's own client_id would be
+        # rejected as that client isn't registered with OpenAI auth.
+        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    token_url,
+                    json={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": client_id,
+                        "scope": "openid profile email offline_access",
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "codex token refresh failed: %s %s",
+                        resp.status_code, resp.text[:200],
+                    )
+                    return None
+                body = resp.json()
+        except (httpx.HTTPError, ValueError, OSError) as e:
+            logger.warning("codex token refresh exception: %s", e)
+            return None
+        new_access = (body.get("access_token") or "").strip()
+        new_id_token = (body.get("id_token") or "").strip()
+        new_refresh = (body.get("refresh_token") or refresh_token).strip()
+        if not new_access:
+            return None
+        # Persist the rotated tokens back to auth.json so future
+        # spawns (including codex's own CLI) see the same state. Mirror
+        # the on-disk shape codex writes: top-level ``tokens`` object
+        # with ``access_token`` / ``id_token`` / ``refresh_token`` /
+        # ``account_id`` (the account_id stays put — refresh doesn't
+        # rotate the workspace identifier).
+        tokens["access_token"] = new_access
+        if new_id_token:
+            tokens["id_token"] = new_id_token
+        tokens["refresh_token"] = new_refresh
+        data["tokens"] = tokens
+        data["last_refresh"] = (
+            __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat()
+        )
+        try:
+            auth_path.write_text(json.dumps(data))
+        except OSError as e:
+            logger.warning(
+                "codex token refresh: wrote new token in-memory but "
+                "failed to persist to %s: %s — next host restart will "
+                "still see the expired token.", auth_path, e,
+            )
+        # Re-derive login params from the freshened on-disk state.
+        return self._load_chatgpt_login_params()
+
     async def aclose(self) -> None:
         proc = self._proc
         if proc is None:
@@ -533,14 +636,13 @@ class CodexAppServerClient:
                 # Codex enters external-token mode when we drove
                 # ``account/login/start`` with ``type=chatgptAuthTokens``.
                 # Once the access token expires it asks us (the client)
-                # for fresh tokens via this server→client RPC. Codex CLI
-                # keeps ``auth.json`` current via its own background
-                # refresh; we just re-read the file so codex can pick
-                # up the new token without restarting the kestrel
-                # process. Without this, long-running sessions break
-                # with 401 once the original token expires (codex
-                # review #1394 P1).
-                refreshed = self._load_chatgpt_login_params()
+                # for fresh tokens via this server→client RPC. Drive
+                # the actual OAuth refresh against OpenAI's token
+                # endpoint and persist the rotated tokens back to
+                # ``auth.json`` — otherwise long-running sessions would
+                # 401 again immediately because nothing else is
+                # refreshing the file. Codex review #1394 P1.
+                refreshed = await self._refresh_chatgpt_tokens()
                 if refreshed is not None:
                     result = {
                         "accessToken": refreshed["accessToken"],
@@ -550,17 +652,18 @@ class CodexAppServerClient:
                         "chatgptPlanType": refreshed.get("chatgptPlanType"),
                     }
                 else:
-                    # No usable OAuth tokens on disk — surface the
-                    # failure rather than silently sending empty
-                    # strings (which would just produce another 401).
+                    # Refresh failed — surface a structured error so
+                    # codex stops and a higher layer can prompt the
+                    # operator to re-authenticate, rather than
+                    # silently replaying an expired token.
                     self._send({
                         "id": mid,
                         "error": {
                             "code": -32603,
                             "message": (
                                 "kestrel could not refresh chatgpt auth "
-                                "tokens: no usable OAuth credentials in "
-                                "auth.json (run `codex login`)"
+                                "tokens (run `codex login` to "
+                                "re-authenticate)"
                             ),
                         },
                     })
