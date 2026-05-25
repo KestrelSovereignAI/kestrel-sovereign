@@ -522,6 +522,42 @@ class CodexAppServerClient:
                 handler = self._server_request_handlers.get((method, None))
             if handler is not None:
                 result = await handler(params)
+            elif method == "account/chatgptAuthTokens/refresh":
+                # Codex enters external-token mode when we drove
+                # ``account/login/start`` with ``type=chatgptAuthTokens``.
+                # Once the access token expires it asks us (the client)
+                # for fresh tokens via this server→client RPC. Codex CLI
+                # keeps ``auth.json`` current via its own background
+                # refresh; we just re-read the file so codex can pick
+                # up the new token without restarting the kestrel
+                # process. Without this, long-running sessions break
+                # with 401 once the original token expires (codex
+                # review #1394 P1).
+                refreshed = self._load_chatgpt_login_params()
+                if refreshed is not None:
+                    result = {
+                        "accessToken": refreshed["accessToken"],
+                        "chatgptAccountId": refreshed.get(
+                            "chatgptAccountId", ""
+                        ),
+                        "chatgptPlanType": refreshed.get("chatgptPlanType"),
+                    }
+                else:
+                    # No usable OAuth tokens on disk — surface the
+                    # failure rather than silently sending empty
+                    # strings (which would just produce another 401).
+                    self._send({
+                        "id": mid,
+                        "error": {
+                            "code": -32603,
+                            "message": (
+                                "kestrel could not refresh chatgpt auth "
+                                "tokens: no usable OAuth credentials in "
+                                "auth.json (run `codex login`)"
+                            ),
+                        },
+                    })
+                    return
             elif method in _DEFAULT_APPROVAL_REPLIES:
                 result = _DEFAULT_APPROVAL_REPLIES[method]
             elif method == "item/tool/call":
