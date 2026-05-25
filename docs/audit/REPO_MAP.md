@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-24
-**Scope:** 1559 tracked files (1011 `.py`, 266 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-25
+**Scope:** 1560 tracked files (1012 `.py`, 266 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1835,7 +1835,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_constitutional_profile.py** — Unit tests for Constitutional Profile Service.
   - `def profile_service()`; `def test_load_profiles(profile_service)`; `def test_get_profile_anthropic(profile_service)`; `def test_get_profile_openai(profile_service)`; `def test_get_profile_ollama(profile_service)`; `def test_get_profile_unknown_provider(profile_service)`; `def test_get_profile_for_model(profile_service)`; `def test_get_state_of_mind(profile_service)`; `…`
 - **tests/unit/test_context_analysis.py** — Tests for context analysis: duplicate detection and token attribution by source.
-  - `class TestContextStatsBasic`; `class TestContextStatsNormalization`; `class TestContextStatsIntegrationWithToolContextManager`; `class TestContextStatsIntegrationWithContextManager`; `class TestContextStatsResetOnCompression`; `class TestDispatchToolCallRecording`; `class TestContextStatsSessionReset`
+  - `class TestContextStatsBasic`; `class TestContextStatsNormalization`; `class TestContextStatsIntegrationWithToolContextManager`; `class TestContextStatsIntegrationWithContextManager`; `class TestContextStatsResetOnCompression`; `class TestContextFeatureLateBoundContextManager`; `class TestDispatchToolCallRecording`; `class TestContextStatsSessionReset`
 - **tests/unit/test_context_breakdown_measurement.py** — Tests for ``ContextBuilder.measure_context_breakdown`` and friends.
   - `def mock_storage()`; `def builder(mock_storage)`; `def sample_episodes()`; `def short_history()`; `class TestCountToolSchemaTokens`; `class TestEpisodeGetFormatSplit`; `class TestMeasureContextBreakdown`; `class TestDriftGuard`; `…`
 - **tests/unit/test_context_builder.py** — Tests for the ContextBuilder module.
@@ -2170,6 +2170,8 @@ Repo entry points and standard project files.
   - `class MockStorage`; `class MockDB`; `class MockAgent`; `class MockNode`; `def mock_agent()`; `def temp_agent_dir(tmp_path)`; `class TestRenameValidation`; `class TestRenameExecution`; `…`
 - **tests/unit/test_resolve_session_id.py** — ``resolve_session_id`` is the public surface that lets the streaming endpoint echo the effective session_id back to the client.
   - `async def test_resolve_returns_explicit_value_unchanged()`; `async def test_resolve_derives_when_caller_passes_none()`; `async def test_resolve_propagates_none_when_derive_returns_none()`; `async def test_privacy_wrapper_resolve_passes_through_for_ephemeral()`; `async def test_privacy_wrapper_resolve_passes_through_for_isolated()`; `async def test_privacy_wrapper_resolve_delegates_for_normal()`
+- **tests/unit/test_respond_to_a2a_task.py** — Direct contracts for ``TaskFeature.respond_to_a2a_task``.
+  - `async def test_completes_submitted_task_chains_through_working()`; `async def test_completes_working_task_directly()`; `async def test_failed_state_supported()`; `async def test_canceled_state_supported()`; `async def test_invalid_state_rejected()`; `async def test_unknown_state_string_rejected()`; `async def test_task_not_found_returns_error()`; `async def test_already_terminal_task_rejected()`; `…`
 - **tests/unit/test_response_audit.py** — Unit tests for the per-response audit plugin.
   - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`
 - **tests/unit/test_retention_janitor.py** — Unit tests for the retention helpers (#764).
