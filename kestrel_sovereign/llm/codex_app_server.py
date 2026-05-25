@@ -120,6 +120,38 @@ def _parse_user_agent_version(user_agent: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _strip_plugin_and_project_sections(toml_text: str) -> str:
+    """Return ``toml_text`` with ``[plugins.*]``, ``[marketplaces.*]``,
+    and ``[projects.*]`` sections removed; top-level scalar settings
+    (``model``, ``model_reasoning_effort``, ``notify``, …) and other
+    non-plugin tables are preserved verbatim.
+
+    Used to seed the isolated kestrel ``CODEX_HOME``'s ``config.toml``
+    from the user's real ``~/.codex/config.toml`` while:
+    1. dropping the plugins that hang codex's session_loop, and
+    2. replacing the trusted-projects list with kestrel's own entry.
+
+    Naive line-based scanner: TOML section headers are at column 0 in
+    practice (codex never indents headers), so we walk lines and drop
+    everything between a stripped header and the next one. Multi-line
+    arrays inside a stripped section are dropped with the section.
+    """
+    out_lines: list[str] = []
+    skip = False
+    for line in toml_text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            inner = stripped.lstrip("[").split("]", 1)[0]
+            head = inner.split(".", 1)[0].strip().strip('"').lower()
+            skip = head in ("plugins", "marketplaces", "projects")
+        if not skip:
+            out_lines.append(line)
+    body = "".join(out_lines)
+    # Trim trailing whitespace so the appended trusted-projects block
+    # lands on a clean line boundary.
+    return body.rstrip() + ("\n" if body.strip() else "")
+
+
 class CodexAppServerClient:
     """One managed ``codex app-server`` process + JSON-RPC multiplexer."""
 
@@ -245,17 +277,30 @@ class CodexAppServerClient:
         # review #1394 P2.
         cwd_escaped = cwd_for_codex.replace("\\", "\\\\").replace('"', '\\"')
         bridged_config = kestrel_codex_home / "config.toml"
-        # Don't pin a default model here — the per-thread/turn model
-        # is selected by the orchestrator via ``_model_param`` (which
-        # intentionally omits the model for ``auto``/``default`` so
-        # codex uses its own configured default). Hard-coding ``model
-        # = "gpt-5.5"`` in this config would override that for every
-        # turn. Codex review #1394 P2.
+        # Build the isolated config by COPYING the user's
+        # ~/.codex/config.toml with ``[plugins.*]``, ``[marketplaces.*]``,
+        # and ``[projects.*]`` sections stripped, then appending our
+        # own trusted-project block. This preserves the user's
+        # ``model``, ``model_reasoning_effort``, etc. defaults so the
+        # adapter's ``_model_param`` ``auto``/``default`` path still
+        # gets a configured default to fall through to — otherwise
+        # codex defaults to its own built-in choice and the user's
+        # configured default is lost. Codex review #1394 P2.
+        trusted_block = (
+            f'\n[projects."{cwd_escaped}"]\n'
+            f'trust_level = "trusted"\n'
+        )
+        user_config_path = user_codex_home / "config.toml"
+        sanitized_body = ""
+        if not same_home and user_config_path.exists():
+            try:
+                sanitized_body = _strip_plugin_and_project_sections(
+                    user_config_path.read_text(encoding="utf-8")
+                )
+            except OSError:
+                sanitized_body = ""
         try:
-            bridged_config.write_text(
-                f'[projects."{cwd_escaped}"]\n'
-                f'trust_level = "trusted"\n'
-            )
+            bridged_config.write_text(sanitized_body + trusted_block)
         except OSError:
             pass
         # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env ONLY
