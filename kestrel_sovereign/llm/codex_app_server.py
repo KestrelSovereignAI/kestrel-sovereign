@@ -120,6 +120,38 @@ def _parse_user_agent_version(user_agent: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _strip_plugin_and_project_sections(toml_text: str) -> str:
+    """Return ``toml_text`` with ``[plugins.*]``, ``[marketplaces.*]``,
+    and ``[projects.*]`` sections removed; top-level scalar settings
+    (``model``, ``model_reasoning_effort``, ``notify``, …) and other
+    non-plugin tables are preserved verbatim.
+
+    Used to seed the isolated kestrel ``CODEX_HOME``'s ``config.toml``
+    from the user's real ``~/.codex/config.toml`` while:
+    1. dropping the plugins that hang codex's session_loop, and
+    2. replacing the trusted-projects list with kestrel's own entry.
+
+    Naive line-based scanner: TOML section headers are at column 0 in
+    practice (codex never indents headers), so we walk lines and drop
+    everything between a stripped header and the next one. Multi-line
+    arrays inside a stripped section are dropped with the section.
+    """
+    out_lines: list[str] = []
+    skip = False
+    for line in toml_text.splitlines(keepends=True):
+        stripped = line.lstrip()
+        if stripped.startswith("["):
+            inner = stripped.lstrip("[").split("]", 1)[0]
+            head = inner.split(".", 1)[0].strip().strip('"').lower()
+            skip = head in ("plugins", "marketplaces", "projects")
+        if not skip:
+            out_lines.append(line)
+    body = "".join(out_lines)
+    # Trim trailing whitespace so the appended trusted-projects block
+    # lands on a clean line boundary.
+    return body.rstrip() + ("\n" if body.strip() else "")
+
+
 class CodexAppServerClient:
     """One managed ``codex app-server`` process + JSON-RPC multiplexer."""
 
@@ -161,13 +193,143 @@ class CodexAppServerClient:
             self._initialized = True
 
     async def _spawn(self) -> None:
+        # Isolate ``CODEX_HOME`` to a kestrel-managed directory so codex
+        # does not auto-load the user's globally-configured plugins
+        # (computer-use, codex_apps, browser-use, …). Without isolation,
+        # those plugins are mounted as MCP servers on every thread; some
+        # (notably ``codex_apps``) hang on ``status=starting`` and block
+        # the session_loop's upstream Responses API call indefinitely.
+        # Same mechanism kestrel-claw uses
+        # (extensions/codex/src/app-server/auth-bridge.ts —
+        # ``withAgentCodexHomeEnvironment``): point CODEX_HOME at an
+        # isolated dir, then bridge the user's ChatGPT auth across by
+        # symlinking auth.json so the subscription sign-in still works.
+        kestrel_codex_home = Path.home() / ".kestrel" / "codex-home"
+        kestrel_codex_home.mkdir(parents=True, exist_ok=True)
+        # Source the user's REAL codex home from the environment when set
+        # (e.g. operator overrode ``CODEX_HOME``), not the default
+        # ``~/.codex``. Without this an operator on a non-default codex
+        # home would have the app-server start unauthenticated because
+        # we'd be linking from an empty ``~/.codex``. Codex review
+        # #1394 P2.
+        user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+        user_codex_home = (
+            Path(user_codex_home_env) if user_codex_home_env
+            else Path.home() / ".codex"
+        )
+        # Bridge auth.json + installation_id from the user's real codex
+        # home so codex sees the same ChatGPT identity it would see when
+        # run normally. Symlink rather than copy so token refreshes
+        # propagate to the source.
+        # Re-point the symlink every spawn — a previous bridge created
+        # for a different ``CODEX_HOME`` would otherwise stale-point at
+        # the old source and authenticate as the wrong account. Codex
+        # review #1394 P2.
+        # Guard: if the operator points ``CODEX_HOME`` at our managed
+        # dir, source == dest and the unlink+symlink dance below would
+        # destroy the real auth file. Skip bridging entirely in that
+        # case — the file is already where codex expects it. Codex
+        # review #1394 P2.
+        same_home = (
+            kestrel_codex_home.resolve() == user_codex_home.resolve()
+        )
+        if not same_home:
+            for fname in ("auth.json", "installation_id"):
+                user_file = user_codex_home / fname
+                bridged_file = kestrel_codex_home / fname
+                if not user_file.exists():
+                    # Source absent: clear any stale bridge from a previous
+                    # spawn so the API-key gating below sees the current
+                    # state (not stale OAuth). Codex review #1394 P2.
+                    if bridged_file.is_symlink() or bridged_file.exists():
+                        try:
+                            bridged_file.unlink()
+                        except OSError:
+                            pass
+                    continue
+                try:
+                    if bridged_file.is_symlink() or bridged_file.exists():
+                        if (
+                            bridged_file.is_symlink()
+                            and bridged_file.readlink() == user_file
+                        ):
+                            continue
+                        bridged_file.unlink()
+                    bridged_file.symlink_to(user_file)
+                except OSError:
+                    pass
+        # Minimal config.toml — trust the kestrel workspace + cwd so
+        # codex doesn't refuse to run, but ship NO ``[plugins.*]`` blocks
+        # so the user's globally-enabled MCP plugins
+        # (computer-use, codex_apps, etc.) stay un-mounted in our
+        # sessions. Kestrel runs its own computer-use feature; codex's
+        # bundled one would be a duplicate-mount anyway.
+        # Rewrite every spawn so a cwd change (different KESTREL_CODEX_CWD
+        # or process cwd) is reflected in the trusted-projects list —
+        # otherwise codex rejects/blocks the workspace until the user
+        # manually deletes the stale config. Codex review #1394 P2.
+        cwd_for_codex = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
+        # Escape TOML basic-string special characters in the cwd before
+        # interpolating into the ``[projects."..."]`` table key. A
+        # workspace with ``"`` or ``\`` in the path would otherwise
+        # produce invalid TOML and codex would either refuse to parse
+        # the config or trust a different project than intended. Codex
+        # review #1394 P2.
+        cwd_escaped = cwd_for_codex.replace("\\", "\\\\").replace('"', '\\"')
+        bridged_config = kestrel_codex_home / "config.toml"
+        # Build the isolated config by COPYING the user's
+        # ~/.codex/config.toml with ``[plugins.*]``, ``[marketplaces.*]``,
+        # and ``[projects.*]`` sections stripped, then appending our
+        # own trusted-project block. This preserves the user's
+        # ``model``, ``model_reasoning_effort``, etc. defaults so the
+        # adapter's ``_model_param`` ``auto``/``default`` path still
+        # gets a configured default to fall through to — otherwise
+        # codex defaults to its own built-in choice and the user's
+        # configured default is lost. Codex review #1394 P2.
+        trusted_block = (
+            f'\n[projects."{cwd_escaped}"]\n'
+            f'trust_level = "trusted"\n'
+        )
+        user_config_path = user_codex_home / "config.toml"
+        sanitized_body = ""
+        if not same_home and user_config_path.exists():
+            try:
+                sanitized_body = _strip_plugin_and_project_sections(
+                    user_config_path.read_text(encoding="utf-8")
+                )
+            except OSError:
+                sanitized_body = ""
         try:
+            bridged_config.write_text(sanitized_body + trusted_block)
+        except OSError:
+            pass
+        # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env ONLY
+        # when ``_load_chatgpt_login_params()`` returns usable tokens —
+        # not just on file presence. A stale/corrupt ``auth.json`` with
+        # no ``access_token`` would otherwise leave codex with neither
+        # OAuth (login RPC returns None) nor API-key (we stripped them)
+        # credentials. Matches claw's
+        # ``shouldClearOpenAiApiKeyForCodexAuthProfile`` gating in
+        # ``auth-bridge.ts``. Codex review #1394 P2.
+        usable_oauth_login = self._load_chatgpt_login_params() is not None
+        spawn_env = {**os.environ, "CODEX_HOME": str(kestrel_codex_home)}
+        if usable_oauth_login:
+            spawn_env.pop("OPENAI_API_KEY", None)
+            spawn_env.pop("CODEX_API_KEY", None)
+        try:
+            # ``--disable apps``: codex's bundled ``codex_apps`` MCP
+            # is built-in and tries to fetch ChatGPT app metadata on
+            # every thread. For our session it consistently exceeds
+            # the 30s MCP startup_timeout, leaving session_loop
+            # blocked. Kestrel has its own app/tool surface — we
+            # don't need codex's bundled directory.
             self._proc = await asyncio.create_subprocess_exec(
-                self._binary, "app-server", "--listen", "stdio://",
+                self._binary, "--disable", "apps",
+                "app-server", "--listen", "stdio://",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ},
+                env=spawn_env,
             )
         except OSError as e:
             raise CodexAppServerError(f"Failed to spawn {self._binary}: {e}") from e
@@ -183,7 +345,7 @@ class CodexAppServerClient:
         self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def _handshake(self) -> None:
-        result = await self.request(
+        result = await self._request_unguarded(
             "initialize",
             {
                 "clientInfo": {
@@ -206,6 +368,244 @@ class CodexAppServerClient:
                 f"detected {detected}. Update the Codex app/CLI."
             )
         self.notify("initialized")
+        # Match kestrel-claw's auth-bridge.ts: after initialize +
+        # initialized notification, explicitly drive
+        # ``account/login/start`` with the user's ChatGPT tokens.
+        # Without this the app-server's session_loop hangs before
+        # making the upstream Responses API call — auth.json on disk
+        # in CODEX_HOME is consulted by ``codex exec`` but the
+        # app-server path requires an explicit login RPC to wire the
+        # account into the session (claw's
+        # ``applyCodexAppServerAuthProfile`` in
+        # ``extensions/codex/src/app-server/shared-client.ts``).
+        login_params = self._load_chatgpt_login_params()
+        if login_params is not None:
+            try:
+                await self._request_unguarded(
+                    "account/login/start", login_params, timeout=30,
+                )
+            except CodexAppServerError as e:
+                logger.warning(
+                    "codex account/login/start failed (continuing — auth "
+                    "may still resolve from auth.json): %s", e,
+                )
+
+    def _load_chatgpt_login_params(self) -> Optional[dict]:
+        """Read the user's codex auth.json and shape it as the
+        ``account/login/start`` RPC param for the ChatGPT subscription
+        path. Returns ``None`` when no chatgpt OAuth tokens are present
+        (e.g. an API-key-only setup) — the caller proceeds without the
+        login RPC in that case."""
+        # Source from the user's real codex home — ``CODEX_HOME`` env var
+        # overrides ``~/.codex`` when set. Matches the same resolution in
+        # ``_spawn``; without this, an operator on a non-default codex
+        # home gets an unauthenticated app-server.
+        user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+        user_codex_home = (
+            Path(user_codex_home_env) if user_codex_home_env
+            else Path.home() / ".codex"
+        )
+        auth_path = user_codex_home / "auth.json"
+        if not auth_path.exists():
+            return None
+        try:
+            import json
+            data = json.loads(auth_path.read_text())
+        except (OSError, ValueError):
+            return None
+        # Respect the operator's recorded auth mode. An auth.json with
+        # ``auth_mode: "apikey"`` means the user explicitly chose the
+        # API-key lane — old ChatGPT tokens may still be present in
+        # the file from a prior session but they should not be used.
+        # Without this gate, my code would route through OAuth with
+        # stale tokens AND strip the API-key env vars in _spawn,
+        # silently breaking the operator's selected lane. Codex
+        # review #1394 P2.
+        auth_mode = (data.get("auth_mode") or "").strip().lower()
+        if auth_mode and auth_mode != "chatgpt":
+            return None
+        tokens = data.get("tokens") or {}
+        access = (tokens.get("access_token") or "").strip()
+        account_id = (tokens.get("account_id") or "").strip()
+        if not access:
+            return None
+        # Plan type lives inside the id_token JWT claims under the
+        # OpenAI ``auth.chatgpt_plan_type`` namespace. Decode the
+        # payload portion only (signature unchecked — we trust the
+        # local file). Falls back to ``None`` when absent; codex
+        # accepts a null plan_type.
+        plan_type: Optional[str] = None
+        id_token = (tokens.get("id_token") or "").strip()
+        if id_token:
+            try:
+                import base64
+                parts = id_token.split(".")
+                if len(parts) >= 2:
+                    payload_b64 = parts[1]
+                    payload_b64 += "=" * (-len(payload_b64) % 4)
+                    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+                    auth_claim = claims.get(
+                        "https://api.openai.com/auth"
+                    ) or {}
+                    plan_type = (
+                        auth_claim.get("chatgpt_plan_type")
+                        or claims.get("chatgpt_plan_type")
+                        or None
+                    )
+            except (ValueError, OSError, KeyError):
+                plan_type = None
+        # ``chatgptAccountId`` is REQUIRED by the schema for
+        # ``account/login/start`` (LoginAccountParams::chatgptAuthTokens).
+        # If auth.json is missing it, treat this as unusable OAuth
+        # state — falling through here without it would cause codex
+        # to reject login AND leave us having stripped the API-key
+        # env-var fallback. Codex review #1394 P2.
+        if not account_id:
+            return None
+        params: Dict[str, Any] = {
+            "type": "chatgptAuthTokens",
+            "accessToken": access,
+            "chatgptAccountId": account_id,
+        }
+        if plan_type:
+            params["chatgptPlanType"] = plan_type
+        return params
+
+    async def _refresh_chatgpt_tokens(self) -> Optional[dict]:
+        """Drive the OAuth refresh-token flow against the OpenAI auth
+        endpoint, persist the new tokens back to ``auth.json``, and
+        return the same shape as :meth:`_load_chatgpt_login_params`.
+
+        Codex CLI runs this same refresh on its own schedule when it
+        is the active process. In a long-running kestrel host that is
+        the only app-server client, nobody is refreshing for us — so
+        re-reading ``auth.json`` from
+        ``account/chatgptAuthTokens/refresh`` would return the same
+        expired token and codex would 401 again. This method runs the
+        OAuth grant_type=refresh_token exchange so we can hand codex
+        a real fresh token. Codex review #1394 P1.
+
+        Returns ``None`` when there are no usable OAuth credentials on
+        disk or the refresh exchange fails — the caller should error
+        out cleanly in that case rather than send an empty token.
+        """
+        user_codex_home_env = os.environ.get("CODEX_HOME", "").strip()
+        user_codex_home = (
+            Path(user_codex_home_env) if user_codex_home_env
+            else Path.home() / ".codex"
+        )
+        auth_path = user_codex_home / "auth.json"
+        if not auth_path.exists():
+            return None
+        try:
+            import json
+            data = json.loads(auth_path.read_text())
+        except (OSError, ValueError):
+            return None
+        tokens = data.get("tokens") or {}
+        refresh_token = (tokens.get("refresh_token") or "").strip()
+        if not refresh_token:
+            return None
+        token_url = os.environ.get(
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            "https://auth.openai.com/oauth/token",
+        )
+        # Codex's own client_id — visible as an unredacted string in
+        # the codex binary. Required by OpenAI's OAuth endpoint to
+        # accept the refresh; using kestrel's own client_id would be
+        # rejected as that client isn't registered with OpenAI auth.
+        client_id = "app_EMoamEEZ73f0CkXaXp7hrann"
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=20) as client:
+                # OAuth token endpoints (including OpenAI's) require
+                # ``application/x-www-form-urlencoded``, not JSON. Use
+                # httpx's ``data=`` so the body is form-encoded with
+                # the right Content-Type. Codex review #1394 P1.
+                resp = await client.post(
+                    token_url,
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": client_id,
+                        "scope": "openid profile email offline_access",
+                    },
+                )
+                if resp.status_code != 200:
+                    logger.warning(
+                        "codex token refresh failed: %s %s",
+                        resp.status_code, resp.text[:200],
+                    )
+                    return None
+                body = resp.json()
+        except (httpx.HTTPError, ValueError, OSError) as e:
+            logger.warning("codex token refresh exception: %s", e)
+            return None
+        new_access = (body.get("access_token") or "").strip()
+        new_id_token = (body.get("id_token") or "").strip()
+        new_refresh = (body.get("refresh_token") or refresh_token).strip()
+        if not new_access:
+            return None
+        # Persist the rotated tokens back to auth.json so future
+        # spawns (including codex's own CLI) see the same state. Mirror
+        # the on-disk shape codex writes: top-level ``tokens`` object
+        # with ``access_token`` / ``id_token`` / ``refresh_token`` /
+        # ``account_id`` (the account_id stays put — refresh doesn't
+        # rotate the workspace identifier).
+        tokens["access_token"] = new_access
+        if new_id_token:
+            tokens["id_token"] = new_id_token
+        tokens["refresh_token"] = new_refresh
+        data["tokens"] = tokens
+        data["last_refresh"] = (
+            __import__("datetime").datetime.now(
+                __import__("datetime").timezone.utc
+            ).isoformat()
+        )
+        try:
+            auth_path.write_text(json.dumps(data))
+        except OSError as e:
+            logger.warning(
+                "codex token refresh: wrote new token in-memory but "
+                "failed to persist to %s: %s — next host restart will "
+                "still see the expired token.", auth_path, e,
+            )
+        # Return the in-memory refreshed state directly. Re-reading
+        # auth.json here would replay the OLD token whenever
+        # persistence failed (read-only mount, permissions, etc.),
+        # causing codex to 401 again immediately. Derive the chatgpt
+        # plan type from the new id_token claims using the same logic
+        # as ``_load_chatgpt_login_params``. Codex review #1394 P2.
+        account_id = (tokens.get("account_id") or "").strip()
+        if not account_id:
+            return None
+        plan_type: Optional[str] = None
+        if new_id_token:
+            try:
+                import base64
+                parts = new_id_token.split(".")
+                if len(parts) >= 2:
+                    payload_b64 = parts[1]
+                    payload_b64 += "=" * (-len(payload_b64) % 4)
+                    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+                    auth_claim = claims.get(
+                        "https://api.openai.com/auth"
+                    ) or {}
+                    plan_type = (
+                        auth_claim.get("chatgpt_plan_type")
+                        or claims.get("chatgpt_plan_type")
+                        or None
+                    )
+            except (ValueError, OSError, KeyError):
+                plan_type = None
+        out: Dict[str, Any] = {
+            "type": "chatgptAuthTokens",
+            "accessToken": new_access,
+            "chatgptAccountId": account_id,
+        }
+        if plan_type:
+            out["chatgptPlanType"] = plan_type
+        return out
 
     async def aclose(self) -> None:
         proc = self._proc
@@ -333,6 +733,42 @@ class CodexAppServerClient:
                 handler = self._server_request_handlers.get((method, None))
             if handler is not None:
                 result = await handler(params)
+            elif method == "account/chatgptAuthTokens/refresh":
+                # Codex enters external-token mode when we drove
+                # ``account/login/start`` with ``type=chatgptAuthTokens``.
+                # Once the access token expires it asks us (the client)
+                # for fresh tokens via this server→client RPC. Drive
+                # the actual OAuth refresh against OpenAI's token
+                # endpoint and persist the rotated tokens back to
+                # ``auth.json`` — otherwise long-running sessions would
+                # 401 again immediately because nothing else is
+                # refreshing the file. Codex review #1394 P1.
+                refreshed = await self._refresh_chatgpt_tokens()
+                if refreshed is not None:
+                    result = {
+                        "accessToken": refreshed["accessToken"],
+                        "chatgptAccountId": refreshed.get(
+                            "chatgptAccountId", ""
+                        ),
+                        "chatgptPlanType": refreshed.get("chatgptPlanType"),
+                    }
+                else:
+                    # Refresh failed — surface a structured error so
+                    # codex stops and a higher layer can prompt the
+                    # operator to re-authenticate, rather than
+                    # silently replaying an expired token.
+                    self._send({
+                        "id": mid,
+                        "error": {
+                            "code": -32603,
+                            "message": (
+                                "kestrel could not refresh chatgpt auth "
+                                "tokens (run `codex login` to "
+                                "re-authenticate)"
+                            ),
+                        },
+                    })
+                    return
             elif method in _DEFAULT_APPROVAL_REPLIES:
                 result = _DEFAULT_APPROVAL_REPLIES[method]
             elif method == "item/tool/call":
@@ -405,6 +841,15 @@ class CodexAppServerClient:
             await self.ensure_started()
         if self._closed_error and method != "initialize":
             raise self._closed_error
+        return await self._request_unguarded(method, params, timeout=timeout)
+
+    async def _request_unguarded(
+        self, method: str, params: Optional[dict] = None, *, timeout: float = 120,
+    ) -> Any:
+        """Send a request without going through ``ensure_started``.
+        For use from inside ``_handshake`` where the start lock is
+        already held — calling ``request`` from there would deadlock.
+        """
         mid = self._next_id
         self._next_id += 1
         fut: asyncio.Future = asyncio.get_event_loop().create_future()
