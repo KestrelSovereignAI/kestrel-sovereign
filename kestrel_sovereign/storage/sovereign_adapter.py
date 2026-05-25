@@ -93,6 +93,72 @@ class AssetCollector(abc.ABC):
         ...
 
 
+class AssetRestorer(abc.ABC):
+    """Protocol for downstream apps to restore exported assets on import.
+
+    Symmetric counterpart to :class:`AssetCollector`. The export path
+    serializes downstream-owned bytes into the sovereignty CAR; this
+    protocol is how the receiving side gets those bytes back into its
+    local stores.
+
+    Lifecycle per import:
+
+      1. ``SovereignStorageAdapter.import_agent`` walks
+         ``manifest.assets``, fetches each block from the CAR, and
+         decrypts those with a keyring entry (the
+         convergent-encrypted ones). External-ref assets (blocks that
+         are link nodes to IPFS) are surfaced as metadata-only on
+         ``SovereignImportResult.assets_restored`` and skipped here —
+         restorer Phase 2 will fetch them via the filecoin adapter.
+      2. The adapter groups the resulting ``(AssetMetadata, bytes)``
+         pairs by :attr:`asset_types` and routes each group to every
+         restorer that declares the type.
+      3. Restorers raise on any failure they want to surface; the
+         adapter propagates the exception after writing a structured
+         audit row (the host DB's conversation restore is in the same
+         try-block, so an asset-restore failure rolls back nothing
+         that was already written, but the next caller sees a clean
+         error path).
+
+    A restorer that handles multiple asset types declares them all in
+    :attr:`asset_types`; the same restorer can receive a mix in one
+    ``restore_assets`` call.
+    """
+
+    @property
+    @abc.abstractmethod
+    def asset_types(self) -> List[str]:
+        """Asset type tokens this restorer accepts.
+
+        Tokens match the ``asset_type`` field on
+        :class:`AssetDescriptor`/``AssetMetadata`` (e.g.
+        ``"fhir_resource"``, ``"avatar"``).
+        """
+        ...
+
+    @abc.abstractmethod
+    async def restore_assets(
+        self,
+        agent_did: str,
+        assets: List[Tuple[AssetMetadata, bytes]],
+    ) -> int:
+        """Restore *assets* into local storage. Return count restored.
+
+        ``assets`` is the subset of the import's assets matching one of
+        this restorer's :attr:`asset_types`. Empty list means the
+        adapter has nothing to hand off — restorer may treat that as a
+        no-op or raise. ``bytes`` is decrypted plaintext for assets
+        encrypted under the adapter's convergent keyring, OR raw block
+        bytes for assets the caller pre-encrypted (the restorer
+        decrypts in its own scheme).
+
+        The returned count is recorded on
+        :class:`SovereignImportResult` so callers can verify what
+        landed without inspecting each restorer.
+        """
+        ...
+
+
 @dataclass
 class RootManifest:
     """The Root DAG Node - The Agent's State"""
@@ -162,6 +228,13 @@ class SovereignImportResult:
     string). ``status`` is one of ``imported`` | ``rejected`` | ``error``.
     A ``rejected`` result means the package failed verification and the
     host database was left untouched.
+
+    ``assets_restored`` carries the manifest metadata for every asset
+    in the CAR (matches pre-#1391 behavior). ``asset_payload_counts``
+    is the per-asset-type count of payloads actually handed off to
+    :class:`AssetRestorer` instances during import — when no restorers
+    are wired (legacy callers), every value is ``0`` even though
+    ``assets_restored`` is populated.
     """
     success: bool
     agent_did: str
@@ -173,6 +246,8 @@ class SovereignImportResult:
     messages_restored: int = 0
     shards_restored: int = 0
     assets_restored: List[Dict[str, Any]] = field(default_factory=list)
+    asset_payload_counts: Dict[str, int] = field(default_factory=dict)
+    asset_payloads_skipped: List[Dict[str, Any]] = field(default_factory=list)
     timestamp: str = ""
     source_cid: Optional[str] = None
 
@@ -188,6 +263,8 @@ class SovereignImportResult:
             "messages_restored": self.messages_restored,
             "shards_restored": self.shards_restored,
             "assets_restored": self.assets_restored,
+            "asset_payload_counts": dict(self.asset_payload_counts),
+            "asset_payloads_skipped": self.asset_payloads_skipped,
             "timestamp": self.timestamp,
             "source_cid": self.source_cid,
         }
@@ -476,6 +553,7 @@ class SovereignStorageAdapter:
         ] = None,
         grant_did_web_resolver: Optional[Callable[[str], Any]] = None,
         revoked_grant_ids: Optional[Iterable[str]] = None,
+        asset_restorers: Optional[List[AssetRestorer]] = None,
     ) -> SovereignImportResult:
         """
         Import (restore) an agent from a sovereignty CAR archive.
@@ -531,6 +609,21 @@ class SovereignStorageAdapter:
                 is compared against this set. Sourced from a trusted
                 registry — never from the grant payload. Ignored when
                 ``grant`` is ``None``.
+            asset_restorers: Optional list of :class:`AssetRestorer`
+                instances that consume the CAR's asset payloads
+                (#1391). Each manifest asset whose ``asset_type``
+                matches a restorer's :attr:`AssetRestorer.asset_types`
+                is decrypted (via the convergent keyring when the
+                exporter let the adapter encrypt it, raw bytes when
+                the exporter pre-encrypted) and handed to the
+                restorer in a single ``restore_assets`` call per
+                ``(restorer, asset_type)`` group. External-ref assets
+                (link nodes pointing at IPFS) are skipped with a
+                structured entry on ``asset_payloads_skipped`` —
+                they're a Phase-2 follow-up. ``None`` preserves the
+                pre-#1391 behavior bit-for-bit: ``assets_restored``
+                still populates from the manifest, and
+                ``asset_payload_counts`` is empty.
         """
         source_cid: Optional[str] = None
         try:
@@ -686,6 +779,8 @@ class SovereignStorageAdapter:
                     source_cid=source_cid,
                 )
 
+        asset_payload_counts: Dict[str, int] = {}
+        asset_payloads_skipped: List[Dict[str, Any]] = []
         try:
             if manifest is None or reader is None:
                 raise RuntimeError("package has no readable manifest")
@@ -718,6 +813,22 @@ class SovereignStorageAdapter:
                     f"INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, {self._now_sql()})",
                     (self.agent_id, msg["role"], msg["content"], metadata_json),
                 )
+
+            # Asset restoration (#1391) — runs AFTER conversation
+            # restore so a restorer failure surfaces against an
+            # already-restored conversation set. Pre-#1391 callers
+            # (no ``asset_restorers``) skip this block entirely; the
+            # metadata-only ``assets_restored`` field still populates
+            # from the manifest below, matching the old behavior.
+            if asset_restorers and manifest.assets:
+                asset_payload_counts, asset_payloads_skipped = (
+                    await self._restore_assets(
+                        manifest=manifest,
+                        reader=reader,
+                        keyring=keyring,
+                        asset_restorers=asset_restorers,
+                    )
+                )
         except Exception as e:
             await self._log_import_attempt(
                 agent_did=agent_did, source_did=src_did,
@@ -740,9 +851,12 @@ class SovereignStorageAdapter:
             manifest_version=manifest_version, source_cid=source_cid,
             grant_id=consent_grant_id,
         )
+        asset_payload_total = sum(asset_payload_counts.values())
         self.logger.info(
             f"✅ Sovereignty import complete: {len(all_conversations)} messages, "
-            f"{len(manifest.assets)} assets (continuity {continuity.overall_score:.3f})"
+            f"{len(manifest.assets)} assets (continuity {continuity.overall_score:.3f}, "
+            f"{asset_payload_total} asset payload(s) restored, "
+            f"{len(asset_payloads_skipped)} skipped)"
         )
         return SovereignImportResult(
             success=True, agent_did=agent_did, package_hash=package_hash,
@@ -751,8 +865,145 @@ class SovereignStorageAdapter:
             messages_restored=len(all_conversations),
             shards_restored=len(manifest.shards),
             assets_restored=[asdict(a) for a in manifest.assets],
+            asset_payload_counts=asset_payload_counts,
+            asset_payloads_skipped=asset_payloads_skipped,
             timestamp=manifest.timestamp, source_cid=source_cid,
         )
+
+    # ------------------------------------------------------------------
+    # Asset restoration (#1391)
+    # ------------------------------------------------------------------
+
+    async def _restore_assets(
+        self,
+        *,
+        manifest: RootManifest,
+        reader: CARReader,
+        keyring: Dict[str, str],
+        asset_restorers: List[AssetRestorer],
+    ) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+        """Walk every asset in *manifest*, decrypt, route to restorers.
+
+        Returns ``(payload_counts, skipped)``:
+
+          * ``payload_counts`` — per ``asset_type`` count of payloads
+            successfully restored. ``{"fhir_resource": 12, "avatar": 1}``.
+          * ``skipped`` — list of ``{asset_key, asset_type, reason}``
+            entries for assets the adapter couldn't hand off (external
+            refs, missing block, no keyring entry where one was
+            required). Surface-only — the import still succeeds.
+
+        Raises whatever the restorer raises. By the time a restorer
+        sees its assets, conversations have already been restored; an
+        asset-side failure is auditable but not transactionally
+        rollback-able under the current SQLite schema.
+        """
+        # Pre-compute the restorer-by-asset_type fan-out so we can
+        # short-circuit assets nobody handles.
+        restorers_for: Dict[str, List[AssetRestorer]] = {}
+        for r in asset_restorers:
+            types = r.asset_types or []
+            for t in types:
+                restorers_for.setdefault(t, []).append(r)
+
+        # Group payloads by (restorer, asset_type) so each restorer
+        # sees one batched call per type it claims.
+        grouped: Dict[
+            Tuple[int, str], List[Tuple[AssetMetadata, bytes]]
+        ] = {}
+        skipped: List[Dict[str, Any]] = []
+        for asset in manifest.assets:
+            restorers = restorers_for.get(asset.asset_type)
+            if not restorers:
+                # No restorer registered for this type — surface as
+                # metadata-only so the caller can see what was passed
+                # over.
+                skipped.append({
+                    "asset_key": asset.asset_key,
+                    "asset_type": asset.asset_type,
+                    "reason": "no_restorer_for_type",
+                })
+                continue
+
+            block = reader.get_block(asset.cid)
+            if block is None:
+                # An external-ref block IS reachable via reader (it's
+                # a dag-cbor link node), but we ALSO land here when the
+                # asset's CID just isn't in the CAR. Either way, no
+                # bytes to hand off — skip.
+                skipped.append({
+                    "asset_key": asset.asset_key,
+                    "asset_type": asset.asset_type,
+                    "reason": "asset_block_missing_from_car",
+                })
+                continue
+
+            # External-ref detection: an external-ref block is a
+            # dag-cbor link node shaped ``{"link": …, "type": …}``. A
+            # raw-bytes asset block isn't cbor-encoded at all, so
+            # ``get_dag_cbor_block`` raises rather than returning
+            # None. Both paths land here as "not an external ref" —
+            # only a successful decode + the link-shape signature
+            # confirms.
+            try:
+                link_obj = reader.get_dag_cbor_block(asset.cid)
+            except Exception:
+                link_obj = None
+            if isinstance(link_obj, dict) and "link" in link_obj:
+                # Phase-2 follow-up will fetch via the filecoin
+                # adapter; for now, skip with a structured reason.
+                skipped.append({
+                    "asset_key": asset.asset_key,
+                    "asset_type": asset.asset_type,
+                    "reason": "external_ref_not_yet_supported",
+                })
+                continue
+
+            keyring_key_hex = keyring.get(f"asset_{asset.asset_key}")
+            if keyring_key_hex:
+                # Adapter-encrypted: decrypt with the per-asset key.
+                try:
+                    payload = self.encryptor.decrypt(
+                        block, bytes.fromhex(keyring_key_hex),
+                    )
+                except Exception as e:
+                    skipped.append({
+                        "asset_key": asset.asset_key,
+                        "asset_type": asset.asset_type,
+                        "reason": f"asset_decrypt_failed: {e}",
+                    })
+                    continue
+            else:
+                # Caller pre-encrypted (encrypted=True on the
+                # exported descriptor) — hand raw block bytes
+                # through; the restorer decrypts in its own scheme.
+                payload = block
+
+            for r in restorers:
+                grouped.setdefault(
+                    (id(r), asset.asset_type), [],
+                ).append((asset, payload))
+
+        # Resolve restorer-id back to the restorer instance for the
+        # call. Two restorers with the same id() can't co-exist (CPython
+        # guarantees uniqueness for live objects), so this is stable.
+        by_id = {id(r): r for r in asset_restorers}
+
+        payload_counts: Dict[str, int] = {}
+        for (restorer_id, asset_type), batch in grouped.items():
+            restorer = by_id[restorer_id]
+            restored_n = await restorer.restore_assets(
+                manifest.agent_did, batch,
+            )
+            if not isinstance(restored_n, int):
+                # Defensive: a buggy restorer returning None should not
+                # silently zero out the count.
+                restored_n = len(batch)
+            payload_counts[asset_type] = (
+                payload_counts.get(asset_type, 0) + restored_n
+            )
+
+        return payload_counts, skipped
 
     # ------------------------------------------------------------------
     # Append-only import audit log
