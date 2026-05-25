@@ -197,6 +197,14 @@ class CodexAppServerClient:
             user_file = user_codex_home / fname
             bridged_file = kestrel_codex_home / fname
             if not user_file.exists():
+                # Source absent: clear any stale bridge from a previous
+                # spawn so the API-key gating below sees the current
+                # state (not stale OAuth). Codex review #1394 P2.
+                if bridged_file.is_symlink() or bridged_file.exists():
+                    try:
+                        bridged_file.unlink()
+                    except OSError:
+                        pass
                 continue
             try:
                 if bridged_file.is_symlink() or bridged_file.exists():
