@@ -473,9 +473,13 @@ class CodexAppServerClient:
         try:
             import httpx
             async with httpx.AsyncClient(timeout=20) as client:
+                # OAuth token endpoints (including OpenAI's) require
+                # ``application/x-www-form-urlencoded``, not JSON. Use
+                # httpx's ``data=`` so the body is form-encoded with
+                # the right Content-Type. Codex review #1394 P1.
                 resp = await client.post(
                     token_url,
-                    json={
+                    data={
                         "grant_type": "refresh_token",
                         "refresh_token": refresh_token,
                         "client_id": client_id,
