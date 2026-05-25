@@ -237,11 +237,18 @@ class CodexAppServerClient:
         # otherwise codex rejects/blocks the workspace until the user
         # manually deletes the stale config. Codex review #1394 P2.
         cwd_for_codex = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
+        # Escape TOML basic-string special characters in the cwd before
+        # interpolating into the ``[projects."..."]`` table key. A
+        # workspace with ``"`` or ``\`` in the path would otherwise
+        # produce invalid TOML and codex would either refuse to parse
+        # the config or trust a different project than intended. Codex
+        # review #1394 P2.
+        cwd_escaped = cwd_for_codex.replace("\\", "\\\\").replace('"', '\\"')
         bridged_config = kestrel_codex_home / "config.toml"
         try:
             bridged_config.write_text(
                 f'model = "gpt-5.5"\n\n'
-                f'[projects."{cwd_for_codex}"]\n'
+                f'[projects."{cwd_escaped}"]\n'
                 f'trust_level = "trusted"\n'
             )
         except OSError:
