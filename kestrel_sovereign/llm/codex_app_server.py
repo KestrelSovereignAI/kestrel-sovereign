@@ -193,30 +193,39 @@ class CodexAppServerClient:
         # for a different ``CODEX_HOME`` would otherwise stale-point at
         # the old source and authenticate as the wrong account. Codex
         # review #1394 P2.
-        for fname in ("auth.json", "installation_id"):
-            user_file = user_codex_home / fname
-            bridged_file = kestrel_codex_home / fname
-            if not user_file.exists():
-                # Source absent: clear any stale bridge from a previous
-                # spawn so the API-key gating below sees the current
-                # state (not stale OAuth). Codex review #1394 P2.
-                if bridged_file.is_symlink() or bridged_file.exists():
-                    try:
+        # Guard: if the operator points ``CODEX_HOME`` at our managed
+        # dir, source == dest and the unlink+symlink dance below would
+        # destroy the real auth file. Skip bridging entirely in that
+        # case — the file is already where codex expects it. Codex
+        # review #1394 P2.
+        same_home = (
+            kestrel_codex_home.resolve() == user_codex_home.resolve()
+        )
+        if not same_home:
+            for fname in ("auth.json", "installation_id"):
+                user_file = user_codex_home / fname
+                bridged_file = kestrel_codex_home / fname
+                if not user_file.exists():
+                    # Source absent: clear any stale bridge from a previous
+                    # spawn so the API-key gating below sees the current
+                    # state (not stale OAuth). Codex review #1394 P2.
+                    if bridged_file.is_symlink() or bridged_file.exists():
+                        try:
+                            bridged_file.unlink()
+                        except OSError:
+                            pass
+                    continue
+                try:
+                    if bridged_file.is_symlink() or bridged_file.exists():
+                        if (
+                            bridged_file.is_symlink()
+                            and bridged_file.readlink() == user_file
+                        ):
+                            continue
                         bridged_file.unlink()
-                    except OSError:
-                        pass
-                continue
-            try:
-                if bridged_file.is_symlink() or bridged_file.exists():
-                    if (
-                        bridged_file.is_symlink()
-                        and bridged_file.readlink() == user_file
-                    ):
-                        continue
-                    bridged_file.unlink()
-                bridged_file.symlink_to(user_file)
-            except OSError:
-                pass
+                    bridged_file.symlink_to(user_file)
+                except OSError:
+                    pass
         # Minimal config.toml — trust the kestrel workspace + cwd so
         # codex doesn't refuse to run, but ship NO ``[plugins.*]`` blocks
         # so the user's globally-enabled MCP plugins
@@ -238,18 +247,16 @@ class CodexAppServerClient:
         except OSError:
             pass
         # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env ONLY
-        # when an OAuth ChatGPT auth was actually bridged across —
-        # otherwise codex would route via the chatgpt subscription path
-        # and find no tokens. API-key-only deployments (no
-        # ``auth.json`` to bridge) need the env vars to remain
-        # available so codex can authenticate via API key. Matches
-        # claw's ``shouldClearOpenAiApiKeyForCodexAuthProfile`` gating
-        # in ``auth-bridge.ts``. Codex review #1394 P2.
-        bridged_oauth_present = (kestrel_codex_home / "auth.json").is_symlink() or (
-            kestrel_codex_home / "auth.json"
-        ).exists()
+        # when ``_load_chatgpt_login_params()`` returns usable tokens —
+        # not just on file presence. A stale/corrupt ``auth.json`` with
+        # no ``access_token`` would otherwise leave codex with neither
+        # OAuth (login RPC returns None) nor API-key (we stripped them)
+        # credentials. Matches claw's
+        # ``shouldClearOpenAiApiKeyForCodexAuthProfile`` gating in
+        # ``auth-bridge.ts``. Codex review #1394 P2.
+        usable_oauth_login = self._load_chatgpt_login_params() is not None
         spawn_env = {**os.environ, "CODEX_HOME": str(kestrel_codex_home)}
-        if bridged_oauth_present:
+        if usable_oauth_login:
             spawn_env.pop("OPENAI_API_KEY", None)
             spawn_env.pop("CODEX_API_KEY", None)
         try:
