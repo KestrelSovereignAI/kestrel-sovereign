@@ -189,14 +189,26 @@ class CodexAppServerClient:
         # home so codex sees the same ChatGPT identity it would see when
         # run normally. Symlink rather than copy so token refreshes
         # propagate to the source.
+        # Re-point the symlink every spawn — a previous bridge created
+        # for a different ``CODEX_HOME`` would otherwise stale-point at
+        # the old source and authenticate as the wrong account. Codex
+        # review #1394 P2.
         for fname in ("auth.json", "installation_id"):
             user_file = user_codex_home / fname
             bridged_file = kestrel_codex_home / fname
-            if user_file.exists() and not bridged_file.exists():
-                try:
-                    bridged_file.symlink_to(user_file)
-                except (OSError, FileExistsError):
-                    pass
+            if not user_file.exists():
+                continue
+            try:
+                if bridged_file.is_symlink() or bridged_file.exists():
+                    if (
+                        bridged_file.is_symlink()
+                        and bridged_file.readlink() == user_file
+                    ):
+                        continue
+                    bridged_file.unlink()
+                bridged_file.symlink_to(user_file)
+            except OSError:
+                pass
         # Minimal config.toml — trust the kestrel workspace + cwd so
         # codex doesn't refuse to run, but ship NO ``[plugins.*]`` blocks
         # so the user's globally-enabled MCP plugins
@@ -217,14 +229,21 @@ class CodexAppServerClient:
             )
         except OSError:
             pass
-        # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env so
-        # codex picks the ChatGPT-subscription path via the bridged
-        # auth.json rather than the API-key path (also matches claw's
-        # ``CODEX_APP_SERVER_API_KEY_ENV_VARS`` clearing in
-        # ``auth-bridge.ts``).
+        # Strip OPENAI_API_KEY / CODEX_API_KEY from the spawn env ONLY
+        # when an OAuth ChatGPT auth was actually bridged across —
+        # otherwise codex would route via the chatgpt subscription path
+        # and find no tokens. API-key-only deployments (no
+        # ``auth.json`` to bridge) need the env vars to remain
+        # available so codex can authenticate via API key. Matches
+        # claw's ``shouldClearOpenAiApiKeyForCodexAuthProfile`` gating
+        # in ``auth-bridge.ts``. Codex review #1394 P2.
+        bridged_oauth_present = (kestrel_codex_home / "auth.json").is_symlink() or (
+            kestrel_codex_home / "auth.json"
+        ).exists()
         spawn_env = {**os.environ, "CODEX_HOME": str(kestrel_codex_home)}
-        spawn_env.pop("OPENAI_API_KEY", None)
-        spawn_env.pop("CODEX_API_KEY", None)
+        if bridged_oauth_present:
+            spawn_env.pop("OPENAI_API_KEY", None)
+            spawn_env.pop("CODEX_API_KEY", None)
         try:
             # ``--disable apps``: codex's bundled ``codex_apps`` MCP
             # is built-in and tries to fetch ChatGPT app metadata on
