@@ -398,12 +398,19 @@ class CodexAppServerClient:
                     )
             except (ValueError, OSError, KeyError):
                 plan_type = None
+        # ``chatgptAccountId`` is REQUIRED by the schema for
+        # ``account/login/start`` (LoginAccountParams::chatgptAuthTokens).
+        # If auth.json is missing it, treat this as unusable OAuth
+        # state — falling through here without it would cause codex
+        # to reject login AND leave us having stripped the API-key
+        # env-var fallback. Codex review #1394 P2.
+        if not account_id:
+            return None
         params: Dict[str, Any] = {
             "type": "chatgptAuthTokens",
             "accessToken": access,
+            "chatgptAccountId": account_id,
         }
-        if account_id:
-            params["chatgptAccountId"] = account_id
         if plan_type:
             params["chatgptPlanType"] = plan_type
         return params
@@ -503,8 +510,42 @@ class CodexAppServerClient:
                 "failed to persist to %s: %s — next host restart will "
                 "still see the expired token.", auth_path, e,
             )
-        # Re-derive login params from the freshened on-disk state.
-        return self._load_chatgpt_login_params()
+        # Return the in-memory refreshed state directly. Re-reading
+        # auth.json here would replay the OLD token whenever
+        # persistence failed (read-only mount, permissions, etc.),
+        # causing codex to 401 again immediately. Derive the chatgpt
+        # plan type from the new id_token claims using the same logic
+        # as ``_load_chatgpt_login_params``. Codex review #1394 P2.
+        account_id = (tokens.get("account_id") or "").strip()
+        if not account_id:
+            return None
+        plan_type: Optional[str] = None
+        if new_id_token:
+            try:
+                import base64
+                parts = new_id_token.split(".")
+                if len(parts) >= 2:
+                    payload_b64 = parts[1]
+                    payload_b64 += "=" * (-len(payload_b64) % 4)
+                    claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+                    auth_claim = claims.get(
+                        "https://api.openai.com/auth"
+                    ) or {}
+                    plan_type = (
+                        auth_claim.get("chatgpt_plan_type")
+                        or claims.get("chatgpt_plan_type")
+                        or None
+                    )
+            except (ValueError, OSError, KeyError):
+                plan_type = None
+        out: Dict[str, Any] = {
+            "type": "chatgptAuthTokens",
+            "accessToken": new_access,
+            "chatgptAccountId": account_id,
+        }
+        if plan_type:
+            out["chatgptPlanType"] = plan_type
+        return out
 
     async def aclose(self) -> None:
         proc = self._proc
