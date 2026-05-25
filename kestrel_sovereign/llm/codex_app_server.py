@@ -368,6 +368,17 @@ class CodexAppServerClient:
             data = json.loads(auth_path.read_text())
         except (OSError, ValueError):
             return None
+        # Respect the operator's recorded auth mode. An auth.json with
+        # ``auth_mode: "apikey"`` means the user explicitly chose the
+        # API-key lane — old ChatGPT tokens may still be present in
+        # the file from a prior session but they should not be used.
+        # Without this gate, my code would route through OAuth with
+        # stale tokens AND strip the API-key env vars in _spawn,
+        # silently breaking the operator's selected lane. Codex
+        # review #1394 P2.
+        auth_mode = (data.get("auth_mode") or "").strip().lower()
+        if auth_mode and auth_mode != "chatgpt":
+            return None
         tokens = data.get("tokens") or {}
         access = (tokens.get("access_token") or "").strip()
         account_id = (tokens.get("account_id") or "").strip()
