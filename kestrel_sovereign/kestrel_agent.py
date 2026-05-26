@@ -1815,6 +1815,16 @@ Expected Duration: {expected_duration}
             user_prompt_tokens = (
                 ctx_counter.count(user_prompt) if user_prompt else 0
             )
+            # Tokens the security addendum adds to the system_prompt
+            # that build_context already accounted for. Without this,
+            # a narrowly-fitting context + user prompt could pass the
+            # gate while the addendum's bytes silently push the wire
+            # payload over the cap (codex round-3 P2 on PR #1400).
+            addendum_delta = max(
+                0,
+                ctx_counter.count(system_prompt)
+                - ctx_counter.count(base_system_prompt),
+            )
             total_budget = (
                 context_result.budget_summary.get("total_budget")
                 if getattr(context_result, "budget_summary", None) else None
@@ -1823,22 +1833,28 @@ Expected Duration: {expected_duration}
         except Exception:
             features_tokens = 0
             user_prompt_tokens = 0
+            addendum_delta = 0
             total_budget = None
             already_used = 0
 
         if total_budget is not None and features_tokens > 0:
-            projected = already_used + user_prompt_tokens + features_tokens
+            projected = (
+                already_used
+                + addendum_delta
+                + user_prompt_tokens
+                + features_tokens
+            )
             if projected > total_budget:
                 logging.warning(
                     "Skipping LOADED FEATURES section for this turn — "
                     "appending %d tokens would push projected payload "
-                    "(%d, includes %d user-prompt tokens) past route "
-                    "budget (%d). Route is likely a per-turn-capped "
-                    "subscription (openai:plan). Feature commands "
-                    "still callable; just not advertised in this "
-                    "turn's system_prompt.",
+                    "(%d; incl. %d user-prompt + %d security-addendum) "
+                    "past route budget (%d). Route is likely a "
+                    "per-turn-capped subscription (openai:plan). "
+                    "Feature commands still callable; just not "
+                    "advertised in this turn's system_prompt.",
                     features_tokens, projected, user_prompt_tokens,
-                    total_budget,
+                    addendum_delta, total_budget,
                 )
                 return system_prompt
         return f"{system_prompt}{self._cached_features_prompt}"
