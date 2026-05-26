@@ -598,7 +598,13 @@ class CodexAdapter(LLMAdapter):
             if "idle for" in msg and "no completion" in msg:
                 from .model_catalog import get_catalog_service
                 try:
-                    cap = get_catalog_service().get_context_limit("openai:plan")
+                    # ``get_route_context_cap`` — caps moved to
+                    # ``[route_context_caps]`` in PR #1396 round-3;
+                    # ``get_context_limit`` would always report
+                    # ``unset`` for the operator (codex round-4 P3).
+                    cap = get_catalog_service().get_route_context_cap(
+                        "openai:plan"
+                    )
                 except Exception:
                     cap = None
                 hint = (
