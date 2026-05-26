@@ -13,6 +13,12 @@ import os
 from typing import Any, Dict, List, Optional, Union, AsyncIterator
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
 
@@ -26,6 +32,21 @@ class GoogleAdapter(LLMAdapter):
     Note: Gemini uses a different message format than OpenAI.
     Uses 'contents' with 'role' and 'parts'.
     """
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_tools=True,
+            supports_streaming=True,
+            supports_vision=True,
+            supports_structured_output=False,
+            structured_output_mode=StructuredOutputMode.NONE,
+            tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
+            vision_input_mode=VisionInputMode.GEMINI_INLINE_DATA,
+            notes=(
+                "Direct Gemini adapter does not yet wire response_format into generation_config.",
+                "Streaming tool calls use the framework's non-streaming fallback path.",
+            ),
+        )
 
     def create_messages(
         self,

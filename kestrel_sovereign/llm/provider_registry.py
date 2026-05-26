@@ -51,6 +51,7 @@ except ImportError:
     ollama = None
 
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter, ProviderInfo
+from kestrel_sdk.llm import ProviderCapabilities
 
 from .adapter import LLMAdapter
 from .ollama_adapter import OllamaAdapter
@@ -79,6 +80,14 @@ _ADAPTER_REGISTRY: Dict[str, type] = {
     "GoogleAdapter": GoogleAdapter,
     "VertexAIAdapter": VertexAIAdapter,
 }
+
+
+def _normalize_capabilities(raw: Any) -> ProviderCapabilities:
+    if isinstance(raw, ProviderCapabilities):
+        return raw
+    if isinstance(raw, dict):
+        return ProviderCapabilities.from_mapping(raw)
+    return ProviderCapabilities()
 
 
 class ProviderInitializationError(Exception):
@@ -219,6 +228,7 @@ class ProviderRegistry:
             is_local=is_local,
             base_url=base_url,
             selection_hints=hints,
+            capabilities=adapter.provider_capabilities(),
         )
 
     def _build_client_and_adapter(
@@ -422,6 +432,12 @@ class ProviderRegistry:
                     info.vendor = vendor
                     info.route = route
                     info.name = f"{vendor}:{route}"
+                    # External factories may set a precise ProviderInfo.capabilities
+                    # themselves. Only backfill when the SDK default was left in place.
+                    if getattr(info, "capabilities", None) == ProviderCapabilities():
+                        info.capabilities = _normalize_capabilities(
+                            info.adapter.provider_capabilities()
+                        )
                     providers.append(info)
                     continue
 
@@ -438,16 +454,20 @@ class ProviderRegistry:
                     client_kwargs["base_url"] = base_url
                 client = openai.AsyncOpenAI(**client_kwargs)
 
+                adapter = cls()
                 providers.append(ProviderInfo(
                     name=f"{ep_name}:api",
                     vendor=ep_name,
                     route="api",
                     client=client,
-                    adapter=cls(),
+                    adapter=adapter,
                     model=model,
                     is_cloud=True,
                     is_local=False,
                     base_url=base_url,
+                    capabilities=_normalize_capabilities(
+                        adapter.provider_capabilities()
+                    ),
                 ))
             except Exception as e:
                 logger.warning("Failed to initialize entry_point LLM provider '%s': %s", ep_name, e)

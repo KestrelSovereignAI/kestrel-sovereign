@@ -1,4 +1,5 @@
 from .adapter import LLMAdapter
+from kestrel_sdk.llm import ProviderCapabilities, ToolStreamingMode
 from typing import Any, Dict, List, Optional
 import logging
 
@@ -9,6 +10,13 @@ class MockAdapter(LLMAdapter):
     Mock adapter for demo purposes when no real LLM providers are available.
     Returns canned responses for testing the agent interface.
     """
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_streaming=True,
+            tool_streaming_mode=ToolStreamingMode.NONE,
+            notes=("Mock adapter returns canned text and does not exercise LLM features.",),
+        )
 
     async def get_response(
         self,

@@ -20,6 +20,12 @@ from typing import Any, Dict, List, Optional, Union, AsyncIterator, Type
 from pydantic import BaseModel
 
 from .adapter import LLMAdapter, LLMResponse, ToolCall
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
 from .image_utils import process_images
@@ -48,6 +54,22 @@ class VertexAIAdapter(LLMAdapter):
     - Supports both Gemini models and partner models (Claude on Vertex, Llama on Vertex)
     - Provides API-based model discovery via client.models.list()
     """
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_tools=True,
+            supports_streaming=True,
+            supports_vision=True,
+            supports_structured_output=True,
+            structured_output_mode=StructuredOutputMode.PROVIDER_NATIVE,
+            tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
+            vision_input_mode=VisionInputMode.GEMINI_INLINE_DATA,
+            model_dependent=("tools", "vision", "structured_output"),
+            notes=(
+                "Structured output uses Vertex/Gemini response_schema.",
+                "Streaming tool calls use the framework's non-streaming fallback path.",
+            ),
+        )
 
     def __init__(
         self,

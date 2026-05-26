@@ -22,6 +22,12 @@ from .adapter import (
     ToolCall,
     split_thinking_from_content,
 )
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import get_base64_only
 from .retry import with_retry
@@ -78,6 +84,22 @@ class OllamaAdapter(LLMAdapter):
     - Streaming responses
     - Vision models with base64 images
     """
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_tools=True,
+            supports_streaming=True,
+            supports_vision=True,
+            supports_structured_output=True,
+            structured_output_mode=StructuredOutputMode.SCHEMA_FORMAT,
+            tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
+            vision_input_mode=VisionInputMode.OLLAMA_IMAGES,
+            model_dependent=("tools", "vision", "structured_output"),
+            notes=(
+                "Tool and vision support are model-dependent in Ollama.",
+                "Structured output passes a JSON schema via Ollama's format option.",
+            ),
+        )
 
     def create_messages(
         self,

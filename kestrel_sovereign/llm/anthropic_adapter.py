@@ -18,6 +18,12 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from .model_metadata import ModelInfo, ModelCategory
 from .image_utils import process_images
 from .retry import with_retry
@@ -194,6 +200,21 @@ class AnthropicAdapter(LLMAdapter):
     Note: Anthropic uses a different message format than OpenAI.
     The system prompt is passed separately, not in messages.
     """
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_tools=True,
+            supports_streaming=True,
+            supports_vision=True,
+            supports_structured_output=True,
+            structured_output_mode=StructuredOutputMode.TOOL_FORCED,
+            tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
+            vision_input_mode=VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
+            notes=(
+                "Structured output is implemented by forcing a synthetic Anthropic tool.",
+                "Streaming with response_format falls back to non-streaming structured generation.",
+            ),
+        )
 
     @staticmethod
     def _apply_cache_control(

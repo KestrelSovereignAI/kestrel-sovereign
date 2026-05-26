@@ -19,6 +19,7 @@ Key features:
 """
 import os
 import logging
+from dataclasses import replace
 import httpx
 from typing import List, Optional, Dict, Any, Type, AsyncIterator, Union
 import openai
@@ -26,6 +27,7 @@ import openai
 from pydantic import BaseModel
 
 from .adapter import LLMResponse
+from kestrel_sdk.llm import ProviderCapabilities
 from .openai_adapter import OpenAIAdapter
 from .model_metadata import ModelInfo, ModelCategory
 from kestrel_sovereign.kestrel_config.constants import HTTP_TIMEOUT_DEFAULT
@@ -58,6 +60,17 @@ class OpenRouterAdapter(OpenAIAdapter):
         # Optional attribution headers
         self.site_url = os.environ.get("OPENROUTER_SITE_URL", "https://kestrel.ai")
         self.app_name = os.environ.get("OPENROUTER_APP_NAME", "Kestrel")
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        capabilities = super().provider_capabilities()
+        return replace(
+            capabilities,
+            model_dependent=("tools", "vision", "structured_output"),
+            notes=(
+                "OpenRouter forwards requests to many upstream providers; per-model support is authoritative.",
+                "The adapter can send OpenAI-compatible tools, images, and response_format payloads.",
+            ),
+        )
 
     def _get_client(self) -> openai.AsyncOpenAI:
         """Create an OpenAI client configured for OpenRouter."""

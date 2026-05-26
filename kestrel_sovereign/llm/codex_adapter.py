@@ -48,6 +48,12 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from .codex_app_server import CodexAppServerClient, CodexAppServerError
 from .continuation_store import ContinuationStore, InMemoryContinuationStore
 from .gpt5_overlay import prepend_gpt5_overlay
@@ -333,6 +339,21 @@ class CodexAdapter(LLMAdapter):
         # the same thread (same session_id) would race on the turn-sink
         # registration; the lock makes them queue cleanly instead.
         self._thread_locks: Dict[str, "asyncio.Lock"] = {}
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_tools=True,
+            supports_streaming=True,
+            supports_vision=False,
+            supports_structured_output=False,
+            structured_output_mode=StructuredOutputMode.NONE,
+            tool_streaming_mode=ToolStreamingMode.INLINE_EXECUTOR,
+            vision_input_mode=VisionInputMode.NONE,
+            notes=(
+                "Codex app-server tools are executed through dynamic tool events.",
+                "Generic response_format and image input are not part of this adapter contract.",
+            ),
+        )
 
     # ----------------------------------------------------------- app-server glue
     def _app_server(self) -> CodexAppServerClient:
