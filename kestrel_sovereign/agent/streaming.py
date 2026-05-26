@@ -292,6 +292,7 @@ class StreamingMixin:
         # protected against.
         system_prompt = self._assemble_post_build_system_prompt(
             context_result.system_prompt, context_result,
+            user_prompt=prompt,
         )
 
         if self.extension:

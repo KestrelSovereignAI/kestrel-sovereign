@@ -1774,7 +1774,8 @@ Expected Duration: {expected_duration}
                 )
 
     def _assemble_post_build_system_prompt(
-        self, base_system_prompt: str, context_result,
+        self, base_system_prompt: str, context_result, *,
+        user_prompt: str = "",
     ) -> str:
         """Apply the post-build system_prompt assembly steps.
 
@@ -1796,6 +1797,13 @@ Expected Duration: {expected_duration}
         registry — they just aren't advertised in the
         system_prompt for that turn. The dynamic-tools list still
         flows via the adapter's tool advertisement path.
+
+        ``user_prompt`` is the rendered current-turn user message
+        that the caller will append to ``messages`` AFTER this
+        helper returns. Its tokens are counted into the projection
+        so the gate engages even on long user turns where
+        ``context_result.total_tokens`` alone would underestimate
+        the wire size (codex round-2 P2 on PR #1400).
         """
         system_prompt = append_security_addendum(base_system_prompt)
         if not self._cached_features_prompt:
@@ -1804,6 +1812,9 @@ Expected Duration: {expected_duration}
         try:
             ctx_counter = self.context_manager.counter
             features_tokens = ctx_counter.count(self._cached_features_prompt)
+            user_prompt_tokens = (
+                ctx_counter.count(user_prompt) if user_prompt else 0
+            )
             total_budget = (
                 context_result.budget_summary.get("total_budget")
                 if getattr(context_result, "budget_summary", None) else None
@@ -1811,20 +1822,23 @@ Expected Duration: {expected_duration}
             already_used = getattr(context_result, "total_tokens", 0) or 0
         except Exception:
             features_tokens = 0
+            user_prompt_tokens = 0
             total_budget = None
             already_used = 0
 
         if total_budget is not None and features_tokens > 0:
-            projected = already_used + features_tokens
+            projected = already_used + user_prompt_tokens + features_tokens
             if projected > total_budget:
                 logging.warning(
                     "Skipping LOADED FEATURES section for this turn — "
                     "appending %d tokens would push projected payload "
-                    "(%d) past route budget (%d). Route is likely a "
-                    "per-turn-capped subscription (openai:plan). "
-                    "Feature commands still callable; just not "
-                    "advertised in this turn's system_prompt.",
-                    features_tokens, projected, total_budget,
+                    "(%d, includes %d user-prompt tokens) past route "
+                    "budget (%d). Route is likely a per-turn-capped "
+                    "subscription (openai:plan). Feature commands "
+                    "still callable; just not advertised in this "
+                    "turn's system_prompt.",
+                    features_tokens, projected, user_prompt_tokens,
+                    total_budget,
                 )
                 return system_prompt
         return f"{system_prompt}{self._cached_features_prompt}"
@@ -2024,6 +2038,7 @@ Expected Duration: {expected_duration}
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
         system_prompt = self._assemble_post_build_system_prompt(
             context_result.system_prompt, context_result,
+            user_prompt=prompt,
         )
 
         if self.extension:
