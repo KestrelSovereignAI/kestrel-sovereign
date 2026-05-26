@@ -663,10 +663,24 @@ class CodexAppServerClient:
         except asyncio.CancelledError:
             pass
         finally:
+            # Wait briefly for the OS to report the real returncode.
+            # Without this, ``returncode`` would be None when stdout
+            # closes BEFORE the process is reaped — the error message
+            # would hide whether codex was killed (signal) vs exited
+            # normally vs crashed. Critical for diagnosing
+            # CodexAppServerConnectionClosed reports (#1399).
+            rc_value: Any = "?"
+            if self._proc is not None:
+                try:
+                    rc_value = await asyncio.wait_for(
+                        self._proc.wait(), timeout=1.0
+                    )
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    rc_value = self._proc.returncode
             tail = "\n".join(self._stderr_tail[-10:])
             self._fail_all(
                 CodexAppServerConnectionClosed(
-                    f"codex app-server exited (rc={self._proc.returncode if self._proc else '?'})"
+                    f"codex app-server exited (rc={rc_value})"
                     + (f": {tail}" if tail else "")
                 )
             )

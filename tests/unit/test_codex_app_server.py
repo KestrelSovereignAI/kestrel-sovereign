@@ -296,6 +296,17 @@ class TestInvoluntaryExitRecovery:
         c._proc = MagicMock()
         c._proc.returncode = 0
         c._proc.stdout = _AsyncIterableMock([])  # ends immediately
+
+        # ``_read_loop`` now awaits ``_proc.wait()`` (with a 1s timeout)
+        # to capture the real return code before reporting the exit —
+        # the prior version reported ``rc=None`` because the process
+        # hadn't been reaped, masking whether codex was signaled vs
+        # exited normally (#1399). Mock as a coroutine so the await
+        # resolves.
+        async def _fake_wait():
+            return 0
+        c._proc.wait = _fake_wait
+
         c._initialized = True
         c._pending = {}
         c._turn_sinks = {}

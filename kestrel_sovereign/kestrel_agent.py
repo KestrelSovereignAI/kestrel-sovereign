@@ -1972,9 +1972,52 @@ Expected Duration: {expected_duration}
         # for assembly order; see append_security_addendum's docstring.
         system_prompt = append_security_addendum(system_prompt)
 
-        # Add cached features section (built once at session start)
+        # Add cached features section (built once at session start),
+        # BUT honor the route's per-turn payload cap. ChatGPT-subscription
+        # (openai:plan) enforces a much smaller per-turn limit than the
+        # model's full context window. The features prompt is bulky
+        # (~10K tokens of feature/command listings) — when the agent
+        # already has a heavy constitution + identity, appending it
+        # blows past the route's per-turn cap and ChatGPT-subscription's
+        # codex app-server closes stdout mid-turn (the Claw 500 symptom
+        # in #1399). Drop the features section when including it would
+        # exceed the budget; the kestrel-side features (tools, A2A
+        # agents) are still callable, just not advertised in the
+        # system_prompt for that turn.
         if self._cached_features_prompt:
-            system_prompt = f"{system_prompt}{self._cached_features_prompt}"
+            try:
+                ctx_counter = self.context_manager.counter
+                features_tokens = ctx_counter.count(self._cached_features_prompt)
+                system_tokens_so_far = ctx_counter.count(system_prompt)
+                total_budget = context_result.budget_summary.get("total_budget")
+                already_used = context_result.total_tokens
+            except Exception:
+                features_tokens = 0
+                system_tokens_so_far = 0
+                total_budget = None
+                already_used = 0
+
+            include_features = True
+            if total_budget is not None and features_tokens > 0:
+                # Projected total: system + history/episodes/memories/rag
+                # (already in ``total_used``) + features about to append.
+                # Subtract the "system" allocation already used so we
+                # don't double-count it. This is conservative — if the
+                # projection exceeds the route's total_budget, skip.
+                projected = already_used + features_tokens
+                if projected > total_budget:
+                    include_features = False
+                    logging.warning(
+                        "Skipping LOADED FEATURES section for this turn — "
+                        "appending %d tokens would push projected payload "
+                        "(%d) past route budget (%d). Route is likely a "
+                        "per-turn-capped subscription (openai:plan). "
+                        "Feature commands still callable; just not "
+                        "advertised in this turn's system_prompt.",
+                        features_tokens, projected, total_budget,
+                    )
+            if include_features:
+                system_prompt = f"{system_prompt}{self._cached_features_prompt}"
 
         if self.extension:
             try:
