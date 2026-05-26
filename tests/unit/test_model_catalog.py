@@ -439,6 +439,40 @@ class TestContextLimits:
         assert svc.get_context_limit("openai:plan") == 16384
         assert svc.get_context_limit("openai:plan/gpt-5.5") == 16384
 
+    def test_route_context_cap_only_matches_route_keys(self):
+        """``get_route_context_cap`` ignores bare-model catalog entries.
+
+        Codex round-1 P2 on PR #1396 caught that the broader
+        "catalog-first for any route-qualified model" rule lets bare
+        ``gpt-5`` family entries shadow discovered limits on
+        non-capped routes (e.g. ``openai:api/gpt-5.5``). The
+        route-only lookup distinguishes between operator-set per-turn
+        caps (key contains ``:``) and bare-model entries (do NOT
+        bypass discovery).
+        """
+        content = '''
+[context_limits_override]
+"gpt-5" = 128000
+"openai:plan" = 20480
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        # Route-keyed entry wins on the capped route.
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 20480
+        # Non-capped route returns None — caller falls through to
+        # discovery/cache for the bare model id rather than picking
+        # up the family-match ``gpt-5 = 128000``.
+        assert svc.get_route_context_cap("openai:api/gpt-5.5") is None
+        # Bare model lookup also returns None — this is the
+        # route-only accessor.
+        assert svc.get_route_context_cap("gpt-5.5") is None
+
     def test_env_override_generic_route_cap(self, monkeypatch):
         """``KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>`` honored too."""
         content = '''

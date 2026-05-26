@@ -211,20 +211,21 @@ class TokenCounter:
         if "/" in self.model:
             candidates.append(self.model.rsplit("/", 1)[1])
 
-        # Route-qualified models: give the catalog FIRST shot at the
-        # route-qualified key BEFORE the bare-model cache fallthrough.
-        # Discovery records the model's full context window — it cannot
-        # know about route-level per-turn caps (e.g. ChatGPT-Plus's
-        # ~20K payload limit on openai:plan), so the manual catalog
-        # override is the only authoritative source for those.
-        # Without this, the cache entry for the bare model id silently
-        # overrides the route cap and the budget sizes against the
-        # model's 128K window — the #1395 symptom.
+        # Route-qualified models: give the catalog FIRST shot at any
+        # route-keyed cap (key containing ``:``) before the bare-model
+        # discovered/cache fallthrough. Discovery records the model's
+        # full context window — it cannot know about route-level
+        # per-turn caps (e.g. ChatGPT-Plus's ~20K payload limit on
+        # openai:plan), so the manual catalog override is the only
+        # authoritative source for those. Crucially, this consults
+        # ONLY route-keyed entries — bare-model catalog entries do
+        # NOT bypass discovery on non-capped routes like
+        # ``openai:api/gpt-5.5`` (codex round-1 P2 on PR #1396).
         is_route_qualified = "/" in self.model or ":" in self.model
         if is_route_qualified:
             catalog = _get_catalog_service()
             if catalog is not None:
-                limit = catalog.get_context_limit(self.model)
+                limit = catalog.get_route_context_cap(self.model)
                 if limit is not None:
                     return limit
 

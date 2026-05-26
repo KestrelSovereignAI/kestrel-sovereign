@@ -263,6 +263,34 @@ class ModelCatalogService:
 
         return ModelCategory.CHAT
 
+    def get_route_context_cap(self, model_id: str) -> Optional[int]:
+        """Return ONLY a route-keyed cap matching ``model_id``, or None.
+
+        A *route-keyed* entry is one whose catalog key contains ``:``
+        (e.g. ``"openai:plan"``). This is the manual-override knob for
+        per-turn payload caps that discovery cannot know about
+        (ChatGPT-subscription, etc., #1395). Matched via longest
+        substring so the most specific route prefix wins.
+
+        Distinct from ``get_context_limit`` so callers (TokenCounter)
+        can give route caps absolute priority over discovered/cached
+        bare-model limits **without** also letting bare-model catalog
+        entries shadow discovered limits — codex round-1 P2 on PR
+        #1396 caught the broader version.
+        """
+        self._ensure_loaded()
+        model_lower = model_id.lower()
+        best_match: Optional[int] = None
+        best_len = -1
+        for known_model, limit in self._context_limits.items():
+            if ":" not in known_model:
+                continue
+            key_lower = known_model.lower()
+            if key_lower in model_lower and len(key_lower) > best_len:
+                best_match = limit
+                best_len = len(key_lower)
+        return best_match
+
     def get_context_limit(self, model_id: str) -> Optional[int]:
         """
         Get the context limit for a model.
