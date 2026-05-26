@@ -88,6 +88,25 @@ class TestTokenCounter:
         assert counter.fits_in_context(short_text)
         assert counter.fits_in_context(short_text, reserved_tokens=8000)
 
+    def test_route_qualified_preserves_slashed_model_id(self):
+        """Codex round-7 P2: route-qualified with slash-containing model.
+
+        For OpenRouter/HF-style ids like ``meta-llama/Llama-...`` or
+        ``google/gemini-...``, the route-qualified form is
+        ``openrouter:default/meta-llama/Llama-3.1-8B-Instruct``. The
+        candidate-stripping rule must split on the FIRST ``/`` to
+        recover the full bare model id; ``rsplit('/', 1)`` would
+        truncate it to ``Llama-3.1-8B-Instruct`` and miss the actual
+        cache/catalog key.
+        """
+        from kestrel_sovereign.agent.token_counter import TokenCounter
+        tc = TokenCounter("openrouter:default/meta-llama/Llama-3.1-8B-Instruct")
+        # The TOML catalog has this entry at 128000. The regression
+        # bug would yield DEFAULT_CONTEXT_LIMIT (32768) because the
+        # truncated candidate ``Llama-3.1-8B-Instruct`` is nowhere.
+        limit = tc.get_context_limit()
+        assert limit == 128000
+
     def test_fallback_estimation(self):
         """Test character-based fallback estimation."""
         # Create counter that won't use tiktoken
@@ -334,12 +353,24 @@ class TestContextManagerIntegration:
 
     @pytest.mark.asyncio
     async def test_get_budget_status_uses_live_llm_service_model(self):
-        """Budget status should track llm_service model changes."""
+        """Budget status should track llm_service model changes.
+
+        The route-qualified form (``get_active_model_selection``) is
+        the preferred source so the budget sees the route's per-turn
+        cap (#1395). When the selection isn't configured, the bare
+        ``get_active_model_id`` value is honored for backward compat.
+        """
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         mock_storage = MagicMock()
         mock_llm_service = MagicMock()
         mock_llm_service.get_active_model_id.return_value = "gpt-4"
+        mock_llm_service.get_active_model_selection.return_value = {
+            "model": "gpt-4",
+            "vendor": None,
+            "route": None,
+            "model_name": "gpt-4",
+        }
 
         manager = ContextManager(
             storage=mock_storage,
@@ -350,10 +381,55 @@ class TestContextManagerIntegration:
 
         first = manager.get_budget_status(message_count=20)
         mock_llm_service.get_active_model_id.return_value = "claude-3-5-sonnet"
+        mock_llm_service.get_active_model_selection.return_value = {
+            "model": "claude-3-5-sonnet",
+            "vendor": None,
+            "route": None,
+            "model_name": "claude-3-5-sonnet",
+        }
         second = manager.get_budget_status(message_count=20)
 
         assert first["model"] == "gpt-4"
         assert second["model"] == "claude-3-5-sonnet"
+
+    @pytest.mark.asyncio
+    async def test_route_qualified_model_drives_budget_cap(self):
+        """ContextManager prefers route-qualified model for budget sizing.
+
+        When the active route is openai:plan, the budget must size
+        against the per-turn cap (~20K) rather than the model's full
+        context window. The cap comes from model_catalog.toml's
+        ``[context_limits_override]`` entry for ``openai:plan`` and
+        is selected via the longest-substring match rule in
+        ``ModelCatalogService.get_context_limit``.
+        """
+        from kestrel_sovereign.agent.context_manager import ContextManager
+
+        mock_storage = MagicMock()
+        mock_llm_service = MagicMock()
+        mock_llm_service.get_active_model_id.return_value = "gpt-5.5"
+        mock_llm_service.get_active_model_selection.return_value = {
+            "model": "openai:plan/gpt-5.5",
+            "vendor": "openai",
+            "route": "plan",
+            "model_name": "gpt-5.5",
+        }
+
+        manager = ContextManager(
+            storage=mock_storage,
+            model="gpt-5.5",
+            agent_id="test-agent",
+            llm_service=mock_llm_service,
+        )
+
+        status = manager.get_budget_status(message_count=20)
+        # The catalog's openai:plan entry is 20480; total_budget =
+        # context_limit - RESPONSE_RESERVE (1024) = 19456.
+        # Without #1395 this would be 128000 (gpt-5.5's full window
+        # via partial-match fallthrough) - 1024 = ~127K.
+        assert status["model"] == "openai:plan/gpt-5.5"
+        assert status["context_limit"] == 20480
+        assert status["total_budget"] == 19456
 
 
 class TestSessionCompression:

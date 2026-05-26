@@ -269,8 +269,34 @@ class ContextManager:
 
     @property
     def model(self) -> str:
-        """Resolved model ID. Delegates to LLMService if available."""
+        """Resolved model ID, route-qualified when a route is active.
+
+        Returns the canonical ``"<vendor>:<route>/<model>"`` form when
+        available (e.g. ``"openai:plan/gpt-5.5"``), falling back to the
+        bare model id when no route is configured. The route-qualified
+        form is what the TokenBudget and TokenCounter need to look up
+        the *per-turn* context cap — which can be much lower than the
+        model's full context window (ChatGPT-subscription Plus is the
+        canonical case; #1395).
+
+        ``TokenCounter.get_context_limit()`` already normalizes by
+        trying the route-qualified key first and then the bare model
+        id, so callers that registered context limits under the bare
+        model id continue to work.
+        """
         if self._llm_service:
+            if hasattr(self._llm_service, "get_active_model_selection"):
+                try:
+                    selection = self._llm_service.get_active_model_selection()
+                    qualified = selection.get("model") if selection else None
+                    if qualified:
+                        return qualified
+                except Exception as e:
+                    logger.debug(
+                        "get_active_model_selection failed (%s); "
+                        "falling back to get_active_model_id",
+                        e,
+                    )
             return self._llm_service.get_active_model_id()
         return self._model_fallback
 

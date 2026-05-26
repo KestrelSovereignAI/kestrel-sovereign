@@ -571,6 +571,57 @@ class CodexAdapter(LLMAdapter):
 
         return handler
 
+    async def _iter_with_overflow_hint(
+        self,
+        app: Any,
+        sink: "asyncio.Queue[dict]",
+        est_payload_tokens: int,
+    ) -> AsyncIterator[dict]:
+        """Stream turn events; rewrite the idle-timeout error with a
+        route-cap hint so the operator can act on it.
+
+        The app-server raises ``CodexAppServerError("codex turn idle
+        for Ns with no completion")`` when ChatGPT-subscription
+        (openai:plan) accepts a turn whose payload exceeds the
+        per-turn cap — codex's upstream websocket opens, no events
+        come back, our 300s idle watchdog fires. The base message
+        doesn't tell the operator *why*, which makes #1395 the kind
+        of bug you only diagnose by re-reading the transport doc.
+        Here we attach the route, the est payload size, and the env
+        knob so the operator can raise the cap or shorten the turn.
+        """
+        try:
+            async for ev in app.iter_turn_events(sink):
+                yield ev
+        except CodexAppServerError as e:
+            msg = str(e)
+            if "idle for" in msg and "no completion" in msg:
+                from .model_catalog import get_catalog_service
+                try:
+                    # ``get_route_context_cap`` — caps moved to
+                    # ``[route_context_caps]`` in PR #1396 round-3;
+                    # ``get_context_limit`` would always report
+                    # ``unset`` for the operator (codex round-4 P3).
+                    cap = get_catalog_service().get_route_context_cap(
+                        "openai:plan"
+                    )
+                except Exception:
+                    cap = None
+                hint = (
+                    f"openai:plan (codex app-server) — est turn "
+                    f"payload ~{est_payload_tokens} tokens; current "
+                    f"openai:plan per-turn cap is {cap or 'unset'}. "
+                    "ChatGPT-Plus has a per-turn payload limit below "
+                    "the model's context window — if the payload "
+                    "exceeds it, codex opens the upstream websocket "
+                    "but never returns response.completed. Either "
+                    "compact this session's history (kestrel "
+                    "context compact) or raise the cap via "
+                    "KESTREL_OPENAI_PLAN_CONTEXT_CAP."
+                )
+                raise CodexAppServerError(f"{msg} — {hint}") from e
+            raise
+
     async def _run_turn(
         self, model: str, messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]], session_id: Optional[str],
@@ -687,7 +738,21 @@ class CodexAdapter(LLMAdapter):
             started_item_ids: set = set()
             completed_item_ids: set = set()
 
-            async for ev in app.iter_turn_events(sink):
+            turn_input_len_chars = len(turn_input)
+            instructions_len_chars = len(instructions or "")
+            # Estimated payload-cap hint for the idle-timeout branch
+            # below. We don't want to import the TokenCounter here
+            # (circular with agent/), so a ~4-chars-per-token estimate
+            # is enough to tell the operator whether they're near the
+            # cap. Real budget enforcement lives in ContextManager
+            # via the catalog override #1395 wired in.
+            est_payload_tokens = (
+                turn_input_len_chars + instructions_len_chars
+            ) // 4
+
+            async for ev in self._iter_with_overflow_hint(
+                app, sink, est_payload_tokens
+            ):
                 method = ev.get("method")
                 p = ev.get("params") or {}
                 if method == "item/agentMessage/delta":

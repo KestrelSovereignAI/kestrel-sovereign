@@ -205,11 +205,45 @@ class TokenCounter:
         Returns:
             Maximum tokens allowed in context
         """
-        # Normalize "anthropic:plan/claude-opus-4-7" -> "claude-opus-4-7"
-        # so route-spec callers hit a cache keyed by bare model id.
+        # Build candidate keys for discovered/cache/catalog lookup.
+        # Route-qualified ``"<vendor>:<route>/<model_name>"`` splits on
+        # the FIRST ``/`` so OpenRouter/HF-style model names containing
+        # additional slashes (``google/gemini-pro``,
+        # ``meta-llama/Llama-3.1-8B-Instruct``) survive intact and the
+        # bare-model cache entry is actually found (codex round-7 P2
+        # on PR #1396). For vendor-only ``"vendor/model"`` we keep the
+        # legacy ``rsplit`` fallback (some cache entries are stored
+        # under the bare model name too).
         candidates = [self.model]
-        if "/" in self.model:
+        if ":" in self.model and "/" in self.model:
+            candidates.append(self.model.split("/", 1)[1])
+        elif "/" in self.model:
             candidates.append(self.model.rsplit("/", 1)[1])
+
+        # Route-qualified models: give the catalog FIRST shot at any
+        # route-keyed cap (key containing ``:``) before the bare-model
+        # discovered/cache fallthrough. Discovery records the model's
+        # full context window — it cannot know about route-level
+        # per-turn caps (e.g. ChatGPT-Plus's ~20K payload limit on
+        # openai:plan), so the manual catalog override is the only
+        # authoritative source for those.
+        #
+        # The discriminator requires BOTH ``:`` AND ``/`` — the kestrel
+        # route form is ``"<vendor>:<route>/<model_name>"``. This
+        # excludes Ollama tags like ``"gemma2:9b"`` (which have ``:``
+        # but no ``/`` — codex round-2 P2 on PR #1396) and vendor-only
+        # forms like ``"openai/gpt-5.5"`` (no route to cap). And it
+        # consults ONLY route-keyed catalog entries via
+        # ``get_route_context_cap`` so bare-model catalog entries
+        # cannot bypass discovery on non-capped routes like
+        # ``openai:api/gpt-5.5`` (codex round-1 P2 on PR #1396).
+        is_route_qualified = ":" in self.model and "/" in self.model
+        if is_route_qualified:
+            catalog = _get_catalog_service()
+            if catalog is not None:
+                limit = catalog.get_route_context_cap(self.model)
+                if limit is not None:
+                    return limit
 
         # 1. Discovered limits (populated by API discovery this session)
         for key in candidates:
@@ -222,7 +256,8 @@ class TokenCounter:
             if key in cached:
                 return cached[key]
 
-        # 3. Catalog TOML overrides
+        # 3. Catalog TOML overrides (bare-model fallback path — route
+        # cases already handled above).
         catalog = _get_catalog_service()
         if catalog is not None:
             for key in candidates:

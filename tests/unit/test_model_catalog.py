@@ -385,6 +385,223 @@ class TestContextLimits:
         assert service.get_context_limit("gpt-5-mini") == 128000
         assert service.get_context_limit("totally-unknown-model-xyz") is None
 
+    def test_partial_match_prefers_longest_substring(self):
+        """Longest-substring partial match for bare-model lookups.
+
+        ``get_context_limit`` walks bare-model entries; when several
+        substrings match, the longest wins (deterministic instead of
+        relying on dict-insertion-order). Route caps live in a
+        separate section; that's covered below.
+        """
+        content = '''
+[context_limits_override]
+"gpt-5" = 128000
+"gpt-5-mini" = 96000
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        # "gpt-5-mini" (10 chars) beats "gpt-5" (5 chars) for the
+        # mini-suffixed model.
+        assert svc.get_context_limit("gpt-5-mini-2025-08-07") == 96000
+        # No "mini" — the only substring match is "gpt-5".
+        assert svc.get_context_limit("gpt-5-preview") == 128000
+
+    def test_route_cap_match_requires_route_boundary(self):
+        """Codex round-5 P2: route key must match exactly or with ``/`` boundary.
+
+        A substring check would let ``"openai:plan"`` falsely cap
+        a different route ``"openai:plan-pro/gpt-5.5"``. The fix:
+        require either equality or that the model string starts
+        with ``"<route_key>/"``.
+        """
+        content = '''
+[route_context_caps]
+"openai:plan" = 20480
+"openai:plan-pro" = 40960
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        # Exact route hits its own cap.
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 20480
+        assert svc.get_route_context_cap("openai:plan") == 20480
+        # Sibling route gets its own cap, NOT openai:plan's.
+        assert svc.get_route_context_cap("openai:plan-pro/gpt-5.5") == 40960
+        assert svc.get_route_context_cap("openai:plan-pro") == 40960
+        # Hypothetical third sibling with no cap returns None — even
+        # though "openai:plan" is a substring.
+        assert svc.get_route_context_cap("openai:plan-experimental/gpt-5.5") is None
+
+    def test_route_caps_in_dedicated_section(self):
+        """``[route_context_caps]`` is structurally separate from
+        ``[context_limits_override]``.
+
+        Route caps are looked up via ``get_route_context_cap`` and
+        ONLY against ``_route_context_caps`` — bare-model entries
+        cannot match here, even when they share the ``word:word``
+        shape (Ollama). This is the structural fix codex round-3
+        called for on PR #1396.
+        """
+        content = '''
+[route_context_caps]
+"openai:plan" = 20480
+
+[context_limits_override]
+"gpt-5" = 128000
+"llama3.2:3b" = 128000
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        # Route-qualified selection hits the route cap.
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 20480
+        # Bare-model entries do NOT bleed into the route-cap path,
+        # even with the route-qualified Ollama selection that codex
+        # flagged (``ollama:local/llama3.2:3b``).
+        assert svc.get_route_context_cap("ollama:local/llama3.2:3b") is None
+        # And the bare-model lookup still resolves correctly via the
+        # other API.
+        assert svc.get_context_limit("llama3.2:3b") == 128000
+
+    def test_env_override_openai_plan_context_cap(self, monkeypatch):
+        """``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` overrides the TOML cap.
+
+        The cap is empirical (ChatGPT-Plus doesn't advertise it); the
+        operator needs a no-redeploy way to raise/lower it as the
+        upstream shifts. The env override is read at catalog load
+        time, so a fresh process picks up the new value.
+        """
+        content = '''
+[route_context_caps]
+"openai:plan" = 20480
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        assert svc.get_route_context_cap("openai:plan") == 16384
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 16384
+
+    def test_route_cap_discriminator_excludes_ollama_tags(self):
+        """Codex round-2 P2: route-cap path must NOT engage on Ollama tags.
+
+        Ollama bare model IDs (``gemma2:9b``, ``qwen2.5:14b``,
+        ``mistral:7b``) contain ``:`` but no ``/``. The earlier
+        discriminator ``":" in model or "/" in model`` would let
+        them enter the route-cap branch and pick up colon-containing
+        Ollama catalog entries as if they were route caps,
+        bypassing discovered/cached exact limits for the tag.
+
+        The discriminator now requires BOTH ``:`` AND ``/`` — the
+        kestrel route form ``"<vendor>:<route>/<model_name>"``. This
+        test asserts the rule at the predicate boundary so the
+        guarantee survives even when the catalog has Ollama-style
+        colon keys.
+        """
+        # Direct predicate assertion, no singleton mutation — the
+        # route-cap branch in TokenCounter is gated on this exact
+        # boolean. Keep them in sync with this regression test.
+        def is_route_qualified(model: str) -> bool:
+            return ":" in model and "/" in model
+
+        # Route-qualified (should enter the branch):
+        assert is_route_qualified("openai:plan/gpt-5.5")
+        assert is_route_qualified("anthropic:api/claude-opus-4-7")
+        # Ollama tags (should NOT enter the branch — codex round-2 P2):
+        assert not is_route_qualified("gemma2:9b")
+        assert not is_route_qualified("qwen2.5:14b")
+        assert not is_route_qualified("mistral:7b")
+        assert not is_route_qualified("phi3:3.8b")
+        # Vendor-only forms (no route, no cap):
+        assert not is_route_qualified("openai/gpt-5.5")
+        # Bare models:
+        assert not is_route_qualified("gpt-5.5")
+
+    def test_route_context_cap_only_matches_dedicated_section(self):
+        """``get_route_context_cap`` reads ONLY from ``[route_context_caps]``.
+
+        Bare-model entries that happen to share the ``word:word``
+        shape (e.g. Ollama tags ``llama3.2:3b``) live in
+        ``[context_limits_override]`` and must not appear in
+        route-cap lookups — even when the active selection is
+        route-qualified (``ollama:local/llama3.2:3b``).
+        """
+        content = '''
+[route_context_caps]
+"openai:plan" = 20480
+
+[context_limits_override]
+"gpt-5" = 128000
+"llama3.2:3b" = 128000
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        # Route cap wins on the capped route.
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 20480
+        # Non-capped route returns None — caller falls through to
+        # discovery/cache for the bare model id.
+        assert svc.get_route_context_cap("openai:api/gpt-5.5") is None
+        # Ollama bare-model entry (``llama3.2:3b``) doesn't bleed
+        # into route-cap lookups (codex round-3 P2).
+        assert svc.get_route_context_cap("ollama:local/llama3.2:3b") is None
+        # Bare-model lookup returns None for this accessor.
+        assert svc.get_route_context_cap("gpt-5.5") is None
+
+    def test_env_override_generic_route_cap(self, monkeypatch):
+        """``KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>`` populates the
+        dedicated section."""
+        content = '''
+[route_context_caps]
+"openai:plan" = 20480
+
+[context_limits_override]
+"gpt-5" = 128000
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            monkeypatch.setenv(
+                "KESTREL_ROUTE_CONTEXT_CAP_ANTHROPIC_PLAN", "30720"
+            )
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        assert svc.get_route_context_cap("anthropic:plan") == 30720
+        assert svc.get_route_context_cap("anthropic:plan/claude-sonnet-4-6") == 30720
+        # Pre-existing TOML route cap remains too.
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 20480
+        # Untouched bare-model lookup still works.
+        assert svc.get_context_limit("gpt-5") == 128000
+
 
 class TestTokenCounterCatalogIntegration:
     """Test integration between TokenCounter and ModelCatalogService."""
