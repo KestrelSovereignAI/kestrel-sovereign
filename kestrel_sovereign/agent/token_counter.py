@@ -205,10 +205,19 @@ class TokenCounter:
         Returns:
             Maximum tokens allowed in context
         """
-        # Normalize "anthropic:plan/claude-opus-4-7" -> "claude-opus-4-7"
-        # so route-spec callers hit a cache keyed by bare model id.
+        # Build candidate keys for discovered/cache/catalog lookup.
+        # Route-qualified ``"<vendor>:<route>/<model_name>"`` splits on
+        # the FIRST ``/`` so OpenRouter/HF-style model names containing
+        # additional slashes (``google/gemini-pro``,
+        # ``meta-llama/Llama-3.1-8B-Instruct``) survive intact and the
+        # bare-model cache entry is actually found (codex round-7 P2
+        # on PR #1396). For vendor-only ``"vendor/model"`` we keep the
+        # legacy ``rsplit`` fallback (some cache entries are stored
+        # under the bare model name too).
         candidates = [self.model]
-        if "/" in self.model:
+        if ":" in self.model and "/" in self.model:
+            candidates.append(self.model.split("/", 1)[1])
+        elif "/" in self.model:
             candidates.append(self.model.rsplit("/", 1)[1])
 
         # Route-qualified models: give the catalog FIRST shot at any

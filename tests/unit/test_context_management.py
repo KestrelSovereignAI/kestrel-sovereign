@@ -88,6 +88,25 @@ class TestTokenCounter:
         assert counter.fits_in_context(short_text)
         assert counter.fits_in_context(short_text, reserved_tokens=8000)
 
+    def test_route_qualified_preserves_slashed_model_id(self):
+        """Codex round-7 P2: route-qualified with slash-containing model.
+
+        For OpenRouter/HF-style ids like ``meta-llama/Llama-...`` or
+        ``google/gemini-...``, the route-qualified form is
+        ``openrouter:default/meta-llama/Llama-3.1-8B-Instruct``. The
+        candidate-stripping rule must split on the FIRST ``/`` to
+        recover the full bare model id; ``rsplit('/', 1)`` would
+        truncate it to ``Llama-3.1-8B-Instruct`` and miss the actual
+        cache/catalog key.
+        """
+        from kestrel_sovereign.agent.token_counter import TokenCounter
+        tc = TokenCounter("openrouter:default/meta-llama/Llama-3.1-8B-Instruct")
+        # The TOML catalog has this entry at 128000. The regression
+        # bug would yield DEFAULT_CONTEXT_LIMIT (32768) because the
+        # truncated candidate ``Llama-3.1-8B-Instruct`` is nowhere.
+        limit = tc.get_context_limit()
+        assert limit == 128000
+
     def test_fallback_estimation(self):
         """Test character-based fallback estimation."""
         # Create counter that won't use tiktoken
