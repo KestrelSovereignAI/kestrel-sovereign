@@ -290,9 +290,12 @@ class ModelCatalogService:
         selection like ``ollama:local/llama3.2:3b`` (codex round-3
         P2 on PR #1396).
 
-        Matched via longest substring so the most specific route
-        prefix wins (``"openai:plan/gpt-5.5"`` matches
-        ``"openai:plan"``; ``"openai:api/..."`` does not).
+        Matching rule: the route key must equal the model string,
+        OR the model string must start with ``"<route_key>/"``. A
+        bare substring check would let ``"openai:plan"`` falsely
+        cap a different route like ``"openai:plan-pro/gpt-5.5"``
+        (codex round-5 P2 on PR #1396). With multiple matching
+        keys, the longest wins.
         """
         self._ensure_loaded()
         model_lower = model_id.lower()
@@ -300,7 +303,10 @@ class ModelCatalogService:
         best_len = -1
         for known_route, limit in self._route_context_caps.items():
             key_lower = known_route.lower()
-            if key_lower in model_lower and len(key_lower) > best_len:
+            if (
+                model_lower == key_lower
+                or model_lower.startswith(key_lower + "/")
+            ) and len(key_lower) > best_len:
                 best_match = limit
                 best_len = len(key_lower)
         return best_match

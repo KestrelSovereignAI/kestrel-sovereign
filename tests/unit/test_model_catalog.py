@@ -412,6 +412,37 @@ class TestContextLimits:
         # No "mini" — the only substring match is "gpt-5".
         assert svc.get_context_limit("gpt-5-preview") == 128000
 
+    def test_route_cap_match_requires_route_boundary(self):
+        """Codex round-5 P2: route key must match exactly or with ``/`` boundary.
+
+        A substring check would let ``"openai:plan"`` falsely cap
+        a different route ``"openai:plan-pro/gpt-5.5"``. The fix:
+        require either equality or that the model string starts
+        with ``"<route_key>/"``.
+        """
+        content = '''
+[route_context_caps]
+"openai:plan" = 20480
+"openai:plan-pro" = 40960
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        # Exact route hits its own cap.
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 20480
+        assert svc.get_route_context_cap("openai:plan") == 20480
+        # Sibling route gets its own cap, NOT openai:plan's.
+        assert svc.get_route_context_cap("openai:plan-pro/gpt-5.5") == 40960
+        assert svc.get_route_context_cap("openai:plan-pro") == 40960
+        # Hypothetical third sibling with no cap returns None — even
+        # though "openai:plan" is a substring.
+        assert svc.get_route_context_cap("openai:plan-experimental/gpt-5.5") is None
+
     def test_route_caps_in_dedicated_section(self):
         """``[route_context_caps]`` is structurally separate from
         ``[context_limits_override]``.
