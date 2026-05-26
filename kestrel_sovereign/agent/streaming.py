@@ -11,7 +11,6 @@ from kestrel_sovereign.llm.adapter import LLMResponse, ThinkingDelta
 from kestrel_sovereign.security.input_guardrails import (
     wrap_user_input,
     check_prompt_injection,
-    append_security_addendum,
 )
 from kestrel_sovereign.telemetry import start_span, end_span
 
@@ -285,15 +284,15 @@ class StreamingMixin:
         await self.privacy_agent.add_conversation(
             "user", prompt, metadata={"sent_form": True}, session_id=session_id
         )
-        system_prompt = context_result.system_prompt
-
-        # Append the security + honesty addenda. Single source of truth
-        # for assembly order; see append_security_addendum's docstring.
-        system_prompt = append_security_addendum(system_prompt)
-
-        # Add cached features section
-        if self._cached_features_prompt:
-            system_prompt = f"{system_prompt}{self._cached_features_prompt}"
+        # Apply post-build assembly via the agent helper so this path
+        # uses the same route-aware budget gate as the non-streaming
+        # path (#1399). Without sharing the helper, route-capped
+        # subscriptions hit the same codex-stdout-close 500 from the
+        # streaming endpoint that the non-streaming endpoint just got
+        # protected against.
+        system_prompt = self._assemble_post_build_system_prompt(
+            context_result.system_prompt, context_result,
+        )
 
         if self.extension:
             try:

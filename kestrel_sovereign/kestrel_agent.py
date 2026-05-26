@@ -1773,6 +1773,62 @@ Expected Duration: {expected_duration}
                     anchored_doctrine=anchored_doctrine,
                 )
 
+    def _assemble_post_build_system_prompt(
+        self, base_system_prompt: str, context_result,
+    ) -> str:
+        """Apply the post-build system_prompt assembly steps.
+
+        Both the non-streaming and streaming turn paths append the
+        security addendum and the cached features prompt to the
+        system_prompt that ``build_context`` returned. The features
+        prompt is bulky (~7K tokens of feature/command listings) —
+        when the agent already has a heavy constitution + identity,
+        appending it can blow past a route's per-turn payload cap
+        (ChatGPT-subscription via ``openai:plan`` is the canonical
+        case), causing codex's app-server to close stdout mid-turn
+        (#1399).
+
+        This helper centralizes the assembly so both paths apply the
+        same route-aware gate. The features prompt is dropped when
+        including it would push the projected wire payload past the
+        budget (``budget_summary.total_budget`` from the elastic
+        budget). The feature COMMANDS remain callable via the tool
+        registry — they just aren't advertised in the
+        system_prompt for that turn. The dynamic-tools list still
+        flows via the adapter's tool advertisement path.
+        """
+        system_prompt = append_security_addendum(base_system_prompt)
+        if not self._cached_features_prompt:
+            return system_prompt
+
+        try:
+            ctx_counter = self.context_manager.counter
+            features_tokens = ctx_counter.count(self._cached_features_prompt)
+            total_budget = (
+                context_result.budget_summary.get("total_budget")
+                if getattr(context_result, "budget_summary", None) else None
+            )
+            already_used = getattr(context_result, "total_tokens", 0) or 0
+        except Exception:
+            features_tokens = 0
+            total_budget = None
+            already_used = 0
+
+        if total_budget is not None and features_tokens > 0:
+            projected = already_used + features_tokens
+            if projected > total_budget:
+                logging.warning(
+                    "Skipping LOADED FEATURES section for this turn — "
+                    "appending %d tokens would push projected payload "
+                    "(%d) past route budget (%d). Route is likely a "
+                    "per-turn-capped subscription (openai:plan). "
+                    "Feature commands still callable; just not "
+                    "advertised in this turn's system_prompt.",
+                    features_tokens, projected, total_budget,
+                )
+                return system_prompt
+        return f"{system_prompt}{self._cached_features_prompt}"
+
     async def _process_input_traced_locked(
         self,
         user_input: str,
@@ -1966,58 +2022,9 @@ Expected Duration: {expected_duration}
 
         # Build system prompt with features and security + honesty addenda
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
-        system_prompt = context_result.system_prompt
-
-        # Append the security + honesty addenda. Single source of truth
-        # for assembly order; see append_security_addendum's docstring.
-        system_prompt = append_security_addendum(system_prompt)
-
-        # Add cached features section (built once at session start),
-        # BUT honor the route's per-turn payload cap. ChatGPT-subscription
-        # (openai:plan) enforces a much smaller per-turn limit than the
-        # model's full context window. The features prompt is bulky
-        # (~10K tokens of feature/command listings) — when the agent
-        # already has a heavy constitution + identity, appending it
-        # blows past the route's per-turn cap and ChatGPT-subscription's
-        # codex app-server closes stdout mid-turn (the Claw 500 symptom
-        # in #1399). Drop the features section when including it would
-        # exceed the budget; the kestrel-side features (tools, A2A
-        # agents) are still callable, just not advertised in the
-        # system_prompt for that turn.
-        if self._cached_features_prompt:
-            try:
-                ctx_counter = self.context_manager.counter
-                features_tokens = ctx_counter.count(self._cached_features_prompt)
-                system_tokens_so_far = ctx_counter.count(system_prompt)
-                total_budget = context_result.budget_summary.get("total_budget")
-                already_used = context_result.total_tokens
-            except Exception:
-                features_tokens = 0
-                system_tokens_so_far = 0
-                total_budget = None
-                already_used = 0
-
-            include_features = True
-            if total_budget is not None and features_tokens > 0:
-                # Projected total: system + history/episodes/memories/rag
-                # (already in ``total_used``) + features about to append.
-                # Subtract the "system" allocation already used so we
-                # don't double-count it. This is conservative — if the
-                # projection exceeds the route's total_budget, skip.
-                projected = already_used + features_tokens
-                if projected > total_budget:
-                    include_features = False
-                    logging.warning(
-                        "Skipping LOADED FEATURES section for this turn — "
-                        "appending %d tokens would push projected payload "
-                        "(%d) past route budget (%d). Route is likely a "
-                        "per-turn-capped subscription (openai:plan). "
-                        "Feature commands still callable; just not "
-                        "advertised in this turn's system_prompt.",
-                        features_tokens, projected, total_budget,
-                    )
-            if include_features:
-                system_prompt = f"{system_prompt}{self._cached_features_prompt}"
+        system_prompt = self._assemble_post_build_system_prompt(
+            context_result.system_prompt, context_result,
+        )
 
         if self.extension:
             try:
