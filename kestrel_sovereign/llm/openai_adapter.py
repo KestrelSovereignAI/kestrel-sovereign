@@ -25,6 +25,12 @@ from .adapter import (
     ToolCall,
     split_thinking_from_content,
 )
+from kestrel_sdk.llm import (
+    ProviderCapabilities,
+    StructuredOutputMode,
+    ToolStreamingMode,
+    VisionInputMode,
+)
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo, ModelCategory
 from .retry import with_retry
@@ -47,6 +53,21 @@ class OpenAIAdapter(LLMAdapter):
 
     def __init__(self, name: str = "openai"):
         self.name = name
+
+    def provider_capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(
+            supports_tools=True,
+            supports_streaming=True,
+            supports_vision=True,
+            supports_structured_output=True,
+            structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
+            tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
+            vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
+            model_dependent=("vision",),
+            notes=(
+                "Structured output uses response_format=json_schema for Pydantic models.",
+            ),
+        )
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]

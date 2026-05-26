@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, 
 
 import openai
 import httpx
+from kestrel_sdk.llm import ProviderCapabilities
 
 if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
@@ -809,6 +810,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 hints = list(hints) if hints is not None else []
             except TypeError:
                 hints = []
+            raw_capabilities = getattr(provider, "capabilities", None)
+            if raw_capabilities is None and hasattr(provider.adapter, "provider_capabilities"):
+                raw_capabilities = provider.adapter.provider_capabilities()
+            if isinstance(raw_capabilities, dict):
+                raw_capabilities = ProviderCapabilities.from_mapping(raw_capabilities)
+            if not isinstance(raw_capabilities, ProviderCapabilities):
+                raw_capabilities = ProviderCapabilities()
+            capabilities = raw_capabilities.to_dict()
             out.append({
                 "name": provider.name,
                 "vendor": getattr(provider, "vendor", None),
@@ -820,6 +829,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "is_local": getattr(provider, "is_local", False),
                 "base_url": getattr(provider, "base_url", None),
                 "selection_hints": hints,
+                "capabilities": capabilities,
             })
         return out
 
