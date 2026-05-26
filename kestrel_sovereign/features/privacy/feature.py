@@ -193,7 +193,10 @@ class PrivacyAgent:
 
         saved_count = 0
         for entry in self.isolated_session:
-            await self.storage.add_conversation(entry['role'], entry['content'], entry.get('metadata'))
+            await self.storage.add_conversation(
+                entry['role'], entry['content'], entry.get('metadata'),
+                rendered_content=entry.get('rendered_content'),
+            )
             saved_count += 1
 
         self.isolated_session.clear()
@@ -231,16 +234,24 @@ class PrivacyAgent:
         config = self._privacy_config
 
         if config.is_ephemeral():
-            # Store in ephemeral session only (in-memory). The ephemeral
-            # buffer is never replayed for cache hits, so the rendered
-            # form is intentionally dropped here.
+            # Store in ephemeral session only (in-memory). Preserve
+            # rendered_content so within-session replays keep the
+            # byte-stable transport form (#1402 codex round-1 P2) — the
+            # ephemeral buffer IS replayed across turns of the same
+            # session, even though nothing crosses to disk.
             if self.ephemeral_session is None:
                 self.ephemeral_session = EphemeralSession()
-            self.ephemeral_session.add_message(role, content, metadata)
+            self.ephemeral_session.add_message(
+                role, content, metadata,
+                rendered_content=rendered_content,
+            )
             return  # Do NOT persist to storage
 
         if config.uses_temp_storage():
-            self.isolated_session.append({"role": role, "content": content, "metadata": metadata})
+            entry = {"role": role, "content": content, "metadata": metadata}
+            if rendered_content is not None:
+                entry["rendered_content"] = rendered_content
+            self.isolated_session.append(entry)
             return
 
         final_content = content

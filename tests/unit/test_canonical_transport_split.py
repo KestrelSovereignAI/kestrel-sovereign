@@ -336,6 +336,112 @@ class TestFormatConversationHistoryReplaysVerbatim:
         assert formatted[0]["content"] == "stripped raw"
 
 
+class TestPrivacyModesPreserveRenderedContent:
+    """Ephemeral and isolated privacy buffers replay history across turns
+    of the same session. Dropping ``rendered_content`` for those modes
+    would silently regress cache stability inside the session (codex
+    round-1 P2)."""
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_session_preserves_rendered_content(self):
+        from kestrel_sovereign.ephemeral_session import EphemeralSession
+
+        session = EphemeralSession()
+        session.add_message(
+            "user", "<user_input>\nhi\n</user_input>",
+            rendered_content=RENDERED_FORM,
+        )
+        history = session.get_history(limit=10)
+        assert history[0]["rendered_content"] == RENDERED_FORM
+        assert history[0]["content"] == "<user_input>\nhi\n</user_input>"
+
+    @pytest.mark.asyncio
+    async def test_privacy_wrapper_isolated_session_preserves_rendered_content(self):
+        """``PrivacyEnforcingStorage`` ISOLATED mode appends to an
+        in-memory list that is later replayed; ``rendered_content`` must
+        survive the buffer round-trip."""
+        from unittest.mock import AsyncMock
+
+        from kestrel_sovereign.privacy import PrivacyMode
+        from kestrel_sovereign.storage.privacy_wrapper import (
+            PrivacyEnforcingStorage,
+        )
+
+        underlying = AsyncMock()
+        wrapper = PrivacyEnforcingStorage(underlying, privacy_mode=PrivacyMode.ISOLATED)
+
+        await wrapper.add_conversation(
+            "user", "<user_input>\nhi\n</user_input>",
+            rendered_content=RENDERED_FORM,
+        )
+        # ISOLATED mode buffers in-memory; rendered_content survives
+        assert wrapper._session_conversations[0]["rendered_content"] == RENDERED_FORM
+        # And was NOT forwarded to the persistent underlying storage
+        underlying.add_conversation.assert_not_awaited()
+
+
+class TestHumanRoleStillGetsUserInputWrapper:
+    """Legacy rows persisted with role ``human`` (a normalize-on-emit alias
+    for ``user``) must still pick up the ``<user_input>`` wrapper on
+    replay. Codex round-1 P3 caught a regression where role normalization
+    ran after the wrap-decision, leaving ``human`` rows unwrapped."""
+
+    def _format(self, history):
+        from kestrel_sovereign.agent.context_builder import ContextBuilder
+
+        cb = ContextBuilder.__new__(ContextBuilder)
+        cb._llm_service = None
+        cb._model_fallback = "test-stub"
+
+        class _Counter:
+            def count(self, s):
+                return max(1, len(s) // 4)
+
+            def truncate_to_tokens(self, s, n):
+                return s[: n * 4]
+
+        cb._counter = _Counter()
+        cb._counter_model = "test-stub"
+        return cb.format_conversation_history(history, max_tokens=10_000)
+
+    def test_human_role_is_wrapped(self):
+        from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+        history = [{"role": "human", "content": "legacy human msg", "metadata": {}}]
+        formatted = self._format(history)
+        # Role normalized to 'user' AND wrapped
+        assert formatted[0]["role"] == "user"
+        assert formatted[0]["content"] == wrap_user_input("legacy human msg")
+
+
+class TestKeyRotationWalksRenderedContent:
+    """Encryption-at-rest: when a key rotation runs, ``rendered_content``
+    must be re-encrypted under the new master alongside ``content`` —
+    otherwise post-rotation reads fail to decrypt the replay bytes
+    (codex round-1 P1)."""
+
+    def test_rotation_registry_includes_rendered_content(self):
+        from kestrel_sovereign.security.key_rotation import KeyRotationService
+
+        registry = KeyRotationService.ENCRYPTED_TABLES
+        # conversation_history must appear twice: once for content,
+        # once for rendered_content.
+        ch_entries = [
+            e for e in registry if e["table"] == "conversation_history"
+        ]
+        columns = {e["content_column"] for e in ch_entries}
+        assert columns == {"content", "rendered_content"}
+        # The rendered_content entry must declare a distinct progress
+        # alias so the rotation_progress (rotation_id, table_name,
+        # record_id) PK doesn't collide with the content pass for the
+        # same row.
+        rendered_entry = next(
+            e for e in ch_entries if e["content_column"] == "rendered_content"
+        )
+        assert rendered_entry.get("progress_alias")
+        assert rendered_entry["progress_alias"] != "conversation_history"
+
+
 class TestExtractRawIsIdempotentOnNewWrites:
     """Existing consumers (MemoryFeature, endpoints, personality_analyzer,
     wellness) call ``extract_raw_user_content`` on ``content`` to defend

@@ -30,15 +30,20 @@ class EphemeralSession:
         self.created_at = datetime.now(timezone.utc)
         logger.info(f"Ephemeral session created at {self.created_at}")
 
-    def add_message(self, role: str, content: str, metadata: Optional[Dict] = None):
+    def add_message(self, role: str, content: str, metadata: Optional[Dict] = None,
+                    rendered_content: Optional[str] = None):
         """
         Add a message to the in-memory buffer.
         Old messages are automatically removed if buffer is full.
 
         Args:
             role: Message role (user/assistant/system)
-            content: Message content
+            content: Canonical raw message content
             metadata: Optional metadata (not persisted)
+            rendered_content: Byte-stable transport form (#1402). Replayed
+                verbatim by ``format_conversation_history`` so prompt-cache
+                prefixes stay stable across turns within the ephemeral
+                session.
         """
         message = {
             "role": role,
@@ -46,6 +51,8 @@ class EphemeralSession:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "metadata": metadata or {}
         }
+        if rendered_content is not None:
+            message["rendered_content"] = rendered_content
 
         self.messages.append(message)
 

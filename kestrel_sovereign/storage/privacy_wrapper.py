@@ -370,15 +370,19 @@ class PrivacyEnforcingStorage:
         metadata["privacy_mode"] = self._privacy_mode.value
 
         if self._policy.use_session_storage:
-            # Store in session-local list (ISOLATED mode). Session-local
-            # buffer is in-memory and never replayed for cache hits, so
-            # the rendered form is intentionally dropped here.
-            self._session_conversations.append({
+            # Store in session-local list (ISOLATED mode). The session
+            # buffer IS replayed across turns within the same isolated
+            # session, so preserve rendered_content for cache stability
+            # (#1402 codex round-1 P2).
+            entry = {
                 "role": role,
                 "content": processed_content,
                 "metadata": metadata,
                 "session_id": session_id
-            })
+            }
+            if processed_rendered is not None:
+                entry["rendered_content"] = processed_rendered
+            self._session_conversations.append(entry)
             logger.debug(f"Conversation stored in session ({len(self._session_conversations)} total)")
         else:
             # Store in persistent storage
@@ -444,7 +448,8 @@ class PrivacyEnforcingStorage:
                 conv["role"],
                 conv["content"],
                 conv.get("metadata"),
-                conv.get("session_id")
+                conv.get("session_id"),
+                rendered_content=conv.get("rendered_content"),
             )
             count += 1
         self._session_conversations.clear()

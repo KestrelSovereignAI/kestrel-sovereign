@@ -428,6 +428,14 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             msg_id = msg.get('id')
             meta = msg.get('metadata') or {}
 
+            # Normalize role names FIRST so the wrap-decision below treats
+            # legacy ``human`` rows as user turns (codex round-1 P2).
+            # Without this, ``human`` falls through the user-branch and
+            # the anti-injection ``<user_input>`` wrapper is silently
+            # dropped on replay.
+            if role not in ('user', 'assistant', 'system'):
+                role = 'user' if role == 'human' else 'assistant'
+
             # Select the bytes to emit (#1402). For user turns flagged
             # ``sent_form`` we replay the rendered transport form verbatim
             # — this is the byte-identical prefix the LLM saw at write
@@ -464,10 +472,6 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
                 else:
                     # Skip older messages to preserve newer ones
                     continue
-
-            # Normalize role names for OpenAI API
-            if role not in ('user', 'assistant', 'system'):
-                role = 'user' if role == 'human' else 'assistant'
 
             formatted.append({
                 'role': role,
