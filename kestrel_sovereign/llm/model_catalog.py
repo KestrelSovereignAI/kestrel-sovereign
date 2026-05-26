@@ -108,6 +108,13 @@ class ModelCatalogService:
         self._hidden: Dict[str, Set[str]] = {}
         self._categories: Dict[str, Dict[str, List[str]]] = {}
         self._context_limits: Dict[str, int] = {}
+        # Route-level per-turn payload caps (#1395). Kept in a dedicated
+        # dict, structurally separate from ``_context_limits``, so the
+        # route-cap path cannot accidentally pick up a colon-containing
+        # bare model entry (Ollama tags share the ``word:word`` shape,
+        # so a character heuristic alone is ambiguous — codex round-3
+        # P2 on PR #1396).
+        self._route_context_caps: Dict[str, int] = {}
         self._display_names: Dict[str, str] = {}
         self._tool_support: Dict[str, bool] = {}
         # vendor -> {"small": model_id, "medium": ..., "large": ...}
@@ -145,6 +152,14 @@ class ModelCatalogService:
                 or self._config.get("context_limits", {})
             )
 
+            # Route-level per-turn payload caps live in a dedicated
+            # section so they cannot collide with bare-model entries
+            # that happen to contain ``:`` (Ollama tags share that
+            # shape — codex round-3 P2 on PR #1396).
+            self._route_context_caps = dict(
+                self._config.get("route_context_caps", {})
+            )
+
             # Env overrides for route-level per-turn caps (#1395). Mapped
             # from KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>=<int> so the
             # operator can tune a route's effective window without
@@ -167,7 +182,7 @@ class ModelCatalogService:
                 else:
                     continue
                 try:
-                    self._context_limits[target_key] = int(env_val)
+                    self._route_context_caps[target_key] = int(env_val)
                     logger.info(
                         "route context cap override from env: %s = %s",
                         target_key, env_val,
@@ -264,28 +279,27 @@ class ModelCatalogService:
         return ModelCategory.CHAT
 
     def get_route_context_cap(self, model_id: str) -> Optional[int]:
-        """Return ONLY a route-keyed cap matching ``model_id``, or None.
+        """Return a route-level per-turn payload cap for ``model_id``, or None.
 
-        A *route-keyed* entry is one whose catalog key contains ``:``
-        (e.g. ``"openai:plan"``). This is the manual-override knob for
-        per-turn payload caps that discovery cannot know about
-        (ChatGPT-subscription, etc., #1395). Matched via longest
-        substring so the most specific route prefix wins.
+        Reads exclusively from the dedicated ``[route_context_caps]``
+        TOML section (and env overrides). The structural separation
+        is load-bearing: Ollama bare model IDs share the
+        ``word:word`` shape (e.g. ``llama3.2:3b``), so a character
+        heuristic on ``_context_limits`` would let Ollama entries
+        match as if they were route caps on a route-qualified
+        selection like ``ollama:local/llama3.2:3b`` (codex round-3
+        P2 on PR #1396).
 
-        Distinct from ``get_context_limit`` so callers (TokenCounter)
-        can give route caps absolute priority over discovered/cached
-        bare-model limits **without** also letting bare-model catalog
-        entries shadow discovered limits — codex round-1 P2 on PR
-        #1396 caught the broader version.
+        Matched via longest substring so the most specific route
+        prefix wins (``"openai:plan/gpt-5.5"`` matches
+        ``"openai:plan"``; ``"openai:api/..."`` does not).
         """
         self._ensure_loaded()
         model_lower = model_id.lower()
         best_match: Optional[int] = None
         best_len = -1
-        for known_model, limit in self._context_limits.items():
-            if ":" not in known_model:
-                continue
-            key_lower = known_model.lower()
+        for known_route, limit in self._route_context_caps.items():
+            key_lower = known_route.lower()
             if key_lower in model_lower and len(key_lower) > best_len:
                 best_match = limit
                 best_len = len(key_lower)

@@ -38,18 +38,25 @@ openai = ["babbage-002", "davinci-002"]
 # DO NOT add entries for providers that return this from their API:
 #   - OpenRouter: returns context_length per model
 #   - Google/Vertex AI: returns context window in API response
-[context_limits_override]
-# Route-level per-turn payload caps. Listed FIRST so the longest-substring
-# rule in ModelCatalogService.get_context_limit picks the route entry over
-# any bare-model entry when both could apply. ChatGPT-subscription
-# (openai:plan) has a per-turn payload cap well below the model's own
-# context window — without this cap, ContextManager would size history
-# against the model's 128K+ window and codex's session_loop would never
-# return response.completed (the 300s idle-timeout symptom that #1395
+# Route-level per-turn payload caps (#1395). Kept in a dedicated
+# section structurally separate from [context_limits_override] so
+# the route-cap path cannot accidentally pick up colon-containing
+# bare-model entries (Ollama tags share the word:word shape).
+# Lookups are longest-substring against the route-qualified model
+# string (e.g. "openai:plan/gpt-5.5" matches "openai:plan").
+#
+# ChatGPT-subscription (openai:plan) enforces a per-turn payload
+# cap well below the model's context window — without this cap,
+# ContextManager would size history against the model's 128K+
+# window and codex's session_loop would never return
+# response.completed (the 300s idle-timeout symptom that #1395
 # tracks). Tunable per deployment via env var
-# KESTREL_OPENAI_PLAN_CONTEXT_CAP (read by ModelCatalogService.load).
+# KESTREL_OPENAI_PLAN_CONTEXT_CAP or the generic
+# KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>=<int>.
+[route_context_caps]
 "openai:plan" = 20480
 
+[context_limits_override]
 # OpenAI models
 "gpt-4" = 8192
 "gpt-4-32k" = 32768
