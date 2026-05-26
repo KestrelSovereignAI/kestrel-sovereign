@@ -39,6 +39,17 @@ openai = ["babbage-002", "davinci-002"]
 #   - OpenRouter: returns context_length per model
 #   - Google/Vertex AI: returns context window in API response
 [context_limits_override]
+# Route-level per-turn payload caps. Listed FIRST so the longest-substring
+# rule in ModelCatalogService.get_context_limit picks the route entry over
+# any bare-model entry when both could apply. ChatGPT-subscription
+# (openai:plan) has a per-turn payload cap well below the model's own
+# context window — without this cap, ContextManager would size history
+# against the model's 128K+ window and codex's session_loop would never
+# return response.completed (the 300s idle-timeout symptom that #1395
+# tracks). Tunable per deployment via env var
+# KESTREL_OPENAI_PLAN_CONTEXT_CAP (read by ModelCatalogService.load).
+"openai:plan" = 20480
+
 # OpenAI models
 "gpt-4" = 8192
 "gpt-4-32k" = 32768

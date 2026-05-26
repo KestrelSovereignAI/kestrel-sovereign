@@ -145,6 +145,39 @@ class ModelCatalogService:
                 or self._config.get("context_limits", {})
             )
 
+            # Env overrides for route-level per-turn caps (#1395). Mapped
+            # from KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>=<int> so the
+            # operator can tune a route's effective window without
+            # editing the TOML — useful when ChatGPT-Plus's per-turn cap
+            # shifts (it's empirical, not advertised by OpenAI).
+            # KESTREL_OPENAI_PLAN_CONTEXT_CAP is honored as the
+            # documented shortcut for the canonical case.
+            for env_key, env_val in os.environ.items():
+                if env_val == "":
+                    continue
+                if env_key == "KESTREL_OPENAI_PLAN_CONTEXT_CAP":
+                    target_key = "openai:plan"
+                elif env_key.startswith("KESTREL_ROUTE_CONTEXT_CAP_"):
+                    rest = env_key[len("KESTREL_ROUTE_CONTEXT_CAP_"):]
+                    parts = rest.split("_", 1)
+                    if len(parts) != 2:
+                        continue
+                    vendor, route = parts
+                    target_key = f"{vendor.lower()}:{route.lower()}"
+                else:
+                    continue
+                try:
+                    self._context_limits[target_key] = int(env_val)
+                    logger.info(
+                        "route context cap override from env: %s = %s",
+                        target_key, env_val,
+                    )
+                except ValueError:
+                    logger.warning(
+                        "env override %s=%r is not an integer; ignored",
+                        env_key, env_val,
+                    )
+
             # Parse display name overrides — support both old and new key names
             self._display_names = (
                 self._config.get("display_name_overrides", {})
@@ -251,13 +284,22 @@ class ModelCatalogService:
         if base_model in self._context_limits:
             return self._context_limits[base_model]
 
-        # Try partial match (e.g., "gpt-4" matches "gpt-4-turbo")
+        # Partial match — prefer the LONGEST substring match so route prefixes
+        # like "openai:plan" beat bare model entries like "gpt-5" when both
+        # appear in a route-qualified id ("openai:plan/gpt-5.5"). Without
+        # this, dict-insertion-order determines the winner — fine for the
+        # original ``gpt-4`` → ``gpt-4-turbo`` case, but wrong once we
+        # register a route-level per-turn cap that must take precedence
+        # over the model's full context window (#1395).
         model_lower = model_id.lower()
+        best_match: Optional[int] = None
+        best_len = -1
         for known_model, limit in self._context_limits.items():
-            if known_model.lower() in model_lower:
-                return limit
-
-        return None
+            key_lower = known_model.lower()
+            if key_lower in model_lower and len(key_lower) > best_len:
+                best_match = limit
+                best_len = len(key_lower)
+        return best_match
 
     def get_model_for_size(self, vendor: str, size: str) -> Optional[str]:
         """Look up the canonical model ID for a vendor at a size tier.

@@ -49,8 +49,24 @@ class ToolContextManager:
 
     @property
     def model(self) -> str:
-        """Resolve the current model dynamically when llm_service is available."""
+        """Resolve the current model dynamically when llm_service is available.
+
+        Prefers the route-qualified form (``"<vendor>:<route>/<model>"``) so
+        ``!status`` and downstream budget computations see the route's
+        per-turn cap rather than the model's full context window. This
+        matters for routes whose effective payload limit is below the
+        model's advertised window — ChatGPT-subscription (openai:plan)
+        is the canonical case (#1395).
+        """
         if self._llm_service:
+            if hasattr(self._llm_service, "get_active_model_selection"):
+                try:
+                    selection = self._llm_service.get_active_model_selection()
+                    qualified = selection.get("model") if selection else None
+                    if qualified:
+                        return qualified
+                except Exception:
+                    pass
             return self._llm_service.get_active_model_id()
         return self._model
 

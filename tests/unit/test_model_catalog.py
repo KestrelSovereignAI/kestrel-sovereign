@@ -385,6 +385,82 @@ class TestContextLimits:
         assert service.get_context_limit("gpt-5-mini") == 128000
         assert service.get_context_limit("totally-unknown-model-xyz") is None
 
+    def test_partial_match_prefers_longest_substring(self):
+        """Route prefix (longer key) must win over bare model (shorter key).
+
+        Regression for #1395: ChatGPT-subscription's ``openai:plan``
+        route has a per-turn payload cap below the model's own context
+        window. When ContextManager looks up
+        ``"openai:plan/gpt-5.5"``, the route entry (``"openai:plan"``,
+        11 chars) must beat the bare-model entry (``"gpt-5"``,
+        5 chars). Without longest-match the partial loop returns
+        whichever key the TOML happened to list first — undefined
+        behavior for a load-bearing budget number.
+        """
+        content = '''
+[context_limits_override]
+"gpt-5" = 128000
+"openai:plan" = 20480
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        assert svc.get_context_limit("openai:plan/gpt-5.5") == 20480
+        assert svc.get_context_limit("openai:plan/gpt-5-mini") == 20480
+        # Without the route prefix, the model entry still wins.
+        assert svc.get_context_limit("gpt-5-preview") == 128000
+
+    def test_env_override_openai_plan_context_cap(self, monkeypatch):
+        """``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` overrides the TOML cap.
+
+        The cap is empirical (ChatGPT-Plus doesn't advertise it); the
+        operator needs a no-redeploy way to raise/lower it as the
+        upstream shifts. The env override is read at catalog load
+        time, so a fresh process picks up the new value.
+        """
+        content = '''
+[context_limits_override]
+"openai:plan" = 20480
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        assert svc.get_context_limit("openai:plan") == 16384
+        assert svc.get_context_limit("openai:plan/gpt-5.5") == 16384
+
+    def test_env_override_generic_route_cap(self, monkeypatch):
+        """``KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>`` honored too."""
+        content = '''
+[context_limits_override]
+"gpt-5" = 128000
+'''
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.toml', delete=False
+        ) as f:
+            f.write(content)
+            f.flush()
+            monkeypatch.setenv(
+                "KESTREL_ROUTE_CONTEXT_CAP_ANTHROPIC_PLAN", "30720"
+            )
+            svc = ModelCatalogService(config_path=Path(f.name))
+            svc.load()
+
+        assert svc.get_context_limit("anthropic:plan") == 30720
+        assert svc.get_context_limit("anthropic:plan/claude-sonnet-4-6") == 30720
+        # Untouched bare-model lookup still works.
+        assert svc.get_context_limit("gpt-5") == 128000
+
 
 class TestTokenCounterCatalogIntegration:
     """Test integration between TokenCounter and ModelCatalogService."""
