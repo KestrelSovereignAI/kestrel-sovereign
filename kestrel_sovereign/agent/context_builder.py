@@ -85,35 +85,13 @@ def _count_tool_schema_tokens(
     return counter.count(payload)
 
 
-def extract_raw_user_content(content: str) -> str:
-    """Unwrap a stored user-turn sent-form back to the raw user text.
+# extract_raw_user_content moved to kestrel_sovereign.security.input_guardrails
+# (#1402) so the storage layer can import it without cycling through the
+# agent layer. Re-exported here to keep existing consumers working.
+from kestrel_sovereign.security.input_guardrails import (  # noqa: E402
+    extract_raw_user_content,
+)
 
-    Writers (streaming.py / kestrel_agent.py) persist the rendered sent-form
-    for user turns so history-load reproduces the byte-exact prompt that was
-    sent. Consumers that need raw user text — memory retrieval, UI previews,
-    exports — call this to strip the wrappers.
-
-    Sent-form grammar (see ``prompts/user_prompt.md`` + ``wrap_user_input``):
-        [optional leading \\n from empty {context}]
-        [optional <retrieved_context>...</retrieved_context>\\n]
-        <user_input>\\n{raw}\\n</user_input>
-
-    Idempotent on legacy raw rows (no wrappers) — returns input unchanged.
-    """
-    s = content
-    if s.startswith("\n"):
-        s = s[1:]
-    if s.startswith("<retrieved_context>"):
-        end = s.find("</retrieved_context>")
-        if end != -1:
-            s = s[end + len("</retrieved_context>"):]
-            if s.startswith("\n"):
-                s = s[1:]
-    prefix = "<user_input>\n"
-    suffix = "\n</user_input>"
-    if s.startswith(prefix) and s.endswith(suffix):
-        s = s[len(prefix):-len(suffix)]
-    return s
 
 if TYPE_CHECKING:
     from storage import AsyncStorage
@@ -445,11 +423,33 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
         # Iterate in reverse (newest first) to prioritize recent messages
         for msg in reversed(recent):
             role = msg.get('role', 'user')
-            content = msg.get('content', '')
+            raw_content = msg.get('content', '')
+            rendered_content = msg.get('rendered_content')
             msg_id = msg.get('id')
             meta = msg.get('metadata') or {}
 
-            # Per-message hard cap before budget accounting
+            # Select the bytes to emit (#1402). For user turns flagged
+            # ``sent_form`` we replay the rendered transport form verbatim
+            # — this is the byte-identical prefix the LLM saw at write
+            # time, which is the prerequisite for Anthropic's cache_control
+            # marker at messages[-2] + llama.cpp KV + OpenAI prefix
+            # caching to compound across turns. For legacy unwrapped user
+            # turns (no sent_form flag) we wrap with the anti-injection
+            # <user_input> markers so the system prompt contract still
+            # holds. Assistant/system messages pass through unchanged.
+            # The safety fallback at the bottom handles a sent_form row
+            # whose rendered_content is missing (should not happen post
+            # #1402 — get_conversation_history splits in-memory even when
+            # the DB write is disabled).
+            if role == 'user' and meta.get('sent_form') and rendered_content is not None:
+                content = rendered_content
+            elif role == 'user' and not meta.get('sent_form'):
+                content = wrap_user_input(raw_content)
+            else:
+                content = rendered_content if (rendered_content is not None) else raw_content
+
+            # Per-message hard cap (against the emit bytes — what actually
+            # goes to the LLM) before budget accounting.
             content, content_tokens = self._cap_oversized_message(content, msg_id)
             msg_tokens = content_tokens + MESSAGE_OVERHEAD
 
@@ -468,23 +468,6 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             # Normalize role names for OpenAI API
             if role not in ('user', 'assistant', 'system'):
                 role = 'user' if role == 'human' else 'assistant'
-
-            # For user turns, reproduce what was sent. Rows written with
-            # ``metadata.sent_form == True`` already hold the full rendered
-            # sent-form (retrieved_context + <user_input> wrap) — emit it
-            # verbatim so the history prefix byte-matches what the LLM saw
-            # at send time. Legacy rows (no flag) store raw text; wrap here
-            # so the anti-injection system prompt's <user_input> contract
-            # still holds. Byte-identity across turns is what lets downstream
-            # prompt caches hit (llama.cpp KV, OpenAI prefix, Anthropic
-            # cache_control).
-            if role == 'user' and not meta.get('sent_form'):
-                wrapped = wrap_user_input(content)
-                # Budget was accounted pre-wrap; add the small wrap overhead
-                # so the caller sees an honest token count.
-                wrap_overhead = self.counter.count(wrapped) - content_tokens
-                msg_tokens += max(0, wrap_overhead)
-                content = wrapped
 
             formatted.append({
                 'role': role,

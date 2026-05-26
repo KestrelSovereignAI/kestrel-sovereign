@@ -212,22 +212,28 @@ class PrivacyAgent:
         return f"Discarded {discard_count} messages from isolated session."
 
     async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None,
-                               session_id: Optional[str] = None):
+                               session_id: Optional[str] = None,
+                               rendered_content: Optional[str] = None):
         """
         Adds a conversation entry according to the current privacy config.
         This is the central method for enforcing privacy rules.
 
         Args:
             role: Message role (user, assistant, system)
-            content: Message content
+            content: Canonical raw message content
             metadata: Optional metadata dict
             session_id: If provided, link this message to a specific session.
                        This allows resuming old conversations beyond the 30-min gap.
+            rendered_content: Write-once transport bytes for byte-stable
+                cache replay (#1402); anonymized identically to ``content``
+                when redaction is in force.
         """
         config = self._privacy_config
 
         if config.is_ephemeral():
-            # Store in ephemeral session only (in-memory)
+            # Store in ephemeral session only (in-memory). The ephemeral
+            # buffer is never replayed for cache hits, so the rendered
+            # form is intentionally dropped here.
             if self.ephemeral_session is None:
                 self.ephemeral_session = EphemeralSession()
             self.ephemeral_session.add_message(role, content, metadata)
@@ -238,8 +244,11 @@ class PrivacyAgent:
             return
 
         final_content = content
+        final_rendered = rendered_content
         if config.requires_anonymization():
             final_content = self._anonymize_text(content)
+            if final_rendered is not None:
+                final_rendered = self._anonymize_text(final_rendered)
 
         # Add privacy mode to metadata for tracking
         if metadata is None:
@@ -247,7 +256,10 @@ class PrivacyAgent:
         metadata["privacy_mode"] = self._get_preset_name(config)
         metadata["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-        await self.storage.add_conversation(role, final_content, metadata, session_id)
+        await self.storage.add_conversation(
+            role, final_content, metadata, session_id,
+            rendered_content=final_rendered,
+        )
 
     async def get_conversation_history(self, limit: int = 100, session_id: str = None) -> List[Dict]:
         """

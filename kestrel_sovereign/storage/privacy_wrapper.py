@@ -337,29 +337,42 @@ class PrivacyEnforcingStorage:
     
     # === Conversation Storage (Privacy-Sensitive) ===
     
-    async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None, session_id: Optional[str] = None) -> None:
+    async def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = None,
+                               session_id: Optional[str] = None,
+                               rendered_content: Optional[str] = None) -> None:
         """
         Add a conversation entry, respecting privacy mode.
-        
+
         - EPHEMERAL: Raises PrivacyViolationError (use in-memory buffer instead)
         - ISOLATED: Stores in session-local list
         - ANONYMOUS: Anonymizes content before storing
         - NORMAL/PUBLIC: Stores as-is
+
+        Args:
+            rendered_content: Write-once transport bytes for byte-stable
+                cache replay (#1402); anonymized identically to ``content``
+                so the redacted bytes match what was actually sent.
         """
         if self._privacy_config.is_ephemeral():
             raise PrivacyViolationError(
                 "Cannot store conversations in ephemeral mode. "
                 "Use EphemeralSession for in-memory buffering."
             )
-        
+
         processed_content = self._anonymize_if_required(content)
-        
+        processed_rendered = (
+            self._anonymize_if_required(rendered_content)
+            if rendered_content is not None else None
+        )
+
         if metadata is None:
             metadata = {}
         metadata["privacy_mode"] = self._privacy_mode.value
-        
+
         if self._policy.use_session_storage:
-            # Store in session-local list (ISOLATED mode)
+            # Store in session-local list (ISOLATED mode). Session-local
+            # buffer is in-memory and never replayed for cache hits, so
+            # the rendered form is intentionally dropped here.
             self._session_conversations.append({
                 "role": role,
                 "content": processed_content,
@@ -369,7 +382,10 @@ class PrivacyEnforcingStorage:
             logger.debug(f"Conversation stored in session ({len(self._session_conversations)} total)")
         else:
             # Store in persistent storage
-            await self._storage.add_conversation(role, processed_content, metadata, session_id)
+            await self._storage.add_conversation(
+                role, processed_content, metadata, session_id,
+                rendered_content=processed_rendered,
+            )
     
     async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
         """Surface the effective session_id to the caller.

@@ -2048,19 +2048,25 @@ Expected Duration: {expected_duration}
         # Build user prompt. `context` carries the per-turn retrieved content
         # (memories + RAG) — kept OUT of the system message so the system prefix
         # is stable across turns and prompt caches can hit (see issue #703).
+        wrapped_user = wrap_user_input(user_input)
         prompt = self.user_prompt_template.format(
             context=context_result.dynamic_user_context,
-            query=wrap_user_input(user_input)
+            query=wrapped_user
         )
 
-        # Store the user turn AFTER context build (so memory retrieval sees
-        # the pre-current-turn state) and AFTER rendering, persisting the
-        # full sent-form. History-load at turn N+1 then reproduces the bytes
-        # sent at turn N, which is what lets Anthropic's cache_control marker
-        # at messages[-2] compound across turns.
+        # Canonical/transport split (#1402): persist the raw wrapped user
+        # turn as ``content`` and the rendered prompt (memories + RAG
+        # baked in) as ``rendered_content``. History-load at turn N+1
+        # replays ``rendered_content`` verbatim so Anthropic's
+        # cache_control marker at messages[-2] still compounds across
+        # turns, while every other consumer (search, audit, UI, memory
+        # ingestion) reads clean user speech from ``content``.
         try:
             await self.privacy_agent.add_conversation(
-                "user", prompt, metadata={"sent_form": True}, session_id=session_id
+                "user", wrapped_user,
+                metadata={"sent_form": True},
+                session_id=session_id,
+                rendered_content=prompt,
             )
         except DecryptionError:
             logging.warning("DecryptionError storing user input - continuing in degraded mode")

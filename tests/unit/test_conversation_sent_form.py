@@ -1,16 +1,22 @@
 """Sent-form metadata round-trip for user-turn storage.
 
-Writers (``streaming.py``, ``kestrel_agent.py``) persist the fully rendered
-sent-form for user turns with ``metadata.sent_form = True`` so that history
-replay on subsequent turns is byte-identical to what the LLM saw. This
-module verifies the metadata flag survives the write → encrypt → read →
+After #1402 the user-turn write path is split: ``content`` holds the
+canonical raw user turn and ``rendered_content`` holds the byte-stable
+transport form (memories + RAG baked in). The ``sent_form`` flag still
+marks rows that carry a transport form so the history-load path knows to
+replay verbatim.
+
+This module verifies the flag survives the write → encrypt → read →
 decrypt → metadata-cleanup pipeline so ``ContextBuilder`` can trust it
-when deciding whether to wrap-or-passthrough at load time.
+when deciding whether to replay-or-wrap at load time. Deeper tests for
+the canonical/transport split, lazy migration, and search semantics live
+in :mod:`test_canonical_transport_split`.
 """
 import pytest
 import tempfile
 from pathlib import Path
 
+from kestrel_sovereign.security.input_guardrails import wrap_user_input
 from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
 from kestrel_sovereign.storage.async_database import AsyncDatabase
 
@@ -29,14 +35,18 @@ async def store():
 class TestSentFormMetadataRoundTrip:
     @pytest.mark.asyncio
     async def test_sent_form_flag_round_trips(self, store):
-        """A user row written with metadata={'sent_form': True} surfaces
-        that flag on read, so format_conversation_history can branch on it."""
-        sent = (
+        """A user row written with the canonical/transport split surfaces
+        the ``sent_form`` flag on read so format_conversation_history can
+        branch on it."""
+        raw = wrap_user_input("hello")
+        rendered = (
             "<retrieved_context>\n<memories>\nM\n</memories>\n</retrieved_context>\n"
-            "<user_input>\nhello\n</user_input>"
+            + raw
         )
         await store.add_conversation(
-            "user", sent, metadata={"sent_form": True}, session_id="s1"
+            "user", raw,
+            metadata={"sent_form": True}, session_id="s1",
+            rendered_content=rendered,
         )
 
         history = await store.get_conversation_history(limit=10)
@@ -44,7 +54,8 @@ class TestSentFormMetadataRoundTrip:
         assert len(history) == 1
         row = history[0]
         assert row["role"] == "user"
-        assert row["content"] == sent
+        assert row["content"] == raw
+        assert row["rendered_content"] == rendered
         assert row.get("metadata", {}).get("sent_form") is True
 
     @pytest.mark.asyncio
@@ -58,6 +69,7 @@ class TestSentFormMetadataRoundTrip:
         assert len(history) == 1
         row = history[0]
         assert row["content"] == "raw text"
+        assert "rendered_content" not in row
         meta = row.get("metadata") or {}
         assert "sent_form" not in meta
 
@@ -67,9 +79,10 @@ class TestSentFormMetadataRoundTrip:
         (session_id from implicit-derivation, enc flag from encryption)."""
         await store.add_conversation(
             "user",
-            "<user_input>\nhi\n</user_input>",
+            wrap_user_input("hi"),
             metadata={"sent_form": True, "custom": "keep-me"},
             session_id="explicit-session",
+            rendered_content=wrap_user_input("hi"),
         )
 
         history = await store.get_conversation_history(limit=10)

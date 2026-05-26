@@ -195,19 +195,25 @@ class AsyncStorage:
     
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
-                               session_id: Optional[str] = None) -> None:
+                               session_id: Optional[str] = None,
+                               rendered_content: Optional[str] = None) -> None:
         """Add a conversation message.
 
         Args:
             role: Message role (user, assistant, system)
-            content: Message content
+            content: Canonical raw message content.
             metadata: Optional metadata dict
             session_id: If provided, link this message to a specific session.
                        This allows resuming old conversations beyond the 30-min gap.
+            rendered_content: Write-once transport bytes for byte-stable
+                cache replay (#1402); see AsyncConversationStore.add_conversation.
         """
         if not self._initialized:
             await self.initialize()
-        await self.conversation.add_conversation(role, content, metadata, session_id)
+        await self.conversation.add_conversation(
+            role, content, metadata, session_id,
+            rendered_content=rendered_content,
+        )
     
     async def get_conversation_history(
         self, limit: int = 100, session_id: str = None
