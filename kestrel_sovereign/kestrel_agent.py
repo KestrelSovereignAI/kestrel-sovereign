@@ -1773,6 +1773,107 @@ Expected Duration: {expected_duration}
                     anchored_doctrine=anchored_doctrine,
                 )
 
+    def _assemble_post_build_system_prompt(
+        self, base_system_prompt: str, context_result, *,
+        user_prompt: str = "",
+    ) -> str:
+        """Apply the post-build system_prompt assembly steps.
+
+        Both the non-streaming and streaming turn paths append the
+        security addendum and the cached features prompt to the
+        system_prompt that ``build_context`` returned. The features
+        prompt is bulky (~7K tokens of feature/command listings) —
+        when the agent already has a heavy constitution + identity,
+        appending it can blow past a route's per-turn payload cap
+        (ChatGPT-subscription via ``openai:plan`` is the canonical
+        case), causing codex's app-server to close stdout mid-turn
+        (#1399).
+
+        This helper centralizes the assembly so both paths apply the
+        same route-aware gate. The features prompt is dropped when
+        including it would push the projected wire payload past the
+        budget (``budget_summary.total_budget`` from the elastic
+        budget). The feature COMMANDS remain callable via the tool
+        registry — they just aren't advertised in the
+        system_prompt for that turn. The dynamic-tools list still
+        flows via the adapter's tool advertisement path.
+
+        ``user_prompt`` is the rendered current-turn user message
+        that the caller will append to ``messages`` AFTER this
+        helper returns. Its tokens are counted into the projection
+        so the gate engages even on long user turns where
+        ``context_result.total_tokens`` alone would underestimate
+        the wire size (codex round-2 P2 on PR #1400).
+        """
+        system_prompt = append_security_addendum(base_system_prompt)
+        if not self._cached_features_prompt:
+            return system_prompt
+
+        try:
+            ctx_counter = self.context_manager.counter
+            features_tokens = ctx_counter.count(self._cached_features_prompt)
+            # User prompt rendered as
+            # ``user_prompt_template.format(context=dynamic_user_context,
+            # query=…)``. The ``dynamic_user_context`` block is already
+            # accounted for in ``context_result.total_tokens`` (memories
+            # + RAG slices), so count only the INCREMENT that the
+            # template wrapping + the raw query add (codex round-4 P2
+            # on PR #1400). ``max(0, …)`` guards against tokenizer
+            # non-monotonicity when the dynamic block dominates.
+            if user_prompt:
+                full_user_prompt_tokens = ctx_counter.count(user_prompt)
+                dynamic_ctx_tokens = ctx_counter.count(
+                    getattr(context_result, "dynamic_user_context", "") or ""
+                )
+                user_prompt_tokens = max(
+                    0, full_user_prompt_tokens - dynamic_ctx_tokens
+                )
+            else:
+                user_prompt_tokens = 0
+            # Tokens the security addendum adds to the system_prompt
+            # that build_context already accounted for. Without this,
+            # a narrowly-fitting context + user prompt could pass the
+            # gate while the addendum's bytes silently push the wire
+            # payload over the cap (codex round-3 P2 on PR #1400).
+            addendum_delta = max(
+                0,
+                ctx_counter.count(system_prompt)
+                - ctx_counter.count(base_system_prompt),
+            )
+            total_budget = (
+                context_result.budget_summary.get("total_budget")
+                if getattr(context_result, "budget_summary", None) else None
+            )
+            already_used = getattr(context_result, "total_tokens", 0) or 0
+        except Exception:
+            features_tokens = 0
+            user_prompt_tokens = 0
+            addendum_delta = 0
+            total_budget = None
+            already_used = 0
+
+        if total_budget is not None and features_tokens > 0:
+            projected = (
+                already_used
+                + addendum_delta
+                + user_prompt_tokens
+                + features_tokens
+            )
+            if projected > total_budget:
+                logging.warning(
+                    "Skipping LOADED FEATURES section for this turn — "
+                    "appending %d tokens would push projected payload "
+                    "(%d; incl. %d user-prompt + %d security-addendum) "
+                    "past route budget (%d). Route is likely a "
+                    "per-turn-capped subscription (openai:plan). "
+                    "Feature commands still callable; just not "
+                    "advertised in this turn's system_prompt.",
+                    features_tokens, projected, user_prompt_tokens,
+                    addendum_delta, total_budget,
+                )
+                return system_prompt
+        return f"{system_prompt}{self._cached_features_prompt}"
+
     async def _process_input_traced_locked(
         self,
         user_input: str,
@@ -1966,15 +2067,10 @@ Expected Duration: {expected_duration}
 
         # Build system prompt with features and security + honesty addenda
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
-        system_prompt = context_result.system_prompt
-
-        # Append the security + honesty addenda. Single source of truth
-        # for assembly order; see append_security_addendum's docstring.
-        system_prompt = append_security_addendum(system_prompt)
-
-        # Add cached features section (built once at session start)
-        if self._cached_features_prompt:
-            system_prompt = f"{system_prompt}{self._cached_features_prompt}"
+        system_prompt = self._assemble_post_build_system_prompt(
+            context_result.system_prompt, context_result,
+            user_prompt=prompt,
+        )
 
         if self.extension:
             try:

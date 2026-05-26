@@ -151,13 +151,27 @@ class TestProductionCallSites:
         ],
     )
     def test_uses_append_security_addendum(self, module_path):
-        """Both code paths import + call ``append_security_addendum``,
-        and neither path directly references ``ANTI_INJECTION_SYSTEM_PROMPT``
-        (the helper now owns that detail)."""
+        """Both code paths route the system prompt through
+        ``append_security_addendum``.
+
+        PR #1400 (#1399) consolidated the post-build assembly into
+        ``KestrelAgent._assemble_post_build_system_prompt`` so the
+        streaming and non-streaming paths share the same route-aware
+        features-prompt gate. Both paths now end up calling the
+        addendum helper, but only the consolidated helper imports it
+        directly — the streaming path delegates via the agent method.
+        Accept either the direct call OR the delegation to the
+        helper.
+        """
         src = (_REPO_ROOT / module_path).read_text(encoding="utf-8")
-        assert "append_security_addendum" in src, (
-            f"{module_path} should call append_security_addendum to assemble "
-            "the system prompt's security + honesty addenda"
+        direct = "append_security_addendum" in src
+        delegated = "_assemble_post_build_system_prompt" in src
+        assert direct or delegated, (
+            f"{module_path} must either call append_security_addendum "
+            "directly or delegate to KestrelAgent."
+            "_assemble_post_build_system_prompt (which calls it). "
+            "Without one of those, the security + honesty addenda "
+            "are dropped from this code path."
         )
         # The helper now owns the inline f"{...}\n{ANTI_INJECTION_SYSTEM_PROMPT}"
         # composition — call sites should not reference the constant directly.
