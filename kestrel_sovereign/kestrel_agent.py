@@ -1812,9 +1812,24 @@ Expected Duration: {expected_duration}
         try:
             ctx_counter = self.context_manager.counter
             features_tokens = ctx_counter.count(self._cached_features_prompt)
-            user_prompt_tokens = (
-                ctx_counter.count(user_prompt) if user_prompt else 0
-            )
+            # User prompt rendered as
+            # ``user_prompt_template.format(context=dynamic_user_context,
+            # query=…)``. The ``dynamic_user_context`` block is already
+            # accounted for in ``context_result.total_tokens`` (memories
+            # + RAG slices), so count only the INCREMENT that the
+            # template wrapping + the raw query add (codex round-4 P2
+            # on PR #1400). ``max(0, …)`` guards against tokenizer
+            # non-monotonicity when the dynamic block dominates.
+            if user_prompt:
+                full_user_prompt_tokens = ctx_counter.count(user_prompt)
+                dynamic_ctx_tokens = ctx_counter.count(
+                    getattr(context_result, "dynamic_user_context", "") or ""
+                )
+                user_prompt_tokens = max(
+                    0, full_user_prompt_tokens - dynamic_ctx_tokens
+                )
+            else:
+                user_prompt_tokens = 0
             # Tokens the security addendum adds to the system_prompt
             # that build_context already accounted for. Without this,
             # a narrowly-fitting context + user prompt could pass the
