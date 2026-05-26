@@ -198,8 +198,27 @@ class ContextBuilder:
 
     @property
     def model(self) -> str:
-        """Resolved model ID. Delegates to LLMService if available."""
+        """Resolved model ID, route-qualified when available.
+
+        Prefers the route-qualified form (``"<vendor>:<route>/<model>"``)
+        from ``get_active_model_selection`` so ``measure_context_breakdown``
+        and the ``/context-status`` endpoint see the route's per-turn
+        cap (#1395). Without this, the status footer/popup would
+        under-report utilization on capped routes (codex round-6 P2 on
+        PR #1396) — top-level ``context_limit`` would honor the route
+        cap (because TokenCounter does), but the breakdown's
+        ``total_budget`` would still come from the bare model's 128K+
+        window.
+        """
         if self._llm_service:
+            if hasattr(self._llm_service, "get_active_model_selection"):
+                try:
+                    selection = self._llm_service.get_active_model_selection()
+                    qualified = selection.get("model") if selection else None
+                    if qualified:
+                        return qualified
+                except Exception:
+                    pass
             return self._llm_service.get_active_model_id()
         return self._model_fallback
 
