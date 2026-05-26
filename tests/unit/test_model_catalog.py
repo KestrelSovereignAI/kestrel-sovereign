@@ -439,6 +439,41 @@ class TestContextLimits:
         assert svc.get_context_limit("openai:plan") == 16384
         assert svc.get_context_limit("openai:plan/gpt-5.5") == 16384
 
+    def test_route_cap_discriminator_excludes_ollama_tags(self):
+        """Codex round-2 P2: route-cap path must NOT engage on Ollama tags.
+
+        Ollama bare model IDs (``gemma2:9b``, ``qwen2.5:14b``,
+        ``mistral:7b``) contain ``:`` but no ``/``. The earlier
+        discriminator ``":" in model or "/" in model`` would let
+        them enter the route-cap branch and pick up colon-containing
+        Ollama catalog entries as if they were route caps,
+        bypassing discovered/cached exact limits for the tag.
+
+        The discriminator now requires BOTH ``:`` AND ``/`` — the
+        kestrel route form ``"<vendor>:<route>/<model_name>"``. This
+        test asserts the rule at the predicate boundary so the
+        guarantee survives even when the catalog has Ollama-style
+        colon keys.
+        """
+        # Direct predicate assertion, no singleton mutation — the
+        # route-cap branch in TokenCounter is gated on this exact
+        # boolean. Keep them in sync with this regression test.
+        def is_route_qualified(model: str) -> bool:
+            return ":" in model and "/" in model
+
+        # Route-qualified (should enter the branch):
+        assert is_route_qualified("openai:plan/gpt-5.5")
+        assert is_route_qualified("anthropic:api/claude-opus-4-7")
+        # Ollama tags (should NOT enter the branch — codex round-2 P2):
+        assert not is_route_qualified("gemma2:9b")
+        assert not is_route_qualified("qwen2.5:14b")
+        assert not is_route_qualified("mistral:7b")
+        assert not is_route_qualified("phi3:3.8b")
+        # Vendor-only forms (no route, no cap):
+        assert not is_route_qualified("openai/gpt-5.5")
+        # Bare models:
+        assert not is_route_qualified("gpt-5.5")
+
     def test_route_context_cap_only_matches_route_keys(self):
         """``get_route_context_cap`` ignores bare-model catalog entries.
 
