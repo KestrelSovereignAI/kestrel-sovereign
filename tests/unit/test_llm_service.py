@@ -553,6 +553,155 @@ class TestCoreGeneration:
         assert response is not None
 
 
+class TestAutoRoutingSentinel:
+    """Regression tests for #1408 — the literal string "auto" must never
+    reach a provider client. It expresses routing intent ("pick whatever
+    each route's default is"), not a model identity. Every vendor 404s
+    when handed a model id of "auto", which is how the bug surfaced in
+    frinz's story extraction pipeline."""
+
+    @pytest.mark.asyncio
+    async def test_get_response_with_auto_override_succeeds(self, llm_service):
+        """get_response(model_override="auto", ...) succeeds — the sentinel
+        is normalized at the router boundary and each route falls back to
+        its own configured default."""
+        response = await llm_service.get_response(
+            system_prompt="You are a helpful assistant.",
+            user_prompt="hi",
+            model_override="auto",
+        )
+        assert isinstance(response, str)
+
+    @pytest.mark.asyncio
+    async def test_auto_never_reaches_adapter(self, llm_service, mock_adapter):
+        """The string "auto" never appears as the ``model`` kwarg in any
+        adapter.get_response call, regardless of how it arrives at the
+        router (explicit override, mandate default, prompt mandate)."""
+        await llm_service.get_response(
+            system_prompt="x",
+            user_prompt="y",
+            model_override="auto",
+        )
+
+        assert mock_adapter.get_response.called, "adapter.get_response was not invoked"
+        for call in mock_adapter.get_response.call_args_list:
+            model_used = call.kwargs.get("model")
+            assert model_used != "auto", (
+                f"Provider adapter received model='auto' — sentinel leaked "
+                f"past the router boundary. Call kwargs: {call.kwargs!r}"
+            )
+            # And the model used must actually be a concrete provider default.
+            assert model_used in {"gpt-5-mini", "claude-sonnet-4-5"}, (
+                f"Unexpected model {model_used!r} — expected one of the "
+                f"mock provider defaults."
+            )
+
+    @pytest.mark.asyncio
+    async def test_resolve_provider_routing_strips_auto(self, llm_service):
+        """The router contract: when model_override=='auto', target_model
+        must come back as None so _try_single_provider uses each route's
+        own provider['model']."""
+        _providers, target_model = llm_service.resolve_provider_routing(
+            model_override="auto",
+        )
+        assert target_model is None
+
+    @pytest.mark.asyncio
+    async def test_misconfigured_auto_route_is_skipped(
+        self, llm_service, mock_adapter, caplog
+    ):
+        """Strict-refusal contract: a route configured ``model="auto"``
+        where ``resolve_provider_default`` cannot resolve (empty discovery)
+        is *skipped* via ``ModelNotAvailableForRoute`` so the fallback
+        loop tries the next route. ``"auto"`` must NEVER reach a provider
+        client even when the caller didn't pass an override — that is
+        precisely the #1408 bug. A soft passthrough would re-leak it."""
+        # First route is misconfigured; second route has a concrete default
+        # the fallback chain can use.
+        llm_service.providers[0]["model"] = "auto"
+        llm_service.providers[1]["model"] = "claude-sonnet-4-5"
+
+        with patch(
+            "kestrel_sovereign.llm.model_selection.resolve_provider_default",
+            side_effect=ValueError("no discovery cache"),
+        ), caplog.at_level("WARNING", logger="kestrel_sovereign.llm.service"):
+            response = await llm_service.get_response(
+                system_prompt="x",
+                user_prompt="y",
+            )
+
+        assert isinstance(response, str)
+        assert any(
+            "discovery cache is empty" in r.message for r in caplog.records
+        ), "expected the skip warning to be logged"
+        # And nothing the mock received was "auto" — the misconfigured
+        # route was skipped, the fallback ran with its concrete model.
+        for call in mock_adapter.get_response.call_args_list:
+            assert call.kwargs.get("model") != "auto"
+
+    @pytest.mark.asyncio
+    async def test_all_routes_misconfigured_auto_surfaces_clear_error(
+        self, llm_service
+    ):
+        """Worst-case: every route is misconfigured ``model="auto"`` and
+        discovery is empty. Caller gets ``LLMAllProvidersFailedError``
+        listing each route's reason — not a 404 from the wire."""
+        for p in llm_service.providers:
+            p["model"] = "auto"
+
+        with patch(
+            "kestrel_sovereign.llm.model_selection.resolve_provider_default",
+            side_effect=ValueError("no discovery cache"),
+        ):
+            with pytest.raises(LLMAllProvidersFailedError):
+                await llm_service.get_response(
+                    system_prompt="x",
+                    user_prompt="y",
+                )
+
+    @pytest.mark.asyncio
+    async def test_scrub_auto_helper_callable_via_self(self, llm_service):
+        """Pins the contract that ``_scrub_auto`` is callable as a bound
+        instance method (``self._scrub_auto(x)``). Used directly by the
+        remote-GPU fast paths in ``streaming.py`` and ``service.py.generate``
+        — a regression that drops the ``@staticmethod`` or accidentally
+        passes ``self`` would break every REMOTE_GPU session."""
+        assert llm_service._scrub_auto("auto") is None
+        assert llm_service._scrub_auto(None) is None
+        assert llm_service._scrub_auto("claude-haiku-4-5") == "claude-haiku-4-5"
+
+    @pytest.mark.asyncio
+    async def test_route_with_auto_default_is_lazy_resolved(
+        self, llm_service, mock_adapter
+    ):
+        """Fresh quickstart case: a route is configured with model="auto"
+        and discovery hasn't populated yet. _try_single_provider must
+        lazy-resolve to a concrete model rather than send "auto" downstream."""
+        # Simulate the quickstart shape: both routes still on the sentinel.
+        for p in llm_service.providers:
+            p["model"] = "auto"
+
+        # Make resolve_provider_default deterministic regardless of disk
+        # cache state — return a concrete model for each route.
+        with patch(
+            "kestrel_sovereign.llm.model_selection.resolve_provider_default",
+            side_effect=lambda name: {
+                "openai:api": "gpt-5-mini",
+                "anthropic:api": "claude-sonnet-4-5",
+            }.get(name, "gpt-5-mini"),
+        ):
+            await llm_service.get_response(
+                system_prompt="x",
+                user_prompt="y",
+            )
+
+        for call in mock_adapter.get_response.call_args_list:
+            assert call.kwargs.get("model") != "auto", (
+                f"Provider adapter received model='auto' from a route whose "
+                f"own configured default was 'auto'. Call kwargs: {call.kwargs!r}"
+            )
+
+
 # =============================================================================
 # Priority 3 — Backend and Lifecycle Tests
 # =============================================================================

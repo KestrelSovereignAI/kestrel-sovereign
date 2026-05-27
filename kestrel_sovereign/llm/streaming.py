@@ -174,7 +174,7 @@ class StreamingMixin:
             try:
                 provider_name = provider["name"]
                 last_provider_name = provider_name
-                model_to_use = target_model or provider["model"]
+                model_to_use = self._resolve_concrete_model(target_model, provider)
 
                 logger.info(f"Attempting streaming from {provider_name} with {model_to_use}")
                 messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
@@ -282,7 +282,7 @@ class StreamingMixin:
             try:
                 self._ensure_remote_active()
                 messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
-                model = model_override or self._remote_config.model
+                model = self._scrub_auto(model_override) or self._remote_config.model
                 async for chunk in self._remote_adapter.get_streaming_response(
                     client=self._remote_client,
                     model=model,
@@ -341,7 +341,7 @@ class StreamingMixin:
         ):
             try:
                 self._ensure_remote_active()
-                model = model_override or self._remote_config.model
+                model = self._scrub_auto(model_override) or self._remote_config.model
                 if hasattr(self._remote_adapter, "get_streaming_response"):
                     async for chunk in self._remote_adapter.get_streaming_response(
                         client=self._remote_client,
@@ -368,7 +368,7 @@ class StreamingMixin:
             try:
                 last_provider_name = provider["name"]
                 adapter = provider["adapter"]
-                model = target_model or provider["model"]
+                model = self._resolve_concrete_model(target_model, provider)
 
                 if hasattr(adapter, "get_streaming_response"):
                     async for chunk in adapter.get_streaming_response(
@@ -494,7 +494,7 @@ class StreamingMixin:
         ):
             try:
                 self._ensure_remote_active()
-                model = model_override or self._remote_config.model
+                model = self._scrub_auto(model_override) or self._remote_config.model
                 if hasattr(self._remote_adapter, "get_streaming_response_with_tools"):
                     async for item in self._remote_adapter.get_streaming_response_with_tools(
                         client=self._remote_client,
@@ -524,7 +524,7 @@ class StreamingMixin:
         for provider in providers:
             try:
                 adapter = provider["adapter"]
-                model = target_model or provider["model"]
+                model = self._resolve_concrete_model(target_model, provider)
                 provider_name = provider["name"]
 
                 logger.info(f"Attempting streaming with tools from {provider_name} with {model}")

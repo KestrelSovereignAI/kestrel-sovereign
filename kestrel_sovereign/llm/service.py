@@ -629,6 +629,15 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         providers_to_use = self._available_providers()
         target_model: Optional[str] = None
 
+        # Normalize the sentinel "auto" to no-override. "auto" expresses
+        # routing intent ("pick the default for whichever route runs"), not
+        # a model identity, and must never reach a provider client — every
+        # vendor 404s when asked to call a model literally named "auto"
+        # (#1408). Leaving target_model as None means each route falls
+        # back to its own provider["model"] in _try_single_provider.
+        if model_override == "auto":
+            model_override = None
+
         # --- 1. Explicit model_override ---
         if model_override:
             if "/" in model_override:
@@ -1230,6 +1239,63 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             return f"{vendor}/{model}"
         return model if model and model != "auto" else None
 
+    @staticmethod
+    def _scrub_auto(model_override: Optional[str]) -> Optional[str]:
+        """Normalize the ``"auto"`` sentinel to ``None``. Used by entry
+        points that bypass :meth:`resolve_provider_routing` — chiefly the
+        remote-GPU fast path which reads ``model_override`` directly via
+        ``model_override or self._remote_config.model``. See #1408 for
+        why ``"auto"`` must never reach a provider client."""
+        return None if model_override == "auto" else model_override
+
+    def _resolve_concrete_model(
+        self,
+        target_model: Optional[str],
+        provider: Dict[str, Any],
+    ) -> str:
+        """Resolve the concrete model id to send to a provider client.
+
+        Single source of truth for the "auto" sentinel scrub (#1408). Both
+        the non-streaming ``_try_single_provider`` and the streaming paths
+        in ``streaming.py`` funnel here so neither can leak ``"auto"`` to
+        the wire.
+
+        Resolution order:
+          1. ``target_model`` if it is a concrete model id (not None and
+             not the ``"auto"`` sentinel).
+          2. ``provider["model"]`` if it is concrete.
+          3. ``resolve_provider_default(provider["name"])`` — lazy resolve
+             from kestrel.toml + cached discovery (covers the fresh
+             quickstart case where the route default is still ``"auto"``).
+        """
+        if target_model and target_model != "auto":
+            return target_model
+        route_model = provider.get("model")
+        if route_model and route_model != "auto":
+            return route_model
+        from .model_selection import resolve_provider_default
+        try:
+            return resolve_provider_default(provider["name"])
+        except ValueError as exc:
+            # Route is misconfigured (model="auto" + empty discovery) AND
+            # the caller didn't supply an override. Refuse to send "auto"
+            # downstream — that's the #1408 bug we're fixing, no soft
+            # passthrough. Raise ModelNotAvailableForRoute so the outer
+            # fallback loop skips this route and tries the next; if every
+            # route is in this state the loop aggregates them into
+            # LLMAllProvidersFailedError which names each route's reason.
+            logger.warning(
+                "Skipping route %r: configured as model='auto' and "
+                "discovery cache is empty. Run model discovery or set "
+                "a concrete `model` in kestrel.toml to fix. Underlying: %s",
+                provider["name"], exc,
+            )
+            raise ModelNotAvailableForRoute(
+                vendor=provider.get("vendor"),
+                route=provider.get("route"),
+                model="auto",
+            ) from exc
+
     @handle_llm_errors()
     async def _try_single_provider(
         self,
@@ -1257,15 +1323,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """
         messages = messages_for(provider["adapter"], user_prompt=user_prompt, system_prompt=system_prompt)
 
-        model_to_use = provider["model"]
-        if target_model:
+        if target_model and target_model != "auto":
             if not self._model_available_for_route(provider, target_model):
                 raise ModelNotAvailableForRoute(
                     vendor=provider.get("vendor"),
                     route=provider.get("route"),
                     model=target_model,
                 )
-            model_to_use = target_model
+        model_to_use = self._resolve_concrete_model(target_model, provider)
 
         response = await provider["adapter"].get_response(
             client=provider["client"],
@@ -1731,7 +1796,7 @@ No other text or formatting.
                 try:
                     self._ensure_remote_active()
                     messages = messages_for(self._remote_adapter, user_prompt=user_prompt, system_prompt=system_prompt)
-                    model = model_override or self._remote_config.model
+                    model = self._scrub_auto(model_override) or self._remote_config.model
                     response = await self._remote_adapter.get_response(
                         client=self._remote_client,
                         model=model,
@@ -1812,7 +1877,7 @@ No other text or formatting.
         ):
             try:
                 self._ensure_remote_active()
-                model = model_override or self._remote_config.model
+                model = self._scrub_auto(model_override) or self._remote_config.model
                 response = await self._remote_adapter.get_response(
                     client=self._remote_client,
                     model=model,
