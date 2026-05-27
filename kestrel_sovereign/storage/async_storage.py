@@ -434,11 +434,18 @@ class AsyncStorage:
             return await self.rag.chunk_document(content_hash, content_str)
         return 0
     
-    async def search_chunks(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """Search document chunks."""
+    async def search_chunks(
+        self, query: str, limit: int = 5, min_score: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Search document chunks.
+
+        ``min_score`` (#1404) is forwarded to the embedding-search
+        candidate filter so weak semantic matches never enter the RRF
+        merge; see AsyncRagStore.search_chunks.
+        """
         if not self._initialized:
             await self.initialize()
-        return await self.rag.search_chunks(query, limit)
+        return await self.rag.search_chunks(query, limit, min_score=min_score)
     
     # --- Case Law / Audit Search ---
     

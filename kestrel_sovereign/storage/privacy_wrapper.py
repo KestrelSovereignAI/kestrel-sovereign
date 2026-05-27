@@ -526,9 +526,14 @@ class PrivacyEnforcingStorage:
         await self._check_write_permission("chunk_document")
         return await self._storage.chunk_document(content_hash)
     
-    async def search_chunks(self, query: str, limit: int = 5) -> List[Dict]:
-        """Search document chunks. Read-only, always allowed."""
-        return await self._storage.search_chunks(query, limit)
+    async def search_chunks(
+        self, query: str, limit: int = 5, min_score: float = 0.0,
+    ) -> List[Dict]:
+        """Search document chunks. Read-only, always allowed.
+
+        ``min_score`` (#1404) forwarded to the underlying RAG store.
+        """
+        return await self._storage.search_chunks(query, limit, min_score=min_score)
     
     # === Backup Operations (Privacy-Sensitive) ===
     

@@ -180,6 +180,24 @@ banned = []
 #"creative" = "anthropic"
 
 # =============================================================================
+# Retrieval relevance gate (#1404)
+# =============================================================================
+# Floors applied per turn when assembling the `<retrieved_context>` block.
+# Tightens what memory + RAG retrieval can stamp into the rendered transport
+# form. Trivial turns (greetings, sign-offs, bang/slash commands, very-short
+# utterances) bypass retrieval entirely via the turn classifier in
+# `kestrel_sovereign/agent/turn_classifier.py`; for non-trivial turns these
+# floors drop weak candidates before they enter the context.
+#
+# Both floors are conservative defaults. Tune via telemetry — too high and
+# genuinely-relevant memories drop; too low and noisy retrieval reappears.
+#
+# [retrieval]
+# memory_min_score = 0.3  # weighted retrieval score on emotionally-weighted memories
+# rag_min_score    = 0.5  # cosine similarity floor on RAG embedding candidates
+
+
+# =============================================================================
 # Voice Configuration (Kestrel-Squack)
 # =============================================================================
 # Priority order for voice providers. Local providers (piper, faster_whisper)

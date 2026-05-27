@@ -80,6 +80,65 @@ def reset_injection_tracking() -> None:
     _INJECTION_TRACKING_VAR.set(None)
 
 
+# Relevance-gate defaults (#1404). Conservative floors — set high
+# enough to drop weak matches but low enough that genuinely relevant
+# content still surfaces. Override via ``[retrieval]`` in kestrel.toml.
+_RETRIEVAL_DEFAULTS = {
+    "memory_min_score": 0.3,
+    "rag_min_score": 0.5,
+}
+_RETRIEVAL_CONFIG_CACHE: Optional[Dict[str, float]] = None
+
+
+def _retrieval_config() -> Dict[str, float]:
+    """Resolve the relevance-gate config from kestrel.toml (#1404).
+
+    Reads the ``[retrieval]`` block on first call and caches the merged
+    config for subsequent turns. Missing keys fall back to
+    :data:`_RETRIEVAL_DEFAULTS`. Missing config file or unreadable TOML
+    falls back silently to defaults — config is optional, not required.
+
+    Cache busts on test isolation via ``reset_retrieval_config_cache``.
+    """
+    global _RETRIEVAL_CONFIG_CACHE
+    if _RETRIEVAL_CONFIG_CACHE is not None:
+        return _RETRIEVAL_CONFIG_CACHE
+
+    merged = dict(_RETRIEVAL_DEFAULTS)
+    try:
+        from pathlib import Path
+        try:
+            import tomllib  # Python 3.11+
+        except ImportError:  # pragma: no cover — pre-3.11 path
+            import tomli as tomllib  # type: ignore
+
+        try:
+            from kestrel_sovereign.paths import project_dir
+            root = Path(project_dir())
+        except Exception:
+            root = Path.cwd()
+        toml_path = root / "kestrel.toml"
+        if toml_path.is_file():
+            with toml_path.open("rb") as fh:
+                data = tomllib.load(fh)
+            section = data.get("retrieval", {}) or {}
+            for key in _RETRIEVAL_DEFAULTS:
+                if key in section and isinstance(section[key], (int, float)):
+                    merged[key] = float(section[key])
+    except Exception as e:
+        logger.debug(f"Falling back to retrieval defaults: {e}")
+
+    _RETRIEVAL_CONFIG_CACHE = merged
+    return merged
+
+
+def reset_retrieval_config_cache() -> None:
+    """Test hook: drop the cached relevance-gate config so the next
+    call re-reads ``kestrel.toml`` (#1404)."""
+    global _RETRIEVAL_CONFIG_CACHE
+    _RETRIEVAL_CONFIG_CACHE = None
+
+
 @dataclass
 class ContextResult:
     """Result of context assembly."""
@@ -651,15 +710,31 @@ class ContextManager:
         if hasattr(budget, "mark_section_finalized"):
             budget.mark_section_finalized("episodes")
 
+        # Relevance gate (#1404): trivial turns (greetings, sign-offs,
+        # bang/slash commands, very-short utterances) skip memory + RAG
+        # retrieval entirely. The cost is per-call retrieval cycles and,
+        # more importantly, an empty ``dynamic_user_context`` — so the
+        # rendered transport form for "hi" carries no ``<retrieved_context>``
+        # block and the next turn's retrieval doesn't see stamped noise.
+        from kestrel_sovereign.agent.turn_classifier import is_trivial_turn
+        retrieval_cfg = _retrieval_config()
+        trivial_turn = is_trivial_turn(query)
+        if trivial_turn:
+            logger.debug(
+                "Trivial turn classified by turn_classifier — "
+                "skipping memory + RAG retrieval (#1404)"
+            )
+
         # 3. Retrieve emotionally-weighted memories (placed in dynamic user
         # context, not system, so the system prefix stays cacheable).
-        if include_memories and self.memory_retriever:
+        if include_memories and self.memory_retriever and not trivial_turn:
             try:
                 memories = await self.memory_manager.retrieve_memories(
                     query=query,
                     max_tokens=budget.memories,
                     counter=self.counter,
-                    emotional_context=emotional_context
+                    emotional_context=emotional_context,
+                    min_score=retrieval_cfg["memory_min_score"],
                 )
                 if memories:
                     memory_tokens = self.counter.count(memories)
@@ -676,9 +751,11 @@ class ContextManager:
             budget.mark_section_finalized("memories")
 
         # 4. Retrieve RAG context (placed in dynamic user context, not system).
-        if include_rag:
+        if include_rag and not trivial_turn:
             try:
-                rag_context = await self.context_builder.retrieve_context(query)
+                rag_context = await self.context_builder.retrieve_context(
+                    query, min_score=retrieval_cfg["rag_min_score"],
+                )
                 if rag_context:
                     rag_tokens = self.counter.count(rag_context)
                     if budget.can_fit("rag", rag_tokens):

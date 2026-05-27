@@ -264,21 +264,34 @@ class ContextBuilder:
         """Backward-compatible method -- delegates to reload."""
         self._bootstrap_loader.reload()
 
-    async def retrieve_context(self, query: str) -> str:
+    async def retrieve_context(
+        self, query: str, min_score: Optional[float] = None
+    ) -> str:
         """
         Retrieves relevant documents and knowledge graph context for a query.
 
         Args:
             query: The user's query to find relevant context for
+            min_score: Similarity floor for embedding-search candidates
+                (#1404). Chunks whose embedding cosine similarity falls
+                below this value are dropped before the RRF merge so
+                weak matches don't get stamped into the rendered
+                transport form. ``None`` falls back to the storage
+                layer's default (no floor, all candidates merge).
 
         Returns:
             Formatted context string with relevant documents
         """
         logger.info(f"Retrieving context for query: '{query}'")
 
-        # 1. Search document chunks (RAG)
+        # 1. Search document chunks (RAG). Forward ``min_score`` only
+        # when the caller set it so the storage layer's existing
+        # default behavior holds for legacy call sites.
         try:
-            rag_results = await self.storage.search_chunks(query)
+            search_kwargs: Dict[str, Any] = {}
+            if min_score is not None:
+                search_kwargs["min_score"] = min_score
+            rag_results = await self.storage.search_chunks(query, **search_kwargs)
             context_parts = []
             for res in rag_results:
                 doc_name = res.get('document_name') or res.get('file_hash', 'unknown')
