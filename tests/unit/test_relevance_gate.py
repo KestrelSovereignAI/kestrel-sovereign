@@ -72,10 +72,8 @@ class TestTurnClassifierTrivialCases:
         "",
         "   ",
         "\n\n",
-        "hi",          # 1 word
-        "ok thanks",   # 2 words — below DEFAULT_MIN_WORDS=3
     ])
-    def test_empty_and_very_short_are_trivial(self, query):
+    def test_empty_and_whitespace_only_are_trivial(self, query):
         assert is_trivial_turn(query) is True
 
     def test_none_is_trivial(self):
@@ -96,8 +94,35 @@ class TestTurnClassifierSubstantiveCases:
         "thanks but I have a follow-up question on that",
         # Multi-line substantive content
         "here is the error\ntraceback\nthat I'm seeing",
+        # Short topical lookups (codex round-1 P2): two-word retrieval
+        # queries must NOT be classified as trivial. The user can ask
+        # "Alice birthday" expecting memories about Alice; suppressing
+        # retrieval would starve a real query of context.
+        "Alice birthday",
+        "project Phoenix",
+        "test query",
+        "encryption keys",
+        # Single-word substantive lookups also route through retrieval —
+        # the min_score floor handles weak matches, not the classifier.
+        "encryption",
+        "Phoenix",
     ])
     def test_substantive_queries_are_not_trivial(self, query):
+        assert is_trivial_turn(query) is False
+
+    @pytest.mark.parametrize("query", [
+        # Absolute filesystem paths must NOT match the slash-command
+        # regex (codex round-1 P2). The regex requires a single
+        # word-like command token; paths fail because the first segment
+        # is followed by ``/``, not whitespace or end-of-string.
+        "/private/tmp/kestrel-1404 explain this failure",
+        "/Users/foo/file.py what's wrong here",
+        "/usr/local/bin/codex review",
+        # Bang followed by non-letter shouldn't match either
+        "!!!",
+        "! something",
+    ])
+    def test_paths_and_malformed_commands_are_not_trivial(self, query):
         assert is_trivial_turn(query) is False
 
     def test_long_repeated_greeting_still_trivial_via_pattern(self):
@@ -108,10 +133,11 @@ class TestTurnClassifierSubstantiveCases:
         # But once it becomes a substantive sentence it's not trivial.
         assert is_trivial_turn("hi how are you doing today") is False
 
-    def test_word_count_floor_can_be_tuned(self):
-        # With min_words=2 a single-word substantive query stays trivial,
-        # a two-word substantive query passes.
-        assert is_trivial_turn("encryption", min_words=2) is True
+    def test_word_count_floor_opt_in(self):
+        # Default floor (1) only catches empty strings; callers can
+        # raise it for opt-in stricter gating.
+        assert is_trivial_turn("encryption") is False  # default floor 1
+        assert is_trivial_turn("encryption", min_words=2) is True  # opt-in floor 2
         assert is_trivial_turn("explain encryption", min_words=2) is False
 
 

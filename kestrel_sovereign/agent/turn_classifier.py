@@ -45,28 +45,35 @@ _TRIVIAL_RE = re.compile(
 # Slash- and bang-commands. These are control surface, not conversation
 # — the command dispatcher resolves them; the LLM doesn't need memories
 # to answer "/help" or "!plan".
-_COMMAND_PREFIX_RE = re.compile(r"^\s*[/!]\S+")
+#
+# Codex round-1 P2 (#1404): the command token must be a single word-like
+# segment so absolute Unix paths like "/private/tmp/foo explain this"
+# don't get false-classified as slash commands. We require the prefix
+# character followed by a letter and word-chars only, terminated by
+# whitespace or end-of-string. Real commands match (``/help``, ``!plan``,
+# ``/foo arg1``); path-leading prompts do not.
+_COMMAND_PREFIX_RE = re.compile(r"^[!/][A-Za-z][A-Za-z0-9_-]*(?:\s|$)")
 
-# Below this word count we treat the turn as too short to warrant
-# pulling bulky retrieval blocks. "weather" by itself probably isn't
-# searchable against the corpus in a useful way.
-DEFAULT_MIN_WORDS = 3
 
-
-def is_trivial_turn(query: Optional[str], min_words: int = DEFAULT_MIN_WORDS) -> bool:
+def is_trivial_turn(query: Optional[str], min_words: int = 1) -> bool:
     """Decide whether this user turn should bypass memory + RAG retrieval.
 
     Triviality is conservative: we only return True when the turn is
     obviously a greeting, sign-off, acknowledgement, bang/slash command,
-    or empty/whitespace-only string. A short *question* about a real
-    topic still routes through retrieval (false positives are the
-    expensive failure mode).
+    or empty/whitespace-only string. Short topical lookups
+    (``"Alice birthday"``, ``"project Phoenix"``) MUST still go through
+    retrieval — false positives starve relevant turns of context, which
+    is the expensive failure mode.
 
     Args:
         query: Raw user text. ``None`` and empty strings classify as
             trivial — there's nothing to retrieve against.
-        min_words: Word-count floor below which a turn is trivial
-            even if it doesn't match any pattern. Defaults to 3.
+        min_words: Word-count floor below which a turn is trivial even
+            if it doesn't match any pattern. Defaults to ``1`` (only
+            empty / whitespace-only strings hit the floor; everything
+            else routes through retrieval). Codex round-1 P2 dropped
+            the previous floor of 3 because it falsely suppressed
+            substantive two-word topical queries.
 
     Returns:
         True when retrieval should be skipped.
@@ -89,8 +96,9 @@ def is_trivial_turn(query: Optional[str], min_words: int = DEFAULT_MIN_WORDS) ->
     if _TRIVIAL_RE.match(stripped):
         return True
 
-    # Below the word-count floor: too short to anchor useful retrieval.
-    # ``split()`` collapses runs of whitespace.
+    # Word-count floor (configurable, default 1). The default floor only
+    # catches empty / whitespace-only strings (already handled above);
+    # callers can raise it for opt-in stricter gating.
     if len(stripped.split()) < min_words:
         return True
 
