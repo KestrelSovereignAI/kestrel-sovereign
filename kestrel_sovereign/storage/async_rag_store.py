@@ -139,7 +139,12 @@ class AsyncRAGStore:
 
         return len(chunks)
     
-    async def search_chunks(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
+    async def search_chunks(
+        self,
+        query: str,
+        limit: int = 5,
+        min_score: float = 0.0,
+    ) -> List[Dict[str, Any]]:
         """
         Search for relevant chunks using hybrid search.
 
@@ -149,6 +154,14 @@ class AsyncRAGStore:
         Args:
             query: Search query
             limit: Maximum results to return
+            min_score: Cosine-similarity floor (#1404) applied to the
+                embedding-search source. Candidates with similarity
+                below this value are dropped before RRF so weak
+                semantic matches don't survive the merge. BM25
+                (keyword) candidates are NOT thresholded — they have
+                no comparable similarity scalar; keyword-only matches
+                still surface for queries the embedding model misses.
+                Default ``0.0`` preserves legacy behavior (no floor).
 
         Returns:
             List of matching chunks with scores
@@ -156,8 +169,12 @@ class AsyncRAGStore:
         if not query.strip():
             return []
 
-        # Get candidates from both methods
-        embedding_results = await self._search_by_embedding(query, limit=limit * 2)
+        # Get candidates from both methods. Embedding source is gated
+        # by min_score; BM25 stays unfiltered (no per-candidate
+        # similarity scalar).
+        embedding_results = await self._search_by_embedding(
+            query, limit=limit * 2, min_score=min_score,
+        )
         bm25_results = await self._search_by_bm25(query, limit=limit * 2)
 
         # If both methods fail, fall back to LIKE search
@@ -170,9 +187,14 @@ class AsyncRAGStore:
         return merged
 
     async def _search_by_embedding(
-        self, query: str, limit: int = 10
+        self, query: str, limit: int = 10, min_score: float = 0.0,
     ) -> List[Dict[str, Any]]:
-        """Search using embedding similarity."""
+        """Search using embedding similarity.
+
+        ``min_score`` (#1404) filters candidates by cosine similarity
+        before sort/limit so weak semantic matches don't survive into
+        the RRF merge upstream.
+        """
         embedding_service = _get_embedding_service()
         if not embedding_service:
             return []
@@ -194,13 +216,17 @@ class AsyncRAGStore:
             if not rows:
                 return []
 
-            # Score by cosine similarity
+            # Score by cosine similarity, dropping candidates below
+            # the relevance floor (#1404). Floor applies pre-sort so
+            # the limit cap is filled with above-floor candidates only.
             scored = []
             for row in rows:
                 chunk_id, file_hash, content, embedding_blob = row
                 if embedding_blob:
                     chunk_embedding = _deserialize_embedding(embedding_blob)
                     score = cosine_similarity(query_embedding, chunk_embedding)
+                    if score < min_score:
+                        continue
                     scored.append({
                         'chunk_id': chunk_id,
                         'file_hash': file_hash,

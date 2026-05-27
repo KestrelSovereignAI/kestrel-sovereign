@@ -104,7 +104,8 @@ class MemoryManager:
         query: str,
         max_tokens: int,
         counter,
-        emotional_context: Optional[Dict[str, Any]] = None
+        emotional_context: Optional[Dict[str, Any]] = None,
+        min_score: Optional[float] = None,
     ) -> Optional[str]:
         """
         Retrieve emotionally-weighted memories.
@@ -115,6 +116,13 @@ class MemoryManager:
         - Importance weighting (20%)
         - Recency with decay (15%)
         - Access frequency (10%)
+
+        Args:
+            min_score: Relevance gate floor (#1404). When set, memories
+                with weighted retrieval score below this value are
+                dropped — keeps weak matches from being stamped into
+                the rendered transport form. ``None`` keeps the
+                underlying ``MemoryRetriever`` default (0.1).
         """
         if not self.memory_retriever:
             return None
@@ -131,13 +139,18 @@ class MemoryManager:
                     emotional_categories=emotional_context.get("categories", []),
                 )
 
-            # Retrieve memories
-            memories = await self.memory_retriever.retrieve(
-                query=query,
-                agent_id=self.agent_id,
-                emotional_context=emotional_meta,
-                limit=5
-            )
+            # Retrieve memories. ``min_score`` forwarded only when the
+            # caller set it so the underlying retriever's own default
+            # (0.1) keeps applying on the legacy code path.
+            retrieve_kwargs: Dict[str, Any] = {
+                "query": query,
+                "agent_id": self.agent_id,
+                "emotional_context": emotional_meta,
+                "limit": 5,
+            }
+            if min_score is not None:
+                retrieve_kwargs["min_score"] = min_score
+            memories = await self.memory_retriever.retrieve(**retrieve_kwargs)
 
             if not memories:
                 return None
