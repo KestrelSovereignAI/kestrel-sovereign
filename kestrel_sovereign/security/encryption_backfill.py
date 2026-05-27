@@ -247,24 +247,39 @@ def backfill_conversation_history(
     conn = sqlite3.connect(str(db_path))
     try:
         cur = conn.cursor()
-        # Scope to this agent's rows. Multi-agent hosts share the DB
-        # in some deployments; never touch a sibling agent's bytes.
+        # Scope to this agent's rows. The conversation_history schema
+        # defaults agent_id to '' (empty string), so legacy rows
+        # written before agent-scoped storage shipped also live here
+        # under that default. Include them in this agent's scope —
+        # ``kestrel_prime.db`` is per-agent (see
+        # ``agent_data/<name>/kestrel_prime.db``), so untagged rows
+        # cannot belong to a different agent. On the UPDATE we
+        # re-tag them with the proper agent_id so the runtime
+        # read-path's ``agent_id = ?`` filter finds them after the
+        # migration (codex round-2 P2 on PR #1405).
         cur.execute(
-            "SELECT id, content, metadata FROM conversation_history "
-            "WHERE agent_id = ?",
+            "SELECT id, content, metadata, agent_id "
+            "FROM conversation_history "
+            "WHERE agent_id = ? OR agent_id = '' OR agent_id IS NULL",
             (agent_id,),
         )
         rows = cur.fetchall()
 
-        for row_id, content, metadata_json in rows:
+        for row_id, content, metadata_json, row_agent_id in rows:
             report.scanned += 1
             if not _is_plaintext(metadata_json):
                 continue
             report.plaintext += 1
+            if dry_run:
+                # Read-only audit: report counts without requiring an
+                # encryption key. Treating a missing key here as a
+                # ``skipped_no_fernet`` would surface as exit 4 and
+                # break the documented audit workflow (codex round-2
+                # P2 on PR #1405). The missing-key check still runs
+                # in write mode below.
+                continue
             if fernet is None:
                 report.skipped_no_fernet += 1
-                continue
-            if dry_run:
                 continue
             meta = _parse_metadata(metadata_json)
             try:
@@ -287,10 +302,19 @@ def backfill_conversation_history(
             meta["key_version"] = (
                 CURRENT_KEY_VERSION if agent_fernet is not None else 0
             )
+            # Re-tag legacy untagged rows to the canonical agent_id
+            # so the runtime read path finds them. The UPDATE
+            # matches on the row's OWN agent_id to keep the change
+            # idempotent against concurrent writes.
             cur.execute(
-                "UPDATE conversation_history SET content = ?, metadata = ? "
-                "WHERE id = ? AND agent_id = ?",
-                (ciphertext, json.dumps(meta), row_id, agent_id),
+                "UPDATE conversation_history "
+                "SET content = ?, metadata = ?, agent_id = ? "
+                "WHERE id = ? AND (agent_id = ? OR agent_id = '' "
+                "OR agent_id IS NULL)",
+                (
+                    ciphertext, json.dumps(meta), agent_id,
+                    row_id, row_agent_id or "",
+                ),
             )
             conn.commit()
             report.encrypted_now += 1
@@ -330,10 +354,13 @@ def backfill_files(
             if not _is_plaintext(metadata_json):
                 continue
             report.plaintext += 1
+            if dry_run:
+                # Audit-only: skip missing-key counting (codex round-2
+                # P2 on PR #1405). The missing-key check still runs
+                # in write mode below.
+                continue
             if fernet is None:
                 report.skipped_no_fernet += 1
-                continue
-            if dry_run:
                 continue
             meta = _parse_metadata(metadata_json)
             try:

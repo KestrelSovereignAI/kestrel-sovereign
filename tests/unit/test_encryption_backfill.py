@@ -295,6 +295,82 @@ class TestConversationHistoryBackfill:
         # stub we seeded — backfill did not re-encrypt it.
         assert row[0] == "ciphertext-stub"
 
+    def test_includes_legacy_untagged_rows(self, tmp_path, data_key):
+        """Legacy rows with ``agent_id = ''`` or NULL must be backfilled.
+
+        Codex round-2 P2 on PR #1405: the per-agent-scoped query
+        ignored pre-migration rows whose ``agent_id`` is the schema
+        default (empty string). Those rows ARE part of the
+        plaintext corpus this command is meant to backfill; the
+        per-agent kestrel_prime.db is unambiguously this agent's,
+        so re-tag them with the canonical agent_id on the way.
+        """
+        db = tmp_path / "legacy.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(
+            """
+            CREATE TABLE graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                node_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                properties TEXT
+            );
+            CREATE TABLE conversation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP DEFAULT NULL
+            );
+            """
+        )
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO graph_nodes (node_id, node_type, label, properties) "
+            "VALUES (?, 'agent', 'Test', '{}')",
+            (AGENT_DID,),
+        )
+        # Two legacy rows: empty agent_id (schema default), and one
+        # already-tagged. All plaintext. The schema's NOT NULL
+        # constraint means truly NULL ``agent_id`` is impossible on
+        # disk — only the empty-string default exists as legacy.
+        cur.execute(
+            "INSERT INTO conversation_history (agent_id, role, content) "
+            "VALUES ('', 'user', 'legacy empty-agent')"
+        )
+        cur.execute(
+            "INSERT INTO conversation_history (agent_id, role, content) "
+            "VALUES (?, 'user', 'tagged plaintext')",
+            (AGENT_DID,),
+        )
+        conn.commit()
+        conn.close()
+
+        report = backfill_conversation_history(
+            db, agent_id=AGENT_DID, dry_run=False,
+        )
+        # Both plaintext rows are touched.
+        assert report.scanned == 2
+        assert report.plaintext == 2
+        assert report.encrypted_now == 2
+
+        # And both are re-tagged with the canonical agent_id so
+        # the runtime read path finds them.
+        conn = sqlite3.connect(str(db))
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+            (AGENT_DID,),
+        )
+        assert cur.fetchone()[0] == 2
+        cur.execute(
+            "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ''"
+        )
+        assert cur.fetchone()[0] == 0
+        conn.close()
+
     def test_idempotent_second_run(self, seeded_db, data_key):
         backfill_conversation_history(
             seeded_db, agent_id=AGENT_DID, dry_run=False,
@@ -487,6 +563,33 @@ class TestCliExitCode:
         )
         rc = cmd_migrate_encryption(args)
         assert rc == 3
+
+    def test_dry_run_works_without_encryption_key(
+        self, seeded_db, monkeypatch, capsys,
+    ):
+        """Audit-only dry-run must work without ``KESTREL_DATA_KEY``.
+
+        Codex round-2 P2 on PR #1405: the read-only audit is a
+        documented step for operators who haven't yet loaded the key
+        for the host. Treating a missing key as a skipped write
+        would surface as exit 4 and break that workflow.
+        """
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+        from kestrel_sdk.security import encryption as _enc_mod
+        if hasattr(_enc_mod, "_FERNET_CACHE"):
+            _enc_mod._FERNET_CACHE = None
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=True,
+        )
+        rc = cmd_migrate_encryption(args)
+        # Dry-run reports counts and returns 0 even without a key.
+        assert rc == 0
 
     def test_four_when_no_fernet_skipped(
         self, seeded_db, monkeypatch, capsys,
