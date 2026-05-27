@@ -1268,6 +1268,100 @@ def cmd_migrate_llm_config(args) -> int:
     return 0
 
 
+def cmd_migrate_encryption(args) -> int:
+    """One-shot: encrypt pre-migration plaintext rows at rest (#1401).
+
+    Reads ``kestrel_prime.db`` under ``--data-dir`` and re-encrypts any
+    row whose metadata lacks ``enc: true`` in both
+    ``conversation_history`` (per-agent fernet) and ``files`` (global
+    fernet). ``--dry-run`` reports counts without writing — safe to
+    run on a live DB. The mutating run requires the agent to be
+    stopped (sqlite write lock); the command refuses to proceed when
+    it detects a live pid for the agent.
+    """
+    from kestrel_sovereign.security.encryption_backfill import backfill_all
+
+    data_dir = Path(args.data_dir).resolve()
+    db_path = data_dir / "kestrel_prime.db"
+    if not db_path.exists():
+        print(
+            f"No kestrel_prime.db at {db_path}. Pass --data-dir pointing "
+            f"at an agent's data directory (e.g. agent_data/meridian).",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Refuse to write while the agent host is running. SQLite would
+    # honor file locks, but the kestrel daemon caches metadata
+    # in-process and we'd see writes the daemon doesn't; safer to
+    # require a stop. ``--dry-run`` is read-only so it's allowed.
+    if not args.dry_run:
+        try:
+            from kestrel_sovereign.multi_agent.process_manager import ProcessManager
+            pid_file = ProcessManager.agent_pid_file(data_dir)
+            if pid_file and pid_file.exists():
+                pid_text = pid_file.read_text().strip()
+                print(
+                    f"Refusing to mutate: an agent process appears to be "
+                    f"running (pid file {pid_file} = {pid_text}). Stop the "
+                    f"host first (kestrel stop), then re-run. Use "
+                    f"--dry-run to audit without writing.",
+                    file=sys.stderr,
+                )
+                return 2
+        except ImportError:
+            pass
+
+    report = backfill_all(
+        db_path,
+        agent_id=getattr(args, "agent_id", None),
+        dry_run=bool(args.dry_run),
+    )
+
+    mode = "DRY RUN — no changes written" if report.dry_run else "WRITE MODE"
+    print(f"=== migrate-encryption ({mode}) ===")
+    print(f"  db:       {report.db_path}")
+    print(f"  agent_id: {report.agent_id or '(unresolved)'}")
+    for tr in (report.conversation, report.files):
+        print(f"  [{tr.table}]")
+        print(f"    scanned:           {tr.scanned}")
+        print(f"    plaintext rows:    {tr.plaintext}")
+        print(f"    re-encrypted now:  {tr.encrypted_now}")
+        if tr.skipped_no_fernet:
+            print(
+                f"    skipped (no key):  {tr.skipped_no_fernet} — "
+                "KESTREL_DATA_KEY not set?"
+            )
+        if tr.errors:
+            print(f"    errors: {len(tr.errors)}")
+            for err in tr.errors[:5]:
+                print(f"      - {err}")
+            if len(tr.errors) > 5:
+                print(f"      … {len(tr.errors) - 5} more")
+
+    if report.dry_run:
+        print(
+            "\nRe-run without --dry-run to apply. The mutating run requires "
+            "the agent to be stopped."
+        )
+    else:
+        total = (
+            report.conversation.encrypted_now
+            + report.files.encrypted_now
+        )
+        if total:
+            print(
+                f"\nDone — encrypted {total} row(s) at rest. Re-run with "
+                f"--dry-run to verify zero plaintext rows remain."
+            )
+        else:
+            print(
+                "\nNo plaintext rows found. DB is already fully encrypted "
+                "(or no encryption key is configured)."
+            )
+    return 0
+
+
 def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
     """Best-effort check that the agent process isn't holding the DB."""
     try:
@@ -2092,6 +2186,27 @@ def build_parser() -> argparse.ArgumentParser:
              "CI runners that want every agent they incept tagged as a test.",
     )
 
+    # kestrel migrate-encryption — backfill plaintext rows at rest (#1401)
+    migrate_enc_p = subparsers.add_parser(
+        "migrate-encryption",
+        help="One-shot: encrypt pre-migration plaintext rows at rest "
+             "in conversation_history + files (#1401)",
+    )
+    migrate_enc_p.add_argument(
+        "--data-dir", required=True,
+        help="Agent data directory containing kestrel_prime.db "
+             "(e.g. agent_data/meridian).",
+    )
+    migrate_enc_p.add_argument(
+        "--agent-id", default=None,
+        help="Agent DID to scope conversation_history backfill. "
+             "Defaults to the DID stored in graph_nodes.",
+    )
+    migrate_enc_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Report counts without writing. Safe to run on a live DB.",
+    )
+
     # kestrel migrate-llm-config
     migrate_llm_p = subparsers.add_parser(
         "migrate-llm-config",
@@ -2289,6 +2404,7 @@ def main() -> int:
         "setup": cmd_setup,
         "constitution": cmd_constitution,
         "migrate-llm-config": cmd_migrate_llm_config,
+        "migrate-encryption": cmd_migrate_encryption,
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,
