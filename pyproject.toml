@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.14.1"
+version = "0.15.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -47,9 +47,9 @@ dependencies = [
     # 0.17.0 floor: adds the SDK-owned LLM provider capability contract.
     "kestrel-sovereign-sdk>=0.17.0,<1",
     # Core web framework
-    "fastapi==0.128.1",
-    "uvicorn==0.35.0",
-    "pydantic==2.12.5",
+    "fastapi==0.136.3",
+    "uvicorn==0.48.0",
+    "pydantic==2.13.4",
     # HTTP clients
     "aiohttp>=3.13.3",
     "httpx>=0.27.0",
@@ -77,7 +77,7 @@ dependencies = [
     # Redis for caching
     "redis>=6.4.0",
     # Config and utilities
-    "python-dotenv==1.1.1",
+    "python-dotenv==1.2.2",
     "toml==0.10.2",
     "PyYAML>=6.0",
     # Interactive setup wizard prompts
@@ -93,18 +93,18 @@ dependencies = [
     # BM25 for hybrid search
     "rank_bm25>=0.2.2",
     # Web scraping (lightweight)
-    "beautifulsoup4==4.13.4",
+    "beautifulsoup4==4.14.3",
     # Graph operations (lightweight)
-    "networkx==3.5",
+    "networkx==3.6.1",
     # Misc
-    "certifi==2026.1.4",
-    "charset-normalizer==3.4.4",
-    "idna==3.11",
-    "packaging==24.1",
+    "certifi==2026.5.20",
+    "charset-normalizer==3.4.7",
+    "idna==3.16",
+    "packaging==26.2",
     "urllib3>=2.6.3",
-    "pygments==2.19.2",
+    "pygments==2.20.0",
     "pluggy==1.6.0",
-    "iniconfig==2.1.0",
+    "iniconfig==2.3.0",
     # Google auth for cloud deployments
     "google-auth>=2.40.3",
     # Google Vertex AI (unified SDK for Gemini API and Vertex AI)
@@ -129,7 +129,7 @@ dependencies = [
     # time, so jsonschema must be a runtime dependency, not just a test
     # extra. Cheap pure-Python install (~90KB wheel + a few small deps).
     "jsonschema>=4.20",
-    "kestrel-llms[all]==0.1.5",
+    "kestrel-llms[all]==0.1.8",
 ]
 
 [project.urls]
@@ -164,12 +164,12 @@ ml = [
 # Local LLM support (adds ~2GB+ for torch, sentence-transformers)
 local = [
     "ollama>=0.6.1",
-    "sentence-transformers==3.0.1",
+    "sentence-transformers==5.5.1",
     "spacy>=3.7.0",
-    "chromadb==1.0.15",
+    "chromadb==1.5.9",
     "langchain>=0.3.31",
     "langchain-community>=0.3.31",
-    "numpy==2.3.1",
+    "numpy==2.4.6",
 ]
 # Observability (OpenTelemetry tracing + Prometheus metrics)
 # Prometheus support comes via the SDK's [metrics] extra; OpenTelemetry
