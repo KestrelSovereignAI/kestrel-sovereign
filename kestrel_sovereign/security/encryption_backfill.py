@@ -25,6 +25,15 @@ Operator workflow:
     # 5) Restart.
     kestrel start
 
+Recovery entry — when the LLM stack itself is broken (an in-flight
+``kestrel-sdk`` upgrade, a corrupted venv) and ``kestrel
+migrate-encryption`` can't import, run this module directly. Its
+import graph is intentionally small (cryptography + the SDK's
+encryption primitives — no agent, no LLM)::
+
+    python -m kestrel_sovereign.security.encryption_backfill \\
+        --data-dir agent_data/meridian --dry-run
+
 Invariants
 ----------
 
@@ -386,6 +395,49 @@ def backfill_files(
     return report
 
 
+def _build_arg_parser():
+    """argparse for the module-runnable recovery path.
+
+    ``kestrel migrate-encryption`` is the everyday entry, but it
+    requires ``kestrel_sovereign.cli`` to import — which in turn
+    pulls the full LLM stack. When the LLM stack is broken (an
+    in-flight sibling upgrade, a corrupted venv), operators still
+    need a way to backfill encryption-at-rest. Run this module
+    directly with::
+
+        python -m kestrel_sovereign.security.encryption_backfill \\
+            --data-dir agent_data/<name> [--dry-run]
+
+    The module-only import graph is intentionally small — just
+    ``cryptography`` + ``kestrel_sdk.security.encryption``. No
+    KestrelAgent, no LLMService.
+    """
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="python -m kestrel_sovereign.security.encryption_backfill",
+        description=(
+            "One-shot: encrypt pre-migration plaintext rows at rest. "
+            "Recovery entry — does not import the LLM stack."
+        ),
+    )
+    parser.add_argument(
+        "--data-dir", required=True,
+        help="Agent data directory containing kestrel_prime.db "
+             "(e.g. agent_data/meridian).",
+    )
+    parser.add_argument(
+        "--agent-id", default=None,
+        help="Agent DID to scope conversation_history backfill. "
+             "Defaults to the DID stored in graph_nodes.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Report counts without writing. Safe to run on a live DB; "
+             "does not require KESTREL_DATA_KEY.",
+    )
+    return parser
+
+
 def cli_run(args, *, stdout=None, stderr=None) -> int:
     """Entry point for ``kestrel migrate-encryption``.
 
@@ -568,3 +620,8 @@ def backfill_all(
         conversation=conversation_report,
         files=files_report,
     )
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    raise SystemExit(cli_run(_build_arg_parser().parse_args()))

@@ -644,6 +644,49 @@ class TestCliExitCode:
         # Stale pid should NOT block — the migration ran.
         assert rc == 0
 
+    def test_module_runnable_recovery_path(
+        self, seeded_db, data_key, tmp_path, monkeypatch,
+    ):
+        """The ``python -m`` entry point must work without importing
+        ``kestrel_sovereign.cli``.
+
+        Codex round-3 P2 on PR #1405: when the LLM stack can't
+        import (in-flight ``ProviderCapabilities`` mismatch, e.g.),
+        ``kestrel migrate-encryption`` fails before dispatch. The
+        module-runnable recovery entry must remain usable on
+        exactly that import-broken environment.
+        """
+        import subprocess
+        import sys
+        # Invoke via a subprocess so we exercise the real
+        # ``python -m`` resolution, not the in-process imports the
+        # test runner already has loaded. We run from the worktree
+        # root so our copy of the module wins over any installed
+        # version.
+        repo_root = Path(__file__).resolve().parents[2]
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m", "kestrel_sovereign.security.encryption_backfill",
+                "--data-dir", str(seeded_db.parent),
+                "--dry-run",
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(repo_root),
+            },
+        )
+        # Recovery path should succeed and report the audit.
+        assert result.returncode == 0, (
+            f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
+        )
+        assert "DRY RUN" in result.stdout
+        assert "conversation_history" in result.stdout
+        assert "plaintext rows:" in result.stdout
+
     def test_live_pid_file_blocks_with_exit_2(
         self, seeded_db, data_key, capsys,
     ):
