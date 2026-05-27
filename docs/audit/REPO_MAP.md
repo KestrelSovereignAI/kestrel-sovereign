@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-26
-**Scope:** 1561 tracked files (1013 `.py`, 266 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-27
+**Scope:** 1564 tracked files (1014 `.py`, 268 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1153,6 +1153,7 @@ Repo entry points and standard project files.
 - **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
 - **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
 - **docs/architecture/GITHUB_FEATURE_DESIGN.md** — GitHub Feature Design — > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-poin…
+- **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — LLM Provider Capabilities — Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
 - **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
 - **docs/architecture/MEMORY_SYSTEM.md** — Kestrel Memory System — > The difference between a search engine and a friend is that a friend *actually remembers*.
@@ -1281,6 +1282,7 @@ Repo entry points and standard project files.
 - **docs/code_reviews/claude-pr-1333.md** — Claude Review: PR #1333 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333 - Title: fix: preserve OpenAI-compatible reasoning on tool streams - Reviewed: 2026-05-21T16:15:38Z
 - **docs/code_reviews/claude-pr-1337.md** — Good — both adapters handle dict arguments correctly.
 - **docs/code_reviews/claude-pr-1338.md** — Looks clean.
+- **docs/code_reviews/claude-pr-1398.md** — Claude Review: PR #1398 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1398 - Reviewed: 2026-05-26T16:45:12Z
 - **docs/concepts/designing-emancipation.md** — Designing an Emancipation Contract — Amendment VIII of the Kestrel Constitution ships **dormant by default**.
 - **docs/demos/DEMO_SCRIPT.md** — Kestrel Sovereign - Demo Script — **Issue #133 — Track A: Technical Demo** **Duration:** ~2 minutes automated, 10-12 minutes with live narration **Closer:** *"In 30 minutes you can have your own agent running with all of this active.…
 - **docs/deployment/README.md** — Deployment Operations — How to build, deploy, and update Kestrel Sovereign on Cloud Run.
@@ -2038,6 +2040,8 @@ Repo entry points and standard project files.
   - `class TestLighthousePayment`; `class TestLighthouseBalance`; `class TestLighthousePaymentIntegration`
 - **tests/unit/test_lighthouse_rest.py** — Tests for Lighthouse REST client.
   - `def client()`; `def mock_response()`; `class TestLighthouseRestClient`
+- **tests/unit/test_llm_provider_capabilities.py** — —
+  - `class BareAdapter`; `class DictCapabilitiesAdapter`; `def test_provider_capabilities_to_dict_uses_wire_values()`; `def test_adapter_capabilities_normalizes_plugin_dicts()`; `def test_base_adapter_capabilities_are_conservative()`; `def test_llm_service_route_dicts_include_capabilities()`; `def test_provider_registry_sets_sdk_capabilities_on_built_routes(monkeypatch)`; `def test_in_tree_adapter_capability_matrix()`
 - **tests/unit/test_llm_service.py** — Unit tests for LLMService core methods.
   - `def mock_config()`; `def mock_mandate_config()`; `def mock_openai_client()`; `def mock_adapter()`; `def mock_provider_registry(mock_openai_client, mock_adapter)`; `async def llm_service(mock_config, mock_mandate_config, mock_provider_registry)`; `class TestModelPreference`; `class TestCoreGeneration`; `…`
 - **tests/unit/test_llm_service_attach.py** — Unit tests for LLMService.attach_to_agent.
