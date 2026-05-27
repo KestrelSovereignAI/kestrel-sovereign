@@ -1268,6 +1268,19 @@ def cmd_migrate_llm_config(args) -> int:
     return 0
 
 
+def cmd_migrate_encryption(args) -> int:
+    """One-shot: encrypt pre-migration plaintext rows at rest (#1401).
+
+    Thin wrapper — the real logic lives in
+    ``kestrel_sovereign.security.encryption_backfill.cli_run`` so the
+    test suite can drive it without paying the full ``cli.py`` import
+    cost (which transitively pulls KestrelAgent + LLM stack and trips
+    on in-flight sibling work like ``ProviderCapabilities``).
+    """
+    from kestrel_sovereign.security.encryption_backfill import cli_run
+    return cli_run(args)
+
+
 def _agent_appears_running(project_dir, agent_name, agent_cfg) -> bool:
     """Best-effort check that the agent process isn't holding the DB."""
     try:
@@ -2092,6 +2105,27 @@ def build_parser() -> argparse.ArgumentParser:
              "CI runners that want every agent they incept tagged as a test.",
     )
 
+    # kestrel migrate-encryption — backfill plaintext rows at rest (#1401)
+    migrate_enc_p = subparsers.add_parser(
+        "migrate-encryption",
+        help="One-shot: encrypt pre-migration plaintext rows at rest "
+             "in conversation_history + files (#1401)",
+    )
+    migrate_enc_p.add_argument(
+        "--data-dir", required=True,
+        help="Agent data directory containing kestrel_prime.db "
+             "(e.g. agent_data/meridian).",
+    )
+    migrate_enc_p.add_argument(
+        "--agent-id", default=None,
+        help="Agent DID to scope conversation_history backfill. "
+             "Defaults to the DID stored in graph_nodes.",
+    )
+    migrate_enc_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Report counts without writing. Safe to run on a live DB.",
+    )
+
     # kestrel migrate-llm-config
     migrate_llm_p = subparsers.add_parser(
         "migrate-llm-config",
@@ -2289,6 +2323,7 @@ def main() -> int:
         "setup": cmd_setup,
         "constitution": cmd_constitution,
         "migrate-llm-config": cmd_migrate_llm_config,
+        "migrate-encryption": cmd_migrate_encryption,
         "config": cmd_config,
         "feature": cmd_feature,
         "skills": cmd_skills,
