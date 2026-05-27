@@ -373,9 +373,15 @@ class TestUsageTrackingIntegration:
         mock_adapter.create_messages = MagicMock(return_value=[{"role": "user", "content": "Hi"}])
         mock_adapter.get_response = AsyncMock(return_value=mock_response)
 
-        # Replace first provider with our mock
+        # Replace first provider with our mock. Pin a concrete model on
+        # the route too — the bare LLMService() picks up whatever the CI
+        # config says, which can be `model="auto"`. After #1408 a route
+        # configured `model="auto"` with an empty discovery cache is
+        # skipped by the fallback loop (refusing to leak the sentinel),
+        # so the mocked adapter would never be invoked.
         if service.providers:
             service.providers[0]["adapter"] = mock_adapter
+            service.providers[0]["model"] = "test-model-mocked"
 
             response = await service.get_response(
                 system_prompt="Be helpful",
