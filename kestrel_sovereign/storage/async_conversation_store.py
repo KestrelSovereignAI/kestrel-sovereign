@@ -22,6 +22,7 @@ from .encryption import (
     get_fernet, get_agent_fernet, encrypt_string, decrypt_string, remove_enc_flag,
     DecryptionError
 )
+from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
 
@@ -160,17 +161,25 @@ class AsyncConversationStore:
 
     async def add_conversation(self, role: str, content: str,
                                metadata: Optional[Dict] = None,
-                               session_id: Optional[str] = None) -> None:
+                               session_id: Optional[str] = None,
+                               rendered_content: Optional[str] = None) -> None:
         """Add a conversation message with per-agent encryption.
 
         Args:
             role: Message role (user, assistant, system)
-            content: Message content
+            content: Canonical message content. For user turns this is the
+                raw user speech (typically ``wrap_user_input(raw)``) — never
+                the rendered-with-retrieval transport form.
             metadata: Optional metadata dict
             session_id: If provided, link this message to a specific session.
                        This allows resuming old conversations beyond the 30-min gap.
                        If not provided, an implicit session_id is derived from
                        the time-gap heuristic (30 min inactivity = new session).
+            rendered_content: Write-once transport bytes for byte-stable cache
+                replay (#1402). Carries memories + RAG baked into the user
+                template. The history-load path emits this verbatim so the
+                prefix bytes match what the LLM saw at send time. Encrypted
+                with the same per-agent key as ``content``.
         """
         meta = dict(metadata) if metadata else {}
 
@@ -189,9 +198,23 @@ class AsyncConversationStore:
             meta['enc'] = True
             meta['key_version'] = CURRENT_KEY_VERSION
 
+        rendered_to_store: Optional[str] = None
+        if rendered_content is not None:
+            rendered_to_store, rendered_was_encrypted = encrypt_string(
+                rendered_content, fernet_to_use
+            )
+            # rendered_content shares the same key/version as content; the
+            # ``enc`` flag covers both. If content was empty and skipped
+            # encryption but rendered_content didn't, surface that.
+            if rendered_was_encrypted and not was_encrypted:
+                meta['enc'] = True
+                meta['key_version'] = CURRENT_KEY_VERSION
+
         await self.db.execute_commit(
-            f"INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, {self._now_sql()})",
-            (self.agent_id, role, to_store, json.dumps(meta) if meta else None)
+            f"INSERT INTO conversation_history (agent_id, role, content, rendered_content, metadata, created_at) "
+            f"VALUES (?, ?, ?, ?, ?, {self._now_sql()})",
+            (self.agent_id, role, to_store, rendered_to_store,
+             json.dumps(meta) if meta else None)
         )
 
     def _decrypt_with_fallback(self, content: str, meta: Optional[Dict]) -> tuple[str, bool]:
@@ -260,6 +283,108 @@ class AsyncConversationStore:
         )
         logger.debug(f"Migrated message {row_id} to per-agent encryption")
 
+    async def _resolve_canonical(
+        self,
+        row_id: int,
+        role: str,
+        meta: Optional[Dict],
+        content: str,
+        rendered_raw: Optional[str],
+    ) -> tuple[str, Optional[str]]:
+        """Apply the canonical/transport split (#1402) for a single row.
+
+        Returns ``(canonical_content, rendered_content)`` where
+        ``canonical_content`` is the raw user turn (or original content for
+        non-user rows) and ``rendered_content`` is the byte-stable
+        transport form for sent_form user turns (or ``None``).
+
+        On legacy ``sent_form`` rows (``rendered_raw is None``) this splits
+        the rendered bytes into the new shape in-memory and triggers an
+        opportunistic DB UPDATE to persist the split (gated on
+        ``_migrate_on_read``). Already-split rows pass through unchanged.
+
+        Handles decryption of ``rendered_raw`` via the same fernet
+        fallback path as ``content``. Decryption failures hard-fail (not
+        silenced) because a sent_form row we can't decrypt would silently
+        regress cache stability.
+        """
+        rendered_content: Optional[str] = None
+        if rendered_raw is not None:
+            try:
+                rendered_content, _ = self._decrypt_with_fallback(rendered_raw, meta)
+            except DecryptionError as e:
+                logger.error(
+                    "Failed to decrypt rendered_content for message %s: %s",
+                    row_id, e,
+                )
+                raise
+
+        if (
+            role == 'user'
+            and meta
+            and meta.get('sent_form')
+            and rendered_content is None
+        ):
+            # Legacy sent_form row: content currently holds the rendered
+            # form. Move it into rendered_content and strip wrappers.
+            rendered_content = content
+            content = extract_raw_user_content(content)
+            if self._migrate_on_read:
+                try:
+                    await self._migrate_split_sent_form(
+                        row_id, content, rendered_content, meta
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Split-migration failed for message %s: %s",
+                        row_id, e,
+                    )
+
+        return content, rendered_content
+
+    async def _migrate_split_sent_form(
+        self,
+        row_id: int,
+        raw_content: str,
+        rendered_content: str,
+        meta: Optional[Dict],
+    ) -> None:
+        """Backfill the canonical/transport split (#1402) for a legacy row.
+
+        Legacy ``sent_form=True`` rows store the rendered transport form in
+        ``content`` with ``rendered_content IS NULL``. Move the original
+        bytes into ``rendered_content`` (preserving them byte-for-byte so
+        the cache prefix continues to hit through deploy) and replace
+        ``content`` with the stripped raw user turn. The shared ``enc``
+        flag/key_version cover both columns.
+
+        Idempotent — already-split rows have ``rendered_content IS NOT
+        NULL`` and never reach this method.
+        """
+        fernet_to_use = self._agent_fernet or self._global_fernet
+        new_content, was_encrypted_c = encrypt_string(raw_content, fernet_to_use)
+        new_rendered, was_encrypted_r = encrypt_string(
+            rendered_content, fernet_to_use
+        )
+
+        # Preserve everything else in metadata; just refresh the encryption
+        # marker if a fernet was available so legacy plaintext rows pick up
+        # encryption-at-rest for both columns at the same time.
+        new_meta = dict(meta) if meta else {}
+        if was_encrypted_c or was_encrypted_r:
+            new_meta['enc'] = True
+            new_meta['key_version'] = CURRENT_KEY_VERSION
+
+        await self.db.execute_commit(
+            "UPDATE conversation_history "
+            "SET content = ?, rendered_content = ?, metadata = ? WHERE id = ?",
+            (new_content, new_rendered, json.dumps(new_meta), row_id)
+        )
+        logger.debug(
+            "Split-migrated sent_form message %s into canonical/transport columns",
+            row_id,
+        )
+
     async def get_conversation_history(
         self, limit: int = 100, session_id: str = None
     ) -> List[Dict[str, Any]]:
@@ -273,9 +398,12 @@ class AsyncConversationStore:
             # Session-aware retrieval: get messages from the specified session
             rows = await self._get_session_messages(session_id, limit)
         else:
-            # Default behavior: get most recent live messages
+            # Default behavior: get most recent live messages.
+            # rendered_content (#1402) appended at row[5] so existing
+            # positional accesses on metadata/created_at don't shift.
             rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata, created_at FROM conversation_history "
+                "SELECT id, role, content, metadata, created_at, rendered_content "
+                "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL "
                 "ORDER BY id DESC LIMIT ?",
                 (self.agent_id, limit)
@@ -298,12 +426,25 @@ class AsyncConversationStore:
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id}: {e}")
 
+            # rendered_content (#1402): decrypt + apply canonical/transport
+            # split (legacy ``sent_form`` rows are split in-memory and
+            # opportunistically migrated). Defensive ``len(row) > 5``
+            # covers callers that pass legacy 5-tuple rows (e.g. soft-
+            # delete restore paths that haven't been migrated to the new
+            # SELECT shape yet).
+            rendered_raw = row[5] if len(row) > 5 else None
+            content, rendered_content = await self._resolve_canonical(
+                row_id, row[1], meta, content, rendered_raw
+            )
+
             entry = {
                 'id': row_id,
                 'role': row[1],
                 'content': content,
                 'created_at': row[4]
             }
+            if rendered_content is not None:
+                entry['rendered_content'] = rendered_content
             cleaned_meta = remove_enc_flag(meta)
             if cleaned_meta:
                 # Remove internal key_version from external metadata
@@ -358,7 +499,10 @@ class AsyncConversationStore:
                 ``all`` (for purge — finds rows in any state).
 
         Returns:
-            List of raw rows (id, role, content, metadata, created_at)
+            List of raw rows
+            (id, role, content, metadata, created_at, rendered_content)
+            — rendered_content (#1402) appended so existing positional
+            accesses below don't shift.
         """
         del_clause = self._deleted_filter_clause(deleted_filter)
         from datetime import datetime
@@ -379,10 +523,12 @@ class AsyncConversationStore:
             )
 
             # If session_id is a message ID, get messages from that timestamp forward
+            # rendered_content (#1402) appended at row[5] so existing
+            # positional accesses on metadata/created_at don't shift.
             if start_row:
                 start_time = start_row[0]
                 all_rows = await self.db.fetchall(
-                    f"""SELECT id, role, content, metadata, created_at
+                    f"""SELECT id, role, content, metadata, created_at, rendered_content
                        FROM conversation_history
                        WHERE agent_id = ? AND created_at >= ?{del_clause}
                        ORDER BY created_at ASC
@@ -393,7 +539,7 @@ class AsyncConversationStore:
         # Also get messages that explicitly belong to this session (resumed conversations)
         # These are messages with session_id in metadata that may come after a time gap
         resumed_rows = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at
+            f"""SELECT id, role, content, metadata, created_at, rendered_content
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ?{del_clause}
                ORDER BY created_at ASC
@@ -403,7 +549,7 @@ class AsyncConversationStore:
 
         # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
-            f"""SELECT id, role, content, metadata, created_at
+            f"""SELECT id, role, content, metadata, created_at, rendered_content
                FROM conversation_history
                WHERE agent_id = ? AND metadata LIKE ?{del_clause}
                ORDER BY created_at ASC
@@ -504,7 +650,8 @@ class AsyncConversationStore:
         to see Trash too.
         """
         rows = await self.db.fetchall(
-            "SELECT id, role, content, metadata FROM conversation_history "
+            "SELECT id, role, content, metadata, rendered_content "
+            "FROM conversation_history "
             "WHERE agent_id = ? AND deleted_at IS NULL "
             "ORDER BY id ASC",
             (self.agent_id,)
@@ -515,12 +662,17 @@ class AsyncConversationStore:
             meta = json.loads(row[3]) if row[3] else None
             content, needs_migration = self._decrypt_with_fallback(row[2], meta)
 
-            # Opportunistic migration
+            # Opportunistic per-agent key migration
             if needs_migration and self._migrate_on_read:
                 try:
                     await self._migrate_message(row_id, content)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id} in get_full_history: {e}")
+
+            # Canonical/transport split (#1402)
+            content, rendered_content = await self._resolve_canonical(
+                row_id, row[1], meta, content, row[4] if len(row) > 4 else None
+            )
 
             cleaned_meta = remove_enc_flag(meta)
             if cleaned_meta:
@@ -531,6 +683,8 @@ class AsyncConversationStore:
                 'content': content,
                 'metadata': cleaned_meta if cleaned_meta else None
             }
+            if rendered_content is not None:
+                entry['rendered_content'] = rendered_content
             history.append(entry)
         return history
 
@@ -558,7 +712,8 @@ class AsyncConversationStore:
         if session_id:
             # Match both `"session_id": "X"` and `"session_id":"X"` formats
             rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata FROM conversation_history "
+                "SELECT id, role, content, metadata, rendered_content "
+                "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL "
                 "AND (metadata LIKE ? OR metadata LIKE ?) "
                 "ORDER BY id DESC LIMIT 5000",
@@ -572,7 +727,8 @@ class AsyncConversationStore:
             # Fetch all live messages (up to 5000) and search client-side after decryption
             # SQL LIKE doesn't work on encrypted content, so we must decrypt first
             rows = await self.db.fetchall(
-                "SELECT id, role, content, metadata FROM conversation_history "
+                "SELECT id, role, content, metadata, rendered_content "
+                "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL "
                 "ORDER BY id DESC LIMIT 5000",
                 (self.agent_id,)
@@ -586,14 +742,23 @@ class AsyncConversationStore:
             meta = json.loads(row[3]) if row[3] else None
             content, needs_migration = self._decrypt_with_fallback(row[2], meta)
 
-            # Opportunistic migration
+            # Opportunistic per-agent key migration
             if needs_migration and self._migrate_on_read:
                 try:
                     await self._migrate_message(row_id, content)
                 except Exception as e:
                     logger.warning(f"Migration failed for message {row_id} in search_history: {e}")
 
-            # Client-side search on decrypted content
+            # Canonical/transport split (#1402): search must match against
+            # the raw user turn, not the rendered transport bytes — a
+            # search for what the user said should not false-match against
+            # stamped <retrieved_context> from memories/RAG.
+            content, _ = await self._resolve_canonical(
+                row_id, row[1], meta, content, row[4] if len(row) > 4 else None
+            )
+
+            # Client-side search on canonical content (raw user speech for
+            # user turns, assistant/system unchanged).
             if query_lower in content.lower():
                 cleaned_meta = remove_enc_flag(meta)
                 if cleaned_meta:

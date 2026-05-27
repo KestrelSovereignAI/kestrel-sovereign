@@ -24,8 +24,9 @@ class _PrivacyAgent:
         self.privacy_mode = PrivacyMode.NORMAL
         self.conversations = []
 
-    async def add_conversation(self, role, content, metadata=None, session_id=None):
-        self.conversations.append((role, content, metadata, session_id))
+    async def add_conversation(self, role, content, metadata=None, session_id=None,
+                               rendered_content=None):
+        self.conversations.append((role, content, metadata, session_id, rendered_content))
 
     async def get_conversation_history(self, limit=50, session_id=None):
         return []

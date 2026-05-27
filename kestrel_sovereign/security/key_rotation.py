@@ -375,6 +375,19 @@ class KeyRotationService:
             "agent_id_column": "agent_id",
             "is_text_column": True,
         },
+        # rendered_content (#1402) holds the byte-stable transport form
+        # encrypted under the same per-agent fernet as ``content``. It
+        # gets a separate registry entry so rotation walks it in its own
+        # pass; ``progress_alias`` keeps the rotation_progress key
+        # distinct from the ``content`` pass for the same row.
+        {
+            "table": "conversation_history",
+            "content_column": "rendered_content",
+            "id_column": "id",
+            "agent_id_column": "agent_id",
+            "is_text_column": True,
+            "progress_alias": "conversation_history.rendered_content",
+        },
         {
             "table": "files",
             "content_column": "content",
@@ -412,6 +425,7 @@ class KeyRotationService:
                     agent_id_column=entry.get("agent_id_column"),
                     is_text_column=entry.get("is_text_column", True),
                     skip_v2=same_key,
+                    progress_alias=entry.get("progress_alias"),
                 )
 
             # Rotation complete
@@ -442,6 +456,7 @@ class KeyRotationService:
         agent_id_column: Optional[str] = None,
         is_text_column: bool = True,
         skip_v2: bool = False,
+        progress_alias: Optional[str] = None,
     ):
         """Rotate encryption for a single table.
 
@@ -464,10 +479,16 @@ class KeyRotationService:
         ``skip_v2=True`` (set by ``_execute_rotation`` when masters are
         equal) narrows the SELECT to ``gAAAAA%`` only — same-key upgrade
         runs do not need to revisit already-v2 rows.
+
+        ``progress_alias`` (#1402) lets two passes over the same SQL
+        table (one per encrypted column) record progress under distinct
+        rotation_progress keys. SQL queries still use ``table``; the
+        progress table sees ``progress_alias or table``.
         """
+        progress_key = progress_alias or table
         already_rotated_rows = await self.storage.database.fetchall(
             "SELECT record_id FROM rotation_progress WHERE rotation_id = ? AND table_name = ?",
-            (rotation.id, table),
+            (rotation.id, progress_key),
         )
         already_rotated = {row[0] for row in already_rotated_rows}
 
@@ -586,7 +607,7 @@ class KeyRotationService:
                         "(rotation_id, table_name, record_id, rotated_at) "
                         "VALUES (?, ?, ?, ?)",
                         (
-                            rotation.id, table, record_id_str,
+                            rotation.id, progress_key, record_id_str,
                             datetime.now(timezone.utc).isoformat(),
                         ),
                     )

@@ -336,9 +336,16 @@ class SovereignStorageAdapter:
         return "datetime('now')"
 
     async def _get_conversations(self) -> List[Dict]:
-        """Get all conversations from DB for this agent"""
+        """Get all conversations from DB for this agent.
+
+        Carries ``rendered_content`` (#1402) alongside ``content`` so a
+        backup → restore round-trip preserves byte-stable cache replay for
+        rows that have already been split. Legacy rows (rendered_content
+        NULL) restore as-is and get lazily split on next read.
+        """
         rows = await self.db.fetchall(
-            "SELECT role, content, metadata, id FROM conversation_history WHERE agent_id = ? ORDER BY id ASC",
+            "SELECT role, content, metadata, id, rendered_content "
+            "FROM conversation_history WHERE agent_id = ? ORDER BY id ASC",
             (self.agent_id,)
         )
         return [
@@ -346,7 +353,8 @@ class SovereignStorageAdapter:
                 "role": row[0],
                 "content": row[1],
                 "metadata": json.loads(row[2]) if row[2] else {},
-                "id": row[3]
+                "id": row[3],
+                "rendered_content": row[4],
             }
             for row in rows
         ]
@@ -809,9 +817,15 @@ class SovereignStorageAdapter:
             )
             for msg in sorted(all_conversations, key=lambda m: m.get("id", 0)):
                 metadata_json = json.dumps(msg.get("metadata", {}))
+                # rendered_content (#1402) restored if present; older
+                # backups (no key) default to NULL and get lazily split
+                # by AsyncConversationStore on first read.
+                rendered = msg.get("rendered_content")
                 await self.db.execute(
-                    f"INSERT INTO conversation_history (agent_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, {self._now_sql()})",
-                    (self.agent_id, msg["role"], msg["content"], metadata_json),
+                    f"INSERT INTO conversation_history "
+                    f"(agent_id, role, content, rendered_content, metadata, created_at) "
+                    f"VALUES (?, ?, ?, ?, ?, {self._now_sql()})",
+                    (self.agent_id, msg["role"], msg["content"], rendered, metadata_json),
                 )
 
             # Asset restoration (#1391) — runs AFTER conversation

@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS conversation_history (
     agent_id TEXT NOT NULL DEFAULT '',
     role TEXT NOT NULL,
     content TEXT NOT NULL,
+    rendered_content TEXT DEFAULT NULL,
     metadata TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP DEFAULT NULL
@@ -480,6 +481,14 @@ class AsyncDatabase:
         # present, otherwise legacy DBs blow up at boot (#795).
         await self._migrate_add_column(
             "conversation_history", "deleted_at", "TIMESTAMP DEFAULT NULL"
+        )
+        # Canonical/transport split (#1402): add rendered_content to hold the
+        # byte-stable replay form (memories + RAG baked in) separately from
+        # the canonical raw user turn in `content`. Legacy rows have a NULL
+        # rendered_content; lazy migration in AsyncConversationStore splits
+        # them on first read.
+        await self._migrate_add_column(
+            "conversation_history", "rendered_content", "TEXT DEFAULT NULL"
         )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(

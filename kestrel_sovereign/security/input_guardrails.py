@@ -64,6 +64,41 @@ def wrap_user_input(user_message: str) -> str:
     return f"<user_input>\n{user_message}\n</user_input>"
 
 
+def extract_raw_user_content(content: str) -> str:
+    """Unwrap a stored user-turn sent-form back to the raw user text.
+
+    Inverse of the rendering done at LLM-call time: strips an optional
+    leading newline, an optional ``<retrieved_context>...</retrieved_context>``
+    block (memories + RAG), and the outer ``<user_input>...</user_input>``
+    wrapper, returning the raw user speech.
+
+    Sent-form grammar (matches ``user_prompt.md`` + ``wrap_user_input``):
+
+        [optional leading \\n from empty {context}]
+        [optional <retrieved_context>...</retrieved_context>\\n]
+        <user_input>\\n{raw}\\n</user_input>
+
+    Idempotent on legacy raw rows (no wrappers) — returns input unchanged.
+
+    Lives next to ``wrap_user_input`` so storage can import it without
+    pulling in the agent layer (would cycle through ``context_builder``).
+    """
+    s = content
+    if s.startswith("\n"):
+        s = s[1:]
+    if s.startswith("<retrieved_context>"):
+        end = s.find("</retrieved_context>")
+        if end != -1:
+            s = s[end + len("</retrieved_context>"):]
+            if s.startswith("\n"):
+                s = s[1:]
+    prefix = "<user_input>\n"
+    suffix = "\n</user_input>"
+    if s.startswith(prefix) and s.endswith(suffix):
+        s = s[len(prefix):-len(suffix)]
+    return s
+
+
 def check_prompt_injection(user_message: str) -> List[str]:
     """
     Scan user input for common prompt injection patterns.

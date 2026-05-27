@@ -270,19 +270,23 @@ class StreamingMixin:
         # Build user prompt. `context` carries the per-turn retrieved content
         # (memories + RAG) — kept OUT of the system message so the system prefix
         # is stable across turns and prompt caches can hit (see issue #703).
+        wrapped_user = wrap_user_input(user_input)
         prompt = self.user_prompt_template.format(
             context=context_result.dynamic_user_context,
-            query=wrap_user_input(user_input)
+            query=wrapped_user
         )
 
-        # Store the user turn AFTER context build (so memory retrieval sees
-        # the pre-current-turn state) and AFTER hook mutation (so stored bytes
-        # match sent bytes). Persisting the rendered sent-form — not raw
-        # user_input — makes history-load at turn N+1 byte-match what was
-        # sent at turn N, which is the prerequisite for Anthropic's
-        # cache_control marker at messages[-2] to compound across turns.
+        # Canonical/transport split (#1402): persist raw wrapped user turn
+        # as ``content`` and the rendered prompt (memories + RAG baked in)
+        # as ``rendered_content``. History-load replays ``rendered_content``
+        # verbatim so Anthropic's cache_control marker at messages[-2]
+        # still compounds across turns, while every other consumer
+        # (search, audit, UI, memory ingestion) sees clean user speech.
         await self.privacy_agent.add_conversation(
-            "user", prompt, metadata={"sent_form": True}, session_id=session_id
+            "user", wrapped_user,
+            metadata={"sent_form": True},
+            session_id=session_id,
+            rendered_content=prompt,
         )
         # Apply post-build assembly via the agent helper so this path
         # uses the same route-aware budget gate as the non-streaming

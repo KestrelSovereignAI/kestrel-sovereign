@@ -229,26 +229,29 @@ class TestContextBuilder:
     def test_format_conversation_history_sent_form_emitted_verbatim(
         self, context_builder
     ):
-        """Rows with metadata ``sent_form=True`` already hold the full
-        rendered sent-form (retrieved_context + <user_input> wrap). They
-        must be emitted verbatim so the history prefix byte-matches what
-        the LLM saw at send time at the prior turn.
+        """After #1402 the canonical/transport split puts the rendered
+        sent-form in ``rendered_content`` (memories + RAG + <user_input>
+        wrap) and the raw user turn in ``content``. ``format_conversation_history``
+        must emit ``rendered_content`` verbatim for ``sent_form`` user
+        turns so the history prefix byte-matches what the LLM saw at the
+        prior turn — that's the cache-stability invariant.
         """
-        sent_form = (
+        rendered_form = (
             "<retrieved_context>\n<memories>\nM\n</memories>\n"
             "</retrieved_context>\n<user_input>\nhello\n</user_input>"
         )
         history = [
             {
                 "role": "user",
-                "content": sent_form,
+                "content": "<user_input>\nhello\n</user_input>",  # canonical raw
+                "rendered_content": rendered_form,                # transport
                 "metadata": {"sent_form": True},
             },
             {"role": "assistant", "content": "hi"},
         ]
         result = context_builder.format_conversation_history(history)
 
-        assert result[0]["content"] == sent_form
+        assert result[0]["content"] == rendered_form
         assert result[1]["content"] == "hi"
 
     def test_format_conversation_history_legacy_rows_still_wrapped(

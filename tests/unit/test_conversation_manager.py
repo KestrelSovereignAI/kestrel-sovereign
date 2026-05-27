@@ -55,7 +55,8 @@ class MockConversationStore:
         """Return all messages with IDs."""
         return self.messages.copy()
 
-    async def add_conversation(self, role: str, content: str, metadata: Dict = None):
+    async def add_conversation(self, role: str, content: str, metadata: Dict = None,
+                               session_id: str = None, rendered_content: str = None):
         """Add a message to conversation history."""
         msg_id = len(self.messages) + 1
         msg = {
@@ -65,6 +66,8 @@ class MockConversationStore:
             "metadata": metadata or {},
             "created_at": datetime.now(timezone.utc).isoformat()
         }
+        if rendered_content is not None:
+            msg["rendered_content"] = rendered_content
         self.messages.append(msg)
         return msg_id
 
