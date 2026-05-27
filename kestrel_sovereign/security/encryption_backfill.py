@@ -86,7 +86,7 @@ CURRENT_KEY_VERSION = 1
 
 
 def _agent_pid_file(data_dir: Path) -> Path:
-    """Path to the agent's pid file under ``data_dir``.
+    """Path to the per-agent pid file under ``data_dir``.
 
     Inlined here (rather than imported from
     ``kestrel_sovereign.multi_agent.process_manager``) to keep this
@@ -99,8 +99,39 @@ def _agent_pid_file(data_dir: Path) -> Path:
     Must stay in lockstep with
     ``ProcessManager.agent_pid_file``; that's the canonical
     location and any change there should mirror here.
+
+    NOTE: this only exists in MULTI-PROCESS mode (one OS process
+    per agent). The DEFAULT in-process host writes its PID to
+    ``<project_dir>/logs/.host.pid`` instead. ``_host_pid_files``
+    covers that case (codex round-4 P2 on PR #1405).
     """
     return data_dir / "agent.pid"
+
+
+def _host_pid_files(data_dir: Path) -> list[Path]:
+    """Candidate locations for the in-process host's pid file.
+
+    Default kestrel deployment runs ALL agents in one host process
+    and writes that PID to ``<project_dir>/logs/.host.pid``. From
+    ``--data-dir agent_data/<name>`` the project root is two levels
+    up (``data_dir.parent.parent``); we also try one level up to
+    cover layouts where ``--data-dir`` points directly at the
+    project root.
+
+    Returns a list — caller checks each. Multiple paths is
+    cheap (~µs) and avoids miscounting layouts.
+
+    Mirrors ``cli._host_log_file`` / ``cli._host_pid_file``; if
+    those move, mirror here.
+    """
+    candidates: list[Path] = []
+    data_dir = data_dir.resolve()
+    candidates.append(data_dir / "logs" / ".host.pid")
+    if data_dir.parent != data_dir:
+        candidates.append(data_dir.parent / "logs" / ".host.pid")
+    if data_dir.parent.parent != data_dir.parent:
+        candidates.append(data_dir.parent.parent / "logs" / ".host.pid")
+    return candidates
 
 
 def _read_pid(pid_file: Path) -> Optional[int]:
@@ -485,24 +516,40 @@ def cli_run(args, *, stdout=None, stderr=None) -> int:
     # #1405). ``ProcessManager.is_process_running`` does the kill(0)
     # check that confirms the pid actually exists.
     if not args.dry_run:
-        pid_file = _agent_pid_file(data_dir)
-        if pid_file.exists():
+        # Two pid file locations to check:
+        #  * ``<data_dir>/agent.pid`` — multi-process deployments
+        #    (one OS process per agent, see ProcessManager).
+        #  * ``<project_dir>/logs/.host.pid`` — DEFAULT in-process
+        #    host serves every agent from one process. Codex round-4
+        #    P2 on PR #1405 caught that we missed this and would
+        #    happily mutate a DB the in-process host is still
+        #    serving.
+        candidate_pid_files: list[Tuple[str, Path]] = [
+            ("agent process", _agent_pid_file(data_dir)),
+        ]
+        for host_pid_file in _host_pid_files(data_dir):
+            candidate_pid_files.append(("host process", host_pid_file))
+
+        for label, pid_file in candidate_pid_files:
+            if not pid_file.exists():
+                continue
             pid = _read_pid(pid_file)
-            if pid is not None and _is_process_running(pid):
+            if pid is None:
+                continue
+            if _is_process_running(pid):
                 print(
-                    f"Refusing to mutate: agent process is running "
-                    f"(pid {pid}, pid file {pid_file}). Stop the host "
+                    f"Refusing to mutate: {label} is running (pid "
+                    f"{pid}, pid file {pid_file}). Stop the host "
                     f"first (kestrel stop), then re-run. Use "
                     f"--dry-run to audit without writing.",
                     file=err,
                 )
                 return 2
-            if pid is not None:
-                print(
-                    f"Note: ignoring stale pid file {pid_file} (pid "
-                    f"{pid} is not running).",
-                    file=err,
-                )
+            print(
+                f"Note: ignoring stale pid file {pid_file} ({label} "
+                f"pid {pid} is not running).",
+                file=err,
+            )
 
     report = backfill_all(
         db_path,

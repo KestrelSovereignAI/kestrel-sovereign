@@ -687,6 +687,40 @@ class TestCliExitCode:
         assert "conversation_history" in result.stdout
         assert "plaintext rows:" in result.stdout
 
+    def test_live_host_pid_blocks_with_exit_2(
+        self, seeded_db, data_key, tmp_path,
+    ):
+        """A live ``<project>/logs/.host.pid`` must block the
+        migration even when there's no per-agent ``agent.pid``.
+
+        Codex round-4 P2 on PR #1405 caught that the default
+        in-process host doesn't write a per-agent pid; the host
+        pid lives at ``<project>/logs/.host.pid``. Without
+        checking that file, the migration would happily mutate
+        a DB the host is still serving.
+        """
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        # Build a project layout: project_dir/agent_data/<seeded>
+        # where seeded_db is the kestrel_prime.db. ``tmp_path`` is
+        # the seeded_db's parent already; arrange the host pid in
+        # the candidate location.
+        host_logs = seeded_db.parent.parent / "logs"
+        host_logs.mkdir(parents=True, exist_ok=True)
+        host_pid_file = host_logs / ".host.pid"
+        # ``os.getpid()`` is guaranteed to be alive — use it as
+        # the "live host" stand-in.
+        host_pid_file.write_text(str(os.getpid()))
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=False,
+        )
+        rc = cmd_migrate_encryption(args)
+        assert rc == 2
+
     def test_live_pid_file_blocks_with_exit_2(
         self, seeded_db, data_key, capsys,
     ):
