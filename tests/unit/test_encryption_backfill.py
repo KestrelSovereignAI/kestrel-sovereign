@@ -428,3 +428,139 @@ class TestBackfillAll:
         # Files backfill still runs — it doesn't need agent_id.
         assert report.conversation.errors  # one error explaining the miss
         assert report.files.errors == []
+
+
+class TestCliExitCode:
+    """The CLI must signal failure to scripts on partial migrations.
+
+    Codex round-1 P2 on PR #1405 caught that ``return 0`` masked
+    unresolvable-agent_id and per-row encrypt failures. These tests
+    pin the exit-code contract so script-driven migrations don't
+    treat an incomplete backfill as success.
+    """
+
+    def test_zero_when_clean(self, seeded_db, data_key, capsys):
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=False,
+        )
+        rc = cmd_migrate_encryption(args)
+        assert rc == 0
+
+    def test_three_when_errors_present(self, tmp_path, data_key, capsys):
+        """Unresolvable agent_id is recorded as an error → exit 3."""
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        # DB without an agent row in graph_nodes — backfill reports an
+        # error on the conversation table.
+        db = tmp_path / "kestrel_prime.db"
+        conn = sqlite3.connect(str(db))
+        conn.executescript(
+            """
+            CREATE TABLE graph_nodes (
+                node_id TEXT PRIMARY KEY,
+                node_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                properties TEXT
+            );
+            CREATE TABLE files (
+                content_hash TEXT PRIMARY KEY,
+                original_name TEXT NOT NULL,
+                content BLOB,
+                metadata TEXT
+            );
+            """
+        )
+        conn.commit()
+        conn.close()
+        args = SimpleNamespace(
+            data_dir=str(tmp_path),
+            agent_id=None,
+            dry_run=False,
+        )
+        rc = cmd_migrate_encryption(args)
+        assert rc == 3
+
+    def test_four_when_no_fernet_skipped(
+        self, seeded_db, monkeypatch, capsys,
+    ):
+        """No KESTREL_DATA_KEY but plaintext rows present → exit 4."""
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        # Explicitly unset the key + reset cached fernets.
+        monkeypatch.delenv("KESTREL_DATA_KEY", raising=False)
+        from kestrel_sdk.security import encryption as _enc_mod
+        if hasattr(_enc_mod, "_FERNET_CACHE"):
+            _enc_mod._FERNET_CACHE = None
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=False,
+        )
+        rc = cmd_migrate_encryption(args)
+        assert rc == 4
+
+    def test_stale_pid_file_does_not_block(
+        self, seeded_db, data_key, capsys,
+    ):
+        """A pid file whose PID is not running must not block writes.
+
+        Operators can't recover from an unclean shutdown otherwise —
+        codex round-1 P2 on PR #1405.
+        """
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        # Drop a stale pid file in the data dir. Use the agent's own
+        # ProcessManager helper to compute the canonical path.
+        from kestrel_sovereign.security.encryption_backfill import (
+            _agent_pid_file,
+        )
+        pid_file = _agent_pid_file(seeded_db.parent)
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        # Use a PID that's definitely not running. 2^31 - 1 is the
+        # historical max on 32-bit Linux pid_max; nothing legitimate
+        # will hold this on a dev box.
+        pid_file.write_text("2147483647")
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=False,
+        )
+        rc = cmd_migrate_encryption(args)
+        # Stale pid should NOT block — the migration ran.
+        assert rc == 0
+
+    def test_live_pid_file_blocks_with_exit_2(
+        self, seeded_db, data_key, capsys,
+    ):
+        """A pid file pointing at a real running process must block."""
+        from types import SimpleNamespace
+        from kestrel_sovereign.security.encryption_backfill import (
+            cli_run as cmd_migrate_encryption,
+        )
+        from kestrel_sovereign.security.encryption_backfill import (
+            _agent_pid_file,
+        )
+        pid_file = _agent_pid_file(seeded_db.parent)
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        # ``os.getpid()`` is guaranteed to be alive — use this
+        # process's own pid as the "living daemon" stand-in.
+        pid_file.write_text(str(os.getpid()))
+        args = SimpleNamespace(
+            data_dir=str(seeded_db.parent),
+            agent_id=None,
+            dry_run=False,
+        )
+        rc = cmd_migrate_encryption(args)
+        assert rc == 2
