@@ -91,8 +91,25 @@ function isToolActivityStartLine(line) {
     return /^\u{1F527}\s+Calling\s+.+(?:\.\.\.)?$/u.test(String(line || '').trim());
 }
 
+// Server emitters yield tool markers with only a TRAILING newline
+// (orchestrator_engine.py and codex_adapter.py). The LLM's preceding
+// text chunk is not guaranteed to end with `\n`, so the accumulated
+// buffer often looks like `"...so we get a grounded success or
+// failure.🔧 Calling list_peers..."` — a single glued line that the
+// anchored `^🔧` matchers below can't see. Normalize here so the
+// downstream line-prefix logic recognizes the section boundary
+// regardless of upstream newline discipline. Gated on the presence
+// of a 🔧-Calling marker so ordinary assistant prose containing
+// phrases like "Done: ✓ migration complete" is left untouched.
+const TOOL_MARKER_PRESENCE_PATTERN = /\u{1F527}\s+Calling\s+/u;
+const TOOL_MARKER_PREFIX_PATTERN = /([^\n])(\u{1F527}\s+Calling\s+|✓\s+\S[^\n]*?\s+(?:complete|done)\b|❌\s+\S[^\n]*?\s+failed\b)/gu;
+function normalizeToolMarkerLineBreaks(text) {
+    if (!TOOL_MARKER_PRESENCE_PATTERN.test(text)) return text;
+    return text.replace(TOOL_MARKER_PREFIX_PATTERN, '$1\n$2');
+}
+
 export function splitToolActivity(content) {
-    const text = String(content || '');
+    const text = normalizeToolMarkerLineBreaks(String(content || ''));
     const [beforeSeparator, ...afterSeparatorParts] = text.split('\n---\n');
     const beforeLines = beforeSeparator.split('\n');
     const toolStartIndex = beforeLines.findIndex(isToolActivityStartLine);

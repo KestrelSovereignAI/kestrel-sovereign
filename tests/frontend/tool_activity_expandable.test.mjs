@@ -269,3 +269,58 @@ test('splitToolActivity requires a tool start line before completion or error st
         assert.equal(split.response, content);
     }
 });
+
+test('splitToolActivity recognizes a tool start glued onto the end of prose', () => {
+    // Server emitters yield `\uD83D\uDD27 Calling X...\n` with only a trailing
+    // newline; the LLM's last text chunk often lacks one, so the
+    // accumulated buffer glues prose and marker onto a single source
+    // line. The render must still split them.
+    const split = splitToolActivity(
+        'I will check that now.\u{1F527} Calling lookup...\n'
+        + '\u2713 lookup complete (7ms)\n'
+        + '---\n'
+        + 'The lookup finished.',
+    );
+
+    assert.equal(split.hasToolActivity, true);
+    assert.equal(split.prelude, 'I will check that now.');
+    assert.equal(
+        split.toolActivity,
+        '\u{1F527} Calling lookup...\n\u2713 lookup complete (7ms)',
+    );
+    assert.equal(split.response, 'The lookup finished.');
+});
+
+test('splitToolActivity leaves marker-shaped prose untouched when no tool start exists', () => {
+    // Ordinary assistant prose that happens to contain `✓ X complete`
+    // or `❌ X failed` substrings must NOT have line breaks injected —
+    // the bubble would render with surprising paragraph splits even
+    // though no tool was called. Gated by the presence of a 🔧 Calling
+    // marker.
+    for (const content of [
+        'Done: ✓ migration complete and ready to ship',
+        'Heads up❌ build failed: missing dependency',
+        'Status report: ✓ phase 1 complete, ✓ phase 2 complete',
+    ]) {
+        const split = splitToolActivity(content);
+
+        assert.equal(split.hasToolActivity, false);
+        assert.equal(split.toolActivity, '');
+        assert.equal(split.response, content);
+    }
+});
+
+test('splitToolActivity splits a completion marker glued onto a start line', () => {
+    // codex_adapter emits `\u2713 X complete\n` and `\u274C X failed\n` with no
+    // leading newline. When a fast item collapses start+complete in the
+    // same chunk, the buffer can read `\uD83D\uDD27 Calling X...\u2713 X complete`.
+    const split = splitToolActivity(
+        '\u{1F527} Calling lookup...\u2713 lookup complete',
+    );
+
+    assert.equal(split.hasToolActivity, true);
+    assert.equal(
+        split.toolActivity,
+        '\u{1F527} Calling lookup...\n\u2713 lookup complete',
+    );
+});
