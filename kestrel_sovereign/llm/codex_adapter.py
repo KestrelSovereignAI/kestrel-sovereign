@@ -661,8 +661,9 @@ class CodexAdapter(LLMAdapter):
                         "is a transient upstream codex / ChatGPT-Plus "
                         "stall, not a payload-cap problem. Retry once; "
                         "if persistent, switch to a non-plan route "
-                        "(openai:api) or inspect the codex stderr / "
-                        "codex-rs log lines included above."
+                        "(openai:api) or check server logs for the "
+                        "codex stderr / codex-rs log tail (kept out "
+                        "of this message to avoid cross-session leaks)."
                     )
                 raise CodexAppServerError(f"{msg} — {hint}") from e
             raise

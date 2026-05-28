@@ -967,31 +967,37 @@ class CodexAppServerClient:
         doesn't trip the local watchdog before the app-server's own
         server-request timeout fires.
 
-        On idle-timeout (#1410) the error message is augmented with
-        the most recent codex-rs stderr lines AND a tail of codex-rs's
-        internal sqlite log — same data the on-exit path surfaces, so
-        the operator sees what codex-rs actually thought happened
-        upstream instead of just "idle for Ns".
+        On idle-timeout (#1410) codex-rs stderr + the internal sqlite
+        log tail are logged at ERROR level for server-side diagnosis,
+        but DELIBERATELY KEPT OUT of the raised ``CodexAppServerError``
+        message. The exception text propagates to chat callers (e.g.
+        ``endpoints/agent.py`` yields ``Error: {e}`` to the streaming
+        response), and codex-rs's structured log carries content from
+        prior turns / other agents on the same CODEX_HOME — surfacing
+        it to whichever user triggers the timeout would be a
+        cross-session data leak (codex round-1 P1).
         """
         while True:
             try:
                 msg = await asyncio.wait_for(sink.get(), timeout=idle_timeout)
             except asyncio.TimeoutError as e:
                 base = f"codex turn idle for {idle_timeout}s with no completion"
-                pieces = [base]
+                # Log diagnostic tails server-side so operators can see
+                # codex-side root cause via ``kestrel logs``; do not
+                # attach to the user-visible exception.
                 stderr_tail = self.recent_stderr(10)
                 if stderr_tail:
-                    pieces.append(
-                        "codex stderr (last lines): "
-                        + " | ".join(stderr_tail)
+                    logger.error(
+                        "codex app-server idle-timeout: codex stderr (last lines): %s",
+                        " | ".join(stderr_tail),
                     )
                 log_tail = self.recent_codex_log(30)
                 if log_tail:
-                    pieces.append(
-                        "codex-rs log (last entries): "
-                        + " | ".join(log_tail)
+                    logger.error(
+                        "codex app-server idle-timeout: codex-rs log (last entries): %s",
+                        " | ".join(log_tail),
                     )
-                raise CodexAppServerError(" — ".join(pieces)) from e
+                raise CodexAppServerError(base) from e
             if msg.get("__closed__"):
                 raise self._closed_error or CodexAppServerConnectionClosed(
                     "codex app-server closed mid-turn"
