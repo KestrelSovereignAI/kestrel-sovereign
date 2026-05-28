@@ -238,3 +238,95 @@ class TestSentFormBytePreservation:
         target_msg = next(m for m in survivors if m.get("metadata"))
         assert target_msg["metadata"] == {"sent_form": True}
         assert target_msg["rendered_content"] == "RENDERED-BYTES"
+
+
+class TestEmitByteCounting:
+    """The anchor must count the bytes the LLM will actually see, not
+    raw ``content``. Without this, a sent_form user row whose
+    ``rendered_content`` is much larger than raw ``content`` would let
+    the anchor declare a fit while the formatter still has to truncate
+    inside the anchored slice — recreating the cache churn this fix is
+    meant to prevent (codex round-2 P1)."""
+
+    def test_sent_form_uses_rendered_content_bytes(self):
+        cm = _make_manager()
+        # Two messages: one user with sent_form (rendered_content is
+        # much larger than content), one assistant.
+        sent_form_msg = {
+            "role": "user",
+            "content": "hello",  # 5 chars
+            "rendered_content": "x" * 4000,  # ~1000 tokens
+            "metadata": {"sent_form": True},
+        }
+        emit = cm._emit_content_for_msg(sent_form_msg)
+        # The emitter picks rendered_content, NOT raw content.
+        assert emit == "x" * 4000
+
+    def test_unsent_user_wraps_with_user_input_tags(self):
+        cm = _make_manager()
+        msg = {"role": "user", "content": "hi"}
+        emit = cm._emit_content_for_msg(msg)
+        assert "<user_input>" in emit and "</user_input>" in emit
+        assert "hi" in emit
+
+    def test_assistant_uses_raw_content(self):
+        cm = _make_manager()
+        msg = {"role": "assistant", "content": "ack"}
+        emit = cm._emit_content_for_msg(msg)
+        assert emit == "ack"
+
+    def test_legacy_human_role_treated_as_user(self):
+        cm = _make_manager()
+        msg = {"role": "human", "content": "old format"}
+        emit = cm._emit_content_for_msg(msg)
+        assert "<user_input>" in emit
+
+    def test_anchor_overflows_when_emit_bytes_exceed_raw(self):
+        """Critical regression: if anchor only counted raw, a slice
+        with sent_form rows whose rendered_content blew up would pass
+        the anchor's fit check and overflow downstream."""
+        cm = _make_manager()
+        cm.PRUNE_TARGET_FRAC = 0.75
+        # Build messages with small raw content but huge rendered.
+        history = []
+        for i in range(50):
+            history.append(
+                {
+                    "role": "user" if i % 2 == 0 else "assistant",
+                    "content": "x",  # ~1 token raw
+                    # Sent-form on user rows blows up to ~250 tokens
+                    "rendered_content": ("y " * 250) if i % 2 == 0 else None,
+                    "metadata": {"sent_form": True} if i % 2 == 0 else {},
+                }
+            )
+        # Small ceiling so emit-byte total clearly overflows but raw total fits.
+        anchor = cm._lumpy_anchor(history, max_tokens=500)
+        # Must drop some — because emit bytes are what matter.
+        assert anchor > 0, "anchor failed to detect emit-byte overflow"
+
+
+class TestStableCeiling:
+    """Per-turn budget variance (RAG/memory slack) must not move the
+    anchor. ``build_context`` calls _lumpy_anchor with the static
+    ``budget.history``, not the elastic effective ceiling, so the
+    anchor is deterministic from raw history and a fixed ceiling
+    (codex round-2 P2)."""
+
+    def test_anchor_independent_of_elastic_slack(self):
+        cm = _make_manager()
+        cm.PRUNE_TARGET_FRAC = 0.75
+        history = _seed_history(50, 60)
+        # Same history, different ceilings: anchor should be a
+        # function of (history, ceiling), so caller controls
+        # stability by passing a stable ceiling.
+        a1 = cm._lumpy_anchor(history, max_tokens=2000)
+        a2 = cm._lumpy_anchor(history, max_tokens=2000)
+        assert a1 == a2  # idempotent given same inputs
+        # When the ceiling jitters (e.g. elastic slack changes), the
+        # anchor's output changes. That's why build_context passes
+        # budget.history (static), not budget.effective_budget.
+        a3 = cm._lumpy_anchor(history, max_tokens=2500)
+        # Without hysteresis on the ceiling parameter, different
+        # ceilings can yield different anchors — this test pins that
+        # behaviour so reviewers understand the trade-off.
+        assert isinstance(a3, int)

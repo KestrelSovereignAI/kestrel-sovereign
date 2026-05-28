@@ -805,7 +805,14 @@ class ContextManager:
         # shifting the bytes at ``messages[-2]`` / ``messages[-4]`` and
         # invalidating Anthropic's position-indexed cache markers on
         # every request.
-        anchor = self._lumpy_anchor(history, history_max_tokens)
+        #
+        # The anchor uses the STATIC ``budget.history`` ceiling, not
+        # the elastic effective ceiling, so per-turn variance in
+        # RAG/memory/episodes slack doesn't disturb the anchor
+        # position (codex round 2 P2). Format still gets the elastic
+        # ceiling for ``max_tokens``, so when slack is available the
+        # anchored slice fits comfortably with no further trimming.
+        anchor = self._lumpy_anchor(history, budget.history)
         anchored_history = history[anchor:] if anchor > 0 else history
         if anchor > 0:
             logger.info(
@@ -1243,6 +1250,32 @@ class ContextManager:
         os.environ.get("KESTREL_PRUNE_TARGET_FRAC")
     )
 
+    @staticmethod
+    def _emit_content_for_msg(msg: Dict[str, Any]) -> str:
+        """Mirror the emit-byte selection in
+        ``ContextBuilder.format_conversation_history`` so the anchor
+        counts the SAME bytes the LLM will see.
+
+        Without this, the anchor can over-estimate fit for ``sent_form``
+        user rows (whose ``rendered_content`` is larger than raw
+        ``content``) and let the formatter fall into its just-enough
+        skip path — recreating the per-turn cache churn the anchor is
+        supposed to prevent (codex round 2 P1).
+        """
+        from kestrel_sovereign.security.input_guardrails import wrap_user_input
+
+        role = msg.get("role", "user")
+        if role not in ("user", "assistant", "system"):
+            role = "user" if role == "human" else "assistant"
+        raw = msg.get("content", "") or ""
+        rendered = msg.get("rendered_content")
+        meta = msg.get("metadata") or {}
+        if role == "user" and meta.get("sent_form") and rendered is not None:
+            return rendered
+        if role == "user" and not meta.get("sent_form"):
+            return wrap_user_input(raw)
+        return rendered if rendered is not None else raw
+
     def _lumpy_anchor(
         self,
         history: List[Dict[str, Any]],
@@ -1260,15 +1293,16 @@ class ContextManager:
         jumps, so Anthropic's position-indexed cache markers compound
         (see ``project_anthropic_cache_markers.md``).
 
-        Counts are approximate — based on raw ``content`` plus a 4-token
-        overhead. ``format_conversation_history`` applies its own
-        per-message cap as a defensive net if the slice still overshoots
-        after sent-form/wrapping expansion.
+        Counts use ``_emit_content_for_msg`` to match the bytes
+        ``format_conversation_history`` will emit (including sent-form
+        rendered content and ``wrap_user_input`` expansion). Otherwise
+        the formatter's just-enough skip path can run inside the
+        anchored slice and undo the hysteresis.
         """
         if not history or max_tokens <= 0:
             return 0
         msg_tokens = [
-            self.counter.count(m.get("content", "") or "") + 4 for m in history
+            self.counter.count(self._emit_content_for_msg(m)) + 4 for m in history
         ]
         total = sum(msg_tokens)
         if total <= max_tokens:
