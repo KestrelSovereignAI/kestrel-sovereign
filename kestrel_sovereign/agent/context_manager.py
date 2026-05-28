@@ -838,25 +838,15 @@ class ContextManager:
                 f"History truncated: {len(formatted_history)}/{len(history)} messages"
             )
 
-        # Pre-send budget enforcement: if total exceeds budget, drop oldest history
+        # Pre-send budget enforcement: if total exceeds budget, drop
+        # oldest history down to ``PRUNE_TARGET_FRAC`` of the budget
+        # rather than just-enough-to-fit. See ``_lumpy_prune_history``.
         if budget.total_used > budget.total_budget and len(formatted_history) > 1:
-            overage = budget.total_used - budget.total_budget
-            logger.warning(
-                f"Context budget exceeded by {overage} tokens — auto-pruning oldest history"
-            )
-            pruned_tokens = 0
-            while formatted_history and pruned_tokens < overage:
-                dropped = formatted_history.pop(0)  # Drop oldest
-                dropped_tokens = self.counter.count(dropped.get("content", "")) + 4
-                pruned_tokens += dropped_tokens
-            # Update budget tracking
-            new_history_tokens = self.counter.count_messages(formatted_history)
-            alloc = budget.allocations["history"]
-            alloc.used = new_history_tokens
-            alloc.items = len(formatted_history)
-            warnings.append(
-                f"Auto-pruned {pruned_tokens} tokens from history to fit budget"
-            )
+            pruned_tokens = self._lumpy_prune_history(formatted_history, budget)
+            if pruned_tokens > 0:
+                warnings.append(
+                    f"Auto-pruned {pruned_tokens} tokens from history to fit budget"
+                )
 
         # === C / #1311: durable salvage of pruned spans ===
         # Any messages that were in the raw history but did not survive
@@ -1209,6 +1199,59 @@ class ContextManager:
     def _build_message_chunks(self, messages: List[Dict], chunk_size: int) -> List[str]:
         """Delegate to MemoryManager."""
         return self.memory_manager._build_message_chunks(messages, chunk_size)
+
+    # Lumpy prune: when history overflows the budget, drop down to this
+    # fraction of the budget instead of just-enough-to-fit. The headroom
+    # buys multiple cache-warm turns between prune events; just-enough
+    # would prune ~one turn's tokens every turn and invalidate the
+    # ``messages[-2]``/``[-4]`` cache markers on every request (see
+    # ``project_anthropic_cache_markers.md``). Override with
+    # ``KESTREL_PRUNE_TARGET_FRAC``; clamped to (0.0, 1.0].
+    PRUNE_TARGET_FRAC = max(
+        0.05,
+        min(1.0, float(os.environ.get("KESTREL_PRUNE_TARGET_FRAC", "0.75"))),
+    )
+
+    def _lumpy_prune_history(
+        self,
+        formatted_history: List[Dict[str, Any]],
+        budget: TokenBudget,
+    ) -> int:
+        """Drop oldest history down to ``PRUNE_TARGET_FRAC`` of the budget.
+
+        Just-enough-to-fit pruning sheds ~one turn of tokens every turn
+        once history sits at the budget ceiling, which invalidates the
+        ``messages[-2]`` / ``messages[-4]`` Anthropic cache markers on
+        every request. Dropping to a lumpy target instead buys multiple
+        cache-warm turns between prune events.
+
+        Mutates ``formatted_history`` in place, updates ``budget``'s
+        ``history`` allocation, and returns the total tokens dropped.
+        Always keeps at least one message so the LLM call has a current
+        turn to respond to.
+        """
+        overage = budget.total_used - budget.total_budget
+        if overage <= 0 or len(formatted_history) <= 1:
+            return 0
+        target_total = int(budget.total_budget * self.PRUNE_TARGET_FRAC)
+        target_drop = max(overage, budget.total_used - target_total)
+        logger.warning(
+            "Context budget exceeded by %d tokens — lumpy-pruning to "
+            "%.0f%% of budget (target drop ~%d tokens)",
+            overage,
+            self.PRUNE_TARGET_FRAC * 100,
+            target_drop,
+        )
+        pruned_tokens = 0
+        while len(formatted_history) > 1 and pruned_tokens < target_drop:
+            dropped = formatted_history.pop(0)
+            dropped_tokens = self.counter.count(dropped.get("content", "") or "") + 4
+            pruned_tokens += dropped_tokens
+        new_history_tokens = self.counter.count_messages(formatted_history)
+        alloc = budget.allocations["history"]
+        alloc.used = new_history_tokens
+        alloc.items = len(formatted_history)
+        return pruned_tokens
 
     # --- Microcompact: zero-cost tool result clearing ---
 
