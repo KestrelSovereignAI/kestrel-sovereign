@@ -27,10 +27,33 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMResponse, ThinkingDelta, messages_for
+from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
 
 logger = logging.getLogger(__name__)
+
+
+def _is_harness_owned_transport_error(exc: BaseException) -> bool:
+    """True when ``exc`` is a *transport* failure from a harness that
+    owns its own transport (timeouts, retries, websocket lifecycle)
+    and therefore must NOT be treated as evidence the route is broken.
+
+    Sovereign's only such harness today is the codex app-server bridge
+    (``openai:plan``): a transient codex/ChatGPT-Plus stall raises
+    ``CodexAppServerTransportError`` (idle timeout, RPC timeout,
+    app-server connection closed) and is **not** a signal that openai
+    is down. Rotating to a different provider on this error gives the
+    user a wrong-model response without warning — the upstream
+    antipattern openclaw fixed in commit ``3a64dc7623`` ("keep turn
+    timeouts inside Codex").
+
+    Narrowed to ``CodexAppServerTransportError`` specifically (not the
+    supertype ``CodexAppServerError``) so caller-config / protocol /
+    codex-reported-turn-failure errors retain their normal fallback
+    semantics — those *should* let the chain try the next provider.
+    """
+    return isinstance(exc, CodexAppServerTransportError)
 
 
 class LLMStreamingError(LLMError):
@@ -219,8 +242,26 @@ class StreamingMixin:
 
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
-                self._maybe_disable_route(provider, e)
                 last_error = e
+                if _is_harness_owned_transport_error(e):
+                    # Harness-owned transport error (codex app-server idle
+                    # stall, app-server connection closed, etc.). Don't
+                    # rotate to a different provider — that would answer
+                    # the user from a wrong model on a transient codex
+                    # stall. Also skip ``_maybe_disable_route``: even an
+                    # auth-shaped codex message ("session expired",
+                    # "unauthorized") is the harness's responsibility, not
+                    # evidence the kestrel route is broken — disabling it
+                    # for the rest of the process would skip codex on
+                    # every future turn even after the operator
+                    # re-authenticates. See #1429 and openclaw commit
+                    # 3a64dc7623.
+                    raise LLMStreamingError(
+                        f"Harness-owned route {provider_name} failed: {e}",
+                        provider=provider_name,
+                        underlying=e,
+                    )
+                self._maybe_disable_route(provider, e)
                 if mandate_restricted:
                     # No silent fallthrough when the user has explicitly narrowed
                     # routing. Fail loudly — the caller / agent / user must see
@@ -393,8 +434,17 @@ class StreamingMixin:
                     return
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
-                self._maybe_disable_route(provider, e)
                 last_error = e
+                if _is_harness_owned_transport_error(e):
+                    # See #1429: skip _maybe_disable_route too — harness
+                    # owns auth, kestrel doesn't disable the route on its
+                    # behalf.
+                    raise LLMStreamingError(
+                        f"Harness-owned route {provider['name']} failed: {e}",
+                        provider=provider["name"],
+                        underlying=e,
+                    )
+                self._maybe_disable_route(provider, e)
                 if mandate_restricted:
                     raise LLMStreamingError(
                         f"Selected route {provider['name']} failed: {e}",
@@ -586,9 +636,18 @@ class StreamingMixin:
 
             except Exception as e:
                 logger.error(f"Provider {provider['name']} failed: {e}")
-                self._maybe_disable_route(provider, e)
                 last_error = e
                 last_provider_name = provider["name"]
+                if _is_harness_owned_transport_error(e):
+                    # See #1429: skip _maybe_disable_route too — harness
+                    # owns auth, kestrel doesn't disable the route on its
+                    # behalf.
+                    raise LLMStreamingError(
+                        f"Harness-owned route {provider['name']} failed: {e}",
+                        provider=provider["name"],
+                        underlying=e,
+                    )
+                self._maybe_disable_route(provider, e)
                 if mandate_restricted:
                     raise LLMStreamingError(
                         f"Selected route {provider['name']} failed: {e}",

@@ -54,7 +54,11 @@ from kestrel_sdk.llm import (
     ToolStreamingMode,
     VisionInputMode,
 )
-from .codex_app_server import CodexAppServerClient, CodexAppServerError
+from .codex_app_server import (
+    CodexAppServerClient,
+    CodexAppServerError,
+    CodexAppServerTransportError,
+)
 from .continuation_store import ContinuationStore, InMemoryContinuationStore
 from .gpt5_overlay import prepend_gpt5_overlay
 from .model_metadata import ModelInfo
@@ -665,7 +669,12 @@ class CodexAdapter(LLMAdapter):
                         "codex stderr / codex-rs log tail (kept out "
                         "of this message to avoid cross-session leaks)."
                     )
-                raise CodexAppServerError(f"{msg} — {hint}") from e
+                # The original ``e`` is a ``CodexAppServerTransportError``
+                # (idle timeout from ``iter_turn_events``). Preserve the
+                # transport classification so streaming.py's harness-owned
+                # check still recognizes it after the hint rewrite. See
+                # #1429.
+                raise CodexAppServerTransportError(f"{msg} — {hint}") from e
             raise
 
     async def _run_turn(
