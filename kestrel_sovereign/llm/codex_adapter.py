@@ -628,18 +628,43 @@ class CodexAdapter(LLMAdapter):
                     )
                 except Exception:
                     cap = None
-                hint = (
-                    f"openai:plan (codex app-server) — est turn "
-                    f"payload ~{est_payload_tokens} tokens; current "
-                    f"openai:plan per-turn cap is {cap or 'unset'}. "
-                    "ChatGPT-Plus has a per-turn payload limit below "
-                    "the model's context window — if the payload "
-                    "exceeds it, codex opens the upstream websocket "
-                    "but never returns response.completed. Either "
-                    "compact this session's history (kestrel "
-                    "context compact) or raise the cap via "
-                    "KESTREL_OPENAI_PLAN_CONTEXT_CAP."
+                # Branch the hint by payload vs cap (#1410). When the
+                # payload is *under* the cap, "compact or raise the
+                # cap" is wrong advice — the failure is an upstream
+                # codex/ChatGPT-Plus stall, not a payload-too-big
+                # rejection. iter_turn_events has already appended
+                # stderr + codex-rs log tails to ``msg``; the operator
+                # sees the actual root cause without being misdirected
+                # toward compaction that can't help.
+                exceeds_cap = (
+                    isinstance(cap, int) and est_payload_tokens > cap
                 )
+                if exceeds_cap:
+                    hint = (
+                        f"openai:plan (codex app-server) — est turn "
+                        f"payload ~{est_payload_tokens} tokens EXCEEDS "
+                        f"the openai:plan per-turn cap ({cap}). "
+                        "ChatGPT-Plus has a per-turn payload limit "
+                        "below the model's context window — when the "
+                        "payload exceeds it, codex opens the upstream "
+                        "websocket but never returns response.completed. "
+                        "Either compact this session's history "
+                        "(kestrel context compact) or raise the cap "
+                        "via KESTREL_OPENAI_PLAN_CONTEXT_CAP."
+                    )
+                else:
+                    cap_str = f"{cap}" if isinstance(cap, int) else "unset"
+                    hint = (
+                        f"openai:plan (codex app-server) — est turn "
+                        f"payload ~{est_payload_tokens} tokens is "
+                        f"within the per-turn cap ({cap_str}); this "
+                        "is a transient upstream codex / ChatGPT-Plus "
+                        "stall, not a payload-cap problem. Retry once; "
+                        "if persistent, switch to a non-plan route "
+                        "(openai:api) or check server logs for the "
+                        "codex stderr / codex-rs log tail (kept out "
+                        "of this message to avoid cross-session leaks)."
+                    )
                 raise CodexAppServerError(f"{msg} — {hint}") from e
             raise
 
