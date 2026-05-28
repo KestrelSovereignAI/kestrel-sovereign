@@ -217,6 +217,28 @@ class AnthropicAdapter(LLMAdapter):
         )
 
     @staticmethod
+    def _resolve_wire_model_id(model: str) -> str:
+        """Strip a leading ``anthropic/`` prefix from a stored model id
+        before sending it to api.anthropic.com.
+
+        Why: the Vendor/Route/Model design lets ``kestrel model set
+        anthropic/claude-opus-4-5-20251101`` persist a prefix-bearing id,
+        and the prefix is meaningful for OpenRouter and other proxies that
+        re-route by vendor. But the canonical Anthropic Messages API
+        rejects prefixed ids — it expects bare ``claude-opus-4-5-...``.
+        Both ``AnthropicAdapter`` and ``ClaudeMaxAdapter`` route through
+        ``anthropic.AsyncAnthropic`` against api.anthropic.com, so both
+        must strip at the transport boundary.
+
+        Mirrors openclaw commit ``aa0a29099f`` (#87181) in spirit. We
+        keep prefix-bearing ids in stored config; the strip is the last
+        thing before the wire.
+        """
+        if model and model.lower().startswith("anthropic/"):
+            return model[len("anthropic/"):]
+        return model
+
+    @staticmethod
     def _apply_cache_control(
         api_params: Dict[str, Any],
     ) -> Dict[str, Any]:
@@ -472,7 +494,7 @@ class AnthropicAdapter(LLMAdapter):
                 combined_system = f"{combined_system}\n\n{system_prompt}" if combined_system else system_prompt
             
             api_params = {
-                "model": model,
+                "model": self._resolve_wire_model_id(model),
                 "messages": filtered_messages,
                 "max_tokens": kwargs.get("max_tokens", 4096),
             }
@@ -669,7 +691,7 @@ class AnthropicAdapter(LLMAdapter):
                 combined_system = f"{combined_system}\n\n{system_prompt}" if combined_system else system_prompt
             
             api_params = {
-                "model": model,
+                "model": self._resolve_wire_model_id(model),
                 "messages": filtered_messages,
                 "max_tokens": kwargs.get("max_tokens", 4096),
             }
@@ -823,7 +845,7 @@ class AnthropicAdapter(LLMAdapter):
                 combined_system = f"{combined_system}\n\n{system_prompt}" if combined_system else system_prompt
             
             api_params = {
-                "model": model,
+                "model": self._resolve_wire_model_id(model),
                 "messages": filtered_messages,
                 "max_tokens": kwargs.get("max_tokens", 4096),
             }
