@@ -32,11 +32,21 @@ def test_snake_case_matches_feature_tool_name():
     assert _snake_case("AlreadySnake_thing") == "already_snake_thing"
 
 
-def test_most_permissive_picks_allow_over_ask():
+def test_resolve_levels_picks_allow_over_ask():
+    """ALLOW outranks ASK; SESSION outranks ASK; AUTO outranks ASK."""
     assert _most_permissive([PermissionLevel.ASK, PermissionLevel.ALLOW]) is PermissionLevel.ALLOW
-    assert _most_permissive([PermissionLevel.DENY, PermissionLevel.ALLOW]) is PermissionLevel.ALLOW
     assert _most_permissive([PermissionLevel.AUTO, PermissionLevel.ASK]) is PermissionLevel.AUTO
     assert _most_permissive([PermissionLevel.ASK]) is PermissionLevel.ASK
+
+
+def test_resolve_levels_deny_wins():
+    """DENY is the operator's last word. A stale ALLOW under a legacy casing
+    must NOT override a newer DENY under the canonical casing (codex review
+    #1427 P1). Otherwise the normalization layer becomes a security
+    regression for any operator who has explicitly blocked a tool."""
+    assert _most_permissive([PermissionLevel.DENY, PermissionLevel.ALLOW]) is PermissionLevel.DENY
+    assert _most_permissive([PermissionLevel.ALLOW, PermissionLevel.DENY]) is PermissionLevel.DENY
+    assert _most_permissive([PermissionLevel.AUTO, PermissionLevel.DENY]) is PermissionLevel.DENY
 
 
 @pytest.mark.asyncio
@@ -155,6 +165,66 @@ async def test_migrate_legacy_feature_aliases_idempotent(tmp_path):
     n2 = await store.migrate_legacy_feature_aliases(aliases)
     assert n1 == 1, f"first pass should upsert 1 row, got {n1}"
     assert n2 == 0, f"second pass should be a no-op, got {n2}"
+
+
+@pytest.mark.asyncio
+async def test_deny_under_canonical_wins_over_allow_under_alias(tmp_path):
+    """Operator's explicit DENY under PascalCase must NOT be overridden by a
+    stale ALLOW under the legacy snake casing. Codex review #1427 P1 — the
+    normalization layer would otherwise be a quiet security regression."""
+    db_path = str(tmp_path / "perms.db")
+    store = PermissionStore(db_path)
+    await store.initialize()
+    await store.set_permission("task_feature", "respond_to_a2a_task", PermissionLevel.ALLOW)
+    await store.set_permission("TaskFeature", "respond_to_a2a_task", PermissionLevel.DENY)
+    # Lookup under canonical: DENY wins (operator's most-recent intent).
+    assert await store.get_permission("TaskFeature", "respond_to_a2a_task") == PermissionLevel.DENY
+    # And under the alias too — same logical row, DENY must apply.
+    assert await store.get_permission("task_feature", "respond_to_a2a_task") == PermissionLevel.DENY
+
+
+@pytest.mark.asyncio
+async def test_migration_preserves_explicit_deny_at_canonical(tmp_path):
+    """If the canonical row is already DENY, the alias ALLOW does not
+    upgrade it. Migration must not be a foot-gun for operators who've
+    explicitly blocked a tool."""
+    db_path = str(tmp_path / "perms.db")
+    store = PermissionStore(db_path)
+    await store.initialize()
+    await store.set_permission("TaskFeature", "respond_to_a2a_task", PermissionLevel.DENY)
+    await store.set_permission("task_feature", "respond_to_a2a_task", PermissionLevel.ALLOW)
+    n = await store.migrate_legacy_feature_aliases({"task_feature": "TaskFeature"})
+    # The migration must NOT have changed the canonical row.
+    assert await store.get_permission("TaskFeature", "respond_to_a2a_task") == PermissionLevel.DENY
+    # And the upsert count must reflect that no canonical write happened
+    # (alias row is left untouched as audit trail).
+    assert n == 0, f"expected 0 upserts (canonical DENY held), got {n}"
+
+
+@pytest.mark.asyncio
+async def test_runtime_alias_map_lookup(tmp_path):
+    """After ``migrate_legacy_feature_aliases`` registers the alias map,
+    a runtime ``set_permission`` under the LEGACY alias still resolves on
+    a canonical-name read. Codex review #1427 P2 — needed for any
+    operator/integration that writes under ``computer_use`` after startup."""
+    db_path = str(tmp_path / "perms.db")
+    store = PermissionStore(db_path)
+    await store.initialize()
+    await store.migrate_legacy_feature_aliases(
+        {"computer_use": "ComputerUseFeature"}
+    )
+    # Operator (or external integration) writes under the legacy alias
+    # AFTER startup; canonical-side lookup should still find it.
+    await store.set_permission("computer_use", "fs_read", PermissionLevel.ALLOW)
+    assert (
+        await store.get_permission("ComputerUseFeature", "fs_read")
+        == PermissionLevel.ALLOW
+    )
+    # Symmetrically: write canonical, read alias.
+    await store.set_permission("ComputerUseFeature", "shell", PermissionLevel.ALLOW)
+    assert (
+        await store.get_permission("computer_use", "shell") == PermissionLevel.ALLOW
+    )
 
 
 @pytest.mark.asyncio

@@ -115,22 +115,34 @@ def _name_variants(name: str) -> set[str]:
     return {name, _snake_case(name), _pascal_case(name)}
 
 
-# Permissive-wins ordering. ALLOW/AUTO beat ASK/SESSION beat DENY-not-found.
-# DENY is a hard stop and only "wins" when it's the only thing on the row —
-# if any matching row says ALLOW the operator's grant is honored. This is
-# the same intent encoded in the global Auto-mode short-circuit, kept
-# consistent at the per-row level.
-_PERMISSIVENESS = {
+# DENY-wins ordering for casing-variant resolution. An explicit DENY anywhere
+# in the row set is treated as the operator's last word — a stale ALLOW under
+# a legacy casing must not silently re-enable a tool the operator has since
+# blocked under the canonical casing. ALLOW/AUTO outrank ASK/SESSION; SESSION
+# outranks ASK because SESSION is a deliberate per-session grant whereas ASK
+# is the "no row at all" default. See codex review #1427 P1 — without the
+# DENY priority, security regressions sneak in via the mixed-case DB state
+# this normalization layer was added to handle.
+_LEVEL_RANK = {
+    PermissionLevel.DENY: 100,
     PermissionLevel.ALLOW: 4,
     PermissionLevel.AUTO: 3,
     PermissionLevel.SESSION: 2,
     PermissionLevel.ASK: 1,
-    PermissionLevel.DENY: 0,
 }
 
 
-def _most_permissive(levels: List["PermissionLevel"]) -> "PermissionLevel":
-    return max(levels, key=lambda level: _PERMISSIVENESS.get(level, 0))
+def _resolve_levels(levels: List["PermissionLevel"]) -> "PermissionLevel":
+    """Resolve a list of (feature_name casing-variant) row levels for the same
+    logical (feature, tool) pair. DENY is a hard stop; otherwise pick the
+    most permissive grant."""
+    return max(levels, key=lambda level: _LEVEL_RANK.get(level, 0))
+
+
+# Kept as a public alias for the test suite — the previous name read more
+# naturally for the non-DENY case. Use ``_resolve_levels`` for new callers
+# so the DENY-wins behavior is unambiguous from the name.
+_most_permissive = _resolve_levels
 
 
 class PermissionStore:
@@ -169,6 +181,14 @@ class PermissionStore:
         self._session_overrides: Dict[str, PermissionLevel] = {}
         self._global_auto_mode = False
         self._initialized = False
+        # Bidirectional alias map populated by ``migrate_legacy_feature_aliases``.
+        # Used by ``_lookup_rows`` to translate between the snake-case alias an
+        # operator/integration might use (``computer_use``) and the canonical
+        # class name (``ComputerUseFeature``) — covers the non-derived aliases
+        # that ``_snake_case``/``_pascal_case`` can't recover (codex review
+        # #1427 P2).
+        self._feature_alias_to_class: Dict[str, str] = {}
+        self._feature_class_to_alias: Dict[str, str] = {}
 
     async def initialize(self) -> None:
         """Create database tables if they don't exist."""
@@ -297,6 +317,13 @@ class PermissionStore:
         """
         if not aliases:
             return 0
+        # Persist for runtime lookup so a post-startup write under the alias
+        # (``set_permission("computer_use", ...)`` from an operator or
+        # integration) still resolves on canonical-name reads.
+        for alias, canonical in aliases.items():
+            if alias and canonical and alias != canonical:
+                self._feature_alias_to_class[alias] = canonical
+                self._feature_class_to_alias[canonical] = alias
         upserts = 0
         async with aiosqlite.connect(self.db_path) as db:
             for alias, canonical in aliases.items():
@@ -435,8 +462,20 @@ class PermissionStore:
         See ``get_permission`` for the rationale — the DB has accumulated
         rows under both casings over time and we want operator grants to
         survive the orchestrator-side normalization to PascalCase (#1427).
+        Also queries any registered feature alias for the canonical name
+        (and vice versa) so non-derived pairs like ``computer_use`` ↔
+        ``ComputerUseFeature`` resolve symmetrically (codex review #1427 P2).
         """
         names = _name_variants(feature_name)
+        # Add registered cross-form alias (covers non-derived pairs that
+        # _name_variants can't reproduce, e.g. ``computer_use`` ↔
+        # ``ComputerUseFeature``).
+        canonical = self._feature_alias_to_class.get(feature_name)
+        if canonical:
+            names.add(canonical)
+        alias = self._feature_class_to_alias.get(feature_name)
+        if alias:
+            names.add(alias)
         placeholders = ",".join(["?"] * len(names))
         query = (
             f"SELECT level FROM security_permissions "
