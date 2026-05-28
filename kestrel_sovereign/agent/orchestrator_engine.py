@@ -1440,6 +1440,31 @@ class OrchestratorEngineMixin:
                 dispatch_meta=dispatch_meta,
             )
 
+    def _security_feature_name_for_tool(self, tool_name: str) -> str:
+        """Return the canonical feature name (PascalCase = ``feature.name``)
+        used by the security permission store, given a direct-tool name.
+
+        ``_tool_to_feature`` stores ``feature.tool_name`` (snake_case) so the
+        feature_features inventory can map back to a feature object. The
+        permission store, however, keys on ``feature.name`` (PascalCase, =
+        ``type(feature).__name__``) — every other call site
+        (``_dispatch_to_feature_subagent``, ``_get_denied_tools``, the
+        ``set_permission`` tool docstring example "WalletAgent") writes/reads
+        PascalCase. Without translating at the direct-tool boundary, every
+        ``set_permission("TaskFeature", ...)`` row was invisible to direct
+        invocations like ``respond_to_a2a_task`` — and the security hook
+        defaulted to ASK, queueing approvals that no user was watching for
+        in signal-driven cognition turns (#1427).
+        """
+        snake = self._tool_to_feature.get(tool_name)
+        if not snake:
+            return tool_name
+        features = getattr(self, "features", None) or {}
+        for feature in features.values():
+            if getattr(feature, "tool_name", None) == snake:
+                return getattr(feature, "name", snake)
+        return snake
+
     async def _get_denied_tools(self, feature_name: str) -> set:
         """Get tools denied by security policy for a feature.
 
@@ -1534,7 +1559,7 @@ class OrchestratorEngineMixin:
     ):
         """Dispatch a direct tool call (no subagent LLM hop)."""
         tool = self._direct_tools[tool_name]
-        hook_feature_name = self._tool_to_feature.get(tool_name, tool_name)
+        hook_feature_name = self._security_feature_name_for_tool(tool_name)
 
         async def _exec_direct(t=tool, a=args):
             return await t.execute(**a)
