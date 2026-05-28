@@ -69,11 +69,33 @@ ServerRequestHandler = Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
 
 
 class CodexAppServerError(RuntimeError):
-    """Any app-server failure: spawn, version, RPC error, exit, timeout."""
+    """Any app-server failure: spawn, version, protocol error, caller
+    config violation, codex-reported turn failure.
+
+    Catch-all supertype. Callers that need to distinguish a transient
+    transport stall (which they should surface without rotating to a
+    different LLM provider) from a permanent caller-config error
+    (which fallback should handle as usual) should check
+    :class:`CodexAppServerTransportError` instead.
+    """
 
 
-class CodexAppServerConnectionClosed(CodexAppServerError):
-    """The app-server process is gone (exited / stdin closed)."""
+class CodexAppServerTransportError(CodexAppServerError):
+    """A *transient* failure in the codex app-server transport itself:
+    RPC timeout, idle stall, websocket dropped, app-server process gone
+    mid-turn. These are not evidence the kestrel route is broken — the
+    harness owns the transport. The streaming fallback loops in
+    ``llm/streaming.py`` use this discriminator to refuse to rotate
+    providers on these errors, matching openclaw commit ``3a64dc7623``
+    ("keep turn timeouts inside Codex").
+    """
+
+
+class CodexAppServerConnectionClosed(CodexAppServerTransportError):
+    """The app-server process is gone (exited / stdin closed). Modeled
+    as a transport error: the connection died, which is what the
+    fallback escalation rule cares about.
+    """
 
 
 def resolve_codex_binary() -> str:
@@ -893,7 +915,9 @@ class CodexAppServerClient:
             return await asyncio.wait_for(fut, timeout=timeout)
         except asyncio.TimeoutError as e:
             self._pending.pop(mid, None)
-            raise CodexAppServerError(f"{method} timed out after {timeout}s") from e
+            raise CodexAppServerTransportError(
+                f"{method} timed out after {timeout}s"
+            ) from e
         except asyncio.CancelledError:
             # Ctrl-C / outer task cancel (including ``asyncio.timeout``
             # firing on the agent turn) during a pending RPC. Drop the
@@ -1023,7 +1047,7 @@ class CodexAppServerClient:
                         "codex app-server idle-timeout: codex-rs log (last entries): %s",
                         " | ".join(log_tail),
                     )
-                raise CodexAppServerError(base) from e
+                raise CodexAppServerTransportError(base) from e
             if msg.get("__closed__"):
                 raise self._closed_error or CodexAppServerConnectionClosed(
                     "codex app-server closed mid-turn"
