@@ -101,13 +101,19 @@ def _a2a_submitted_schema(payload: dict) -> dict:
         raise ValueError(
             "a2a.task_submitted payload request_content must be a string"
         )
-    # Inject the empty-string default if the caller didn't supply one. The
-    # prompt template's ``{payload[request_content]}`` placeholder requires
-    # the key to exist; without this default, any signal built by a legacy
-    # caller (test fixtures, prior code paths, external integrations) that
-    # omits the field would KeyError at render time and the cognition turn
-    # would silently never fire (codex review #1433 P2).
+    # Inject defaults for every field the prompt template indexes so any
+    # legacy caller (test fixtures, prior code paths, external
+    # integrations) building a payload with only the required keys still
+    # renders cleanly. Without this, ``Dispatcher._render_prompt()`` would
+    # KeyError on `{payload[a2a_verb]}` / `{payload[skill_id]}` /
+    # `{payload[request_content]}` for older payloads and the cognition
+    # turn would silently never fire (codex review #1433 P2 rounds 1+2).
+    # Keep this list in lockstep with the placeholders in
+    # ``prompts/signals/a2a_task_submitted.md``.
     payload.setdefault("request_content", "")
+    payload.setdefault("a2a_verb", "")
+    payload.setdefault("skill_id", "")
+    payload.setdefault("reply_expected", False)
     return payload
 
 

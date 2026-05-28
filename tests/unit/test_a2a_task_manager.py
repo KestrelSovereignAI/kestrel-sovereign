@@ -586,21 +586,26 @@ class TestA2ATaskSubmittedSignalSource:
             "placeholder always resolves. Otherwise cognition turns "
             "spawned from these signals fail silently with KeyError."
         )
-        # And the prompt template can format against it without KeyError.
+        # The schema must inject defaults for EVERY field the prompt
+        # template indexes — not just request_content. The first iteration
+        # of this test manually padded `a2a_verb`/`skill_id`/`reply_expected`
+        # which masked codex round 2 P2: legacy payloads still KeyError'd
+        # at render time. Use ONLY the schema's output here so the prompt
+        # template's full set of placeholders is exercised.
+        assert out["a2a_verb"] == ""
+        assert out["skill_id"] == ""
+        assert out["reply_expected"] is False
+
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             PROMPT_TEMPLATE,
         )
         template_text = PROMPT_TEMPLATE.read_text()
-        # Minimal smoke: format with the schema's enriched payload (+ the
-        # other variables the dispatcher provides). If anything is
-        # missing from `out` that the template needs, this raises.
-        full_payload = {**out, "a2a_verb": "", "skill_id": "", "reply_expected": False}
         template_text.format(
             source="a2a.task_submitted",
             target_agent="meridian-did",
             arrived_at="2026-05-28T20:00:00Z",
             urgency="normal",
-            payload=full_payload,
+            payload=out,
         )
 
     def test_signal_request_content_empty_when_history_absent(self):
