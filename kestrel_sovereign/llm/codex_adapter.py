@@ -38,6 +38,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from pathlib import Path
 from typing import (
     Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple, Type, Union,
@@ -311,6 +312,23 @@ def _result_to_codex_response(result: Any) -> Dict[str, Any]:
         "contentItems": [{"type": "inputText", "text": text}],
         "success": success,
     }
+
+
+_CODEX_RETRY_BASE_SECONDS = 5.0
+_CODEX_RETRY_JITTER_SECONDS = 2.0
+
+
+def _codex_retry_wait_seconds() -> float:
+    """How long ``_run_turn_with_retry`` waits between attempts.
+
+    Module-level seam: tests monkey-patch this to ``lambda: 0.0`` to
+    avoid burning real wall-clock seconds in the retry path. Production
+    returns a 5-7s jittered float — minute-scale stalls don't benefit
+    from sub-second backoff and a small jitter prevents synchronized
+    second-attempt spikes when multiple agents hit the same upstream
+    blip.
+    """
+    return _CODEX_RETRY_BASE_SECONDS + random.uniform(0, _CODEX_RETRY_JITTER_SECONDS)
 
 
 class CodexAdapter(LLMAdapter):
@@ -674,7 +692,21 @@ class CodexAdapter(LLMAdapter):
                 # transport classification so streaming.py's harness-owned
                 # check still recognizes it after the hint rewrite. See
                 # #1429.
-                raise CodexAppServerTransportError(f"{msg} — {hint}") from e
+                rewritten = CodexAppServerTransportError(f"{msg} — {hint}")
+                # Surface the cap-vs-payload determination as an
+                # attribute so ``_run_turn_with_retry`` (#1411) can gate
+                # its one-shot retry on "under cap only" without
+                # re-parsing the hint string. ONLY set the attribute
+                # when we actually have a known integer cap to compare
+                # against — leaving it unset for unknown caps means the
+                # retry wrapper's ``getattr(e, "exceeds_cap", True)``
+                # default kicks in and skips retry. Otherwise a missing
+                # ``[route_context_caps]`` entry would let us silently
+                # retry an over-cap stall and burn another 300s. Codex
+                # review round 4 caught this.
+                if isinstance(cap, int):
+                    rewritten.exceeds_cap = exceeds_cap
+                raise rewritten from e
             raise
 
     async def _run_turn(
@@ -728,6 +760,36 @@ class CodexAdapter(LLMAdapter):
         # registrations. ``setdefault`` keeps lock identity stable.
         lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
         await lock.acquire()
+
+        # Defense against concurrent same-session idle-timeout invalidation:
+        # while we were queued on this thread lock, another same-session
+        # turn may have idle-timed-out on the same thread and popped the
+        # session→thread cache in its ``except CodexAppServerTransportError``
+        # arm below. If our cached ``thread_id`` no longer matches what
+        # ``_session_threads[session_id]`` points at, the thread is hung
+        # on the remote side — running ``turn/start`` against it now
+        # would yield stale events from the failed turn or be rejected
+        # outright. Re-resolve via ``_ensure_thread`` to get a fresh
+        # thread. Repeats while a poisoned thread keeps being handed to
+        # us by a tight cascade of failures (extremely unlikely, but the
+        # while-loop costs nothing in the common no-race case).
+        # Guard on truthy ``session_id`` — empty-string session ids are
+        # treated as sessionless by ``_ensure_thread`` (it gates on
+        # ``if session_id``), so the cache is never written and this
+        # loop would spin forever rebuilding fresh threads. Codex review
+        # round 4 caught the empty-string case.
+        # See #1411 codex review rounds 3 and 4.
+        while session_id:
+            cached = self._session_threads.get(session_id)
+            if cached is not None and cached[0] == thread_id:
+                break
+            lock.release()
+            thread_id, fresh = await self._ensure_thread(
+                app, session_id, model, instructions, dyn,
+            )
+            turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
+            lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
+            await lock.acquire()
 
         # Per-turn record of every inline-executed tool call. Surfaced
         # on the final LLMResponse so the orchestrator can render
@@ -964,11 +1026,160 @@ class CodexAdapter(LLMAdapter):
                 # chat-history breadcrumbs from it.
                 "executed": list(executed_log),
             }
+        except CodexAppServerTransportError as e:
+            # Invalidate the session→thread cache BEFORE the ``finally``
+            # below releases the per-thread lock, so a same-session call
+            # queued on ``_session_locks[session_id]`` sees the popped
+            # cache and starts a fresh thread via ``_ensure_thread``.
+            # If we relied on the retry wrapper to pop after this method
+            # returns, the lock release would already have unblocked the
+            # queued caller — it could grab the still-hung thread before
+            # our pop ran. See #1411 codex review round 2.
+            #
+            # Only pop on the assistant-stage idle marker. A
+            # ``turn/start`` RPC timeout or a connection drop don't
+            # leave codex-rs with an in-flight turn on this thread;
+            # popping there would just lose conversation context for
+            # no safety gain.
+            msg = str(e)
+            # Match ``_ensure_thread``'s truthy session_id semantics —
+            # empty-string session_ids never write to ``_session_threads``,
+            # so popping them is a no-op but also signals intent.
+            if (
+                session_id
+                and "idle for" in msg
+                and "no completion" in msg
+            ):
+                self._session_threads.pop(session_id, None)
+            raise
         finally:
             app.close_turn_sink(thread_id)
             if unregister is not None:
                 unregister()
             lock.release()
+
+    async def _run_turn_with_retry(
+        self,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        session_id: Optional[str],
+        tool_executor: Optional[ToolExecutor],
+    ) -> AsyncIterator[dict]:
+        """One-shot retry around :meth:`_run_turn` for the narrow case
+        of a transient codex/ChatGPT-Plus idle stall.
+
+        Mirrors openclaw's "harness owns transport" pattern (commit
+        ``3a64dc7623`` and the per-turn watchdog work that followed):
+        a codex idle-timeout under cap is the kind of transient
+        upstream stall that one retry can recover, but escalating it
+        to a different provider would give the user a wrong-model
+        answer (the case #1431 just locked down at the streaming
+        boundary).
+
+        Retry fires only when **all** gates pass:
+
+        1. The exception is :class:`CodexAppServerTransportError`.
+        2. The message contains ``"idle for"`` *and* ``"no completion"``
+           — i.e. the assistant-stage idle watchdog tripped, not a
+           prompt-stage RPC timeout or a connection drop.
+        3. The exception's ``exceeds_cap`` attribute is ``False``.
+           Over-cap stalls are caused by the ChatGPT-Plus per-turn
+           payload limit; retry without compaction can't recover.
+        4. Zero events have been yielded to the caller on this attempt.
+           If any text / thinking / tool-call delta has already
+           reached the caller, a retry would duplicate observable
+           output — worse than failing.
+
+        Tool-bearing turns (``tools is not None``) bypass the retry
+        wrapper entirely; the safe-replay analysis for inline tool
+        execution is deferred to a future ticket per #1411 scope. The
+        wrapper then behaves exactly like ``_run_turn``.
+
+        On retry exhaustion, the second-attempt exception is augmented
+        with ``" (retried once after first idle-timeout; second attempt
+        also failed)"`` so operators can see the retry happened. The
+        transport classification and ``exceeds_cap`` attribute are
+        preserved so the streaming.py harness-owned check still kicks
+        in (#1429 contract).
+        """
+        if tools:
+            # See docstring: tool-bearing turns are outside the safe
+            # retry envelope today. Delegate straight through.
+            # Truthy gate (``if tools:``) — an empty list means the
+            # caller declared "no tools," same effect as ``None``, and
+            # the underlying turn won't be tool-bearing. Skipping
+            # retry for ``tools=[]`` would deny the one-shot recovery
+            # to callers that normalize "no tools" to an empty list.
+            # Codex review round 4 caught this.
+            async for ev in self._run_turn(
+                model, messages, tools, session_id, tool_executor,
+            ):
+                yield ev
+            return
+
+        MAX_ATTEMPTS = 2
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            events_yielded = 0
+            try:
+                async for ev in self._run_turn(
+                    model, messages, None, session_id, None,
+                ):
+                    events_yielded += 1
+                    yield ev
+                return
+            except CodexAppServerTransportError as e:
+                if attempt >= MAX_ATTEMPTS:
+                    raise self._annotate_retry_exhaustion(e) from e
+                if events_yielded > 0:
+                    raise
+                msg = str(e)
+                if "idle for" not in msg or "no completion" not in msg:
+                    raise
+                # ``exceeds_cap`` is False only when the hint-rewrite
+                # in ``_iter_with_overflow_hint`` actually ran and
+                # determined the payload is within the cap. Default
+                # to True (skip retry) when the attribute is absent —
+                # safer than retrying a stall we don't fully classify.
+                if getattr(e, "exceeds_cap", True):
+                    raise
+                # Belt-and-suspenders cache invalidation. ``_run_turn``
+                # itself pops the cache in its ``except`` arm BEFORE
+                # releasing the per-thread lock — that's the race-free
+                # invalidation point. This pop is redundant in the
+                # normal path; kept so a future refactor that drops
+                # ``_run_turn``'s pop still has the wrapper's pop as a
+                # last line of defense. Truthy guard matches
+                # ``_ensure_thread``'s ``if session_id`` gate so an
+                # empty-string id (treated as sessionless upstream)
+                # doesn't trigger a spurious pop attempt.
+                if session_id:
+                    self._session_threads.pop(session_id, None)
+                wait_s = _codex_retry_wait_seconds()
+                logger.warning(
+                    "codex idle-timeout under cap with zero events; "
+                    "retrying once on fresh thread after %.1fs "
+                    "(session=%s, model=%s)",
+                    wait_s, session_id, model,
+                )
+                await asyncio.sleep(wait_s)
+
+    @staticmethod
+    def _annotate_retry_exhaustion(
+        exc: CodexAppServerTransportError,
+    ) -> CodexAppServerTransportError:
+        """Wrap a second-attempt transport error with retry context.
+
+        Preserves the transport classification (so the streaming
+        harness-owned check still recognizes it) and the
+        ``exceeds_cap`` attribute (so any future caller-side logic
+        can read it).
+        """
+        suffix = " (retried once after first idle-timeout; second attempt also failed)"
+        annotated = CodexAppServerTransportError(f"{exc}{suffix}")
+        if hasattr(exc, "exceeds_cap"):
+            annotated.exceeds_cap = exc.exceeds_cap
+        return annotated
 
     # --------------------------------------------------------------- public API
     async def get_response(
@@ -987,8 +1198,8 @@ class CodexAdapter(LLMAdapter):
         tool_calls: Optional[List[ToolCall]] = None
         usage: Dict[str, Optional[int]] = {}
         executed: List[Dict[str, Any]] = []
-        async for ev in self._run_turn(
-            model, messages, tools, session_id, tool_executor
+        async for ev in self._run_turn_with_retry(
+            model, messages, tools, session_id, tool_executor,
         ):
             if "final" in ev:
                 content, tool_calls, usage = ev["final"]
@@ -1022,7 +1233,11 @@ class CodexAdapter(LLMAdapter):
     ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         session_id = kwargs.get("session_id")
         # Tools intentionally not passed: text-only streaming surface.
-        async for ev in self._run_turn(model, messages, None, session_id, None):
+        # Uses ``_run_turn_with_retry`` so a transient codex idle stall
+        # gets one chance to recover before the error surfaces. See #1411.
+        async for ev in self._run_turn_with_retry(
+            model, messages, None, session_id, None,
+        ):
             if "text" in ev:
                 yield ev["text"]
             elif "thinking" in ev:
