@@ -112,9 +112,35 @@ class TaskFeature(Feature):
         if not task:
             return {"ok": False, "error": f"Task {task_id} not found"}
 
+        # ``status.message`` is the AGENT'S response message (set when the
+        # receiver calls ``respond_to_a2a_task``). For a fresh inbound task
+        # it's None until the agent replies — DO NOT mistake it for the
+        # sender's question. The incoming request body lives in
+        # ``task.history[0]`` (where ``create_task`` puts ``params.message``).
+        # Surface both so the LLM inspecting an inbox task sees what was
+        # ASKED (request_content) AND what was answered if anything
+        # (status_message). Conflating the two caused #1433 — the receiver
+        # read None and concluded the body was null when in fact it just
+        # hadn't been replied to yet.
         status_message = None
         if task.status.message and task.status.message.parts:
             status_message = task.status.message.parts[0].text
+
+        request_content: Optional[str] = None
+        sender: Optional[str] = None
+        history = getattr(task, "history", None) or []
+        if history:
+            first = history[0]
+            parts = getattr(first, "parts", None) or []
+            for part in parts:
+                text = getattr(part, "text", None)
+                if isinstance(text, str) and text:
+                    request_content = text
+                    break
+        if task.metadata and isinstance(task.metadata, dict):
+            raw_sender = task.metadata.get("sender")
+            if isinstance(raw_sender, str) and raw_sender:
+                sender = raw_sender
 
         artifacts: List[Dict[str, Any]] = []
         if task.artifacts:
@@ -144,6 +170,8 @@ class TaskFeature(Feature):
             "task_id": task_id,
             "status": task.status.state.value,
             "message": status_message,
+            "request_content": request_content,
+            "sender": sender,
             "task_type": task.metadata.get("task_type") if task.metadata else None,
             "artifacts": artifacts,
             "created_at": task.id[:8],  # task ID prefix encodes timestamp
@@ -667,15 +695,33 @@ class TaskFeature(Feature):
         if not data["ok"]:
             return ToolResult.failed(data["error"])
 
+        # The confirmation must show the LLM what was ASKED (for inbound
+        # tasks awaiting a reply, this is the load-bearing fact) AND any
+        # reply that's been written. The data dict keeps both fields so
+        # downstream rendering can show either; the confirmation prefers
+        # request_content for non-terminal states and status_message for
+        # terminal ones — the actionable text on each side.
+        bits = [f"Task {task_id[:8]} status: {data['status']}"]
+        if data["sender"]:
+            bits.append(f"from {data['sender']}")
+        if data["request_content"]:
+            preview = data["request_content"]
+            if len(preview) > 200:
+                preview = preview[:197] + "..."
+            bits.append(f"request: {preview!r}")
+        if data["message"]:
+            preview = data["message"]
+            if len(preview) > 200:
+                preview = preview[:197] + "..."
+            bits.append(f"reply: {preview!r}")
         return ToolResult.ok(
-            confirmation=(
-                f"Task {task_id[:8]} status: {data['status']}"
-                + (f" — {data['message']}" if data["message"] else "")
-            ),
+            confirmation=" — ".join(bits),
             data={
                 "task_id": data["task_id"],
                 "status": data["status"],
                 "message": data["message"],
+                "request_content": data["request_content"],
+                "sender": data["sender"],
                 "task_type": data["task_type"],
                 "artifacts": data["artifacts"],
                 "created_at": data["created_at"],
@@ -742,11 +788,32 @@ class TaskFeature(Feature):
                 if task.status.message and task.status.message.parts:
                     status_msg = task.status.message.parts[0].text
 
+                # Same conflation guard as `_get_task_status_data`: surface
+                # the incoming sender content from `history[0]` so an inbox
+                # listing actually shows what was ASKED, not just the
+                # currently-empty reply slot. See #1433.
+                request_text = None
+                history = getattr(task, "history", None) or []
+                if history:
+                    parts = getattr(history[0], "parts", None) or []
+                    for part in parts:
+                        text = getattr(part, "text", None)
+                        if isinstance(text, str) and text:
+                            request_text = text
+                            break
+                sender_name = None
+                if task.metadata and isinstance(task.metadata, dict):
+                    raw_sender = task.metadata.get("sender")
+                    if isinstance(raw_sender, str) and raw_sender:
+                        sender_name = raw_sender
+
                 task_list.append({
                     "task_id": task.id,
                     "status": task.status.state.value,
                     "task_type": task.metadata.get("task_type") if task.metadata else None,
                     "message": status_msg,
+                    "request_content": request_text,
+                    "sender": sender_name,
                 })
         except Exception as e:
             logger.error(f"Failed to list tasks: {e}", exc_info=True)
@@ -814,6 +881,8 @@ class TaskFeature(Feature):
                 "task_type": data["task_type"],
                 "artifacts": data["artifacts"],
                 "message": data["message"],
+                "request_content": data["request_content"],
+                "sender": data["sender"],
             },
         )
 

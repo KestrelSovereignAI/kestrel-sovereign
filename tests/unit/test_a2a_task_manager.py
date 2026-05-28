@@ -526,6 +526,107 @@ class TestA2ATaskSubmittedSignalSource:
         reg = build_a2a_task_submitted_registration()
         reg.schema(sig.payload)  # must not raise
 
+    def test_signal_surfaces_request_content_from_history(self):
+        """#1433: the cognition prompt needs the sender's actual question
+        text inline so the receiver doesn't have to call check_task_status
+        first. Extracted from ``task.history[0].parts[0].text``."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_a2a_task_submitted_registration,
+            build_signal_for_submitted_task,
+        )
+
+        class _FakePart:
+            def __init__(self, text):
+                self.text = text
+
+        class _FakeMessage:
+            def __init__(self, text):
+                self.parts = [_FakePart(text)]
+
+        class _FakeTask:
+            id = "task-1433"
+            sessionId = "sess-1433"
+            metadata = {"sender": "emma", "a2a_verb": "question", "reply_expected": True}
+            history = [_FakeMessage("What is 2+2?")]
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="meridian-did", sender="emma",
+        )
+        assert sig.payload["request_content"] == "What is 2+2?", (
+            "The signal-source must extract the sender's question text "
+            "from history[0] and put it in payload['request_content'] so "
+            "the prompt template can render it inline. Without this, the "
+            "receiver's cognition turn only sees the task envelope and "
+            "hallucinates 'null body' — see #1433."
+        )
+        # Schema accepts the new field.
+        reg = build_a2a_task_submitted_registration()
+        reg.schema(sig.payload)
+
+    def test_schema_injects_default_request_content_for_legacy_payloads(self):
+        """Codex review #1433 P2: any legacy caller that builds a signal
+        payload without ``request_content`` (test fixtures, external
+        integrations, prior code paths) must NOT KeyError at template
+        render time. The schema injects an empty-string default so the
+        prompt's ``{payload[request_content]}`` placeholder always
+        resolves and the cognition turn fires."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_a2a_task_submitted_registration,
+        )
+        reg = build_a2a_task_submitted_registration()
+        legacy_payload = {
+            "task_id": "task-legacy",
+            "session_id": "sess-legacy",
+            "sender": "emma",
+        }
+        out = reg.schema(legacy_payload)
+        assert out["request_content"] == "", (
+            "Schema must inject an empty-string default for legacy "
+            "payloads so the prompt template's {payload[request_content]} "
+            "placeholder always resolves. Otherwise cognition turns "
+            "spawned from these signals fail silently with KeyError."
+        )
+        # The schema must inject defaults for EVERY field the prompt
+        # template indexes — not just request_content. The first iteration
+        # of this test manually padded `a2a_verb`/`skill_id`/`reply_expected`
+        # which masked codex round 2 P2: legacy payloads still KeyError'd
+        # at render time. Use ONLY the schema's output here so the prompt
+        # template's full set of placeholders is exercised.
+        assert out["a2a_verb"] == ""
+        assert out["skill_id"] == ""
+        assert out["reply_expected"] is False
+
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            PROMPT_TEMPLATE,
+        )
+        template_text = PROMPT_TEMPLATE.read_text()
+        template_text.format(
+            source="a2a.task_submitted",
+            target_agent="meridian-did",
+            arrived_at="2026-05-28T20:00:00Z",
+            urgency="normal",
+            payload=out,
+        )
+
+    def test_signal_request_content_empty_when_history_absent(self):
+        """A task with no history (edge case from legacy code paths)
+        produces an empty ``request_content`` rather than KeyError-ing.
+        The prompt template surface guards visually for empty bodies."""
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        class _FakeTask:
+            id = "task-empty"
+            sessionId = "sess-empty"
+            metadata = {"sender": "emma"}
+            history = []
+
+        sig = build_signal_for_submitted_task(
+            _FakeTask(), target_agent="meridian-did", sender="emma",
+        )
+        assert sig.payload["request_content"] == ""
+
     def test_signal_empty_a2a_verb_when_metadata_missing(self):
         """Legacy / non-PeersFeature task creators leave a2a_verb
         empty. Signal still builds; payload has empty strings rather
