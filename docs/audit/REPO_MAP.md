@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-27
-**Scope:** 1564 tracked files (1014 `.py`, 268 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-28
+**Scope:** 1569 tracked files (1019 `.py`, 268 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -108,9 +108,9 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/constitution.py** — Constitution verification and integrity checking for Kestrel Agent.
   - `class ConstitutionMixin`
 - **kestrel_sovereign/agent/context_builder.py** — Context Builder for Kestrel Agent.
-  - `def extract_raw_user_content(content)`; `class ContextBuilder`
+  - `class ContextBuilder`
 - **kestrel_sovereign/agent/context_manager.py** — Unified Context Manager for Kestrel Agent.
-  - `def get_current_injection_tracking()`; `def reset_injection_tracking()`; `class ContextResult`; `class ContextManager`
+  - `def get_current_injection_tracking()`; `def reset_injection_tracking()`; `def reset_retrieval_config_cache()`; `class ContextResult`; `class ContextManager`
 - **kestrel_sovereign/agent/conversation_manager.py** — Conversation Manager for Kestrel Agent.
   - `class ConversationManager`
 - **kestrel_sovereign/agent/doctrine_bundle.py** — Doctrine bundle hashing, anchoring, and verification.
@@ -143,6 +143,8 @@ Repo entry points and standard project files.
   - `class ToolContextManager`
 - **kestrel_sovereign/agent/tool_registry.py** — Dynamic tool registry mixin for KestrelAgent.
   - `class ToolRegistryMixin`
+- **kestrel_sovereign/agent/turn_classifier.py** — Cheap heuristic classifier for whether a user turn warrants retrieval.
+  - `def is_trivial_turn(query, min_words)`
 - **kestrel_sovereign/agent/turn_lifecycle.py** — Shared turn lifecycle for non-streaming and streaming entry points.
   - `class TurnLifecycleMixin`
 - **kestrel_sovereign/agent_config.py** — Agent Configuration Management.
@@ -701,13 +703,15 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/demo_isolation.py** — Server-side demo-mode isolation (#766).
   - `def classify_server_mode(agents)`; `async def enforce_destructive_op(request)`; `def all_destructive_endpoints_registered(routes)`
 - **kestrel_sovereign/security/encryption.py** — Unified encryption utilities for Kestrel.
+- **kestrel_sovereign/security/encryption_backfill.py** — One-shot backfill: encrypt pre-migration plaintext rows at rest (#1401).
+  - `class TableReport`; `class BackfillReport`; `def discover_agent_id(db_path)`; `def backfill_conversation_history(db_path)`; `def backfill_files(db_path)`; `def cli_run(args)`; `def backfill_all(db_path)`
 - **kestrel_sovereign/security/exceptions.py** — Unified exception hierarchy for Kestrel security module.
 - **kestrel_sovereign/security/host_key_storage.py** — Host Master Key Storage for Kestrel.
   - `class HostKeyInfo`; `class HostKeyStorage`
 - **kestrel_sovereign/security/hybrid_kem.py** — Hybrid KEM combiner — Wave 4 sub-PR 2 of Quantum Hardening (#921, #919).
   - `class HybridKEMKeypair`; `def generate_hybrid_kem_keypair()`; `class HybridKEMCiphertext`; `def encapsulate_hybrid(classical_public_key, pq_public_key)`; `def decapsulate_hybrid(ciphertext, classical_keypair, pq_keypair)`
 - **kestrel_sovereign/security/input_guardrails.py** — Prompt injection detection and input sanitization for Kestrel Agent.
-  - `def wrap_user_input(user_message)`; `def check_prompt_injection(user_message)`; `def validate_tool_arguments(tool_name, arguments, known_tools)`; `def append_security_addendum(base_system_prompt)`
+  - `def wrap_user_input(user_message)`; `def extract_raw_user_content(content)`; `def check_prompt_injection(user_message)`; `def validate_tool_arguments(tool_name, arguments, known_tools)`; `def append_security_addendum(base_system_prompt)`
 - **kestrel_sovereign/security/kem_suite.py** — KEMSuite — pluggable Key Encapsulation Mechanism suites for Kestrel.
   - `class KEMSuiteError`; `class KEMKeypair`; `class KEMSuite`; `def register_kem_suite(suite)`; `def get_kem_suite(alg_id)`; `def list_registered_kems()`; `class X25519Suite`; `class MLKEM768Suite`
 - **kestrel_sovereign/security/key_rotation.py** — Key Rotation Service
@@ -1746,6 +1750,8 @@ Repo entry points and standard project files.
 - **tests/unit/test_caller_context_endpoint_propagation.py** — Regression suite for #736 — every authenticated endpoint must pass a CallerContext into agent.process_input/process_input_streaming so that sovereign-command authorization is consistent regardless of…
   - `def test_chat_completions_propagates_sovereign_caller_from_api_key()`; `def test_bridge_invoke_propagates_sovereign_caller_from_api_key()`; `def test_bridge_stream_propagates_sovereign_caller_from_api_key()`
 - **tests/unit/test_canonical_inventory_sync.py** — (unparseable Python source)
+- **tests/unit/test_canonical_transport_split.py** — Canonical/transport split for the conversation record (#1402).
+  - `async def store()`; `class TestNewWritePath`; `class TestLazySplitMigration`; `class TestNoDoubleStamp`; `class TestSearchHistoryDoesNotMatchRetrieval`; `class TestFormatConversationHistoryReplaysVerbatim`; `class TestPrivacyModesPreserveRenderedContent`; `class TestHumanRoleStillGetsUserInputWrapper`; `…`
 - **tests/unit/test_car_builder.py** — Tests for CAR v1 builder and reader.
   - `class TestVarint`; `class TestCID`; `class TestCARBuilder`; `class TestCARReader`; `class TestCARRoundTrip`
 - **tests/unit/test_car_import_consent.py** — Unit tests for #1379 — CAR-side consent verification.
@@ -1932,6 +1938,8 @@ Repo entry points and standard project files.
   - `def test_derive_command_shell_and_compute()`; `async def test_policy_match_positive_and_scopes()`; `async def test_repo_scope_is_exact_not_substring()`; `async def test_rule_without_repo_scope_never_auto_approves()`; `def test_suggest_rule_has_trailing_boundary()`; `def test_suggest_rule_from_command_is_conservative()`; `async def store()`; `async def test_two_phase_audit(store)`; `…`
 - **tests/unit/test_encryption.py** — Unit tests for storage/encryption.py
   - `class TestGetFernet`; `class TestGetMasterKeyBytes`; `class TestGetAgentFernet`; `class TestEncryptDecryptBytes`; `class TestEncryptDecryptString`; `class TestRemoveEncFlag`; `class TestKeyVersioningIntegration`
+- **tests/unit/test_encryption_backfill.py** — Unit tests for the one-shot encryption backfill (#1401).
+  - `def data_key(monkeypatch)`; `def seeded_db(tmp_path)`; `class TestIsPlaintext`; `class TestDiscoverAgentId`; `class TestConversationHistoryBackfill`; `class TestFilesBackfill`; `class TestBackfillAll`; `class TestCliExitCode`
 - **tests/unit/test_endpoint_contract_suite.py** — Focused contract tests for weak endpoint groups.
   - `def test_database_tables_endpoint_returns_shape_from_storage()`; `def test_files_head_uses_existence_check_contract()`; `def test_observability_events_endpoint_returns_serialized_events()`; `def test_saved_items_structured_endpoint_uses_store_contract()`; `def test_openai_compatible_endpoints_return_minimal_contracts()`; `def test_v1_models_reports_mandated_model_not_provider_default()`; `def test_chat_completions_reports_active_model_not_request_echo()`; `def test_chat_completions_preserves_503_when_no_agent_bound()`; `…`
 - **tests/unit/test_endpoint_contracts.py** — —
@@ -2170,6 +2178,8 @@ Repo entry points and standard project files.
   - `def slh_kp()`; `def slh_pub_multibase(slh_kp)`; `def ed_kp()`; `def base_manifest()`; `def signed_manifest(base_manifest, slh_kp)`; `def test_new_manifest_requires_release_tag()`; `def test_new_manifest_default_released_at_is_utc()`; `def test_naive_released_at_rejected()`; `…`
 - **tests/unit/test_release_signing_key_loader.py** — Tests for ``scripts/release/load_signing_key_from_env.py`` — Wave 5 sub-PR 3 (#920).
   - `def test_loader_happy_path(tmp_path, monkeypatch)`; `def test_loader_rejects_wrong_length_secret(tmp_path)`; `def test_loader_rejects_wrong_length_public(tmp_path)`; `def test_loader_rejects_mismatched_pair(tmp_path)`; `def test_loader_rejects_empty_secret_env(tmp_path)`; `def test_loader_rejects_malformed_base64(tmp_path)`
+- **tests/unit/test_relevance_gate.py** — Relevance gate on memory + RAG retrieval (#1404).
+  - `class TestTurnClassifierTrivialCases`; `class TestTurnClassifierSubstantiveCases`; `class TestRetrievalConfigDefaults`; `class TestRAGMinScoreFilter`; `class TestContextManagerSkipsRetrievalForTrivialTurns`
 - **tests/unit/test_remote_gpu_mandate_gate.py** — Regression suite for #734 — remote-GPU shortcut must honor the mandate.
   - `def test_remote_first_allowed_with_no_mandate_and_no_override()`; `def test_remote_first_allowed_with_bare_model_override()`; `def test_remote_first_allowed_rejects_vendor_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_route_prefixed_override()`; `def test_remote_first_allowed_rejects_vendor_selector_without_slash()`; `def test_remote_first_allowed_rejects_mandate_with_vendor()`; `def test_remote_first_allowed_rejects_mandate_with_route()`; `def test_remote_first_allowed_with_model_only_mandate()`; `…`
 - **tests/unit/test_rename_command.py** — Unit tests for the rename command.
