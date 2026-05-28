@@ -11,6 +11,7 @@ import pytest
 from kestrel_sovereign.llm.codex_app_server import (
     MIN_CODEX_APP_SERVER_VERSION,
     CodexAppServerClient,
+    CodexAppServerConnectionClosed,
     CodexAppServerError,
     _parse_user_agent_version,
     _version_tuple,
@@ -289,6 +290,94 @@ class TestInvoluntaryExitRecovery:
     error until kestrel itself was restarted — observed live when
     codex panicked on ``spawn_agent`` namespace collision (#1334
     follow-up; see commit history)."""
+
+    @pytest.mark.asyncio
+    async def test_read_loop_exit_does_not_leak_stderr_to_exception(self, caplog):
+        """#1412: when codex-rs exits, the stderr ring buffer is logged
+        server-side at ERROR level but kept OUT of the
+        ``CodexAppServerConnectionClosed`` text. Same leak boundary as
+        the idle-timeout path established in #1410 — the exception
+        propagates to chat callers (via ``_fail_all`` -> pending
+        futures and ``endpoints/agent.py``), so cross-session stderr
+        content must not surface in the user-visible error.
+        """
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._proc = MagicMock()
+        c._proc.returncode = 137  # OOM-kill style code, distinctive
+        c._proc.stdout = _AsyncIterableMock([])
+
+        async def _fake_wait():
+            return 137
+        c._proc.wait = _fake_wait
+
+        c._initialized = True
+        # Pending future will receive the exception via _fail_all.
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        pending_fut = loop.create_future()
+        c._pending = {1: pending_fut}
+        c._turn_sinks = {}
+        c._stderr_tail = [
+            "TRACE codex_protocol: prior session token=secret_xyz",
+            "INFO  codex_login: auth refreshed for user_42",
+        ]
+        c._closed_error = None
+
+        import logging
+        caplog.set_level(logging.ERROR, logger="kestrel_sovereign.llm.codex_app_server")
+        await c._read_loop()
+
+        # Exception text is framework-owned: rc + nothing else.
+        with pytest.raises(CodexAppServerConnectionClosed) as ei:
+            pending_fut.result()
+        msg = str(ei.value)
+        assert msg == "codex app-server exited (rc=137)"
+        # The stderr lines must NOT have leaked into the chat-facing text.
+        assert "secret_xyz" not in msg
+        assert "user_42" not in msg
+        assert "auth refreshed" not in msg
+
+        # The same lines DO appear in server logs for operator diagnosis.
+        log_text = " ".join(rec.message for rec in caplog.records)
+        assert "secret_xyz" in log_text
+        assert "auth refreshed" in log_text
+        assert "rc=137" in log_text
+
+    @pytest.mark.asyncio
+    async def test_read_loop_exit_with_no_stderr_emits_no_diagnostic_log(self, caplog):
+        """Negative case: when the ring buffer is empty, no stderr-tail
+        log line fires — keeps the happy-path log surface clean."""
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._proc = MagicMock()
+        c._proc.returncode = 0
+        c._proc.stdout = _AsyncIterableMock([])
+
+        async def _fake_wait():
+            return 0
+        c._proc.wait = _fake_wait
+
+        c._initialized = True
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        pending_fut = loop.create_future()
+        c._pending = {1: pending_fut}
+        c._turn_sinks = {}
+        c._stderr_tail = []
+        c._closed_error = None
+
+        import logging
+        caplog.set_level(logging.ERROR, logger="kestrel_sovereign.llm.codex_app_server")
+        await c._read_loop()
+
+        # Exception still raises cleanly with rc.
+        with pytest.raises(CodexAppServerConnectionClosed) as ei:
+            pending_fut.result()
+        assert str(ei.value) == "codex app-server exited (rc=0)"
+        # No "exit stderr tail" log line when there's nothing to report.
+        diag_records = [
+            r for r in caplog.records if "exit stderr tail" in r.message
+        ]
+        assert diag_records == []
 
     @pytest.mark.asyncio
     async def test_read_loop_exit_resets_initialized_and_proc(self):

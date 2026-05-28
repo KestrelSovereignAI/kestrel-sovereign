@@ -685,11 +685,23 @@ class CodexAppServerClient:
                     )
                 except (asyncio.TimeoutError, ProcessLookupError):
                     rc_value = self._proc.returncode
+            # Diagnostic tail goes to server logs only (#1412). Mirrors
+            # the leak boundary established for the idle-timeout path in
+            # #1410: ``CodexAppServerConnectionClosed`` propagates to
+            # chat callers via ``endpoints/agent.py`` and
+            # ``_fail_all`` -> pending futures, so the stderr buffer can
+            # carry content from prior turns / other agents sharing
+            # CODEX_HOME and must not leak into the user-visible
+            # exception text.
             tail = "\n".join(self._stderr_tail[-10:])
+            if tail:
+                logger.error(
+                    "codex app-server exit stderr tail (rc=%s):\n%s",
+                    rc_value, tail,
+                )
             self._fail_all(
                 CodexAppServerConnectionClosed(
                     f"codex app-server exited (rc={rc_value})"
-                    + (f": {tail}" if tail else "")
                 )
             )
             # Reset connection state so the NEXT request can spawn a
