@@ -27,7 +27,8 @@ from kestrel_sdk.signals import (
 
 SOURCE_NAME = "heartbeat"
 PROMPT_TEMPLATE = (
-    Path(__file__).resolve().parents[3] / "prompts" / "signals" / "heartbeat.md"
+    # Inside the package (#1415); see a2a.py for the full rationale.
+    Path(__file__).resolve().parents[2] / "prompts" / "signals" / "heartbeat.md"
 )
 
 

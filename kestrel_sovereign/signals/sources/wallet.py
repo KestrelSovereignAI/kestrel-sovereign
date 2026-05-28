@@ -65,7 +65,8 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "webhook.stripe.deposit_complete"
 PROMPT_TEMPLATE = (
-    Path(__file__).resolve().parents[3]
+    # Inside the package (#1415); see a2a.py for the full rationale.
+    Path(__file__).resolve().parents[2]
     / "prompts" / "signals" / "webhook_stripe_deposit.md"
 )
 
