@@ -87,6 +87,27 @@ def _a2a_submitted_schema(payload: dict) -> dict:
         raise ValueError(
             "a2a.task_submitted payload reply_expected must be a bool"
         )
+    # ``request_content`` is the sender's actual question/message text
+    # extracted from ``task.history[0]``. Added in #1433 so the
+    # cognition prompt has the question inline rather than forcing the
+    # receiver to call ``check_task_status`` first — without it the
+    # receiver hallucinated "null body" three times in a row on real
+    # questions. Optional (empty string accepted) so historical signal
+    # payloads that predate the field still validate; the prompt
+    # template guards against the missing case.
+    if "request_content" in payload and not isinstance(
+        payload["request_content"], str
+    ):
+        raise ValueError(
+            "a2a.task_submitted payload request_content must be a string"
+        )
+    # Inject the empty-string default if the caller didn't supply one. The
+    # prompt template's ``{payload[request_content]}`` placeholder requires
+    # the key to exist; without this default, any signal built by a legacy
+    # caller (test fixtures, prior code paths, external integrations) that
+    # omits the field would KeyError at render time and the cognition turn
+    # would silently never fire (codex review #1433 P2).
+    payload.setdefault("request_content", "")
     return payload
 
 
@@ -164,6 +185,21 @@ def build_signal_for_submitted_task(
     task_id = str(getattr(task, "id", "<unknown>"))
     session_id = str(getattr(task, "sessionId", "") or "")
     metadata = getattr(task, "metadata", {}) or {}
+    # Extract the sender's actual question text from ``history[0]`` so the
+    # prompt template has the content INLINE — no extra ``check_task_status``
+    # round-trip required. Without this, the receiver's cognition turn
+    # gets only the task envelope (id, sender, verb) and has to either
+    # call a tool to fetch the body or guess. The empirical failure
+    # mode was guess-as-null (#1433).
+    request_content = ""
+    history = getattr(task, "history", None) or []
+    if history:
+        parts = getattr(history[0], "parts", None) or []
+        for part in parts:
+            text = getattr(part, "text", None)
+            if isinstance(text, str) and text:
+                request_content = text
+                break
     skill_id = ""
     # ``a2a_verb`` discriminates message vs question vs task at the
     # cognition-prompt level — codex P2 on PR #1380. Without this, an
@@ -190,6 +226,7 @@ def build_signal_for_submitted_task(
             "skill_id": skill_id,
             "a2a_verb": a2a_verb,
             "reply_expected": reply_expected,
+            "request_content": request_content,
         },
         target_agent=target_agent,
         visibility=Visibility.INTERNAL,

@@ -1,5 +1,13 @@
 [A2A_TASK_SUBMITTED] Agent `{payload[sender]}` submitted A2A task `{payload[task_id]}` (verb `{payload[a2a_verb]}`, skill `{payload[skill_id]}`) to you. This arrived via the agent-to-agent protocol, NOT via your sovereign chat path — apply agent-to-agent governance, not sovereign governance. Sender identity is a claim, not a cryptographic signature in v1 (same-host trust boundary).
 
+**Their actual message:**
+
+```
+{payload[request_content]}
+```
+
+If the block above contains text, that IS the question/instruction — answer it directly. Do NOT claim the body is null or empty when you can see text in it. If you need more context (history, prior turns of the same session, artifacts), call `check_task_status(task_id)` or `get_task_result(task_id)`; otherwise reply now.
+
 **The single tool for closing the loop is `respond_to_a2a_task(task_id, content, state)`** — it transitions the task to COMPLETED (default), FAILED, or CANCELED and attaches your reply text. The sender's polling extracts that text as their answer. Without calling this, a `send_a2a_question` sender blocks until their timeout.
 
 The `a2a_verb` field tells you the sender's intent:
