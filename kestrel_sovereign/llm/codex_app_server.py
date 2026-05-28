@@ -177,6 +177,11 @@ class CodexAppServerClient:
             Tuple[str, Optional[str]], ServerRequestHandler
         ] = {}
         self._stderr_tail: list[str] = []
+        # Resolved CODEX_HOME path used by ``_spawn`` (#1410). Captured at
+        # spawn time so accessors (``recent_codex_log``) can query the
+        # codex-rs internal log DB at ``<CODEX_HOME>/logs_2.sqlite``
+        # without recomputing the path resolution.
+        self._codex_home: Optional[Path] = None
         self._closed_error: Optional[BaseException] = None
         self._start_lock = asyncio.Lock()
         self._initialized = False
@@ -206,6 +211,9 @@ class CodexAppServerClient:
         # symlinking auth.json so the subscription sign-in still works.
         kestrel_codex_home = Path.home() / ".kestrel" / "codex-home"
         kestrel_codex_home.mkdir(parents=True, exist_ok=True)
+        # Capture for diagnostic accessors (#1410). Read on error paths
+        # to surface the codex-rs internal log alongside our stderr tail.
+        self._codex_home = kestrel_codex_home
         # Source the user's REAL codex home from the environment when set
         # (e.g. operator overrode ``CODEX_HOME``), not the default
         # ``~/.codex``. Without this an operator on a non-default codex
@@ -887,6 +895,68 @@ class CodexAppServerClient:
     def close_turn_sink(self, key: Any) -> None:
         self._turn_sinks.pop(key, None)
 
+    # ------------------------------------------------------- diagnostics (#1410)
+    def recent_stderr(self, n: int = 10) -> list[str]:
+        """Return the last ``n`` lines of captured codex-rs stderr.
+
+        Drained live into a 40-line ring buffer by ``_drain_stderr``;
+        this accessor exposes a snapshot for error-path callers (e.g.
+        the idle-timeout branch of ``iter_turn_events``). Returns an
+        empty list when nothing has been captured.
+        """
+        if not self._stderr_tail:
+            return []
+        return list(self._stderr_tail[-n:])
+
+    def recent_codex_log(self, n: int = 30) -> list[str]:
+        """Tail the last ``n`` rows of codex-rs's internal log DB (#1410).
+
+        codex-rs writes structured logs to ``<CODEX_HOME>/logs_2.sqlite``
+        via sqlx — schema: ``logs(id, ts, ts_nanos, level, target,
+        feedback_log_body, module_path, file, line, thread_id)``. On
+        any ``CodexAppServerError`` this is the most reliable place to
+        find the codex-side root cause (upstream RPC error, auth
+        refresh failure, websocket close, etc.) — our stderr tail only
+        sees what codex-rs explicitly prints, not what it logs.
+
+        Defensive on every failure mode: missing CODEX_HOME, missing
+        DB file, schema drift, locked DB, oversize DB, anything else
+        — returns ``[]`` rather than raising. This is an error-path
+        helper; it must never compound the failure it's reporting on.
+        """
+        if not self._codex_home:
+            return []
+        db_path = self._codex_home / "logs_2.sqlite"
+        if not db_path.is_file():
+            return []
+        try:
+            import sqlite3
+            # Open read-only with a 1s busy timeout so we never block the
+            # error path on a long-held codex-rs writer lock. URI mode
+            # gives us ``mode=ro`` which won't create the DB if missing.
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro", uri=True, timeout=1.0,
+            )
+            try:
+                cur = conn.execute(
+                    "SELECT ts, level, target, feedback_log_body "
+                    "FROM logs ORDER BY id DESC LIMIT ?",
+                    (max(1, n),),
+                )
+                rows = cur.fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("recent_codex_log query failed: %s", e)
+            return []
+        # Restore chronological order (oldest → newest) for human
+        # readability and format compactly. Body may be NULL.
+        lines: list[str] = []
+        for ts, level, target, body in reversed(rows):
+            piece = (body or "").strip().replace("\n", " ")
+            lines.append(f"[{ts} {level} {target}] {piece}"[:500])
+        return lines
+
     async def iter_turn_events(
         self, sink: "asyncio.Queue[dict]", *, idle_timeout: float = 300
     ) -> "asyncio.AsyncIterator[dict]":
@@ -896,14 +966,32 @@ class CodexAppServerClient:
         tool callback (e.g. one waiting on kestrel's approval queue)
         doesn't trip the local watchdog before the app-server's own
         server-request timeout fires.
+
+        On idle-timeout (#1410) the error message is augmented with
+        the most recent codex-rs stderr lines AND a tail of codex-rs's
+        internal sqlite log — same data the on-exit path surfaces, so
+        the operator sees what codex-rs actually thought happened
+        upstream instead of just "idle for Ns".
         """
         while True:
             try:
                 msg = await asyncio.wait_for(sink.get(), timeout=idle_timeout)
             except asyncio.TimeoutError as e:
-                raise CodexAppServerError(
-                    f"codex turn idle for {idle_timeout}s with no completion"
-                ) from e
+                base = f"codex turn idle for {idle_timeout}s with no completion"
+                pieces = [base]
+                stderr_tail = self.recent_stderr(10)
+                if stderr_tail:
+                    pieces.append(
+                        "codex stderr (last lines): "
+                        + " | ".join(stderr_tail)
+                    )
+                log_tail = self.recent_codex_log(30)
+                if log_tail:
+                    pieces.append(
+                        "codex-rs log (last entries): "
+                        + " | ".join(log_tail)
+                    )
+                raise CodexAppServerError(" — ".join(pieces)) from e
             if msg.get("__closed__"):
                 raise self._closed_error or CodexAppServerConnectionClosed(
                     "codex app-server closed mid-turn"
