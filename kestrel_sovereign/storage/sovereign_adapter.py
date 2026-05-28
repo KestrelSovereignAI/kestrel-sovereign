@@ -964,13 +964,26 @@ class SovereignStorageAdapter:
             except Exception:
                 link_obj = None
             if isinstance(link_obj, dict) and "link" in link_obj:
-                # Phase-2 follow-up will fetch via the filecoin
-                # adapter; for now, skip with a structured reason.
-                skipped.append({
-                    "asset_key": asset.asset_key,
-                    "asset_type": asset.asset_type,
-                    "reason": "external_ref_not_yet_supported",
-                })
+                # Phase-2 (#1438): fetch the external blob via the
+                # filecoin adapter and hand it to the restorer. The
+                # CAR-side block held only a link, so the bytes the
+                # restorer receives are the external IPFS content
+                # itself (caller's own encryption scheme, if any —
+                # the adapter doesn't second-guess).
+                payload, fetch_reason = await self._fetch_external_ref_bytes(
+                    link_obj["link"],
+                )
+                if payload is None:
+                    skipped.append({
+                        "asset_key": asset.asset_key,
+                        "asset_type": asset.asset_type,
+                        "reason": fetch_reason,
+                    })
+                    continue
+                for r in restorers:
+                    grouped.setdefault(
+                        (id(r), asset.asset_type), [],
+                    ).append((asset, payload))
                 continue
 
             keyring_key_hex = keyring.get(f"asset_{asset.asset_key}")
@@ -1018,6 +1031,58 @@ class SovereignStorageAdapter:
             )
 
         return payload_counts, skipped
+
+    async def _fetch_external_ref_bytes(
+        self, link: Any,
+    ) -> Tuple[Optional[bytes], str]:
+        """Resolve an external-ref CBOR tag-42 link to its IPFS bytes.
+
+        Returns ``(payload, reason)``. ``payload`` is ``None`` when
+        the link is malformed or the fetch fails; ``reason`` is the
+        structured skip code surfaced on
+        ``asset_payloads_skipped``. ``payload`` is the raw bytes the
+        downstream restorer receives — the convergent keyring isn't
+        consulted because external-ref content was never encrypted by
+        the source adapter (the caller either pre-encrypted before
+        uploading to IPFS, or stored it plaintext on a tier where
+        confidentiality lives at the storage layer).
+        """
+        # cbor2 + CID helpers are local imports — they're transitive
+        # car_builder deps already present at module load; keeping
+        # them inline here makes the asset-restorer module-graph
+        # self-contained and avoids polluting the top-level imports.
+        import cbor2
+        from kestrel_sovereign.storage.car_builder import cid_bytes_to_string
+
+        if not isinstance(link, cbor2.CBORTag) or link.tag != 42:
+            return None, "external_ref_malformed_link"
+
+        raw = link.value
+        if not isinstance(raw, (bytes, bytearray)):
+            return None, "external_ref_malformed_link"
+
+        # dag-cbor CID links wrap the CID bytes with a leading 0x00
+        # multibase identity prefix (per the dag-cbor spec). Strip it
+        # if present; otherwise assume raw is already the CID bytes.
+        cid_bytes = bytes(raw[1:]) if raw[:1] == b"\x00" else bytes(raw)
+
+        try:
+            cid_str = cid_bytes_to_string(cid_bytes)
+        except Exception as e:
+            return None, f"external_ref_malformed_link: {e}"
+
+        try:
+            payload = await asyncio.to_thread(
+                self.adapter.retrieve_content,
+                content_hash=cid_str,
+                ipfs_cid=cid_str,
+            )
+        except Exception as e:
+            return None, f"external_ref_fetch_failed: {e}"
+
+        if not isinstance(payload, (bytes, bytearray)):
+            return None, "external_ref_fetch_failed: non-bytes payload"
+        return bytes(payload), "external_ref_fetched"
 
     # ------------------------------------------------------------------
     # Append-only import audit log
