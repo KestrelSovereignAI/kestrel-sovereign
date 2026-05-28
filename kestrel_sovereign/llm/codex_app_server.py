@@ -894,6 +894,20 @@ class CodexAppServerClient:
         except asyncio.TimeoutError as e:
             self._pending.pop(mid, None)
             raise CodexAppServerError(f"{method} timed out after {timeout}s") from e
+        except asyncio.CancelledError:
+            # Ctrl-C / outer task cancel (including ``asyncio.timeout``
+            # firing on the agent turn) during a pending RPC. Drop the
+            # mid from ``_pending`` so a late-arriving response from
+            # the app-server doesn't try to resolve a dead future and
+            # so the dict doesn't grow for the life of the process.
+            # Re-raise the original ``CancelledError`` to preserve
+            # cooperative cancellation — converting to a typed error
+            # here would prevent ``asyncio.timeout`` from rewriting
+            # the cancel into ``TimeoutError``. The user-facing
+            # "openai:plan login cancelled" message is the outer
+            # agent-error formatter's job, not this layer's. See #1421.
+            self._pending.pop(mid, None)
+            raise
 
     def notify(self, method: str, params: Optional[dict] = None) -> None:
         self._send({"method": method, "params": params or {}})
