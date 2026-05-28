@@ -49,7 +49,8 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "a2a.task_submitted"
 PROMPT_TEMPLATE = (
-    Path(__file__).resolve().parents[3]
+    # Inside the package (#1415); see a2a.py for the full rationale.
+    Path(__file__).resolve().parents[2]
     / "prompts" / "signals" / "a2a_task_submitted.md"
 )
 

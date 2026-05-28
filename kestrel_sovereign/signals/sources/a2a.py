@@ -44,7 +44,14 @@ logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "a2a.task_complete"
 PROMPT_TEMPLATE = (
-    Path(__file__).resolve().parents[3]
+    # Inside the package (#1415). ``parents[2]`` resolves to
+    # ``<package>/kestrel_sovereign/`` so the template ships with the
+    # wheel; ``parents[3]`` pointed at the repo root, which only
+    # worked from a source checkout and silently failed on every PyPI
+    # install — every COGNITION wake-up using this source raised
+    # FileNotFoundError in ``_render_prompt`` and the recipient agent
+    # was never woken.
+    Path(__file__).resolve().parents[2]
     / "prompts" / "signals" / "a2a_task_complete.md"
 )
 METADATA_KEY = "causation_chain"
