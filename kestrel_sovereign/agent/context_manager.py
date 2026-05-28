@@ -798,8 +798,24 @@ class ContextManager:
             history_max_tokens = budget.effective_budget("history")
         else:
             history_max_tokens = budget.history
+        # Lumpy anchor (#1430): pre-slice history so the prefix we send
+        # is byte-stable across multiple turns of growth. Without this,
+        # ``format_conversation_history`` re-anchors from the newest
+        # end every turn once total history exceeds ``max_tokens``,
+        # shifting the bytes at ``messages[-2]`` / ``messages[-4]`` and
+        # invalidating Anthropic's position-indexed cache markers on
+        # every request.
+        anchor = self._lumpy_anchor(history, history_max_tokens)
+        anchored_history = history[anchor:] if anchor > 0 else history
+        if anchor > 0:
+            logger.info(
+                "lumpy anchor dropped %d oldest messages (kept %d) for "
+                "cache-stable prefix",
+                anchor,
+                len(anchored_history),
+            )
         formatted_history = self.context_builder.format_conversation_history(
-            history=history,
+            history=anchored_history,
             max_tokens=history_max_tokens,
         )
         history_tokens = self.counter.count_messages(formatted_history)
@@ -1206,11 +1222,71 @@ class ContextManager:
     # would prune ~one turn's tokens every turn and invalidate the
     # ``messages[-2]``/``[-4]`` cache markers on every request (see
     # ``project_anthropic_cache_markers.md``). Override with
-    # ``KESTREL_PRUNE_TARGET_FRAC``; clamped to (0.0, 1.0].
-    PRUNE_TARGET_FRAC = max(
-        0.05,
-        min(1.0, float(os.environ.get("KESTREL_PRUNE_TARGET_FRAC", "0.75"))),
+    # ``KESTREL_PRUNE_TARGET_FRAC``; bad/out-of-range values fall back
+    # to the default rather than crashing the import.
+    @staticmethod
+    def _resolve_prune_target_frac(raw: Optional[str], default: float = 0.75) -> float:
+        if raw is None:
+            return default
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "KESTREL_PRUNE_TARGET_FRAC=%r is not a number — using default %.2f",
+                raw,
+                default,
+            )
+            return default
+        return max(0.05, min(1.0, value))
+
+    PRUNE_TARGET_FRAC = _resolve_prune_target_frac.__func__(
+        os.environ.get("KESTREL_PRUNE_TARGET_FRAC")
     )
+
+    def _lumpy_anchor(
+        self,
+        history: List[Dict[str, Any]],
+        max_tokens: int,
+    ) -> int:
+        """Compute the oldest-message index to KEEP for a cache-stable
+        history window.
+
+        When the full history fits the ceiling, returns 0 (include all).
+        When it doesn't, advances the anchor in chunks of
+        ``(1 - PRUNE_TARGET_FRAC) * max_tokens`` so the anchor stays put
+        across multiple turns of growth before jumping forward. That
+        hysteresis is the whole point: the prefix at ``messages[-2]`` /
+        ``messages[-4]`` is byte-stable across the turns between anchor
+        jumps, so Anthropic's position-indexed cache markers compound
+        (see ``project_anthropic_cache_markers.md``).
+
+        Counts are approximate — based on raw ``content`` plus a 4-token
+        overhead. ``format_conversation_history`` applies its own
+        per-message cap as a defensive net if the slice still overshoots
+        after sent-form/wrapping expansion.
+        """
+        if not history or max_tokens <= 0:
+            return 0
+        msg_tokens = [
+            self.counter.count(m.get("content", "") or "") + 4 for m in history
+        ]
+        total = sum(msg_tokens)
+        if total <= max_tokens:
+            return 0
+        chunk = max(1, int(max_tokens * (1.0 - self.PRUNE_TARGET_FRAC)))
+        overage = total - max_tokens
+        # Round drop UP to the next chunk boundary so the anchor only
+        # advances in lumpy steps. Between steps, overage growth within
+        # a chunk's worth of tokens leaves the anchor untouched.
+        import math
+        chunks = max(1, math.ceil(overage / chunk))
+        target_drop = chunks * chunk
+        dropped = 0
+        anchor = 0
+        while anchor < len(history) - 1 and dropped < target_drop:
+            dropped += msg_tokens[anchor]
+            anchor += 1
+        return anchor
 
     def _lumpy_prune_history(
         self,
@@ -1219,19 +1295,19 @@ class ContextManager:
     ) -> int:
         """Drop oldest history down to ``PRUNE_TARGET_FRAC`` of the budget.
 
-        Just-enough-to-fit pruning sheds ~one turn of tokens every turn
-        once history sits at the budget ceiling, which invalidates the
-        ``messages[-2]`` / ``messages[-4]`` Anthropic cache markers on
-        every request. Dropping to a lumpy target instead buys multiple
-        cache-warm turns between prune events.
+        Defensive safety net for the rare case where total budget
+        accounting overshoots after all sections have sized (e.g. when
+        ``ElasticTokenBudget.use`` returns False without recording). The
+        primary cache-stable path is ``_lumpy_anchor`` running before
+        ``format_conversation_history``.
 
         Mutates ``formatted_history`` in place, updates ``budget``'s
         ``history`` allocation, and returns the total tokens dropped.
-        Always keeps at least one message so the LLM call has a current
-        turn to respond to.
+        Will drain the list if necessary; the current user turn is
+        appended downstream by the caller, not held in this list.
         """
         overage = budget.total_used - budget.total_budget
-        if overage <= 0 or len(formatted_history) <= 1:
+        if overage <= 0 or not formatted_history:
             return 0
         target_total = int(budget.total_budget * self.PRUNE_TARGET_FRAC)
         target_drop = max(overage, budget.total_used - target_total)
@@ -1243,7 +1319,7 @@ class ContextManager:
             target_drop,
         )
         pruned_tokens = 0
-        while len(formatted_history) > 1 and pruned_tokens < target_drop:
+        while formatted_history and pruned_tokens < target_drop:
             dropped = formatted_history.pop(0)
             dropped_tokens = self.counter.count(dropped.get("content", "") or "") + 4
             pruned_tokens += dropped_tokens
