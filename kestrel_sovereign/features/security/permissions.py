@@ -10,6 +10,7 @@ This module provides SQLite-backed storage for tool permissions with:
 
 import aiosqlite
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -81,6 +82,55 @@ class FeaturePermissions:
             return f"{level.value}_all"
 
         return "mixed"
+
+
+def _snake_case(name: str) -> str:
+    """Convert PascalCase to snake_case the same way `Feature.tool_name` does.
+    Used at the storage boundary to look up legacy rows under both casings.
+    """
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+
+
+def _pascal_case(name: str) -> str:
+    """Best-effort inverse of ``_snake_case`` for the common snake form
+    ``word_word_word``: capitalize each underscored part and concatenate.
+
+    Lossy: e.g. ``m_c_p_agent`` → ``MCPAgent`` (correct round-trip) and
+    ``mcp_agent`` → ``McpAgent`` (NOT the original class name, but still
+    fine — that class name doesn't exist in the codebase anyway). Used
+    only for the lookup-time variant search; we don't write under this
+    form, so any oddness stays at read-time only."""
+    if "_" not in name:
+        return name
+    parts = [p for p in name.split("_") if p]
+    if not parts:
+        return name
+    return "".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def _name_variants(name: str) -> set[str]:
+    """Return the set of feature_name strings to try at lookup time:
+    the input, its snake form, and a candidate PascalCase form. See the
+    detailed rationale on `_lookup_rows` for why we accept both."""
+    return {name, _snake_case(name), _pascal_case(name)}
+
+
+# Permissive-wins ordering. ALLOW/AUTO beat ASK/SESSION beat DENY-not-found.
+# DENY is a hard stop and only "wins" when it's the only thing on the row —
+# if any matching row says ALLOW the operator's grant is honored. This is
+# the same intent encoded in the global Auto-mode short-circuit, kept
+# consistent at the per-row level.
+_PERMISSIVENESS = {
+    PermissionLevel.ALLOW: 4,
+    PermissionLevel.AUTO: 3,
+    PermissionLevel.SESSION: 2,
+    PermissionLevel.ASK: 1,
+    PermissionLevel.DENY: 0,
+}
+
+
+def _most_permissive(levels: List["PermissionLevel"]) -> "PermissionLevel":
+    return max(levels, key=lambda level: _PERMISSIVENESS.get(level, 0))
 
 
 class PermissionStore:
@@ -213,6 +263,99 @@ class PermissionStore:
         self._initialized = True
         logger.info("PermissionStore initialized")
 
+    async def migrate_legacy_feature_aliases(
+        self,
+        aliases: Dict[str, str],
+    ) -> int:
+        """One-time consolidation of legacy snake_case/alias rows into
+        ``feature.name`` (PascalCase) rows.
+
+        Different code paths historically wrote ``security_permissions``
+        under different feature_name conventions: the subagent path used
+        ``feature.name`` (class name, e.g. ``ComputerUseFeature``); the
+        direct-tool path used ``feature.tool_name`` (snake-case alias,
+        e.g. ``computer_use``); the operator's ``!security-set`` call used
+        whatever the user typed. The orchestrator now normalizes to
+        PascalCase (#1427), but agents already in operation have months of
+        snake-rowed grants the operator intended to keep.
+
+        This migration copies the more permissive of any (alias, tool)
+        row pair into the (PascalCase, tool) row, preserving operator
+        intent. The alias rows themselves are kept (audit trail) so a
+        rollback can re-read them; lookups now resolve via the canonical
+        PascalCase row.
+
+        Args:
+            aliases: Mapping of ``feature.tool_name`` → ``feature.name``,
+                built from the loaded feature registry. The caller (agent
+                init) supplies this — the store has no knowledge of which
+                Feature classes are loaded.
+
+        Returns:
+            Number of (feature, tool) pairs whose canonical row was
+            upserted from a more-permissive alias row.
+        """
+        if not aliases:
+            return 0
+        upserts = 0
+        async with aiosqlite.connect(self.db_path) as db:
+            for alias, canonical in aliases.items():
+                if alias == canonical:
+                    continue
+                cursor = await db.execute(
+                    "SELECT tool_name, level FROM security_permissions "
+                    "WHERE feature_name = ?",
+                    (alias,),
+                )
+                alias_rows = await cursor.fetchall()
+                if not alias_rows:
+                    continue
+                for tool_name, raw_level in alias_rows:
+                    try:
+                        alias_level = PermissionLevel(raw_level)
+                    except ValueError:
+                        continue
+                    cursor = await db.execute(
+                        "SELECT level FROM security_permissions "
+                        "WHERE feature_name = ? AND tool_name = ?",
+                        (canonical, tool_name),
+                    )
+                    row = await cursor.fetchone()
+                    if row:
+                        try:
+                            existing = PermissionLevel(row[0])
+                        except ValueError:
+                            existing = PermissionLevel.ASK
+                        winner = _most_permissive([existing, alias_level])
+                        if winner == existing:
+                            continue
+                        await db.execute(
+                            "UPDATE security_permissions SET level = ?, "
+                            "updated_at = CURRENT_TIMESTAMP "
+                            "WHERE feature_name = ? AND tool_name = ?",
+                            (winner.value, canonical, tool_name),
+                        )
+                    else:
+                        await db.execute(
+                            "INSERT INTO security_permissions "
+                            "(feature_name, tool_name, level, reason) "
+                            "VALUES (?, ?, ?, ?)",
+                            (
+                                canonical,
+                                tool_name,
+                                alias_level.value,
+                                f"Migrated from legacy alias '{alias}' (#1427)",
+                            ),
+                        )
+                    upserts += 1
+            await db.commit()
+        if upserts:
+            logger.info(
+                "Permission alias migration: %d row(s) consolidated into "
+                "canonical PascalCase rows.", upserts,
+            )
+        return upserts
+
     async def get_permission(
         self,
         feature_name: str,
@@ -243,19 +386,28 @@ class PermissionStore:
                 return PermissionLevel.AUTO
             return level
 
-        # Check persistent storage
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                """SELECT level FROM security_permissions
-                   WHERE feature_name = ? AND tool_name = ?""",
-                (feature_name, tool_name)
-            )
-            row = await cursor.fetchone()
-            if row:
-                level = PermissionLevel(row[0])
-                if self._global_auto_mode and level != PermissionLevel.DENY:
-                    return PermissionLevel.AUTO
-                return level
+        # Check persistent storage.
+        #
+        # The DB has historically accumulated a mix of casings for the same
+        # logical feature: PascalCase (`TaskFeature.respond_to_a2a_task`,
+        # written from the subagent-dispatch path and the operator
+        # ``!security-set`` tool) and snake_case (`task_feature.…`, written
+        # from the older direct-tool dispatch path before #1427's
+        # normalization). Either form may be the source of truth on a given
+        # row, so look up BOTH variants and resolve any tie by preferring
+        # the more permissive level — that matches the operator's intent:
+        # if they ever granted ALLOW under either name, the tool is allowed
+        # (rather than re-asking just because the bookkeeping shifted).
+        # The orchestrator's new lookup canonicalizes to PascalCase, so
+        # future writes converge on the class-name form; this fallback
+        # exists for backward compatibility with the mixed-case state on
+        # already-running agents (#1427 sibling).
+        rows = await self._lookup_rows(feature_name, tool_name)
+        if rows:
+            best = _most_permissive(rows)
+            if self._global_auto_mode and best != PermissionLevel.DENY:
+                return PermissionLevel.AUTO
+            return best
 
         # Default for unregistered tools.
         # Demo servers (KESTREL_DEMO_SERVER=1) auto-allow — _register_all_tools
@@ -270,6 +422,37 @@ class PermissionStore:
         if self._global_auto_mode:
             return PermissionLevel.AUTO
         return PermissionLevel.ASK
+
+    async def _lookup_rows(
+        self,
+        feature_name: str,
+        tool_name: str,
+    ) -> List[PermissionLevel]:
+        """Look up `security_permissions` rows for both PascalCase and
+        snake_case forms of ``feature_name`` (e.g. ``TaskFeature`` and
+        ``task_feature``) and return all matching `PermissionLevel` values.
+
+        See ``get_permission`` for the rationale — the DB has accumulated
+        rows under both casings over time and we want operator grants to
+        survive the orchestrator-side normalization to PascalCase (#1427).
+        """
+        names = _name_variants(feature_name)
+        placeholders = ",".join(["?"] * len(names))
+        query = (
+            f"SELECT level FROM security_permissions "
+            f"WHERE feature_name IN ({placeholders}) AND tool_name = ?"
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(query, (*names, tool_name))
+            rows = await cursor.fetchall()
+        levels: List[PermissionLevel] = []
+        for row in rows:
+            try:
+                levels.append(PermissionLevel(row[0]))
+            except ValueError:
+                # Stale level value from a removed enum variant — ignore.
+                continue
+        return levels
 
     async def set_permission(
         self,

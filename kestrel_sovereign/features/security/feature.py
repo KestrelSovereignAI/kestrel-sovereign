@@ -213,6 +213,26 @@ class SecurityFeature(Feature):
 
     async def post_all_features_loaded(self, agent):
         """Register all tools with security permissions after all features are loaded."""
+        # One-time consolidation of legacy snake-case/alias rows into the
+        # canonical PascalCase rows the orchestrator now looks up (#1427).
+        # Without this, agents already in operation lose previously-granted
+        # tools (e.g. ``computer_use.fs_read`` → ``ComputerUseFeature.fs_read``)
+        # the next time the security hook runs.
+        aliases: Dict[str, str] = {}
+        for feature in agent.features.values():
+            tool_alias = getattr(feature, "tool_name", None)
+            if not isinstance(tool_alias, str) or not tool_alias:
+                continue
+            canonical = getattr(feature, "name", type(feature).__name__)
+            if not canonical or canonical == tool_alias:
+                continue
+            aliases[tool_alias] = canonical
+        try:
+            await self.permission_store.migrate_legacy_feature_aliases(aliases)
+        except Exception as exc:  # never fail startup on migration
+            logger.warning(
+                "Legacy permission alias migration skipped: %s", exc,
+            )
         await self._register_all_tools()
         logger.info("Security permissions registered for all features")
 
