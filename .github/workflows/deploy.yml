@@ -115,6 +115,15 @@ jobs:
       - name: Configure Docker for GCR
         run: gcloud auth configure-docker --quiet
 
+      # Release path → ``vX.Y.Z`` (unique per release, never re-pushed).
+      # Dispatch path → ``dev-<7sha>-r<run_id>.<run_attempt>``: includes
+      # both the run id (distinct dispatch invocations) and the run
+      # attempt (workflow reruns of the same invocation — GitHub
+      # increments ``run_attempt`` but keeps ``run_id`` constant) so
+      # every build/deploy pair produces a unique image string. Without
+      # either, Cloud Run's string-based template comparison would
+      # no-op a second deploy (#1441) even though the image was rebuilt
+      # and re-pushed.
       - name: Determine tag
         id: tag
         env:
@@ -123,7 +132,7 @@ jobs:
           if [[ "$RESOLVED_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "tag=$RESOLVED_REF" >> $GITHUB_OUTPUT
           else
-            echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+            echo "tag=dev-$(echo ${{ github.sha }} | cut -c1-7)-r${{ github.run_id }}.${{ github.run_attempt }}" >> $GITHUB_OUTPUT
           fi
 
       # Set up Docker BuildKit + QEMU for multi-arch builds. ``kestrel
@@ -188,11 +197,17 @@ jobs:
       # is interpolated via the ``${KESTREL_ALLOWED_EMAILS}`` placeholder
       # in the TOML, expanded by DeployManagerCore._expand_env_vars from
       # this step's environment.
+      #
+      # ``--tag`` is REQUIRED — the manager rejects ``:latest`` (#1441).
+      # ``needs.build.outputs.tag`` resolves to ``v<semver>`` on release
+      # pushes and ``dev-<7sha>`` on workflow_dispatch, so each deploy
+      # produces a unique image string and Cloud Run reliably rolls a
+      # new revision.
       - name: Deploy to Cloud Run (dev)
         env:
           GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
           KESTREL_ALLOWED_EMAILS: ${{ secrets.KESTREL_ALLOWED_EMAILS }}
-        run: uv run kestrel deploy dev
+        run: uv run kestrel deploy dev --tag ${{ needs.build.outputs.tag }}
 
       - name: Show dev URL
         run: |
@@ -242,11 +257,12 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
 
+      # ``--tag`` is REQUIRED — see deploy-dev step for rationale (#1441).
       - name: Deploy to Cloud Run (prod)
         env:
           GCP_PROJECT_ID: ${{ env.PROJECT_ID }}
           KESTREL_ALLOWED_EMAILS: ${{ secrets.KESTREL_ALLOWED_EMAILS }}
-        run: uv run kestrel deploy prod
+        run: uv run kestrel deploy prod --tag ${{ needs.build.outputs.tag }}
 
       - name: Show prod URL
         run: |
