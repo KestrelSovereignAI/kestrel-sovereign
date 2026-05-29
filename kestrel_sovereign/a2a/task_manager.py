@@ -906,17 +906,33 @@ class TaskManager:
         self._subscribers[task_id].append(queue)
 
         try:
-            # Send current state first
+            # Send current state first. If the task is already terminal
+            # (late subscriber), yield with top-level ``final`` so the
+            # endpoint loop breaks cleanly — without this, the SSE
+            # stream stayed alive emitting keepalives until the client
+            # timed out (codex round 1 P2 on PR #1453). Match the same
+            # envelope shape ``_notify_status_update`` uses for the
+            # live-update path so subscribers can rely on one contract.
             task = await self.task_store.get(task_id)
             if task:
+                terminal = task.status.state in (
+                    TaskState.COMPLETED,
+                    TaskState.CANCELED,
+                    TaskState.FAILED,
+                )
                 yield {
                     "event": "status",
                     "data": TaskStatusUpdateEvent(
                         id=task_id,
                         status=task.status,
-                        final=task.status.state in (TaskState.COMPLETED, TaskState.CANCELED, TaskState.FAILED),
-                    ).model_dump_json()
+                        final=terminal,
+                    ).model_dump_json(),
+                    "final": terminal,
                 }
+                if terminal:
+                    # Don't enter the keepalive loop — the subscriber
+                    # already has the terminal frame.
+                    return
 
             # Stream updates
             while True:

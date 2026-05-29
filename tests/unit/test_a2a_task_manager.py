@@ -910,3 +910,94 @@ class TestTaskManagerWorkerIntegration:
 
         final_task = await task_manager.get_task(task.id)
         assert final_task.status.state == TaskState.COMPLETED
+
+
+# =============================================================================
+# Subscribe — late-subscriber close (#1444 codex round 1 P2)
+# =============================================================================
+
+class TestSubscribeLateTerminal:
+    """A subscriber that connects AFTER the task is already terminal
+    must receive the snapshot frame and immediately see the stream
+    close — without this fix, the connection stayed alive emitting
+    keepalives until the client timed out (codex round 1 P2 on PR
+    #1453)."""
+
+    @pytest.mark.asyncio
+    async def test_already_completed_task_closes_after_snapshot(self):
+        task = Task(
+            id="t-late-completed",
+            sessionId="sess",
+            status=TaskStatus(
+                state=TaskState.COMPLETED,
+                message=Message(
+                    role="agent",
+                    parts=[TextPart(type="text", text="done")],
+                ),
+            ),
+        )
+        store = MagicMock()
+        store.get = AsyncMock(return_value=task)
+        store.close = AsyncMock()
+        session_service = MagicMock()
+        session_service.close = AsyncMock()
+        observability_store = MagicMock()
+        observability_store.close = AsyncMock()
+        manager = track_manager(TaskManager(
+            task_store=store,
+            session_service=session_service,
+            observability_store=observability_store,
+        ))
+
+        # asyncio.wait_for around the iteration so a regression where
+        # the loop stays open emitting keepalives fails fast instead
+        # of hanging the test forever.
+        frames = []
+        async def _collect():
+            async for ev in manager.subscribe("t-late-completed"):
+                frames.append(ev)
+        await asyncio.wait_for(_collect(), timeout=2.0)
+
+        assert len(frames) == 1, (
+            f"Late subscriber to an already-terminal task must receive "
+            f"the snapshot frame and then have the stream close — got "
+            f"{len(frames)} frame(s), which means the keepalive loop "
+            f"was entered. {[(f.get('event'), f.get('final')) for f in frames]}"
+        )
+        assert frames[0]["event"] == "status"
+        assert frames[0]["final"] is True, (
+            "Snapshot frame for an already-terminal task must carry "
+            "top-level ``final=True`` so SSE bridges (e.g. the "
+            "endpoints/agent.py subscribe handler) close the stream "
+            "cleanly without parsing JSON data."
+        )
+
+    @pytest.mark.asyncio
+    async def test_already_failed_task_closes_after_snapshot(self):
+        """FAILED is also terminal — same close behavior as COMPLETED."""
+        task = Task(
+            id="t-late-failed",
+            sessionId="sess",
+            status=TaskStatus(state=TaskState.FAILED),
+        )
+        store = MagicMock()
+        store.get = AsyncMock(return_value=task)
+        store.close = AsyncMock()
+        session_service = MagicMock()
+        session_service.close = AsyncMock()
+        observability_store = MagicMock()
+        observability_store.close = AsyncMock()
+        manager = track_manager(TaskManager(
+            task_store=store,
+            session_service=session_service,
+            observability_store=observability_store,
+        ))
+
+        frames = []
+        async def _collect():
+            async for ev in manager.subscribe("t-late-failed"):
+                frames.append(ev)
+        await asyncio.wait_for(_collect(), timeout=2.0)
+
+        assert len(frames) == 1
+        assert frames[0]["final"] is True
