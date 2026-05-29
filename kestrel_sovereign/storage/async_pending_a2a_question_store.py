@@ -87,8 +87,15 @@ class PendingA2AQuestionStore:
         should not need this in practice (task_id is a fresh UUID per
         POST) but the guard prevents the startup-replay sweep from
         double-inserting on a crash-restart-during-write boundary."""
-        if deadline.tzinfo is None:
-            deadline = deadline.replace(tzinfo=timezone.utc)
+        # Normalize to UTC then strip tzinfo: Postgres TIMESTAMP columns
+        # require naive datetimes (asyncpg rejects strings; see the
+        # ``_track_model_usage`` pattern in llm/usage_tracking.py). SQLite
+        # also accepts datetime values via aiosqlite's adapter. Codex
+        # round 6 P2 on PR #1453 — the prior ``.isoformat()`` worked on
+        # SQLite by coincidence (TEXT column) and silently broke the
+        # Postgres path after the task had already been POSTed.
+        if deadline.tzinfo is not None:
+            deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
         await self._db.execute(
             """
             INSERT OR IGNORE INTO pending_a2a_questions
@@ -103,7 +110,7 @@ class PendingA2AQuestionStore:
                 original_question,
                 origin_turn_id,
                 origin_session_id,
-                deadline.isoformat(),
+                deadline,
             ),
         )
 
@@ -171,7 +178,12 @@ class PendingA2AQuestionStore:
         hourly-expiry input set. ``now`` defaults to current UTC; pass
         an explicit value in tests so the sweep is deterministic
         without monkey-patching ``datetime.utcnow``."""
-        ts = (now or datetime.now(timezone.utc)).isoformat()
+        # See ``insert`` for why we strip tzinfo — Postgres TIMESTAMP
+        # columns reject strings AND tz-aware datetimes. Codex round 6
+        # P2.
+        ts_dt = (now or datetime.now(timezone.utc))
+        if ts_dt.tzinfo is not None:
+            ts_dt = ts_dt.astimezone(timezone.utc).replace(tzinfo=None)
         rows = await self._db.fetchall(
             """
             SELECT task_id, recipient, original_question,
@@ -180,7 +192,7 @@ class PendingA2AQuestionStore:
             FROM pending_a2a_questions
             WHERE agent_id = ? AND status = 'WAITING' AND deadline < ?
             """,
-            (self._agent_id, ts),
+            (self._agent_id, ts_dt),
         )
         return [self._row_to_dc(r) for r in rows]
 

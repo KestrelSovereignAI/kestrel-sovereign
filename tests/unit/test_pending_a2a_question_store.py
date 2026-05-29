@@ -272,6 +272,83 @@ async def test_mark_expired_is_durable_across_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_insert_and_sweep_bind_datetime_not_string(tmp_path):
+    """Codex round 6 P2 on PR #1453: Postgres TIMESTAMP columns reject
+    string binds — asyncpg expects naive ``datetime`` objects. The
+    store previously called ``.isoformat()`` on the deadline before
+    binding, which worked on SQLite (TEXT-typed column accepts
+    anything) but broke ``send_a2a_question`` for Postgres-backed
+    agents AFTER the task had already been POSTed (no pending row =
+    no resumption signal). Pin that ``insert`` and
+    ``list_waiting_past_deadline`` pass real datetime values
+    through.
+
+    We patch the underlying ``execute``/``fetchall`` to capture the
+    bound params and assert their types. The functional integration
+    is already covered by the surrounding CRUD tests."""
+    db_path = str(tmp_path / "type_check.db")
+    db = await AsyncDatabase.sqlite(db_path)
+    store = PendingA2AQuestionStore(db, agent_id="did:test:bind")
+
+    captured_execute: list = []
+    captured_fetchall: list = []
+    real_execute = db.execute
+    real_fetchall = db.fetchall
+
+    async def fake_execute(sql, params=()):
+        captured_execute.append((sql, params))
+        return await real_execute(sql, params)
+
+    async def fake_fetchall(sql, params=()):
+        captured_fetchall.append((sql, params))
+        return await real_fetchall(sql, params)
+
+    db.execute = fake_execute
+    db.fetchall = fake_fetchall
+
+    deadline = datetime.now(timezone.utc) - timedelta(hours=1)
+    await store.insert(
+        task_id="t-bind", recipient="Meridian",
+        original_question="q", origin_turn_id=None,
+        origin_session_id=None, deadline=deadline,
+    )
+    await store.list_waiting_past_deadline()
+
+    # Find the INSERT and SELECT calls.
+    insert_calls = [
+        params for sql, params in captured_execute
+        if "INSERT" in sql.upper()
+    ]
+    sweep_calls = [
+        params for sql, params in captured_fetchall
+        if "deadline <" in sql
+    ]
+    assert insert_calls, "Insert path was not exercised."
+    assert sweep_calls, "Sweep path was not exercised."
+
+    # Insert binds positional (agent_id, task_id, recipient, msg, turn,
+    # session, deadline). Deadline is the 7th element.
+    insert_params = insert_calls[0]
+    assert isinstance(insert_params[6], datetime), (
+        f"Insert must bind a datetime to the TIMESTAMP column, not a "
+        f"string. Got {type(insert_params[6]).__name__}={insert_params[6]!r}. "
+        f"Postgres rejects strings here (codex round 6 P2)."
+    )
+    assert insert_params[6].tzinfo is None, (
+        "Bind must be a NAIVE datetime — Postgres TIMESTAMP (without "
+        "tz) rejects tz-aware values."
+    )
+
+    sweep_params = sweep_calls[0]
+    # list_waiting_past_deadline binds (agent_id, ts).
+    assert isinstance(sweep_params[1], datetime), (
+        f"Sweep must bind a datetime, not a string. Got "
+        f"{type(sweep_params[1]).__name__}."
+    )
+    assert sweep_params[1].tzinfo is None
+
+
+@pytest.mark.asyncio
 async def test_mark_expired_terminal_transition(tmp_path):
     store = await _make_store(tmp_path)
     past = datetime.now(timezone.utc) - timedelta(hours=2)
