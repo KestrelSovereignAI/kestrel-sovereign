@@ -834,8 +834,27 @@ class PeersFeature(Feature):
             )
 
         while _remaining() > 0 and state not in terminal_states:
+            # Bound this connect attempt's timeouts by the remaining
+            # wall-clock so a peer/proxy that accepts the connection
+            # then stalls without yielding any frames cannot block
+            # ``aiter_lines()`` past the deadline (codex round 5 P2
+            # on PR #1453). Without these caps the ``async for sse_event``
+            # loop never wakes to see ``_remaining() <= 0`` and the
+            # deadline-accurate expired signal never fires for stalled
+            # streams. Allow a small floor so a fast deadline doesn't
+            # immediately raise on connect — anything below 0.5s, we
+            # just exit at the outer ``while`` check.
+            remaining = _remaining()
+            if remaining < 0.5:
+                break
+            iter_timeout = httpx.Timeout(
+                connect=min(PEER_CONNECT_TIMEOUT, remaining),
+                read=remaining,
+                write=min(PEER_CONNECT_TIMEOUT, remaining),
+                pool=min(PEER_CONNECT_TIMEOUT, remaining),
+            )
             try:
-                async with httpx.AsyncClient(timeout=None) as client:
+                async with httpx.AsyncClient(timeout=iter_timeout) as client:
                     async with client.stream(
                         "GET",
                         subscribe_url,

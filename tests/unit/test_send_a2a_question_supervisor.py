@@ -526,6 +526,75 @@ class TestSupervisorDeadlineInsideStreamLoop:
         )
 
 
+class TestSupervisorStalledStream:
+    @pytest.mark.asyncio
+    async def test_stalled_stream_raises_timeout_caught_as_transient(
+        self, monkeypatch,
+    ):
+        """Codex round 5 P2 on PR #1453: a peer/proxy that accepts the
+        SSE request but stalls without yielding any frames must NOT
+        block ``aiter_lines()`` past the deadline. The httpx read
+        timeout is bound to ``_remaining()`` so the stalled stream
+        raises ``httpx.ReadTimeout`` (caught as transient), the outer
+        loop sees ``_remaining() <= 0``, and the deadline-exit branch
+        fires the expired signal."""
+
+        class _StalledResponse:
+            """Stand-in for httpx response whose ``aiter_lines()``
+            raises ReadTimeout — same behavior we'd see from a real
+            peer that accepted the connection then went silent past
+            the bound timeout."""
+            status_code = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+            async def aiter_lines(self):
+                raise httpx.ReadTimeout("stalled stream")
+                yield  # pragma: no cover — make this an async-gen
+
+        feature, agent, enqueue, fake_client = _make_feature(
+            sse_responses=[_StalledResponse(), _StalledResponse()],
+            monkeypatch=monkeypatch,
+        )
+        agent.pending_a2a_questions.mark_expired = AsyncMock(
+            return_value=True,
+        )
+
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        deadline = _dt.now(_tz.utc) + _td(milliseconds=50)
+        await asyncio.wait_for(
+            feature._supervise_a2a_question(
+                task_id="t-stalled",
+                recipient="Meridian",
+                original_question="?",
+                sess_id="s-stall",
+                deadline_utc=deadline,
+                causation_chain=None,
+            ),
+            timeout=2.0,
+        )
+
+        agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
+            "t-stalled",
+        )
+        enqueue.assert_awaited_once()
+        sig = enqueue.await_args.args[0]
+        assert sig.payload["state"] == "expired", (
+            "Stalled stream past deadline must fire state='expired' "
+            "via the deadline-exit branch — without the bound httpx "
+            "timeout the supervisor would hang on aiter_lines() "
+            "indefinitely (codex round 5 P2)."
+        )
+
+
 class TestSupervisorDedupSignal:
     @pytest.mark.asyncio
     async def test_already_terminal_pending_row_drops_signal(
