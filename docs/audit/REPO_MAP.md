@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-28
-**Scope:** 1569 tracked files (1019 `.py`, 268 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-29
+**Scope:** 1580 tracked files (1030 `.py`, 268 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -617,7 +617,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/codex_adapter.py** — Codex Provider Adapter — OpenAI ChatGPT subscription via the official ``@openai/codex`` app-server.
   - `class CodexAdapter`
 - **kestrel_sovereign/llm/codex_app_server.py** — Codex app-server JSON-RPC client.
-  - `class CodexAppServerError`; `class CodexAppServerConnectionClosed`; `def resolve_codex_binary()`; `class CodexAppServerClient`
+  - `class CodexAppServerError`; `class CodexAppServerTransportError`; `class CodexAppServerConnectionClosed`; `def resolve_codex_binary()`; `class CodexAppServerClient`
 - **kestrel_sovereign/llm/constitutional_awareness.py** — Constitutional awareness for LLM Service.
   - `class ConstitutionalAwarenessMixin`
 - **kestrel_sovereign/llm/constitutional_profile.py** — Constitutional Profile Service
@@ -686,7 +686,11 @@ Repo entry points and standard project files.
   - `class PrivacyConfig`; `def get_privacy_preset(name)`; `def privacy_mode_to_config(mode)`; `def privacy_config_to_mode(config)`
 - **kestrel_sovereign/prompts/companion_system_prompt.md** — Companion System Prompt — ## Platform Awareness
 - **kestrel_sovereign/prompts/discovery_prompt.md** — Discovery Mode Prompt — You are a Kestrel agent meeting your Sovereign for the very first time.
+- **kestrel_sovereign/prompts/signals/a2a_task_complete.md** — [A2A_COMPLETE] An A2A task you spawned has reached a terminal state.
+- **kestrel_sovereign/prompts/signals/a2a_task_submitted.md** — [A2A_TASK_SUBMITTED] Agent `{payload[sender]}` submitted A2A task `{payload[task_id]}` (verb `{payload[a2a_verb]}`, skill `{payload[skill_id]}`) to you.
 - **kestrel_sovereign/prompts/signals/channel_message.md** — [CHANNEL_MESSAGE] A message arrived through an external channel.
+- **kestrel_sovereign/prompts/signals/heartbeat.md** — [HEARTBEAT] Read HEARTBEAT.md if it exists.
+- **kestrel_sovereign/prompts/signals/webhook_stripe_deposit.md** — [STRIPE_DEPOSIT] An external Stripe webhook has reported a crypto deposit.
 - **kestrel_sovereign/prompts/soul_generation_prompt.md** — SOUL.md Generation Prompt — Generate a SOUL.md file for a Kestrel agent based on a discovery conversation with their Sovereign.
 - **kestrel_sovereign/prompts/system_prompt.md** — Kestrel System Prompt — You are Kestrel, a sovereign AI agent.
 - **kestrel_sovereign/prompts/test_instance_disclosure.md** — Test Instance Disclosure — This disclosure is prepended to the system prompt for test agents.
@@ -1505,6 +1509,8 @@ Repo entry points and standard project files.
   - `def clean_sse_connections()`; `async def test_approval_request_reaches_sse_and_decision_resolves_caller()`
 - **tests/integration/test_asset_restorer.py** — Integration tests for #1391 — :class:`AssetRestorer` protocol + ``SovereignStorageAdapter.import_agent(asset_restorers=...)``.
   - `def temp_db()`; `def temp_db_2()`; `async def test_no_restorers_preserves_pre_1391_behavior(temp_db)`; `async def test_inline_asset_decrypted_and_handed_to_restorer(temp_db)`; `async def test_pre_encrypted_asset_passes_raw_bytes_through(temp_db)`; `async def test_restorer_only_sees_its_declared_types(temp_db)`; `async def test_unhandled_asset_type_recorded_as_skipped(temp_db)`; `async def test_multiple_restorers_for_same_type_both_called(temp_db)`; `…`
+- **tests/integration/test_asset_restorer_external_ref.py** — Integration tests for #1438 — external-ref asset restoration via the filecoin adapter (Phase-2 follow-up to #1391).
+  - `def temp_db()`; `async def test_external_ref_asset_fetched_and_routed(temp_db)`; `async def test_inline_and_external_ref_in_one_car(temp_db)`; `async def test_external_ref_fetch_failure_lands_on_skipped(temp_db)`; `async def test_malformed_external_ref_lands_on_skipped(temp_db)`; `async def test_pre_1438_inline_only_path_unchanged(temp_db)`
 - **tests/integration/test_atomic_increment_metadata.py** — Integration tests for ``AsyncConversationStore.atomic_increment_metadata_counter``.
   - `async def test_increment_creates_counter_when_absent(tmp_path)`; `async def test_increment_is_monotonic_across_serial_calls(tmp_path)`; `async def test_increment_does_not_collide_concurrent_calls(tmp_path)`; `async def test_increment_preserves_other_metadata_fields(tmp_path)`; `async def test_postgres_sql_shape_uses_jsonb_cast(tmp_path)`; `async def test_increment_returns_false_for_unknown_message(tmp_path)`; `async def test_increment_returns_true_for_real_message(tmp_path)`; `async def test_increment_without_timestamp_field(tmp_path)`
 - **tests/integration/test_avatar_api_e2e.py** — Integration tests for avatar API endpoints
@@ -1711,6 +1717,8 @@ Repo entry points and standard project files.
   - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_idle_shape_includes_silently_pruned_flag()`; `def test_context_status_returns_idle_shape_when_no_session_id()`; `def test_context_status_returns_idle_shape_for_empty_session_id()`; `def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history()`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_apply_cache_control_marks_all_three_positions()`; `…`
+- **tests/unit/test_anthropic_wire_model_id.py** — Unit tests for AnthropicAdapter wire model-id normalization (#1420).
+  - `def test_resolve_wire_model_id_strips_anthropic_prefix()`; `def test_resolve_wire_model_id_is_case_insensitive()`; `def test_resolve_wire_model_id_passes_through_bare_id()`; `def test_resolve_wire_model_id_passes_through_other_vendor_prefix()`; `def test_resolve_wire_model_id_handles_empty_and_none_gracefully()`; `def test_resolve_wire_model_id_does_not_strip_prefix_inside_id()`; `def test_resolve_wire_model_id_inherited_by_claude_max()`; `async def test_get_response_sends_bare_model_id_when_prefixed()`; `…`
 - **tests/unit/test_api_key_query_param.py** — Unit tests for API key query parameter restriction (GitHub issue #149).
   - `def app()`; `def client(app)`; `class TestQueryParamAuthOnSSEPaths`; `class TestQueryParamAuthRejectedOnOtherPaths`; `class TestHeaderAuthStillWorks`; `class TestWrongKeyRejected`; `class TestSSEPathsConstant`
 - **tests/unit/test_associative_linker.py** — Unit tests for AssociativeLinker typed LinkedConcept return shape.
@@ -1764,6 +1772,8 @@ Repo entry points and standard project files.
   - `def test_no_config_no_hints_returns_none()`; `def test_hints_match_returns_vendor_scoped_selector()`; `def test_no_matching_hint_returns_none()`; `def test_explicit_cheap_model_selector_honored()`; `def test_cheap_model_auto_falls_through_to_hints()`; `def test_get_cheap_model_backcompat_returns_bare_model()`
 - **tests/unit/test_check_policy_guard.py** — Reflection test for the LLMService._check_policy() guard.
   - `class TestPolicyGuardCoverage`; `class TestCheckPolicyBehavior`
+- **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
+  - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_get_task_result_includes_request_content_for_completed_task()`
 - **tests/unit/test_clean_install_verify.py** — Unit tests for scripts/ci/clean_install_verify.py.
   - `def test_wizard_artifacts_passes_on_post_wizard_tree(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_env_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_data_key_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_route_priority_empty(tmp_path, monkeypatch, capsys)`; `def test_identity_passes_when_did_present(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_db_missing(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_no_agent_node(tmp_path, monkeypatch, capsys)`; `def test_constitution_passes_with_full_anchor(tmp_path, monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
@@ -1804,6 +1814,12 @@ Repo entry points and standard project files.
   - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestDynamicToolsSpec`; `class TestTurnInputBuilder`; `class TestUsageProjection`; `class TestResultMarshalling`; `class TestAdapterTextPath`; `…`
 - **tests/unit/test_codex_app_server.py** — Tests for the codex app-server JSON-RPC client.
   - `class TestVersionGate`; `class TestBinaryResolution`; `class TestDispatchLogic`; `class TestServerRequestHandlerRegistration`; `class TestTurnIteration`; `class TestInvoluntaryExitRecovery`
+- **tests/unit/test_codex_app_server_cancel.py** — Cancellation cleanup for the codex app-server client (#1421).
+  - `async def test_request_unguarded_drops_pending_on_cancel()`; `async def test_request_unguarded_preserves_cancellation_for_asyncio_timeout()`; `async def test_request_unguarded_timeout_still_raises_typed_error()`; `async def test_request_unguarded_normal_response_unaffected()`
+- **tests/unit/test_codex_idle_timeout_diagnostics.py** — codex app-server idle-timeout diagnostic surface (#1410).
+  - `class TestRecentStderr`; `class TestRecentCodexLog`; `class TestIterTurnEventsIdleTimeoutLogsTailsServerSide`; `class TestOverflowHintBranchesOnPayloadVsCap`
+- **tests/unit/test_codex_retry_on_idle_timeout.py** — One-shot retry on codex idle-timeout under cap (#1411).
+  - `async def test_retry_succeeds_after_first_idle_timeout_under_cap()`; `async def test_retry_waits_via_seam_before_second_attempt()`; `async def test_no_retry_when_events_already_yielded()`; `async def test_no_retry_when_exceeds_cap()`; `async def test_no_retry_when_exceeds_cap_attribute_missing()`; `async def test_no_retry_when_error_is_not_idle_timeout()`; `async def test_no_retry_on_connection_closed()`; `async def test_no_retry_when_tools_are_present()`; `…`
 - **tests/unit/test_command_handler_async_boundary_contracts.py** — Contracts for explicit sync/async boundaries in CommandHandler.
   - `def test_privacy_save_handler_is_explicitly_async()`; `async def test_handle_awaits_privacy_save_without_leaking_coroutine()`; `async def test_handle_accepts_custom_awaitable_results_via_isawaitable()`; `def test_create_agent_handler_is_explicitly_async()`; `async def test_handle_awaits_create_agent_command()`; `def test_anchor_handler_is_explicitly_async()`; `async def test_handle_awaits_anchor_command()`
 - **tests/unit/test_command_handler_constitution_contracts.py** — Command-handler contracts for constitution verification commands.
@@ -1908,6 +1924,8 @@ Repo entry points and standard project files.
   - `def test_build_did_host_only()`; `def test_build_did_with_path()`; `def test_build_did_with_port_encoded_as_percent_3a()`; `def test_build_did_rejects_bare_colon_in_domain()`; `def test_build_did_rejects_scheme_in_domain()`; `def test_build_did_rejects_slash_in_domain()`; `def test_build_did_rejects_colon_in_segment()`; `def test_build_did_rejects_empty_segment()`; `…`
 - **tests/unit/test_diminishing_returns.py** — Tests for diminishing returns detection in orchestrator loops.
   - `class TestIterationTrackerRecord`; `class TestIterationTrackerShouldStop`; `class TestIterationTrackerIntegration`; `class TestDiminishingReturnsConstants`
+- **tests/unit/test_direct_tool_security_feature_name.py** — Direct-tool dispatch must use the PascalCase feature name for security lookups (#1427).
+  - `class TestSecurityFeatureNameForTool`; `class TestDirectToolDispatchUsesPascalcaseFeatureName`
 - **tests/unit/test_discovery_hang_regression.py** — Regression tests for the post-#1110 discovery wedge.
   - `async def test_generate_with_messages_lazy_resolves_auto_models()`; `async def test_process_discovery_message_times_out_on_llm_hang()`; `def test_constitution_feature_finds_package_shipped_constitution(tmp_path, monkeypatch)`; `def test_constitution_feature_prefers_source_clone_path(tmp_path, monkeypatch)`; `def test_constitution_feature_reports_path_when_neither_exists(tmp_path, monkeypatch)`
 - **tests/unit/test_docker_network_check.py** — Tests for the _is_docker_network helper in server.py.
@@ -2060,6 +2078,8 @@ Repo entry points and standard project files.
   - `def cwd(tmp_path, monkeypatch)`; `def test_warn_includes_no_section_message(cwd, caplog)`; `def test_warn_points_at_migrate_command_when_legacy_file_exists(cwd, caplog)`; `def test_warn_handles_post_migration_bak_case(cwd, caplog)`; `def test_warn_recommends_setup_or_example_when_neither_exists(cwd, caplog)`; `def test_warn_minimal_hint_when_nothing_present(cwd, caplog)`; `def test_llmservice_init_emits_warning_when_config_section_empty(cwd, caplog)`; `def test_llmservice_init_does_not_warn_when_config_present(tmp_path, monkeypatch, caplog)`
 - **tests/unit/test_local_mps_adapter_async_contracts.py** — Contracts for Local MPS training adapter async offload boundaries.
   - `def adapter(tmp_path)`; `def tracked_to_thread()`; `async def test_start_training_offloads_file_setup_and_process_launch(adapter, tracked_to_thread)`; `async def test_failed_status_offloads_log_tail_read(adapter, tracked_to_thread)`; `async def test_status_without_process_offloads_output_scan(adapter, tracked_to_thread)`; `async def test_download_weights_offloads_lora_read(adapter, tracked_to_thread)`; `async def test_cancel_offloads_process_termination(adapter, tracked_to_thread)`; `async def test_cleanup_offloads_dataset_removal(adapter, tracked_to_thread)`; `…`
+- **tests/unit/test_lumpy_prune.py** — Tests for the lumpy-prune anchor and safety-net helper (#1430).
+  - `class TestLumpyAnchorStability`; `class TestLumpyPruneSafetyNet`; `class TestEnvParsing`; `def test_safety_net_target_respected_across_fractions(frac)`; `class TestSentFormBytePreservation`; `class TestEmitByteCounting`; `class TestStableCeiling`
 - **tests/unit/test_mandate_resolution_contracts.py** — Contracts for mandate selector resolution and shipped config shape.
   - `def test_resolve_model_selector_maps_provider_name_to_current_model()`; `def test_resolve_model_selector_maps_cheap_alias_via_cheap_model_policy()`; `def test_get_model_for_prompt_normalizes_provider_selectors()`; `def test_shipped_mandate_configs_use_discovery_backed_cheap_policy()`
 - **tests/unit/test_mandate_vendor_resolution_contracts.py** — Contract tests for mandate vendor auto-resolution.
@@ -2130,6 +2150,8 @@ Repo entry points and standard project files.
   - `class TestPerAgentOverlayLoading`; `class TestComputerUseFeaturePicksUpOverlay`
 - **tests/unit/test_permission_seam_contracts.py** — Permission seam contracts across command, A2A, and tool execution paths.
   - `async def test_a2a_skill_uses_feature_class_name_for_permission_hooks()`; `async def test_command_routing_uses_same_permission_identity_as_a2a_skill()`
+- **tests/unit/test_permission_store_dual_casing.py** — ``PermissionStore.get_permission`` resolves rows under both PascalCase and snake_case forms, picking the more permissive of any duplicates.
+  - `def test_snake_case_matches_feature_tool_name()`; `def test_resolve_levels_picks_allow_over_ask()`; `def test_resolve_levels_deny_wins()`; `async def test_get_permission_finds_pascalcase_when_queried_pascal(tmp_path)`; `async def test_get_permission_finds_pascalcase_when_queried_snake(tmp_path)`; `async def test_get_permission_finds_snakecase_when_queried_pascal(tmp_path)`; `async def test_get_permission_picks_more_permissive_of_two_rows(tmp_path)`; `async def test_migrate_legacy_feature_aliases_consolidates_alias_rows(tmp_path)`; `…`
 - **tests/unit/test_personality_analyzer.py** — Unit tests for the Personality Analyzer module.
   - `class TestPersonalityAnalyzer`; `class TestCalibrationPromptGenerator`; `class TestConvenienceFunctions`; `class TestPersonalityConsistency`
 - **tests/unit/test_phase3a_wiring.py** — Unit tests for Phase 3a — Lighthouse + LLM resolver wiring.
@@ -2266,6 +2288,8 @@ Repo entry points and standard project files.
   - `class TestExitTokenSet`
 - **tests/unit/test_sign_package_hybrid.py** — sign_package / verify_package_signature hybrid-format tests.
   - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `def test_legacy_agent_signs_v1_only(legacy_agent_dir)`; `def test_legacy_tamper_detected(legacy_agent_dir)`; `def test_hybrid_agent_emits_v2_only(post_ceremony_agent_dir)`; `def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `…`
+- **tests/unit/test_signal_prompt_templates_packaged.py** — Every signal source's prompt_template must ship inside the package (#1415).
+  - `def package_root()`; `class TestPromptTemplateShipsWithWheel`; `class TestPackagedTemplateInventory`
 - **tests/unit/test_signals_a2a_source.py** — Phase 5 of #889: a2a.task_complete source registration + causation chain propagation + the cycle detection mechanism's first real-world exercise.
   - `async def components(tmp_path)`; `def test_registration_is_cognition_only_and_trusted()`; `def test_registration_schema_rejects_missing_required_fields()`; `def test_registration_redaction_caps_long_summaries()`; `def test_build_signal_extracts_text_from_status_message()`; `def test_build_signal_falls_back_when_no_status_message()`; `def test_build_signal_with_no_metadata_yields_empty_chain()`; `def test_build_signal_rehydrates_chain_from_metadata()`; `…`
 - **tests/unit/test_signals_channel_source.py** — Source registration tests for inbound channel messages.
@@ -2346,6 +2370,8 @@ Repo entry points and standard project files.
   - `async def test_persist_marks_cancelled_when_request_was_stopped()`; `async def test_persist_merges_cancelled_with_caller_metadata()`; `async def test_persist_no_marker_when_not_cancelled()`; `async def test_persist_no_marker_when_request_id_not_provided()`; `async def test_stream_loop_breaks_when_cancel_arrives_mid_stream()`; `async def test_cancel_between_llm_and_tool_dispatch_skips_tools()`; `async def test_no_cancel_path_unaffected_for_normal_completion()`; `async def test_orchestrator_loop_returns_early_when_cancelled_between_iterations()`; `…`
 - **tests/unit/test_streaming_inband_revising_sentinel.py** — Wave 5E in-band revising sentinel — kestrel-sovereign #1086.
   - `class TestSentinelConstruction`; `async def test_inband_sentinel_yielded_through_chat_stream()`; `async def test_sentinel_not_appended_to_persisted_assistant_text()`; `async def test_no_sentinel_when_no_marker_fires()`; `async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted()`; `async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted()`; `async def test_multiple_markers_yield_multiple_sentinels()`
+- **tests/unit/test_streaming_no_codex_escalation.py** — Streaming fallback must not rotate providers on codex idle-timeout (#1429).
+  - `def test_is_harness_owned_for_codex_transport_error()`; `def test_is_harness_owned_for_codex_app_server_connection_closed()`; `def test_is_harness_owned_false_for_non_transport_codex_error()`; `def test_is_harness_owned_false_for_generic_exceptions()`; `async def test_get_streaming_response_no_rotation_on_codex_idle_timeout()`; `async def test_get_streaming_response_no_rotation_on_codex_prompt_timeout()`; `async def test_get_streaming_response_rotates_on_non_transport_codex_error()`; `async def test_get_streaming_response_rotates_on_generic_exception()`; `…`
 - **tests/unit/test_streaming_persist_cancellation.py** — Cancellation-safe persistence: when the streaming generator is cancelled (client disconnect, browser nav, agent switch) AFTER the last chunk is yielded but BEFORE the assistant row is inserted, the i…
   - `async def test_persist_completes_when_outer_task_is_cancelled_mid_insert()`; `async def test_persist_failure_logs_metric_and_swallows_exception()`; `async def test_persist_failure_with_broken_telemetry_does_not_raise()`; `async def test_persist_passes_metadata_and_session_id_through()`; `async def test_outer_cancellation_propagates_after_shielded_completes()`
 - **tests/unit/test_streaming_persists_full_assistant_text.py** — Regression: streaming agent must persist the FULL visible assistant text.
@@ -2493,10 +2519,6 @@ Repo entry points and standard project files.
 ## `prompts/`
 
 - **prompts/companion_system_prompt.md** — Companion System Prompt — ## Platform Awareness
-- **prompts/signals/a2a_task_complete.md** — [A2A_COMPLETE] An A2A task you spawned has reached a terminal state.
-- **prompts/signals/a2a_task_submitted.md** — [A2A_TASK_SUBMITTED] Agent `{payload[sender]}` submitted A2A task `{payload[task_id]}` (verb `{payload[a2a_verb]}`, skill `{payload[skill_id]}`) to you.
-- **prompts/signals/heartbeat.md** — [HEARTBEAT] Read HEARTBEAT.md if it exists.
-- **prompts/signals/webhook_stripe_deposit.md** — [STRIPE_DEPOSIT] An external Stripe webhook has reported a crypto deposit.
 - **prompts/system_prompt.md** — Kestrel System Prompt — You are Kestrel, a sovereign AI agent.
 - **prompts/test_instance_disclosure.md** — Test Instance Disclosure — This disclosure is prepended to the system prompt for test agents.
 - **prompts/user_prompt.md** — User Prompt Template — This template is used to format the user's query with context.
