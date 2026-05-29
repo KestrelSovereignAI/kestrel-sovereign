@@ -1016,7 +1016,50 @@ class CodexAdapter(LLMAdapter):
                         f"codex turn failed: "
                         f"{err.get('message') or err or 'unknown'}"
                     )
-                # turn/completed terminates iter_turn_events.
+                elif method == "error":
+                    # Standalone error event — codex emits this (instead of,
+                    # or in addition to, ``turn/failed``) when the upstream
+                    # Responses API rejects the request. Pre-#1438 this was
+                    # silently ignored: the read loop kept going, the turn
+                    # ended with empty content, and the caller got HTTP 200
+                    # with ``response=""`` — the honesty floor was breached
+                    # because codex told us the request failed and we
+                    # relayed it as a clean response. Smoking gun: a
+                    # ChatGPT-Plus account asking for ``gpt-5.5-pro`` got
+                    # "model is not supported when using Codex with a
+                    # ChatGPT account" silently swallowed instead of
+                    # surfaced. ``willRetry=True`` is codex's signal that
+                    # it's about to retry internally — leave those alone;
+                    # only escalate when retry is off.
+                    will_retry = bool(p.get("willRetry", False))
+                    if not will_retry:
+                        err = p.get("error") or {}
+                        msg = (
+                            err.get("message") if isinstance(err, dict)
+                            else str(err)
+                        )
+                        raise CodexAppServerError(
+                            f"codex turn failed: {msg or 'unknown'}"
+                        )
+                elif method == "turn/completed":
+                    # Terminal event. If the turn entered failed state
+                    # (upstream rejection that didn't already raise via
+                    # the ``error`` branch), surface it as an exception
+                    # rather than letting the loop fall through to the
+                    # final yield with empty content. Same honesty
+                    # rationale as the ``error`` branch.
+                    turn_info = p.get("turn") or {}
+                    if turn_info.get("status") == "failed":
+                        err = turn_info.get("error") or {}
+                        msg = (
+                            err.get("message") if isinstance(err, dict)
+                            else str(err)
+                        )
+                        raise CodexAppServerError(
+                            f"codex turn completed in failed state: "
+                            f"{msg or 'unknown'}"
+                        )
+                    # Otherwise terminates iter_turn_events normally.
 
             content = final_text if final_text is not None else "".join(text_parts)
             yield {

@@ -353,6 +353,22 @@ class CodexAppServerClient:
             # the 30s MCP startup_timeout, leaving session_loop
             # blocked. Kestrel has its own app/tool surface — we
             # don't need codex's bundled directory.
+            #
+            # ``limit=16 MiB``: codex emits JSON-RPC frames as single
+            # newline-terminated lines on stdout. Streaming events for a
+            # turn carrying our typical ~20K-input-token prompt routinely
+            # exceed asyncio's default 64 KiB StreamReader buffer (e.g.
+            # a single Item-finished event echoing the full assistant
+            # text or a snapshot containing the cumulative reasoning
+            # trace). The default raises ``ValueError('Separator is
+            # found, but chunk is longer than limit')`` from
+            # ``StreamReader.__anext__``, the read loop dies before any
+            # frame is parsed, and ``_read_loop``'s finally reports
+            # ``codex app-server exited (rc=None)`` — silently masking
+            # a 64 KiB cap as a process death. 16 MiB matches the
+            # codex-rs internal frame budget; if anything ever exceeds
+            # it we want a real protocol error, not a quiet crash. See
+            # #1438.
             self._proc = await asyncio.create_subprocess_exec(
                 self._binary, "--disable", "apps",
                 "app-server", "--listen", "stdio://",
@@ -360,6 +376,7 @@ class CodexAppServerClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=spawn_env,
+                limit=16 * 1024 * 1024,
             )
         except OSError as e:
             raise CodexAppServerError(f"Failed to spawn {self._binary}: {e}") from e
@@ -692,6 +709,35 @@ class CodexAppServerClient:
                 self._dispatch(msg)
         except asyncio.CancelledError:
             pass
+        except ValueError as e:
+            # ``StreamReader.__anext__`` raises ValueError when a single
+            # line exceeds the configured ``limit=`` on the subprocess
+            # spawn (asyncio's "Separator is found, but chunk is longer
+            # than limit" — see #1438). Pre-#1438 this fell through to
+            # the finally and the call site saw a generic "app-server
+            # exited (rc=None)" with no clue why. Surface the buffer
+            # cap explicitly so a future regression points at the spawn
+            # ``limit=`` argument instead of looking like an upstream
+            # crash. Server-log only; the call-site exception text stays
+            # neutral to avoid the cross-session leak boundary set in
+            # #1410/#1412.
+            logger.error(
+                "codex app-server read_loop hit asyncio StreamReader limit "
+                "(spawn `limit=` argument too low for current frame): %s",
+                e,
+            )
+        except Exception as e:
+            # Don't let an unexpected reader exception look like a clean
+            # exit — log the actual error so it survives the
+            # ``CodexAppServerConnectionClosed`` thrown in the finally
+            # block. The pre-#1438 implementation buried these inside
+            # asyncio's "Task exception was never retrieved" warning and
+            # operators chasing 500s had nothing to grep for.
+            logger.error(
+                "codex app-server _read_loop crashed: %s: %s",
+                type(e).__name__, e,
+                exc_info=True,
+            )
         finally:
             # Wait briefly for the OS to report the real returncode.
             # Without this, ``returncode`` would be None when stdout
