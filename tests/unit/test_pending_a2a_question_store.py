@@ -208,6 +208,70 @@ async def test_two_agents_on_shared_backend_do_not_see_each_others_rows(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_mark_resolved_is_durable_across_reopen(tmp_path):
+    """Codex round 4 P2 on PR #1453: terminal status transitions MUST
+    be durably committed on SQLite. The prior implementation used
+    ``fetchall(UPDATE ... RETURNING ...)`` which surfaced the row to
+    the current connection but never committed — restarting the agent
+    resurrected RESOLVED rows as WAITING and the startup-replay sweep
+    re-fired the resumption signal as a duplicate cognition wake."""
+    db_path = str(tmp_path / "durable.db")
+    db1 = await AsyncDatabase.sqlite(db_path)
+    store1 = PendingA2AQuestionStore(db1, agent_id="did:test:durable")
+    await store1.insert(
+        task_id="t-durable", recipient="Meridian",
+        original_question="q", origin_turn_id=None, origin_session_id=None,
+        deadline=datetime.now(timezone.utc) + timedelta(minutes=10),
+    )
+    assert await store1.mark_resolved("t-durable") is True
+    assert (await store1.get("t-durable")).status == "RESOLVED"
+    await db1.close()
+
+    # Reopen the SAME file. If mark_resolved didn't commit, the row
+    # will look WAITING again — startup-replay would then re-spawn a
+    # supervisor and the eventual terminal would fire a DUPLICATE
+    # a2a.question_answered signal.
+    db2 = await AsyncDatabase.sqlite(db_path)
+    store2 = PendingA2AQuestionStore(db2, agent_id="did:test:durable")
+    row = await store2.get("t-durable")
+    assert row is not None
+    assert row.status == "RESOLVED", (
+        "After agent restart the resolved row must STILL be RESOLVED "
+        "— if it reverted to WAITING the startup-replay sweep would "
+        "double-fire the resumption signal (codex round 4 P2)."
+    )
+    assert row.resolved_at is not None
+    await db2.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_expired_is_durable_across_reopen(tmp_path):
+    """Same durability contract as ``mark_resolved`` — terminal
+    EXPIRED rows must survive a restart so the hourly sweep doesn't
+    walk them again on the next boot."""
+    db_path = str(tmp_path / "durable_expired.db")
+    db1 = await AsyncDatabase.sqlite(db_path)
+    store1 = PendingA2AQuestionStore(db1, agent_id="did:test:durable")
+    await store1.insert(
+        task_id="t-exp-durable", recipient="Meridian",
+        original_question="q", origin_turn_id=None, origin_session_id=None,
+        deadline=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    assert await store1.mark_expired("t-exp-durable") is True
+    await db1.close()
+
+    db2 = await AsyncDatabase.sqlite(db_path)
+    store2 = PendingA2AQuestionStore(db2, agent_id="did:test:durable")
+    row = await store2.get("t-exp-durable")
+    assert row.status == "EXPIRED", (
+        "After restart, an EXPIRED row must NOT revert to WAITING — "
+        "the hourly sweep would otherwise re-fire the synthetic "
+        "expired signal as a duplicate cognition wake."
+    )
+    await db2.close()
+
+
+@pytest.mark.asyncio
 async def test_mark_expired_terminal_transition(tmp_path):
     store = await _make_store(tmp_path)
     past = datetime.now(timezone.utc) - timedelta(hours=2)

@@ -139,17 +139,25 @@ class PendingA2AQuestionStore:
         was already terminal (RESOLVED or EXPIRED) or belonged to a
         different agent — both cases are benign (subscription racing a
         startup-replay; another agent's row on a shared backend) and
-        the caller should drop their resolve-side signal silently."""
-        rows = await self._db.fetchall(
+        the caller should drop their resolve-side signal silently.
+
+        Codex round 4 P2 on PR #1453: use ``execute()`` (which commits
+        on SQLite) rather than ``fetchall(UPDATE ... RETURNING ...)``
+        — the prior implementation surfaced the row to the current
+        connection but never durably wrote it, so restarting the agent
+        resurrected RESOLVED rows as WAITING and the startup-replay
+        sweep re-fired the resumption signal as a duplicate. Rowcount
+        > 0 carries the same conditional-update semantics as a
+        ``RETURNING task_id`` row count."""
+        rowcount = await self._db.execute(
             """
             UPDATE pending_a2a_questions
             SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND task_id = ? AND status = 'WAITING'
-            RETURNING task_id
             """,
             (self._agent_id, task_id),
         )
-        return bool(rows)
+        return rowcount > 0
 
     async def list_waiting(self) -> List[PendingA2AQuestion]:
         """All rows still in WAITING for THIS agent — startup-replay's
@@ -179,17 +187,18 @@ class PendingA2AQuestionStore:
     async def mark_expired(self, task_id: str) -> bool:
         """Transition WAITING → EXPIRED (terminal) for THIS agent's
         row. Same idempotency + cross-agent semantics as
-        ``mark_resolved``."""
-        rows = await self._db.fetchall(
+        ``mark_resolved``. ``execute()`` is used for the same
+        durability reason — see ``mark_resolved`` docstring + codex
+        round 4 P2."""
+        rowcount = await self._db.execute(
             """
             UPDATE pending_a2a_questions
             SET status = 'EXPIRED', resolved_at = CURRENT_TIMESTAMP
             WHERE agent_id = ? AND task_id = ? AND status = 'WAITING'
-            RETURNING task_id
             """,
             (self._agent_id, task_id),
         )
-        return bool(rows)
+        return rowcount > 0
 
     async def _list_by_status(self, status: str) -> List[PendingA2AQuestion]:
         rows = await self._db.fetchall(
