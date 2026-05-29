@@ -604,6 +604,142 @@ class PeersFeature(Feature):
             },
         )
 
+    @tool(
+        name="get_peer_task_result",
+        description=(
+            "Fetch the current state + full reply text of an A2A "
+            "task you previously sent to a peer agent. Use this when "
+            "an `a2a.question_answered` signal arrived with "
+            "`truncated=true` (the inline reply was clipped at 8 "
+            "KiB) — this tool fetches the FULL untruncated body from "
+            "the peer's task store. Returns the same envelope shape "
+            "a local `get_task_result` would, but routed through the "
+            "host proxy to the peer (#1444 truncation recovery path)."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a result",
+    )
+    async def get_peer_task_result(
+        self,
+        recipient: str,
+        task_id: str,
+    ) -> ToolResult:
+        """Fetch a peer's task envelope and return the full reply
+        text. Mirrors ``get_task_result`` but for tasks the caller
+        SENT to a peer (not tasks in the caller's own store).
+
+        Args:
+            recipient: The peer agent name the task was sent to.
+            task_id: The task id returned from
+                ``send_a2a_question`` / ``send_a2a_task``.
+        """
+        if not self._host_url:
+            return ToolResult.failed(
+                "Not running in a multi_agent environment — no host "
+                "to proxy through",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+        url = (
+            f"{self._host_url}/api/agents/{recipient}"
+            f"/api/agent/tasks/{task_id}"
+        )
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    url,
+                    headers=self._build_headers(),
+                    timeout=httpx.Timeout(
+                        connect=PEER_CONNECT_TIMEOUT,
+                        read=PEER_CONNECT_TIMEOUT,
+                        write=PEER_CONNECT_TIMEOUT,
+                        pool=PEER_CONNECT_TIMEOUT,
+                    ),
+                )
+        except (httpx.ConnectError, httpx.TimeoutException) as e:
+            return ToolResult.failed(
+                f"Could not reach peer '{recipient}' for task "
+                f"{task_id}: {e}",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+        except Exception as e:
+            return ToolResult.failed(
+                f"Error fetching peer task {task_id} from "
+                f"{recipient}: {e}",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+
+        if resp.status_code == 404:
+            return ToolResult.failed(
+                f"Task {task_id} not found on peer '{recipient}' "
+                f"(either the peer evicted it or task_id is wrong)",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+        if resp.status_code != 200:
+            return ToolResult.failed(
+                f"Peer '{recipient}' returned HTTP {resp.status_code} "
+                f"for task {task_id}",
+                data={
+                    "recipient": recipient,
+                    "task_id": task_id,
+                    "status_code": resp.status_code,
+                },
+            )
+        try:
+            data = resp.json()
+        except ValueError as e:
+            return ToolResult.failed(
+                f"Peer '{recipient}' returned malformed JSON for "
+                f"task {task_id}: {e}",
+                data={"recipient": recipient, "task_id": task_id},
+            )
+
+        # Reuse the supervisor's dual-shape parser to extract the
+        # reply text — handles both canonical A2A and kestrel's
+        # flattened endpoint shape consistently with how the
+        # ``a2a.question_answered`` signal got built in the first
+        # place.
+        raw_status = data.get("status")
+        if isinstance(raw_status, dict):
+            current_state = raw_status.get("state", "unknown")
+        elif isinstance(raw_status, str):
+            current_state = raw_status
+        else:
+            current_state = "unknown"
+        reply_text = ""
+        if isinstance(raw_status, dict):
+            msg = raw_status.get("message") or {}
+            for part in (msg.get("parts") or []):
+                if isinstance(part, dict) and "text" in part:
+                    reply_text = part["text"] or ""
+                    break
+        if not reply_text:
+            top_msg = data.get("message")
+            if isinstance(top_msg, str) and top_msg:
+                reply_text = top_msg
+        if not reply_text:
+            for artifact in (data.get("artifacts") or []):
+                if isinstance(artifact, dict):
+                    for part in (artifact.get("parts") or []):
+                        if isinstance(part, dict) and "text" in part:
+                            reply_text = part["text"] or ""
+                            break
+                if reply_text:
+                    break
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Fetched peer task {task_id[:8]} from {recipient} "
+                f"(state={current_state}, {len(reply_text)} chars)"
+            ),
+            data={
+                "recipient": recipient,
+                "task_id": task_id,
+                "state": current_state,
+                "reply_text": reply_text,
+                "artifacts": data.get("artifacts") or [],
+            },
+        )
+
     # ------------------------------------------------------------------
     # Subscription supervisor (#1444)
     #
@@ -747,14 +883,43 @@ class PeersFeature(Feature):
             await asyncio.sleep(min(backoff, _remaining()))
 
         if state not in terminal_states:
-            # Deadline passed without terminal. The hourly expiry sweep
-            # owns firing the synthetic ``state=expired`` signal — don't
-            # double-fire from here. Just leave the row WAITING.
+            # Deadline passed without terminal. Fire the synthetic
+            # ``state='expired'`` signal NOW (deadline-accurate) rather
+            # than letting the caller wait up to an hour for the hourly
+            # sweep — promised wake-by-deadline must actually happen at
+            # the deadline (codex round 2 P2a on PR #1453). Mark-expired
+            # FIRST so a racing hourly sweep that's also walking this row
+            # gets a False return and drops its duplicate signal.
             logger.info(
                 "A2A subscription supervisor for task=%s recipient=%s "
-                "exited without terminal frame. Hourly sweep will fire "
-                "the expired signal.",
+                "exited at deadline without terminal frame. Firing "
+                "deadline-accurate expired signal.",
                 task_id, recipient,
+            )
+            store = getattr(self.agent, "pending_a2a_questions", None)
+            if store is not None:
+                try:
+                    was_waiting = await store.mark_expired(task_id)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to mark pending_a2a_question task=%s "
+                        "expired: %s. Firing signal anyway — better a "
+                        "possible duplicate than a missed resumption.",
+                        task_id, e,
+                    )
+                    was_waiting = True
+                if not was_waiting:
+                    # Someone else (hourly sweep that beat us by a tick)
+                    # got there first — drop our duplicate signal.
+                    return
+            await self._fire_question_answered_signal(
+                task_id=task_id,
+                recipient=recipient,
+                original_question=original_question,
+                sess_id=sess_id,
+                state="expired",
+                reply_text="",
+                causation_chain=causation_chain,
             )
             return
 

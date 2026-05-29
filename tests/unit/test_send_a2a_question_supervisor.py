@@ -344,6 +344,122 @@ class TestSupervisor404HardCut:
         )
 
 
+class TestSupervisorDeadlineAccurateExpiry:
+    @pytest.mark.asyncio
+    async def test_deadline_passes_without_terminal_fires_expired_signal_now(
+        self, monkeypatch,
+    ):
+        """Codex round 2 P2a on PR #1453: when the supervisor exits at
+        its deadline without a terminal frame, it MUST fire the
+        synthetic ``state='expired'`` signal immediately — not wait
+        for the hourly sweep. A caller who passed ``timeout_seconds=300``
+        should NOT have to wait up to an hour for the resumption."""
+        # Stream that never yields a terminal — supervisor reads the
+        # snapshot, sees "working", and reconnects until deadline.
+        working_frame = json.dumps({
+            "id": "t-deadline",
+            "status": {"state": "working"},
+        })
+        # Two reconnect attempts both yield only working frames, then
+        # the deadline passes.
+        sse_response_a = _FakeStreamResponse([
+            "event: status",
+            f"data: {working_frame}",
+            "",
+        ])
+        sse_response_b = _FakeStreamResponse([
+            "event: status",
+            f"data: {working_frame}",
+            "",
+        ])
+        feature, agent, enqueue, _ = _make_feature(
+            sse_responses=[sse_response_a, sse_response_b],
+            monkeypatch=monkeypatch,
+        )
+        # ``mark_expired`` returns True (this row is still WAITING).
+        agent.pending_a2a_questions.mark_expired = AsyncMock(
+            return_value=True,
+        )
+
+        # Deadline 100ms in the future so the loop exits fast. Patch
+        # asyncio.sleep to a no-op so backoff doesn't blow the test
+        # budget.
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        await feature._supervise_a2a_question(
+            task_id="t-deadline",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-deadline",
+            deadline_utc=_dt.now(_tz.utc) + _td(milliseconds=100),
+            causation_chain=None,
+        )
+
+        agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
+            "t-deadline",
+        )
+        enqueue.assert_awaited_once()
+        sig = enqueue.await_args.args[0]
+        assert sig.payload["state"] == "expired", (
+            "Deadline-exit must fire state='expired' so the asking "
+            "lineage resumes at the deadline, not up to an hour later "
+            "when the hourly sweep runs."
+        )
+        assert sig.payload["reply_text"] == "", (
+            "Expired signal must NOT carry a reply text — there isn't "
+            "one. The prompt template branches on state='expired' to "
+            "render the empty body."
+        )
+
+    @pytest.mark.asyncio
+    async def test_deadline_exit_drops_signal_when_already_terminal(
+        self, monkeypatch,
+    ):
+        """If the hourly sweep beat the supervisor to mark_expired
+        (a benign race), the supervisor must drop its synthetic
+        signal rather than firing a duplicate."""
+        working_frame = json.dumps({
+            "id": "t-deadline-raced",
+            "status": {"state": "working"},
+        })
+        sse_response = _FakeStreamResponse([
+            "event: status",
+            f"data: {working_frame}",
+            "",
+        ])
+        feature, agent, enqueue, _ = _make_feature(
+            sse_responses=[sse_response], monkeypatch=monkeypatch,
+        )
+        agent.pending_a2a_questions.mark_expired = AsyncMock(
+            return_value=False,  # someone already expired it
+        )
+
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        await feature._supervise_a2a_question(
+            task_id="t-deadline-raced",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-raced",
+            deadline_utc=_dt.now(_tz.utc) + _td(milliseconds=100),
+            causation_chain=None,
+        )
+
+        agent.pending_a2a_questions.mark_expired.assert_awaited_once()
+        enqueue.assert_not_awaited(), (
+            "Supervisor must NOT fire its expired signal when "
+            "mark_expired returns False — the hourly sweep already "
+            "claimed the resumption and would otherwise produce a "
+            "duplicate cognition wake."
+        )
+
+
 class TestSupervisorDedupSignal:
     @pytest.mark.asyncio
     async def test_already_terminal_pending_row_drops_signal(

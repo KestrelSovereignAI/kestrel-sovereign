@@ -12,7 +12,7 @@
 {payload[reply_text]}
 ```
 
-If the reply block above contains the text `[truncated; call get_a2a_task(...)`, the full body exceeded the inline cap (8 KiB). Call `get_a2a_task("{payload[task_id]}")` to fetch the complete reply before responding — do NOT pretend the truncated text is the whole answer.
+If the reply block above contains the text `[truncated; call get_peer_task_result(...)`, the full body exceeded the inline cap (8 KiB). Call `get_peer_task_result("{payload[recipient]}", "{payload[task_id]}")` to fetch the complete reply through the host proxy before responding — do NOT pretend the truncated text is the whole answer.
 
 If `state` is `expired`, your subscription deadline passed without `{payload[recipient]}` reaching a terminal state. The reply block will be empty. Decide whether to give up, re-ask via a fresh `send_a2a_question`, or escalate — do NOT claim you got an answer when state is `expired`.
 

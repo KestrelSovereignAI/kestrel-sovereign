@@ -153,9 +153,12 @@ class TestSignalBuilder:
             f"Truncated reply must fit under {REPLY_TEXT_INLINE_CAP_BYTES} "
             f"bytes; got {len(rendered.encode('utf-8'))}."
         )
-        assert "call get_a2a_task(\"t-big\")" in rendered, (
-            "Overflow hint must cite the task_id so the resumed turn "
-            "knows exactly which task to fetch the full body from."
+        assert "get_peer_task_result(\"Meridian\", \"t-big\")" in rendered, (
+            "Overflow hint must cite get_peer_task_result with BOTH "
+            "recipient and task_id so the resumed turn can fetch the "
+            "full body through the host proxy. Citing only task_id (or "
+            "a nonexistent get_a2a_task) makes the truncated reply "
+            "unrecoverable — codex round 2 P2b on PR #1453."
         )
 
     def test_causation_chain_threaded_through(self):

@@ -41,11 +41,11 @@ the supervisor builds the signal, so A→B→A→B chains still hit the
 dispatcher's depth-2 cycle cap.
 
 Reply text size: 8 KiB inline soft cap. Overflow is truncated with an
-explicit ``call get_a2a_task('<task_id>') for the full body`` hint in
-the prompt — the receiver-side task store still has the full reply,
-so the resumed turn has a path. 8 KiB picked so a normal prompt token
-budget can absorb the inline reply without crowding out memories /
-RAG context (~2K tokens).
+explicit ``call get_peer_task_result('<recipient>', '<task_id>')`` hint
+in the prompt — the receiver-side task store still has the full reply,
+and ``PeersFeature.get_peer_task_result`` fetches it through the host
+proxy. 8 KiB picked so a normal prompt token budget can absorb the
+inline reply without crowding out memories / RAG context (~2K tokens).
 
 Retention: 90 days per Sovereign decision on #1444 — resumed-turn
 context-recall sometimes benefits from looking back at the original
@@ -86,7 +86,8 @@ PROMPT_TEMPLATE = (
 # docstring.
 REPLY_TEXT_INLINE_CAP_BYTES = 8 * 1024
 REPLY_TEXT_OVERFLOW_HINT = (
-    " ...[truncated; call get_a2a_task(\"{task_id}\") for the full body]"
+    " ...[truncated; call get_peer_task_result(\"{recipient}\", "
+    "\"{task_id}\") for the full body]"
 )
 
 
@@ -214,8 +215,14 @@ def build_signal_for_question_answered(
         # Trim to the budget then append the hint. Use byte-aware
         # truncation so multi-byte UTF-8 sequences don't get cut.
         encoded = reply_text.encode("utf-8")
-        # Reserve room for the hint so the total payload stays under cap.
-        hint = REPLY_TEXT_OVERFLOW_HINT.format(task_id=task_id)
+        # Reserve room for the hint so the total payload stays under
+        # cap. The hint cites get_peer_task_result with BOTH recipient
+        # and task_id since fetching the peer's task requires both
+        # (the sender's own store only has tasks it received, not
+        # tasks it sent — codex round 2 P2b on PR #1453).
+        hint = REPLY_TEXT_OVERFLOW_HINT.format(
+            recipient=recipient, task_id=task_id,
+        )
         hint_bytes = hint.encode("utf-8")
         room = REPLY_TEXT_INLINE_CAP_BYTES - len(hint_bytes)
         clipped = encoded[:room].decode("utf-8", errors="ignore")
