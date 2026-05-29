@@ -292,36 +292,35 @@ async def test_search_end_to_end_against_real_sqlite():
             target = [1.0] + [0.0] * 1535
             distractor = [0.0, 1.0] + [0.0] * 1534
 
-            await db.execute(
-                """INSERT INTO saved_items
-                   (id, agent_id, item_type, name, summary, content,
-                    content_hash, ipfs_cid, embedding, source_type,
-                    source_ref, schema_id, tags, metadata,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    "id-target", "agent-e2e", "stash", "Target", None,
-                    "content t", "h1", None,
-                    struct.pack(f"<1536f", *target),
-                    None, None, None, "[]", "{}",
-                    "2026-01-01T00:00:00", "2026-01-01T00:00:00",
-                ),
-            )
-            await db.execute(
-                """INSERT INTO saved_items
-                   (id, agent_id, item_type, name, summary, content,
-                    content_hash, ipfs_cid, embedding, source_type,
-                    source_ref, schema_id, tags, metadata,
-                    created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    "id-distractor", "agent-e2e", "stash", "Distractor", None,
-                    "content d", "h2", None,
-                    struct.pack(f"<1536f", *distractor),
-                    None, None, None, "[]", "{}",
-                    "2026-01-01T00:00:00", "2026-01-01T00:00:00",
-                ),
-            )
+            # Phase 2: rows are written to BOTH the legacy ``embedding``
+            # column (BYTEA / BLOB used by raw IO) AND ``embedding_vec``
+            # (the ORM-mapped column the vector backend reads). In
+            # production ``save_item()``'s dual-write keeps these in
+            # sync; the test does it manually here to keep the search
+            # path isolated from the embedding-service path.
+            for row_id, name, vec in [
+                ("id-target", "Target", target),
+                ("id-distractor", "Distractor", distractor),
+            ]:
+                packed = struct.pack("<1536f", *vec)
+                await db.execute(
+                    """INSERT INTO saved_items
+                       (id, agent_id, item_type, name, summary, content,
+                        content_hash, ipfs_cid, embedding, source_type,
+                        source_ref, schema_id, tags, metadata,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        row_id, "agent-e2e", "stash", name, None,
+                        "content x", row_id, None, packed,
+                        None, None, None, "[]", "{}",
+                        "2026-01-01T00:00:00", "2026-01-01T00:00:00",
+                    ),
+                )
+                await db.execute(
+                    "UPDATE saved_items SET embedding_vec = ? WHERE id = ?",
+                    (packed, row_id),
+                )
             await db.commit()
 
             # Stub the embedding service so search() picks the kNN

@@ -1,30 +1,35 @@
 """SQLAlchemy mapping of the ``saved_items`` table.
 
 The table is created and managed by the raw-SQL ``AsyncDatabase`` /
-``CORE_SCHEMA`` path (see ``async_database.py``). This module just
-adds an ORM view on top so :func:`SavedItemsStore.search` can hand the
-table to the generic vector backends in
-``kestrel_sovereign.storage.vector``.
+``CORE_SCHEMA`` path (see ``async_database.py``). This module adds an
+ORM view on top so :func:`SavedItemsStore.search` can hand the table
+to the generic vector backends in ``kestrel_sovereign.storage.vector``.
 
-The mapping deliberately does NOT introduce any column the existing
-schema doesn't already have. The ``embedding`` column stays as
-``LargeBinary`` (= SQLite BLOB / PG BYTEA) so a Phase-1 read path
-works against the existing storage shape. A Phase-2 follow-up migrates
-the column to ``vector(1536)`` on PG and switches the vector backend
-factory dispatch to ``PgVectorBackend`` for real pgvector kNN. See
-kestrel-sovereign #1447 for the staged plan.
+The ``embedding`` column uses :class:`PortableVector` — ``vector(N)``
+on Postgres (via pgvector) and ``LargeBinary`` (BLOB) on SQLite. The
+Phase-2 PG migration in ``saved_items_pgvector_migration.py`` swaps
+existing BYTEA data to ``vector(N)`` on upgrade; SQLite is unchanged.
+See kestrel-sovereign #1447 / #1452.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
-from sqlalchemy import LargeBinary, String, Text
+from sqlalchemy import String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ..vector import VectorTableSpec
 from .base import SovereignBase
+from .types import PortableVector
+
+
+# Embedding dimension for ``saved_items``. Matches the default Ollama
+# ``nomic-embed-text`` model. The Phase-2 PG migration sniffs existing
+# rows to pick the actual dim on upgrade — this default is only used
+# when the migration finds no embedded rows (fresh DB).
+SAVED_ITEM_EMBEDDING_DIM = 768
 
 
 class SavedItem(SovereignBase):
@@ -56,12 +61,18 @@ class SavedItem(SovereignBase):
     content_hash: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     ipfs_cid: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
-    # The embedding column. ``LargeBinary`` maps to SQLite BLOB and PG
-    # BYTEA — the existing schema shape. The vector backends'
-    # ``PurePythonBackend`` reads the raw bytes and unpacks them in
-    # Python. ``PgVectorBackend`` requires ``Vector(N)``, which is the
-    # Phase-2 migration target for this column.
-    embedding: Mapped[Optional[bytes]] = mapped_column(LargeBinary, nullable=True)
+    # Embedding column — the ORM uses the parallel ``embedding_vec``
+    # SQL column added by the Phase-2 migration (NOT the legacy
+    # ``embedding`` BYTEA / BLOB column used by raw ``AsyncDatabase``
+    # IO). The two are kept in sync by ``SavedItemsStore.save_item``'s
+    # dual-write. This split lets the SQLA + pgvector path land
+    # without disturbing the raw ``INSERT`` / ``from_row`` callers
+    # that bind/unpack float32 bytes. (Caught by codex review on the
+    # Phase 2 PR — an in-place column-type swap would have broken
+    # them.)
+    embedding: Mapped[Optional[Any]] = mapped_column(
+        "embedding_vec", PortableVector(SAVED_ITEM_EMBEDDING_DIM), nullable=True
+    )
 
     # Provenance + categorization. JSON-encoded blobs stored as TEXT —
     # matches the existing ``json.dumps(...)`` writes in
