@@ -562,12 +562,37 @@ class PeersFeature(Feature):
                 deadline=deadline_utc,
             )
         except Exception as e:
-            logger.warning(
+            # Codex round 3 P2d on PR #1453: without a pending row the
+            # supervisor's mark_resolved would return False on the
+            # terminal frame and silently drop the resumption signal as
+            # a duplicate — the asking lineage would never resume even
+            # though the task was sent and the receiver answered.
+            # Surface this as a failure so the caller knows fire-and-
+            # resume is NOT in play: the task was POSTed (receiver will
+            # still act), but resumption is broken.
+            logger.error(
                 "Failed to record pending_a2a_question for task=%s "
-                "recipient=%s: %s. Continuing — the task was sent but "
-                "without a correlation row the answer cannot resume; "
-                "the receiver will still respond on their own.",
-                task_id, recipient, e,
+                "recipient=%s: %s. Failing the tool call rather than "
+                "silently losing the resumption signal.",
+                task_id, recipient, e, exc_info=True,
+            )
+            return ToolResult.failed(
+                f"Question was POSTed to {recipient} (task_id={task_id}) "
+                f"but the local pending-questions store rejected the "
+                f"correlation row ({type(e).__name__}: {e}). Without "
+                f"that row, the a2a.question_answered signal cannot "
+                f"fire — your turn will NOT be resumed when "
+                f"{recipient} answers. The receiver will still process "
+                f"the task; you can fetch the result manually with "
+                f"get_peer_task_result.",
+                data={
+                    "sent": True,
+                    "awaiting_reply": False,
+                    "task_id": task_id,
+                    "session_id": sess_id,
+                    "recipient": recipient,
+                    "store_error": f"{type(e).__name__}: {e}",
+                },
             )
 
         # Spawn the supervisor as an agent-owned background task. It
@@ -844,6 +869,16 @@ class PeersFeature(Feature):
                         # Successful connect — reset backoff.
                         backoff_idx = 0
                         async for sse_event in self._iter_sse_events(resp):
+                            # Codex round 3 P2c on PR #1453: enforce
+                            # the deadline INSIDE the stream loop. On
+                            # a healthy long-running task the receiver
+                            # keeps the connection open emitting
+                            # status/keepalive frames; without this
+                            # check the supervisor blows past
+                            # ``timeout_seconds`` without firing the
+                            # deadline-accurate expired signal.
+                            if _remaining() <= 0:
+                                break
                             event_name = sse_event.get("event") or "message"
                             data_str = sse_event.get("data") or ""
                             if event_name in ("keepalive", "ping"):
@@ -859,7 +894,9 @@ class PeersFeature(Feature):
                                 reply_text = event_reply
                                 break
                         # Stream ended cleanly — if we saw a terminal,
-                        # exit the outer loop; otherwise reconnect.
+                        # exit the outer loop; otherwise reconnect (or
+                        # the outer ``while`` will exit if the deadline
+                        # passed during the stream read).
                         if state in terminal_states:
                             break
             except (httpx.RequestError, httpx.TimeoutException) as e:

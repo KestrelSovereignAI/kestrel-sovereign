@@ -460,6 +460,72 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
 
 
+class TestSupervisorDeadlineInsideStreamLoop:
+    @pytest.mark.asyncio
+    async def test_long_running_stream_does_not_blow_past_deadline(
+        self, monkeypatch,
+    ):
+        """Codex round 3 P2c on PR #1453: a healthy peer that keeps the
+        SSE stream open emitting keepalive/status frames must not let
+        the supervisor blow past its ``deadline_utc`` without firing
+        the expired signal. The deadline check inside the stream loop
+        must break out and the deadline-exit branch must fire."""
+        # Build a stream that yields a steady drip of keepalives and
+        # working-state status frames — never terminal.
+        working = json.dumps({
+            "id": "t-deadline-stream",
+            "status": {"state": "working"},
+        })
+        frames: List[str] = []
+        for _ in range(2000):
+            frames.extend([
+                "event: keepalive",
+                "data: ",
+                "",
+                "event: status",
+                f"data: {working}",
+                "",
+            ])
+        sse_response = _FakeStreamResponse(frames)
+        feature, agent, enqueue, fake_client = _make_feature(
+            sse_responses=[sse_response], monkeypatch=monkeypatch,
+        )
+        agent.pending_a2a_questions.mark_expired = AsyncMock(
+            return_value=True,
+        )
+
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+        deadline = _dt.now(_tz.utc) + _td(milliseconds=20)
+        # asyncio.wait_for backstop: a real regression of this fix
+        # would hang the supervisor draining 2000 frames. Fail fast.
+        await asyncio.wait_for(
+            feature._supervise_a2a_question(
+                task_id="t-deadline-stream",
+                recipient="Meridian",
+                original_question="?",
+                sess_id="s-stream",
+                deadline_utc=deadline,
+                causation_chain=None,
+            ),
+            timeout=2.0,
+        )
+
+        agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
+            "t-deadline-stream",
+        )
+        enqueue.assert_awaited_once()
+        sig = enqueue.await_args.args[0]
+        assert sig.payload["state"] == "expired", (
+            "Deadline check inside the SSE stream loop must trigger "
+            "the deadline-exit path so the expired signal fires on "
+            "time, not when the peer eventually closes the stream."
+        )
+
+
 class TestSupervisorDedupSignal:
     @pytest.mark.asyncio
     async def test_already_terminal_pending_row_drops_signal(

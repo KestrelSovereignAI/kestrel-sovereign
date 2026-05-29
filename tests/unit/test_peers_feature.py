@@ -269,6 +269,49 @@ async def test_send_a2a_question_records_pending_row_and_spawns_supervisor():
 
 
 @pytest.mark.asyncio
+async def test_send_a2a_question_fails_when_pending_store_insert_fails():
+    """Codex round 3 P2d on PR #1453: if the pending-questions store
+    rejects the correlation row, the tool must NOT return
+    ``awaiting_reply=True`` — without the row, the supervisor's
+    mark_resolved returns False and silently drops the answered
+    signal as a duplicate, so the asking lineage never resumes
+    despite the receiver answering. Surface as failure so the
+    caller knows fire-and-resume is broken."""
+    feature = _make_a2a_feature()
+    post_resp = _mock_post_response(task_id="q-insert-fails", state="submitted")
+    client = _async_client_with(post_resp=post_resp)
+    feature.agent.pending_a2a_questions.insert = AsyncMock(
+        side_effect=RuntimeError("disk full"),
+    )
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_question(
+            "meridian", "the question?",
+        )
+
+    assert result.status is ToolResultStatus.ERROR, (
+        f"Insert failure must yield ToolResult.failed, not ok. Got "
+        f"{result.status}: {result.error}"
+    )
+    assert result.data["sent"] is True, (
+        "The task WAS POSTed — the caller should know that."
+    )
+    assert result.data["awaiting_reply"] is False, (
+        "Without a pending row the supervisor's mark_resolved returns "
+        "False and the resumption signal gets dropped — awaiting_reply "
+        "must NOT be True or the agent will end its turn waiting for a "
+        "signal that will never fire."
+    )
+    assert "get_peer_task_result" in (result.error or ""), (
+        "Error should tell the caller the recovery path is "
+        "get_peer_task_result so they can fetch the answer manually."
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_a2a_question_stamps_a2a_verb_metadata():
     """Receiver-side verb discrimination still must not depend solely
     on skill_id / reply_expected — the explicit ``a2a_verb='question'``
