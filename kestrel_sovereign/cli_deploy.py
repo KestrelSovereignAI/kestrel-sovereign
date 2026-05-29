@@ -122,7 +122,15 @@ def add_deploy_subcommands(subparsers: "argparse._SubParsersAction") -> None:
         "--tag",
         type=str,
         default="latest",
-        help="Image tag to deploy (default: latest)",
+        help=(
+            "Image tag to deploy. Required for Cloud Run profiles — "
+            "``latest`` is rejected because Cloud Run Admin v2 "
+            "``update_service`` compares image strings, so deploying "
+            "``:latest`` silently no-ops when the underlying digest "
+            "changes (#1441). Pass a concrete tag such as ``v0.15.1`` "
+            "or ``dev-abc1234``. Azure profiles still accept "
+            "``latest`` (default behavior unchanged)."
+        ),
     )
     deploy_p.add_argument(
         "--lines",

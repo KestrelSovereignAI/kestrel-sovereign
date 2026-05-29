@@ -236,6 +236,11 @@ class DeployFeature(Feature):
         ``!deploy deploy profile=dev`` calling convention, so the
         "profile required" hint with the agent-flavored ``usage`` string
         stays here. The actual provider work lives on the manager.
+
+        ``image_tag`` defaults to ``"latest"`` for backward compat with
+        the agent-tool calling convention, but the manager will reject
+        it for Cloud Run profiles (#1441) — operators must pass a
+        concrete tag like ``!deploy deploy profile=dev tag=v0.15.1``.
         """
         if not profile_name:
             profiles = list(self.manager.profiles.keys())
@@ -243,7 +248,7 @@ class DeployFeature(Feature):
                 "success": False,
                 "error": "Profile required",
                 "available_profiles": profiles,
-                "usage": "!deploy deploy profile=dev",
+                "usage": "!deploy deploy profile=dev tag=v0.15.1",
             }
 
         return await self.manager.deploy_profile(profile_name, image_tag)

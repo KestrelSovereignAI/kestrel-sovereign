@@ -214,6 +214,27 @@ class DeployManagerCore:
                 f"`kestrel deploy {profile_name}`. Affected: {details}"
             )
 
+    # Tags that point at moving aliases — deploying these silently
+    # no-ops on Cloud Run because the template comparison is by string,
+    # not by resolved digest. See #1441.
+    _MOVING_ALIAS_TAGS = frozenset({"", "latest"})
+
+    def _reject_moving_alias_tag(self, profile_name: str, tag: str) -> None:
+        """Raise DeployManagerError if ``tag`` is a moving alias."""
+        if tag in self._MOVING_ALIAS_TAGS:
+            image_ref_no_tag = self.build_image_reference(profile_name, "").rstrip(":")
+            raise DeployManagerError(
+                f"Refusing to deploy '{profile_name}': image tag is "
+                f"{tag!r}. Cloud Run treats moving aliases as stable "
+                f"strings and won't roll a new revision when the "
+                f"underlying digest changes (#1441). Pass a concrete "
+                f"tag such as `--tag v0.15.1` or `--tag dev-abc1234`. "
+                f"In CI, pass the build's resolved tag via "
+                f"`--tag ${{ needs.build.outputs.tag }}`. "
+                f"List recent tags with: gcloud container images "
+                f"list-tags {image_ref_no_tag} --limit 5"
+            )
+
     @staticmethod
     def _expand_env_vars(env_dict: Dict[str, str]) -> Dict[str, str]:
         """
@@ -490,6 +511,22 @@ class DeployManagerCore:
             # scripts errored on missing env via ``${VAR:?...}``;
             # mirror that here. Codex review on PR #1064.
             self._validate_no_unresolved_placeholders(profile_name, profile)
+
+            # Refuse to deploy a moving-alias tag on Cloud Run. Admin v2
+            # ``update_service`` compares the new template against the
+            # existing one as strings; if both reference ``:latest``,
+            # the underlying digest can change in the registry and the
+            # service silently keeps serving the prior revision. Every
+            # ``kestrel deploy`` invocation since the legacy bash scripts
+            # were retired hit this (#1441) — the workflow looked green
+            # but no new revision rolled out. Force callers to pass a
+            # concrete tag (``v0.15.1``, ``dev-abc1234``) so each deploy
+            # produces a unique image string. Other providers (Azure
+            # Container Apps) are not known to share this bug and are
+            # left at the prior default-``latest`` behavior; if they
+            # turn out to no-op similarly, widen this guard then.
+            if profile.provider == DeployProviderType.CLOUD_RUN:
+                self._reject_moving_alias_tag(profile_name, tag)
 
             image = self.build_image_reference(profile_name, tag)
 

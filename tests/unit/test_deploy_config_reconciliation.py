@@ -430,6 +430,123 @@ async def test_deploy_profile_rejects_empty_string_placeholder(
 
 
 @pytest.mark.asyncio
+async def test_deploy_profile_rejects_latest_tag(live_config, monkeypatch):
+    """#1441: ``kestrel deploy <profile>`` defaulted ``tag="latest"``,
+    and Cloud Run Admin v2 ``update_service`` compares templates as
+    strings — so deploying ``:latest`` after a fresh build silently
+    no-ops because the existing service template already references
+    ``:latest``. Every CI deploy since the bash retirement (epic
+    #1050 sub-PR 1.4) was a phantom rollout. Manager-level guard
+    refuses moving-alias tags; CI workflow now passes the build's
+    resolved per-invocation tag (``v0.15.1`` or ``dev-<7sha>``)
+    explicitly via ``--tag``.
+    """
+    # Satisfy the placeholder validator first so we reach the tag guard.
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "ops@example.com")
+    manager = DeployManager(config=live_config)
+
+    result = await manager.deploy_profile("dev", tag="latest")
+
+    assert result["success"] is False
+    err = result["error"]
+    assert "Refusing to deploy 'dev'" in err
+    assert "'latest'" in err
+    assert "#1441" in err
+    assert "--tag" in err
+
+
+@pytest.mark.asyncio
+async def test_deploy_profile_rejects_empty_tag(live_config, monkeypatch):
+    """An empty tag would resolve to ``gcr.io/.../image:`` — invalid as
+    a Docker reference and another silent failure mode. Treated the
+    same as ``:latest`` by the moving-alias guard."""
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "ops@example.com")
+    manager = DeployManager(config=live_config)
+
+    result = await manager.deploy_profile("dev", tag="")
+
+    assert result["success"] is False
+    assert "Refusing to deploy 'dev'" in result["error"]
+
+
+class _StubProvider:
+    """Records the image/profile passed to ``deploy`` without contacting
+    any cloud. Used to assert the moving-alias guard's pass/fail
+    behavior without ever reaching real provider code, even when GCP
+    or Azure credentials happen to be present in the test env."""
+
+    def __init__(self):
+        self.deploy_calls: list[dict] = []
+
+    async def deploy(self, *, image, service_name, profile):
+        self.deploy_calls.append(
+            {"image": image, "service_name": service_name, "profile": profile}
+        )
+        return {"service_url": "https://stub", "revision": "stub-rev-1"}
+
+
+def _install_offline_stubs(manager, monkeypatch) -> _StubProvider:
+    """Replace the provider AND the post-deploy health check so the
+    test cannot reach any real cloud or HTTP endpoint."""
+    stub = _StubProvider()
+    monkeypatch.setattr(manager, "_get_provider", lambda *a, **kw: stub)
+
+    async def _fake_health(_url, *_args, **_kw):
+        return True
+
+    monkeypatch.setattr(manager, "_verify_health", _fake_health)
+    return stub
+
+
+@pytest.mark.asyncio
+async def test_deploy_profile_accepts_concrete_version_tag(
+    live_config, monkeypatch
+):
+    """Concrete tags (``v0.15.1``, ``dev-abc1234``) pass the guard and
+    reach the provider with the expected image string. Provider AND
+    health check are stubbed — this test must never contact a real
+    cloud or HTTP endpoint, even when credentials are available."""
+    monkeypatch.setenv("KESTREL_ALLOWED_EMAILS", "ops@example.com")
+    manager = DeployManager(config=live_config)
+    stub = _install_offline_stubs(manager, monkeypatch)
+
+    result = await manager.deploy_profile("dev", tag="v0.15.1")
+
+    assert result["success"] is True
+    assert len(stub.deploy_calls) == 1
+    assert stub.deploy_calls[0]["image"].endswith(":v0.15.1"), (
+        f"unexpected image ref: {stub.deploy_calls[0]['image']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_deploy_profile_latest_tag_allowed_on_azure(
+    live_config, monkeypatch
+):
+    """Codex review caught: the moving-alias guard is Cloud Run-specific
+    (Admin v2 ``update_service`` compares image strings; #1441). Azure
+    Container Apps deploys are not known to share this bug, so the
+    guard must NOT block ``kestrel deploy azure-dev`` with the CLI
+    default tag — that would be a brand-new regression for an
+    unrelated provider. Provider + health check stubbed to keep this
+    fully offline."""
+    for var in (
+        "OPENAI_API_KEY", "KESTREL_API_KEY", "KESTREL_DATA_KEY",
+        "LIGHTHOUSE_API_KEY",
+    ):
+        monkeypatch.setenv(var, "test-placeholder")
+    manager = DeployManager(config=live_config)
+    stub = _install_offline_stubs(manager, monkeypatch)
+
+    result = await manager.deploy_profile("azure-dev", tag="latest")
+
+    # Guard must not fire for non-Cloud-Run providers.
+    assert result["success"] is True
+    assert len(stub.deploy_calls) == 1
+    assert stub.deploy_calls[0]["image"].endswith(":latest")
+
+
+@pytest.mark.asyncio
 async def test_deploy_profile_rejects_unresolved_placeholders(
     live_config, monkeypatch
 ):
