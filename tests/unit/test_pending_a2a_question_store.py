@@ -18,10 +18,10 @@ from kestrel_sovereign.storage.async_pending_a2a_question_store import (
 )
 
 
-async def _make_store(tmp_path):
+async def _make_store(tmp_path, agent_id="did:test:sender"):
     db_path = str(tmp_path / "store.db")
     db = await AsyncDatabase.sqlite(db_path)
-    return PendingA2AQuestionStore(db)
+    return PendingA2AQuestionStore(db, agent_id=agent_id)
 
 
 @pytest.mark.asyncio
@@ -148,6 +148,63 @@ async def test_list_waiting_past_deadline_for_expiry_sweep(tmp_path):
         f"Expired sweep must include past-deadline WAITING rows only "
         f"(not fresh ones, not already-resolved ones). Got {task_ids}."
     )
+
+
+@pytest.mark.asyncio
+async def test_two_agents_on_shared_backend_do_not_see_each_others_rows(tmp_path):
+    """Codex round 1 P1 on PR #1453: a shared backend (Postgres multi-
+    agent deployment) must NOT let agent A's startup-replay walk agent
+    B's WAITING rows. Each store is scoped to its own ``agent_id`` so
+    list_waiting / mark_resolved / mark_expired only see this agent's
+    rows."""
+    db_path = str(tmp_path / "shared.db")
+    db = await AsyncDatabase.sqlite(db_path)
+    store_a = PendingA2AQuestionStore(db, agent_id="did:test:A")
+    store_b = PendingA2AQuestionStore(db, agent_id="did:test:B")
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    # Agent A's row + agent B's row, same task_id (a legitimate
+    # collision now that task_id is no longer globally unique).
+    await store_a.insert(
+        task_id="t-shared", recipient="Meridian",
+        original_question="A's question",
+        origin_turn_id=None, origin_session_id=None,
+        deadline=deadline,
+    )
+    await store_b.insert(
+        task_id="t-shared", recipient="Meridian",
+        original_question="B's question",
+        origin_turn_id=None, origin_session_id=None,
+        deadline=deadline,
+    )
+
+    # Each agent sees only its own row.
+    rows_a = await store_a.list_waiting()
+    rows_b = await store_b.list_waiting()
+    assert len(rows_a) == 1 and rows_a[0].original_question == "A's question"
+    assert len(rows_b) == 1 and rows_b[0].original_question == "B's question"
+
+    # B's get() never returns A's row.
+    a_row_seen_by_b = await store_b.get("t-shared")
+    assert a_row_seen_by_b is not None
+    assert a_row_seen_by_b.original_question == "B's question", (
+        "Cross-agent get() would surface another agent's question "
+        "text — that's the root of the codex round-1 P1 misroute bug."
+    )
+
+    # A's mark_resolved cannot touch B's row.
+    assert await store_a.mark_resolved("t-shared") is True
+    b_row_after = await store_b.get("t-shared")
+    assert b_row_after.status == "WAITING", (
+        "Agent A marking task_id 't-shared' RESOLVED must NOT mark "
+        "agent B's same-id row RESOLVED — that would silently lose "
+        "B's resumption signal."
+    )
+
+    # A's mark_resolved a second time is False (own row already terminal).
+    assert await store_a.mark_resolved("t-shared") is False
+    # But B can still mark THEIR own row resolved.
+    assert await store_b.mark_resolved("t-shared") is True
 
 
 @pytest.mark.asyncio

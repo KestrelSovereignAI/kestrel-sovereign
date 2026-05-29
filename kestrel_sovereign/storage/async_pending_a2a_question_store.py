@@ -49,13 +49,24 @@ class PendingA2AQuestion:
 class PendingA2AQuestionStore:
     """Async CRUD over ``pending_a2a_questions`` (#1444).
 
-    Construct with the agent's ``AsyncDatabase`` so the writes go to the
-    same backend as the rest of agent state (and benefit from the same
-    transaction + retry posture).
+    Construct with the agent's ``AsyncDatabase`` AND the owning agent's
+    id. Every query is filtered by ``agent_id`` so a shared backend
+    (e.g. Postgres in a multi-agent deployment) cannot leak rows
+    between agents — codex round 1 P1 on PR #1453. ``agent_id`` is
+    the agent's DID; tests can pass any non-empty string.
     """
 
-    def __init__(self, db: AsyncDatabase):
+    def __init__(self, db: AsyncDatabase, agent_id: str):
+        if not isinstance(agent_id, str):
+            raise TypeError(
+                f"PendingA2AQuestionStore agent_id must be a string, "
+                f"got {type(agent_id).__name__}"
+            )
         self._db = db
+        # Empty string is a valid back-compat default for solo-agent
+        # SQLite deployments where the rows are scoped to the file
+        # rather than a column; the schema default is also ''.
+        self._agent_id = agent_id
 
     async def insert(
         self,
@@ -71,21 +82,22 @@ class PendingA2AQuestionStore:
         UTC moment past which the hourly expiry sweep will mark this row
         EXPIRED and fire a synthetic ``a2a.question_answered`` signal.
 
-        Idempotency: if a row for the same ``task_id`` already exists,
-        ``INSERT OR IGNORE`` skips silently. Callers should not need this
-        in practice (task_id is a fresh UUID per POST) but the guard
-        prevents the startup-replay sweep from double-inserting on a
-        crash-restart-during-write boundary."""
+        Idempotency: if a row for the same ``(agent_id, task_id)`` PK
+        already exists, ``INSERT OR IGNORE`` skips silently. Callers
+        should not need this in practice (task_id is a fresh UUID per
+        POST) but the guard prevents the startup-replay sweep from
+        double-inserting on a crash-restart-during-write boundary."""
         if deadline.tzinfo is None:
             deadline = deadline.replace(tzinfo=timezone.utc)
         await self._db.execute(
             """
             INSERT OR IGNORE INTO pending_a2a_questions
-                (task_id, recipient, original_question,
+                (agent_id, task_id, recipient, original_question,
                  origin_turn_id, origin_session_id, deadline, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'WAITING')
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'WAITING')
             """,
             (
+                self._agent_id,
                 task_id,
                 recipient,
                 original_question,
@@ -102,9 +114,9 @@ class PendingA2AQuestionStore:
                    origin_turn_id, origin_session_id, deadline,
                    status, created_at, resolved_at
             FROM pending_a2a_questions
-            WHERE task_id = ?
+            WHERE agent_id = ? AND task_id = ?
             """,
-            (task_id,),
+            (self._agent_id, task_id),
         )
         if not rows:
             return None
@@ -122,33 +134,35 @@ class PendingA2AQuestionStore:
         )
 
     async def mark_resolved(self, task_id: str) -> bool:
-        """Transition WAITING → RESOLVED. Returns True if a WAITING row
-        was found and updated, False if the row was already terminal
-        (RESOLVED or EXPIRED) — that case is benign (subscription racing
-        a startup-replay both seeing the same terminal event) and the
-        caller should drop their resolve-side signal silently."""
+        """Transition WAITING → RESOLVED for THIS agent's row. Returns
+        True if a WAITING row was found and updated, False if the row
+        was already terminal (RESOLVED or EXPIRED) or belonged to a
+        different agent — both cases are benign (subscription racing a
+        startup-replay; another agent's row on a shared backend) and
+        the caller should drop their resolve-side signal silently."""
         rows = await self._db.fetchall(
             """
             UPDATE pending_a2a_questions
             SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP
-            WHERE task_id = ? AND status = 'WAITING'
+            WHERE agent_id = ? AND task_id = ? AND status = 'WAITING'
             RETURNING task_id
             """,
-            (task_id,),
+            (self._agent_id, task_id),
         )
         return bool(rows)
 
     async def list_waiting(self) -> List[PendingA2AQuestion]:
-        """All rows still in WAITING — startup-replay's input set."""
+        """All rows still in WAITING for THIS agent — startup-replay's
+        input set."""
         return await self._list_by_status("WAITING")
 
     async def list_waiting_past_deadline(
         self, now: Optional[datetime] = None,
     ) -> List[PendingA2AQuestion]:
-        """WAITING rows whose deadline has passed — hourly-expiry input
-        set. ``now`` defaults to current UTC; pass an explicit value in
-        tests so the sweep is deterministic without monkey-patching
-        ``datetime.utcnow``."""
+        """WAITING rows whose deadline has passed for THIS agent —
+        hourly-expiry input set. ``now`` defaults to current UTC; pass
+        an explicit value in tests so the sweep is deterministic
+        without monkey-patching ``datetime.utcnow``."""
         ts = (now or datetime.now(timezone.utc)).isoformat()
         rows = await self._db.fetchall(
             """
@@ -156,23 +170,24 @@ class PendingA2AQuestionStore:
                    origin_turn_id, origin_session_id, deadline,
                    status, created_at, resolved_at
             FROM pending_a2a_questions
-            WHERE status = 'WAITING' AND deadline < ?
+            WHERE agent_id = ? AND status = 'WAITING' AND deadline < ?
             """,
-            (ts,),
+            (self._agent_id, ts),
         )
         return [self._row_to_dc(r) for r in rows]
 
     async def mark_expired(self, task_id: str) -> bool:
-        """Transition WAITING → EXPIRED (terminal). Same idempotency
-        semantics as ``mark_resolved``."""
+        """Transition WAITING → EXPIRED (terminal) for THIS agent's
+        row. Same idempotency + cross-agent semantics as
+        ``mark_resolved``."""
         rows = await self._db.fetchall(
             """
             UPDATE pending_a2a_questions
             SET status = 'EXPIRED', resolved_at = CURRENT_TIMESTAMP
-            WHERE task_id = ? AND status = 'WAITING'
+            WHERE agent_id = ? AND task_id = ? AND status = 'WAITING'
             RETURNING task_id
             """,
-            (task_id,),
+            (self._agent_id, task_id),
         )
         return bool(rows)
 
@@ -183,9 +198,9 @@ class PendingA2AQuestionStore:
                    origin_turn_id, origin_session_id, deadline,
                    status, created_at, resolved_at
             FROM pending_a2a_questions
-            WHERE status = ?
+            WHERE agent_id = ? AND status = ?
             """,
-            (status,),
+            (self._agent_id, status),
         )
         return [self._row_to_dc(r) for r in rows]
 

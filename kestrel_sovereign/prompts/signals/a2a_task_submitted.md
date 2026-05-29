@@ -8,7 +8,7 @@
 
 If the block above contains text, that IS the question/instruction — answer it directly. Do NOT claim the body is null or empty when you can see text in it. If you need more context (history, prior turns of the same session, artifacts), call `check_task_status(task_id)` or `get_task_result(task_id)`; otherwise reply now.
 
-**The single tool for closing the loop is `respond_to_a2a_task(task_id, content, state)`** — it transitions the task to COMPLETED (default), FAILED, or CANCELED and attaches your reply text. The sender's subscription supervisor (or the receiver's `/tasks/{id}/subscribe` SSE stream) picks up the terminal frame and fires an `a2a.question_answered` signal back on the sender's dispatcher with your reply inline. Without calling this, a `send_a2a_question` sender never gets resumed (the supervisor times out on the deadline, then the hourly sweep fires a `state='expired'` signal so the sender doesn't hang forever).
+**The single tool for closing the loop is `respond_to_a2a_task(task_id, content, state)`** — it transitions the task to COMPLETED (default), FAILED, or CANCELED and attaches your reply text. The sender's subscription supervisor (or the receiver's `/tasks/{{id}}/subscribe` SSE stream) picks up the terminal frame and fires an `a2a.question_answered` signal back on the sender's dispatcher with your reply inline. Without calling this, a `send_a2a_question` sender never gets resumed (the supervisor times out on the deadline, then the hourly sweep fires a `state='expired'` signal so the sender doesn't hang forever).
 
 The `a2a_verb` field tells you the sender's intent:
 

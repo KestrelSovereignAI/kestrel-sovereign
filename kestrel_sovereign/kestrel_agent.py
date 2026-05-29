@@ -705,8 +705,13 @@ class KestrelAgent(
             from kestrel_sovereign.storage.async_pending_a2a_question_store import (
                 PendingA2AQuestionStore,
             )
+            # ``agent_id`` is the agent's DID — scopes every query so a
+            # shared backend cannot leak rows across agents (codex
+            # round 1 P1 on PR #1453). DID is guaranteed non-None by
+            # the time we get here.
             self.pending_a2a_questions = PendingA2AQuestionStore(
-                self._raw_storage.db
+                self._raw_storage.db,
+                agent_id=self.did or "",
             )
 
             # Initialize storage providers for features (reflection self-model, etc.)

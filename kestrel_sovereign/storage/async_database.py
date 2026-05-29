@@ -352,8 +352,16 @@ CREATE INDEX IF NOT EXISTS idx_saved_items_hash ON saved_items(content_hash);
 --   4. Hourly expiry sweep (rows past ``deadline`` get a synthetic
 --      ``state='expired'`` signal so the resumed prompt has a clean branch)
 -- ============================================================================
+-- ``agent_id`` scopes rows to the OWNING agent so a shared backend
+-- (e.g. Postgres in a multi-agent deployment) does NOT let agent A's
+-- startup-replay walk agent B's WAITING rows and mis-route the
+-- ``a2a.question_answered`` signal to A's local dispatcher with B's
+-- question content. The PK is composite (agent_id, task_id) since
+-- ``task_id`` is only unique within an agent's own counter.
+-- (Codex round 1 P1 on PR #1453.)
 CREATE TABLE IF NOT EXISTS pending_a2a_questions (
-    task_id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL DEFAULT '',
+    task_id TEXT NOT NULL,
     recipient TEXT NOT NULL,
     original_question TEXT NOT NULL,
     origin_turn_id TEXT,
@@ -363,11 +371,12 @@ CREATE TABLE IF NOT EXISTS pending_a2a_questions (
         status IN ('WAITING', 'RESOLVED', 'EXPIRED')
     ),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    resolved_at TIMESTAMP
+    resolved_at TIMESTAMP,
+    PRIMARY KEY (agent_id, task_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
-    ON pending_a2a_questions(status, deadline);
+    ON pending_a2a_questions(agent_id, status, deadline);
 """
 
 # Backend-specific JSON-path indexes on graph_nodes properties.
