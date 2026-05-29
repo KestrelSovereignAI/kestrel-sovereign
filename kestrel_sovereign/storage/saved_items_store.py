@@ -678,6 +678,34 @@ class SavedItemsStore:
             )
         return [SavedItem.from_row(row) for row in rows]
 
+    def _get_vector_session_factory(self):
+        """Lazy-build a SQLAlchemy session factory pointed at the same
+        DB as ``self.db``.
+
+        Cached on the store so repeated searches reuse the same pool.
+        Returns ``None`` if construction fails (e.g. ``from_pool``
+        AsyncDatabase, in-memory SQLite, or any other unsupported
+        backend shape) — callers then fall back to the legacy
+        in-Python search path.
+        """
+        if getattr(self, "_sqla_factory", None) is not None:
+            return self._sqla_factory
+        # Don't keep retrying once we've decided it isn't available.
+        if getattr(self, "_sqla_factory_unavailable", False):
+            return None
+        try:
+            from kestrel_sovereign.storage.sqla import make_session_factory
+            self._sqla_factory = make_session_factory(self.db)
+            return self._sqla_factory
+        except Exception as e:
+            logger.info(
+                "SQLAlchemy session factory unavailable for saved_items "
+                "vector search (%s); falling back to in-Python search.",
+                e,
+            )
+            self._sqla_factory_unavailable = True
+            return None
+
     async def search(
         self,
         query: str,
@@ -688,6 +716,27 @@ class SavedItemsStore:
         Semantic search across saved items.
 
         Returns items sorted by relevance with scores.
+
+        Phase-1 vector path: query embeddings are scored against stored
+        embeddings via ``kestrel_sovereign.storage.vector``'s
+        ``PurePythonBackend``. Same numpy-cosine math as the prior
+        hand-rolled loop, but routed through the generic, shared
+        primitives so a future Phase-2 PR can swap PG to pgvector by
+        migrating the embedding column and flipping the backend choice
+        — no further changes here. See kestrel-sovereign #1447 for the
+        staged plan.
+
+        Three fallbacks, in priority order:
+
+        1. No embedding service available → return text-LIKE results
+        2. SQLAlchemy session factory can't be built (e.g.
+           ``AsyncDatabase`` from a bare pool) → fall back to legacy
+           in-Python loop reading via ``self.db``
+        3. Vector backend yields no rows (no stored embeddings yet) →
+           fall back to text search
+
+        Result shape matches the legacy code exactly:
+        ``[{"item": <dict>, "score": <float>}, ...]``.
         """
         embedding_service = self._get_embedding_service()
 
@@ -698,6 +747,116 @@ class SavedItemsStore:
                 query_embedding = await embedding_service.aembed(query)
             except Exception as e:
                 logger.warning(f"Failed to embed query: {e}")
+
+        if not query_embedding:
+            # No embedding for the query → can't do semantic search at
+            # all. Text-LIKE has the same fallback semantics the old
+            # code had.
+            return await self._text_search(query, item_type, limit)
+
+        # Sovereign vector backend path. ``PurePythonBackend`` is used
+        # explicitly (not the dialect-dispatching factory) until the
+        # Phase-2 BYTEA→vector(N) migration lands: the embedding
+        # column is still BYTEA on PG today, which PgVectorBackend
+        # can't query.
+        sf = self._get_vector_session_factory()
+        if sf is not None:
+            scored = await self._search_via_vector_backend(
+                sf, query, query_embedding, item_type, limit
+            )
+            if scored is not None:
+                return scored
+
+        # No SQLA session factory available → fall back to the legacy
+        # in-Python loop. Behaviourally identical.
+        return await self._legacy_in_python_search(
+            query, query_embedding, item_type, limit
+        )
+
+    async def _search_via_vector_backend(
+        self,
+        session_factory,
+        query: str,
+        query_embedding: List[float],
+        item_type: Optional[str],
+        limit: int,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Run kNN through ``kestrel_sovereign.storage.vector`` and
+        materialize the top-k items via ``self.db``.
+
+        Returns ``None`` (so the caller falls back to the legacy path)
+        on any unexpected vector-backend failure — we'd rather degrade
+        than 500.
+        """
+        try:
+            # Local imports keep the legacy code paths free of the new
+            # dependency surface when the vector backend isn't being
+            # exercised.
+            from kestrel_sovereign.storage.sqla import build_saved_item_spec
+            from kestrel_sovereign.storage.vector import PurePythonBackend
+
+            # Pack query embedding into float32 little-endian bytes —
+            # the shape both backends consume. The spec is built with
+            # ``dimension=len(query_embedding)`` so any embedding-model
+            # shape works (Ollama nomic-embed-text=768,
+            # mxbai-embed-large=1024, OpenAI ada-002=1536, …) without a
+            # hard-coded mismatch.
+            packed = _serialize_embedding(query_embedding)
+            spec = build_saved_item_spec(dimension=len(query_embedding))
+
+            filter_kwargs: Dict[str, Any] = {"agent_id": self.agent_id}
+            if item_type:
+                filter_kwargs["item_type"] = item_type
+
+            backend = PurePythonBackend(session_factory, spec)
+            top_k = await backend.knn(
+                packed, k=limit, filter=filter_kwargs
+            )
+        except Exception as e:
+            logger.warning(
+                "Vector-backend search failed (%s); falling back to "
+                "in-Python legacy path.", e,
+            )
+            return None
+
+        if not top_k:
+            # No stored embeddings for this agent's scope — fall back
+            # to text search with the original query string (matching
+            # the pre-#1447 behaviour exactly).
+            return await self._text_search(query, item_type, limit)
+
+        # Materialize: fetch full SavedItem rows by id, preserve the
+        # backend's similarity ordering.
+        scored: List[Dict[str, Any]] = []
+        for item_id, score in top_k:
+            row = await self.db.fetchone(
+                """SELECT id, agent_id, item_type, name, summary, content,
+                          content_hash, ipfs_cid, embedding, source_type,
+                          source_ref, schema_id, tags, metadata,
+                          created_at, updated_at
+                   FROM saved_items WHERE id = ? AND agent_id = ?""",
+                (item_id, self.agent_id),
+            )
+            if not row:
+                # Row deleted between knn() and the lookup — skip it.
+                continue
+            scored.append({
+                "item": SavedItem.from_row(row).to_dict(),
+                "score": float(score),
+            })
+
+        return scored
+
+    async def _legacy_in_python_search(
+        self,
+        query: str,
+        query_embedding: List[float],
+        item_type: Optional[str],
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """Fallback used when the SQLAlchemy session factory isn't
+        available (in-memory SQLite, ``AsyncDatabase.from_pool``,
+        etc.). Same shape as the pre-1447 search path."""
 
         # Get all items with embeddings
         if item_type:
@@ -720,29 +879,25 @@ class SavedItemsStore:
             )
 
         if not rows:
-            # Fall back to text search
+            # Fall back to text search with the original query string —
+            # matches the pre-#1447 behaviour exactly.
             return await self._text_search(query, item_type, limit)
 
-        # Score by cosine similarity if we have query embedding
-        if query_embedding:
-            from kestrel_sovereign.llm.embedding_service import cosine_similarity
+        from kestrel_sovereign.llm.embedding_service import cosine_similarity
 
-            scored = []
-            for row in rows:
-                item = SavedItem.from_row(row)
-                if item.embedding:
-                    score = cosine_similarity(query_embedding, item.embedding)
-                    scored.append({
-                        "item": item.to_dict(),
-                        "score": score
-                    })
+        scored = []
+        for row in rows:
+            item = SavedItem.from_row(row)
+            if item.embedding:
+                score = cosine_similarity(query_embedding, item.embedding)
+                scored.append({
+                    "item": item.to_dict(),
+                    "score": score
+                })
 
-            # Sort by score descending
-            scored.sort(key=lambda x: x["score"], reverse=True)
-            return scored[:limit]
-
-        # Fall back to text search
-        return await self._text_search(query, item_type, limit)
+        # Sort by score descending
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:limit]
 
     async def _text_search(
         self,

@@ -606,6 +606,22 @@ class AsyncDatabase:
     
     async def close(self) -> None:
         """Close the database connection."""
+        # If the SQLA helper ever cached a session factory on us
+        # (``kestrel_sovereign.storage.sqla.make_session_factory``),
+        # dispose its engine first so the underlying connection pool
+        # is released cleanly before the AsyncDatabase backend
+        # shuts down. The cache is best-effort and may be absent in
+        # tests / fresh DBs — guard with ``getattr``.
+        sqla_factory = getattr(self, "_sovereign_sqla_factory", None)
+        if sqla_factory is not None:
+            try:
+                await sqla_factory.close()
+            except Exception as e:
+                logger.warning(
+                    "Failed to close cached SQLAlchemy session factory: %s", e
+                )
+            self._sovereign_sqla_factory = None
+
         await self._backend.close()
         self._initialized = False
         logger.debug("Database connection closed")
