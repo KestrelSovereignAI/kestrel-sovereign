@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.15.2"
+version = "0.16.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -66,6 +66,16 @@ dependencies = [
     "aiosqlite>=0.21.0",
     "asyncpg>=0.30.0",
     "psycopg2-binary>=2.9.10",
+    # SQLAlchemy (used by the generic vector_search backends in
+    # kestrel_sovereign.storage.vector — feature packages already pull this
+    # transitively; promoted to a direct dep so the sovereign vector module
+    # can ship without depending on a feature pkg being installed).
+    "sqlalchemy[asyncio]>=2.0",
+    # pgvector Python bindings (registers the Vector column type +
+    # cosine-distance operator on SQLAlchemy's expression language). Only
+    # exercised at runtime on Postgres dialects; the Python import itself is
+    # safe on SQLite.
+    "pgvector>=0.3.0",
     # Cryptography
     "cryptography>=45.0.5",
     "pycryptodome==3.23.0",
