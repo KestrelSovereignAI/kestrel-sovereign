@@ -1154,6 +1154,136 @@ async def get_task(request: Request, task_id: str):
     }
 
 
+@router.get("/tasks/{task_id}/subscribe")
+@limiter.limit("30/minute")
+async def subscribe_task(request: Request, task_id: str):
+    """
+    SSE stream of status updates for a single A2A task.
+
+    Subscribers receive:
+        event: status
+        data: {"id": "...", "status": {...}, "final": true|false}
+
+    Plus periodic ``event: keepalive`` pings so HTTP intermediaries
+    (reverse proxies, Castle towers, NAT idle-close) don't close the
+    long-lived connection between updates. The stream closes after the
+    first event whose ``final == true`` is delivered.
+
+    This endpoint exists so peer agents that just POST'd a question via
+    ``/tasks/send`` can wait for the answer with a push subscription
+    instead of polling ``GET /tasks/{id}`` on an adaptive backoff
+    (#1444). The sender's ``PeersFeature._post_a2a_task`` opens this
+    stream in a background-tracked coroutine and turns the terminal
+    event into a local ``a2a.question_answered`` cognition signal.
+
+    Auth: same handshake as ``POST /tasks/send`` — the agent-routing
+    middleware applies its API-key check before this handler runs.
+
+    Connection limits: ``MAX_SSE_CONNECTIONS_PER_CLIENT`` per
+    (client_ip, agent_id) pair, same posture as ``/notifications/sse``.
+
+    Final-state snapshot on connect: ``TaskManager.subscribe`` already
+    yields a "status" event with the current task state immediately
+    after subscription so a late subscriber doesn't miss a terminal
+    that already fired. We forward that snapshot as the first SSE
+    frame.
+    """
+    agent = get_agent(request)
+
+    if not hasattr(agent, "task_manager") or not agent.task_manager:
+        raise HTTPException(
+            status_code=404, detail="TaskManager not available",
+        )
+
+    # 404 on unknown task_id rather than holding an SSE connection
+    # open against a non-existent subscription target — the sender
+    # would otherwise idle forever waiting for terminal events that
+    # can never fire.
+    task = await agent.task_manager.task_store.get(task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=404, detail=f"Task '{task_id}' not found",
+        )
+
+    client_ip = request.client.host if request.client else "unknown"
+    agent_id = getattr(agent, "agent_id", "default")
+    conn_key = (client_ip, agent_id)
+    async with _sse_lock:
+        if _sse_connections[conn_key] >= MAX_SSE_CONNECTIONS_PER_CLIENT:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Too many SSE connections "
+                    f"(limit: {MAX_SSE_CONNECTIONS_PER_CLIENT})"
+                ),
+            )
+        _sse_connections[conn_key] += 1
+
+    async def event_generator():
+        import json
+        last_ping = time.monotonic()
+        ping_interval = 10.0  # 10s heartbeat for intermediaries
+        try:
+            # ``TaskManager.subscribe`` already yields the current state
+            # first, then streams updates, then breaks on the first
+            # final event. It also yields its own ``keepalive`` events
+            # on its internal timeout — we forward those as SSE
+            # comments-or-pings so the connection stays warm even when
+            # the task sits in SUBMITTED for a while.
+            async for ev in agent.task_manager.subscribe(task_id):
+                if await request.is_disconnected():
+                    logger.debug(
+                        "task subscribe client disconnected (task=%s)",
+                        task_id[:8],
+                    )
+                    break
+                ev_name = ev.get("event") or "status"
+                ev_data = ev.get("data") or ""
+                yield f"event: {ev_name}\ndata: {ev_data}\n\n"
+                last_ping = time.monotonic()
+                if ev.get("final"):
+                    # Terminal event delivered; subscribe()'s loop
+                    # already breaks, but yielding a small comment line
+                    # signals end-of-stream to the SSE client cleanly.
+                    yield ": end-of-stream\n\n"
+                    break
+                # Top up the keepalive cadence if a long stretch of
+                # quiet just ended.
+                now = time.monotonic()
+                if now - last_ping >= ping_interval:
+                    yield f"event: ping\ndata: {json.dumps({'t': now})}\n\n"
+                    last_ping = now
+        except asyncio.CancelledError:
+            logger.debug(
+                "task subscribe cancelled (task=%s)", task_id[:8],
+            )
+        except Exception as e:
+            logger.error(
+                "task subscribe error (task=%s): %s",
+                task_id[:8], e, exc_info=True,
+            )
+            yield (
+                "event: error\ndata: "
+                + json.dumps({"error": "Internal server error"})
+                + "\n\n"
+            )
+        finally:
+            async with _sse_lock:
+                _sse_connections[conn_key] -= 1
+                if _sse_connections[conn_key] <= 0:
+                    del _sse_connections[conn_key]
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 # --- Heartbeat Endpoints ---
 #
 # In the OpenClaw / kestrel-claw tradition, a "heartbeat" is a scheduled LLM

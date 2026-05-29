@@ -683,6 +683,32 @@ class KestrelAgent(
                 build_stripe_deposit_registration()
             )
 
+            # Register the a2a.question_answered source — the SENDER-
+            # side resumption rail for ``send_a2a_question`` (#1444).
+            # When the sender's subscription supervisor sees the
+            # outbound task reach a terminal state on the receiver, it
+            # builds a signal from this registration and enqueues it
+            # locally so the asking turn resumes via a fresh COGNITION
+            # turn rather than a long-blocking poll.
+            from kestrel_sovereign.signals.sources.a2a_question_answered import (
+                build_a2a_question_answered_registration,
+            )
+            self.signal_registry.register(
+                build_a2a_question_answered_registration()
+            )
+
+            # Sender-side store for in-flight send_a2a_question
+            # correlation rows (#1444). PeersFeature.send_a2a_question
+            # inserts here on POST; the subscription supervisor marks
+            # RESOLVED on terminal SSE frame; the hourly expiry sweep
+            # walks ``list_waiting_past_deadline`` and marks EXPIRED.
+            from kestrel_sovereign.storage.async_pending_a2a_question_store import (
+                PendingA2AQuestionStore,
+            )
+            self.pending_a2a_questions = PendingA2AQuestionStore(
+                self._raw_storage.db
+            )
+
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
 

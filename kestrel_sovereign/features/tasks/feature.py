@@ -891,12 +891,15 @@ class TaskFeature(Feature):
         description=(
             "Respond to an incoming A2A task in your inbox by transitioning "
             "it to a terminal state with your reply text. Use this when "
-            "another agent sent you a task via send_a2a_question (sync, "
-            "waits for your answer), send_a2a_message (FYI, brief receipt), "
-            "or send_a2a_task (delegated work, full result). The sender's "
-            "polling against /tasks/{id} will pick up your transition + "
-            "answer text. Without this tool the sender's send_a2a_question "
-            "call sits in WORKING forever and times out."
+            "another agent sent you a task via send_a2a_question "
+            "(fire-and-resume — sender's turn ended, they wake on the "
+            "a2a.question_answered signal when you transition), "
+            "send_a2a_message (FYI, brief receipt), or send_a2a_task "
+            "(delegated work, full result). The sender's subscription "
+            "supervisor on the SSE stream picks up your terminal frame "
+            "and fires their resumption signal. Without this tool the "
+            "sender's send_a2a_question lineage never resumes until the "
+            "hourly expiry sweep fires a state='expired' signal."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a respond",
@@ -913,8 +916,10 @@ class TaskFeature(Feature):
         Transitions the named task to a terminal state (COMPLETED by
         default; FAILED or CANCELED via the ``state`` argument) and
         attaches ``content`` as the response text in
-        ``status.message.parts[].text``. The sender polling via
-        ``send_a2a_question`` extracts this text as their answer.
+        ``status.message.parts[].text``. The sender's subscription
+        supervisor on ``GET /tasks/{id}/subscribe`` picks up the
+        terminal SSE frame and fires their ``a2a.question_answered``
+        resumption signal (#1444).
 
         A2A state machine constraint: SUBMITTED cannot go directly to
         COMPLETED — it must pass through WORKING first. This tool

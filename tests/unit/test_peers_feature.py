@@ -106,7 +106,33 @@ async def test_ask_agent_returns_peer_response():
 
 
 def _make_a2a_feature(name="emma"):
-    agent = SimpleNamespace(_agent_name=name)
+    """Build a PeersFeature against a fake agent that exposes the
+    minimum surface ``send_a2a_question`` (#1444) and the legacy verbs
+    rely on. ``pending_a2a_questions`` and ``dispatcher`` are wired
+    with AsyncMocks so the fire-and-resume path runs end-to-end
+    without a real DB or dispatcher hop. ``_track_background_task``
+    runs coroutines synchronously to keep tests deterministic — the
+    happy path doesn't actually need to wait on the SSE supervisor."""
+    agent = MagicMock()
+    agent._agent_name = name
+    agent.did = f"did:test:{name}"
+    agent._provide_causation_chain = MagicMock(return_value=None)
+    agent._get_current_turn_id = MagicMock(return_value=None)
+    agent.pending_a2a_questions = MagicMock()
+    agent.pending_a2a_questions.insert = AsyncMock(return_value=None)
+    agent.pending_a2a_questions.mark_resolved = AsyncMock(return_value=True)
+    agent.dispatcher = MagicMock()
+    agent.dispatcher.enqueue_signal = AsyncMock()
+
+    def _track_bg(coro, *, name=""):
+        # Close the coroutine immediately — tests asserting on POST-
+        # time behavior don't want the SSE loop firing. Tests that DO
+        # care about the supervisor run it directly via
+        # _supervise_a2a_question (see test_send_a2a_question_supervisor).
+        coro.close()
+        return MagicMock()
+    agent._track_background_task = _track_bg
+
     feature = PeersFeature(agent)
     feature._host_url = "http://multi_agent"
     feature._api_key = ""
@@ -171,178 +197,92 @@ async def test_send_a2a_message_rejects_self_target():
 
 
 @pytest.mark.asyncio
-async def test_send_a2a_question_waits_for_terminal_state_and_returns_answer():
-    """``send_a2a_question`` polls /tasks/{id} until terminal, then
-    returns the answer text from status.message.parts. The POST shape
-    matches send_a2a_message (no skill_id); the difference is the
-    sync-wait + answer-extraction on the caller side."""
+async def test_send_a2a_question_returns_awaiting_reply_after_post():
+    """Under the #1444 fire-and-resume contract, ``send_a2a_question``
+    returns IMMEDIATELY after the POST with ``awaiting_reply=True``
+    and ``resume_via='a2a.question_answered'``. The wait happens on
+    the dispatcher's signal rail, not in this tool call."""
     feature = _make_a2a_feature()
-
-    # First the POST that creates the task.
     post_resp = _mock_post_response(task_id="q1", state="submitted")
-    # Then polling: first returns still-working, second returns
-    # completed with an answer.
-    get_working = MagicMock(status_code=200)
-    get_working.json.return_value = {
-        "id": "q1", "sessionId": "s1",
-        "status": {"state": "working"},
-    }
-    get_done = MagicMock(status_code=200)
-    get_done.json.return_value = {
-        "id": "q1", "sessionId": "s1",
-        "status": {
-            "state": "completed",
-            "message": {
-                "role": "agent",
-                "parts": [{"type": "text", "text": "yes, three open PRs"}],
-            },
-        },
-    }
-
-    client = AsyncMock()
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = False
-    client.post.return_value = post_resp
-    client.get = AsyncMock(side_effect=[get_working, get_done])
+    client = _async_client_with(post_resp=post_resp)
 
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
     ):
         result = await feature.send_a2a_question(
-            "meridian", "any open PRs?", timeout_seconds=10,
+            "meridian", "any open PRs?", timeout_seconds=300,
         )
 
     assert result.status is ToolResultStatus.OK
-    assert result.data["answered"] is True
-    assert result.data["answer"] == "yes, three open PRs"
-    assert result.data["state"] == "completed"
+    assert result.data["sent"] is True
+    assert result.data["awaiting_reply"] is True
+    assert result.data["task_id"] == "q1"
+    assert result.data["recipient"] == "meridian"
+    assert result.data["resume_via"] == "a2a.question_answered"
+    assert "expires_at" in result.data
 
 
 @pytest.mark.asyncio
-async def test_send_a2a_question_returns_failed_on_canceled_state():
-    """A task that terminates as FAILED or CANCELED returns
-    ToolResult.failed (not ok) — the caller's calling cognition
-    turn should know the answer is unreliable, not just shaped
-    differently."""
+async def test_send_a2a_question_records_pending_row_and_spawns_supervisor():
+    """The fire-and-resume contract has three side effects at POST
+    time: insert pending_a2a_questions row, spawn supervisor task,
+    return immediately. All three must happen — without the pending
+    row, the startup-replay sweep cannot recover from a crash; without
+    the supervisor, the answered signal never fires."""
     feature = _make_a2a_feature()
-    post_resp = _mock_post_response(task_id="q2", state="submitted")
-    get_failed = MagicMock(status_code=200)
-    get_failed.json.return_value = {
-        "id": "q2",
-        "status": {
-            "state": "failed",
-            "message": {
-                "role": "agent",
-                "parts": [{"type": "text", "text": "permission denied"}],
-            },
-        },
-    }
-    client = _async_client_with(post_resp=post_resp, get_resp=get_failed)
+    post_resp = _mock_post_response(task_id="q-spawn", state="submitted")
+    client = _async_client_with(post_resp=post_resp)
+
+    spawned = []
+
+    def _track_bg(coro, *, name=""):
+        spawned.append((coro, name))
+        coro.close()
+        return MagicMock()
+    feature.agent._track_background_task = _track_bg
 
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
     ):
         result = await feature.send_a2a_question(
-            "meridian", "do X", timeout_seconds=5,
+            "meridian", "the question?",
         )
 
-    assert result.status is ToolResultStatus.ERROR
-    assert result.data["state"] == "failed"
-    assert "permission denied" in result.data["answer"]
-
-
-@pytest.mark.asyncio
-async def test_send_a2a_question_partial_on_timeout():
-    """When the recipient doesn't reach terminal state in the
-    allotted time, return ToolResult.partial — the task is still
-    live (caller can poll task_id manually), but our sync wait is up."""
-    feature = _make_a2a_feature()
-    post_resp = _mock_post_response(task_id="q3", state="submitted")
-    get_still_working = MagicMock(status_code=200)
-    get_still_working.json.return_value = {
-        "id": "q3", "status": {"state": "working"},
-    }
-    client = AsyncMock()
-    client.__aenter__.return_value = client
-    client.__aexit__.return_value = False
-    client.post.return_value = post_resp
-    client.get = AsyncMock(return_value=get_still_working)
-
-    with patch(
-        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
-        return_value=client,
-    ):
-        # 1-second timeout; first poll interval is 0.5s so at least
-        # one GET happens before the deadline.
-        result = await feature.send_a2a_question(
-            "meridian", "what's the answer?", timeout_seconds=1,
-        )
-
-    assert result.status is ToolResultStatus.PARTIAL
-    assert result.data["state"] == "timeout"
-    assert result.data["task_id"] == "q3"
-
-
-@pytest.mark.asyncio
-async def test_send_a2a_question_handles_kestrel_flattened_response_shape():
-    """Codex P1 on PR #1380: the real GET /tasks/{task_id} endpoint
-    in endpoints/agent.py returns a FLATTENED shape ({"status":
-    "completed", "message": "...", ...}), not the canonical A2A
-    envelope ({"status": {"state": ..., "message": {"parts":
-    [...]}}}). send_a2a_question must handle both — the prior code
-    raised AttributeError on .get('state') against a string."""
-    feature = _make_a2a_feature()
-    post_resp = _mock_post_response(task_id="qF1", state="submitted")
-    # Flattened shape (the actual kestrel endpoint output).
-    get_flattened_done = MagicMock(status_code=200)
-    get_flattened_done.json.return_value = {
-        "id": "qF1",
-        "status": "completed",         # STRING, not dict
-        "message": "found three PRs",  # top-level string
-        "artifacts": [],
-        "metadata": {},
-    }
-    client = _async_client_with(
-        post_resp=post_resp, get_resp=get_flattened_done,
+    assert result.status is ToolResultStatus.OK
+    # Pending row insert.
+    feature.agent.pending_a2a_questions.insert.assert_awaited_once()
+    insert_kwargs = (
+        feature.agent.pending_a2a_questions.insert.await_args.kwargs
     )
-
-    with patch(
-        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
-        return_value=client,
-    ):
-        result = await feature.send_a2a_question(
-            "meridian", "any open PRs?", timeout_seconds=5,
-        )
-
-    assert result.status is ToolResultStatus.OK, (
-        f"flattened response must yield ok, got {result.status}: "
-        f"{result.error}"
-    )
-    assert result.data["answer"] == "found three PRs"
-    assert result.data["state"] == "completed"
+    assert insert_kwargs["task_id"] == "q-spawn"
+    assert insert_kwargs["recipient"] == "meridian"
+    assert insert_kwargs["original_question"] == "the question?"
+    # Supervisor spawn — task name must let `kill -SIGUSR1` ps grep
+    # find it during ops.
+    assert len(spawned) == 1
+    _, spawn_name = spawned[0]
+    assert "a2a_question_supervisor" in spawn_name
+    assert "meridian" in spawn_name
+    assert "q-spawn" in spawn_name
 
 
 @pytest.mark.asyncio
 async def test_send_a2a_question_stamps_a2a_verb_metadata():
-    """Codex P2 on PR #1380: receiver-side verb discrimination must
-    not depend solely on skill_id / reply_expected. Add explicit
-    a2a_verb='question' so the inbound signal payload tells the
-    receiver's cognition prompt how to frame the response."""
+    """Receiver-side verb discrimination still must not depend solely
+    on skill_id / reply_expected — the explicit ``a2a_verb='question'``
+    tag survives the fire-and-resume refactor so receiver prompts can
+    still branch on it (codex P2 on PR #1380)."""
     feature = _make_a2a_feature()
     post_resp = _mock_post_response(task_id="qV1", state="submitted")
-    get_done = MagicMock(status_code=200)
-    get_done.json.return_value = {
-        "id": "qV1", "status": "completed", "message": "ok",
-    }
-    client = _async_client_with(post_resp=post_resp, get_resp=get_done)
+    client = _async_client_with(post_resp=post_resp)
 
     with patch(
         "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
         return_value=client,
     ):
-        await feature.send_a2a_question("meridian", "ping", timeout_seconds=5)
+        await feature.send_a2a_question("meridian", "ping")
 
     posted_body = client.post.call_args.kwargs["json"]
     assert posted_body["metadata"]["a2a_verb"] == "question"

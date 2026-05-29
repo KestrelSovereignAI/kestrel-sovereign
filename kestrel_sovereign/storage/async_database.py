@@ -329,6 +329,45 @@ CREATE TABLE IF NOT EXISTS saved_items (
 CREATE INDEX IF NOT EXISTS idx_saved_items_agent ON saved_items(agent_id);
 CREATE INDEX IF NOT EXISTS idx_saved_items_type ON saved_items(agent_id, item_type);
 CREATE INDEX IF NOT EXISTS idx_saved_items_hash ON saved_items(content_hash);
+
+-- ============================================================================
+-- A2A async-question correlation (#1444)
+--
+-- Sender-side record of in-flight ``send_a2a_question`` calls. When the
+-- sender's ``PeersFeature._post_a2a_task`` POSTs a question to a peer, it
+-- writes a row here AND spawns a tracked SSE subscription. When the
+-- subscription handler sees the task reach a terminal state, it fires a
+-- local ``a2a.question_answered`` signal that wakes the sender's cognition
+-- loop with the reply inline.
+--
+-- This is NOT a "suspended turn" table — the asking turn ends cleanly the
+-- moment the tool returns. The row exists only for:
+--   1. Prompt assembly (the resumed turn's prompt cites the original
+--      question text by task_id so the LLM has full context)
+--   2. Restart replay (on boot, scan ``status='WAITING'`` rows and re-poll
+--      the recipient — catches terminal events that fired while the sender
+--      was down)
+--   3. Two-questions-in-flight disambiguation (resumed signal carries the
+--      task_id key)
+--   4. Hourly expiry sweep (rows past ``deadline`` get a synthetic
+--      ``state='expired'`` signal so the resumed prompt has a clean branch)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS pending_a2a_questions (
+    task_id TEXT PRIMARY KEY,
+    recipient TEXT NOT NULL,
+    original_question TEXT NOT NULL,
+    origin_turn_id TEXT,
+    origin_session_id TEXT,
+    deadline TIMESTAMP NOT NULL,
+    status TEXT NOT NULL DEFAULT 'WAITING' CHECK (
+        status IN ('WAITING', 'RESOLVED', 'EXPIRED')
+    ),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    resolved_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
+    ON pending_a2a_questions(status, deadline);
 """
 
 # Backend-specific JSON-path indexes on graph_nodes properties.
