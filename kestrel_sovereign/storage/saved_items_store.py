@@ -438,7 +438,11 @@ class SavedItemsStore:
         if pin_to_ipfs:
             ipfs_cid = await self._pin_to_ipfs(content, content_hash)
 
-        # Insert into database
+        # Insert into database. Legacy ``embedding`` BYTEA / BLOB
+        # column is written here unchanged; the parallel
+        # ``embedding_vec`` column added by the Phase-2 migration is
+        # populated by ``_write_embedding_vec`` below so the vector
+        # search backend can pick it up.
         await self.db.execute(
             """INSERT INTO saved_items
                (id, agent_id, item_type, name, summary, content, content_hash,
@@ -464,6 +468,8 @@ class SavedItemsStore:
                 now.isoformat()
             )
         )
+        if embedding is not None:
+            await self._write_embedding_vec(item_id, embedding)
         await self.db.commit()
 
         return SavedItem(
@@ -678,6 +684,48 @@ class SavedItemsStore:
             )
         return [SavedItem.from_row(row) for row in rows]
 
+    async def _write_embedding_vec(
+        self, item_id: str, embedding: List[float]
+    ) -> None:
+        """Write the embedding to the parallel ``embedding_vec`` column
+        so it's discoverable by the vector backend.
+
+        - On Postgres, formats the list as pgvector's text shape
+          (``[v1,v2,…]``) and binds with a ``::vector`` cast.
+        - On SQLite, packs to float32 little-endian bytes — same shape
+          stored in the legacy ``embedding`` BLOB column, so the
+          PurePythonBackend reads either column identically.
+        - On any other dialect, treats the column as binary like
+          SQLite.
+
+        Errors here are non-fatal: the legacy ``embedding`` BYTEA / BLOB
+        column is already written, so search degrades gracefully to
+        the in-Python fallback path on the next ``search()`` call.
+        """
+        backend_type = getattr(self.db, "backend_type", None)
+        try:
+            if backend_type == "postgres":
+                vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
+                await self.db.execute(
+                    "UPDATE saved_items SET embedding_vec = ?::vector WHERE id = ?",
+                    (vec_text, item_id),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE saved_items SET embedding_vec = ? WHERE id = ?",
+                    (_serialize_embedding(embedding), item_id),
+                )
+        except Exception as e:
+            # Most likely cause: the Phase-2 migration hasn't run yet
+            # on this DB (the column doesn't exist). Log info and move
+            # on — the legacy path keeps working unchanged.
+            logger.info(
+                "Could not write saved_items.embedding_vec for %s: %s. "
+                "Vector search will use the in-Python fallback path "
+                "until the next boot's migration runs.",
+                item_id, e,
+            )
+
     def _get_vector_session_factory(self):
         """Lazy-build a SQLAlchemy session factory pointed at the same
         DB as ``self.db``.
@@ -754,11 +802,11 @@ class SavedItemsStore:
             # code had.
             return await self._text_search(query, item_type, limit)
 
-        # Sovereign vector backend path. ``PurePythonBackend`` is used
-        # explicitly (not the dialect-dispatching factory) until the
-        # Phase-2 BYTEA→vector(N) migration lands: the embedding
-        # column is still BYTEA on PG today, which PgVectorBackend
-        # can't query.
+        # Sovereign vector backend path. After Phase 2 of #1447
+        # (BYTEA → vector(N) migration on PG) the dialect-dispatching
+        # ``get_vector_backend`` is safe to use here: PG hits
+        # ``PgVectorBackend`` for native pgvector kNN, SQLite stays on
+        # ``PurePythonBackend`` numpy cosine.
         sf = self._get_vector_session_factory()
         if sf is not None:
             scored = await self._search_via_vector_backend(
@@ -793,7 +841,7 @@ class SavedItemsStore:
             # dependency surface when the vector backend isn't being
             # exercised.
             from kestrel_sovereign.storage.sqla import build_saved_item_spec
-            from kestrel_sovereign.storage.vector import PurePythonBackend
+            from kestrel_sovereign.storage.vector import get_vector_backend
 
             # Pack query embedding into float32 little-endian bytes —
             # the shape both backends consume. The spec is built with
@@ -808,7 +856,9 @@ class SavedItemsStore:
             if item_type:
                 filter_kwargs["item_type"] = item_type
 
-            backend = PurePythonBackend(session_factory, spec)
+            # Factory dispatch: PgVectorBackend on PG (post-Phase-2
+            # migration), PurePythonBackend on SQLite.
+            backend = get_vector_backend(session_factory, spec)
             top_k = await backend.knn(
                 packed, k=limit, filter=filter_kwargs
             )

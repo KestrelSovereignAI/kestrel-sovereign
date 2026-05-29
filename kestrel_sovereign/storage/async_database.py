@@ -502,6 +502,29 @@ class AsyncDatabase:
                 "preceding logs."
             )
 
+        # Phase 2 of #1447: add a parallel ``saved_items.embedding_vec``
+        # column for the SQLA + pgvector code path. On PG it's
+        # ``vector(N)`` indexed with HNSW; on SQLite it's BLOB. The
+        # legacy ``embedding`` BYTEA / BLOB column stays — raw IO in
+        # SavedItemsStore continues to use it, and ``save_item``'s
+        # dual-write keeps both in sync.
+        # Idempotent: skips cleanly if the column already exists.
+        # Wrapped in ``db.transaction()`` internally so any partial
+        # failure rolls back. See sqla/migrations.py for details.
+        try:
+            from .sqla.migrations import migrate_saved_items_add_embedding_vec
+            await migrate_saved_items_add_embedding_vec(self)
+        except Exception as e:
+            # Migration failure is non-fatal for startup — saved-items
+            # search falls back to the legacy in-Python path via
+            # SavedItemsStore's existing fallback chain. Log loudly so
+            # operators see it on the next boot.
+            logger.error(
+                "Phase-2 saved_items embedding_vec migration failed: %s. "
+                "Falling back to BYTEA + PurePythonBackend until next "
+                "boot.", e, exc_info=True,
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(
