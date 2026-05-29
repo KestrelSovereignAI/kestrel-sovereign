@@ -44,8 +44,11 @@ def _spec(**overrides) -> VectorTableSpec:
         id_column=_FakeEntity.id,
         embedding_column=_FakeEntity.embedding,
         dimension=4,
-        required_filter_columns={"tenant_id": _FakeEntity.tenant_id},
-        optional_filter_columns={"item_type": _FakeEntity.item_type},
+        required_filter_keys=("tenant_id",),
+        filter_columns={
+            "tenant_id": _FakeEntity.tenant_id,
+            "item_type": _FakeEntity.item_type,
+        },
     )
     base.update(overrides)
     return VectorTableSpec(**base)
@@ -86,8 +89,8 @@ def test_spec_rejects_non_positive_dimension():
         )
 
 
-def test_spec_rejects_tenant_key_not_in_required_filters():
-    # ``tenant_id_filter_key`` must be in ``required_filter_columns`` so the
+def test_spec_rejects_tenant_key_not_in_required_keys():
+    # ``tenant_id_filter_key`` must be in ``required_filter_keys`` so the
     # session-scoping code actually sees the value to use. Otherwise
     # multi-tenant scoping would silently never apply.
     with pytest.raises(ValueError, match="tenant_id_filter_key"):
@@ -96,8 +99,8 @@ def test_spec_rejects_tenant_key_not_in_required_filters():
             id_column=_FakeEntity.id,
             embedding_column=_FakeEntity.embedding,
             dimension=4,
-            required_filter_columns={"agent_id": _FakeEntity.tenant_id},
-            tenant_id_filter_key="tenant_id",  # not in required_filter_columns
+            required_filter_keys=("agent_id",),
+            tenant_id_filter_key="tenant_id",  # not in required_filter_keys
         )
 
 

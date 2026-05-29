@@ -30,46 +30,60 @@ from typing import Any, Dict
 class VectorTableSpec:
     """Description of a vector-indexed SQLAlchemy table.
 
-    Attributes:
-        entity: The SQLAlchemy mapped class (e.g. ``Event``). Used as the
-            FROM target of the ``select(...)`` statement.
-        id_column: The InstrumentedAttribute identifying the row's
-            primary key (returned by ``knn()`` as the result tuple's
-            first element).
-        embedding_column: The InstrumentedAttribute holding the embedding.
-            On PG it should be typed ``Vector(dim)`` (or
-            ``PortableVector(dim)``); on SQLite it can be a BLOB. The
-            backends introspect the dialect at query time and pick the
-            right code path.
-        dimension: Embedding dimension (e.g. 1536 for OpenAI ada-002).
-            Used by the pgvector backend to construct the
-            ``cast(qvec_literal, Vector(dim))`` expression node.
-        required_filter_columns: Map of filter-name → InstrumentedAttribute
-            for filters every caller MUST supply (e.g.
-            ``{"timeline_id": Event.timeline_id, "tenant_id":
-            Event.tenant_id}``). The backend raises ``VectorSearchError``
-            if any required filter is missing from a ``knn()`` call.
-        optional_filter_columns: Map of filter-name → InstrumentedAttribute
-            for filters callers MAY supply (e.g.
-            ``{"event_type": Event.event_type, "is_sensitive":
-            Event.is_sensitive}``). The backend applies these as extra
-            WHERE clauses when present.
-        tenant_id_filter_key: Name of the filter that should be passed to
-            ``TenantContext.use(...)`` to scope the inner read session.
-            If ``None``, no TenantContext wrapping happens (e.g. a
-            single-tenant store like agent saved_items). When set, this
-            key MUST also appear in ``required_filter_columns``.
+    The spec separates THREE concerns that earlier per-table backends
+    conflated:
 
-    Frozen so a spec can be safely shared across goroutines / async
-    tasks (the backends store a reference and use it on every query).
+    1. **What keys must be present in a filter dict** (validation only).
+       Set via ``required_filter_keys``.
+    2. **Which filter keys map to WHERE clauses** (server-side filtering).
+       Set via ``filter_columns``. A key here is applied as
+       ``column == filter[key]`` when present in the call.
+    3. **Which filter key scopes the session via TenantContext** (the
+       session-construction-time loader criterion). Set via
+       ``tenant_id_filter_key``. The corresponding value never appears
+       in the WHERE clause — it's used to wrap the read session.
+
+    The separation matters because some tables are tenant-scoped purely
+    via ``TenantContext`` loader criteria (story-archive's ``Event``)
+    while others have no tenant scoping at all (single-agent
+    ``saved_items``). Mixing the two roles in one map made the older
+    story-archive backends require their callers to also be running
+    against a tenant-aware session factory — a hidden coupling.
+
+    Attributes:
+        entity: The SQLAlchemy mapped class (e.g. ``Event``). Used as
+            the FROM target of the ``select(...)`` statement.
+        id_column: The ``InstrumentedAttribute`` identifying the row's
+            primary key. Returned as the first element of each result
+            tuple from ``knn()``.
+        embedding_column: The ``InstrumentedAttribute`` holding the
+            embedding. On PG it should be typed ``Vector(dim)`` (or
+            ``PortableVector(dim)``); on SQLite it can be a BLOB.
+        dimension: Embedding dimension (e.g. 1536 for OpenAI ada-002).
+        required_filter_keys: Filter keys every caller MUST supply.
+            Missing keys → ``VectorSearchError``. Keys here may also
+            appear in ``filter_columns`` (then they're additionally
+            applied as WHERE clauses) or ``tenant_id_filter_key`` (then
+            their value wraps the session), or neither (just validated).
+        filter_columns: Filter keys mapped to ``InstrumentedAttribute``
+            references. When a key is present in ``filter`` AND in this
+            dict, ``column == filter[key]`` is appended to the WHERE
+            clause. Keys can be required (also in
+            ``required_filter_keys``) or optional.
+        tenant_id_filter_key: Optional key whose value wraps the read
+            session in ``TenantContext.use(<that filter value>)``. Must
+            also appear in ``required_filter_keys`` so the value is
+            guaranteed available.
+
+    Frozen so a spec can be shared safely across async tasks.
     """
 
     entity: Any
     id_column: Any
     embedding_column: Any
     dimension: int
-    required_filter_columns: Dict[str, Any] = field(default_factory=dict)
-    optional_filter_columns: Dict[str, Any] = field(default_factory=dict)
+    required_filter_keys: tuple = field(default_factory=tuple)
+    filter_columns: Dict[str, Any] = field(default_factory=dict)
     tenant_id_filter_key: str | None = None
 
     def __post_init__(self) -> None:
@@ -79,13 +93,13 @@ class VectorTableSpec:
             )
         if (
             self.tenant_id_filter_key is not None
-            and self.tenant_id_filter_key not in self.required_filter_columns
+            and self.tenant_id_filter_key not in self.required_filter_keys
         ):
-            # A tenant_id_filter_key that isn't in required_filter_columns
+            # A tenant_id_filter_key that isn't in required_filter_keys
             # would silently never get applied — fail loudly at config
             # time so the consumer fixes the spec.
             raise ValueError(
                 f"VectorTableSpec.tenant_id_filter_key={self.tenant_id_filter_key!r} "
-                "is not present in required_filter_columns; tenant scoping would "
+                "is not present in required_filter_keys; tenant scoping would "
                 "be skipped."
             )

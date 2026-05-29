@@ -113,9 +113,7 @@ class PgVectorBackend:
             spec.embedding_column.isnot(None),
             func.vector_norm(spec.embedding_column) > 0,
         ]
-        for key, column in spec.required_filter_columns.items():
-            conditions.append(column == filter[key])
-        for key, column in spec.optional_filter_columns.items():
+        for key, column in spec.filter_columns.items():
             if key in filter:
                 conditions.append(column == filter[key])
 
@@ -168,7 +166,7 @@ class PgVectorBackend:
         return _TenantScopedSession(self._sf, tenant_id)
 
     def _require_filters(self, filter: Optional[Dict[str, Any]]) -> None:
-        required = set(self._spec.required_filter_columns)
+        required = set(self._spec.required_filter_keys)
         if filter is None:
             missing = required
         else:
@@ -193,6 +191,11 @@ class PgVectorBackend:
                 f"expected {expected} (dim={self._spec.dimension} * 4)."
             )
         return list(struct.unpack(f"<{self._spec.dimension}f", data))
+
+    # Back-compat alias for tests that exercised the older story-archive
+    # backends' internals. New callers should use ``_unpack`` directly
+    # (or rely on the backend's ``knn()``).
+    _deserialize_embedding = _unpack
 
 
 class _TenantScopedSession:

@@ -76,8 +76,11 @@ class PurePythonBackend:
         stmt = select(spec.id_column, spec.embedding_column).where(
             and_(
                 spec.embedding_column.isnot(None),
-                *(column == filter[key] for key, column in spec.required_filter_columns.items()),
-                *(column == filter[key] for key, column in spec.optional_filter_columns.items() if key in filter),
+                *(
+                    column == filter[key]
+                    for key, column in spec.filter_columns.items()
+                    if key in filter
+                ),
             )
         )
 
@@ -134,7 +137,7 @@ class PurePythonBackend:
         return _TenantScopedSession(self._sf, filter[self._spec.tenant_id_filter_key])
 
     def _require_filters(self, filter: Optional[Dict[str, Any]]) -> None:
-        required = set(self._spec.required_filter_columns)
+        required = set(self._spec.required_filter_keys)
         if filter is None:
             missing = required
         else:
@@ -154,3 +157,7 @@ class PurePythonBackend:
                 f"expected {expected} (dim={self._spec.dimension} * 4)."
             )
         return list(struct.unpack(f"<{self._spec.dimension}f", data))
+
+    # Back-compat alias for tests that exercised the older story-archive
+    # backends' internals.
+    _deserialize_embedding = _unpack
