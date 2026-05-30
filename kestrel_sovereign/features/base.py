@@ -649,11 +649,26 @@ class Feature(_SdkFeature):
 
             logger.info(f"Feature {self.name} executing subagent task: {task[:100]}...")
 
-            # Make LLM call with feature's tools
-            response = await self.agent.llm_service.generate(
-                system_prompt=system_prompt,
-                user_prompt=user_prompt,
-                tools=feature_tools if feature_tools else None
+            # Build messages for ``generate_with_messages`` — the only
+            # llm_service entrypoint that threads ``tool_executor``
+            # through to the adapter. ``generate()`` doesn't accept it,
+            # so codex app-server (openai:plan) calls there fail with
+            # "requires a tool_executor callback when tools are
+            # provided" — that's what was hiding behind Emma's
+            # "memory_feature failed at the provider layer" for days
+            # (#1461 follow-up).
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            tool_executor = (
+                self._make_feature_inline_tool_executor()
+                if feature_tools else None
+            )
+            response = await self.agent.llm_service.generate_with_messages(
+                messages=messages,
+                tools=feature_tools if feature_tools else None,
+                tool_executor=tool_executor,
             )
 
             # Log what we got back
@@ -682,6 +697,54 @@ class Feature(_SdkFeature):
         except Exception as e:
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
             return {"success": False, "error": str(e)}
+
+    def _make_feature_inline_tool_executor(self):
+        """Build an inline ``(name, args) -> result_dict`` async callable
+        bound to this feature's OWN tool palette.
+
+        Required by adapters that execute tool calls INSIDE the LLM
+        turn and block until the result arrives — the codex app-server
+        (openai:plan, gpt-5.5) is the live case today. Without an
+        executor, codex-routed subagent LLM calls fail at the provider
+        layer with "requires a tool_executor callback when tools are
+        provided", which is what hid Emma's memory_feature failures
+        until the observability fix (#1461) made the error visible.
+
+        Mirrors ``OrchestratorEngineMixin._make_inline_tool_executor``
+        but scoped to this feature's tools rather than the agent's
+        global palette — a subagent shouldn't be able to reach for
+        tools outside its own feature mid-turn, and the codex adapter
+        already constrains the visible tool set, so a name mismatch
+        here is a real bug (or a security policy denial) and should
+        surface as a structured error rather than silently fall back
+        to the agent-wide executor."""
+        tools_by_name = {t.name: t for t in self.get_tools()}
+
+        async def _exec(name: str, args: Dict[str, Any]):
+            tool = tools_by_name.get(name)
+            if tool is None:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Tool {name!r} is not in subagent {self.name!r}'s "
+                        f"palette; available: {sorted(tools_by_name)}"
+                    ),
+                }
+            try:
+                result = await tool.execute(**(args or {}))
+            except Exception as e:
+                logger.warning(
+                    "Feature %s inline executor: %s raised %s",
+                    self.name, name, e,
+                )
+                return {"success": False, "error": f"{type(e).__name__}: {e}"}
+            if isinstance(result, dict):
+                return result
+            # ToolResult / object — coerce to a success envelope so the
+            # codex adapter has a uniform shape.
+            return {"success": True, "result": result}
+
+        return _exec
 
     def _get_subagent_prompt(self) -> str:
         """

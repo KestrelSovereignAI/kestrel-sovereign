@@ -225,6 +225,70 @@ class ProcessManager:
             })
         return env
 
+    def _spawn_detached(
+        self,
+        cmd: list[str],
+        env: dict,
+        log_file: Path,
+        pid_file: Path,
+    ) -> int:
+        """Spawn a process whose stdout/stderr go DIRECTLY to ``log_file``
+        via inherited file descriptors. No pump thread.
+
+        Use this when the parent (the launcher, e.g. ``kestrel start``)
+        EXITS immediately after spawning — the in-process host pattern
+        for local dev. The pipe+pump model in ``_spawn`` requires the
+        parent to keep running so its daemon pump thread can survive;
+        when the launcher exits, that thread dies and the child's
+        future stdout writes hit a closed pipe → EPIPE → silently
+        swallowed. Runtime log lines (INFO from request handlers,
+        ERROR + traceback from exception paths) get LOST.
+
+        With direct fd redirection, the kernel writes the child's
+        stdout/stderr straight to ``log_file``. The parent's file
+        handle gets closed once Popen has duped it into the child;
+        when the parent exits, the child's inherited fd remains valid
+        and writes continue without interruption.
+
+        Forces ``PYTHONUNBUFFERED=1`` (see ``_spawn`` for the
+        block-buffering rationale).
+        """
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        child_env = dict(env)
+        child_env.setdefault("PYTHONUNBUFFERED", "1")
+
+        # Open the file with the OS-level append + create flags so two
+        # spawns can't truncate each other and the file exists before
+        # we hand the fd to the child. ``buffering=0`` because we hand
+        # the raw fd to Popen — Python's own buffering layer doesn't
+        # matter here.
+        log_fd = os.open(
+            log_file,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o644,
+        )
+        try:
+            kwargs = dict(
+                cwd=self.project_dir,
+                env=child_env,
+                stdout=log_fd,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                kwargs["start_new_session"] = True
+            process = subprocess.Popen(cmd, **kwargs)
+        finally:
+            # Popen has duped our fd into the child's stdout; close
+            # our reference so the parent can exit cleanly. The child's
+            # inherited copy is what keeps writes flowing.
+            os.close(log_fd)
+
+        self.write_pid(pid_file, process.pid)
+        return process.pid
+
     def _spawn(
         self,
         cmd: list[str],
