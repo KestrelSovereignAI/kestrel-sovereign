@@ -781,26 +781,48 @@ class Feature(_SdkFeature):
             hook_output = await hooks_manager.execute_hooks(
                 HookEvent.PRE_TOOL_USE, hook_input,
             )
-            if hook_output.permission_decision == PermissionDecision.DENY:
+            # Both DENY and ASK must short-circuit. ASK means "human
+            # approval required" — the orchestrator-driven path's
+            # ``execute_named_tool`` blocks both, and the codex inline
+            # subagent path must match that contract or approval-gated
+            # tools silently run without approval (codex round 2 P1
+            # on #1461 follow-up).
+            if hook_output.permission_decision in (
+                PermissionDecision.DENY,
+                PermissionDecision.ASK,
+            ):
                 reason = (
                     hook_output.permission_reason
                     or "Blocked by security policy"
                 )
+                decision_label = (
+                    "PERMISSION DENIED"
+                    if hook_output.permission_decision == PermissionDecision.DENY
+                    else "APPROVAL REQUIRED"
+                )
                 logger.info(
-                    "[SUBAGENT-TOOL] %s blocked by security: %s",
-                    tool_name, reason,
+                    "[SUBAGENT-TOOL] %s blocked (%s): %s",
+                    tool_name, decision_label, reason,
                 )
                 return {
                     "success": False,
                     "error": (
-                        f"PERMISSION DENIED: {reason}. The tool was "
+                        f"{decision_label}: {reason}. The tool was "
                         f"NOT executed. Do NOT tell the user this "
                         f"action succeeded — inform them it was "
                         f"blocked by security policy."
                     ),
                 }
-            # Hooks may have rewritten arguments (PII redaction,
-            # normalization, etc.). Honor that.
+            # Real HookManager MODIFY hooks rewrite arguments by
+            # MUTATING ``hook_input.tool_input`` (the canonical
+            # in-place pattern; ``HookOutput.allow()`` returns
+            # ``updated_input=None``). Honor the mutated input first.
+            # Codex round 2 P1 on #1461 follow-up: reading only the
+            # output field meant codex-inline subagent tools ran with
+            # the original (pre-redaction) args.
+            mutated_input = getattr(hook_input, "tool_input", None)
+            if isinstance(mutated_input, dict):
+                effective_args = mutated_input
             updated = getattr(hook_output, "updated_input", None)
             if isinstance(updated, dict):
                 effective_args = updated

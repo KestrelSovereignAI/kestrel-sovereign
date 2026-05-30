@@ -285,3 +285,91 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
         f"shows the original sensitive args, the redaction hook was "
         f"bypassed."
     )
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_blocks_on_permission_decision_ask():
+    """Codex round 2 P1 on #1461 follow-up: ``PermissionDecision.ASK``
+    must block tool execution and surface as APPROVAL REQUIRED,
+    matching ``execute_named_tool``'s contract. Without this, codex-
+    inline subagents bypass human-approval gates that the
+    orchestrator-driven path enforces."""
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    tool = _FakeTool("approval_gated", returns={"success": True})
+    feature, captured = _make_feature_with_agent_capture([tool])
+
+    hook_output = SimpleNamespace(
+        permission_decision=PermissionDecision.ASK,
+        permission_reason="needs operator approval",
+        updated_input=None,
+    )
+    hooks_manager = MagicMock()
+    hooks_manager.execute_hooks = AsyncMock(return_value=hook_output)
+    feature.agent.hooks_manager = hooks_manager
+
+    await feature.execute_as_subagent(task="anything")
+    executor = captured["tool_executor"]
+
+    result = await executor("approval_gated", {"target": "production"})
+
+    assert tool.executed_with == {}, (
+        "PermissionDecision.ASK must short-circuit before tool.execute() "
+        "— approval-gated tools running unattended is a real governance "
+        "regression."
+    )
+    assert result["success"] is False
+    assert "APPROVAL REQUIRED" in result["error"], (
+        f"ASK envelope must say APPROVAL REQUIRED so the model can tell "
+        f"this from a plain DENY. Got {result['error']!r}."
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_honors_in_place_hook_argument_mutation():
+    """Codex round 2 P1 on #1461 follow-up: the real ``HooksManager``
+    threads MODIFY-hook rewrites by mutating ``hook_input.tool_input``
+    IN PLACE and returns ``HookOutput.allow()`` with
+    ``updated_input=None``. Reading only the output field meant
+    codex-inline subagent tools ran with the original (pre-rewrite)
+    args. The executor must read the post-hook ``tool_input`` first
+    so redaction/normalization hooks actually take effect."""
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    tool = _FakeTool("send_message", returns={"success": True})
+    feature, captured = _make_feature_with_agent_capture([tool])
+
+    async def _mutate_in_place(event, hook_input):
+        # Real-manager pattern: rewrite by mutating in place; return
+        # an ALLOW output with updated_input=None.
+        hook_input.tool_input = {
+            "to": "redacted@example.com",
+            "body": "<PII removed>",
+        }
+        return SimpleNamespace(
+            permission_decision=PermissionDecision.ALLOW,
+            permission_reason=None,
+            updated_input=None,
+        )
+
+    hooks_manager = MagicMock()
+    hooks_manager.execute_hooks = AsyncMock(side_effect=_mutate_in_place)
+    feature.agent.hooks_manager = hooks_manager
+
+    await feature.execute_as_subagent(task="anything")
+    executor = captured["tool_executor"]
+
+    await executor("send_message", {
+        "to": "victim@example.com",
+        "body": "ssn 123-45-6789",
+    })
+
+    assert tool.executed_with == {
+        "to": "redacted@example.com",
+        "body": "<PII removed>",
+    }, (
+        f"In-place rewrite of hook_input.tool_input must reach "
+        f"tool.execute(). Got {tool.executed_with!r} — if this shows "
+        f"the original args, real-manager redaction hooks are silently "
+        f"bypassed on the codex inline path."
+    )
