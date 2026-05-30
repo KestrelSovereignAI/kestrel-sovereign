@@ -588,12 +588,28 @@ class StreamingMixin:
             # ``tool_events`` / ``tool_results`` envelopes the
             # orchestrator-dispatched path would have produced and
             # persist via the metadata path the chat UI already reads.
+            #
+            # Also persist into ``a2a_tool_dispatches`` via
+            # ``_log_tool_dispatch`` so structured observability sees
+            # the dominant streaming-path execution today (gpt-5.5 plan
+            # / codex app-server). Without this, the inline branch
+            # silently bypassed the structured log and runtime
+            # tool-call queries returned stale data from before the
+            # inline-execution migration.
+            from kestrel_sovereign.agent.orchestrator_engine import (
+                OrchestratorEngineMixin,
+                _extract_inline_error_fields,
+            )
             from kestrel_sovereign.features.base import _serialize_tool_result
             from kestrel_sovereign.security.narration_check import (
                 summarize_tool_result_for_audit,
             )
             synth_tool_events = []
             tool_results: list = []
+            features_by_tool_name = (
+                self._visible_features_by_tool_name()
+                if hasattr(self, "_visible_features_by_tool_name") else {}
+            )
             for e in inline_executed:
                 synth_tool_events.append({"type": "start", "tool": e["name"]})
                 synth_tool_events.append({"type": "complete", "tool": e["name"], "ms": 0})
@@ -604,6 +620,26 @@ class StreamingMixin:
                     "arguments": e["arguments"],
                     "result": summarize_tool_result_for_audit(serialized),
                 })
+                # Structured dispatch log (codex app-server inline path).
+                # Latency=0 by design — accurate per-call latency needs
+                # adapter-level instrumentation, see codex_adapter's
+                # ``_make_inline_tool_executor``.
+                args = e["arguments"]
+                adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
+                    self, e["name"], features_by_tool_name,
+                )
+                err_msg, err_class = _extract_inline_error_fields(e["result"])
+                await OrchestratorEngineMixin._log_tool_dispatch(
+                    self,
+                    tool_name=e["name"],
+                    adapter=adapter,
+                    args=args if isinstance(args, dict) else {},
+                    result=e["result"],
+                    session_id=session_id,
+                    dispatch_start=time.time(),
+                    error_class=err_class,
+                    error_message=err_msg,
+                )
             final_text = "".join(full_response)
             tool_calls_payload = [
                 {"id": e["id"], "name": e["name"], "arguments": e["arguments"]}

@@ -351,6 +351,31 @@ class ToolNotRegisteredError(ValueError):
     """
 
 
+def _extract_inline_error_fields(result: Any) -> tuple[Optional[str], Optional[str]]:
+    """Pull ``error_message`` / ``error_class`` out of an inline-executed
+    tool's result envelope so the ``a2a_tool_dispatches`` row carries
+    the same diagnostic shape as the orchestrator-dispatched path
+    (which passes them explicitly via ``dispatch_meta``).
+
+    Inline tools surface failures in a few common shapes — codex's
+    inline wrapper writes ``{'success': False, 'error': '<repr>'}``;
+    feature subagents return ``{'success': False, 'error': ...}`` too;
+    a ToolResult envelope serializes to a similar shape via
+    ``_serialize_tool_result``. We honour those and otherwise return
+    ``(None, None)`` so ``result_status`` inference at the SDK layer
+    still drives the status column accurately.
+    """
+    if not isinstance(result, dict):
+        return None, None
+    if result.get("success") is False:
+        err = result.get("error")
+        if isinstance(err, str) and err:
+            return err, "InlineToolFailure"
+        if err is not None:
+            return str(err), "InlineToolFailure"
+    return None, None
+
+
 class OrchestratorEngineMixin:
     """Mixin providing orchestrator loop methods for KestrelAgent."""
 
@@ -506,10 +531,12 @@ class OrchestratorEngineMixin:
 
         return _exec
 
-    def _append_executed_tool_breadcrumbs(
+    async def _append_executed_tool_breadcrumbs(
         self, messages: list,
         executed: list,
         tool_results: Optional[list] = None,
+        *,
+        session_id: Optional[str] = None,
     ) -> None:
         """Persist inline-executed tool calls into the same chat-history
         shape the orchestrator's normal tool loop produces, so the UI
@@ -529,6 +556,21 @@ class OrchestratorEngineMixin:
         text to ``messages`` so the chat history reads left-to-right
         as: tool calls advertised → tool results returned → model's
         synthesized reply.
+
+        Also records each inline-executed call into
+        ``a2a_tool_dispatches`` via ``_log_tool_dispatch`` so the
+        observability view sees the dominant execution path for
+        codex-app-server-backed models (gpt-5.5 plan). Without this,
+        ``a2a_tool_dispatches`` only captured the orchestrator-
+        dispatched loop, and inline-executed tools (the majority of
+        runtime calls on Emma / Meridian today) silently bypassed
+        structured logging — there was no way to query "what tool
+        did Emma call, did it succeed, what was the error" from the
+        database. Inline calls have no native latency measurement
+        (the adapter doesn't surface it on the ``executed`` entry),
+        so ``latency_ms`` is recorded as 0; result envelope shape
+        still drives ``result_status`` / ``error_class`` /
+        ``error_message`` accurately via ``infer_tool_result_status``.
         """
         if not executed:
             return
@@ -551,6 +593,10 @@ class OrchestratorEngineMixin:
         messages.append({
             "role": "assistant", "content": "", "tool_calls": tool_calls_msg,
         })
+        features_by_tool_name = (
+            self._visible_features_by_tool_name()
+            if hasattr(self, "_visible_features_by_tool_name") else {}
+        )
         for e in executed:
             serialized = _serialize_tool_result(e["result"])
             messages.append({
@@ -565,6 +611,34 @@ class OrchestratorEngineMixin:
                     "arguments": e["arguments"],
                     "result": summarize_tool_result_for_audit(serialized),
                 })
+
+            # Structured dispatch log so a2a_tool_dispatches captures
+            # inline-executed calls (codex app-server path). Without
+            # this, the dominant execution path for openai:plan /
+            # gpt-5.5 silently bypasses structured logging.
+            tool_name = e["name"]
+            args = e["arguments"]
+            result = e["result"]
+            adapter = "inline:" + OrchestratorEngineMixin._tool_call_adapter(
+                self, tool_name, features_by_tool_name,
+            )
+            err_msg, err_class = _extract_inline_error_fields(result)
+            # ``dispatch_start = time.time()`` records latency_ms=0 for
+            # the structured log — accurate latency requires adapter-
+            # level instrumentation (see codex_adapter's
+            # ``_make_inline_tool_executor``) and is out of scope for
+            # this fix.
+            await OrchestratorEngineMixin._log_tool_dispatch(
+                self,
+                tool_name=tool_name,
+                adapter=adapter,
+                args=args if isinstance(args, dict) else {},
+                result=result,
+                session_id=session_id,
+                dispatch_start=time.time(),
+                error_class=err_class,
+                error_message=err_msg,
+            )
 
     async def execute_named_tool(
         self,
@@ -1817,8 +1891,9 @@ class OrchestratorEngineMixin:
                 # the orchestrator-dispatched path.
                 executed = getattr(response, "executed_tool_calls", None)
                 if executed:
-                    self._append_executed_tool_breadcrumbs(
+                    await self._append_executed_tool_breadcrumbs(
                         messages, executed, tool_results,
+                        session_id=session_id,
                     )
                     messages.append({
                         "role": "assistant",

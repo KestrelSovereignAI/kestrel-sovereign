@@ -249,9 +249,23 @@ class ProcessManager:
         never block the host from shutting down.
         """
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        # Force unbuffered stdout in the CHILD process so the pump sees
+        # runtime log lines (single-line WARNINGs, exception tracebacks)
+        # immediately. Without this, Python detects its stdout isn't a
+        # TTY and switches to BLOCK-buffered mode (~4 KiB), which means
+        # sparse runtime INFO/WARNING/ERROR lines sit in the child's
+        # libc buffer until either the buffer fills or the child exits.
+        # On a long-running uvicorn host that bufsize is never met, so
+        # host.log appears to "stop" after the chatty startup phase
+        # fills the buffer and runtime errors silently vanish. The
+        # parent's pump already has ``bufsize=1`` for line-buffered
+        # reads on its side — that handles the pipe READ; this env var
+        # handles the WRITE.
+        child_env = dict(env)
+        child_env.setdefault("PYTHONUNBUFFERED", "1")
         kwargs = dict(
             cwd=self.project_dir,
-            env=env,
+            env=child_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

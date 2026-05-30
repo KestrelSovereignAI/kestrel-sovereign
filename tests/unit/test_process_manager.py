@@ -608,3 +608,116 @@ class TestPumpStdout:
         # Should not raise — pump catches the open() failure and logs a warning
         ProcessManager._pump_stdout(process, log_file, "[agent:bad] ")
         process.wait(timeout=5)
+
+
+class TestSpawnUnbuffered:
+    """``ProcessManager._spawn`` must force ``PYTHONUNBUFFERED=1`` in the
+    child env so the parent's pump thread sees runtime log lines
+    immediately. Without this, the host's Python child detects its
+    stdout is a pipe (not a TTY) and switches to block-buffered
+    mode (~4 KiB), which holds sparse runtime WARN/ERROR lines until
+    the buffer fills — on a long-running uvicorn that buffer never
+    fills, so host.log appears to "freeze" after the chatty startup
+    and runtime errors silently vanish. This is the root cause of
+    the observability blackout that hid Emma's memory_feature
+    failures."""
+
+    def test_spawn_sets_pythonunbuffered_when_unset(self, pm, tmp_path):
+        """The default env passed to _spawn has no PYTHONUNBUFFERED.
+        The spawn helper must inject it so the child Python is
+        line-flush instead of 4KiB-block-flush."""
+        import subprocess
+        captured = {}
+
+        class _FakeProcess:
+            pid = 12345
+            stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def _fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _FakeProcess()
+
+        with patch.object(subprocess, "Popen", side_effect=_fake_popen):
+            # Also patch the pump thread so we don't try to read from None.
+            with patch("threading.Thread"):
+                pm._spawn(
+                    cmd=["python", "-c", "pass"],
+                    env={"PATH": "/usr/bin"},  # NO PYTHONUNBUFFERED set
+                    log_file=tmp_path / "spawn.log",
+                    pid_file=tmp_path / "spawn.pid",
+                    agent_name="probe",
+                )
+
+        env = captured["env"]
+        assert env is not None
+        assert env.get("PYTHONUNBUFFERED") == "1", (
+            f"_spawn must force PYTHONUNBUFFERED=1 in the child env. "
+            f"Without it, runtime log lines block-buffer in the child's "
+            f"stdout and never reach host.log after the startup phase. "
+            f"Got PYTHONUNBUFFERED={env.get('PYTHONUNBUFFERED')!r}."
+        )
+
+    def test_spawn_does_not_mutate_caller_env(self, pm, tmp_path):
+        """The caller's env dict must not gain a PYTHONUNBUFFERED key
+        as a side effect — that would surprise callers passing their
+        own carefully-curated env (e.g. integration tests, CI pipes
+        verifying buffered behavior). The spawn helper must copy."""
+        import subprocess
+
+        class _FakeProcess:
+            pid = 12345
+            stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        caller_env = {"PATH": "/usr/bin"}
+        with patch.object(subprocess, "Popen", return_value=_FakeProcess()):
+            with patch("threading.Thread"):
+                pm._spawn(
+                    cmd=["python", "-c", "pass"],
+                    env=caller_env,
+                    log_file=tmp_path / "spawn.log",
+                    pid_file=tmp_path / "spawn.pid",
+                )
+
+        assert "PYTHONUNBUFFERED" not in caller_env, (
+            "_spawn must copy the caller's env before mutating; "
+            "mutating in place would leak the override back into a "
+            "shared dict held by tests or higher-level config code."
+        )
+
+    def test_spawn_respects_caller_pythonunbuffered_override(self, pm, tmp_path):
+        """If the caller explicitly sets PYTHONUNBUFFERED themselves
+        (e.g. PYTHONUNBUFFERED=0 to debug buffer behavior), don't
+        overwrite it. ``setdefault`` semantics preserve caller intent."""
+        import subprocess
+        captured = {}
+
+        class _FakeProcess:
+            pid = 12345
+            stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def _fake_popen(cmd, **kwargs):
+            captured["env"] = kwargs.get("env")
+            return _FakeProcess()
+
+        with patch.object(subprocess, "Popen", side_effect=_fake_popen):
+            with patch("threading.Thread"):
+                pm._spawn(
+                    cmd=["python", "-c", "pass"],
+                    env={"PATH": "/usr/bin", "PYTHONUNBUFFERED": "0"},
+                    log_file=tmp_path / "spawn.log",
+                    pid_file=tmp_path / "spawn.pid",
+                )
+
+        assert captured["env"]["PYTHONUNBUFFERED"] == "0", (
+            "An explicit caller override must survive — _spawn uses "
+            "setdefault, not assignment."
+        )
