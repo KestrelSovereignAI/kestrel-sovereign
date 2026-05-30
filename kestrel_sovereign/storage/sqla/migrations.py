@@ -244,3 +244,166 @@ async def _migrate_sqlite(db: "AsyncDatabase") -> None:
         "saved_items Phase-2 SQLite migration complete: added embedding_vec "
         "BLOB, copied existing embeddings."
     )
+
+
+# =============================================================================
+# document_chunks (kestrel-sovereign #1447 follow-up — same pattern as
+# saved_items, applied to AsyncRAGStore.)
+# =============================================================================
+
+
+async def migrate_document_chunks_add_embedding_vec(db: "AsyncDatabase") -> None:
+    """Add a parallel ``embedding_vec`` column to ``document_chunks``
+    and backfill from the existing ``embedding`` BYTEA / BLOB.
+
+    Same shape as :func:`migrate_saved_items_add_embedding_vec` —
+    different table. Idempotent, transactional, defers column creation
+    on fresh DBs (no dim guess).
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        await _migrate_pg_table(db, "document_chunks", "chunk_id")
+    elif backend_type == "sqlite":
+        await _migrate_sqlite_table(db, "document_chunks")
+    # Other dialects: no-op.
+
+
+async def _migrate_pg_table(db: "AsyncDatabase", table: str, id_col: str) -> None:
+    """Generic Postgres migration that adds ``embedding_vec`` to ``table``.
+
+    Factored out so the saved_items + document_chunks paths share the
+    cast-bytea-to-vector logic. The two callers differ only by table
+    name + id column name.
+    """
+    rows = await db.fetchall(
+        f"""SELECT 1 FROM information_schema.columns
+            WHERE table_name = '{table}' AND column_name = 'embedding_vec'""",
+        (),
+    )
+    if rows:
+        logger.debug(
+            "%s.embedding_vec already present — skipping Phase-2 PG migration.",
+            table,
+        )
+        return
+
+    src = await db.fetchall(
+        f"""SELECT udt_name FROM information_schema.columns
+            WHERE table_name = '{table}' AND column_name = 'embedding'""",
+        (),
+    )
+    if not src:
+        logger.debug(
+            "%s table not yet present — skipping Phase-2 PG migration.",
+            table,
+        )
+        return
+
+    sample = await db.fetchall(
+        f"""SELECT octet_length(embedding) FROM {table}
+            WHERE embedding IS NOT NULL LIMIT 1""",
+        (),
+    )
+    if not sample:
+        logger.info(
+            "%s has no embedded rows yet — deferring embedding_vec column "
+            "creation until the next boot.",
+            table,
+        )
+        return
+
+    byte_len = sample[0][0]
+    if byte_len % 4 != 0 or byte_len <= 0:
+        logger.error(
+            "%s.embedding has non-float32 byte length %d. Refusing to migrate.",
+            table, byte_len,
+        )
+        return
+    dim = byte_len // 4
+    logger.info(
+        "Sniffed embedding dimension %d (%d bytes) from existing %s rows.",
+        dim, byte_len, table,
+    )
+    expected_bytes = dim * 4
+
+    async with db.transaction():
+        # pgvector extension MUST exist before the ALTER (codex review
+        # on #1454).
+        await db.execute("CREATE EXTENSION IF NOT EXISTS vector", ())
+        await db.execute(
+            f"ALTER TABLE {table} ADD COLUMN embedding_vec vector({dim})", ()
+        )
+
+        all_rows = await db.fetchall(
+            f"SELECT {id_col}, embedding FROM {table} WHERE embedding IS NOT NULL",
+            (),
+        )
+        converted = 0
+        skipped = 0
+        for row_id, embedding_bytes in all_rows:
+            if embedding_bytes is None:
+                continue
+            if len(embedding_bytes) != expected_bytes:
+                logger.warning(
+                    "Skipping %s row %s: %d bytes != expected %d.",
+                    table, row_id, len(embedding_bytes), expected_bytes,
+                )
+                skipped += 1
+                continue
+            floats = struct.unpack(f"<{dim}f", bytes(embedding_bytes))
+            vec_text = "[" + ",".join(repr(float(v)) for v in floats) + "]"
+            await db.execute(
+                f"UPDATE {table} SET embedding_vec = $1::vector WHERE {id_col} = $2",
+                (vec_text, row_id),
+            )
+            converted += 1
+
+        await db.execute(
+            f"""CREATE INDEX IF NOT EXISTS idx_{table}_embedding_vec_hnsw
+                ON {table} USING hnsw (embedding_vec vector_cosine_ops)""",
+            (),
+        )
+
+    logger.info(
+        "%s Phase-2 PG migration complete: added embedding_vec vector(%d), "
+        "backfilled %d rows, skipped %d mismatched, HNSW index.",
+        table, dim, converted, skipped,
+    )
+
+
+async def _migrate_sqlite_table(db: "AsyncDatabase", table: str) -> None:
+    """Generic SQLite migration that adds ``embedding_vec`` BLOB to ``table``."""
+    rows = await db.fetchall(
+        f"SELECT name FROM pragma_table_info('{table}') WHERE name = 'embedding_vec'",
+        (),
+    )
+    if rows:
+        logger.debug(
+            "%s.embedding_vec already present — skipping Phase-2 SQLite migration.",
+            table,
+        )
+        return
+
+    table_exists = await db.fetchall(
+        f"SELECT 1 FROM sqlite_master WHERE type='table' AND name='{table}'",
+        (),
+    )
+    if not table_exists:
+        logger.debug(
+            "%s table not yet present — skipping Phase-2 SQLite migration.",
+            table,
+        )
+        return
+
+    async with db.transaction():
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN embedding_vec BLOB", ())
+        await db.execute(
+            f"UPDATE {table} SET embedding_vec = embedding "
+            f"WHERE embedding IS NOT NULL",
+            (),
+        )
+
+    logger.info(
+        "%s Phase-2 SQLite migration complete: added embedding_vec BLOB, "
+        "copied existing embeddings.", table,
+    )

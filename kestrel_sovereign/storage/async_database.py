@@ -573,6 +573,21 @@ class AsyncDatabase:
                 "boot.", e, exc_info=True,
             )
 
+        # Same Phase-2 treatment for ``document_chunks`` (the
+        # AsyncRAGStore backing table). Idempotent + transactional +
+        # dim-sniffed, just like the saved_items migration above.
+        # Independent try/except so a failure on one table doesn't
+        # block the other from migrating.
+        try:
+            from .sqla.migrations import migrate_document_chunks_add_embedding_vec
+            await migrate_document_chunks_add_embedding_vec(self)
+        except Exception as e:
+            logger.error(
+                "Phase-2 document_chunks embedding_vec migration failed: %s. "
+                "AsyncRAGStore search falls back to in-Python cosine until "
+                "next boot.", e, exc_info=True,
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(
