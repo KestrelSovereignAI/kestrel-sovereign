@@ -26,6 +26,7 @@ read paths grow vector / structured-query needs.
 """
 
 from .base import SovereignBase
+from .document_chunk import DocumentChunk, build_document_chunk_spec
 from .saved_item import SavedItem, build_saved_item_spec
 from .session import SovereignSqlaSessionFactory, make_session_factory
 
@@ -33,6 +34,8 @@ __all__ = [
     "SovereignBase",
     "SavedItem",
     "build_saved_item_spec",
+    "DocumentChunk",
+    "build_document_chunk_spec",
     "SovereignSqlaSessionFactory",
     "make_session_factory",
 ]
