@@ -657,24 +657,22 @@ class Feature(_SdkFeature):
 
             logger.info(f"Feature {self.name} executing subagent task: {task[:100]}...")
 
-            # Build messages for ``generate_with_messages`` — the only
-            # llm_service entrypoint that threads ``tool_executor``
-            # through to the adapter. ``generate()`` doesn't accept it,
-            # so codex app-server (openai:plan) calls there fail with
-            # "requires a tool_executor callback when tools are
-            # provided" — that's what was hiding behind Emma's
-            # "memory_feature failed at the provider layer" for days
-            # (#1461 follow-up).
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ]
+            # ``llm_service.generate`` accepts ``tool_executor`` and
+            # delegates to ``get_response`` which calls
+            # ``messages_for(adapter)`` per-provider so the message
+            # shape gets translated to each route's native format
+            # (Gemini's ``parts`` + ``_system`` vs OpenAI's
+            # ``role``/``content``). Using ``generate_with_messages``
+            # with a hand-built OpenAI-style list would bypass that
+            # translation and break Gemini/Vertex routes — codex
+            # round 3 P2 on #1461 follow-up.
             tool_executor = (
                 self._make_feature_inline_tool_executor()
                 if feature_tools else None
             )
-            response = await self.agent.llm_service.generate_with_messages(
-                messages=messages,
+            response = await self.agent.llm_service.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
                 tools=feature_tools if feature_tools else None,
                 tool_executor=tool_executor,
             )

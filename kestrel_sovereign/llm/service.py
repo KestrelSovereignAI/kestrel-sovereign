@@ -1306,7 +1306,8 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         tools: Optional[List[Dict[str, Any]]],
         response_format: Optional[Type[BaseModel]],
         force_local_only: bool,
-        start_time: float
+        start_time: float,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -1339,6 +1340,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             tools=tools,
             response_format=response_format,
             extra_body=provider_cache_body(provider),
+            tool_executor=tool_executor,
         )
 
         # Calculate duration and log to observability
@@ -1515,7 +1517,8 @@ No other text or formatting.
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
-        response_format: Optional[Type[BaseModel]] = None
+        response_format: Optional[Type[BaseModel]] = None,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> Union[str, LLMResponse]:
         """Get a response from providers in priority order.
 
@@ -1566,7 +1569,8 @@ No other text or formatting.
                         tools=tools,
                         response_format=response_format,
                         force_local_only=force_local_only,
-                        start_time=start_time
+                        start_time=start_time,
+                        tool_executor=tool_executor,
                     )
                     if llm_span and isinstance(result, LLMResponse):
                         if result.input_tokens is not None:
@@ -1757,6 +1761,7 @@ No other text or formatting.
         model_override: Optional[str] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
+        tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
     ) -> Union[str, LLMResponse]:
         """Generate text using the active backend with automatic fallback.
 
@@ -1837,6 +1842,7 @@ No other text or formatting.
                 model_override=model_override,
                 tools=tools,
                 response_format=response_format,
+                tool_executor=tool_executor,
             )
 
     async def generate_with_messages(

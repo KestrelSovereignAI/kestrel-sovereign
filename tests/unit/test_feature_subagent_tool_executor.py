@@ -69,16 +69,24 @@ class _ProbeFeature(Feature):
 def _make_feature_with_agent_capture(
     fake_tools: list[_FakeTool],
 ) -> tuple[_ProbeFeature, dict]:
-    """Return a probe feature whose agent.llm_service.generate_with_messages
-    captures the call kwargs into the returned dict."""
+    """Return a probe feature whose agent.llm_service.{generate,
+    generate_with_messages} captures the call kwargs into the
+    returned dict. Both entrypoints are stubbed so the test doesn't
+    care which one the subagent ends up calling — codex round 3
+    pushed us back to ``generate()`` to preserve per-provider
+    ``messages_for(adapter)`` translation, but the assertion ("tools
+    + tool_executor are threaded through") is the same on either."""
     captured: dict = {}
 
+    from kestrel_sdk.llm.adapter import LLMResponse
+
     class _ProbeLLMService:
+        async def generate(self, **kwargs):
+            captured.update(kwargs)
+            return LLMResponse(content="ok", tool_calls=None)
+
         async def generate_with_messages(self, **kwargs):
             captured.update(kwargs)
-            # Return a no-tool-call response so the subagent's tool loop
-            # exits cleanly.
-            from kestrel_sdk.llm.adapter import LLMResponse
             return LLMResponse(content="ok", tool_calls=None)
 
     agent = SimpleNamespace(
