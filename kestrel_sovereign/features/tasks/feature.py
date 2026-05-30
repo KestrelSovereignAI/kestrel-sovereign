@@ -1038,6 +1038,112 @@ class TaskFeature(Feature):
         )
 
     @tool(
+        name="attach_artifact_to_a2a_task",
+        description=(
+            "Attach one chunk of long-form output as an Artifact to "
+            "an incoming A2A task BEFORE calling respond_to_a2a_task. "
+            "Use this when your reply exceeds the per-tool argument "
+            "cap (10K chars) — chunk the body into segments of <=9000 "
+            "chars each, call this tool once per segment with "
+            "monotonically-increasing index (0, 1, 2, ...) and "
+            "last_chunk=False on every segment except the final one. "
+            "The sender's get_peer_task_result returns the artifacts "
+            "in order so the resumed turn can reassemble the full "
+            "body. After all segments are attached, call "
+            "respond_to_a2a_task with a SHORT content like "
+            "'See attached artifacts (N segments).' so the sender "
+            "knows where to look."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a attach",
+    )
+    async def attach_artifact_to_a2a_task(
+        self,
+        task_id: str,
+        name: str,
+        content: str,
+        index: int = 0,
+        last_chunk: bool = True,
+    ) -> ToolResult:
+        """Attach a single artifact segment to an incoming A2A task.
+
+        For replies up to ~9K chars one call with ``last_chunk=True``
+        is enough. For longer replies, chunk into segments and call
+        repeatedly with monotonically-increasing ``index`` and
+        ``last_chunk=False`` until the final segment.
+
+        Args:
+            task_id: The incoming task to attach to.
+            name: Artifact name. Use the SAME name across all
+                segments of one logical body so the sender's
+                resumed turn can group them — e.g.
+                ``"reply_body"``.
+            content: The segment text. Bounded by the system-wide
+                10K tool-arg cap; keep segments at ~9000 chars to
+                leave headroom.
+            index: Segment order, 0-based. Matters because the
+                sender's reassembly walks artifacts in index order.
+            last_chunk: ``True`` on the final segment (or on the
+                only segment for short replies). The sender's
+                resumed-turn prompt uses this to decide whether the
+                body it received is complete.
+        """
+        from kestrel_sovereign.a2a.types import Artifact, TextPart
+
+        if not self.task_manager:
+            return ToolResult.failed(
+                "No A2A task manager available — not running in a "
+                "multi_agent environment with inbox support.",
+                data={"task_id": task_id},
+            )
+
+        agent_name = (
+            getattr(self.agent, "did", None) or type(self.agent).__name__
+        )
+        artifact = Artifact(
+            name=name,
+            parts=[TextPart(text=content)],
+            index=index,
+            lastChunk=last_chunk,
+        )
+        try:
+            updated = await self.task_manager.add_artifact(
+                task_id=task_id,
+                artifact=artifact,
+                agent_name=agent_name,
+            )
+        except ValueError as e:
+            return ToolResult.failed(
+                f"Failed to attach artifact to task {task_id}: {e}",
+                data={"task_id": task_id, "name": name, "index": index},
+            )
+        except Exception as e:
+            logger.error(
+                "attach_artifact_to_a2a_task failed for task=%s: %s",
+                task_id, e, exc_info=True,
+            )
+            return ToolResult.failed(
+                str(e),
+                data={"task_id": task_id, "name": name, "index": index},
+            )
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Attached artifact '{name}' (index={index}, "
+                f"last_chunk={last_chunk}, {len(content)} chars) to "
+                f"task {task_id[:8]}."
+            ),
+            data={
+                "task_id": task_id,
+                "name": name,
+                "index": index,
+                "last_chunk": last_chunk,
+                "content_chars": len(content),
+                "artifact_count": len(updated.artifacts or []),
+            },
+        )
+
+    @tool(
         name="cancel_task",
         description="Cancel a pending or running task.",
         category=ToolCategory.UTILITY,
