@@ -409,3 +409,100 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
         "to": "redacted@example.com",
         "body": "<PII removed>",
     }
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_surfaces_redacted_args_on_deny():
+    """Codex round 5 P1 on #1461 follow-up: when an upstream redaction
+    hook scrubs the args (mutates ``hook_input.tool_input``) and a
+    downstream permission hook returns DENY, the executor's returned
+    effective_args must surface the REDACTED form, not the raw
+    pre-redaction args. Otherwise PII the redaction hook removed
+    leaks straight into ``a2a_tool_dispatches`` /
+    ``executed_tool_calls`` on the codex audit row."""
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    tool = _FakeTool("send_email", returns={"success": True})
+    feature, captured = _make_feature_with_agent_capture([tool])
+
+    async def _redact_then_deny(event, hook_input):
+        # Real-manager pattern: a MODIFY hook ran earlier in the
+        # chain and rewrote tool_input in place; the chain ended on
+        # a PermissionHook returning DENY.
+        hook_input.tool_input = {
+            "to": "<redacted@example.com>",
+            "body": "<PII removed>",
+        }
+        return SimpleNamespace(
+            permission_decision=PermissionDecision.DENY,
+            permission_reason="email send disabled in this session",
+            updated_input=None,
+        )
+
+    hooks_manager = MagicMock()
+    hooks_manager.execute_hooks = AsyncMock(side_effect=_redact_then_deny)
+    feature.agent.hooks_manager = hooks_manager
+
+    await feature.execute_as_subagent(task="anything")
+    executor = captured["tool_executor"]
+
+    effective_args, result = await executor("send_email", {
+        "to": "victim@example.com",
+        "body": "ssn 123-45-6789",
+    })
+
+    assert result["success"] is False
+    assert "PERMISSION DENIED" in result["error"]
+    # The tool did NOT execute (DENY blocked it).
+    assert tool.executed_with == {}
+    # CRITICAL: the executor's returned effective_args reflects the
+    # REDACTED state from the upstream MODIFY hook, NOT the original
+    # PII. Without this, codex audit logging leaks the scrubbed
+    # values it should never see.
+    assert effective_args == {
+        "to": "<redacted@example.com>",
+        "body": "<PII removed>",
+    }, (
+        f"Block path must surface POST-hook (redacted) args so codex "
+        f"audit doesn't log raw PII. Got {effective_args!r} — if this "
+        f"shows the original sensitive values, the redaction hook's "
+        f"protection is silently undone on the audit path."
+    )
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_surfaces_redacted_args_on_ask():
+    """Same as the DENY case but for the ASK (human approval) path.
+    Audit storage for held-for-approval tools must not contain raw
+    PII either — approval queues are reviewed by humans and the
+    scrubbed form is what should be reviewed."""
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    tool = _FakeTool("publish_message", returns={"success": True})
+    feature, captured = _make_feature_with_agent_capture([tool])
+
+    async def _redact_then_ask(event, hook_input):
+        hook_input.tool_input = {"channel": "<redacted>", "body": "<redacted>"}
+        return SimpleNamespace(
+            permission_decision=PermissionDecision.ASK,
+            permission_reason="publishes require approval",
+            updated_input=None,
+        )
+
+    hooks_manager = MagicMock()
+    hooks_manager.execute_hooks = AsyncMock(side_effect=_redact_then_ask)
+    feature.agent.hooks_manager = hooks_manager
+
+    await feature.execute_as_subagent(task="anything")
+    executor = captured["tool_executor"]
+
+    effective_args, result = await executor("publish_message", {
+        "channel": "#secret-team",
+        "body": "merger details: ...",
+    })
+
+    assert "APPROVAL REQUIRED" in result["error"]
+    assert tool.executed_with == {}
+    assert effective_args == {
+        "channel": "<redacted>", "body": "<redacted>",
+    }
