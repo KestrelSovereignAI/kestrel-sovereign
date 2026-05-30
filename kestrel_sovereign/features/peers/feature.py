@@ -741,27 +741,54 @@ class PeersFeature(Feature):
             top_msg = data.get("message")
             if isinstance(top_msg, str) and top_msg:
                 reply_text = top_msg
-        if not reply_text:
-            for artifact in (data.get("artifacts") or []):
-                if isinstance(artifact, dict):
-                    for part in (artifact.get("parts") or []):
-                        if isinstance(part, dict) and "text" in part:
-                            reply_text = part["text"] or ""
-                            break
-                if reply_text:
-                    break
+        # Walk artifacts in INDEX order so multi-segment long replies
+        # reassemble correctly. The receiver-side
+        # ``attach_artifact_to_a2a_task`` tool stamps ``index`` per
+        # segment for exactly this reason — the underlying transport
+        # is allowed to return artifacts out of insertion order, but
+        # the canonical reassembly order is by ``index`` ascending.
+        artifacts_raw = data.get("artifacts") or []
+        sorted_artifacts = sorted(
+            (a for a in artifacts_raw if isinstance(a, dict)),
+            key=lambda a: a.get("index") if isinstance(a.get("index"), int) else 0,
+        )
+        artifact_texts = []
+        for artifact in sorted_artifacts:
+            for part in (artifact.get("parts") or []):
+                if isinstance(part, dict) and "text" in part:
+                    artifact_texts.append(part["text"] or "")
+        artifact_body = "".join(artifact_texts)
+        # If the inline reply was empty but artifacts carry text, the
+        # asking lineage's answer IS the artifact body — surface it as
+        # reply_text so the resumed turn doesn't have to special-case
+        # the chunked path.
+        if not reply_text and artifact_body:
+            reply_text = artifact_body
+        # Check for incomplete chunked artifacts so the caller knows
+        # the body is partial. ``lastChunk=True`` on the final segment
+        # means the body is complete; absence of any True flag plus
+        # multi-segment shape means the receiver is mid-stream.
+        last_chunk_seen = any(
+            a.get("lastChunk") is True for a in sorted_artifacts
+        )
+        artifact_body_complete = (not sorted_artifacts) or last_chunk_seen
 
         return ToolResult.ok(
             confirmation=(
                 f"Fetched peer task {task_id[:8]} from {recipient} "
-                f"(state={current_state}, {len(reply_text)} chars)"
+                f"(state={current_state}, {len(reply_text)} chars, "
+                f"{len(sorted_artifacts)} artifact segment(s), "
+                f"complete={artifact_body_complete})"
             ),
             data={
                 "recipient": recipient,
                 "task_id": task_id,
                 "state": current_state,
                 "reply_text": reply_text,
-                "artifacts": data.get("artifacts") or [],
+                "artifacts": artifacts_raw,
+                "artifact_body": artifact_body,
+                "artifact_body_complete": artifact_body_complete,
+                "artifact_segment_count": len(sorted_artifacts),
             },
         )
 

@@ -222,3 +222,119 @@ async def test_task_manager_unavailable():
     )
     assert result.status is ToolResultStatus.ERROR
     assert "task manager not available" in result.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# attach_artifact_to_a2a_task — long-reply path via Artifact chunking
+# ---------------------------------------------------------------------------
+
+def _make_feature_with_artifact_tracking(initial_state: TaskState = TaskState.WORKING):
+    """Same shape as ``_make_feature`` but also tracks ``add_artifact``
+    calls so the tests can verify chunked-reply ordering and metadata."""
+    task = Task(
+        id="task-art",
+        sessionId="sess-art",
+        status=TaskStatus(state=initial_state),
+        history=[],
+        artifacts=[],
+        metadata={"sender": "emma", "a2a_verb": "question"},
+    )
+    state = {"task": task, "added": []}
+
+    async def get_task(task_id):
+        return state["task"] if state["task"].id == task_id else None
+
+    async def add_artifact(task_id, artifact, agent_name=None):
+        assert state["task"].id == task_id
+        state["added"].append(artifact)
+        if state["task"].artifacts is None:
+            state["task"].artifacts = []
+        state["task"].artifacts.append(artifact)
+        return state["task"]
+
+    task_manager = MagicMock()
+    task_manager.get_task = AsyncMock(side_effect=get_task)
+    task_manager.add_artifact = AsyncMock(side_effect=add_artifact)
+
+    agent = SimpleNamespace(did="did:test:receiver")
+    feature = TaskFeature(agent)
+    feature.task_manager = task_manager
+    return feature, state
+
+
+@pytest.mark.asyncio
+async def test_attach_artifact_single_chunk_short_reply():
+    """The happy path for a ~5K reply that still fits in one segment.
+    One call, ``last_chunk=True``, body shows up as a single Artifact
+    with ``index=0`` and ``lastChunk=True``."""
+    feature, state = _make_feature_with_artifact_tracking()
+    result = await feature.attach_artifact_to_a2a_task(
+        task_id="task-art", name="reply_body",
+        content="A" * 5000, index=0, last_chunk=True,
+    )
+    assert result.status is ToolResultStatus.OK
+    assert result.data["content_chars"] == 5000
+    assert len(state["added"]) == 1
+    art = state["added"][0]
+    assert art.name == "reply_body"
+    assert art.index == 0
+    assert art.lastChunk is True
+    assert art.parts[0].text == "A" * 5000
+
+
+@pytest.mark.asyncio
+async def test_attach_artifact_chunked_multi_segment_order_preserved():
+    """A long reply chunked into 3 segments. Each call independently
+    records the right index + last_chunk flag so the sender's
+    ``get_peer_task_result`` can reassemble in index order with the
+    final-segment marker."""
+    feature, state = _make_feature_with_artifact_tracking()
+    for i, (chunk, last) in enumerate([
+        ("X" * 9000, False),
+        ("Y" * 9000, False),
+        ("Z" * 3000, True),
+    ]):
+        result = await feature.attach_artifact_to_a2a_task(
+            task_id="task-art", name="reply_body",
+            content=chunk, index=i, last_chunk=last,
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["index"] == i
+        assert result.data["last_chunk"] is last
+
+    assert len(state["added"]) == 3
+    assert [a.index for a in state["added"]] == [0, 1, 2]
+    assert [a.lastChunk for a in state["added"]] == [False, False, True]
+    assert state["added"][0].parts[0].text == "X" * 9000
+    assert state["added"][2].parts[0].text == "Z" * 3000
+
+
+@pytest.mark.asyncio
+async def test_attach_artifact_returns_failed_when_task_manager_missing():
+    """Standalone agent with no task manager — graceful fail rather
+    than AttributeError so the LLM's error-handling path can react."""
+    feature, _ = _make_feature_with_artifact_tracking()
+    feature.task_manager = None
+    result = await feature.attach_artifact_to_a2a_task(
+        task_id="task-art", name="reply_body",
+        content="x", index=0, last_chunk=True,
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "task manager" in result.error.lower()
+
+
+@pytest.mark.asyncio
+async def test_attach_artifact_surfaces_task_not_found():
+    """``task_manager.add_artifact`` raises ValueError for unknown
+    task ids — should surface as a clean failed ToolResult, not a
+    raw exception."""
+    feature, _ = _make_feature_with_artifact_tracking()
+    feature.task_manager.add_artifact = AsyncMock(
+        side_effect=ValueError("Task not found: task-art"),
+    )
+    result = await feature.attach_artifact_to_a2a_task(
+        task_id="task-art", name="reply_body",
+        content="x", index=0, last_chunk=True,
+    )
+    assert result.status is ToolResultStatus.ERROR
+    assert "task-art" in result.error

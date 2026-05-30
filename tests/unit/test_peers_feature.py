@@ -386,3 +386,107 @@ async def test_send_a2a_task_carries_skill_id_and_returns_task_id():
         "send_a2a_task MUST carry skill_id on the wire — that's the "
         "workflow-routing hook the receiver uses to pick the handler"
     )
+
+
+@pytest.mark.asyncio
+async def test_get_peer_task_result_reassembles_artifacts_in_index_order():
+    """When the receiver chunked a long reply into multiple Artifacts
+    (because per-tool argument cap is 10K), ``get_peer_task_result``
+    must reassemble them in ``index`` order — NOT in the order the
+    underlying transport happened to return them. The receiver-side
+    ``attach_artifact_to_a2a_task`` tool stamps ``index`` per segment
+    for this reason."""
+    feature = _make_a2a_feature()
+    # Recipient's GET response: artifacts deliberately out of insertion
+    # order to prove the sort is index-based.
+    get_resp = MagicMock(status_code=200)
+    get_resp.json.return_value = {
+        "id": "t-chunked",
+        "status": "completed",
+        "message": "See attached artifacts (3 segments of reply_body).",
+        "artifacts": [
+            {"name": "reply_body", "index": 2, "lastChunk": True,
+             "parts": [{"type": "text", "text": "third"}]},
+            {"name": "reply_body", "index": 0, "lastChunk": False,
+             "parts": [{"type": "text", "text": "first-"}]},
+            {"name": "reply_body", "index": 1, "lastChunk": False,
+             "parts": [{"type": "text", "text": "second-"}]},
+        ],
+    }
+    client = _async_client_with(get_resp=get_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.get_peer_task_result("meridian", "t-chunked")
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["artifact_segment_count"] == 3
+    assert result.data["artifact_body"] == "first-second-third", (
+        f"Artifact reassembly must walk index ascending. Got "
+        f"{result.data['artifact_body']!r}."
+    )
+    assert result.data["artifact_body_complete"] is True, (
+        "lastChunk=True on the index=2 segment means the body is "
+        "complete; resumed turn can use it without waiting for more."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_peer_task_result_flags_incomplete_chunked_body():
+    """If the receiver is still mid-stream (no segment carries
+    ``lastChunk=True``), ``artifact_body_complete`` must be False so
+    the resumed turn doesn't act on a partial body."""
+    feature = _make_a2a_feature()
+    get_resp = MagicMock(status_code=200)
+    get_resp.json.return_value = {
+        "id": "t-partial",
+        "status": "working",
+        "artifacts": [
+            {"name": "reply_body", "index": 0, "lastChunk": False,
+             "parts": [{"type": "text", "text": "first-"}]},
+            {"name": "reply_body", "index": 1, "lastChunk": False,
+             "parts": [{"type": "text", "text": "second-"}]},
+        ],
+    }
+    client = _async_client_with(get_resp=get_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.get_peer_task_result("meridian", "t-partial")
+
+    assert result.data["artifact_body"] == "first-second-"
+    assert result.data["artifact_body_complete"] is False, (
+        "Without any segment carrying lastChunk=True the body is "
+        "partial — the resumed turn must know not to use it as final."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_peer_task_result_falls_back_to_inline_message_when_no_artifacts():
+    """Backwards-compat: short replies (no artifacts at all) must keep
+    surfacing ``reply_text`` from the inline ``message`` field — the
+    existing fire-and-resume contract for ≤10K replies is unchanged."""
+    feature = _make_a2a_feature()
+    get_resp = MagicMock(status_code=200)
+    get_resp.json.return_value = {
+        "id": "t-short",
+        "status": "completed",
+        "message": "Rome",
+        "artifacts": [],
+    }
+    client = _async_client_with(get_resp=get_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.get_peer_task_result("meridian", "t-short")
+
+    assert result.data["reply_text"] == "Rome"
+    assert result.data["artifact_body"] == ""
+    assert result.data["artifact_segment_count"] == 0
+    assert result.data["artifact_body_complete"] is True, (
+        "No artifacts at all means the body IS complete via the inline "
+        "message field — short-reply path must not get flagged partial."
+    )
