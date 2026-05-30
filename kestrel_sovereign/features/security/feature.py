@@ -61,8 +61,6 @@ _DEFAULT_PERMISSION_BY_FEATURE: Dict[str, PermissionLevel] = {
     "ConsentFeature": PermissionLevel.ALLOW,
     "SkillsFeature": PermissionLevel.ALLOW,
     "CliFeature": PermissionLevel.ALLOW,
-    "WorkflowsFeature": PermissionLevel.ALLOW,
-    "FeatureFeaturesFeature": PermissionLevel.ALLOW,
 
     # --- Externally-visible / irreversible / risky: ASK explicitly ---
     "ComputeFeature": PermissionLevel.ASK,

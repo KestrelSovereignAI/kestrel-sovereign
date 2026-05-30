@@ -4,7 +4,7 @@ Auto-generated file-tree + per-file purpose index. Always-loaded context for the
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
 **Generated:** 2026-05-30
-**Scope:** 1605 tracked files (1054 `.py`, 269 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Scope:** 1577 tracked files (1029 `.py`, 266 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -361,16 +361,6 @@ Repo entry points and standard project files.
   - `class CloudRunProvider`
 - **kestrel_sovereign/features/deploy/secrets.py** — GCP Secret Manager sync — port of ``scripts/cloudrun/setup_secrets.sh``.
   - `class SecretSyncResult`; `def derive_secret_mapping(deploy_config, profile)`; `def load_env_file(path)`; `def sync_secret(client, project_id, secret_name, value)`; `def sync_all_secrets(deploy_config, env_path, project_id)`
-- **kestrel_sovereign/features/feature_features/__init__.py** — FeatureFeature: workflow contracts for agent-authored features.
-- **kestrel_sovereign/features/feature_features/feature.py** — Agent-facing FeatureFeature surface (#1151).
-  - `class FeatureFeaturesFeature`
-- **kestrel_sovereign/features/feature_features/prompts/feature_feature_constitutional_review.md** — You are the constitutional review stage for a proposed Kestrel feature.
-- **kestrel_sovereign/features/feature_features/prompts/feature_feature_design.md** — You are designing a Kestrel feature proposal inside the FeatureFeature workflow.
-- **kestrel_sovereign/features/feature_features/prompts/feature_feature_red_team_review.md** — You are a FeatureFeature red-team reviewer.
-- **kestrel_sovereign/features/feature_features/signals.py** — Signal source registrations for FeatureFeature workflows.
-  - `def build_feature_feature_registrations(agent)`
-- **kestrel_sovereign/features/feature_features/workflows.py** — Workflow definition payloads for FeatureFeature (#1151).
-  - `def feature_propose_tool_spec_payload()`; `def feature_propose_package_spec_payload()`; `def feature_feature_workflow_payloads(kind)`
 - **kestrel_sovereign/features/health/__init__.py** — Health Feature - periodic liveness probes for the agent.
 - **kestrel_sovereign/features/health/checks.py** — Individual health check functions for the Heartbeat Feature.
   - `async def check_database(db)`; `async def check_llm_service(agent)`; `async def check_memory_system(agent)`; `async def check_disk_space(threshold_mb)`; `async def check_context_budget(agent)`
@@ -521,23 +511,6 @@ Repo entry points and standard project files.
   - `class WellnessFeature`
 - **kestrel_sovereign/features/wellness/metrics.py** — Operational Wellness Metric Calculators.
   - `class FrictionCalculator`; `class ContextPressureCalculator`; `class InteractionDepthCalculator`; `class SessionContinuityCalculator`; `class MemoryHealthCalculator`
-- **kestrel_sovereign/features/workflows/__init__.py** — kestrel-feature-workflows — first-class agent workflow primitive.
-- **kestrel_sovereign/features/workflows/feature.py** — Agent-callable Workflows feature surface.
-  - `class WorkflowsFeature`
-- **kestrel_sovereign/features/workflows/metrics.py** — Workflow-level Prometheus counters.
-  - `def record_gate_outcome(workflow_name, stage_name, outcome)`; `def record_compensation_state(workflow_name, stage_name, state)`; `def record_compensation_failed(workflow_name, stage_name)`; `def record_irreversible_residue(workflow_name)`
-- **kestrel_sovereign/features/workflows/models.py** — Workflow domain model — Phase 0.
-  - `class EdgeKind`; `class TriggerKind`; `class GateOutcome`; `class RunStatus`; `class RevocationReason`; `class WorkflowDefinitionError`; `class Gate`; `class Stage`; `…`
-- **kestrel_sovereign/features/workflows/reflection_cycle.py** — Reflection-cycle workflow pilot contract (#1145).
-  - `def reflection_cycle_spec_payload()`; `def normalize_reflection_output(value)`; `def reflection_outputs_match(legacy_output, workflow_output)`; `def reflection_shadow_report()`
-- **kestrel_sovereign/features/workflows/runner.py** — Workflow runner foundation.
-  - `class WorkflowRunnerError`; `class WorkflowRunResult`; `class WorkflowRevocationResult`; `class ReadOnlyWriteViolation`; `class WorkflowRunner`; `def canonical_signature_ack_payload()`; `def derive_stage_idempotency_key()`
-- **kestrel_sovereign/features/workflows/schema.py** — JSON Schema for the workflow domain model.
-  - `def validate_spec_payload(payload)`
-- **kestrel_sovereign/features/workflows/signing.py** — Workflow definition + transition signing helpers.
-  - `def canonical_force_abort_payload()`; `def canonical_definition_revocation_payload()`; `def sign_definition_revocation()`; `def sign_workflow_spec(spec, agent_identity)`; `def verify_workflow_spec(spec, public_key_resolver)`; `def spec_hash_to_bytes(spec_hash)`; `def canonical_transition_payload()`; `def sign_stage_transition()`; `…`
-- **kestrel_sovereign/features/workflows/store.py** — Workflow storage for the Workflows feature.
-  - `class WorkflowStore`
 - **kestrel_sovereign/filecoin_adapter.py** — Filecoin/IPFS adapter for Kestrel's sovereign storage system.
   - `class FilecoinAdapter`
 - **kestrel_sovereign/graduate_service.py** — Graduate Service - Promote a test agent to permanent status.
@@ -1103,8 +1076,6 @@ Repo entry points and standard project files.
   - `async def main()`
 - **scripts/verify_character_consistency.py** — Character Consistency Verification using Claude.
   - `def resolve_verification_model()`; `def get_anthropic_client()`; `def load_image_as_base64(path)`; `def get_image_media_type(path)`; `def verify_character_consistency(manifest)`; `def main()`
-- **scripts/workflow_cassette_ci.py** — CI helpers for encrypted workflow cassette bootstrap.
-  - `def canonical_record_approval_payload()`; `def verify_operator_record_signature()`; `def validate_record_gate_from_env(env)`; `def encrypt_payload_file_from_env()`; `def build_parser()`; `def main(argv)`
 - **scripts/workload_manager.py** — Workload Manager - Orchestrates all Mac Studio workloads.
   - `class WorkloadState`; `class StatusHandler`; `def start_status_server(port)`; `def check_kimi_health()`; `def is_in_time_window(start, end)`; `def is_sleep_time()`; `def is_lora_time()`; `class SubprocessManager`; `…`
 
@@ -1477,8 +1448,6 @@ Repo entry points and standard project files.
 - **tests/e2e/test_voice_ui.spec.cjs** — —
 - **tests/e2e/voice_helpers.cjs** — —
 - **tests/fixtures/tone_440hz.wav** — —
-- **tests/fixtures/workflow_harness.py** — Deterministic WorkflowHarness for Phase 1 tests.
-  - `class WorkflowCassetteError`; `class EncryptedWorkflowCassetteStore`; `def assert_no_plaintext_workflow_cassettes(root)`; `class HarnessAgent`; `class WorkflowHarness`
 - **tests/frontend/api_client.test.mjs** — (mjs asset)
 - **tests/frontend/api_client_dispatch_pinning.test.mjs** — (mjs asset)
 - **tests/frontend/api_client_stop.test.mjs** — (mjs asset)
@@ -2013,8 +1982,6 @@ Repo entry points and standard project files.
   - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`
 - **tests/unit/test_feature_doc_canonicality.py** — Guardrails for canonical feature-document structure.
   - `def test_canonical_feature_doc_declares_source_of_truth()`; `def test_canonical_feature_doc_distinguishes_core_and_package_features()`; `def test_canonical_feature_doc_lists_core_only_inventory()`; `def test_legacy_archive_is_marked_historical()`; `def test_generator_prompt_does_not_hardcode_stale_metrics()`; `def test_progress_review_script_uses_discovered_inventory_language()`; `def test_investor_generated_doc_does_not_invent_unverified_metrics()`
-- **tests/unit/test_feature_features.py** — Tests for the FeatureFeature workflow contracts (#1151).
-  - `class RuntimeDemoFeature`; `class RouterDemoFeature`; `class ExternalSdkDemoFeature`; `class ExternalSdkToolOnlyFeature`; `def test_feature_feature_workflow_payloads_are_valid_unsigned_specs(name, payload)`; `def test_feature_feature_workflow_gates_pin_required_review_path()`; `def test_feature_feature_workflow_params_allow_talon_assignment_inputs()`; `def test_feature_feature_workflow_edges_are_sequential()`; `…`
 - **tests/unit/test_feature_inventory_contracts.py** — Contract tests for the discoverable feature inventory.
   - `def test_every_discoverable_feature_module_exports_a_feature_class()`; `def test_discover_features_matches_unique_class_inventory()`; `def test_disabled_feature_env_filters_exact_class_names()`; `def test_get_feature_by_name_resolves_discovered_features_by_name_and_class()`; `def test_entrypoint_features_included_in_combined_inventory()`; `def test_combined_inventory_has_no_duplicates()`; `def test_combined_inventory_respects_disabled_env()`; `def test_core_only_inventory_stable_without_entrypoints()`; `…`
 - **tests/unit/test_feature_lifecycle.py** — Unit Tests for Feature Lifecycle Hooks.
@@ -2487,26 +2454,8 @@ Repo entry points and standard project files.
   - `class TestFrictionCalculator`; `class TestContextPressureCalculator`; `class TestInteractionDepthCalculator`; `class TestSessionContinuityCalculator`; `class TestMemoryHealthCalculator`; `class TestWellnessFeature`; `class TestOverallScoreCalculation`; `class TestGracefulDegradation`
 - **tests/unit/test_wellness_telemetry_guard.py** — Telemetry-Only Guard Tests for Operational Wellness.
   - `class TestWellnessTelemetryOnlyFlag`; `class TestWellnessNotInSystemPrompt`; `class TestWellnessNotInContext`; `class TestWellnessToolsAreReadOnly`; `class TestWellnessExportDoesNotInject`; `class TestCouncilConditionDocumented`
-- **tests/unit/test_workflow_cassette_ci.py** — Tests for the workflow cassette CI bootstrap helper.
-  - `def test_validate_record_gate_requires_manual_dispatch()`; `def test_validate_record_gate_requires_manual_secret_store_approval()`; `def test_validate_record_gate_requires_trusted_ref()`; `def test_validate_record_gate_does_not_require_cassette_key()`; `def test_verify_operator_record_signature_binds_ref_and_cassette()`; `def test_encrypt_payload_file_writes_only_encrypted_envelope(tmp_path)`; `def test_encrypt_payload_file_allows_explicit_retention(tmp_path)`
 - **tests/unit/test_workflow_executor.py** — Unit tests for TaskFeature.run_workflow — multi-step workflow execution.
   - `class MockHandler`; `def make_agent_card(name, skills)`; `def db_path()`; `async def task_manager(db_path)`; `async def task_feature(task_manager)`; `class TestRunWorkflow`; `class TestRunWorkflowSemanticHonesty`; `class TestListAvailableSkills`
-- **tests/unit/test_workflows_feature.py** — Tests for the agent-callable WorkflowsFeature surface.
-  - `async def feature_components(tmp_path)`; `async def test_workflow_define_signs_and_lists_definition(feature_components)`; `async def test_workflow_run_status_history_and_list_runs(feature_components)`; `async def test_workflow_run_accepts_json_string_params_and_latest_version_string(feature_components)`; `async def test_workflow_list_runs_accepts_string_limit(feature_components)`; `async def test_workflow_revoke_definition_records_typed_reason(feature_components)`; `async def test_workflow_force_abort_tool_calls_runner(feature_components)`; `async def test_runner_preserves_missing_script_provider_for_preflight(feature_components)`; `…`
-- **tests/unit/test_workflows_harness.py** — Tests for the reusable WorkflowHarness fixture.
-  - `async def test_workflow_harness_runs_signed_action_workflow(tmp_path)`; `def test_workflow_cassette_store_encrypts_payload_and_binds_owner(tmp_path)`; `def test_workflow_cassette_store_purges_expired(tmp_path)`; `def test_workflow_harness_requires_manual_secret_store_for_env_cassettes(tmp_path, monkeypatch)`; `def test_workflow_cassette_gitignore_and_plaintext_lint(tmp_path)`
-- **tests/unit/test_workflows_metrics.py** — Workflow Prometheus metric wrappers.
-  - `def test_workflow_metric_recorders_noop_when_handles_missing(monkeypatch)`; `def test_workflow_gate_metric_increments_when_prometheus_available()`; `def test_workflow_compensation_metric_increments_when_prometheus_available()`; `def test_workflow_compensate_failed_metric_increments_when_prometheus_available()`; `def test_workflow_irreversible_residue_metric_increments_when_prometheus_available()`; `def test_workflow_alert_metric_names_match_issue_1143_contract()`; `def test_workflow_prometheus_alert_rules_separate_page_from_dashboard_only()`
-- **tests/unit/test_workflows_models.py** — Phase 0 chunk A — dataclass + schema invariants for kestrel-feature-workflows.
-  - `def test_built_in_gate_types_match_design_doc()`; `def test_gate_types_needing_registration_subset_of_built_ins()`; `def test_run_status_enum_matches_design_doc_section_5()`; `def test_gate_outcome_vocabulary()`; `def test_gate_rejects_unknown_type()`; `def test_gate_signal_status_ok_default()`; `def test_gate_constitutional_boundary_clean_requires_forbidden_modules()`; `def test_gate_tests_pass_requires_suite()`; `…`
-- **tests/unit/test_workflows_reflection_cycle.py** — Tests for the reflection-cycle workflow pilot contract (#1145).
-  - `def test_reflection_cycle_spec_payload_is_valid_unsigned_workflow()`; `def test_reflection_cycle_params_schema_accepts_raw_shadow_outputs()`; `def test_reflection_cycle_stages_map_existing_internal_flow()`; `def test_reflection_cycle_edges_are_strictly_sequential()`; `def test_reflection_shadow_report_normalizes_json_outputs()`; `def test_reflection_shadow_report_detects_mismatch()`
-- **tests/unit/test_workflows_runner.py** — Phase 1 foundation tests for WorkflowRunner.
-  - `async def runner_components(tmp_path)`; `async def test_runner_walks_sequential_signal_status_ok_flow(runner_components)`; `async def test_runner_adds_metadata_to_feature_feature_stage_payloads(runner_components)`; `async def test_runner_persists_feature_feature_epic_issue_for_next_stage(runner_components)`; `async def test_runner_persists_feature_feature_talon_jobs_for_implementation(runner_components)`; `async def test_runner_persists_feature_feature_ci_publish_head_for_publish(runner_components)`; `async def test_runner_rejects_noop_idempotent_after_read_only_write(runner_components)`; `async def test_runner_rejects_read_only_execute_many_writes(runner_components)`; `…`
-- **tests/unit/test_workflows_signing.py** — Phase 0 chunk C — workflow signing/verification tests.
-  - `def test_sign_then_verify_round_trip()`; `def test_verify_fails_when_payload_tampered()`; `def test_verify_fails_under_wrong_public_key()`; `def test_verify_fails_when_unsigned()`; `def test_verify_fails_under_unresolvable_did()`; `def test_verify_fails_with_malformed_signature_hex()`; `def test_sign_rejects_mismatched_author_did()`; `def test_sign_uses_legacy_did_for_hybrid_agent()`; `…`
-- **tests/unit/test_workflows_store.py** — Phase 0 chunk B — workflow storage migration tests.
-  - `async def store(tmp_path)`; `async def test_initialize_creates_three_tables(store)`; `async def test_initialize_idempotent(store)`; `async def test_definition_unique_per_name_version(store)`; `async def test_definition_round_trip(store)`; `async def test_revoke_definition_records_typed_signed_reason(store)`; `async def test_revoke_definition_allows_compromise_escalation(store)`; `async def test_revoke_definition_rejects_unknown_reason(store)`; `…`
 - **tests/utils/__init__.py** — Test utilities for Kestrel test suite.
 - **tests/utils/async_waits.py** — Async wait utilities to replace hardcoded sleep statements.
   - `class WaitTimeoutError`; `async def wait_until(condition, timeout, interval, message)`; `async def wait_for_value(getter, expected, timeout, interval, …)`; `async def wait_for_not_none(getter, timeout, interval, message)`; `async def wait_for_http_ready(client, url, timeout, interval, …)`; `async def wait_for_db_connection(connect_func, timeout, interval)`; `async def wait_for_process_ready(process, check_func, timeout, interval)`; `async def poll_with_backoff(func, check, timeout, initial_interval, …)`
