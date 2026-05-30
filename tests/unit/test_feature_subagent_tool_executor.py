@@ -195,3 +195,93 @@ async def test_subagent_no_tools_passes_no_executor():
         "No tools → no executor. The codex adapter is fine with both "
         "absent — it's the (tools-yes, executor-no) combo that errors."
     )
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_enforces_pre_tool_use_hooks():
+    """Codex round 1 P1 on #1461 follow-up: the inline executor must
+    gate through PRE_TOOL_USE hooks just like the non-inline
+    ``_handle_feature_tool_calls`` path. Without this, the codex
+    app-server inline path bypasses SecurityHook denials, approval
+    hooks, and argument-redaction hooks — a real privilege-escalation
+    hole on every codex-routed subagent dispatch."""
+    from kestrel_sdk.hooks.base import (
+        HookEvent,
+        PermissionDecision,
+    )
+
+    tool = _FakeTool("dangerous", returns={"success": True})
+    feature, captured = _make_feature_with_agent_capture([tool])
+
+    # Wire a hook manager that DENIES the tool call. Mirrors what a
+    # SecurityHook would emit when the agent lacks permission.
+    hook_output = SimpleNamespace(
+        permission_decision=PermissionDecision.DENY,
+        permission_reason="missing permission for dangerous tool",
+        updated_input=None,
+    )
+    hooks_manager = MagicMock()
+    hooks_manager.execute_hooks = AsyncMock(return_value=hook_output)
+    feature.agent.hooks_manager = hooks_manager
+
+    await feature.execute_as_subagent(task="anything")
+    executor = captured["tool_executor"]
+
+    result = await executor("dangerous", {"target": "/etc/passwd"})
+
+    # The hook decision must be honored — the tool must NOT execute.
+    assert tool.executed_with == {}, (
+        "PRE_TOOL_USE DENY decision must prevent tool.execute() from "
+        "running. If this assertion fires, codex-routed subagents can "
+        "execute denied tools by routing through the inline path."
+    )
+    assert result["success"] is False
+    assert "PERMISSION DENIED" in result["error"], (
+        f"Denial envelope must say PERMISSION DENIED — that's what "
+        f"the non-inline path produces (parity required so the LLM "
+        f"can't tell which transport ran). Got {result['error']!r}."
+    )
+    # Hook DID fire (proof the executor consulted the manager).
+    hooks_manager.execute_hooks.assert_awaited_once()
+    call_args = hooks_manager.execute_hooks.await_args.args
+    assert call_args[0] == HookEvent.PRE_TOOL_USE
+    assert call_args[1].tool_name == "dangerous"
+
+
+@pytest.mark.asyncio
+async def test_subagent_executor_honors_hook_argument_rewrite():
+    """PRE_TOOL_USE hooks may rewrite arguments (PII redaction,
+    normalization, constraint enforcement). The inline executor must
+    forward the REWRITTEN args to ``tool.execute``, not the original
+    — otherwise a redaction hook's protection is silently ignored on
+    the codex inline path."""
+    from kestrel_sdk.hooks.base import PermissionDecision
+
+    tool = _FakeTool("send_email", returns={"success": True})
+    feature, captured = _make_feature_with_agent_capture([tool])
+
+    # Hook rewrites the to/body to redact PII.
+    hook_output = SimpleNamespace(
+        permission_decision=PermissionDecision.ALLOW,
+        permission_reason=None,
+        updated_input={"to": "<redacted>", "body": "<redacted>"},
+    )
+    hooks_manager = MagicMock()
+    hooks_manager.execute_hooks = AsyncMock(return_value=hook_output)
+    feature.agent.hooks_manager = hooks_manager
+
+    await feature.execute_as_subagent(task="anything")
+    executor = captured["tool_executor"]
+
+    await executor("send_email", {
+        "to": "victim@example.com", "body": "ssn 123-45-6789",
+    })
+
+    assert tool.executed_with == {
+        "to": "<redacted>", "body": "<redacted>",
+    }, (
+        f"Hook updated_input must override the original args before "
+        f"tool.execute() runs. Got {tool.executed_with!r} — if this "
+        f"shows the original sensitive args, the redaction hook was "
+        f"bypassed."
+    )
