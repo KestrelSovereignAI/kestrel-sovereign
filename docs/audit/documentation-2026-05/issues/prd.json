@@ -1,0 +1,37 @@
+{
+  "title": "May 2026 Documentation Audit",
+  "description": "Reconcile Kestrel Sovereign documentation after package extraction, context/memory/storage/LLM/signal/Talon work, and archive stale documentation scaffolding.",
+  "stories": [
+    {
+      "id": "docs-2026-05-01-truth-sources",
+      "title": "Reconcile feature and package truth sources",
+      "description": "Fix source-of-truth drift across KESTREL_FEATURES.md, feature_registry.toml, pyproject.toml, generated feature docs, and package-boundary language.",
+      "done": "Core vs feature package vs provider package vs standalone tool boundaries are explicit, generated feature docs are regenerated from corrected inputs, and registry semantics are documented."
+    },
+    {
+      "id": "docs-2026-05-02-entrypoints",
+      "title": "Update main documentation entry points",
+      "description": "Update README.md, docs/README.md, and docs/architecture/README.md to point to canonical sources and avoid duplicating unstable details.",
+      "done": "Main entry points describe current package boundaries, link to canonical docs, and do not contradict corrected feature inventory."
+    },
+    {
+      "id": "docs-2026-05-03-volatile-architecture",
+      "title": "Reconcile volatile architecture docs",
+      "description": "Re-audit context, memory/retrieval/storage, LLM routing, signals/workflows, and Talon docs against current code and package ownership.",
+      "done": "Each volatile system has one canonical doc or explicitly marked design/history docs, with stale claims updated or archived."
+    },
+    {
+      "id": "docs-2026-05-04-user-operator-docs",
+      "title": "Reconcile user, operator, demo, and generated docs",
+      "description": "Update user-facing docs, deployment docs, demo scripts, generated docs, and launch copy for optional-package and current-behavior accuracy.",
+      "done": "User/operator docs distinguish base install from optional packages and match current CLI/UI behavior."
+    },
+    {
+      "id": "docs-2026-05-05-diagrams-hygiene",
+      "title": "Clean diagrams, archive scaffolding, and public-release hygiene",
+      "description": "Add status/date/owner notes to diagrams, archive or mark superseded old audit/index/review scaffolding, and classify internal/public doc directories.",
+      "done": "Old scaffolding no longer competes with current docs, diagrams carry status, and public-release-sensitive directories are classified."
+    }
+  ]
+}
+

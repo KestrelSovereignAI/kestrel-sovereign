@@ -14,3 +14,8 @@ Operating rules:
 
 Issue bodies live in `docs/audit/issues/`.
 Worktree strategy lives in `docs/audit/worktree-plan.md`.
+
+Current documentation audit:
+
+- [`DOCUMENTATION_AUDIT_5_2026.md`](DOCUMENTATION_AUDIT_5_2026.md) - May 2026 audit ledger for package extraction, context, memory, storage, LLM, signals, Talon, cloud, generated docs, and public-doc hygiene.
+- [`documentation-2026-05/`](documentation-2026-05/) - working audit workspace with shared context, lane briefs, subagent reports, stale-artifact review, and execution order.
