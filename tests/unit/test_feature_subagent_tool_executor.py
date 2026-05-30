@@ -129,8 +129,10 @@ async def test_subagent_threads_tool_executor_through_to_llm_service():
 @pytest.mark.asyncio
 async def test_subagent_executor_dispatches_to_feature_tool():
     """The feature-scoped executor must dispatch to the named tool
-    from THIS feature's palette and return its result. Tools live
-    inside the feature; the executor is the bridge to them."""
+    from THIS feature's palette and return ``(effective_args, result)``
+    — the tuple shape the codex adapter requires so audit /
+    observability paths log the EFFECTIVE (post-hook) args. Codex
+    round 4 P1 on #1461 follow-up."""
     tool = _FakeTool(
         "search_memory",
         returns={"success": True, "data": {"hits": 2}},
@@ -139,13 +141,18 @@ async def test_subagent_executor_dispatches_to_feature_tool():
     await feature.execute_as_subagent(task="anything")
 
     executor = captured["tool_executor"]
-    result = await executor("search_memory", {"query": "rescue", "limit": 5})
+    returned = await executor("search_memory", {"query": "rescue", "limit": 5})
 
-    assert result == {"success": True, "data": {"hits": 2}}
-    assert tool.executed_with == {"query": "rescue", "limit": 5}, (
-        f"Executor must forward args verbatim to tool.execute(). Got "
-        f"{tool.executed_with!r}."
+    assert isinstance(returned, tuple) and len(returned) == 2, (
+        "Executor must return the (effective_args, result) tuple the "
+        "codex adapter expects — otherwise audit paths log pre-hook "
+        "args even when a redaction hook rewrote them."
     )
+    effective_args, result = returned
+    # No hooks wired → effective args == original.
+    assert effective_args == {"query": "rescue", "limit": 5}
+    assert result == {"success": True, "data": {"hits": 2}}
+    assert tool.executed_with == {"query": "rescue", "limit": 5}
 
 
 @pytest.mark.asyncio
@@ -160,8 +167,9 @@ async def test_subagent_executor_rejects_tool_outside_palette():
     await feature.execute_as_subagent(task="anything")
 
     executor = captured["tool_executor"]
-    result = await executor("forbidden", {})
+    effective_args, result = await executor("forbidden", {})
 
+    assert effective_args == {}
     assert result["success"] is False
     assert "palette" in result["error"].lower(), (
         f"Out-of-palette rejection must mention the palette so the "
@@ -181,8 +189,9 @@ async def test_subagent_executor_surfaces_tool_exception_as_error_envelope():
     await feature.execute_as_subagent(task="anything")
 
     executor = captured["tool_executor"]
-    result = await executor("broken", {"x": 1})
+    effective_args, result = await executor("broken", {"x": 1})
 
+    assert effective_args == {"x": 1}
     assert result == {
         "success": False,
         "error": "ValueError: bad input",
@@ -235,7 +244,7 @@ async def test_subagent_executor_enforces_pre_tool_use_hooks():
     await feature.execute_as_subagent(task="anything")
     executor = captured["tool_executor"]
 
-    result = await executor("dangerous", {"target": "/etc/passwd"})
+    effective_args, result = await executor("dangerous", {"target": "/etc/passwd"})
 
     # The hook decision must be honored — the tool must NOT execute.
     assert tool.executed_with == {}, (
@@ -243,6 +252,8 @@ async def test_subagent_executor_enforces_pre_tool_use_hooks():
         "running. If this assertion fires, codex-routed subagents can "
         "execute denied tools by routing through the inline path."
     )
+    # Effective args on denial = original (no hook rewrite happened).
+    assert effective_args == {"target": "/etc/passwd"}
     assert result["success"] is False
     assert "PERMISSION DENIED" in result["error"], (
         f"Denial envelope must say PERMISSION DENIED — that's what "
@@ -281,7 +292,7 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
     await feature.execute_as_subagent(task="anything")
     executor = captured["tool_executor"]
 
-    await executor("send_email", {
+    effective_args, _ = await executor("send_email", {
         "to": "victim@example.com", "body": "ssn 123-45-6789",
     })
 
@@ -292,6 +303,16 @@ async def test_subagent_executor_honors_hook_argument_rewrite():
         f"tool.execute() runs. Got {tool.executed_with!r} — if this "
         f"shows the original sensitive args, the redaction hook was "
         f"bypassed."
+    )
+    # And the EXECUTOR's returned effective_args reflects the
+    # post-hook args — so codex's audit paths log redacted values.
+    assert effective_args == {
+        "to": "<redacted>", "body": "<redacted>",
+    }, (
+        f"Executor return must surface POST-hook args so codex audit "
+        f"paths (a2a_tool_dispatches.args_redacted, "
+        f"executed_tool_calls) record the redacted values. Got "
+        f"{effective_args!r} — original PII leaks otherwise."
     )
 
 
@@ -319,13 +340,14 @@ async def test_subagent_executor_blocks_on_permission_decision_ask():
     await feature.execute_as_subagent(task="anything")
     executor = captured["tool_executor"]
 
-    result = await executor("approval_gated", {"target": "production"})
+    effective_args, result = await executor("approval_gated", {"target": "production"})
 
     assert tool.executed_with == {}, (
         "PermissionDecision.ASK must short-circuit before tool.execute() "
         "— approval-gated tools running unattended is a real governance "
         "regression."
     )
+    assert effective_args == {"target": "production"}
     assert result["success"] is False
     assert "APPROVAL REQUIRED" in result["error"], (
         f"ASK envelope must say APPROVAL REQUIRED so the model can tell "
@@ -367,7 +389,7 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
     await feature.execute_as_subagent(task="anything")
     executor = captured["tool_executor"]
 
-    await executor("send_message", {
+    effective_args, _ = await executor("send_message", {
         "to": "victim@example.com",
         "body": "ssn 123-45-6789",
     })
@@ -381,3 +403,9 @@ async def test_subagent_executor_honors_in_place_hook_argument_mutation():
         f"the original args, real-manager redaction hooks are silently "
         f"bypassed on the codex inline path."
     )
+    # The executor's returned effective_args must also be the
+    # post-rewrite values so codex audit paths log redacted args.
+    assert effective_args == {
+        "to": "redacted@example.com",
+        "body": "<PII removed>",
+    }

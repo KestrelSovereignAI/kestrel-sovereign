@@ -736,6 +736,7 @@ class Feature(_SdkFeature):
                 tool_name=name,
                 args=args or {},
                 tools_by_name={t.name: t for t in self.get_tools()},
+                return_with_effective_args=True,
             )
         return _exec
 
@@ -745,23 +746,46 @@ class Feature(_SdkFeature):
         tool_name: str,
         args: Dict[str, Any],
         tools_by_name: Dict[str, Any],
-    ) -> Dict[str, Any]:
+        return_with_effective_args: bool = False,
+    ) -> Any:
         """Execute one of this feature's tools with PRE_TOOL_USE hook
         enforcement. Shared between the inline-executor path (used by
         codex app-server) and the post-LLM tool loop in
         ``_handle_feature_tool_calls`` so security policies, approval
         prompts, and argument-redaction hooks apply uniformly
-        regardless of which transport ran the tool call."""
+        regardless of which transport ran the tool call.
+
+        ``return_with_effective_args`` controls the return shape:
+
+          - ``False`` (default, used by the post-LLM loop): returns
+            just the ``result`` dict. The loop already knows the args.
+          - ``True`` (used by the inline executor): returns the
+            ``(effective_args, result)`` tuple the codex adapter
+            expects. Codex round 4 P1 on #1461 follow-up — without
+            this, audit / observability paths (``executed_tool_calls``,
+            ``a2a_tool_dispatches.args_redacted``, persisted
+            ``tool_results``) record the PRE-redaction args even
+            when a hook rewrote them, leaking PII into log storage."""
+        def _shape(effective_args_value: Dict[str, Any], result_value: Any) -> Any:
+            """Return either the raw result or the
+            ``(effective_args, result)`` tuple per the
+            ``return_with_effective_args`` flag — this is what tells
+            the codex adapter which args to log into
+            ``executed_tool_calls`` / ``a2a_tool_dispatches``."""
+            if return_with_effective_args:
+                return (effective_args_value, result_value)
+            return result_value
+
         tool = tools_by_name.get(tool_name)
         if tool is None:
-            return {
+            return _shape(args, {
                 "success": False,
                 "error": (
                     f"Tool {tool_name!r} is not in subagent "
                     f"{self.name!r}'s palette; available: "
                     f"{sorted(tools_by_name)}"
                 ),
-            }
+            })
 
         hooks_manager = getattr(self.agent, "hooks_manager", None)
         effective_args = args
@@ -802,7 +826,9 @@ class Feature(_SdkFeature):
                     "[SUBAGENT-TOOL] %s blocked (%s): %s",
                     tool_name, decision_label, reason,
                 )
-                return {
+                # Use original args here — the hook blocked BEFORE
+                # any rewrite, so effective args = original.
+                return _shape(args, {
                     "success": False,
                     "error": (
                         f"{decision_label}: {reason}. The tool was "
@@ -810,7 +836,7 @@ class Feature(_SdkFeature):
                         f"action succeeded — inform them it was "
                         f"blocked by security policy."
                     ),
-                }
+                })
             # Real HookManager MODIFY hooks rewrite arguments by
             # MUTATING ``hook_input.tool_input`` (the canonical
             # in-place pattern; ``HookOutput.allow()`` returns
@@ -827,13 +853,16 @@ class Feature(_SdkFeature):
 
         try:
             result = await tool.execute(**effective_args)
-            return _serialize_tool_result(result)
+            return _shape(effective_args, _serialize_tool_result(result))
         except Exception as e:
             logger.warning(
                 "[SUBAGENT-TOOL] %s raised %s",
                 tool_name, e,
             )
-            return {"success": False, "error": f"{type(e).__name__}: {e}"}
+            return _shape(
+                effective_args,
+                {"success": False, "error": f"{type(e).__name__}: {e}"},
+            )
 
     def _get_subagent_prompt(self) -> str:
         """
