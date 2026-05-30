@@ -721,3 +721,149 @@ class TestSpawnUnbuffered:
             "An explicit caller override must survive — _spawn uses "
             "setdefault, not assignment."
         )
+
+
+class TestSpawnDetached:
+    """``_spawn_detached`` hands the log file's fd straight to the
+    child via Popen ``stdout=fd, stderr=STDOUT``, then closes the
+    parent's reference. The child inherits the duplicated fd and
+    keeps writing to the file even after the launcher exits — which
+    is exactly what ``kestrel start`` needs since it's fire-and-exit.
+
+    The existing ``_spawn`` (pipe+pump) writes are LOST after the
+    launcher exits because the daemon pump thread dies with its
+    parent and the child's stdout pipe gets EPIPE on subsequent
+    writes. This bug hid runtime errors after every restart."""
+
+    def test_spawn_detached_passes_log_fd_as_stdout(self, pm, tmp_path):
+        """Popen must receive an integer fd for stdout (not PIPE, not
+        a file object) so the kernel handles writes directly. ``PIPE``
+        was the buggy model — it requires a parent-side reader."""
+        import subprocess
+        captured = {}
+
+        class _FakeProcess:
+            pid = 67890
+            stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def _fake_popen(cmd, **kwargs):
+            captured["stdout"] = kwargs.get("stdout")
+            captured["stderr"] = kwargs.get("stderr")
+            captured["env"] = kwargs.get("env")
+            return _FakeProcess()
+
+        with patch.object(subprocess, "Popen", side_effect=_fake_popen):
+            pm._spawn_detached(
+                cmd=["python", "-c", "pass"],
+                env={"PATH": "/usr/bin"},
+                log_file=tmp_path / "detached.log",
+                pid_file=tmp_path / "detached.pid",
+            )
+
+        # An OS file descriptor is an int.
+        assert isinstance(captured["stdout"], int), (
+            f"_spawn_detached must pass an int fd to Popen so the "
+            f"kernel writes directly to the log file. Got "
+            f"{type(captured['stdout']).__name__}={captured['stdout']!r}."
+        )
+        assert captured["stderr"] == subprocess.STDOUT, (
+            "stderr must merge into stdout so tracebacks land in the "
+            "same log file the rest of the runtime writes to."
+        )
+        # And PYTHONUNBUFFERED is still set (same rationale as _spawn).
+        assert captured["env"]["PYTHONUNBUFFERED"] == "1"
+
+    def test_spawn_detached_writes_to_log_file_after_parent_exits(
+        self, pm, tmp_path,
+    ):
+        """End-to-end: spawn a real subprocess that writes a line,
+        let our process method return (simulating launcher exit by
+        completing the call), then verify the line is on disk.
+
+        Before the fix, the same scenario with ``_spawn`` would race:
+        the pump thread is a daemon and dies if the parent exits
+        before it consumes the line. With detached fd redirection,
+        the child writes the line directly — no thread needed,
+        nothing to race."""
+        import subprocess
+        import sys
+        import time
+
+        log_file = tmp_path / "real-detached.log"
+        pid_file = tmp_path / "real-detached.pid"
+        marker = "post-launcher-exit-marker-9c8b2"
+
+        # The child writes a marker then sleeps so we can read while
+        # it's still running (mimicking a long-lived uvicorn host).
+        cmd = [
+            sys.executable, "-c",
+            f"import sys, time; "
+            f"sys.stdout.write({marker!r}+'\\n'); "
+            f"sys.stdout.flush(); "
+            f"time.sleep(5)",
+        ]
+        pid = pm._spawn_detached(
+            cmd=cmd, env={"PATH": "/usr/bin"},
+            log_file=log_file, pid_file=pid_file,
+        )
+
+        # Poll briefly for the marker to land. Don't sleep forever —
+        # 2s is plenty for a single print to make it through the
+        # kernel write path.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if log_file.exists() and marker in log_file.read_text(
+                encoding="utf-8",
+            ):
+                break
+            time.sleep(0.05)
+        try:
+            assert log_file.exists()
+            content = log_file.read_text(encoding="utf-8")
+            assert marker in content, (
+                f"Detached spawn must persist child stdout to {log_file} "
+                f"without a pump thread. Got content: {content!r}"
+            )
+        finally:
+            # Clean up the still-running test child.
+            try:
+                import os
+                import signal
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+
+    def test_spawn_detached_appends_does_not_truncate(self, pm, tmp_path):
+        """Repeated launches must append to the same log file, not
+        truncate. Operators rely on host.log accumulating across
+        restarts so they can correlate errors across reboots."""
+        import subprocess
+
+        log_file = tmp_path / "append.log"
+        log_file.write_text("PRIOR-RESTART-CONTENT\n", encoding="utf-8")
+
+        class _FakeProcess:
+            pid = 11111
+            stdout = None
+
+            def wait(self, timeout=None):
+                return 0
+
+        with patch.object(subprocess, "Popen", return_value=_FakeProcess()):
+            pm._spawn_detached(
+                cmd=["python", "-c", "pass"],
+                env={"PATH": "/usr/bin"},
+                log_file=log_file,
+                pid_file=tmp_path / "append.pid",
+            )
+
+        # The file should still carry its prior content; the OS append
+        # flag we opened with doesn't truncate.
+        content = log_file.read_text(encoding="utf-8")
+        assert "PRIOR-RESTART-CONTENT" in content, (
+            "Detached spawn must open with O_APPEND so prior content "
+            "(another agent's pre-restart logs) is preserved."
+        )

@@ -214,8 +214,15 @@ class Feature(_SdkFeature):
         response: Any,
         messages: list,
         tools: List[Dict[str, Any]],
+        tool_executor: Optional[Any] = None,
     ) -> Any:
-        """Give a feature subagent one more step when it narrates but emits no tool."""
+        """Give a feature subagent one more step when it narrates but emits no tool.
+
+        ``tool_executor`` is threaded through to ``generate_with_messages``
+        so codex-routed repair turns don't hit the same "requires a
+        tool_executor callback" error the initial subagent call was
+        wired around (codex round 1 P2 on #1461 follow-up).
+        """
         content = getattr(response, "content", "") or ""
         if not tools or not self._signals_unfinished_tool_work(content):
             return response
@@ -227,6 +234,7 @@ class Feature(_SdkFeature):
         return await self.agent.llm_service.generate_with_messages(
             messages=self._append_missing_tool_call_repair(messages, content),
             tools=tools if tools else None,
+            tool_executor=tool_executor,
         )
 
     # =========================================================================
@@ -649,11 +657,24 @@ class Feature(_SdkFeature):
 
             logger.info(f"Feature {self.name} executing subagent task: {task[:100]}...")
 
-            # Make LLM call with feature's tools
+            # ``llm_service.generate`` accepts ``tool_executor`` and
+            # delegates to ``get_response`` which calls
+            # ``messages_for(adapter)`` per-provider so the message
+            # shape gets translated to each route's native format
+            # (Gemini's ``parts`` + ``_system`` vs OpenAI's
+            # ``role``/``content``). Using ``generate_with_messages``
+            # with a hand-built OpenAI-style list would bypass that
+            # translation and break Gemini/Vertex routes — codex
+            # round 3 P2 on #1461 follow-up.
+            tool_executor = (
+                self._make_feature_inline_tool_executor()
+                if feature_tools else None
+            )
             response = await self.agent.llm_service.generate(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
-                tools=feature_tools if feature_tools else None
+                tools=feature_tools if feature_tools else None,
+                tool_executor=tool_executor,
             )
 
             # Log what we got back
@@ -664,13 +685,18 @@ class Feature(_SdkFeature):
                 content_preview = str(response)[:100] if response else "None"
                 logger.debug(f"Feature {self.name} LLM returned text (no tool calls): {content_preview}...")
 
-            # Handle tool calls within this feature's context
+            # Handle tool calls within this feature's context. Thread
+            # ``tool_executor`` through so every nested generate_with_
+            # messages call (continuation, repair) on the codex-routed
+            # path has the executor it needs to satisfy inline tool
+            # calls (codex round 1 P2 on #1461 follow-up).
             result = await self._handle_feature_tool_calls(
                 response,
                 feature_tools,
                 system_prompt,
                 max_iterations=max_iterations,
                 user_prompt=user_prompt,
+                tool_executor=tool_executor,
             )
 
             # Debug: Log what we're returning to the orchestrator
@@ -682,6 +708,172 @@ class Feature(_SdkFeature):
         except Exception as e:
             logger.error(f"Feature {self.name} subagent execution failed: {e}")
             return {"success": False, "error": str(e)}
+
+    def _make_feature_inline_tool_executor(self):
+        """Build an inline ``(name, args) -> result_dict`` async callable
+        bound to this feature's OWN tool palette, gated by the same
+        ``PRE_TOOL_USE`` hooks the non-inline ``_handle_feature_tool_calls``
+        path enforces.
+
+        Required by adapters that execute tool calls INSIDE the LLM
+        turn and block until the result arrives — the codex app-server
+        (openai:plan, gpt-5.5) is the live case today. Without an
+        executor, codex-routed subagent LLM calls fail at the provider
+        layer with "requires a tool_executor callback when tools are
+        provided", which is what hid Emma's memory_feature failures
+        until the observability fix (#1461) made the error visible.
+
+        Scoped to this feature's tools rather than the agent's global
+        palette — a subagent shouldn't be able to reach for tools
+        outside its own feature mid-turn. A name not in this feature's
+        palette returns a structured error envelope; a PRE_TOOL_USE
+        deny returns the same PERMISSION DENIED envelope the
+        non-inline path produces (codex round 1 P1 on #1461 follow-up
+        — without this, hook-gated policies were bypassed by the
+        inline-execution path)."""
+        async def _exec(name: str, args: Dict[str, Any]):
+            return await self._execute_subagent_tool(
+                tool_name=name,
+                args=args or {},
+                tools_by_name={t.name: t for t in self.get_tools()},
+                return_with_effective_args=True,
+            )
+        return _exec
+
+    async def _execute_subagent_tool(
+        self,
+        *,
+        tool_name: str,
+        args: Dict[str, Any],
+        tools_by_name: Dict[str, Any],
+        return_with_effective_args: bool = False,
+    ) -> Any:
+        """Execute one of this feature's tools with PRE_TOOL_USE hook
+        enforcement. Shared between the inline-executor path (used by
+        codex app-server) and the post-LLM tool loop in
+        ``_handle_feature_tool_calls`` so security policies, approval
+        prompts, and argument-redaction hooks apply uniformly
+        regardless of which transport ran the tool call.
+
+        ``return_with_effective_args`` controls the return shape:
+
+          - ``False`` (default, used by the post-LLM loop): returns
+            just the ``result`` dict. The loop already knows the args.
+          - ``True`` (used by the inline executor): returns the
+            ``(effective_args, result)`` tuple the codex adapter
+            expects. Codex round 4 P1 on #1461 follow-up — without
+            this, audit / observability paths (``executed_tool_calls``,
+            ``a2a_tool_dispatches.args_redacted``, persisted
+            ``tool_results``) record the PRE-redaction args even
+            when a hook rewrote them, leaking PII into log storage."""
+        def _shape(effective_args_value: Dict[str, Any], result_value: Any) -> Any:
+            """Return either the raw result or the
+            ``(effective_args, result)`` tuple per the
+            ``return_with_effective_args`` flag — this is what tells
+            the codex adapter which args to log into
+            ``executed_tool_calls`` / ``a2a_tool_dispatches``."""
+            if return_with_effective_args:
+                return (effective_args_value, result_value)
+            return result_value
+
+        tool = tools_by_name.get(tool_name)
+        if tool is None:
+            return _shape(args, {
+                "success": False,
+                "error": (
+                    f"Tool {tool_name!r} is not in subagent "
+                    f"{self.name!r}'s palette; available: "
+                    f"{sorted(tools_by_name)}"
+                ),
+            })
+
+        hooks_manager = getattr(self.agent, "hooks_manager", None)
+        effective_args = args
+        if hooks_manager is not None:
+            from kestrel_sdk.hooks.base import (
+                HookEvent, HookInput, PermissionDecision,
+            )
+            hook_input = HookInput(
+                session_id="subagent",
+                hook_event_name=HookEvent.PRE_TOOL_USE.value,
+                tool_name=tool_name,
+                tool_input=args,
+                feature_name=type(self).__name__,
+            )
+            hook_output = await hooks_manager.execute_hooks(
+                HookEvent.PRE_TOOL_USE, hook_input,
+            )
+            # Compute the effective args from the post-hook state FIRST,
+            # before the block check. A hook chain may redact via an
+            # early MODIFY hook (in-place mutation of
+            # ``hook_input.tool_input``) and then DENY via a later
+            # PermissionHook; the blocking branch must surface the
+            # REDACTED args to the codex audit path or PII the
+            # redaction hook removed will leak straight into
+            # ``a2a_tool_dispatches.args_redacted`` /
+            # ``executed_tool_calls``. Codex round 5 P1 on #1461
+            # follow-up.
+            mutated_input = getattr(hook_input, "tool_input", None)
+            if isinstance(mutated_input, dict):
+                effective_args = mutated_input
+            updated = getattr(hook_output, "updated_input", None)
+            if isinstance(updated, dict):
+                effective_args = updated
+
+            # Both DENY and ASK must short-circuit. ASK means "human
+            # approval required" — the orchestrator-driven path's
+            # ``execute_named_tool`` blocks both, and the codex inline
+            # subagent path must match that contract or approval-gated
+            # tools silently run without approval (codex round 2 P1
+            # on #1461 follow-up).
+            if hook_output.permission_decision in (
+                PermissionDecision.DENY,
+                PermissionDecision.ASK,
+            ):
+                reason = (
+                    hook_output.permission_reason
+                    or "Blocked by security policy"
+                )
+                decision_label = (
+                    "PERMISSION DENIED"
+                    if hook_output.permission_decision == PermissionDecision.DENY
+                    else "APPROVAL REQUIRED"
+                )
+                logger.info(
+                    "[SUBAGENT-TOOL] %s blocked (%s): %s",
+                    tool_name, decision_label, reason,
+                )
+                # Surface the POST-hook args even on the block path —
+                # an upstream redaction hook may have run before the
+                # downstream permission hook denied, and the codex
+                # audit row should record the redacted form, not the
+                # raw PII (codex round 5 P1 on #1461 follow-up).
+                return _shape(effective_args, {
+                    "success": False,
+                    "error": (
+                        f"{decision_label}: {reason}. The tool was "
+                        f"NOT executed. Do NOT tell the user this "
+                        f"action succeeded — inform them it was "
+                        f"blocked by security policy."
+                    ),
+                })
+            # ``effective_args`` was already resolved above to the
+            # post-hook state (mutated ``tool_input`` first, then any
+            # ``updated_input`` override) — see the comment block
+            # before the DENY/ASK branch.
+
+        try:
+            result = await tool.execute(**effective_args)
+            return _shape(effective_args, _serialize_tool_result(result))
+        except Exception as e:
+            logger.warning(
+                "[SUBAGENT-TOOL] %s raised %s",
+                tool_name, e,
+            )
+            return _shape(
+                effective_args,
+                {"success": False, "error": f"{type(e).__name__}: {e}"},
+            )
 
     def _get_subagent_prompt(self) -> str:
         """
@@ -726,6 +918,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
         system_prompt: str,
         max_iterations: int = None,
         user_prompt: Optional[str] = None,
+        tool_executor: Optional[Any] = None,
     ) -> str:
         """
         Handle tool calls within this feature's context.
@@ -764,6 +957,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                 response,
                 messages,
                 tools,
+                tool_executor=tool_executor,
             )
             if isinstance(response, str):
                 return response
@@ -793,50 +987,21 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     except (json.JSONDecodeError, TypeError):
                         args = {}
 
-                # Find and execute the tool (with security hook enforcement)
-                tool = tools_by_name.get(tool_name)
-                if tool:
-                    # Check security hooks before executing
-                    hooks_manager = getattr(self.agent, 'hooks_manager', None)
-                    if hooks_manager:
-                        from kestrel_sdk.hooks.base import HookInput, HookEvent
-                        from kestrel_sdk.hooks.base import PermissionDecision
-                        hook_input = HookInput(
-                            session_id="subagent",
-                            hook_event_name=HookEvent.PRE_TOOL_USE.value,
-                            tool_name=tool_name,
-                            tool_input=args,
-                            feature_name=type(self).__name__,
-                        )
-                        hook_output = await hooks_manager.execute_hooks(
-                            HookEvent.PRE_TOOL_USE, hook_input
-                        )
-                        if hook_output.permission_decision == PermissionDecision.DENY:
-                            reason = hook_output.permission_reason or "Blocked by security policy"
-                            result = {
-                                "success": False,
-                                "error": f"PERMISSION DENIED: {reason}. The tool was NOT executed. Do NOT tell the user this action succeeded — inform them it was blocked by security policy."
-                            }
-                            logger.info(f"[SUBAGENT-TOOL] {tool_name} blocked by security: {reason}")
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": json.dumps(result)
-                            })
-                            continue
-
-                    try:
-                        result = await tool.execute(**args)
-                        result = _serialize_tool_result(result)
-                        # Debug: Log tool result
-                        result_str = json.dumps(result) if isinstance(result, dict) else str(result)
-                        logger.info(f"[SUBAGENT-TOOL] {tool_name} result ({len(result_str)} chars): {result_str[:300]}...")
-                    except Exception as e:
-                        result = {"success": False, "error": str(e)}
-                        logger.error(f"[SUBAGENT-TOOL] {tool_name} failed: {e}")
-                else:
-                    result = {"success": False, "error": f"Unknown tool: {tool_name}"}
-                    logger.warning(f"[SUBAGENT-TOOL] Unknown tool: {tool_name}")
+                # Execute through the shared hook-enforced helper so
+                # this loop AND the inline-executor path apply
+                # identical PRE_TOOL_USE policy. Without this the
+                # codex app-server inline path would bypass security
+                # hooks the orchestrator-driven path enforces (codex
+                # round 1 P1 on #1461 follow-up).
+                result = await self._execute_subagent_tool(
+                    tool_name=tool_name,
+                    args=args,
+                    tools_by_name=tools_by_name,
+                )
+                result_str = json.dumps(result) if isinstance(result, dict) else str(result)
+                logger.info(
+                    f"[SUBAGENT-TOOL] {tool_name} result ({len(result_str)} chars): {result_str[:300]}..."
+                )
 
                 # Add tool result to messages
                 messages.append({
@@ -845,10 +1010,15 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     "content": json.dumps(result)
                 })
 
-            # Continue conversation with tool results
+            # Continue conversation with tool results — thread the
+            # ``tool_executor`` through so codex-routed continuation
+            # turns don't hit the same "requires a tool_executor"
+            # provider error the initial subagent call avoided
+            # (codex round 1 P2 on #1461 follow-up).
             response = await self.agent.llm_service.generate_with_messages(
                 messages=messages,
-                tools=tools if tools else None
+                tools=tools if tools else None,
+                tool_executor=tool_executor,
             )
 
             # If response is string or has no more tool calls, we're done
@@ -860,6 +1030,7 @@ ABSOLUTE PROHIBITION - NEVER FABRICATE:
                     response,
                     messages,
                     tools,
+                    tool_executor=tool_executor,
                 )
                 if isinstance(response, str):
                     return response

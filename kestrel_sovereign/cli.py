@@ -208,7 +208,16 @@ def _start_inprocess_mode(project_dir: Path, multi_agent, pm: ProcessManager) ->
            "--host", multi_agent.host.bind, "--port", str(multi_agent.host.port)]
 
     print(f"   Starting server on :{multi_agent.host.port}...", end="", flush=True)
-    pm._spawn(cmd, env, log_file, host_pid_file)
+    # In-process host: ``kestrel start`` is fire-and-exit (returns
+    # after wait_for_health). The pipe+pump model in ``_spawn``
+    # requires the parent to keep running for the daemon pump
+    # thread to survive — so this launcher uses the detached
+    # variant that hands the log file's fd straight to the child.
+    # Without this, runtime INFO/WARNING/ERROR lines from the
+    # uvicorn host hit a closed pipe (EPIPE) once the launcher
+    # exits and are silently swallowed; host.log appears to freeze
+    # after startup and runtime tracebacks vanish. See #1461.
+    pm._spawn_detached(cmd, env, log_file, host_pid_file)
 
     if pm.wait_for_health(multi_agent.host.port, timeout=30):
         print("          \u2705")
