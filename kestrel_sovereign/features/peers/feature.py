@@ -741,56 +741,97 @@ class PeersFeature(Feature):
             top_msg = data.get("message")
             if isinstance(top_msg, str) and top_msg:
                 reply_text = top_msg
-        # Walk artifacts in INDEX order so multi-segment long replies
-        # reassemble correctly. The receiver-side
-        # ``attach_artifact_to_a2a_task`` tool stamps ``index`` per
-        # segment for exactly this reason — the underlying transport
-        # is allowed to return artifacts out of insertion order, but
-        # the canonical reassembly order is by ``index`` ascending.
+        # Group artifacts by ``name`` first, then reassemble each
+        # group in INDEX order. The A2A artifact model allows a task
+        # to carry multiple unrelated artifact groups simultaneously
+        # (e.g. ``reply_body`` chunks + a separate ``debug_log``);
+        # concatenating ALL text parts globally would interleave
+        # unrelated groups and pollute the answer. The chunking
+        # convention in the receiver-side
+        # ``attach_artifact_to_a2a_task`` tool documents
+        # ``reply_body`` as the canonical group name for chunked Q&A
+        # replies — we look there first, falling back to whatever
+        # single group exists. Codex round 2 P2 on the artifact PR.
         artifacts_raw = data.get("artifacts") or []
-        sorted_artifacts = sorted(
-            (a for a in artifacts_raw if isinstance(a, dict)),
-            key=lambda a: a.get("index") if isinstance(a.get("index"), int) else 0,
+        terminal_states = ("completed", "failed", "canceled")
+        groups: dict[str, list[dict]] = {}
+        for art in artifacts_raw:
+            if not isinstance(art, dict):
+                continue
+            group_name = art.get("name") or ""
+            groups.setdefault(group_name, []).append(art)
+
+        artifact_bodies: dict[str, str] = {}
+        artifact_group_complete: dict[str, bool] = {}
+        for group_name, group_arts in groups.items():
+            arts_sorted = sorted(
+                group_arts,
+                key=lambda a: (
+                    a.get("index")
+                    if isinstance(a.get("index"), int)
+                    else 0
+                ),
+            )
+            body = "".join(
+                part["text"] or ""
+                for art in arts_sorted
+                for part in (art.get("parts") or [])
+                if isinstance(part, dict) and "text" in part
+            )
+            last_chunk_seen = any(
+                a.get("lastChunk") is True for a in arts_sorted
+            )
+            complete = (
+                current_state in terminal_states or last_chunk_seen
+            )
+            artifact_bodies[group_name] = body
+            artifact_group_complete[group_name] = complete
+
+        # Primary body: ``reply_body`` is the documented convention;
+        # fall back to whichever single group exists (preserves
+        # backwards-compat with legacy senders that don't follow the
+        # naming convention) or empty.
+        if "reply_body" in artifact_bodies:
+            primary_name = "reply_body"
+        elif len(artifact_bodies) == 1:
+            primary_name = next(iter(artifact_bodies))
+        else:
+            primary_name = None
+        artifact_body = (
+            artifact_bodies.get(primary_name, "") if primary_name else ""
         )
-        artifact_texts = []
-        for artifact in sorted_artifacts:
-            for part in (artifact.get("parts") or []):
-                if isinstance(part, dict) and "text" in part:
-                    artifact_texts.append(part["text"] or "")
-        artifact_body = "".join(artifact_texts)
-        # If the inline reply was empty but artifacts carry text, the
-        # asking lineage's answer IS the artifact body — surface it as
-        # reply_text so the resumed turn doesn't have to special-case
-        # the chunked path.
+        # If the inline reply was empty but the primary artifact group
+        # carries text, the asking lineage's answer IS the artifact
+        # body — surface it as reply_text so the resumed turn doesn't
+        # have to special-case the chunked path.
         if not reply_text and artifact_body:
             reply_text = artifact_body
-        # Determine whether the assembled body is complete. Three cases:
-        #   1. No artifacts at all → inline message IS the body → complete.
-        #   2. Task is already in a TERMINAL state (completed/failed/
-        #      canceled) → the peer is done emitting; whatever's there
-        #      is final, even if no segment carries ``lastChunk=True``.
-        #      This preserves backwards-compat with the legacy A2A
-        #      artifact shape that pre-dates the chunking convention
-        #      (codex round 1 P2 on the artifact PR).
-        #   3. Task still in a non-terminal state (working / submitted)
-        #      → only complete when at least one segment carries
-        #      ``lastChunk=True``.
-        last_chunk_seen = any(
-            a.get("lastChunk") is True for a in sorted_artifacts
-        )
-        terminal_states = ("completed", "failed", "canceled")
-        artifact_body_complete = (
-            (not sorted_artifacts)
-            or current_state in terminal_states
-            or last_chunk_seen
-        )
+
+        # Completeness:
+        #   - No artifacts → inline message IS the body → complete.
+        #   - Primary group has its completeness flag (terminal state
+        #     OR lastChunk=True).
+        #   - No primary group identifiable (multiple unnamed groups,
+        #     none labeled ``reply_body``) → fall back to overall
+        #     completeness: complete iff EVERY group is complete OR
+        #     task is terminal.
+        if not artifact_bodies:
+            artifact_body_complete = True
+        elif primary_name is not None:
+            artifact_body_complete = artifact_group_complete[primary_name]
+        else:
+            artifact_body_complete = current_state in terminal_states or all(
+                artifact_group_complete.values()
+            )
+
+        artifact_segment_count = sum(len(g) for g in groups.values())
 
         return ToolResult.ok(
             confirmation=(
                 f"Fetched peer task {task_id[:8]} from {recipient} "
                 f"(state={current_state}, {len(reply_text)} chars, "
-                f"{len(sorted_artifacts)} artifact segment(s), "
-                f"complete={artifact_body_complete})"
+                f"{artifact_segment_count} artifact segment(s) across "
+                f"{len(groups)} group(s), complete={artifact_body_complete})"
             ),
             data={
                 "recipient": recipient,
@@ -798,9 +839,16 @@ class PeersFeature(Feature):
                 "state": current_state,
                 "reply_text": reply_text,
                 "artifacts": artifacts_raw,
+                # The primary group body (the documented ``reply_body``
+                # convention) reassembled in index order.
                 "artifact_body": artifact_body,
                 "artifact_body_complete": artifact_body_complete,
-                "artifact_segment_count": len(sorted_artifacts),
+                "artifact_segment_count": artifact_segment_count,
+                # All groups, keyed by name, for callers that need to
+                # inspect non-reply artifacts (logs, side-channel
+                # results, etc.).
+                "artifact_bodies": artifact_bodies,
+                "artifact_group_complete": artifact_group_complete,
             },
         )
 

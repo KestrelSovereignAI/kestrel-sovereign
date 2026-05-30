@@ -525,3 +525,78 @@ async def test_get_peer_task_result_legacy_terminal_artifacts_complete():
         "flag incomplete — the resumed turn would otherwise loop "
         "waiting for chunks that will never arrive."
     )
+
+
+@pytest.mark.asyncio
+async def test_get_peer_task_result_multi_group_artifacts_isolate_reply_body():
+    """Codex round 2 P2 on the artifact PR: when the peer attaches
+    ``reply_body`` chunks AND a separate ``debug_log`` artifact,
+    ``artifact_body`` must contain ONLY the reply_body group
+    reassembled in index order — never the debug_log content.
+    Otherwise the resumed turn would treat unrelated artifacts as
+    part of the answer."""
+    feature = _make_a2a_feature()
+    get_resp = MagicMock(status_code=200)
+    get_resp.json.return_value = {
+        "id": "t-multi",
+        "status": "completed",
+        "message": "See attached artifacts (2 segments of reply_body).",
+        "artifacts": [
+            {"name": "debug_log", "index": 0, "lastChunk": True,
+             "parts": [{"type": "text", "text": "<UNRELATED LOG OUTPUT>"}]},
+            {"name": "reply_body", "index": 1, "lastChunk": True,
+             "parts": [{"type": "text", "text": "second"}]},
+            {"name": "reply_body", "index": 0, "lastChunk": False,
+             "parts": [{"type": "text", "text": "first-"}]},
+        ],
+    }
+    client = _async_client_with(get_resp=get_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.get_peer_task_result("meridian", "t-multi")
+
+    assert result.data["artifact_body"] == "first-second", (
+        f"artifact_body must contain only the reply_body group "
+        f"reassembled in index order, got {result.data['artifact_body']!r}. "
+        f"Concatenating across groups would corrupt the answer."
+    )
+    assert "<UNRELATED LOG OUTPUT>" not in result.data["artifact_body"]
+    # All groups are still surfaced individually for callers that need
+    # the non-reply artifacts.
+    assert result.data["artifact_bodies"] == {
+        "debug_log": "<UNRELATED LOG OUTPUT>",
+        "reply_body": "first-second",
+    }
+    assert result.data["artifact_group_complete"]["reply_body"] is True
+    assert result.data["artifact_segment_count"] == 3, (
+        "segment_count counts ALL artifact segments across groups, "
+        "not just the primary reply group."
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_peer_task_result_legacy_single_unnamed_group_still_works():
+    """Backwards-compat: a single artifact group with no recognized
+    name (or empty name) still becomes the primary body — so peers
+    that don't follow the ``reply_body`` convention yet aren't broken."""
+    feature = _make_a2a_feature()
+    get_resp = MagicMock(status_code=200)
+    get_resp.json.return_value = {
+        "id": "t-unnamed",
+        "status": "completed",
+        "message": "",
+        "artifacts": [
+            {"name": "result", "parts": [{"type": "text", "text": "the answer"}]},
+        ],
+    }
+    client = _async_client_with(get_resp=get_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.get_peer_task_result("meridian", "t-unnamed")
+
+    assert result.data["artifact_body"] == "the answer"
+    assert result.data["artifact_body_complete"] is True
