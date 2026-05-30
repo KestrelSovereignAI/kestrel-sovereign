@@ -1,23 +1,19 @@
 # Code Reviews
 
-Code quality reviews, audit findings, and remediation tracking.
+Point-in-time code review notes that are still useful during active PR or follow-up work.
 
-## Active Reviews
+## Current Review Notes
 
 | Document | Description |
-|----------|-------------|
-| [ROUND_3_PLAN.md](ROUND_3_PLAN.md) | Session reconciliation and Round 3 plan - Sprint 3 in progress |
-| [CODE_REVIEW_01_03_2026.md](CODE_REVIEW_01_03_2026.md) | Spackle Report: Codebase issues (Round 2) |
-| [CODE_REVIEW_01_03_2026_STATUS.md](CODE_REVIEW_01_03_2026_STATUS.md) | Resolution status for January 2026 review |
-| [SPRINT_1_COMPLETION.md](SPRINT_1_COMPLETION.md) | Sprint 1 critical security fixes - complete |
+|---|---|
+| [claude-pr-1330.md](claude-pr-1330.md) | Claude review notes for PR 1330 |
+| [claude-pr-1333.md](claude-pr-1333.md) | Claude review notes for PR 1333 |
+| [claude-pr-1337.md](claude-pr-1337.md) | Claude review notes for PR 1337 |
+| [claude-pr-1338.md](claude-pr-1338.md) | Claude review notes for PR 1338 |
+| [claude-pr-1398.md](claude-pr-1398.md) | Claude review notes for PR 1398 |
 
-## Archived Reviews
+## Archive Policy
 
-Historical code reviews are in [../archive/code_reviews/](../archive/code_reviews/).
+Historical code reviews live in [../archive/code_reviews/](../archive/code_reviews/). Move PR review notes there after confirming the PR is merged/closed and no follow-up issue still depends on the note.
 
-## Process
-
-1. Issues are identified during code reviews
-2. Tracked in GitHub Project: Code Quality Improvements
-3. Resolved through sprints with documented status
-4. Archived after completion
+The May 2026 documentation audit tracks this cleanup in [../audit/documentation-2026-05/STALE_ARTIFACTS.md](../audit/documentation-2026-05/STALE_ARTIFACTS.md).
