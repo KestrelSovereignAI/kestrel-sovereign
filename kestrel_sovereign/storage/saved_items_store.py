@@ -262,9 +262,42 @@ class SavedItem:
             schema_id=row[11],
             tags=json.loads(row[12]) if row[12] else [],
             metadata=json.loads(row[13]) if row[13] else {},
-            created_at=datetime.fromisoformat(row[14]) if row[14] else None,
-            updated_at=datetime.fromisoformat(row[15]) if row[15] else None,
+            # Asyncpg returns ``datetime.datetime`` directly for
+            # TIMESTAMP columns on Postgres; aiosqlite returns ISO
+            # strings via the TEXT-affinity coercion. Accept either
+            # shape so SavedItemsStore is portable across both
+            # backends (caught by the vector-lift e2e validation
+            # script: save_item had never been exercised on PG until
+            # then).
+            created_at=row[14] if isinstance(row[14], datetime) else (
+                datetime.fromisoformat(row[14]) if row[14] else None
+            ),
+            updated_at=row[15] if isinstance(row[15], datetime) else (
+                datetime.fromisoformat(row[15]) if row[15] else None
+            ),
         )
+
+
+def _now_for_backend(db, now: datetime) -> tuple:
+    """Return ``(created_at, updated_at)`` bind values shaped for the
+    target backend.
+
+    - **Postgres** (asyncpg): pass ``datetime`` objects directly.
+      Binding strings raises ``invalid input for query argument`` on
+      TIMESTAMP columns.
+    - **SQLite** (aiosqlite via Python's stdlib sqlite3 adapter): emit
+      ``.isoformat()`` strings to preserve the historical on-disk
+      encoding. Existing rows used the ``T`` separator; sqlite3's
+      built-in datetime adapter would write the SPACE separator,
+      which sorts differently under lexicographic ORDER BY and
+      breaks ``list_items`` ordering. (Caught by codex review on the
+      vector-lift validation PR.)
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        return (now, now)
+    iso = now.isoformat()
+    return (iso, iso)
 
 
 def _serialize_embedding(embedding: List[float]) -> bytes:
@@ -464,8 +497,22 @@ class SavedItemsStore:
                 schema_id,
                 json.dumps(tags or []),
                 json.dumps(metadata or {}),
-                now.isoformat(),
-                now.isoformat()
+                # Backend-aware timestamp binding (caught by codex
+                # review on the vector-lift validation script):
+                # - asyncpg requires a real ``datetime`` for
+                #   TIMESTAMP columns; binding a string raises
+                #   ``invalid input for query argument``.
+                # - sqlite3's stdlib adapter encodes a ``datetime``
+                #   as ``YYYY-MM-DD HH:MM:SS...`` (SPACE separator),
+                #   but existing ``saved_items`` rows in SQLite were
+                #   written with ``.isoformat()`` (``T`` separator).
+                #   ``list_items`` orders this TEXT column
+                #   lexicographically; mixing the two encodings
+                #   sorts rows incorrectly (space < T, so newer
+                #   rows would precede older same-day rows).
+                # Preserve the existing SQLite shape while giving
+                # Postgres what it actually needs.
+                *_now_for_backend(self.db, now),
             )
         )
         if embedding is not None:
@@ -551,7 +598,17 @@ class SavedItemsStore:
             # Update database with CID
             await self.db.execute(
                 "UPDATE saved_items SET ipfs_cid = ?, updated_at = ? WHERE id = ? AND agent_id = ?",
-                (ipfs_cid, datetime.now(timezone.utc).isoformat(), item_id, self.agent_id)
+                # Backend-aware: datetime for PG, ISO string for
+                # SQLite. Same rationale as ``save_item`` —
+                # asyncpg refuses string TIMESTAMP binds, and SQLite
+                # needs the ``T`` separator to keep lexicographic
+                # ordering consistent with historical rows.
+                (
+                    ipfs_cid,
+                    _now_for_backend(self.db, datetime.now(timezone.utc))[0],
+                    item_id,
+                    self.agent_id,
+                )
             )
             await self.db.commit()
 
@@ -590,7 +647,8 @@ class SavedItemsStore:
             params.append(json.dumps(merged))
 
         updates.append("updated_at = ?")
-        params.append(now.isoformat())
+        # Backend-aware timestamp bind — see save_item.
+        params.append(_now_for_backend(self.db, now)[0])
         params.append(item_id)
         params.append(self.agent_id)
 
