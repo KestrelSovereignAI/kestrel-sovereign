@@ -490,3 +490,38 @@ async def test_get_peer_task_result_falls_back_to_inline_message_when_no_artifac
         "No artifacts at all means the body IS complete via the inline "
         "message field — short-reply path must not get flagged partial."
     )
+
+
+@pytest.mark.asyncio
+async def test_get_peer_task_result_legacy_terminal_artifacts_complete():
+    """Codex round 1 P2 on the artifact PR: a peer task in a TERMINAL
+    state (completed/failed/canceled) whose artifacts predate the
+    ``lastChunk`` chunking convention must still be flagged
+    ``artifact_body_complete=True``. Otherwise the resumed turn
+    would wait or refetch indefinitely on legacy peers that ship
+    artifact text without the explicit terminal-segment marker."""
+    feature = _make_a2a_feature()
+    get_resp = MagicMock(status_code=200)
+    get_resp.json.return_value = {
+        "id": "t-legacy",
+        "status": "completed",  # ← TERMINAL
+        "message": "",  # answer lives in the artifact, not inline
+        "artifacts": [
+            # Legacy shape: no `lastChunk`, no `index` even — just the
+            # answer text in parts[].
+            {"name": "result", "parts": [{"type": "text", "text": "42"}]},
+        ],
+    }
+    client = _async_client_with(get_resp=get_resp)
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.get_peer_task_result("meridian", "t-legacy")
+
+    assert result.data["artifact_body"] == "42"
+    assert result.data["artifact_body_complete"] is True, (
+        "Terminal task with legacy artifact (no lastChunk) must NOT "
+        "flag incomplete — the resumed turn would otherwise loop "
+        "waiting for chunks that will never arrive."
+    )

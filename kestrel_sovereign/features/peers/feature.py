@@ -764,14 +764,26 @@ class PeersFeature(Feature):
         # the chunked path.
         if not reply_text and artifact_body:
             reply_text = artifact_body
-        # Check for incomplete chunked artifacts so the caller knows
-        # the body is partial. ``lastChunk=True`` on the final segment
-        # means the body is complete; absence of any True flag plus
-        # multi-segment shape means the receiver is mid-stream.
+        # Determine whether the assembled body is complete. Three cases:
+        #   1. No artifacts at all → inline message IS the body → complete.
+        #   2. Task is already in a TERMINAL state (completed/failed/
+        #      canceled) → the peer is done emitting; whatever's there
+        #      is final, even if no segment carries ``lastChunk=True``.
+        #      This preserves backwards-compat with the legacy A2A
+        #      artifact shape that pre-dates the chunking convention
+        #      (codex round 1 P2 on the artifact PR).
+        #   3. Task still in a non-terminal state (working / submitted)
+        #      → only complete when at least one segment carries
+        #      ``lastChunk=True``.
         last_chunk_seen = any(
             a.get("lastChunk") is True for a in sorted_artifacts
         )
-        artifact_body_complete = (not sorted_artifacts) or last_chunk_seen
+        terminal_states = ("completed", "failed", "canceled")
+        artifact_body_complete = (
+            (not sorted_artifacts)
+            or current_state in terminal_states
+            or last_chunk_seen
+        )
 
         return ToolResult.ok(
             confirmation=(
