@@ -187,8 +187,6 @@ def test_core_features_default_to_allow():
         "TaskFeature",           # NOT TasksFeature
         "ChannelFeature",        # NOT ChannelsFeature
         "CliFeature",
-        "WorkflowsFeature",
-        "FeatureFeaturesFeature",
     ]
     for name in core_must_allow:
         assert default_permission_for_feature(name) == PermissionLevel.ALLOW, (

@@ -134,11 +134,6 @@ dependencies = [
     "google-generativeai>=0.8.6",
     "google-cloud-storage>=3.4.1",
     "pqcrypto>=0.4.0",
-    # Workflows feature (#1131): the public ``validate_spec_payload``
-    # entrypoint runs draft-2020-12 schema validation at workflow_define
-    # time, so jsonschema must be a runtime dependency, not just a test
-    # extra. Cheap pure-Python install (~90KB wheel + a few small deps).
-    "jsonschema>=4.20",
     "kestrel-llms[all]==0.1.8",
 ]
 
@@ -157,8 +152,6 @@ test = [
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
     "asgi-lifespan>=2.1.0",
-    # ``jsonschema`` is a core runtime dependency now (workflows feature
-    # uses it at workflow_define time); no need to repeat here.
 ]
 # ML/training dependencies (adds ~2GB+ for torch, diffusers, etc.)
 ml = [
@@ -268,8 +261,6 @@ test = [
     "pytest-timeout>=2.3.1",
     "pytest-xdist>=3.0.0",
     "asgi-lifespan>=2.1.0",
-    # ``jsonschema`` is in the runtime deps above (workflows feature
-    # uses it at workflow_define time).
 ]
 
 [tool.pytest.ini_options]
