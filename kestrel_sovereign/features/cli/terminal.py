@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import json
 import platform
@@ -274,14 +273,3 @@ def redact_secrets(value: str) -> str:
         else:
             redacted = pattern.sub("[REDACTED]", redacted)
     return redacted
-
-
-def decode_github_content_response(payload: dict[str, Any]) -> str:
-    """Decode a `gh api /contents` response body."""
-
-    content = payload.get("content")
-    encoding = payload.get("encoding")
-    if not isinstance(content, str) or encoding != "base64":
-        raise ValueError("GitHub contents response is not base64 encoded")
-    compact = "".join(content.splitlines())
-    return base64.b64decode(compact).decode("utf-8", errors="replace")

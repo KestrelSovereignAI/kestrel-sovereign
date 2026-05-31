@@ -140,23 +140,13 @@ context_resize = { description = "Adjust context budget allocation", category = 
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["CliFeature"]
-description = "Registered feature-owned CLI workflows using installed tools and existing user authentication"
-tags = ["core", "cli", "tools", "github", "git"]
+description = "Registered feature-owned CLI workflows for local repository inspection (read-only git)"
+tags = ["core", "cli", "tools", "git"]
 icon = "terminal"
 core = true
 
 [cli.skills]
 cli_status = { description = "Show CLI adapter tool availability", category = "system", tags = ["cli", "tools"] }
-github_cli_auth_status = { description = "Check GitHub CLI authentication", category = "system", tags = ["github", "cli"] }
-github_pr_view = { description = "Inspect GitHub PR metadata, files, commits, head ref, and checks", category = "data_access", tags = ["github", "pull-request"] }
-github_issue_view = { description = "Inspect GitHub issue metadata, labels, assignees, state, and comments", category = "data_access", tags = ["github", "issue"] }
-github_issue_comments = { description = "Read comments for a GitHub issue", category = "data_access", tags = ["github", "issue", "comments"] }
-github_pr_diff = { description = "Read a GitHub PR unified diff", category = "data_access", tags = ["github", "pull-request", "diff"] }
-github_pr_files = { description = "List changed files for a GitHub PR", category = "data_access", tags = ["github", "pull-request", "files"] }
-github_pr_checks = { description = "Read check/status rollup for a GitHub PR", category = "data_access", tags = ["github", "pull-request", "checks"] }
-github_read_file_at_ref = { description = "Read a GitHub repository file at a branch, tag, or commit ref", category = "data_access", tags = ["github", "ref"] }
-github_read_file_at_pr_head = { description = "Read a GitHub repository file at a PR head commit", category = "data_access", tags = ["github", "pull-request", "ref"] }
-github_pr_review_context = { description = "Build GitHub PR review context with metadata, files, checks, and diff", category = "data_access", tags = ["github", "pull-request", "review"] }
 git_status = { description = "Read local repository status", category = "data_access", tags = ["git", "local"] }
 git_diff = { description = "Read local repository diff", category = "data_access", tags = ["git", "local", "diff"] }
 git_log = { description = "Read recent local repository commits", category = "data_access", tags = ["git", "local", "history"] }
