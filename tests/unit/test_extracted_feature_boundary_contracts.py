@@ -79,8 +79,16 @@ def test_voice_feature_is_external_to_core():
     ).read_text()
     voice_block = registry.split("[voice]", 1)[1].split("\n[", 1)[0]
     assert "core = false" in voice_block
-    assert not feature_dir.exists()
-    assert not support_dir.exists()
+    source_files = [
+        path for path in feature_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if feature_dir.exists() else []
+    assert source_files == []
+    support_files = [
+        path for path in support_dir.rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    ] if support_dir.exists() else []
+    assert support_files == []
 
 
 def test_reflection_feature_is_external_to_core():

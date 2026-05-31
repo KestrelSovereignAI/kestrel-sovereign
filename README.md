@@ -9,14 +9,14 @@ Kestrel is a continuously-developing framework for creating autonomous AI agents
 | Pillar | What it means |
 |--------|--------------|
 | **Portable DID identity** | Cryptographic identity the agent's user owns. Exportable, self-hostable, cloud-optional — the agent is not bound to any provider. |
-| **Persistent memory you own** | SQLite-backed knowledge graph with full-text search and RAG. Conversations, documents, relationships — all searchable, portable, and encrypted at rest. |
+| **Persistent memory you own** | Local-first memory with full-text search, knowledge graph retrieval, and RAG. Conversations, documents, relationships — searchable, portable, and encrypted at rest when configured. The storage and embedding layer is actively migrating through SQLAlchemy and the shared semantic embeddings service. |
 | **Constitutional governance** | Every agent runs under an audited set of principles enforced *above* the LLM. Genesis audit on creation. Amendment requires cryptographic signature. |
 
 ### What's in core, what's an add-on
 
-`pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, voice (Piper TTS + FasterWhisper STT), local sandboxed compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
+`pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, local guarded compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
 
-Cloud providers (RunPod, Vast.ai), specialized integrations (MCP, GitHub App, wallet), and proprietary training adapters are **installable add-ons** — separate Python packages that register themselves via entry points. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md).
+Voice, MCP, GitHub App, wallet, council, observability, and similar specialized capabilities are **installable feature packages**. RunPod, Vast.ai, GCP Compute, voice cloud backends, and storage backends are **provider packages** that register with provider-specific entry points rather than the feature entry-point group. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md).
 
 ## 🚀 Quick Start
 
@@ -136,7 +136,7 @@ uv run kestrel config ./agent_data/MyAgent  # Show agent config
 
 ### Feature management (`kestrel feature`)
 
-Kestrel ships a lean core; everything else is a feature. Cloud providers, training adapters, voice cloud backends, and specialized integrations are installable packages that register themselves via Python entry points.
+Kestrel ships a lean core. Optional feature packages register `Feature` classes through the `kestrel_sovereign.features` entry-point group. Provider packages, such as cloud, voice, and storage backends, register with provider-specific entry-point groups and are consumed by their owning core or feature module.
 
 ```bash
 uv run kestrel feature list                   # Show installed + available features
@@ -210,17 +210,18 @@ uv run python -m kestrel_sovereign.main ./agent_data/myagent
 
 Kestrel includes a built-in web interface called the **Sovereign Console**. Once your agent is running, open the URL the CLI printed on start — `http://localhost:8888` for the multi-agent host (default `kestrel start` mode), or the per-agent port for a single-agent start — in any browser; no additional software required.
 
-The console provides 8 tabs:
+The console provides 9 tabs:
 
 | Tab | Description |
 |-----|-------------|
-| **Identity** | View the agent's DID, name, and cryptographic identity |
 | **Chat** | Converse with the agent (supports model selection, privacy modes, chat history) |
+| **Identity** | View the agent's DID, name, and cryptographic identity |
 | **Constitution** | View and audit the agent's constitutional principles |
 | **Memories** | Browse the agent's knowledge graph and stored memories |
 | **Tasks** | Monitor background tasks and activity |
 | **Sovereignty** | Manage data sovereignty, backups, and exports |
 | **Resources** | View agent resource usage and configuration |
+| **Features** | Browse installed, available, enabled, and disabled features |
 | **Security** | Manage permissions, audit logs, and session security |
 
 > **Alternative clients:** The server also exposes an OpenAI-compatible API at `/v1/chat/completions`, so you can connect any OpenAI-compatible client (e.g., [Open WebUI](https://github.com/open-webui/open-webui)) if you prefer.
@@ -230,7 +231,7 @@ The console provides 8 tabs:
 Kestrel agents are built on several key components:
 
 - **Cryptographic Identity**: Each agent has a unique DID (Decentralized Identifier)
-- **Enhanced Storage**: SQLite-based memory with FTS, knowledge graphs, and RAG
+- **Enhanced Storage**: Local-first memory with SQL-backed stores, FTS, knowledge graphs, and RAG; SQLAlchemy/common semantic embeddings migration is in progress
 - **Multi-Model LLM**: Fallback between local (Ollama) and cloud (OpenAI) models
 - **Constitutional Governance**: Immutable principles with interpretive flexibility
 - **Blockchain Anchoring**: Optional integrity verification via blockchain
@@ -245,12 +246,13 @@ kestrel-sovereign/
 │   ├── inception_service.py   # Agent creation (DID + genesis audit)
 │   ├── agent_config.py        # Per-agent config loader
 │   ├── data/feature_registry.toml  # Runtime feature registry
+│   ├── features/              # Core bundled features
+│   ├── storage/               # SQL-backed storage facade and stores
+│   ├── static/                # Sovereign Console frontend
 │   └── ...
 ├── server.py                  # Re-export shim → kestrel_sovereign/server.py
 ├── host.py                    # Multi-agent multi_agent host
 ├── main.py                    # Re-export shim → kestrel_sovereign/main.py
-├── packages/                  # Extracted feature packages
-├── features/                  # Built-in features
 ├── docs/                      # Architecture & guides
 └── tests/                     # Test suite
 
@@ -265,8 +267,8 @@ kestrel-sovereign/
 ## 🎯 Core Features
 
 ### 1. Sovereign Memory
-- **Persistent Storage**: SQLite with full-text search and knowledge graphs
-- **RAG Pipeline**: Document chunking, embedding, and semantic retrieval
+- **Persistent Storage**: SQL-backed stores with full-text search and knowledge graphs
+- **RAG Pipeline**: Document chunking and semantic retrieval; storage/embedding internals are moving through SQLAlchemy and the shared semantic embeddings service
 - **Conversation History**: Complete interaction tracking with metadata
 - **Human-Led Interactions**: Prioritizes user narratives (e.g., storytelling) for preservation and no-loss continuity.
 
@@ -289,29 +291,27 @@ kestrel-sovereign/
 - **Ephemeral Mode**: True off-the-record conversations (nothing stored)
 - **Privacy Granularity**: 5 distinct privacy levels for different use cases
 - **Decentralized Storage**: Filecoin/IPFS integration for vendor independence
-- **Agent Economics**: Autonomous economic contracts using cryptographic payments
+- **Optional Economics**: Wallet and autonomous payment flows are installable feature-package surfaces, not part of the base install
 
-## ⚠️ Feature Stability (v0.1.8 Beta)
+## ⚠️ Feature Stability (v0.18+ Beta)
 
-Kestrel covers a wide surface; not all of it ships at the same maturity. **Verified 2026-04-25** by reading code, tests, skip markers, and recent git activity:
+Kestrel covers a wide surface; not all of it ships at the same maturity. **Verified 2026-05-31** against the current feature inventory, runtime registry, package-boundary docs, tests, and recent documentation audit:
 
 ### ✅ Stable — battle-tested in production by the maintainers
 
 - **Constitutional AI** — Genesis audits, hierarchical permissions, approval queues
 - **DID-based Identity** — `did:pkh` format, portable agent identity, export/import
 - **5-Level Privacy Modes** — EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC
-- **Memory & Storage** — SQLite/PostgreSQL with FTS, knowledge graph, RAG pipeline; storage parity contracts in CI
+- **Memory & Storage** — Local-first memory, FTS, knowledge graph, and RAG surfaces are core; storage and semantic retrieval internals are actively moving through SQLAlchemy and the shared embedding service, so docs should avoid assuming a final backend layout
 - **LLM service** — Vendor/route/model architecture with Anthropic, OpenAI, Vertex AI, Ollama, OpenRouter, xAI, Groq; retry, structured output, streaming, vision
-- **Voice (local)** — Piper TTS + FasterWhisper STT
-- **Agent Economics** — Multi-currency wallets (FIL, USDC, USDT, ETH)
 - **A2A Protocol** — JSON-RPC 2.0 for agent-to-agent communication
 - **Cloud Run deploy** — 90 tests, active maintenance; the most-tested cloud feature
 
 ### 🧪 Experimental — works on the happy path; gaps to know about
 
-- **RunPod GPU orchestration** — start/stop/status work; managed-mode log retrieval is `NotImplementedError`; image generation (`!dream`) is dead code; integration tests skip in CI without `RUNPOD_API_KEY`. No active development since early April 2026.
-- **Vast.ai GPU marketplace** — broader test coverage than RunPod, but recent extraction/revert churn; integration tests skip without `VASTAI_API_KEY`.
-- **GCP Compute GPU VMs** — similar maturity to Vast.ai; integration tests skip without `GCP_PROJECT_ID`.
+- **Optional voice feature package** — `kestrel-feature-voice` supplies `VoiceFeature`; cloud TTS/STT providers live in `kestrel-voice-*` provider packages.
+- **Wallet / agent economics** — installable feature package surface, not part of the base install.
+- **RunPod, Vast.ai, and GCP Compute** — cloud provider packages/bridges, not core features; integration tests skip in CI without provider credentials.
 - **Azure Container Apps deploy** — provider stub; not the recommended deploy target.
 - **GitHub code introspection** — file reading, code search, definition lookup, issue tools all work (48 unit tests). The deeper static-analysis surface promised in [`docs/architecture/GITHUB_FEATURE_DESIGN.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/architecture/GITHUB_FEATURE_DESIGN.md) (call graphs, inheritance trees, dependency analysis) is not implemented.
 - **Training (LoRA pipeline)** — core ships the protocol + factory; the local-MPS adapter is actively maintained. Cloud-training adapters (RunPod/Vertex/Replicate) work but skip CI without API keys; production-grade adapters are being moved to private packages.
@@ -324,10 +324,10 @@ Kestrel covers a wide surface; not all of it ships at the same maturity. **Verif
 
 ### ❌ Not implemented in this framework
 
-These are not on the kestrel-sovereign roadmap; if you need them, OpenClaw or a different tool is the better fit.
+These are not bundled in the `kestrel-sovereign` base install:
 
-- **Multi-Channel Messaging** — WhatsApp, Telegram, Discord, Slack integration
-- **Voice cloud backends** — beyond local Piper / FasterWhisper (e.g. ElevenLabs, Deepgram)
+- **Turnkey channel adapters** — WhatsApp, Telegram, Discord, and Slack adapters are not shipped in the base install; the core channels surface is a registry/logging foundation.
+- **Bundled voice cloud backends** — ElevenLabs, Deepgram, and OpenAI voice support live in optional `kestrel-voice-*` provider packages.
 - **Browser Automation** — Chrome/Chromium control
 - **Visual Workspaces** — A2UI canvas, live reload
 
@@ -382,7 +382,7 @@ The install matrix covers:
 | Test | Scenario | Verifies |
 |------|----------|----------|
 | 1 | **SDK only** | `from kestrel_sdk.features.base import Feature` |
-| 2 | **Core sovereign** | `from kestrel_sovereign.features.base import Feature` + `/health` |
+| 2 | **Core sovereign** | `from kestrel_sovereign.features.base import Feature` compatibility + `/health` |
 | 3 | **Feature package** | `from kestrel_feature_wallet import WalletFeature` |
 | 4 | **SDK + feature dev mode** | Feature packages can develop against SDK alone |
 | 5 | **Full stack** | Sovereign + wallet + intelligence, entry_point discovery |
@@ -561,7 +561,7 @@ Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sover
 
 - **Issues**: GitHub Issues for bug reports and feature requests
 - **Discussions**: GitHub Discussions for questions and ideas
-- **Documentation**: See `features/` directory for detailed guides
+- **Documentation**: See [`docs/`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/README.md) and [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md)
 
 ---
 
@@ -591,10 +591,10 @@ Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sover
 
 The Kestrel storage system is designed to be modular and extensible. It is composed of several specialized components, orchestrated by a high-level facade.
 
-*   **`storage.Database`**: Manages the low-level SQLite connection and schema.
+*   **`storage.Database`**: Manages the low-level SQL-backed connection and schema. SQLite remains the local default while SQLAlchemy/PostgreSQL paths continue to mature.
 *   **`storage.FileStore`**: Handles the storage and retrieval of files.
 *   **`storage.GraphStore`**: Manages the knowledge graph (nodes and edges).
-*   **`storage.RAGStore`**: Responsible for document chunking and semantic search for the RAG pipeline and "case law" system.
+*   **`storage.RAGStore`**: Responsible for document chunking and semantic search for the RAG pipeline and "case law" system. The embedding path is being aligned with the common semantic embeddings service.
 *   **`storage.ConversationStore`**: Manages the agent's conversation history.
 
 The main `Storage` class in `storage/__init__.py` acts as a facade, providing a single, unified interface to these components.
@@ -614,4 +614,4 @@ This process guarantees that every agent in the ecosystem starts from a foundati
 
 After getting started:
 
-1.  **Explore Features**: Read `features/` documentation 
+1.  **Explore Features**: Read [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md) and [`docs/guides/BUILDING_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/guides/BUILDING_FEATURES.md)

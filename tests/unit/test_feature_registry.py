@@ -31,9 +31,10 @@ class TestLoadRegistry:
         assert len(registry) > 0
 
     def test_all_18_packages_present(self):
-        """All 18 feature packages are defined in the catalog."""
+        """The bundled catalog includes the expected capability inventory."""
         registry = load_registry()
-        # The issue specifies 18 feature packages — verify we have at least that many
+        # Historical issues specified 18 entries; the modern catalog includes
+        # bundled features, optional feature packages, and provider packages.
         assert len(registry) >= 18, f"Expected >=18 packages, got {len(registry)}: {sorted(registry.keys())}"
 
     def test_each_entry_has_required_fields(self):
