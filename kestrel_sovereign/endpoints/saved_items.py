@@ -77,7 +77,7 @@ def _get_saved_items_store(request: Request):
     # Create SavedItemsStore
     from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
     agent_id = getattr(storage, 'agent_id', '') or getattr(agent, 'agent_id', '')
-    return SavedItemsStore(db, agent_id)
+    return SavedItemsStore(db, agent_id, llm_service=getattr(agent, "llm_service", None))
 
 
 # =============================================================================

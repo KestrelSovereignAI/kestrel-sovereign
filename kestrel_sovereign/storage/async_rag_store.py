@@ -33,22 +33,16 @@ from .bm25_index import AsyncBM25Index, BM25_AVAILABLE
 
 logger = logging.getLogger(__name__)
 
-# Lazy load embedding service
-_embedding_service = None
 
+def _get_embedding_service(llm_service: Optional[Any] = None):
+    """Resolve the active chat provider's embedding service."""
+    try:
+        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
 
-def _get_embedding_service():
-    """Lazy load the Ollama embedding service."""
-    global _embedding_service
-    if _embedding_service is None:
-        try:
-            from kestrel_sovereign.llm.embedding_service import get_embedding_service
-            _embedding_service = get_embedding_service()
-            logger.info("Ollama embedding service initialized")
-        except Exception as e:
-            logger.warning(f"Embedding service not available: {e}")
-            _embedding_service = False  # Mark as unavailable
-    return _embedding_service if _embedding_service else None
+        return get_provider_embedding_service(llm_service)
+    except Exception as e:
+        logger.warning(f"Embedding service not available: {e}")
+        return None
 
 
 def _serialize_embedding(embedding: List[float]) -> bytes:
@@ -73,10 +67,17 @@ class AsyncRAGStore:
     Results are merged using Reciprocal Rank Fusion (RRF).
     """
 
-    def __init__(self, db: AsyncDatabase):
+    def __init__(self, db: AsyncDatabase, llm_service: Optional[Any] = None):
         self.db = db
         self._bm25_index: Optional[AsyncBM25Index] = None
         self._bm25_built = False
+        self._llm_service = llm_service
+
+    def _get_embedding_service(self):
+        llm_service = getattr(self, "_llm_service", None)
+        if llm_service is not None:
+            return _get_embedding_service(llm_service)
+        return _get_embedding_service()
     
     async def chunk_document(
         self,
@@ -115,7 +116,7 @@ class AsyncRAGStore:
         # Get embeddings if requested and service available
         embeddings = [None] * len(chunks)
         if compute_embeddings:
-            embedding_service = _get_embedding_service()
+            embedding_service = self._get_embedding_service()
             if embedding_service:
                 try:
                     embeddings = await embedding_service.aembed_batch(chunks)
@@ -273,7 +274,7 @@ class AsyncRAGStore:
         session factory can't be built (e.g. ``AsyncDatabase`` from a
         bare pool with no DSN, or the Phase-2 migration hasn't run yet).
         """
-        embedding_service = _get_embedding_service()
+        embedding_service = self._get_embedding_service()
         if not embedding_service:
             return []
 
@@ -587,7 +588,7 @@ class AsyncRAGStore:
         Returns:
             List of matching case law entries with scores
         """
-        embedding_service = _get_embedding_service()
+        embedding_service = self._get_embedding_service()
         if embedding_service is None:
             logger.warning("Embedding service not available for case law search")
             return []

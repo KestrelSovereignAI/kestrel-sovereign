@@ -39,14 +39,61 @@ class GoogleAdapter(LLMAdapter):
             supports_streaming=True,
             supports_vision=True,
             supports_structured_output=False,
+            supports_embeddings=True,
             structured_output_mode=StructuredOutputMode.NONE,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.GEMINI_INLINE_DATA,
+            embedding_model="text-embedding-004",
+            embedding_dim=768,
             notes=(
                 "Direct Gemini adapter does not yet wire response_format into generation_config.",
                 "Streaming tool calls use the framework's non-streaming fallback path.",
             ),
         )
+
+    @staticmethod
+    def _embedding_model_id(model: Optional[str]) -> str:
+        model_id = model or "text-embedding-004"
+        return model_id if model_id.startswith("models/") else f"models/{model_id}"
+
+    @staticmethod
+    def _embedding_from_google_response(response: Any) -> Optional[List[float]]:
+        if isinstance(response, dict):
+            embedding = response.get("embedding")
+        else:
+            embedding = getattr(response, "embedding", None)
+        if isinstance(embedding, dict):
+            values = embedding.get("values")
+        else:
+            values = getattr(embedding, "values", embedding)
+        return list(values) if values is not None else None
+
+    async def aembed(
+        self,
+        client: Any,
+        text: str,
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[List[float]]:
+        response = await client.embed_content_async(
+            model=self._embedding_model_id(model),
+            content=text,
+        )
+        return self._embedding_from_google_response(response)
+
+    async def aembed_batch(
+        self,
+        client: Any,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[Optional[List[float]]]:
+        return [
+            await self.aembed(client, text, model=model, **kwargs)
+            for text in texts
+        ]
 
     def create_messages(
         self,

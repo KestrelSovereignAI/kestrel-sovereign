@@ -152,6 +152,34 @@ def test_resolve_embedding_dim_no_env_returns_default():
     assert resolve_embedding_dim({}) == 768
 
 
+def test_resolve_embedding_dim_without_test_env_uses_active_provider(monkeypatch):
+    """Production no-env path asks the active provider before falling back."""
+    import kestrel_sovereign.storage.sqla.conversation_message as mod
+
+    monkeypatch.delenv("KESTREL_EMBEDDING_DIM", raising=False)
+    monkeypatch.setattr(mod, "_active_provider_embedding_dim", lambda: 1536)
+
+    assert mod.resolve_embedding_dim() == 1536
+
+
+def test_conversation_store_lazy_embedding_service_uses_provider_hook(monkeypatch):
+    from kestrel_sovereign.storage.async_conversation_store import AsyncConversationStore
+    import kestrel_sovereign.llm.embedding_service as embedding_mod
+
+    service = object()
+    fake_embedding_service = object()
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store._llm_service = service
+
+    monkeypatch.setattr(
+        embedding_mod,
+        "get_provider_embedding_service",
+        lambda llm_service=None: fake_embedding_service if llm_service is service else None,
+    )
+
+    assert store._lazy_embedding_service() is fake_embedding_service
+
+
 def test_resolve_embedding_dim_empty_string_returns_default():
     """``KESTREL_EMBEDDING_DIM=`` (set but empty) is treated as unset."""
     assert resolve_embedding_dim({"KESTREL_EMBEDDING_DIM": ""}) == 768

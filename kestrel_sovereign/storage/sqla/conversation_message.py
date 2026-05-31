@@ -46,16 +46,27 @@ from .base import SovereignBase
 from .types import PortableVector
 
 
+def _active_provider_embedding_dim() -> Optional[int]:
+    try:
+        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
+
+        service = get_provider_embedding_service()
+        dim = getattr(service, "embedding_dim", None) if service else None
+        return int(dim) if dim else None
+    except Exception:
+        return None
+
+
 def resolve_embedding_dim(env: Optional[dict] = None) -> int:
     """Pick the embedding dimension for fresh ``conversation_history`` DBs.
 
     Unlike ``saved_items`` / ``document_chunks`` the table has no
     legacy embedding column to sniff from, so the migration MUST pick
-    a dim up front. ``KESTREL_EMBEDDING_DIM`` lets ops override the
-    default before first write (e.g. to switch to ``mxbai-embed-large``
-    at 1024 or OpenAI ada-002 at 1536); the fallback matches the
-    default Ollama ``nomic-embed-text`` model
-    (:class:`~kestrel_sovereign.llm.embedding_service.EmbeddingService.DEFAULT_MODEL`).
+    a dim up front. ``KESTREL_EMBEDDING_DIM`` still wins as an explicit
+    operator override. Without it, Kestrel asks the active chat provider's
+    embedding capability for a dimension (OpenAI 1536, Gemini/Vertex 768,
+    Ollama 768, etc.) and only falls back to 768 if no provider embedding
+    service is available.
 
     Bad values (non-integer, non-positive) fall back to 768 with a
     warning. Mismatch between the column width and a future writer's
@@ -71,7 +82,11 @@ def resolve_embedding_dim(env: Optional[dict] = None) -> int:
     """
     source = env if env is not None else os.environ
     raw = source.get("KESTREL_EMBEDDING_DIM")
-    if not raw:
+    if raw is None:
+        if env is not None:
+            return 768
+        return _active_provider_embedding_dim() or 768
+    if raw == "":
         return 768
     try:
         value = int(raw)

@@ -51,8 +51,27 @@ class OpenAIAdapter(LLMAdapter):
     - JSON mode
     """
 
-    def __init__(self, name: str = "openai"):
+    DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+    DEFAULT_EMBEDDING_DIM = 1536
+
+    def __init__(
+        self,
+        name: str = "openai",
+        *,
+        supports_embeddings: Optional[bool] = None,
+        embedding_model: Optional[str] = None,
+        embedding_dim: Optional[int] = None,
+    ):
         self.name = name
+        if supports_embeddings is None:
+            supports_embeddings = name == "openai"
+        if supports_embeddings and embedding_model is None:
+            embedding_model = self.DEFAULT_EMBEDDING_MODEL
+        if supports_embeddings and embedding_dim is None:
+            embedding_dim = self.DEFAULT_EMBEDDING_DIM
+        self._supports_embeddings = supports_embeddings
+        self._embedding_model = embedding_model
+        self._embedding_dim = embedding_dim
 
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -60,14 +79,59 @@ class OpenAIAdapter(LLMAdapter):
             supports_streaming=True,
             supports_vision=True,
             supports_structured_output=True,
+            supports_embeddings=self._supports_embeddings,
             structured_output_mode=StructuredOutputMode.JSON_SCHEMA,
             tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
             vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
+            embedding_model=self._embedding_model,
+            embedding_dim=self._embedding_dim,
             model_dependent=("vision",),
             notes=(
                 "Structured output uses response_format=json_schema for Pydantic models.",
             ),
         )
+
+    async def aembed(
+        self,
+        client: openai.AsyncOpenAI,
+        text: str,
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[List[float]]:
+        response = await with_retry(
+            client.embeddings.create,
+            model=model or self.DEFAULT_EMBEDDING_MODEL,
+            input=text,
+        )
+        data = getattr(response, "data", None) or []
+        if not data:
+            return None
+        embedding = getattr(data[0], "embedding", None)
+        return list(embedding) if embedding is not None else None
+
+    async def aembed_batch(
+        self,
+        client: openai.AsyncOpenAI,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[Optional[List[float]]]:
+        if not texts:
+            return []
+        response = await with_retry(
+            client.embeddings.create,
+            model=model or self.DEFAULT_EMBEDDING_MODEL,
+            input=texts,
+        )
+        embeddings: List[Optional[List[float]]] = [None] * len(texts)
+        for item in getattr(response, "data", None) or []:
+            index = getattr(item, "index", None)
+            embedding = getattr(item, "embedding", None)
+            if isinstance(index, int) and 0 <= index < len(embeddings) and embedding is not None:
+                embeddings[index] = list(embedding)
+        return embeddings
 
     def contribute_system_prompt(
         self, model_id: str, base: Optional[str]

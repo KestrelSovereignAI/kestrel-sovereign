@@ -51,7 +51,7 @@ class OpenRouterAdapter(OpenAIAdapter):
     """
 
     def __init__(self):
-        self.name = "openrouter"
+        super().__init__(name="openrouter", supports_embeddings=False)
         self.base_url = get_openrouter_api_base()
 
         # Get API key
@@ -65,6 +65,9 @@ class OpenRouterAdapter(OpenAIAdapter):
         capabilities = super().provider_capabilities()
         return replace(
             capabilities,
+            supports_embeddings=False,
+            embedding_model=None,
+            embedding_dim=None,
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
                 "OpenRouter forwards requests to many upstream providers; per-model support is authoritative.",

@@ -30,7 +30,7 @@ from kestrel_sdk.llm import (
     ModelInfo, ModelCategory, # what list_models returns
     ProviderInfo,           # registration record (rarely constructed by plugins)
     BackendType,            # cloud / local / remote_gpu enum
-    SDK_LLM_CONTRACT_VERSION,  # currently 2; pin against this if you need to detect drift
+    SDK_LLM_CONTRACT_VERSION,  # currently 4; pin against this if you need to detect drift
 )
 ```
 
@@ -60,6 +60,8 @@ The framework hands you a provider-native client (constructed during route init 
 | `get_streaming_response(...)` | raises `NotImplementedError` | yields text chunks for plain streaming |
 | `get_streaming_response_with_tools(...)` | raises `NotImplementedError` | yields `Union[str, ToolCallStarted, LLMResponse]` for streaming with tool calls |
 | `list_models(client)` | raises `NotImplementedError` | returns `List[ModelInfo]` for the discovery dropdown |
+| `aembed(client, text, model=None)` | returns `None` | returns one embedding as `Optional[list[float]]` |
+| `aembed_batch(client, texts, model=None)` | calls `aembed` per text | returns `List[Optional[list[float]]]` |
 | `contribute_system_prompt(model_id, base)` | returns `base` unchanged | injects model-family-specific overlays (rare) |
 | `cost_per_1m_tokens()` | `None` | `{"input": float, "output": float}` for council cost accounting |
 | `substrate_type()` | `None` | `"claude" \| "gpt" \| "gemini" \| "llama" \| ...` for substrate-aware routing |
@@ -68,6 +70,22 @@ The framework hands you a provider-native client (constructed during route init 
 | `deliberation_style()` | `None` | `"parallel"` or `"sequential"` hint for council routing |
 
 Override the ones your backend actually has data for. Returning `None` (the default) tells the framework "fall back to a sensible default" — that's a documented and supported state.
+
+### Embeddings
+
+Embeddings use one common adapter boundary shape: `list[float]` for a
+successful embedding and `None` when the provider cannot embed. Batch calls
+return one item per input text. Declare `supports_embeddings=True`,
+`embedding_model`, and `embedding_dim` from `ProviderCapabilities` when your
+route has a stable default embedding model.
+
+The vectors are not semantically interchangeable across providers or embedding
+models. Kestrel's storage code sizes vector queries from the returned list, but
+operators who switch from one embedding model to another must re-embed existing
+rows or widen/recreate provider-specific vector columns. Providers with no
+embedding API, such as Anthropic, should leave the default `aembed()` behavior;
+Sovereign will degrade to keyword/BM25/LIKE fallback instead of silently using
+an unrelated global Ollama service.
 
 ---
 
@@ -320,5 +338,7 @@ The eight in-tree adapters live at [`kestrel_sovereign/llm/`][in-tree-llm]. Read
 | `0.6.0` | `cost_per_1m_tokens`, `substrate_type`, `display_name`, `key_env_var`, `deliberation_style` |
 | `0.7.0` | `ToolCallStarted`, optional `get_streaming_response_with_tools` |
 | `0.8.0` | `kestrel_sdk.testing` conformance helpers; `SDK_LLM_CONTRACT_VERSION = 2` (clarifies `index` semantics) |
+| `0.17.0` | `ProviderCapabilities`, `ProviderInfo.capabilities`, `SDK_LLM_CONTRACT_VERSION = 3` |
+| `0.18.0` | Provider-owned embeddings: `aembed`, `aembed_batch`, embedding capability metadata, `SDK_LLM_CONTRACT_VERSION = 4` |
 
-Pin `kestrel-sovereign-sdk >= 0.8,<1` to get the full surface this doc describes.
+Pin `kestrel-sovereign-sdk >= 0.18,<1` to get the full surface this doc describes.

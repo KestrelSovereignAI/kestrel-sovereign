@@ -757,6 +757,52 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
 
         return providers_to_use, target_model
 
+    @staticmethod
+    def _provider_supports_embeddings(provider: Dict[str, Any]) -> bool:
+        capabilities = provider.get("capabilities") or {}
+        return bool(capabilities.get("supports_embeddings"))
+
+    def resolve_embedding_provider(self) -> Optional[Dict[str, Any]]:
+        """Return the active chat route when it can also embed text.
+
+        Embeddings intentionally follow the selected chat provider. If the
+        active route has no embedding API (Anthropic, for example), callers get
+        ``None`` and storage falls back to keyword/LIKE search rather than
+        silently using an unrelated global Ollama singleton.
+        """
+        if getattr(self, "disabled", False):
+            return None
+        providers_to_use, target_model = self.resolve_provider_routing()
+        if not providers_to_use:
+            return None
+        provider = next(
+            (
+                candidate
+                for candidate in providers_to_use
+                if not target_model
+                or target_model == "auto"
+                or self._model_available_for_route(candidate, target_model)
+            ),
+            providers_to_use[0],
+        )
+        if self._provider_supports_embeddings(provider):
+            return provider
+        logger.info(
+            "Active LLM route %s does not support embeddings; semantic "
+            "storage search will use keyword fallback.",
+            provider.get("name"),
+        )
+        return None
+
+    def get_embedding_service(self):
+        """Return a provider-backed embedding service for the active route."""
+        provider = self.resolve_embedding_provider()
+        if provider is None:
+            return None
+        from .embedding_service import ProviderEmbeddingService
+
+        return ProviderEmbeddingService(provider)
+
     def _model_available_for_route(self, provider: Dict[str, Any], model_id: str) -> bool:
         """Return True iff the model is discoverable in this route's vendor catalog.
 

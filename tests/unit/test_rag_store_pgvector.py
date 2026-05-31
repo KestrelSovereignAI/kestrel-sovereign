@@ -276,21 +276,15 @@ async def test_search_end_to_end_against_real_sqlite():
                 )
             await db.commit()
 
-            # Stub the global embedding service so the search picks
-            # the vector path. Returning ``target`` makes the
+            # Stub the store embedding service so the search picks the
+            # vector path. Returning ``target`` makes the
             # file-target chunk highest-similarity.
-            import kestrel_sovereign.storage.async_rag_store as rag_mod
-
             class _StubEmbed:
                 async def aembed(self, _q):
                     return target
 
-            orig_svc = rag_mod._embedding_service
-            rag_mod._embedding_service = _StubEmbed()
-            try:
-                results = await store._search_by_embedding("anything", limit=5)
-            finally:
-                rag_mod._embedding_service = orig_svc
+            store._get_embedding_service = lambda: _StubEmbed()
+            results = await store._search_by_embedding("anything", limit=5)
 
             assert len(results) == 2
             assert results[0]["file_hash"] == "file-target"

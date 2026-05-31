@@ -52,15 +52,33 @@ def _rows_affected(result) -> int:
 class AsyncConversationStore:
     """Async conversation history storage with per-agent encryption."""
 
-    def __init__(self, db: AsyncDatabase, agent_id: str = ""):
+    def __init__(
+        self,
+        db: AsyncDatabase,
+        agent_id: str = "",
+        llm_service: Optional[Any] = None,
+    ):
         self.db = db
         self.agent_id = agent_id
+        self._llm_service = llm_service
         # Global key for backward compatibility
         self._global_fernet = get_fernet()
         # Per-agent key (recommended, used for new data)
         self._agent_fernet = get_agent_fernet(agent_id) if agent_id else None
         # Auto-migration on read (can be disabled via env var)
         self._migrate_on_read = os.environ.get("KESTREL_DISABLE_MIGRATION") != "true"
+
+    def _lazy_embedding_service(self):
+        """Return the active chat provider's embedding service when available.
+
+        Conversation-history embedding writes live in the sibling
+        conversation vector PRs. Keeping the hook here lets that path source
+        embeddings from the same provider-backed service as saved-items and RAG
+        without reintroducing the old global Ollama singleton.
+        """
+        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
+
+        return get_provider_embedding_service(self._llm_service)
 
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""

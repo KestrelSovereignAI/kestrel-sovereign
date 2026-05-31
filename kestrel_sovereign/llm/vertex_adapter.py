@@ -61,15 +61,70 @@ class VertexAIAdapter(LLMAdapter):
             supports_streaming=True,
             supports_vision=True,
             supports_structured_output=True,
+            supports_embeddings=True,
             structured_output_mode=StructuredOutputMode.PROVIDER_NATIVE,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.GEMINI_INLINE_DATA,
+            embedding_model="text-embedding-004",
+            embedding_dim=768,
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
                 "Structured output uses Vertex/Gemini response_schema.",
                 "Streaming tool calls use the framework's non-streaming fallback path.",
             ),
         )
+
+    @staticmethod
+    def _embedding_values(item: Any) -> Optional[List[float]]:
+        if isinstance(item, dict):
+            values = item.get("values")
+        else:
+            values = getattr(item, "values", None)
+        return list(values) if values is not None else None
+
+    @classmethod
+    def _embeddings_from_response(cls, response: Any, count: int) -> List[Optional[List[float]]]:
+        embeddings = getattr(response, "embeddings", None)
+        if embeddings is None and isinstance(response, dict):
+            embeddings = response.get("embeddings")
+        out: List[Optional[List[float]]] = [None] * count
+        for idx, item in enumerate(embeddings or []):
+            if idx >= count:
+                break
+            out[idx] = cls._embedding_values(item)
+        return out
+
+    async def aembed(
+        self,
+        client: Any,
+        text: str,
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[List[float]]:
+        genai_client = client if client else self._get_client()
+        response = await genai_client.aio.models.embed_content(
+            model=model or "text-embedding-004",
+            contents=text,
+        )
+        return self._embeddings_from_response(response, 1)[0]
+
+    async def aembed_batch(
+        self,
+        client: Any,
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[Optional[List[float]]]:
+        if not texts:
+            return []
+        genai_client = client if client else self._get_client()
+        response = await genai_client.aio.models.embed_content(
+            model=model or "text-embedding-004",
+            contents=texts,
+        )
+        return self._embeddings_from_response(response, len(texts))
 
     def __init__(
         self,

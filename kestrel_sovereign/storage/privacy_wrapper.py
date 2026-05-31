@@ -1062,6 +1062,11 @@ class PrivacyEnforcingStorage:
         return self._storage.db_path
 
     @property
+    def llm_service(self):
+        """Get the agent-scoped LLM service from underlying storage."""
+        return getattr(self._storage, "llm_service", None)
+
+    @property
     def graph_store(self):
         """Access to graph store."""
         return self._storage.graph
