@@ -1512,6 +1512,7 @@ def cmd_feature(args) -> int:
     feature_commands = {
         "list": cmd_feature_list,
         "install": cmd_feature_install,
+        "upgrade": cmd_feature_upgrade,
         "enable": cmd_feature_enable,
         "disable": cmd_feature_disable,
         "info": cmd_feature_info,
@@ -1521,7 +1522,7 @@ def cmd_feature(args) -> int:
 
     handler = feature_commands.get(args.feature_command)
     if handler is None:
-        print("Usage: kestrel feature {list|install|enable|disable|info|scaffold|skills}")
+        print("Usage: kestrel feature {list|install|upgrade|enable|disable|info|scaffold|skills}")
         return 1
     return handler(args)
 
@@ -1622,6 +1623,177 @@ def cmd_feature_install(args) -> int:
             for line in lines[-5:]:
                 print(f"  {line}")
         return 1
+
+
+# Entry-point groups that back installable Kestrel extensions. A feature or
+# provider package registers itself here; core/in-repo features do not, which is
+# exactly why they are excluded from `feature upgrade` (they ship with, and
+# upgrade with, kestrel-sovereign itself).
+_EXTENSION_ENTRY_POINT_GROUPS = (
+    "kestrel_sovereign.features",
+    "kestrel_sovereign.cloud_providers",
+    "kestrel_sovereign.voice_providers",
+    "kestrel_sovereign.storage_providers",
+)
+
+
+def _editable_install_path(dist_name: str) -> Optional[str]:
+    """Return the local source path if *dist_name* is an editable install.
+
+    PEP 660 editable installs record ``direct_url.json`` with
+    ``dir_info.editable == true``. Editable installs track a local checkout, so
+    pip cannot meaningfully "upgrade" them.
+    """
+    import importlib.metadata as md
+    import json
+
+    try:
+        raw = md.distribution(dist_name).read_text("direct_url.json")
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not data.get("dir_info", {}).get("editable"):
+        return None
+    url = data.get("url", "")
+    return url[len("file://") :] if url.startswith("file://") else url or None
+
+
+def _installed_extension_distributions() -> list:
+    """Enumerate distinct pip distributions backing installed extension entry-points.
+
+    Kestrel already knows what is loaded — each feature/provider class is wired
+    through an entry-point whose distribution we can resolve — so no curated
+    requirements file is needed. Returns a list of dicts sorted by name:
+    ``{dist, version, editable_path, entries: [group:name, ...]}``.
+    """
+    import importlib.metadata as md
+
+    by_dist: dict = {}
+    for group in _EXTENSION_ENTRY_POINT_GROUPS:
+        try:
+            eps = md.entry_points(group=group)
+        except TypeError:  # Python <3.10 selection API
+            eps = md.entry_points().get(group, [])
+        for ep in eps:
+            dist = getattr(ep, "dist", None)
+            if dist is None:
+                continue
+            entry = by_dist.setdefault(
+                dist.name,
+                {
+                    "dist": dist.name,
+                    "version": None,
+                    "editable_path": _editable_install_path(dist.name),
+                    "entries": [],
+                },
+            )
+            if entry["version"] is None:
+                try:
+                    entry["version"] = md.version(dist.name)
+                except Exception:
+                    entry["version"] = "?"
+            short_group = group.rsplit(".", 1)[-1]
+            entry["entries"].append(f"{short_group}:{ep.name}")
+    return sorted(by_dist.values(), key=lambda e: e["dist"])
+
+
+def _parse_pip_installed_version(stdout: str, dist_name: str) -> Optional[str]:
+    """Extract the post-upgrade version from pip's 'Successfully installed' line."""
+    normalized = dist_name.lower().replace("_", "-")
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("Successfully installed"):
+            continue
+        for token in line.split()[2:]:
+            pkg, _, ver = token.rpartition("-")
+            if pkg.lower().replace("_", "-") == normalized:
+                return ver
+    return None
+
+
+def cmd_feature_upgrade(args) -> int:
+    """Upgrade installed feature/provider packages via pip.
+
+    Discovers the packages from their live entry-points (no requirements file),
+    skips editable/dev installs (they track a local checkout), and upgrades the
+    rest in place.
+    """
+    dists = _installed_extension_distributions()
+
+    from kestrel_sovereign.feature_registry import load_registry
+
+    requested = getattr(args, "names", None) or []
+    registry = load_registry()
+    git_urls = {info.package: info.git for info in registry.values() if info.package}
+
+    if requested:
+        wanted = set()
+        for name in requested:
+            pkg = _resolve_feature_name(name, registry)
+            wanted.add(registry[pkg].package if pkg else name)
+        unmatched = wanted - {d["dist"] for d in dists}
+        dists = [d for d in dists if d["dist"] in wanted]
+        for name in sorted(unmatched):
+            print(f"Skipping '{name}': not an installed extension package")
+        if not dists:
+            return 1
+
+    if not dists:
+        print("No installed feature/provider packages to upgrade.")
+        print(
+            "Core features ship with kestrel-sovereign; add extras with "
+            "'kestrel feature install <name>'."
+        )
+        return 0
+
+    dry_run = getattr(args, "dry_run", False)
+    print()
+    print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
+    print(f"  {'-' * 62}")
+
+    rc = 0
+    upgraded = 0
+    for d in dists:
+        name = d["dist"]
+        current = d["version"] or "?"
+        if d["editable_path"]:
+            print(f"  {name:<34} {current:<10} skip (editable -> {d['editable_path']})")
+            continue
+        if dry_run:
+            print(f"  {name:<34} {current:<10} would upgrade")
+            continue
+
+        cmd = [sys.executable, "-m", "pip", "install", "--upgrade", name]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0 and git_urls.get(name):
+            cmd = [sys.executable, "-m", "pip", "install", "--upgrade", f"git+{git_urls[name]}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            rc = 1
+            print(f"  {name:<34} {current:<10} FAILED")
+            for line in (result.stderr or "").strip().splitlines()[-3:]:
+                print(f"      {line}")
+            continue
+
+        new_version = _parse_pip_installed_version(result.stdout, name)
+        if new_version and new_version != current:
+            upgraded += 1
+            print(f"  {name:<34} {current:<10} upgraded -> {new_version}")
+        else:
+            print(f"  {name:<34} {current:<10} up to date")
+
+    print()
+    if not dry_run:
+        print(f"  {upgraded} package(s) upgraded.")
+        if upgraded:
+            print("  Restart the host/agents to load the upgraded code.")
+    return rc
 
 
 def cmd_feature_enable(args) -> int:
@@ -2190,6 +2362,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     feat_install = feature_sub.add_parser("install", help="Install a feature package")
     feat_install.add_argument("name", help="Feature name (e.g. cloud, voice)")
+
+    feat_upgrade = feature_sub.add_parser(
+        "upgrade",
+        help="Upgrade installed feature/provider packages via pip",
+    )
+    feat_upgrade.add_argument(
+        "names",
+        nargs="*",
+        help="Optional package/feature names to upgrade (default: all installed extensions)",
+    )
+    feat_upgrade.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be upgraded without changing anything",
+    )
 
     feat_enable = feature_sub.add_parser("enable", help="Enable a disabled feature")
     feat_enable.add_argument("name", help="Feature or package name")
