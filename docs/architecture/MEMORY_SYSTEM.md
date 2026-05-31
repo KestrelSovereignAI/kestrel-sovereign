@@ -4,7 +4,7 @@
 > *actually remembers*. Not just the facts -- the feelings, the weight,
 > the way a conversation mattered.
 
-> **Honest status (2026-04-18):** This document describes the cognitive
+> **Honest status (2026-05-31):** This document describes the cognitive
 > memory architecture as designed *and* as actually deployed. Subsystem
 > sections include "Deployment note" callouts where the deployed
 > behavior diverged from the design — for example, until #633 the
@@ -13,6 +13,16 @@
 > on it. Each callout cites the PR that closed the gap.
 > If you find a section without evidence that the described behavior
 > actually runs in deployment, treat it as aspirational until verified.
+>
+> Storage update: SQLAlchemy-backed vector storage exists for saved
+> items, document chunks, and conversation history `embedding_vec`
+> columns. Document RAG and saved-item search can use the shared vector
+> backend. The cognitive `MemoryRetriever` still uses keyword/concept
+> overlap for its semantic component in the current code; the
+> conversation-history vector column is storage groundwork for the
+> follow-up cosine path. Embedding generation itself still goes through
+> the current Ollama-backed `EmbeddingService` while another workstream
+> standardizes embedding functions on LLM providers.
 
 Kestrel's memory system is modeled on how human memory works. Memories
 are not stored in a flat database and retrieved by keyword match. They
@@ -95,7 +105,7 @@ flowchart TD
     MD --> MR["MemoryRetriever"]
     KG -->|"query expansion"| MR
 
-    MR -->|"5-weight scoring:<br/>semantic 0.30 · emotional 0.25<br/>importance 0.20 · recency 0.15<br/>access 0.10"| RESULTS["Ranked Memories"]
+    MR -->|"6-weight scoring:<br/>semantic 0.25 · emotional 0.20<br/>importance 0.20 · recency 0.15<br/>access 0.10 · certainty 0.10"| RESULTS["Ranked Memories"]
 
     MD --> MC["MemoryConsolidator"]
     MC -->|"background"| EP["Episodes, Patterns,<br/>Archival"]
@@ -136,9 +146,10 @@ the A2A version to `TaskArchiveService`. See #623 for context.
 
 ### Key Design Decisions
 
-- **No schema changes.** All emotional/importance/decay fields are stored
-  in the existing `conversation_history.metadata` JSON column. This means
-  the memory system can be enabled or disabled without database migrations.
+- **Metadata stays JSON-backed.** Emotional, importance, decay, certainty,
+  and access fields are stored in `conversation_history.metadata` JSON.
+  The current schema also includes a greenfield `conversation_history.embedding_vec`
+  column for the staged SQLAlchemy/vector semantic path.
 
 - **All methods are async** with `agent_id` scoping for multi-tenant
   isolation.
@@ -389,22 +400,23 @@ or explicit recall.
 ## Retrieval Scoring
 
 The `MemoryRetriever` (`storage/memory_retriever.py`) scores every
-candidate memory on five dimensions, then returns the top results sorted
+candidate memory on six dimensions, then returns the top results sorted
 by total score.
 
 ### Weight Distribution
 
 | Factor | Weight | What It Measures |
 |--------|--------|-----------------|
-| Semantic | **0.30** | Keyword overlap + concept match from associative linker |
-| Emotional | **0.25** | Mood-congruent recall (valence matching) |
+| Semantic | **0.25** | Keyword overlap + concept match from associative linker |
+| Emotional | **0.20** | Mood-congruent recall (valence matching) |
 | Importance | **0.20** | Importance score from metadata |
 | Recency | **0.15** | Ebbinghaus decay curve |
 | Access | **0.10** | Rehearsal effect (log-scaled access count) |
+| Certainty | **0.10** | Epistemic confidence / claim certainty from metadata |
 
-Total = `semantic * 0.30 + emotional * 0.25 + importance * 0.20 + recency * 0.15 + access * 0.10`
+Total = `semantic * 0.25 + emotional * 0.20 + importance * 0.20 + recency * 0.15 + access * 0.10 + certainty * 0.10`
 
-### Semantic Score (30%)
+### Semantic Score (25%)
 
 Combines keyword overlap with concept expansion:
 
@@ -419,7 +431,12 @@ semantic = keyword_score * 0.7 + concept_score * 0.3
   expanded with associated concepts from the knowledge graph. Matching
   concepts in the message content boost this score.
 
-### Emotional Score (25%)
+The `conversation_history.embedding_vec` column and SQLAlchemy mapping
+are present for the staged vector/cosine implementation, but current
+`MemoryRetriever` scoring still uses keyword/concept overlap for this
+factor.
+
+### Emotional Score (20%)
 
 Implements **mood-congruent recall** -- the psychological finding that
 people remember information better when their current mood matches the
@@ -478,6 +495,14 @@ massed repetition.
 ### Minimum Score Threshold
 
 Results below `min_score` (default 0.1) are filtered out before sorting.
+
+### Certainty Score (10%)
+
+Certainty comes from epistemic metadata attached to the memory. When a
+memory has stronger certainty markers, it contributes more to retrieval;
+uncertain or hedged content contributes less. This keeps confidently
+known facts from ranking the same as speculative or low-confidence
+claims.
 
 ---
 
@@ -827,11 +852,12 @@ if deleted:
 Set as class constants on `MemoryRetriever`:
 
 ```python
-WEIGHT_SEMANTIC  = 0.30    # Keyword + concept overlap
-WEIGHT_EMOTIONAL = 0.25    # Mood-congruent recall
+WEIGHT_SEMANTIC  = 0.25    # Keyword + concept overlap
+WEIGHT_EMOTIONAL = 0.20    # Mood-congruent recall
 WEIGHT_IMPORTANCE = 0.20   # From metadata tagging
 WEIGHT_RECENCY   = 0.15    # Ebbinghaus decay
 WEIGHT_ACCESS    = 0.10    # Rehearsal effect (log-scaled)
+WEIGHT_CERTAINTY = 0.10    # Epistemic certainty
 ```
 
 ### Decay Parameters
@@ -875,7 +901,7 @@ Falls back to keyword-based analysis if spaCy is not installed.
 | `kestrel_sovereign/storage/memory_system.py` | Unified facade for all memory components |
 | `kestrel_sovereign/storage/memory_models.py` | `MemoryMetadata`, `TemporalPattern`, `MemoryEpisode` dataclasses |
 | `kestrel_sovereign/storage/emotional_tagger.py` | Sentiment analysis and importance detection |
-| `kestrel_sovereign/storage/memory_retriever.py` | 5-weight scoring and decay calculation |
+| `kestrel_sovereign/storage/memory_retriever.py` | 6-weight scoring and decay calculation |
 | `kestrel_sovereign/storage/memory_consolidator.py` | Episode creation, pattern detection, archival |
 | `kestrel_sovereign/storage/associative_linker.py` | Concept extraction and graph-based association |
 | `kestrel_sovereign/storage/temporal_analyzer.py` | Time-of-day and day-of-week pattern detection |

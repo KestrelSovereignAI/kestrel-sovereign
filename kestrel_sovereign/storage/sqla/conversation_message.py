@@ -4,8 +4,10 @@ The table is created by the raw-SQL ``CORE_SCHEMA`` path in
 ``async_database.py``; this module adds an ORM view + spec so the
 generic vector backends in
 ``kestrel_sovereign.storage.vector`` can perform kNN over per-message
-embeddings. Consumed by :class:`MemoryRetriever` to swap the legacy
-keyword-overlap semantic score for true cosine similarity.
+embeddings. This prepares the storage side for :class:`MemoryRetriever`
+to swap the legacy keyword-overlap semantic score for cosine
+similarity; the current retriever still uses keyword/concept overlap
+until the embedding writer/read path is wired through.
 
 Greenfield embedding column — unlike ``saved_items`` and
 ``document_chunks``, ``conversation_history`` had no pre-existing

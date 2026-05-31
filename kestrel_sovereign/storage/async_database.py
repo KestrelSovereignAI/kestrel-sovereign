@@ -589,12 +589,13 @@ class AsyncDatabase:
             )
 
         # Greenfield ``embedding_vec`` column on ``conversation_history``
-        # — the source-of-truth read path for ``MemoryRetriever``'s
-        # semantic score. No legacy embedding column to migrate from;
-        # the dim is taken from ``KESTREL_EMBEDDING_DIM`` (default 768
-        # for Ollama ``nomic-embed-text``). Idempotent + transactional;
-        # failure is non-fatal — retrieval falls back to keyword
-        # overlap, same shape as the prior code path.
+        # for the SQLAlchemy/vector path that will back
+        # ``MemoryRetriever`` cosine scoring. No legacy embedding
+        # column exists to migrate from; the dim is taken from
+        # ``KESTREL_EMBEDDING_DIM`` (default 768 for Ollama
+        # ``nomic-embed-text``). Idempotent + transactional; failure
+        # is non-fatal because the current retriever still falls back
+        # to keyword/concept overlap.
         try:
             from .sqla.migrations import (
                 migrate_conversation_history_add_embedding_vec,

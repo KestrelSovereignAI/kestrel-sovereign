@@ -255,6 +255,33 @@ No maintained "always show" or "always hide" allowlists. Capability and usage si
 
 ---
 
+## Embeddings
+
+Model discovery already classifies embedding models with
+`ModelCategory.EMBEDDING`, and the UI/filtering logic keeps those models out of
+chat-model dropdowns. That is model metadata, not yet the embedding execution
+contract.
+
+Current execution truth as of 2026-05-31:
+
+- `kestrel_sovereign/llm/embedding_service.py` is still the in-tree embedding
+  generator.
+- That service uses Ollama's embedding API, defaulting to `nomic-embed-text`
+  at 768 dimensions.
+- RAG and saved-item vector search consume embeddings through storage/vector
+  backends once embeddings are written.
+- `conversation_history.embedding_vec` exists as SQLAlchemy/vector storage
+  groundwork, but the current `MemoryRetriever` semantic score still uses
+  keyword/concept overlap.
+
+The architecture direction is to make embeddings a standard provider capability
+on LLM adapters, so the storage and retrieval layers can request embeddings
+through the configured LLM provider instead of a hardcoded Ollama side service.
+Until that lands in code, do not document provider embedding functions as
+available runtime behavior.
+
+---
+
 ## No hardcoded model IDs in code
 
 Model identifiers must never appear as literals inside `kestrel_sovereign/**/*.py`, `endpoints/**/*.py`, or frontend JS.

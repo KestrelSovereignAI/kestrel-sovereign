@@ -1,8 +1,17 @@
 # Human-Like Memory System
 
-**Last Updated:** January 25, 2026
-**Status:** 🟢 Implemented
+**Last Updated:** 2026-05-31
+**Status:** Historical companion; canonical implementation details live in
+[`../MEMORY_SYSTEM.md`](../MEMORY_SYSTEM.md)
 **Commit:** `0b83115`
+
+> This page preserves the original human-memory design narrative. For current
+> backend/storage truth, retrieval weights, and embedding status, use
+> [`../MEMORY_SYSTEM.md`](../MEMORY_SYSTEM.md) and
+> [`STORAGE_ARCHITECTURE.md`](STORAGE_ARCHITECTURE.md). In particular,
+> `MemoryRetriever` now has a six-factor score including certainty, and
+> embedding generation is still Ollama-backed while provider-standard
+> embedding functions are being added.
 
 ---
 
@@ -53,7 +62,7 @@ The memory system integrates with the existing storage layer as infrastructure, 
 **Key design decisions:**
 - All components in `storage/` (infrastructure layer, not `features/`)
 - Uses existing `AsyncGraphStore` for concept associations
-- Extends existing `conversation_history.metadata` JSON (no schema changes)
+- Stores emotional/importance/decay/certainty fields in `conversation_history.metadata` JSON; current schema also includes `conversation_history.embedding_vec` as storage groundwork for vector semantic retrieval
 - All methods async with `agent_id` scoping
 
 ---
@@ -167,11 +176,12 @@ Retrieves memories using human-like weighting.
 **Scoring Algorithm:**
 | Factor | Weight | Description |
 |--------|--------|-------------|
-| Semantic | 30% | Keyword overlap (upgradeable to embeddings) |
-| Emotional | 25% | Mood-congruent recall |
+| Semantic | 25% | Keyword/concept overlap; vector/cosine storage groundwork exists but is not the current retriever score |
+| Emotional | 20% | Mood-congruent recall |
 | Importance | 20% | From metadata tagging |
 | Recency | 15% | Ebbinghaus decay curve |
 | Access | 10% | Rehearsal effect (frequently accessed = stronger) |
+| Certainty | 10% | Epistemic certainty from metadata |
 
 **Ebbinghaus Forgetting Curve:**
 - Base half-life: 30 days
@@ -298,7 +308,8 @@ report = await memory.consolidate()
 
 ### Extended Metadata (conversation_history.metadata JSON)
 
-No schema changes to the existing `conversation_history` table. New fields are added to the JSON metadata column:
+The human-memory enrichment fields live in the `conversation_history.metadata`
+JSON column:
 
 ```python
 metadata = {
