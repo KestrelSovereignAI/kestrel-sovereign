@@ -588,6 +588,25 @@ class AsyncDatabase:
                 "next boot.", e, exc_info=True,
             )
 
+        # Greenfield ``embedding_vec`` column on ``conversation_history``
+        # — the source-of-truth read path for ``MemoryRetriever``'s
+        # semantic score. No legacy embedding column to migrate from;
+        # the dim is taken from ``KESTREL_EMBEDDING_DIM`` (default 768
+        # for Ollama ``nomic-embed-text``). Idempotent + transactional;
+        # failure is non-fatal — retrieval falls back to keyword
+        # overlap, same shape as the prior code path.
+        try:
+            from .sqla.migrations import (
+                migrate_conversation_history_add_embedding_vec,
+            )
+            await migrate_conversation_history_add_embedding_vec(self)
+        except Exception as e:
+            logger.error(
+                "conversation_history embedding_vec migration failed: %s. "
+                "MemoryRetriever falls back to keyword-overlap semantic "
+                "scoring until next boot.", e, exc_info=True,
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(

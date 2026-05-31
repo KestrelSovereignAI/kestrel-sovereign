@@ -407,3 +407,138 @@ async def _migrate_sqlite_table(db: "AsyncDatabase", table: str) -> None:
         "%s Phase-2 SQLite migration complete: added embedding_vec BLOB, "
         "copied existing embeddings.", table,
     )
+
+
+# =============================================================================
+# conversation_history (greenfield — no legacy embedding column to migrate
+# from). Adds ``embedding_vec`` at the configured dim plus HNSW on PG.
+# Consumed by MemoryRetriever's cosine semantic score.
+# =============================================================================
+
+
+async def migrate_conversation_history_add_embedding_vec(db: "AsyncDatabase") -> None:
+    """Add an ``embedding_vec`` column to ``conversation_history``.
+
+    Greenfield migration — there is NO pre-existing ``embedding``
+    column on ``conversation_history`` to copy from, so the dim is
+    picked from
+    :data:`~kestrel_sovereign.storage.sqla.conversation_message.CONVERSATION_MESSAGE_EMBEDDING_DIM`
+    (driven by the ``KESTREL_EMBEDDING_DIM`` env var; default 768 for
+    Ollama ``nomic-embed-text``). Operators that switch models AFTER
+    rows have been embedded need an explicit re-embedding script;
+    this migration won't drop or resize the column. See
+    :class:`MemoryRetriever` for the read path.
+
+    Idempotent: skips cleanly if the column already exists. Wrapped
+    in a transaction so a partial failure rolls back.
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        await _migrate_pg_greenfield(
+            db,
+            table="conversation_history",
+        )
+    elif backend_type == "sqlite":
+        await _migrate_sqlite_greenfield(
+            db,
+            table="conversation_history",
+        )
+    # Other dialects: no-op.
+
+
+async def _migrate_pg_greenfield(db: "AsyncDatabase", *, table: str) -> None:
+    """Postgres greenfield migration — add ``embedding_vec vector(N)`` +
+    HNSW on a table that has no existing embedding column.
+
+    The dim is read lazily from
+    ``conversation_message.CONVERSATION_MESSAGE_EMBEDDING_DIM`` rather
+    than passed as an argument, so callers don't have to plumb the
+    same constant through. Local import avoids a module-import cycle
+    with ``sqla/__init__.py``.
+    """
+    # Local import: ``sqla.__init__`` imports this module at package
+    # load, which would otherwise close the cycle.
+    from .conversation_message import CONVERSATION_MESSAGE_EMBEDDING_DIM
+
+    dim = CONVERSATION_MESSAGE_EMBEDDING_DIM
+
+    rows = await db.fetchall(
+        f"""SELECT 1 FROM information_schema.columns
+            WHERE table_name = '{table}' AND column_name = 'embedding_vec'""",
+        (),
+    )
+    if rows:
+        logger.debug(
+            "%s.embedding_vec already present — skipping greenfield PG migration.",
+            table,
+        )
+        return
+
+    table_exists = await db.fetchall(
+        f"""SELECT 1 FROM information_schema.tables
+            WHERE table_name = '{table}'""",
+        (),
+    )
+    if not table_exists:
+        logger.debug(
+            "%s table not yet present — skipping greenfield PG migration.", table,
+        )
+        return
+
+    async with db.transaction():
+        # Extension MUST exist before ``ALTER TABLE`` references
+        # ``vector(N)``. Mirrors the lesson from #1454 — original order
+        # broke on fresh PG without the extension preloaded.
+        await db.execute("CREATE EXTENSION IF NOT EXISTS vector", ())
+        await db.execute(
+            f"ALTER TABLE {table} ADD COLUMN embedding_vec vector({dim})", (),
+        )
+        await db.execute(
+            f"""CREATE INDEX IF NOT EXISTS idx_{table}_embedding_vec_hnsw
+                ON {table} USING hnsw (embedding_vec vector_cosine_ops)""",
+            (),
+        )
+
+    logger.info(
+        "%s greenfield PG migration complete: added embedding_vec vector(%d), "
+        "HNSW index. No backfill (greenfield column).", table, dim,
+    )
+
+
+async def _migrate_sqlite_greenfield(db: "AsyncDatabase", *, table: str) -> None:
+    """SQLite greenfield migration — add ``embedding_vec BLOB`` to a
+    table that has no existing embedding column.
+
+    No backfill, no copy. SQLite has no HNSW equivalent; the
+    PurePythonBackend reads the column directly and computes cosine
+    in Python. FEAT-8's ``SqliteVecBackend`` would add a virtual
+    table later; that's not coupled to this migration.
+    """
+    rows = await db.fetchall(
+        f"SELECT name FROM pragma_table_info('{table}') WHERE name = 'embedding_vec'",
+        (),
+    )
+    if rows:
+        logger.debug(
+            "%s.embedding_vec already present — skipping greenfield SQLite migration.",
+            table,
+        )
+        return
+
+    table_exists = await db.fetchall(
+        f"SELECT 1 FROM sqlite_master WHERE type='table' AND name='{table}'",
+        (),
+    )
+    if not table_exists:
+        logger.debug(
+            "%s table not yet present — skipping greenfield SQLite migration.", table,
+        )
+        return
+
+    async with db.transaction():
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN embedding_vec BLOB", ())
+
+    logger.info(
+        "%s greenfield SQLite migration complete: added embedding_vec BLOB. "
+        "No backfill (greenfield column).", table,
+    )

@@ -19,13 +19,17 @@ Public surface:
   ``AsyncDatabase``. Used by ``SavedItemsStore.search()`` to obtain a
   session for the vector backend.
 
-This is the first SQLAlchemy ORM code in sovereign-core. Today only
-``SavedItem`` lives here; over time we expect ``ConversationMessage``,
-``AgentMetadata``, and other sovereign-owned tables to follow as their
-read paths grow vector / structured-query needs.
+``SavedItem``, ``DocumentChunk``, and ``ConversationMessage`` live here
+today; ``AgentMetadata`` and other sovereign-owned tables will follow
+as their read paths grow vector / structured-query needs.
 """
 
 from .base import SovereignBase
+from .conversation_message import (
+    CONVERSATION_MESSAGE_EMBEDDING_DIM,
+    ConversationMessage,
+    build_conversation_message_spec,
+)
 from .document_chunk import DocumentChunk, build_document_chunk_spec
 from .saved_item import SavedItem, build_saved_item_spec
 from .session import SovereignSqlaSessionFactory, make_session_factory
@@ -36,6 +40,9 @@ __all__ = [
     "build_saved_item_spec",
     "DocumentChunk",
     "build_document_chunk_spec",
+    "ConversationMessage",
+    "build_conversation_message_spec",
+    "CONVERSATION_MESSAGE_EMBEDDING_DIM",
     "SovereignSqlaSessionFactory",
     "make_session_factory",
 ]
