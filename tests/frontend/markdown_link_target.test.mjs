@@ -76,3 +76,36 @@ test('streaming render path also applies the link renderer', () => {
     assert.match(html, /target="_blank"/);
     assert.match(html, /rel="noopener noreferrer"/);
 });
+
+// Capture the options each render path passes to marked.parse so the
+// streaming and finalize paths can be compared. The streaming path used
+// to omit options entirely (CommonMark default), collapsing single `\n`
+// into a space — chat bubbles "scrunched" mid-stream and re-flowed only
+// at finalize. The two paths must agree on `breaks: true` (and the
+// other layout-affecting options) or the bubble's wire form will look
+// different at stream-time vs. finalize.
+function loadParseModuleCapturingOptions() {
+    const calls = [];
+    const marked = {
+        use() {},
+        parse(md, opts) {
+            calls.push({ md, opts });
+            return '';
+        },
+    };
+    const factory = new Function(
+        'marked',
+        `${parseSrc}\nreturn { renderMarkdown, renderStreamingMarkdown };`,
+    );
+    return { mod: factory(marked), calls };
+}
+
+test('renderStreamingMarkdown passes the same options as renderMarkdown', () => {
+    const { mod, calls } = loadParseModuleCapturingOptions();
+    mod.renderMarkdown('line one\nline two');
+    mod.renderStreamingMarkdown('line one\nline two');
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls[0].opts, calls[1].opts);
+    assert.equal(calls[0].opts.breaks, true);
+    assert.equal(calls[1].opts.breaks, true);
+});
