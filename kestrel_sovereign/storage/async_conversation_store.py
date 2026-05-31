@@ -15,7 +15,7 @@ import logging
 import os
 import struct
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Any, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
@@ -248,6 +248,124 @@ class AsyncConversationStore:
         """Mint a new implicit session_id (UUID4)."""
         import uuid
         return str(uuid.uuid4())
+
+    async def get_message_embeddings(
+        self, message_ids: List[int]
+    ) -> Dict[int, List[float]]:
+        """Load embeddings for the given message ids.
+
+        Returns ``{id: [v0, v1, …]}`` for every row that has a
+        non-NULL ``embedding_vec``. Rows without an embedding are
+        absent from the result — caller treats absence as
+        "fall back to keyword overlap."
+
+        Decode handling:
+
+        - SQLite: ``embedding_vec`` is a ``BLOB``; bytes come back
+          raw and we ``struct.unpack`` little-endian float32 (same
+          shape ``_serialize_embedding`` wrote).
+        - Postgres: ``embedding_vec`` is ``vector(N)``. asyncpg
+          returns it via pgvector's adapter as a list of floats (or
+          a numpy array). We accept either via ``list(value)``.
+
+        Empty input → empty dict (no query). Failure paths log at
+        info-level and return whatever we managed to decode —
+        retrieval is best-effort, not load-bearing.
+        """
+        if not message_ids:
+            return {}
+
+        # SQLite's default ``SQLITE_MAX_VARIABLE_NUMBER`` is 999 on
+        # many builds, including the Python stdlib's bundled sqlite.
+        # ``MemoryRetriever.retrieve`` passes up to 1000 ids here, plus
+        # one for ``agent_id`` — that would raise ``too many SQL
+        # variables`` and silently disable cosine recall for long
+        # conversations. Chunk the IN clause well under the limit so
+        # the lookup keeps working regardless of slice size. PG's
+        # ``$N`` placeholder cap is 32K so this chunk size is
+        # comfortable for it too. (Codex P2 on PR-C.)
+        CHUNK = 500
+        rows: List[Tuple[Any, Any]] = []
+        for start in range(0, len(message_ids), CHUNK):
+            chunk = message_ids[start:start + CHUNK]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = (
+                f"SELECT id, embedding_vec FROM conversation_history "
+                f"WHERE agent_id = ? AND id IN ({placeholders}) "
+                f"AND embedding_vec IS NOT NULL"
+            )
+            try:
+                rows.extend(
+                    await self.db.fetchall(sql, (self.agent_id, *chunk))
+                )
+            except Exception as e:
+                # Most likely cause: the Phase-2 migration hasn't run
+                # yet so the column doesn't exist. Don't crash
+                # retrieval — the legacy keyword-overlap path still
+                # works. Bail the whole batch rather than partial-
+                # decoding what we have; mixed-result rankings are
+                # worse than a clean keyword fallback.
+                logger.info(
+                    "Could not load conversation_history.embedding_vec "
+                    "for agent %s (%s); MemoryRetriever falls back to "
+                    "keyword overlap.", self.agent_id, e,
+                )
+                return {}
+
+        out: Dict[int, List[float]] = {}
+        for row in rows:
+            row_id = row[0]
+            raw = row[1]
+            if raw is None:
+                continue
+            try:
+                if isinstance(raw, (bytes, bytearray, memoryview)):
+                    payload = bytes(raw)
+                    if len(payload) % 4 != 0:
+                        # Wrong-length BLOB — would unpack to noise.
+                        # Skip rather than corrupt the score.
+                        logger.warning(
+                            "Skipping embedding for message %s: %d bytes "
+                            "not a multiple of 4.", row_id, len(payload),
+                        )
+                        continue
+                    floats = struct.unpack(
+                        f"<{len(payload) // 4}f", payload
+                    )
+                    out[row_id] = list(floats)
+                elif isinstance(raw, str):
+                    # pgvector text shape: ``[v0,v1,...]``. The raw
+                    # asyncpg path doesn't register a pgvector codec, so
+                    # ``SELECT embedding_vec`` on PG comes back as a
+                    # string the asyncpg driver decodes from the wire.
+                    # Iterating the string character-by-character (the
+                    # original fall-through) would call ``float('[')``
+                    # and crash, silently dropping every PG row.
+                    # (Caught by codex review on PR-C.)
+                    stripped = raw.strip()
+                    if not (stripped.startswith("[") and stripped.endswith("]")):
+                        logger.warning(
+                            "Unexpected pgvector text shape for message "
+                            "%s: %r", row_id, stripped[:40],
+                        )
+                        continue
+                    inner = stripped[1:-1].strip()
+                    if not inner:
+                        continue
+                    out[row_id] = [float(p) for p in inner.split(",")]
+                else:
+                    # pgvector adapter / list-like / numpy: trust
+                    # iteration + ``float()`` to produce a flat float
+                    # list. ``isinstance(value, list)`` would miss
+                    # numpy arrays an adapter may produce.
+                    out[row_id] = [float(v) for v in raw]
+            except Exception as e:
+                logger.warning(
+                    "Could not decode embedding for message %s: %s",
+                    row_id, e,
+                )
+                continue
+        return out
 
     async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
         """Resolve the effective session_id for an incoming turn.

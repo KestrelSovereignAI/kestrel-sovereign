@@ -49,6 +49,24 @@ from .types import PortableVector
 
 
 def _active_provider_embedding_dim() -> Optional[int]:
+    """Best-effort dim probe from the global default embedding provider.
+
+    This intentionally uses ``get_provider_embedding_service()`` with
+    no agent-scoped ``llm_service`` argument — the migration runs at
+    process startup, before any agent-scoped routing decisions exist.
+    The expectation is that a sovereign process serves agents that
+    share an embedding provider (the typical single-tenant
+    deployment).
+
+    Multi-provider deployments (per-agent OpenAI vs Vertex etc.) MUST
+    set ``KESTREL_EMBEDDING_DIM`` explicitly so the column matches
+    every writer. The dim-mismatch fallback in
+    ``AsyncConversationStore._maybe_embed`` is defense-in-depth —
+    it'll log a clear operator-actionable error and persist the row
+    without ``embedding_vec`` rather than silently corrupting data —
+    but vector recall is disabled for that agent until the column is
+    re-migrated.
+    """
     try:
         from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
 
