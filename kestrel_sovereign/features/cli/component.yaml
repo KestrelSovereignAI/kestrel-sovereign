@@ -1,18 +1,10 @@
 name: cli
-description: Registered feature-owned CLI workflows using installed tools and existing user authentication
+description: Registered feature-owned CLI workflows for local repository inspection (read-only git)
 version: 1.0.0
 entry_point: feature.py
 
 tools:
   - cli_status
-  - github_cli_auth_status
-  - github_pr_view
-  - github_pr_diff
-  - github_pr_files
-  - github_pr_checks
-  - github_read_file_at_ref
-  - github_read_file_at_pr_head
-  - github_pr_review_context
   - git_status
   - git_diff
   - git_log

@@ -10,7 +10,7 @@ from kestrel_sovereign.features.base import Feature
 from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
 
-def _tool_schema(name: str = "github_issue_view") -> dict:
+def _tool_schema(name: str = "example_tool") -> dict:
     return {
         "type": "function",
         "function": {
@@ -120,7 +120,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
         side_effect=[
             LLMResponse(
                 content=None,
-                tool_calls=[ToolCall(id="call_1", name="github_issue_view", arguments={})],
+                tool_calls=[ToolCall(id="call_1", name="example_tool", arguments={})],
             ),
             LLMResponse(content="Issue loaded.", tool_calls=None),
         ]
@@ -130,7 +130,7 @@ async def test_no_tool_continuation_gets_one_repair_step():
             {
                 "id": "call_1",
                 "type": "function",
-                "function": {"name": "github_issue_view", "arguments": "{}"},
+                "function": {"name": "example_tool", "arguments": "{}"},
             }
         ]
     )

@@ -121,7 +121,7 @@ async def test_llm_call_observability_records_and_filters_agent_did(tmp_path):
             model="gpt-5.4",
             duration_ms=17,
             session_id="session-1",
-            tool_calls=[{"name": "github_issue_view", "arguments": {}}],
+            tool_calls=[{"name": "example_tool", "arguments": {}}],
         )
         await store.log_llm_call(
             agent_did="did:test:claw",
@@ -137,7 +137,7 @@ async def test_llm_call_observability_records_and_filters_agent_did(tmp_path):
         assert emma_calls[0].agent_did == "did:test:emma"
         assert emma_calls[0].session_id == "session-1"
         assert emma_calls[0].tool_calls == [
-            {"name": "github_issue_view", "arguments": {}}
+            {"name": "example_tool", "arguments": {}}
         ]
     finally:
         await store.close()
