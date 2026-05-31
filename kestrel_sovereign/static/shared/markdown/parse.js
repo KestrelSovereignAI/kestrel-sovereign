@@ -135,7 +135,20 @@ function renderStreamingMarkdown(content) {
     }
 
     try {
-        return marked.parse(processedContent);
+        // Match the finalize-path options (renderMarkdown above) so the
+        // streamed bubble lays out the same way during stream as it does
+        // once finalized. The defaults here would collapse single `\n`
+        // into a space (CommonMark), scrunching chat lines — including
+        // the inline tool-activity markers — into one paragraph until
+        // the stream ended. The catch-fallback below already preserves
+        // line breaks via `\n` → `<br>`, so the no-`breaks` `try` path
+        // was the inconsistent branch.
+        return marked.parse(processedContent, {
+            breaks: true,
+            gfm: true,
+            headerIds: false,
+            mangle: false,
+        });
     } catch (e) {
         return content.replace(/\n/g, '<br>');
     }
