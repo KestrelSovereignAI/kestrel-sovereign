@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.19.0"
+version = "0.20.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -182,7 +182,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics]>=0.11,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.18,<1",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the
