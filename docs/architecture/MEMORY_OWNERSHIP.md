@@ -10,7 +10,7 @@
 | Class | File | Role | Notes |
 |-------|------|------|-------|
 | MemorySystem | `storage/memory_system.py` | **Facade** for all memory components | Single entry point for enrichment, retrieval, consolidation |
-| MemoryRetriever | `storage/memory_retriever.py` | Weighted retrieval (semantic/emotional/importance/recency/access) | Owned by MemorySystem |
+| MemoryRetriever | `storage/memory_retriever.py` | Weighted retrieval (semantic/emotional/importance/recency/access/certainty) | Owned by MemorySystem |
 | MemoryConsolidator | `storage/memory_consolidator.py` | Episode creation, pattern detection, archival | Owned by MemorySystem |
 | MemoryMetadata | `storage/memory_models.py` | Data model for message metadata | Shared data contract |
 | MemoryEpisode | `storage/memory_models.py` | Data model for consolidated episodes | Shared data contract |

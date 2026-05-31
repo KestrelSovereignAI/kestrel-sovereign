@@ -9,7 +9,7 @@ Kestrel is a continuously-developing framework for creating autonomous AI agents
 | Pillar | What it means |
 |--------|--------------|
 | **Portable DID identity** | Cryptographic identity the agent's user owns. Exportable, self-hostable, cloud-optional — the agent is not bound to any provider. |
-| **Persistent memory you own** | Local-first memory with full-text search, knowledge graph retrieval, and RAG. Conversations, documents, relationships — searchable, portable, and encrypted at rest when configured. The storage and embedding layer is actively migrating through SQLAlchemy and the shared semantic embeddings service. |
+| **Persistent memory you own** | Local-first memory with full-text search, knowledge graph retrieval, and RAG. Conversations, documents, relationships — searchable, portable, and encrypted at rest when configured. SQLAlchemy-backed vector storage is in tree for saved items, document chunks, and conversation history; embedding generation is still being standardized across LLM providers. |
 | **Constitutional governance** | Every agent runs under an audited set of principles enforced *above* the LLM. Genesis audit on creation. Amendment requires cryptographic signature. |
 
 ### What's in core, what's an add-on
@@ -231,7 +231,7 @@ The console provides 9 tabs:
 Kestrel agents are built on several key components:
 
 - **Cryptographic Identity**: Each agent has a unique DID (Decentralized Identifier)
-- **Enhanced Storage**: Local-first memory with SQL-backed stores, FTS, knowledge graphs, and RAG; SQLAlchemy/common semantic embeddings migration is in progress
+- **Enhanced Storage**: Local-first memory with SQL-backed stores, SQLAlchemy vector mappings, FTS, knowledge graphs, and RAG; provider-standard embedding generation is in progress
 - **Multi-Model LLM**: Fallback between local (Ollama) and cloud (OpenAI) models
 - **Constitutional Governance**: Immutable principles with interpretive flexibility
 - **Blockchain Anchoring**: Optional integrity verification via blockchain
@@ -268,7 +268,7 @@ kestrel-sovereign/
 
 ### 1. Sovereign Memory
 - **Persistent Storage**: SQL-backed stores with full-text search and knowledge graphs
-- **RAG Pipeline**: Document chunking and semantic retrieval; storage/embedding internals are moving through SQLAlchemy and the shared semantic embeddings service
+- **RAG Pipeline**: Document chunking and semantic retrieval through SQLAlchemy-backed vector search where available; embedding generation still uses the current embedding service while provider-standard embedding functions are being added
 - **Conversation History**: Complete interaction tracking with metadata
 - **Human-Led Interactions**: Prioritizes user narratives (e.g., storytelling) for preservation and no-loss continuity.
 
@@ -302,7 +302,7 @@ Kestrel covers a wide surface; not all of it ships at the same maturity. **Verif
 - **Constitutional AI** — Genesis audits, hierarchical permissions, approval queues
 - **DID-based Identity** — `did:pkh` format, portable agent identity, export/import
 - **5-Level Privacy Modes** — EPHEMERAL → ISOLATED → ANONYMOUS → NORMAL → PUBLIC
-- **Memory & Storage** — Local-first memory, FTS, knowledge graph, and RAG surfaces are core; storage and semantic retrieval internals are actively moving through SQLAlchemy and the shared embedding service, so docs should avoid assuming a final backend layout
+- **Memory & Storage** — Local-first memory, FTS, knowledge graph, RAG, and SQLAlchemy-backed vector storage are core; embedding generation is the moving part as LLM providers gain standardized embedding functions
 - **LLM service** — Vendor/route/model architecture with Anthropic, OpenAI, Vertex AI, Ollama, OpenRouter, xAI, Groq; retry, structured output, streaming, vision
 - **A2A Protocol** — JSON-RPC 2.0 for agent-to-agent communication
 - **Cloud Run deploy** — 90 tests, active maintenance; the most-tested cloud feature
@@ -591,10 +591,10 @@ Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sover
 
 The Kestrel storage system is designed to be modular and extensible. It is composed of several specialized components, orchestrated by a high-level facade.
 
-*   **`storage.Database`**: Manages the low-level SQL-backed connection and schema. SQLite remains the local default while SQLAlchemy/PostgreSQL paths continue to mature.
+*   **`storage.Database` / `AsyncDatabase`**: Manages the low-level SQL-backed connection and schema. SQLite remains the local default; PostgreSQL is supported through the async backend layer.
 *   **`storage.FileStore`**: Handles the storage and retrieval of files.
 *   **`storage.GraphStore`**: Manages the knowledge graph (nodes and edges).
-*   **`storage.RAGStore`**: Responsible for document chunking and semantic search for the RAG pipeline and "case law" system. The embedding path is being aligned with the common semantic embeddings service.
+*   **`storage.RAGStore`**: Responsible for document chunking and semantic search for the RAG pipeline and "case law" system. It uses SQLAlchemy/vector backends when available and falls back gracefully; embedding generation is being aligned with standardized provider embedding functions.
 *   **`storage.ConversationStore`**: Manages the agent's conversation history.
 
 The main `Storage` class in `storage/__init__.py` acts as a facade, providing a single, unified interface to these components.

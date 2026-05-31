@@ -412,7 +412,9 @@ async def _migrate_sqlite_table(db: "AsyncDatabase", table: str) -> None:
 # =============================================================================
 # conversation_history (greenfield — no legacy embedding column to migrate
 # from). Adds ``embedding_vec`` at the configured dim plus HNSW on PG.
-# Consumed by MemoryRetriever's cosine semantic score.
+# This prepares the storage side for MemoryRetriever cosine scoring;
+# the current retriever still falls back to keyword/concept overlap
+# until the embedding writer/read path is wired through.
 # =============================================================================
 
 
@@ -426,8 +428,9 @@ async def migrate_conversation_history_add_embedding_vec(db: "AsyncDatabase") ->
     (driven by the ``KESTREL_EMBEDDING_DIM`` env var; default 768 for
     Ollama ``nomic-embed-text``). Operators that switch models AFTER
     rows have been embedded need an explicit re-embedding script;
-    this migration won't drop or resize the column. See
-    :class:`MemoryRetriever` for the read path.
+    this migration won't drop or resize the column. The read path is
+    intentionally staged: the column exists before MemoryRetriever
+    starts depending on it for cosine semantic scoring.
 
     Idempotent: skips cleanly if the column already exists. Wrapped
     in a transaction so a partial failure rolls back.
