@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-30
-**Scope:** 1577 tracked files (1029 `.py`, 266 `.md`, 282 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-05-31
+**Scope:** 1614 tracked files (1036 `.py`, 295 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -698,6 +698,8 @@ Repo entry points and standard project files.
   - `def secure_delete(path, passes)`; `class EncryptedKeyBundle`; `class SecureKeyStorage`; `def migrate_all_plaintext_keys(storage_dir)`
 - **kestrel_sovereign/security/keypair_factory.py** — KeypairFactory — uniform keypair lifecycle across CryptoSuites.
   - `class KeypairFactory`
+- **kestrel_sovereign/security/legacy_decrypt.py** — Backwards-compat decrypt wrapper that handles pre-v2 raw AES-GCM ciphertext (#1458).
+  - `def decrypt_with_legacy_fallback(agent_did, purpose, ciphertext)`
 - **kestrel_sovereign/security/multikey.py** — Multikey / multibase encoding for Kestrel public keys.
   - `def encode_varint(value)`; `def decode_varint(data)`; `def base58btc_encode(data)`; `def base58btc_decode(s)`; `def public_key_to_multibase(suite, public_key)`; `def multibase_to_public_key(multibase_str)`; `def multibase_to_kem_public_key(multibase_str)`
 - **kestrel_sovereign/security/narration_check.py** — Deterministic narration check for streaming agents (#1042 layer 3).
@@ -914,8 +916,10 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/sqla/__init__.py** — SQLAlchemy infrastructure for sovereign-core storage.
 - **kestrel_sovereign/storage/sqla/base.py** — Declarative base for sovereign-core SQLAlchemy entities.
   - `class SovereignBase`
+- **kestrel_sovereign/storage/sqla/document_chunk.py** — SQLAlchemy mapping of the ``document_chunks`` table.
+  - `class DocumentChunk`; `def build_document_chunk_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/migrations.py** — One-time data migrations for sovereign-core SQLAlchemy entities.
-  - `async def migrate_saved_items_add_embedding_vec(db)`
+  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`
 - **kestrel_sovereign/storage/sqla/saved_item.py** — SQLAlchemy mapping of the ``saved_items`` table.
   - `class SavedItem`; `def build_saved_item_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/session.py** — Construct async SQLAlchemy session factories that connect to the same database as a given :class:`AsyncDatabase`.
@@ -1074,6 +1078,8 @@ Repo entry points and standard project files.
   - `class Colors`; `def print_banner()`; `def print_iteration_header(iteration, max_iterations)`; `async def run_reflection(agent, depth)`; `def format_reflection_summary(result)`; `async def get_health_score(result)`; `async def create_tickets_from_actions(db_path, actions, github_token, repo, …)`; `async def get_agent_did(db_path)`; `…`
 - **scripts/upload_loras_to_lighthouse.py** — Upload trained LoRAs from GCS to Lighthouse for IPFS gateway testing.
   - `async def main()`
+- **scripts/validate_vector_lift_e2e.py** — End-to-end validation of the vector-lift architecture on real PG.
+  - `async def main()`
 - **scripts/verify_character_consistency.py** — Character Consistency Verification using Claude.
   - `def resolve_verification_model()`; `def get_anthropic_client()`; `def load_image_as_base64(path)`; `def get_image_media_type(path)`; `def verify_character_consistency(manifest)`; `def main()`
 - **scripts/workload_manager.py** — Workload Manager - Orchestrates all Mac Studio workloads.
@@ -1223,6 +1229,7 @@ Repo entry points and standard project files.
 - **docs/audit/API_ENDPOINT_MATRIX.md** — API Endpoint Matrix — ## App-level routes
 - **docs/audit/API_SURFACE_RECONCILIATION.md** — API Surface Reconciliation — The legacy catalog under-described the live HTTP surface.
 - **docs/audit/AUTH_SURFACE_MATRIX.md** — Auth Surface Matrix — The live auth model is enforced centrally in [`server.py`](../../server.py), with endpoint semantics layered on top.
+- **docs/audit/DOCUMENTATION_AUDIT_5_2026.md** — Documentation Audit - May 2026 — Status: working audit ledger Created: 2026-05-30 Scope: Kestrel Sovereign public, operator, architecture, generated, and audit documentation after the recent package extraction, context-management, m…
 - **docs/audit/FEATURE_AUDIT_MATRIX.md** — Feature Audit Matrix — | Domain | Canonical Source | Current Proof | Status | |---|---|---|---| | Foundation and constitution | `kestrel_sovereign/agent/constitution.py`, `kestrel_sovereign/data/KESTREL_CONSTITUTION.md` |…
 - **docs/audit/FEATURE_INVENTORY_RECONCILIATION.md** — Feature Inventory Reconciliation — The legacy catalog used fixed plugin counts that no longer matched the implementation.
 - **docs/audit/FEATURE_MODULE_MATRIX.md** — Feature Module Matrix — Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, package `__init__.py`, and package `feature.py`.
@@ -1231,6 +1238,35 @@ Repo entry points and standard project files.
 - **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
 - **docs/audit/SEAM_CAMPAIGNS.md** — Cross-Feature Seam Campaigns — This matrix tracks adversarial campaigns that cross feature boundaries.
 - **docs/audit/SYNC_ASYNC_AUDIT.md** — Sync/Async Audit — Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfaces.
+- **docs/audit/documentation-2026-05/ARCHIVE_DECISIONS.md** — Archive Decisions — This file records cleanup decisions made during the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/CANONICAL_SOURCES.md** — Canonical Sources — This file records which documentation surfaces are allowed to act as source-of-truth during the May 2026 audit.
+- **docs/audit/documentation-2026-05/DOCUMENTATION_INVENTORY.md** — Documentation Inventory - May 2026 — Status: working inventory seed
+- **docs/audit/documentation-2026-05/LANES.md** — Review Lanes — Use these lanes for subagents or human reviewers.
+- **docs/audit/documentation-2026-05/README.md** — May 2026 Documentation Audit Workspace — This directory holds the working artifacts for the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/REPORT_INDEX.md** — Report Index — Reports captured during the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/SHARED_CONTEXT.md** — Shared Context — Date: 2026-05-30
+- **docs/audit/documentation-2026-05/STALE_ARTIFACTS.md** — Stale Artifact Review — This file tracks prior audit/index/review artifacts that should not silently compete with the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/VALIDATION_COMMANDS.md** — Validation Commands — Commands for the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/issues/execution-order.md** — Documentation Audit Execution Order - May 2026 — Parent ledger: `docs/audit/DOCUMENTATION_AUDIT_5_2026.md`
+- **docs/audit/documentation-2026-05/issues/prd.json** — (configuration)
+- **docs/audit/documentation-2026-05/lanes/cloud_training_deployment.md** — Lane Brief: Cloud Training Deployment — Goal: reconcile Cloud Run deployment docs with external cloud provider packages and research-era GPU/training docs.
+- **docs/audit/documentation-2026-05/lanes/context.md** — Lane Brief: Context — Goal: reconcile documentation for prompt assembly, token budgets, context pruning, canonical history, rendered provider transport, retrieval insertion, and diagnostics.
+- **docs/audit/documentation-2026-05/lanes/index_diagrams_hygiene.md** — Lane Brief: Index Diagrams Hygiene — Goal: audit navigation, diagrams, archives, and public/internal doc hygiene.
+- **docs/audit/documentation-2026-05/lanes/llm_routing.md** — Lane Brief: LLM Routing — Goal: reconcile docs for LLM configuration, model preference, provider capability contracts, provider packages, streaming, honesty markers, and transport behavior.
+- **docs/audit/documentation-2026-05/lanes/memory_retrieval_storage.md** — Lane Brief: Memory Retrieval Storage — Goal: reconcile docs for memory ownership, retrieval, saved items, storage backends, encryption, export/import, and privacy-mode effects.
+- **docs/audit/documentation-2026-05/lanes/package_boundaries.md** — Lane Brief: Package Boundaries — Goal: determine the current source of truth for what ships in `kestrel-sovereign`, what is an external feature package, what is a provider package, and what is a standalone tool.
+- **docs/audit/documentation-2026-05/lanes/signals_workflows_talon.md** — Lane Brief: Signals Workflows Talon — Goal: reconcile wake-source docs, workflow ownership, and Talon standalone vs in-agent control-surface boundaries.
+- **docs/audit/documentation-2026-05/lanes/user_public_docs.md** — Lane Brief: User Public Docs — Goal: audit user-facing docs, use cases, demos, and launch copy for stale availability claims and unclear optional-package requirements.
+- **docs/audit/documentation-2026-05/reports/cleanup_candidates_report.md** — Cleanup Candidates Report — Source: subagent review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/cloud_training_deployment_report.md** — Cloud Training Deployment Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/context_report.md** — Context Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/index_diagrams_hygiene_report.md** — Index Diagrams Hygiene Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/llm_routing_report.md** — LLM Routing Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/memory_retrieval_storage_report.md** — Memory Retrieval Storage Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/package_boundaries_report.md** — Package Boundaries Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/pattern_review_report.md** — Pattern Review Report — Source: subagent review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/signals_workflows_talon_report.md** — Signals Workflows Talon Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/user_public_docs_report.md** — User Public Docs Lane Report — Source: subagent lane review, read-only, 2026-05-30.
 - **docs/audit/issues/00-umbrella-whole-of-vision-audit.md** — ## Problem
 - **docs/audit/issues/01-foundation-domain.md** — ## Problem
 - **docs/audit/issues/02-runtime-domain.md** — ## Problem
@@ -1283,7 +1319,7 @@ Repo entry points and standard project files.
 - **docs/audit/issues/privacy-db-bypass-02-feature-cleanup.md** — ## Problem
 - **docs/audit/issues/spawn-lifecycle-guard.md** — ## Problem
 - **docs/audit/worktree-plan.md** — Audit Worktree Plan — Use dedicated worktrees to keep domain audits isolated and parallelizable.
-- **docs/code_reviews/README.md** — Code Reviews — Code quality reviews, audit findings, and remediation tracking.
+- **docs/code_reviews/README.md** — Code Reviews — Point-in-time code review notes that are still useful during active PR or follow-up work.
 - **docs/code_reviews/claude-pr-1330.md** — Claude Review: PR #1330 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1330 - Title: fix: replay provider reasoning through tool loops - Reviewed: 2026-05-21T15:23:32Z
 - **docs/code_reviews/claude-pr-1333.md** — Claude Review: PR #1333 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333 - Title: fix: preserve OpenAI-compatible reasoning on tool streams - Reviewed: 2026-05-21T16:15:38Z
 - **docs/code_reviews/claude-pr-1337.md** — Good — both adapters handle dict arguments correctly.
@@ -1992,6 +2028,8 @@ Repo entry points and standard project files.
   - `class PlainFeature`; `def test_feature_startup_promotion_defaults_to_disabled()`; `def test_meta_features_opt_into_startup_direct_tools()`; `def test_startup_promotion_uses_feature_descriptor_not_feature_names()`
 - **tests/unit/test_feature_storage_access.py** — —
   - `class PrivacyWrappedStorage`; `def test_resolve_feature_database_prefers_raw_storage()`; `def test_resolve_feature_database_unwraps_privacy_storage_without_touching_property()`; `def test_resolve_feature_database_supports_legacy_unwrapped_storage_names()`; `def test_resolve_feature_database_ignores_magicmock_fabricated_attributes()`; `def test_resolve_feature_database_supports_explicit_magicmock_db()`; `def test_resolve_feature_conversation_store_unwraps_without_touching_property()`
+- **tests/unit/test_feature_subagent_tool_executor.py** — Regression tests for ``Feature.execute_as_subagent`` threading a ``tool_executor`` to the LLM service (#1461 follow-up).
+  - `async def test_subagent_threads_tool_executor_through_to_llm_service()`; `async def test_subagent_executor_dispatches_to_feature_tool()`; `async def test_subagent_executor_rejects_tool_outside_palette()`; `async def test_subagent_executor_surfaces_tool_exception_as_error_envelope()`; `async def test_subagent_no_tools_passes_no_executor()`; `async def test_subagent_executor_enforces_pre_tool_use_hooks()`; `async def test_subagent_executor_honors_hook_argument_rewrite()`; `async def test_subagent_executor_blocks_on_permission_decision_ask()`; `…`
 - **tests/unit/test_features_api.py** — Tests for the Feature Store API endpoints (endpoints/features.py).
   - `class TestListFeatures`; `class TestListInstalledFeatures`; `class TestGetFeatureDetail`; `class TestEnableFeature`; `class TestDisableFeature`; `class TestInstallFeature`; `class TestRemoveFeature`; `class TestGetFeatureConfig`; `…`
 - **tests/unit/test_filecoin_miner_selection.py** — Unit tests for Filecoin miner selection logic.
@@ -2062,6 +2100,8 @@ Repo entry points and standard project files.
   - `class TestKeyRotationTaskLifecycle`; `class TestRotationEndToEnd`
 - **tests/unit/test_key_storage.py** — Unit tests for SecureKeyStorage.
   - `def master_key()`; `def test_private_key()`; `def storage(master_key, temp_dir, monkeypatch)`; `class TestSecureKeyStorageInit`; `class TestKeyEncryption`; `class TestKeyMigration`; `class TestEncryptedKeyBundle`; `class TestEdgeCases`; `…`
+- **tests/unit/test_legacy_decrypt_fallback.py** — Regression tests for ``decrypt_with_legacy_fallback`` (#1458).
+  - `class TestCurrentV2Passthrough`; `class TestPreV2RawAESGCMRecovery`; `class TestRejectionShape`
 - **tests/unit/test_lifecycle_checks.py** — Tests for the startup lifecycle hardening rails (#377, #381, #406).
   - `def test_provider_check_passes_when_at_least_one_provider_initialized()`; `def test_provider_check_passes_with_multiple_providers()`; `def test_provider_check_raises_when_zero_providers()`; `def test_provider_check_raises_when_providers_attr_missing()`; `def test_provider_check_raises_when_providers_is_none()`; `def test_provider_check_skipped_when_llm_service_disabled()`; `def test_provider_check_still_raises_when_disabled_false_and_no_providers()`; `def test_provider_check_message_mentions_payer_policy_escape_hatch()`; `…`
 - **tests/unit/test_lighthouse_payment.py** — Unit tests for Lighthouse payment methods.
@@ -2134,6 +2174,8 @@ Repo entry points and standard project files.
   - `class TestNoViolation`; `class TestViolation`; `class TestLegacySuccessEdgeCases`; `class TestSummarizeForAudit`; `class TestVerdictShape`
 - **tests/unit/test_nellie_backend_smoke.py** — Nellie backend smoke-proof tests (issue #427, updated for epic #688).
   - `class TestNellieAnthropicPlan`; `class TestNellieOpenAIPlan`; `class TestNellieFailureModes`; `class TestNellieBackendSwitch`
+- **tests/unit/test_observability_inline_dispatch.py** — Regression tests for inline-executed tool dispatch logging (#1458 follow-up).
+  - `async def test_inline_executed_success_writes_dispatch_row(tmp_path)`; `async def test_inline_executed_failure_writes_error_row(tmp_path)`; `async def test_inline_executed_empty_list_writes_no_rows(tmp_path)`
 - **tests/unit/test_openai_thinking_channel.py** — —
   - `def test_non_streaming_split_extracts_think_tags()`; `def test_non_streaming_split_preserves_untagged_prose_as_visible()`; `def test_non_streaming_split_preserves_visible_content_with_reasoning_field()`; `def test_streaming_splitter_preserves_untagged_prose_as_visible()`; `def test_streaming_splitter_preserves_prose_after_closing_think_tag()`; `def test_streaming_splitter_buffers_split_closing_think_tag()`; `async def test_streaming_response_yields_reasoning_content_as_thinking_delta()`; `async def test_openai_compatible_adapter_uses_configured_provider_name()`
 - **tests/unit/test_path_safety.py** — Tests for path-safety primitives (#834).
@@ -2194,6 +2236,8 @@ Repo entry points and standard project files.
   - `class TestOAuthRouteDoesNotLeakApiKey`
 - **tests/unit/test_provider_thinking_channels.py** — —
   - `async def test_anthropic_streaming_emits_thinking_delta()`; `async def test_anthropic_streaming_splits_think_tags()`; `async def test_ollama_streaming_splits_think_tags(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_field(monkeypatch)`; `async def test_ollama_streaming_emits_native_thinking_via_sdk_objects(monkeypatch)`; `async def test_ollama_with_tools_suppresses_thinking_under_structured_output(monkeypatch)`; `async def test_ollama_with_tools_emits_native_thinking_on_no_tool_fallthrough(monkeypatch)`; `async def test_ollama_with_tools_preserves_untagged_prose_as_visible(monkeypatch)`; `…`
+- **tests/unit/test_rag_store_pgvector.py** — Tests for the SQLA + vector-backend path in :class:`AsyncRAGStore`.
+  - `def test_document_chunk_embedding_maps_to_embedding_vec()`; `def test_build_document_chunk_spec_validates_dim()`; `async def test_migration_skips_when_column_present_pg()`; `async def test_migration_skips_when_table_missing_pg()`; `async def test_migration_defers_when_no_embedded_rows_pg()`; `async def test_migration_backfills_existing_rows_pg()`; `async def test_migration_sqlite_adds_column_and_copies_bytes()`; `async def test_migration_skips_unknown_dialect()`; `…`
 - **tests/unit/test_rasa_shim_endpoint_contracts.py** — Contract tests for the Rasa webhook shim.
   - `def test_rasa_webhook_does_not_force_hardcoded_model_override()`
 - **tests/unit/test_raw_user_strip_in_consumers.py** — Regression: raw-user content consumers (personality calibration, wellness depth metrics) must strip the sent-form wrappers from user-role rows before measuring/exporting.
