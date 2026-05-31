@@ -1,9 +1,9 @@
 """
 Feature Registry — catalog loader and status resolver.
 
-Loads the static feature catalog from data/feature_registry.toml and merges
-it with runtime state (installed entry_points, enabled features) to produce
-a unified view of all available feature packages.
+Loads the static capability catalog from data/feature_registry.toml and merges
+it with runtime state (bundled core entries, installed entry_points, enabled
+features) to produce a unified view for the Feature Store UI.
 
 Consumed by CLI, API, and Feature Store UI.
 """
@@ -31,10 +31,10 @@ REGISTRY_PATH = Path(__file__).parent / "data" / "feature_registry.toml"
 
 
 class FeatureStatus(str, Enum):
-    """Runtime status of a feature package."""
+    """Runtime status of a catalog entry."""
 
-    AVAILABLE = "available"    # In registry, not installed
-    INSTALLED = "installed"    # Has entry_point, not enabled for this agent
+    AVAILABLE = "available"    # In registry, not installed / not bundled
+    INSTALLED = "installed"    # Bundled or has entry_point, not enabled
     ENABLED = "enabled"        # Loaded and active
     DISABLED = "disabled"      # Explicitly disabled via env var
 
@@ -51,7 +51,7 @@ class SkillInfo:
 
 @dataclass
 class FeaturePackageInfo:
-    """Metadata for a feature package from the registry."""
+    """Metadata for a feature/package/provider entry from the registry."""
 
     name: str
     package: str
@@ -73,7 +73,7 @@ def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
         path: Path to the registry TOML file. Defaults to the bundled catalog.
 
     Returns:
-        Dict mapping package short name to FeaturePackageInfo.
+        Dict mapping catalog short name to FeaturePackageInfo.
     """
     catalog_path = path or REGISTRY_PATH
 
@@ -140,10 +140,10 @@ def resolve_status(
     enabled_class_names: Optional[Set[str]] = None,
 ) -> Dict[str, FeaturePackageInfo]:
     """
-    Resolve runtime status for each package in the registry.
+    Resolve runtime status for each catalog entry.
 
     Merges the static catalog with:
-    - Installed entry_points (marks packages as INSTALLED)
+    - Bundled core entries or installed entry_points (marks as INSTALLED)
     - Currently enabled features (marks as ENABLED)
     - Disabled features env var (marks as DISABLED)
 
@@ -172,7 +172,7 @@ def resolve_status(
             info.status = FeatureStatus.ENABLED
             continue
 
-        # Check if the package is installed (core packages or entry_points)
+        # Check if the entry is bundled or installed via entry point.
         if info.core or (feature_classes & installed_ep_classes):
             info.status = FeatureStatus.INSTALLED
             continue

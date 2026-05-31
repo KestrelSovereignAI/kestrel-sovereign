@@ -24,6 +24,16 @@ This audit should become the working ledger for cleanup PRs. The recommended ord
 4. Regenerate derived docs only after canonical inputs are correct.
 5. Move stale aspirational or pre-extraction docs into archive, or add explicit status banners.
 
+## Follow-Up Cleanup Status
+
+2026-05-31 package-boundary cleanup:
+
+- `README.md` no longer says the base `kestrel-sovereign` install includes voice or wallet/economics features. It now distinguishes bundled core, optional feature packages, and provider packages.
+- `README.md` now describes memory/storage as active migration territory for SQLAlchemy and the shared semantic embeddings service instead of freezing a final backend story during ongoing work.
+- `kestrel_sovereign/data/feature_registry.toml` now documents that the catalog contains bundled core entries, optional feature packages, and provider package entries used by the Feature Store UI.
+- `docs/guides/BUILDING_FEATURES.md` now points external feature package authors at the SDK import surface.
+- Generated audience docs remain intentionally untouched until canonical inventories and runtime docs are reconciled enough to regenerate them safely.
+
 ## Evidence Snapshot
 
 Repository observations from 2026-05-30:

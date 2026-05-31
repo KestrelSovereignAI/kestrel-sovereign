@@ -11,13 +11,14 @@ Before diving in, understand the hierarchy:
 | **Tool** | An atomic callable function — one `@tool`-decorated method on a Feature |
 | **Skill** | An externally discoverable tool — a tool with A2A metadata for agent-to-agent discovery |
 | **Feature** | A skill bundle — a `Feature` subclass grouping related tools, hooks, and endpoints |
-| **Module** | A deployment unit — one or more features packaged as a pip-installable package |
+| **Feature package** | A deployment unit — one or more features packaged as a pip-installable package and registered through the feature entry-point group |
+| **Provider package** | A backend implementation package registered through a provider-specific entry-point group, such as cloud, voice, or storage providers |
 
 A feature is the fundamental unit of extensibility in Kestrel. It groups related capabilities into a single class that the agent discovers and loads automatically.
 
 ## The Feature Contract
 
-Every feature is a subclass of `Feature` (from `kestrel_sovereign.features.base`) and must implement two things:
+Every package feature is a subclass of `Feature` from the Kestrel SDK and must implement two things:
 
 1. `async initialize()` — called on agent startup
 2. `tool_description` property — one-line summary shown to the orchestrator LLM
@@ -25,8 +26,8 @@ Every feature is a subclass of `Feature` (from `kestrel_sovereign.features.base`
 Here is the minimal feature:
 
 ```python
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.features.base import Feature, tool
+from kestrel_sdk.tools.base import ToolCategory
 
 
 class GreeterFeature(Feature):
@@ -138,8 +139,8 @@ Tools are the primary way a feature exposes functionality. The `@tool` decorator
 ### The @tool Decorator
 
 ```python
-from kestrel_sovereign.features.base import tool
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.features.base import tool
+from kestrel_sdk.tools.base import ToolCategory
 
 @tool(
     name="search_items",              # Unique tool name
@@ -221,10 +222,10 @@ Hooks let your feature intercept agent events — security checks, audit logging
 
 ### Defining a Hook
 
-Create a Hook subclass (from `kestrel_sovereign.hooks.base`), then return it from `get_hooks()`:
+Create a Hook subclass from the Kestrel SDK, then return it from `get_hooks()`:
 
 ```python
-from kestrel_sovereign.hooks.base import Hook
+from kestrel_sdk.hooks.base import Hook
 
 
 class AuditHook(Hook):
@@ -465,7 +466,7 @@ version = "0.1.0"
 description = "Greeting feature for Kestrel agents"
 requires-python = ">=3.11"
 dependencies = [
-    "kestrel-sovereign>=0.1.8",
+    "kestrel-sovereign-sdk>=0.1.0",
 ]
 
 [project.optional-dependencies]
@@ -641,9 +642,9 @@ Putting it all together — a feature with a tool, a hook, an HTTP endpoint, and
 import logging
 from typing import Dict, List, Optional
 
-from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.hooks.base import Hook
-from kestrel_sovereign.tools.base import ToolCategory
+from kestrel_sdk.features.base import Feature, tool
+from kestrel_sdk.hooks.base import Hook
+from kestrel_sdk.tools.base import ToolCategory
 
 logger = logging.getLogger(__name__)
 
@@ -808,10 +809,10 @@ async def test_router_returned(mock_agent):
 
 | What | Where |
 |------|-------|
-| Base class | `kestrel_sovereign.features.base.Feature` |
-| @tool decorator | `kestrel_sovereign.features.base.tool` |
-| Tool categories | `kestrel_sovereign.tools.base.ToolCategory` |
-| Hook base class | `kestrel_sovereign.hooks.base.Hook` |
+| Base class | `kestrel_sdk.features.base.Feature` |
+| @tool decorator | `kestrel_sdk.features.base.tool` |
+| Tool categories | `kestrel_sdk.tools.base.ToolCategory` |
+| Hook base class | `kestrel_sdk.hooks.base.Hook` |
 | MockAgent | `kestrel_sovereign.testing.mock_agent.MockAgent` |
 | Pytest fixtures | `kestrel_sovereign.testing.fixtures` |
 | FeatureTestCase | `kestrel_sovereign.testing.feature_test_case.FeatureTestCase` |

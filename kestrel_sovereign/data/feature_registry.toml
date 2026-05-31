@@ -1,11 +1,16 @@
 # Kestrel Feature Registry
 #
-# Static catalog of all feature packages. Maps user-friendly names to packages,
-# class names, and git URLs. Consumed by CLI, API, and Feature Store UI.
+# Static catalog of Kestrel capabilities. It includes bundled core features,
+# optional feature packages, and a few provider package entries surfaced by the
+# Feature Store UI. Feature packages register Feature classes through
+# kestrel_sovereign.features; provider packages use provider-specific entry
+# points such as kestrel_sovereign.cloud_providers or
+# kestrel_sovereign.voice_providers.
 #
 # Status levels (computed at runtime by feature_registry.py):
-#   available  - listed here but not installed
-#   installed  - installed via entry_point but not enabled for this agent
+#   available  - listed here but not installed / not bundled
+#   installed  - bundled with kestrel-sovereign or installed via entry_point,
+#                but not enabled for this agent
 #   enabled    - loaded and active for this agent
 #   disabled   - explicitly disabled via KESTREL_DISABLED_FEATURES
 #
@@ -16,7 +21,8 @@
 #   description - human-readable summary
 #   tags        - list of tags for filtering
 #   icon        - icon identifier for UI rendering
-#   core        - true if shipped with kestrel-sovereign (not a separate package)
+#   core        - true if this entry is bundled/available in kestrel-sovereign
+#                 without an external entry point
 #   skills      - per-feature skill declarations for static discovery
 
 # =============================================================================
@@ -50,7 +56,7 @@ core = true
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
 features = ["PeersFeature"]
-description = "Agent-to-agent discovery and mesh networking"
+description = "A2A peer discovery, routing, and task coordination"
 tags = ["core", "networking", "a2a"]
 icon = "network"
 core = true
@@ -199,7 +205,9 @@ list_saved = { description = "List saved items", category = "utility", tags = ["
 search_saved = { description = "Search saved items", category = "utility", tags = ["save", "search"] }
 
 # =============================================================================
-# FEATURE PACKAGES (can be split to separate pip packages)
+# OPTIONAL CAPABILITY CATALOG
+# Some entries here are installable feature packages. Others are core capability
+# groupings or provider packages listed so the UI can explain what's available.
 # =============================================================================
 
 [cloud]
@@ -409,10 +417,10 @@ skill_save = { description = "Promote an insight into a saved skill", category =
 skill_delete = { description = "Delete a saved skill", category = "utility", tags = ["skills"] }
 
 [talon]
-package = "kestrel-feature-talon"
-git = "https://github.com/KestrelSovereignAI/kestrel-feature-talon.git"
+package = "kestrel-talon"
+git = "https://github.com/KestrelSovereignAI/kestrel-talon.git"
 features = ["TalonCoordinatorFeature"]
-description = "Autonomous GitHub issue processing and PR generation"
+description = "In-agent coordinator for the standalone kestrel-talon GitHub issue processor"
 tags = ["automation", "github", "devtools"]
 icon = "bot"
 core = true
