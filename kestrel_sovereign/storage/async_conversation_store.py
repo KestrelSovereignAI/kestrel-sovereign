@@ -13,8 +13,9 @@ All queries are scoped by agent_id for multi-tenant isolation.
 import json
 import logging
 import os
+import struct
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Any
+from typing import Dict, Optional, List, Any, Sequence
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
@@ -28,6 +29,32 @@ logger = logging.getLogger(__name__)
 
 # Current key version for new encryptions
 CURRENT_KEY_VERSION = 1
+
+
+def _serialize_embedding(embedding: Sequence[float]) -> bytes:
+    """Pack a Python embedding list to little-endian float32 bytes.
+
+    Duplicated locally (mirrors ``async_rag_store._serialize_embedding`` and
+    ``saved_items_store._serialize_embedding``) so the conversation_history
+    write path doesn't need to import from a sibling store. Same on-disk
+    shape SQLite's ``embedding_vec`` BLOB column expects and the
+    PurePythonBackend's ``_unpack`` reads — explicit little-endian (``<``)
+    so the bytes round-trip on big-endian hosts. The sibling helpers
+    omit the prefix and rely on the host being little-endian; we fix
+    that here for new writes. (Codex P3 on PR-B.)
+    """
+    return struct.pack(f'<{len(embedding)}f', *embedding)
+
+
+def _format_pgvector_text(embedding: Sequence[float]) -> str:
+    """Format an embedding as pgvector's bind-parameter text shape.
+
+    ``[v1,v2,…]`` — used together with a ``::vector`` cast so asyncpg
+    can hand a Python string to pgvector without a typed-binary
+    adapter. Mirrors the formatting in
+    ``SavedItemsStore._write_embedding_vec``.
+    """
+    return "[" + ",".join(repr(float(v)) for v in embedding) + "]"
 
 
 def _rows_affected(result) -> int:
@@ -58,6 +85,32 @@ class AsyncConversationStore:
         agent_id: str = "",
         llm_service: Optional[Any] = None,
     ):
+        """Initialize the conversation store.
+
+        Args:
+            db: Underlying :class:`AsyncDatabase` (SQLite or Postgres).
+            agent_id: Scope every read / write to this agent. Empty
+                string = global / unscoped (legacy).
+            llm_service: Optional :class:`~kestrel_sovereign.llm.service.LLMService`.
+                When provided, conversation embeddings are sourced from
+                the active chat provider's embedding capability (OpenAI →
+                text-embedding-3-small, Vertex/Google → text-embedding-004,
+                Ollama → nomic-embed-text). When ``None`` the store falls
+                through to ``get_provider_embedding_service(None)`` which
+                resolves the global default. Set
+                ``KESTREL_DISABLE_CONVERSATION_EMBEDDINGS=true`` to opt
+                out entirely (e.g. when the deployment can't reach an
+                embedding provider).
+
+                Embeddings are computed against PLAINTEXT content BEFORE
+                encryption. The threat model already exposes semantic-
+                similarity signal through retrieval results, so the
+                column doesn't widen the surface.
+
+                Tests inject by monkey-patching
+                :meth:`_lazy_embedding_service` (a method on the class so
+                the override sticks per-instance).
+        """
         self.db = db
         self.agent_id = agent_id
         self._llm_service = llm_service
@@ -68,17 +121,50 @@ class AsyncConversationStore:
         # Auto-migration on read (can be disabled via env var)
         self._migrate_on_read = os.environ.get("KESTREL_DISABLE_MIGRATION") != "true"
 
-    def _lazy_embedding_service(self):
+    def _lazy_embedding_service(self) -> Optional[Any]:
         """Return the active chat provider's embedding service when available.
 
-        Conversation-history embedding writes live in the sibling
-        conversation vector PRs. Keeping the hook here lets that path source
-        embeddings from the same provider-backed service as saved-items and RAG
-        without reintroducing the old global Ollama singleton.
-        """
-        from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
+        Conversation-history embedding writes live in PR-B (this PR).
+        Sourcing from :func:`get_provider_embedding_service` (introduced
+        in #1471) keeps saved_items, RAG, and conversation_history all
+        on the same provider-backed embedding stack — switching the
+        chat provider switches embeddings everywhere.
 
-        return get_provider_embedding_service(self._llm_service)
+        Returns ``None`` when the provider doesn't expose embeddings
+        (e.g. Anthropic, which has no embedding API) or when
+        ``KESTREL_DISABLE_CONVERSATION_EMBEDDINGS=true`` opts out.
+        """
+        if os.environ.get(
+            "KESTREL_DISABLE_CONVERSATION_EMBEDDINGS", ""
+        ).lower() == "true":
+            return None
+        try:
+            from kestrel_sovereign.llm.embedding_service import (
+                get_provider_embedding_service,
+            )
+        except Exception:
+            return None
+        try:
+            return get_provider_embedding_service(self._llm_service)
+        except Exception as e:
+            logger.info(
+                "Provider embedding service unavailable for "
+                "conversation_history writes (%s); falling back to legacy "
+                "column set.", e,
+            )
+            return None
+
+    @property
+    def embedding_service(self) -> Optional[Any]:
+        """Expose the active embedding service (read-only).
+
+        :class:`MemoryRetriever` reads this to embed retrieval queries
+        with the SAME model that wrote the row embeddings — using a
+        different model would silently destroy cosine similarity.
+        Returns ``None`` if the active chat provider doesn't expose
+        embeddings or if the opt-out env var is set.
+        """
+        return self._lazy_embedding_service()
 
     def _now_sql(self) -> str:
         """Get SQL expression for current timestamp based on backend type."""
@@ -228,12 +314,166 @@ class AsyncConversationStore:
                 meta['enc'] = True
                 meta['key_version'] = CURRENT_KEY_VERSION
 
-        await self.db.execute_commit(
-            f"INSERT INTO conversation_history (agent_id, role, content, rendered_content, metadata, created_at) "
-            f"VALUES (?, ?, ?, ?, ?, {self._now_sql()})",
-            (self.agent_id, role, to_store, rendered_to_store,
-             json.dumps(meta) if meta else None)
+        # Compute the embedding from plaintext content BEFORE the
+        # INSERT so we can co-write ``embedding_vec`` in a single
+        # statement (no follow-up UPDATE → no autoincrement-id
+        # round-trip needed). The embedding service is optional;
+        # absence + per-call failure both fall back to the legacy
+        # column set with no behavioural change.
+        embedding_vec_val: Optional[List[float]] = await self._maybe_embed(content)
+
+        await self._insert_message(
+            role=role,
+            content=to_store,
+            rendered_content=rendered_to_store,
+            metadata=json.dumps(meta) if meta else None,
+            embedding=embedding_vec_val,
         )
+
+    async def _maybe_embed(self, content: str) -> Optional[List[float]]:
+        """Compute an embedding for ``content`` if a service is wired.
+
+        Failures + empty content + None service all return ``None``,
+        which downstream renders as a NULL ``embedding_vec`` — the
+        legacy keyword-overlap retriever path still works for these
+        rows. Crucially, a provider / network outage during a chat
+        turn must NOT block writing the message.
+
+        Validates the returned embedding's dimension against the
+        column dim chosen at boot time. A mismatch (e.g. provider
+        switched from Ollama-768 to OpenAI-1536 after migration) is
+        treated as "no embedding" — better to fall back to keyword
+        overlap than persist data the retriever will silently reject.
+        The first mismatch per store instance logs a clear error
+        pointing operators at the fix (re-migrate the column).
+        (Codex P2 on PR-B.)
+        """
+        if not content:
+            # Empty content (rare — guardrails would normally reject
+            # earlier) would produce a zero-norm embedding that the
+            # vector backends explicitly short-circuit; skip the
+            # embedding service call entirely.
+            return None
+        service = self._lazy_embedding_service()
+        if service is None:
+            return None
+        try:
+            embedding = await service.aembed(content)
+        except Exception as e:
+            # Embedding generation must NEVER block message persistence.
+            # The retriever falls back to keyword overlap for this row.
+            logger.warning(
+                "Embedding generation failed for agent %s; "
+                "row will be searchable via keyword overlap only: %s",
+                self.agent_id, e,
+            )
+            return None
+        if not embedding:
+            return None
+
+        # Defend against provider/column dim mismatch. The vector
+        # column was created at ``CONVERSATION_MESSAGE_EMBEDDING_DIM``
+        # at boot; if the active provider returns a different dim
+        # (e.g. config drift between agent restart and migration run),
+        # writing it would either crash on PG or persist bytes that
+        # the retriever can't decode on SQLite. Skip the embedding,
+        # log once per store instance, and keep persisting the row.
+        from .sqla.conversation_message import (
+            CONVERSATION_MESSAGE_EMBEDDING_DIM,
+        )
+        if len(embedding) != CONVERSATION_MESSAGE_EMBEDDING_DIM:
+            if not getattr(self, "_warned_dim_mismatch", False):
+                logger.error(
+                    "Embedding dim mismatch for agent %s: provider returned "
+                    "%d, column is %d. Vector recall disabled for this "
+                    "agent until the column is re-migrated at the new dim. "
+                    "Set KESTREL_EMBEDDING_DIM=%d + drop "
+                    "conversation_history.embedding_vec to re-migrate, OR "
+                    "switch the active provider back to one that emits "
+                    "%d-dim embeddings.",
+                    self.agent_id, len(embedding),
+                    CONVERSATION_MESSAGE_EMBEDDING_DIM,
+                    len(embedding),
+                    CONVERSATION_MESSAGE_EMBEDDING_DIM,
+                )
+                # Mark on the instance so we don't flood the log on
+                # every turn. Operators get one error per agent boot.
+                self._warned_dim_mismatch = True
+            return None
+        return list(embedding)
+
+    async def _insert_message(
+        self,
+        *,
+        role: str,
+        content: str,
+        rendered_content: Optional[str],
+        metadata: Optional[str],
+        embedding: Optional[List[float]],
+    ) -> None:
+        """Persist a conversation row, optionally co-writing
+        ``embedding_vec``.
+
+        Dual SQL paths because the ``embedding_vec`` bind shape is
+        dialect-specific:
+
+        - PG: bind a ``[v1,v2,…]`` text literal with ``::vector`` cast
+          so asyncpg can hand the value to pgvector. Mirrors
+          :meth:`SavedItemsStore._write_embedding_vec`.
+        - SQLite (and unknown dialects): bind float32 little-endian
+          bytes to the ``BLOB`` column — same shape the
+          ``PurePythonBackend`` reads back.
+
+        When ``embedding`` is ``None`` (no service / failure / empty
+        content) we fall back to the legacy column list — preserving
+        bit-identical INSERT shape with prior versions so any tooling
+        sniffing the SQL surface keeps working.
+        """
+        base_cols = "agent_id, role, content, rendered_content, metadata, created_at"
+        base_vals_suffix = f", {self._now_sql()}"
+        base_params = (
+            self.agent_id, role, content, rendered_content, metadata,
+        )
+
+        if embedding is None:
+            sql = (
+                f"INSERT INTO conversation_history ({base_cols}) "
+                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix})"
+            )
+            await self.db.execute_commit(sql, base_params)
+            return
+
+        backend_type = getattr(self.db, "backend_type", None)
+        try:
+            if backend_type == "postgres":
+                emb_bind: Any = _format_pgvector_text(embedding)
+                emb_placeholder = "?::vector"
+            else:
+                emb_bind = _serialize_embedding(embedding)
+                emb_placeholder = "?"
+
+            sql = (
+                f"INSERT INTO conversation_history "
+                f"({base_cols}, embedding_vec) "
+                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder})"
+            )
+            await self.db.execute_commit(sql, base_params + (emb_bind,))
+        except Exception as e:
+            # Most likely cause: the Phase-2 migration hasn't run yet
+            # so the column doesn't exist. Don't drop the row — retry
+            # with the legacy column list. The retriever falls back to
+            # keyword overlap for this message until the next boot
+            # finishes the migration.
+            logger.info(
+                "Could not write conversation_history.embedding_vec for "
+                "agent %s (%s); falling back to legacy INSERT path.",
+                self.agent_id, e,
+            )
+            sql = (
+                f"INSERT INTO conversation_history ({base_cols}) "
+                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix})"
+            )
+            await self.db.execute_commit(sql, base_params)
 
     def _decrypt_with_fallback(self, content: str, meta: Optional[Dict]) -> tuple[str, bool]:
         """Decrypt content, trying per-agent key first then global.
