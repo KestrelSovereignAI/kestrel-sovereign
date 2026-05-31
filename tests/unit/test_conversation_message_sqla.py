@@ -125,8 +125,15 @@ def test_build_spec_passes_through_runtime_dimension():
 
 def test_default_dim_is_768_without_env():
     """Default Ollama nomic-embed-text dim. Hardcoded so a missing
-    env var doesn't silently shift to whatever a future model picks."""
-    assert CONVERSATION_MESSAGE_EMBEDDING_DIM == 768
+    env var doesn't silently shift to whatever a future model picks.
+
+    Assert via the resolver with an empty env mapping rather than the
+    import-time constant — operators that run the suite in a shell
+    pre-configured for a 1024 / 1536 model would otherwise see this
+    fail even though production behaviour is correct. (Caught by
+    codex review.)
+    """
+    assert resolve_embedding_dim({}) == 768
 
 
 def test_resolve_embedding_dim_honours_env_override():
