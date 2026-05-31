@@ -515,19 +515,25 @@ class KestrelAgent(
                     pg_backend = PostgresBackend.from_pool(self.pg_pool)
                     self._raw_storage = AsyncStorage(
                         backend=pg_backend,
-                        agent_id=self.did
+                        agent_id=self.did,
+                        llm_service=self.llm_service,
                     )
                     logging.info(f"Using shared PostgreSQL pool for Kestrel storage (agent: {self.did})")
                 else:
                     self._raw_storage = AsyncStorage(
                         backend="postgres",
                         dsn=self._database_url,
-                        agent_id=self.did
+                        agent_id=self.did,
+                        llm_service=self.llm_service,
                     )
                     logging.info(f"Using PostgreSQL backend for Kestrel storage (agent: {self.did})")
             else:
                 # SQLite backend (default) - agent_id optional since each agent has own DB
-                self._raw_storage = AsyncStorage(self.storage_path, agent_id=self.did)
+                self._raw_storage = AsyncStorage(
+                    self.storage_path,
+                    agent_id=self.did,
+                    llm_service=self.llm_service,
+                )
                 logging.info(f"Using SQLite backend for Kestrel storage: {self.storage_path}")
 
             await self._raw_storage.initialize()

@@ -337,12 +337,13 @@ class SavedItemsStore:
         self,
         db: AsyncDatabase,
         agent_id: str,
-        filecoin_adapter: Optional["FilecoinAdapter"] = None
+        filecoin_adapter: Optional["FilecoinAdapter"] = None,
+        llm_service: Optional[Any] = None,
     ):
         self.db = db
         self.agent_id = agent_id
-        self._embedding_service = None
         self._filecoin_adapter = filecoin_adapter
+        self._llm_service = llm_service
 
     def _get_filecoin_adapter(self) -> Optional["FilecoinAdapter"]:
         """Get or lazy-load the FilecoinAdapter for IPFS operations."""
@@ -363,15 +364,14 @@ class SavedItemsStore:
         return self._filecoin_adapter
 
     def _get_embedding_service(self):
-        """Lazy load the embedding service."""
-        if self._embedding_service is None:
-            try:
-                from kestrel_sovereign.llm.embedding_service import get_embedding_service
-                self._embedding_service = get_embedding_service()
-            except Exception as e:
-                logger.warning(f"Embedding service not available: {e}")
-                self._embedding_service = False  # Mark as unavailable
-        return self._embedding_service if self._embedding_service else None
+        """Resolve the active chat provider's embedding service."""
+        try:
+            from kestrel_sovereign.llm.embedding_service import get_provider_embedding_service
+
+            return get_provider_embedding_service(self._llm_service)
+        except Exception as e:
+            logger.warning(f"Embedding service not available: {e}")
+            return None
 
     async def save_item(
         self,

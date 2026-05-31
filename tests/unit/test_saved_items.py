@@ -244,7 +244,7 @@ class TestSavedItemsStore:
         from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
 
         store = SavedItemsStore(mock_db, agent_id="test-agent")
-        store._embedding_service = False  # Mark as unavailable
+        store._get_embedding_service = lambda: None
 
         mock_db.fetchall.return_value = [
             (

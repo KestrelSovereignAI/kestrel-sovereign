@@ -378,7 +378,33 @@ class ProviderRegistry:
             if base_url:
                 kwargs["base_url"] = base_url
             client = openai.AsyncOpenAI(**kwargs)
-            return client, adapter_cls(name=vendor)
+            embedding_model = route_cfg.get("embedding_model")
+            embedding_dim = route_cfg.get("embedding_dim")
+            if embedding_dim is not None:
+                embedding_dim = int(embedding_dim)
+            supports_embeddings = route_cfg.get("supports_embeddings")
+            if supports_embeddings is None:
+                official_openai_base = (
+                    not base_url
+                    or str(base_url).rstrip("/") == "https://api.openai.com/v1"
+                )
+                supports_embeddings = (
+                    vendor == "openai"
+                    and official_openai_base
+                ) or bool(embedding_model)
+            elif isinstance(supports_embeddings, str):
+                supports_embeddings = supports_embeddings.lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }
+            return client, adapter_cls(
+                name=vendor,
+                supports_embeddings=bool(supports_embeddings),
+                embedding_model=embedding_model,
+                embedding_dim=embedding_dim,
+            )
 
         # --- Fallback: try plain instantiation; let adapter fail at call time ---
         logger.warning("No client builder for adapter %s — using adapter-only", adapter_cls.__name__)

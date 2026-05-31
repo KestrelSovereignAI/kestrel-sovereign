@@ -173,7 +173,7 @@ async def test_search_with_no_embedding_service_falls_back_to_text():
     mock_db = MagicMock()
     mock_db.fetchall = AsyncMock(return_value=[])
     store = SavedItemsStore(mock_db, agent_id="agent-1")
-    store._embedding_service = False  # poisoned to unavailable
+    store._get_embedding_service = lambda: None
 
     result = await store.search("hello")
     assert result == []
@@ -249,9 +249,10 @@ async def test_search_preserves_query_when_falling_back_to_text():
     mock_db.fetchall = AsyncMock(return_value=[])
 
     store = SavedItemsStore(mock_db, agent_id="agent-1")
-    store._embedding_service = SimpleNamespace(
+    service = SimpleNamespace(
         aembed=AsyncMock(return_value=[1.0] + [0.0] * 1535)
     )
+    store._get_embedding_service = lambda: service
 
     await store.search("special-term", item_type=None, limit=5)
 
@@ -330,7 +331,7 @@ async def test_search_end_to_end_against_real_sqlite():
                 async def aembed(self, _q):
                     return target
 
-            store._embedding_service = _StubEmbed()
+            store._get_embedding_service = lambda: _StubEmbed()
 
             results = await store.search("anything")
             assert len(results) == 2

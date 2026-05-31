@@ -64,6 +64,7 @@ class AsyncStorage:
         dsn: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
         agent_id: str = "",
+        llm_service: Optional[Any] = None,
     ):
         """
         Initialize AsyncStorage.
@@ -74,10 +75,12 @@ class AsyncStorage:
             dsn: PostgreSQL connection string (for postgres backend)
             config: Full configuration dict (overrides other args)
             agent_id: Agent/companion ID for multi-tenant isolation
+            llm_service: Agent-scoped LLM service used for provider-backed embeddings
         """
         self._backend: Optional[DatabaseBackend] = None
         self.db_path: Optional[str] = None
         self.agent_id = agent_id
+        self.llm_service = llm_service
 
         # If backend is already a DatabaseBackend instance, use it directly
         if isinstance(backend, DatabaseBackend):
@@ -151,9 +154,13 @@ class AsyncStorage:
             await self.db._init_schema()
             self.db._initialized = True
             self.files = AsyncFileStore(self.db)
-            self.conversation = AsyncConversationStore(self.db, agent_id=self.agent_id)
+            self.conversation = AsyncConversationStore(
+                self.db,
+                agent_id=self.agent_id,
+                llm_service=self.llm_service,
+            )
             self.graph = AsyncGraphStore(self.db)
-            self.rag = AsyncRAGStore(self.db)
+            self.rag = AsyncRAGStore(self.db, llm_service=self.llm_service)
             self._initialized = True
             logger.info(f"AsyncStorage initialized ({self.backend_type}): {self.db_path or 'PostgreSQL'}")
     

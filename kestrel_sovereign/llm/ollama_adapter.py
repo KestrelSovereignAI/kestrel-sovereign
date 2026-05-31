@@ -91,15 +91,53 @@ class OllamaAdapter(LLMAdapter):
             supports_streaming=True,
             supports_vision=True,
             supports_structured_output=True,
+            supports_embeddings=True,
             structured_output_mode=StructuredOutputMode.SCHEMA_FORMAT,
             tool_streaming_mode=ToolStreamingMode.NONSTREAM_FALLBACK,
             vision_input_mode=VisionInputMode.OLLAMA_IMAGES,
+            embedding_model="nomic-embed-text",
+            embedding_dim=768,
             model_dependent=("tools", "vision", "structured_output"),
             notes=(
                 "Tool and vision support are model-dependent in Ollama.",
                 "Structured output passes a JSON schema via Ollama's format option.",
             ),
         )
+
+    async def aembed(
+        self,
+        client: "ollama.AsyncClient",
+        text: str,
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> Optional[List[float]]:
+        try:
+            response = await client.embed(model=model or "nomic-embed-text", input=text)
+        except Exception as exc:
+            logger.warning("Ollama embedding failed: %s", exc)
+            return None
+        embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
+        return list(embeddings[0]) if embeddings else None
+
+    async def aembed_batch(
+        self,
+        client: "ollama.AsyncClient",
+        texts: List[str],
+        *,
+        model: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[Optional[List[float]]]:
+        if not texts:
+            return []
+        try:
+            response = await client.embed(model=model or "nomic-embed-text", input=texts)
+        except Exception as exc:
+            logger.warning("Ollama batch embedding failed: %s", exc)
+            return [None] * len(texts)
+        embeddings = response.get("embeddings", []) if isinstance(response, dict) else getattr(response, "embeddings", [])
+        out = [list(item) if item is not None else None for item in embeddings]
+        return (out + [None] * len(texts))[:len(texts)]
 
     def create_messages(
         self,

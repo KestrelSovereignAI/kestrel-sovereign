@@ -44,8 +44,8 @@ dependencies = [
     # constitution_injection / system_prompt_budget_bytes) that chunks 1D,
     # 1F, and 1G consume. Defaults are backwards-compatible.
     #
-    # 0.17.0 floor: adds the SDK-owned LLM provider capability contract.
-    "kestrel-sovereign-sdk>=0.17.0,<1",
+    # 0.18.0 floor: adds the SDK-owned provider embedding contract.
+    "kestrel-sovereign-sdk>=0.18.0,<1",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",

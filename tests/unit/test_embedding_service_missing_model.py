@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from kestrel_sovereign.llm.embedding_service import EmbeddingService
+from kestrel_sovereign.llm.embedding_service import EmbeddingService, cosine_similarity
 
 
 class _FakeOllamaResponseError(Exception):
@@ -131,3 +131,8 @@ class TestModelNotFoundIsWarningNotError:
         errors = [r for r in caplog.records if r.levelname == "ERROR"]
         assert len(warnings) == 1
         assert errors == []
+
+
+def test_cosine_similarity_returns_zero_for_dimension_mismatch():
+    """Provider/model switches can leave old embeddings with stale dimensions."""
+    assert cosine_similarity([1.0, 0.0, 0.0], [1.0, 0.0]) == 0.0

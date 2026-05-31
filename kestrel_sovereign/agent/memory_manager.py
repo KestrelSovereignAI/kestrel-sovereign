@@ -602,7 +602,11 @@ class MemoryManager:
             if not db:
                 return {"success": False, "error": "Database not available"}
 
-            store = SavedItemsStore(db, self.agent_id)
+            store = SavedItemsStore(
+                db,
+                self.agent_id,
+                llm_service=getattr(self.storage, "llm_service", None),
+            )
 
             item = await store.save_item(
                 item_type=SavedItemType.STASH.value,

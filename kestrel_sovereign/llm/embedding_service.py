@@ -5,7 +5,7 @@ Provides text embeddings using Ollama's embedding models.
 This replaces the need for local sentence-transformers installation.
 """
 import logging
-from typing import List, Optional
+from typing import Any, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
@@ -183,6 +183,40 @@ class EmbeddingService:
             return [None] * len(texts)
 
 
+class ProviderEmbeddingService:
+    """Embedding service backed by an initialized LLM provider route.
+
+    Kestrel's storage code consumes one common shape regardless of provider:
+    ``aembed(text) -> Optional[list[float]]`` and
+    ``aembed_batch(texts) -> list[Optional[list[float]]]``. The provider
+    capability metadata records the embedding model and dimension that produced
+    those vectors; vectors from different providers/models are not semantically
+    interchangeable and should be re-embedded before mixing in one index.
+    """
+
+    def __init__(self, provider: dict[str, Any]):
+        self.provider = provider
+        self.adapter = provider["adapter"]
+        self.client = provider["client"]
+        capabilities = provider.get("capabilities") or {}
+        self.model = capabilities.get("embedding_model")
+        self.embedding_dim = capabilities.get("embedding_dim")
+
+    async def aembed(self, text: str) -> Optional[List[float]]:
+        return await self.adapter.aembed(
+            self.client,
+            text,
+            model=self.model,
+        )
+
+    async def aembed_batch(self, texts: List[str]) -> List[Optional[List[float]]]:
+        return await self.adapter.aembed_batch(
+            self.client,
+            texts,
+            model=self.model,
+        )
+
+
 def cosine_similarity(a: List[float], b: List[float]) -> float:
     """
     Compute cosine similarity between two vectors.
@@ -194,6 +228,9 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     Returns:
         Cosine similarity score (0-1, higher is more similar)
     """
+    if len(a) != len(b):
+        return 0.0
+
     a_np = np.array(a)
     b_np = np.array(b)
 
@@ -287,6 +324,25 @@ def get_embedding_service(
                 f"Ignoring new params and returning existing instance."
             )
     return _default_service
+
+
+def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optional[ProviderEmbeddingService]:
+    """Get the active chat provider's embedding service, if it has one.
+
+    When ``llm_service`` is omitted, a process-local ``LLMService`` is created
+    lazily. Callers that already own an agent-scoped ``LLMService`` should pass
+    it so model preference and route disabling are respected exactly.
+    """
+    if llm_service is not None:
+        return llm_service.get_embedding_service()
+
+    try:
+        from kestrel_sovereign.llm.service import LLMService
+
+        return LLMService().get_embedding_service()
+    except Exception as exc:
+        logger.warning("Provider embedding service not available: %s", exc)
+        return None
 
 
 def reset_embedding_service() -> None:

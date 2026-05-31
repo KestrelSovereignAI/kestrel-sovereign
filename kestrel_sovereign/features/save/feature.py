@@ -57,7 +57,11 @@ class SaveFeature(Feature):
     def _get_store(self) -> Optional[SavedItemsStore]:
         """Get or create the saved items store."""
         if self._saved_items_store is None and self._db:
-            self._saved_items_store = SavedItemsStore(self._db, self.agent_id)
+            self._saved_items_store = SavedItemsStore(
+                self._db,
+                self.agent_id,
+                llm_service=getattr(self.agent, "llm_service", None),
+            )
         return self._saved_items_store
 
     @staticmethod
