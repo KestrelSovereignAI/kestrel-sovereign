@@ -20,9 +20,10 @@
 > backend. The cognitive `MemoryRetriever` still uses keyword/concept
 > overlap for its semantic component in the current code; the
 > conversation-history vector column is storage groundwork for the
-> follow-up cosine path. Embedding generation itself still goes through
-> the current Ollama-backed `EmbeddingService` while another workstream
-> standardizes embedding functions on LLM providers.
+> follow-up cosine path. Saved-item and RAG embedding generation now
+> routes through the active LLM provider when it advertises embeddings
+> (OpenAI, Google/Gemini, Vertex, Ollama in tree) and falls back to
+> keyword/BM25/LIKE retrieval when the active route cannot embed.
 
 Kestrel's memory system is modeled on how human memory works. Memories
 are not stored in a flat database and retrieved by keyword match. They

@@ -29,7 +29,7 @@ This audit should become the working ledger for cleanup PRs. The recommended ord
 2026-05-31 package-boundary cleanup:
 
 - `README.md` no longer says the base `kestrel-sovereign` install includes voice or wallet/economics features. It now distinguishes bundled core, optional feature packages, and provider packages.
-- `README.md` now distinguishes completed SQLAlchemy/vector storage groundwork from the still-ongoing provider embedding standardization work.
+- `README.md` now distinguishes completed SQLAlchemy/vector storage groundwork from provider-backed embedding generation.
 - `kestrel_sovereign/data/feature_registry.toml` now documents that the catalog contains bundled core entries, optional feature packages, and provider package entries used by the Feature Store UI.
 - `docs/guides/BUILDING_FEATURES.md` now points external feature package authors at the SDK import surface.
 - Generated audience docs remain intentionally untouched until canonical inventories and runtime docs are reconciled enough to regenerate them safely.
@@ -38,7 +38,7 @@ This audit should become the working ledger for cleanup PRs. The recommended ord
 
 - `docs/architecture/storage/STORAGE_ARCHITECTURE.md` was rewritten from a stale pre-async storage plan into a current implementation snapshot covering `AsyncStorage`, `AsyncDatabase`, SQLAlchemy session factories, vector backends, and startup migrations.
 - `docs/architecture/MEMORY_SYSTEM.md` now reflects the actual six-factor `MemoryRetriever` weights and calls out that cognitive memory still uses keyword/concept overlap while `conversation_history.embedding_vec` prepares the vector path.
-- `docs/architecture/LLM_SERVICE_ARCHITECTURE.md` now states the current embedding execution truth: embeddings still flow through the Ollama-backed `EmbeddingService`; provider-standard embedding functions are architecture direction, not shipped behavior yet.
+- `docs/architecture/LLM_SERVICE_ARCHITECTURE.md` now states the current embedding execution truth: saved-items and RAG request embeddings through the active provider route when it advertises embedding support; providers without embeddings fall back to keyword/BM25/LIKE search.
 
 ## Evidence Snapshot
 

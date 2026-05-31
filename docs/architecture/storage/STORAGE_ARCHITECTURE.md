@@ -64,16 +64,20 @@ as shipped until the backend exists in `storage/vector/`.
 ## Embedding Generation
 
 Embedding storage and vector search are separate from embedding generation.
-Today the in-tree `EmbeddingService` is still Ollama-backed:
+Saved-items and RAG now resolve embeddings through the active agent-scoped LLM
+provider route when that route advertises embedding support:
 
-- default model: `nomic-embed-text`
-- default dimension: 768
-- alternate local models can change the dimension
+- OpenAI defaults to `text-embedding-3-small` at 1536 dimensions.
+- Google/Gemini and Vertex default to `text-embedding-004` at 768 dimensions.
+- Ollama defaults to `nomic-embed-text` at 768 dimensions.
+- Anthropic and OpenRouter currently advertise no embedding API, so storage
+  falls back to text/BM25/LIKE search.
 
-The next architecture step is standardizing embedding functions on LLM providers
-so embeddings are provider capabilities rather than a hardcoded Ollama side path.
-Until that work lands, docs should not say that OpenAI/Anthropic/OpenRouter/etc.
-provide Kestrel embeddings through the unified LLM adapter interface.
+The provider adapter boundary is a common Python shape, not a common semantic
+space: `Optional[list[float]]` for one embedding and one batch result slot per
+input text. Switching embedding models or providers can change both vector
+dimension and ranking behavior, so existing rows need re-embedding or matching
+vector columns before mixed-model semantic search should be trusted.
 
 ## Startup Migrations
 
