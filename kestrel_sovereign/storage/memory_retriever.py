@@ -34,8 +34,9 @@ See docs/architecture/MEMORY_SYSTEM.md for the full decision matrix.
 """
 import asyncio
 import logging
+import math
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 import json
 
 from .memory_models import MemoryMetadata
@@ -43,6 +44,35 @@ from .async_conversation_store import AsyncConversationStore
 from .associative_linker import AssociativeLinker
 
 logger = logging.getLogger(__name__)
+
+
+def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
+    """Cosine similarity normalised into ``[0, 1]``.
+
+    Returns ``None`` when the inputs are unusable (empty, length
+    mismatch, zero norm) so the caller can fall back to keyword
+    overlap for THIS row without mistaking "no signal" for
+    "neutral score." Otherwise returns ``(cos + 1) / 2`` so the
+    output sits in the same ``[0, 1]`` band the rest of
+    ``_score_semantic`` uses.
+
+    Pure-Python (no numpy) — the retriever rescores ~1000 rows
+    per call and a numpy import here adds a few ms of cold-start
+    cost per agent boot for no win at this dimension count.
+    """
+    if not a or not b or len(a) != len(b):
+        return None
+    dot = 0.0
+    norm_a = 0.0
+    norm_b = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        norm_a += x * x
+        norm_b += y * y
+    if norm_a <= 0.0 or norm_b <= 0.0:
+        return None
+    raw = dot / math.sqrt(norm_a * norm_b)
+    return max(0.0, min(1.0, (raw + 1.0) / 2.0))
 
 
 class MemoryRetriever:
@@ -122,6 +152,32 @@ class MemoryRetriever:
                 query, agent_id
             )
 
+        # Compute the query embedding ONCE if the conversation store
+        # has an embedding service. Done before the loop so we don't
+        # pay an Ollama round-trip per row. Any failure → None, which
+        # ``_score_semantic`` reads as "fall back to keyword overlap"
+        # for every row in this call.
+        query_embedding = await self._embed_query(query)
+
+        # If we have a query embedding, hydrate the row embeddings for
+        # the slice in one batched SELECT so we can apply cosine in
+        # ``_score_semantic`` without a per-row IO. Rows missing an
+        # embedding (legacy, pre-Phase-2-migration, or rows written
+        # while Ollama was down) get a None and fall back to keyword
+        # overlap naturally.
+        row_embeddings: Dict[Any, List[float]] = {}
+        if query_embedding is not None:
+            ids = [m.get("id") for m in history if m.get("id") is not None]
+            try:
+                row_embeddings = await self.conversations.get_message_embeddings(ids)
+            except Exception as e:
+                # Embedding load failure must NOT block retrieval —
+                # the keyword path is a complete fallback.
+                logger.warning(
+                    "Could not load row embeddings for vector cosine "
+                    "(falling back to keyword overlap): %s", e,
+                )
+
         # Normalize query for dedup comparison
         query_normalized = query.strip().lower()
 
@@ -148,6 +204,8 @@ class MemoryRetriever:
                 emotional_context=emotional_context,
                 created_at=msg.get("created_at"),
                 expanded_concepts=expanded_concepts,
+                query_embedding=query_embedding,
+                content_embedding=row_embeddings.get(msg.get("id")),
             )
 
             if score >= min_score:
@@ -205,12 +263,15 @@ class MemoryRetriever:
         emotional_context: Optional[MemoryMetadata],
         created_at: Optional[str],
         expanded_concepts: List[str],
+        query_embedding: Optional[List[float]] = None,
+        content_embedding: Optional[List[float]] = None,
     ) -> float:
         """
         Calculate weighted retrieval score.
 
         Components:
-        - semantic: 25% (keyword + concept overlap)
+        - semantic: 25% (keyword + concept overlap, OR vector cosine
+          when both query/content embeddings are present)
         - emotional: 20% (mood match)
         - importance: 20% (from metadata)
         - recency: 15% (with decay)
@@ -224,8 +285,17 @@ class MemoryRetriever:
             except (json.JSONDecodeError, TypeError):
                 metadata = {}
 
-        # 1. Semantic score (keyword overlap + concept match)
-        semantic = self._score_semantic(content, query, expanded_concepts)
+        # 1. Semantic score — vector cosine when we have embeddings
+        # for BOTH sides, keyword overlap otherwise. Cosine is a
+        # strict upgrade over keyword overlap (semantic similarity
+        # without literal token co-occurrence requirement), so a
+        # row with an embedding will score higher / lower
+        # correctly relative to keyword-only rows in the same call.
+        semantic = self._score_semantic(
+            content, query, expanded_concepts,
+            query_embedding=query_embedding,
+            content_embedding=content_embedding,
+        )
 
         # 2. Emotional score (mood congruence)
         emotional = self._score_emotional(metadata, emotional_context)
@@ -262,13 +332,51 @@ class MemoryRetriever:
         self,
         content: str,
         query: str,
-        expanded_concepts: List[str]
+        expanded_concepts: List[str],
+        query_embedding: Optional[List[float]] = None,
+        content_embedding: Optional[List[float]] = None,
     ) -> float:
         """
         Score semantic relevance.
 
-        Uses keyword overlap for now, can be upgraded to embeddings.
+        Two paths:
+
+        1. **Vector cosine** when both ``query_embedding`` and
+           ``content_embedding`` are present (Ollama nomic-embed-text
+           or whatever the conversation store is configured for).
+           Combined 70% cosine + 30% concept-bonus so the
+           concept-expansion path from :class:`AssociativeLinker` still
+           rewards related-concept matches the embedding might miss
+           on short utterances.
+        2. **Keyword overlap** fallback when embeddings aren't
+           available — same shape as the original
+           ``TODO: can be upgraded to embeddings`` implementation,
+           preserved verbatim so a deployment without Ollama keeps
+           the prior behaviour.
+
+        Mixing both paths within a single ``retrieve()`` call is
+        intentional: rows written before the Phase-2 migration / while
+        Ollama was down get keyword scores; new rows get cosine. The
+        scores are normalised into the same 0..1 band so this doesn't
+        produce a discontinuity in the final ranking.
         """
+        if query_embedding is not None and content_embedding is not None:
+            cosine = _cosine_unit(query_embedding, content_embedding)
+            if cosine is not None:
+                content_lower = content.lower()
+                concept_score = 0.0
+                if expanded_concepts:
+                    concept_matches = sum(
+                        1 for c in expanded_concepts if c in content_lower
+                    )
+                    concept_score = min(
+                        1.0, concept_matches / len(expanded_concepts)
+                    )
+                # Same 70/30 split the keyword path uses — keeps the
+                # weighting between "core signal" and "concept-expansion
+                # bonus" consistent across paths.
+                return cosine * 0.7 + concept_score * 0.3
+
         content_lower = content.lower()
         query_lower = query.lower()
 
@@ -299,6 +407,41 @@ class MemoryRetriever:
 
         # Combine: 70% keyword, 30% concept
         return keyword_score * 0.7 + concept_score * 0.3
+
+    async def _embed_query(self, query: str) -> Optional[List[float]]:
+        """Embed the retrieval query with the conversation store's
+        configured embedding service.
+
+        Returns ``None`` (and the retriever silently falls back to
+        keyword overlap for every row this call) when:
+
+        - The conversation store has no embedding service (opted out
+          via ``KESTREL_DISABLE_CONVERSATION_EMBEDDINGS=true``, or
+          lazy-acquire failed).
+        - The service raises (Ollama outage, model missing, timeout).
+        - The query is empty / whitespace.
+
+        Critically the SAME embedding service that WROTE the row
+        embeddings must produce the QUERY embedding — different
+        models would render cosine meaningless. We pull it from the
+        conversation store directly to guarantee that.
+        """
+        service = getattr(self.conversations, "embedding_service", None)
+        if service is None:
+            return None
+        if not query or not query.strip():
+            return None
+        try:
+            embedding = await service.aembed(query)
+        except Exception as e:
+            logger.warning(
+                "Query embedding failed (falling back to keyword "
+                "overlap for this retrieve): %s", e,
+            )
+            return None
+        if not embedding:
+            return None
+        return list(embedding)
 
     def _score_emotional(
         self,
