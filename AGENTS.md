@@ -120,6 +120,21 @@ Profiles, secrets, and env vars are configured in `deploy_config.toml`. See `doc
 
 ---
 
+## Authoring multi-agent Workflow scripts
+
+When using the Workflow tool with multiple stages (typically `observation → diagnosis → synthesis`), the synthesis stage tends to drift more confident than the upstream evidence — diagnosing a bug correctly and then asserting *state* (merged, shipped, closed) that observation never reported. That's narrative smoothing, and it caused [#1484](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1484).
+
+Rules for synthesis prompts in any workflow script:
+
+- **Quote upstream observation fields verbatim** before asserting state. Format: ``<observation-agent> reported `<field>: <value>`. Therefore <claim>.``
+- **No state claims beyond what observation returned.** If observation didn't return `merged_sha`, don't claim a merge.
+- **Distinguish diagnosis from state.** Diagnosis = *what the bug is* (be confident if upstream supports it). State = *what has happened in the world* (strictly observational).
+- **Don't infer state from diagnosis.** A correct-looking fix does not imply the fix has shipped.
+
+See [`docs/development/WORKFLOW_AUTHORING.md`](docs/development/WORKFLOW_AUTHORING.md) for the full convention, the reference synthesis prompt template, and the `#1479` incident the rule was filed from.
+
+---
+
 ## 📚 Lessons Learned (Case Studies)
 
 ### Model Selection System - What NOT to Do

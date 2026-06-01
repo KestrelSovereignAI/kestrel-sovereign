@@ -12,6 +12,7 @@ Developer notes, experiments, and technical development guides.
 | [remote_ollama.md](remote_ollama.md) | Guide for connecting to remote Ollama instances |
 | [SCOUT_PLAN_CODE.md](SCOUT_PLAN_CODE.md) | Scout-Plan-Code agentic development workflow proposal |
 | [SECURITY_AUDIT_REPORT.md](SECURITY_AUDIT_REPORT.md) | Security audit and code quality report |
+| [WORKFLOW_AUTHORING.md](WORKFLOW_AUTHORING.md) | Convention for authoring multi-agent Workflow scripts: separating state from diagnosis in synthesis |
 
 ## Getting Started
 
