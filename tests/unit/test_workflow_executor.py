@@ -248,6 +248,60 @@ class TestRunWorkflow:
         assert step["result"]["provider"] == "openai"
 
     @pytest.mark.asyncio
+    async def test_step_with_json_string_args(self, task_feature):
+        """JSON-string args remain supported for backward compatibility."""
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "model_agent", "skill": "list_models", "args": '{"provider": "openai"}'},
+        ])
+
+        assert result.status is ToolResultStatus.OK
+        step = result.data["results"][0]
+        assert step["result"]["provider"] == "openai"
+
+    @pytest.mark.asyncio
+    async def test_step_args_references_are_resolved_after_normalization(self, task_feature):
+        """Object args still get deep reference substitution."""
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "model_agent", "skill": "get_current_model"},
+            {
+                "feature": "model_agent",
+                "skill": "list_models",
+                "args": {"provider": "{{steps.0.result}}"},
+            },
+        ])
+
+        assert result.status is ToolResultStatus.OK
+        provider = result.data["results"][1]["result"]["provider"]
+        assert provider["model"] == "claude-sonnet-4-5-20250929"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("raw_args", "expected_type"),
+        [
+            ([], "list"),
+            (None, "NoneType"),
+            ('["not", "an", "object"]', "str decoding to list"),
+            ("{not json", "str: invalid JSON"),
+        ],
+    )
+    async def test_invalid_step_args_get_clear_validation_error(
+        self,
+        task_feature,
+        raw_args,
+        expected_type,
+    ):
+        """Invalid args name the step, target skill, and received type."""
+        result = await task_feature.run_workflow(steps=[
+            {"feature": "model_agent", "skill": "list_models", "args": raw_args},
+        ])
+
+        assert result.status is ToolResultStatus.ERROR
+        step = result.data["results"][0]
+        assert step["status"] == "failed"
+        assert f"Step 0 (model_agent.list_models)" in step["error"]
+        assert expected_type in step["error"]
+
+    @pytest.mark.asyncio
     async def test_unknown_feature_fails_gracefully(self, task_feature):
         """Unknown feature name produces a failed step, not a crash."""
         result = await task_feature.run_workflow(steps=[

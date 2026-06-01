@@ -18,6 +18,7 @@ kestrel-sovereign #1042 narration-honesty contract (see #1061).
 
 import asyncio
 import copy
+import json
 import logging
 import re
 import time
@@ -320,11 +321,24 @@ class TaskFeature(Feature):
                 })
                 continue
 
-            args = self._resolve_step_refs(
-                raw_args if isinstance(raw_args, dict) else {},
-                results,
-                i,
-            )
+            try:
+                normalized_args = self._normalize_step_args(
+                    raw_args,
+                    step_index=i,
+                    feature_name=feature_name,
+                    skill_name=skill_name,
+                )
+            except ValueError as e:
+                results.append({
+                    "step": i,
+                    "feature": feature_name,
+                    "skill": skill_name,
+                    "status": "failed",
+                    "error": str(e),
+                })
+                continue
+
+            args = self._resolve_step_refs(normalized_args, results, i)
 
             step_start = time.time()
             last_error: Optional[BaseException] = None
@@ -490,6 +504,37 @@ class TaskFeature(Feature):
         )
 
     @staticmethod
+    def _normalize_step_args(
+        raw_args: Any,
+        *,
+        step_index: int,
+        feature_name: str,
+        skill_name: str,
+    ) -> Dict[str, Any]:
+        if isinstance(raw_args, dict):
+            return raw_args
+        if isinstance(raw_args, str):
+            try:
+                decoded = json.loads(raw_args)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"Step {step_index} ({feature_name}.{skill_name}) args must be "
+                    f"an object/dict or JSON object string, got str: "
+                    f"invalid JSON at char {e.pos}"
+                ) from e
+            if isinstance(decoded, dict):
+                return decoded
+            raise ValueError(
+                f"Step {step_index} ({feature_name}.{skill_name}) args must be "
+                f"an object/dict or JSON object string, got str decoding to "
+                f"{type(decoded).__name__}"
+            )
+        raise ValueError(
+            f"Step {step_index} ({feature_name}.{skill_name}) args must be "
+            f"an object/dict or JSON object string, got {type(raw_args).__name__}"
+        )
+
+    @staticmethod
     def _serialize_step_payload(payload: Any) -> Any:
         """Walk a step's result payload and replace any ToolResult
         instance with its dict form.
@@ -651,10 +696,10 @@ class TaskFeature(Feature):
                     return replacement
                 return str(replacement)
 
-            result = _STEP_REF_PATTERN.sub(_replacer, val)
             single_match = _STEP_REF_PATTERN.fullmatch(val)
             if single_match:
                 return _replacer(single_match)
+            result = _STEP_REF_PATTERN.sub(_replacer, val)
             return result
 
         def _resolve_dict(d):
