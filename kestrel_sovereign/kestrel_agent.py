@@ -1616,7 +1616,17 @@ Expected Duration: {expected_duration}
 
             await self.bootstrap_service.set_bootstrap_state(BootstrapState.DISCOVERY)
 
-            # Store the wake-up message in conversation history
+            # Persist BOTH the user's first message AND the wake-up
+            # greeting (#1486). Pre-fix only the greeting landed, so
+            # the user's first message was silently dropped — never
+            # embedded, never available for future recall. The greeting
+            # is intentionally a non-sequitur ("what should I call
+            # you?" regardless of content) but the user's content
+            # still needs to land so the rest of the conversation can
+            # reference it. Matches the shape of the adjacent
+            # DISCOVERY branch (below) and the normal process_input
+            # path.
+            await self.privacy_agent.add_conversation("user", user_input, session_id=session_id)
             await self.privacy_agent.add_conversation("assistant", wake_up_msg, session_id=session_id)
 
             logging.info(f"[BOOTSTRAP] Agent waking up - entering discovery mode")
