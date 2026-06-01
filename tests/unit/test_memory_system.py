@@ -330,34 +330,187 @@ class TestMemoryRetriever:
         )
 
     @pytest.mark.asyncio
-    async def test_retrieve_skips_user_messages(self):
-        """User messages should not be returned as memories (prevents echo)."""
+    async def test_retrieve_includes_user_messages_with_role_preserved(self):
+        """User-role messages MUST surface — they carry biographical content
+        (preferences, names, dates, locations) that's the whole point of
+        recall in a conversational AI.
+
+        Echo prevention now relies on (a) the exact-query dedup at line 141
+        of ``memory_retriever.py`` and (b) role attribution in the injection
+        format at ``agent/memory_manager.py``. The old blanket
+        ``role=user`` skip from #271 over-broadly suppressed every user-
+        stated fact along with the questions it was trying to suppress.
+        See #1481.
+        """
         store = AsyncMock()
         store.get_conversation_history.return_value = [
-            {"role": "user", "content": "What is my favorite color?",
+            {"role": "user", "id": 1, "content": "My favorite color is blue.",
              "metadata": {}, "created_at": "2025-01-15 10:00:00"},
-            {"role": "assistant", "content": "Your favorite color is blue.",
-             "metadata": {"importance": 0.8}, "created_at": "2025-01-15 10:00:01"},
-            {"role": "user", "content": "Remember my lucky number is 42",
+            {"role": "assistant", "id": 2, "content": "Got it — blue.",
+             "metadata": {"importance": 0.5}, "created_at": "2025-01-15 10:00:01"},
+            {"role": "user", "id": 3, "content": "Remember my lucky number is 42",
              "metadata": {}, "created_at": "2025-01-15 10:01:00"},
-            {"role": "assistant", "content": "I will remember your lucky number is 42.",
-             "metadata": {"importance": 0.7}, "created_at": "2025-01-15 10:01:01"},
+            {"role": "assistant", "id": 4, "content": "I will remember 42.",
+             "metadata": {"importance": 0.5}, "created_at": "2025-01-15 10:01:01"},
         ]
+        store.embedding_service = None  # keyword-only path
 
         retriever = MemoryRetriever(store, None)
         results = await retriever.retrieve(
             query="favorite color",
             agent_id="test-agent",
             limit=10,
-            min_score=0.0
+            min_score=0.0,
         )
 
-        # Only assistant messages should be returned
-        for r in results:
-            assert r["role"] != "user", f"User message leaked into memories: {r['content']}"
-        # Should still find the assistant's answer
         contents = [r["content"] for r in results]
-        assert any("blue" in c for c in contents)
+        roles = [r["role"] for r in results]
+        # The user-stated fact must surface — it's the actual answer to the query.
+        assert any("blue" in c for c in contents), (
+            f"Expected to find user's biographical content; got {contents!r}"
+        )
+        # User-role messages must be present in the results.
+        assert "user" in roles, (
+            f"Expected at least one user-role memory in results; got roles={roles!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_retrieve_skips_exact_query_echo(self):
+        """The exact-match echo guard at line 141 is the only echo-prevention
+        layer now. Verify it still drops a row whose content exactly equals
+        the current query (case-insensitive, whitespace-trimmed).
+        """
+        store = AsyncMock()
+        store.get_conversation_history.return_value = [
+            {"role": "user", "id": 1, "content": "What is my favorite color?",
+             "metadata": {}, "created_at": "2025-01-15 10:00:00"},
+            {"role": "user", "id": 2, "content": "I love sailing.",
+             "metadata": {}, "created_at": "2025-01-15 10:01:00"},
+        ]
+        store.embedding_service = None
+
+        retriever = MemoryRetriever(store, None)
+        results = await retriever.retrieve(
+            query="What is my favorite color?",  # exact echo of row 1
+            agent_id="test-agent",
+            limit=10,
+            min_score=0.0,
+        )
+
+        # Row 1 (exact echo) MUST be dropped.
+        ids = [r.get("id") for r in results]
+        assert 1 not in ids, (
+            f"Exact-query echo should be dropped; got ids={ids!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_retrieve_echo_guard_normalizes_trivial_variants(self):
+        """Punctuation, casing, whitespace differences shouldn't let a
+        prior user question slip past the echo guard. Regression for
+        codex P2 round 2 on #1481 — the exact lowercase comparison was
+        too strict; ``what is my favorite color`` and
+        ``What is my favorite color?`` should both be treated as echoes.
+        """
+        store = AsyncMock()
+        store.get_conversation_history.return_value = [
+            {"role": "user", "id": 1,
+             "content": "<user_input>\nWhat is my favorite color?\n</user_input>",
+             "metadata": {}, "created_at": "2025-01-15 10:00:00"},
+        ]
+        store.embedding_service = None
+
+        retriever = MemoryRetriever(store, None)
+
+        for variant in [
+            "what is my favorite color",          # no punctuation
+            "  What is my favorite COLOR? ",       # extra whitespace + casing
+            "What\tis my\nfavorite color?",        # tab + newline
+            "What is my favorite color???",        # extra punctuation
+        ]:
+            results = await retriever.retrieve(
+                query=variant, agent_id="t", limit=10, min_score=0.0,
+            )
+            ids = [r.get("id") for r in results]
+            assert 1 not in ids, (
+                f"Echo variant {variant!r} should be dropped; got ids={ids!r}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_retrieve_echo_guard_preserves_internal_punctuation(self):
+        """Internal punctuation in alphanumeric tokens is semantically
+        meaningful — ``C++`` is not ``C``, ``1.2`` is not ``12``. Echo
+        normalization must edge-strip only. Regression for codex P3 on
+        #1481.
+        """
+        store = AsyncMock()
+        store.get_conversation_history.return_value = [
+            {"role": "user", "id": 1,
+             "content": "<user_input>\nI use C++.\n</user_input>",
+             "metadata": {}, "created_at": "2025-01-15 10:00:00"},
+            {"role": "user", "id": 2,
+             "content": "<user_input>\nVersion 1.2 ships next week.\n</user_input>",
+             "metadata": {}, "created_at": "2025-01-15 10:01:00"},
+        ]
+        store.embedding_service = None
+
+        retriever = MemoryRetriever(store, None)
+
+        # "I use C" must NOT echo-collide with "I use C++" (different facts).
+        results = await retriever.retrieve(
+            query="I use C", agent_id="t", limit=10, min_score=0.0,
+        )
+        ids = [r.get("id") for r in results]
+        assert 1 in ids, (
+            f"Internal punct (C++) collapsed to (C); got ids={ids!r}"
+        )
+
+        # "Version 12" must NOT echo-collide with "Version 1.2".
+        results = await retriever.retrieve(
+            query="Version 12 ships next week", agent_id="t",
+            limit=10, min_score=0.0,
+        )
+        ids = [r.get("id") for r in results]
+        assert 2 in ids, (
+            f"Internal punct (1.2) collapsed to (12); got ids={ids!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_retrieve_echo_guard_strips_user_input_wrapper(self):
+        """User turns are persisted wrapped via ``wrap_user_input`` as
+        ``<user_input>\\n...\\n</user_input>``. The echo guard MUST unwrap
+        before comparing — otherwise a literal repeat of a prior question
+        bypasses the guard and gets surfaced as a memory.
+
+        Regression for codex P2 on #1481: without ``extract_raw_user_content``
+        the comparison ``content.strip().lower() == query_normalized`` would
+        only fire on raw test data, never on production-wrapped chat rows.
+        """
+        store = AsyncMock()
+        store.get_conversation_history.return_value = [
+            {"role": "user", "id": 1,
+             "content": "<user_input>\nWhat is my favorite color?\n</user_input>",
+             "metadata": {}, "created_at": "2025-01-15 10:00:00"},
+            {"role": "user", "id": 2,
+             "content": "<user_input>\nI love sailing.\n</user_input>",
+             "metadata": {}, "created_at": "2025-01-15 10:01:00"},
+        ]
+        store.embedding_service = None
+
+        retriever = MemoryRetriever(store, None)
+        results = await retriever.retrieve(
+            query="What is my favorite color?",  # raw — matches unwrapped row 1
+            agent_id="test-agent",
+            limit=10,
+            min_score=0.0,
+        )
+
+        ids = [r.get("id") for r in results]
+        assert 1 not in ids, (
+            f"Wrapped-content echo should still be dropped after unwrap; "
+            f"got ids={ids!r}"
+        )
+        # Row 2 (biographical fact, not the query) MUST still surface.
+        assert 2 in ids, f"Expected row 2 to surface; got ids={ids!r}"
 
 
 class TestDecayCalculation:

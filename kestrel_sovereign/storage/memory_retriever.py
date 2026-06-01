@@ -42,8 +42,40 @@ import json
 from .memory_models import MemoryMetadata
 from .async_conversation_store import AsyncConversationStore
 from .associative_linker import AssociativeLinker
+from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 logger = logging.getLogger(__name__)
+
+
+_ECHO_EDGE_PUNCT = ".,;:!?\"'()[]{}"
+
+
+def _normalize_for_echo_check(text: str) -> str:
+    """Normalize for the near-duplicate echo guard.
+
+    Tokenizes on whitespace, edge-strips sentence-ending punctuation
+    and quotes/brackets from each token, collapses to a single space,
+    lowercases. Used ONLY to drop a stored row whose content is
+    effectively the same string as the current query — NOT for any
+    scoring path.
+
+    Edge-strip ONLY sentence punctuation + quotes/brackets, NOT
+    operators or modifiers. ``C++`` and ``C`` must stay distinct;
+    same for ``version 1.2`` vs ``version 12``. Trying to strip every
+    punctuation byte conflates them. The narrower
+    ``.,;:!?\"'()[]{}`` set is enough to drop the trivial variants
+    the echo guard targets (``color?`` vs ``color``, ``"hello"`` vs
+    ``hello``) without touching internal alphanumeric punctuation.
+    (Codex P3 on #1481.)
+    """
+    if not text:
+        return ""
+    tokens = []
+    for tok in text.split():
+        tok = tok.strip(_ECHO_EDGE_PUNCT)
+        if tok:
+            tokens.append(tok.lower())
+    return " ".join(tokens)
 
 
 def _cosine_unit(a: Sequence[float], b: Sequence[float]) -> Optional[float]:
@@ -178,23 +210,42 @@ class MemoryRetriever:
                     "(falling back to keyword overlap): %s", e,
                 )
 
-        # Normalize query for dedup comparison
-        query_normalized = query.strip().lower()
+        # Normalize query for dedup comparison. The echo guard below is
+        # the only barrier between a literal prior user question and it
+        # resurfacing as a "memory" of itself — so the normalization
+        # needs to be aggressive enough to catch trivial variants
+        # (different punctuation, extra whitespace, casing) without
+        # being so loose it would conflate genuinely different
+        # sentences. Strip ASCII punctuation, collapse internal
+        # whitespace to single spaces, lowercase. (Codex P2 round 2
+        # on #1481 — exact-match was too strict.)
+        query_normalized = _normalize_for_echo_check(query)
 
         # Score each message
         scored: List[Tuple[Dict[str, Any], float]] = []
 
         for msg in history:
-            # Skip user messages — they're questions/requests, not knowledge.
-            # Only assistant and system messages contain useful recall content.
-            if msg.get("role") == "user":
-                continue
-
             content = msg.get("content", "")
 
-            # Skip messages that are near-duplicates of the current query
-            # (prevents echoing back the user's own question from a prior turn)
-            if content.strip().lower() == query_normalized:
+            # Skip messages that are near-duplicates of the current query.
+            # This is the ONLY echo guard now — the prior blanket
+            # ``role=user`` skip from #271 was over-broad: it threw out
+            # every user-stated biographical fact ("I love sailing on
+            # Lake Michigan", "My birthday is April 3rd") along with
+            # the questions it was trying to suppress. The injection
+            # format in ``agent/memory_manager.py`` now prefixes each
+            # memory with ``User:`` / ``Assistant:`` so the LLM reads
+            # surfaced user-role content with explicit provenance and
+            # won't confuse it with its own prior thoughts. See #1481.
+            #
+            # User turns are persisted wrapped via ``wrap_user_input``
+            # (``<user_input>\n...\n</user_input>``) — strip the wrapper
+            # before comparing so the echo guard fires on production
+            # rows, not just on synthetic test data. (Codex P2 on PR-1481.)
+            comparison_content = content
+            if msg.get("role") == "user":
+                comparison_content = extract_raw_user_content(content)
+            if _normalize_for_echo_check(comparison_content) == query_normalized:
                 continue
 
             score = self._calculate_score(
