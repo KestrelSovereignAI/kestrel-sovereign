@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-05-31
-**Scope:** 1614 tracked files (1036 `.py`, 295 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-01
+**Scope:** 1619 tracked files (1041 `.py`, 295 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -273,12 +273,12 @@ Repo entry points and standard project files.
   - `class ChannelRegistry`
 - **kestrel_sovereign/features/cli/__init__.py** — Feature-owned CLI adapter support.
 - **kestrel_sovereign/features/cli/adapters.py** — Feature-owned CLI adapters.
-  - `class CliAdapterError`; `class CliAvailabilityReport`; `class FeatureCliAdapter`; `class GitHubCliAdapter`; `class GitCliAdapter`; `def redact_json(value)`
+  - `class CliAdapterError`; `class CliAvailabilityReport`; `class FeatureCliAdapter`; `class GitCliAdapter`
 - **kestrel_sovereign/features/cli/component.yaml** — (configuration)
 - **kestrel_sovereign/features/cli/feature.py** — CLI feature: registered feature-owned command-line adapters.
   - `class CliFeature`
 - **kestrel_sovereign/features/cli/terminal.py** — Shared terminal execution substrate for feature-owned CLI adapters.
-  - `class CliRisk`; `class ToolAvailability`; `class TerminalCommandRequest`; `class TerminalCommandResult`; `class CliToolDeclaration`; `class CliCommandDefinition`; `class TerminalExecutionService`; `def redact_secrets(value)`; `…`
+  - `class CliRisk`; `class ToolAvailability`; `class TerminalCommandRequest`; `class TerminalCommandResult`; `class CliToolDeclaration`; `class CliCommandDefinition`; `class TerminalExecutionService`; `def redact_secrets(value)`
 - **kestrel_sovereign/features/compute/__init__.py** — Kestrel Compute Feature - Execute scripts with constitutional security controls.
 - **kestrel_sovereign/features/compute/component.yaml** — (configuration)
 - **kestrel_sovereign/features/compute/destructive_policy.py** — Kestrel Compute Feature - Destructive Operation Policy.
@@ -598,7 +598,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/continuation_store.py** — Per-conversation continuation cursor store for stateful provider protocols.
   - `class ContinuationCursor`; `class ContinuationStore`; `class InMemoryContinuationStore`
 - **kestrel_sovereign/llm/embedding_service.py** — Embedding Service for Kestrel.
-  - `class EmbeddingService`; `def cosine_similarity(a, b)`; `async def semantic_search(query, documents, embedding_service, top_k)`; `def get_embedding_service(model, base_url)`; `def reset_embedding_service()`
+  - `class EmbeddingService`; `class ProviderEmbeddingService`; `def cosine_similarity(a, b)`; `async def semantic_search(query, documents, embedding_service, top_k)`; `def get_embedding_service(model, base_url)`; `def get_provider_embedding_service(llm_service)`; `def reset_embedding_service()`
 - **kestrel_sovereign/llm/error_handling.py** — Error handling decorators and utilities for LLM operations.
   - `class LLMError`; `class LLMProviderError`; `class LLMProviderTimeoutError`; `class LLMProviderAuthError`; `class LLMProviderQuotaError`; `class LLMProviderUnavailableError`; `class LLMAllProvidersFailedError`; `def handle_llm_errors(provider_name, log_errors, reraise_as)`; `…`
 - **kestrel_sovereign/llm/google_adapter.py** — Google Gemini Adapter
@@ -916,10 +916,12 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/sqla/__init__.py** — SQLAlchemy infrastructure for sovereign-core storage.
 - **kestrel_sovereign/storage/sqla/base.py** — Declarative base for sovereign-core SQLAlchemy entities.
   - `class SovereignBase`
+- **kestrel_sovereign/storage/sqla/conversation_message.py** — SQLAlchemy mapping of the ``conversation_history`` table.
+  - `def resolve_embedding_dim(env)`; `class ConversationMessage`; `def build_conversation_message_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/document_chunk.py** — SQLAlchemy mapping of the ``document_chunks`` table.
   - `class DocumentChunk`; `def build_document_chunk_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/migrations.py** — One-time data migrations for sovereign-core SQLAlchemy entities.
-  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`
+  - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`; `async def migrate_conversation_history_add_embedding_vec(db)`
 - **kestrel_sovereign/storage/sqla/saved_item.py** — SQLAlchemy mapping of the ``saved_items`` table.
   - `class SavedItem`; `def build_saved_item_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/session.py** — Construct async SQLAlchemy session factories that connect to the same database as a given :class:`AsyncDatabase`.
@@ -1213,10 +1215,10 @@ Repo entry points and standard project files.
 - **docs/architecture/security/SERIALIZATION_COMPATIBILITY.md** — Serialization Compatibility Matrix — **Status:** Wave 0A deliverable.
 - **docs/architecture/security/SUCCESSION_RUNBOOK.md** — Hybrid-Identity Rotation Runbook — > **Wave 3 of Quantum Hardening (#921, #918)** — operational procedure for migrating a legacy `did:pkh` Kestrel agent to a hybrid `did:web` identity (Ed25519 + ML-DSA-65) via a signed succession stat…
 - **docs/architecture/storage/DECENTRALIZED_STORAGE.md** — Decentralized Storage Vision: IPFS & Filecoin Integration — **Last Updated:** March 11, 2026
-- **docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md** — Human-Like Memory System — **Last Updated:** January 25, 2026 **Status:** 🟢 Implemented **Commit:** `0b83115`
+- **docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md** — Human-Like Memory System — **Last Updated:** 2026-05-31 **Status:** Historical companion; canonical implementation details live in [`../MEMORY_SYSTEM.md`](../MEMORY_SYSTEM.md) **Commit:** `0b83115` This page preserves the orig…
 - **docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md** — Sovereignty Implementation — **Date:** November 21, 2025 **Status:** ✅ **COMPLETE** - V2 Architecture with Convergent Sharding **Tests:** 16/16 passing (100%) **Vision:** "Your AI companion can never be taken away from you"
 - **docs/architecture/storage/SOVEREIGNTY_V2_TECHNICAL.md** — Convergent Sharding & Merkle Forests: Kestrel Storage V2 — **Technical Architecture Document**
-- **docs/architecture/storage/STORAGE_ARCHITECTURE.md** — Kestrel Storage Architecture - Multi-Tier Design — **Last Updated:** December 8, 2025 **Status:** 🟢 Partially Implemented
+- **docs/architecture/storage/STORAGE_ARCHITECTURE.md** — Kestrel Storage Architecture — **Status:** Active implementation snapshot **Last updated:** 2026-05-31
 - **docs/architecture/subagent_isolation_audit.md** — Subagent Isolation Audit — **Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569) **Phase:** 1 (Audit Only -- No…
 - **docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md** — LLM Router Enhancement - Comprehensive Testing Plan — ## Testing Philosophy - **REAL TESTS ONLY - NO MOCKS** - Tests use real Ollama (localhost:11434), real OpenAI API, real filesystem - Tests create and verify real data - Tests measure real performance…
 - **docs/architecture/testing/TESTING_GUIDE.md** — Kestrel Test Strategy Guide — A comprehensive guide to running and writing tests for Kestrel Sovereign.
@@ -1815,7 +1817,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
   - `class TestArgumentParsing`; `class TestCommandDispatch`; `class TestProcessHelpers`; `def multi_agent_env(tmp_path)`; `class TestCmdList`; `class TestCmdStatus`; `class TestCmdStorage`; `class TestCmdStop`; `…`
 - **tests/unit/test_cli_adapter_feature.py** — Tests for feature-owned CLI adapter support.
-  - `class FakeTerminal`; `class FakeApprovalQueue`; `async def test_github_pr_view_uses_registered_read_only_gh_command()`; `async def test_github_issue_view_uses_registered_read_only_gh_command()`; `async def test_terminal_execution_blocks_non_read_only_without_approval_callback()`; `async def test_terminal_execution_blocks_non_read_only_when_approval_denies()`; `async def test_terminal_execution_runs_non_read_only_after_approval()`; `async def test_cli_feature_approval_callback_uses_security_queue()`; `…`
+  - `class FakeTerminal`; `class FakeApprovalQueue`; `def git_repo(tmp_path)`; `async def test_terminal_execution_blocks_non_read_only_without_approval_callback()`; `async def test_terminal_execution_blocks_non_read_only_when_approval_denies()`; `async def test_terminal_execution_runs_non_read_only_after_approval()`; `async def test_cli_feature_approval_callback_uses_security_queue()`; `async def test_cli_feature_approval_callback_fails_closed_without_security_queue()`; `…`
 - **tests/unit/test_cli_agent_docker.py** — ``kestrel agent docker`` CLI tests — sub-PR 3.2 of epic #1050 (bash-to-Python port of ``scripts/sovereign-agent.sh``).
   - `def test_argparse_create_minimal()`; `def test_argparse_chat()`; `def test_argparse_retire_with_yes()`; `def test_kestrel_cli_registers_agent_docker()`; `def test_cmd_agent_no_subverb_prints_usage(capsys)`; `def test_cmd_agent_docker_no_subverb_prints_usage(capsys)`; `def test_create_without_data_key_errors_with_hint(monkeypatch, capsys)`; `def test_chat_without_data_key_errors(monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli_constitution_reanchor.py** — Unit tests for the ``kestrel constitution reanchor`` CLI surface.
@@ -1834,6 +1836,8 @@ Repo entry points and standard project files.
   - `def test_argparse_build_defaults()`; `def test_argparse_build_overrides()`; `def test_argparse_run_defaults()`; `def test_argparse_run_overrides()`; `def test_kestrel_cli_registers_docker_remote()`; `def test_cmd_docker_no_subverb_prints_usage(capsys)`; `def test_cmd_docker_remote_no_subverb_prints_usage(capsys)`; `def test_build_invokes_docker_build_with_defaults(monkeypatch)`; `…`
 - **tests/unit/test_cli_feature.py** — Tests for the Feature CLI commands (kestrel feature list/install/enable/disable/info/scaffold/skills).
   - `class TestFeatureList`; `class TestFeatureInstall`; `class TestFeatureEnableDisable`; `class TestFeatureInfo`; `class TestFeatureScaffold`; `class TestFeatureSkills`; `class TestSkillsSearch`; `class TestResolveFeatureName`; `…`
+- **tests/unit/test_cli_feature_upgrade.py** — Tests for `kestrel feature upgrade`.
+  - `def fake_registry(monkeypatch)`; `def test_parse_pip_installed_version_extracts_only_matching_package()`; `def test_editable_install_path_reads_direct_url(monkeypatch)`; `def test_upgrade_dry_run_changes_nothing(monkeypatch, fake_registry, capsys)`; `def test_upgrade_skips_editable_and_pip_upgrades_others(monkeypatch, fake_registry, capsys)`; `def test_upgrade_subset_by_name_only_targets_match(monkeypatch, fake_registry, capsys)`; `def test_upgrade_unmatched_name_is_reported(monkeypatch, fake_registry, capsys)`; `def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, capsys)`; `…`
 - **tests/unit/test_cli_first_run.py** — Tests for the first-run setup hook in `kestrel start`.
   - `def test_first_run_returns_none_when_env_exists(tmp_path)`; `def test_first_run_returns_none_when_agent_already_registered(tmp_path)`; `def test_first_run_fires_when_multi_agent_has_no_agents(tmp_path)`; `def test_first_run_tolerates_corrupt_multi_agent(tmp_path)`; `def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch)`; `def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch)`; `def test_first_run_still_fires_when_git_is_directory(tmp_path, monkeypatch)`; `def test_first_run_non_tty_exits_with_hint(tmp_path, capsys, monkeypatch)`; `…`
 - **tests/unit/test_cli_ipfs.py** — ``kestrel ipfs`` CLI tests — sub-PR 4 of epic #1050 (bash-to-Python port of ``scripts/ipfs/{build,deploy,pin_agents}.sh``).
@@ -1920,10 +1924,14 @@ Repo entry points and standard project files.
   - `class TestIdentityChallenge`; `class TestChallengeResult`; `class TestContinuityScore`; `class TestMigrationCertificate`; `class TestChallengeGenerator`; `class TestContinuityVerifier`; `class TestAuditTrail`; `class TestVerifyMigration`
 - **tests/unit/test_conversation_manager.py** — Unit tests for ConversationManager.
   - `class MockTokenCounter`; `class MockTokenBudget`; `class MockConversationStore`; `class MockAsyncStorage`; `class MockLLMService`; `def mock_storage()`; `def conversation_manager(mock_storage)`; `def mock_counter()`; `…`
+- **tests/unit/test_conversation_message_sqla.py** — Tests for the ``conversation_history`` SQLAlchemy entity + greenfield ``embedding_vec`` migration.
+  - `def test_conversation_message_table_name()`; `def test_conversation_message_embedding_uses_portable_vector()`; `def test_conversation_message_maps_expected_columns()`; `def test_build_spec_rejects_non_positive_dimension()`; `def test_build_spec_requires_agent_id()`; `def test_build_spec_exposes_optional_filters()`; `def test_build_spec_has_no_tenant_filter_key()`; `def test_build_spec_passes_through_runtime_dimension()`; `…`
 - **tests/unit/test_conversation_rename_storage.py** — Storage-layer tests for user-assigned conversation names (issue #716).
   - `async def store()`; `async def test_set_then_get_roundtrips(store)`; `async def test_set_trims_whitespace(store)`; `async def test_set_caps_length(store)`; `async def test_empty_string_clears(store)`; `async def test_whitespace_only_clears(store)`; `async def test_none_clears(store)`; `async def test_upsert_overwrites_previous_name(store)`; `…`
 - **tests/unit/test_conversation_sent_form.py** — Sent-form metadata round-trip for user-turn storage.
   - `async def store()`; `class TestSentFormMetadataRoundTrip`
+- **tests/unit/test_conversation_store_embedding_write.py** — Tests for the optional embedding-write path on :meth:`AsyncConversationStore.add_conversation`.
+  - `def test_serialize_embedding_round_trips_float32()`; `def test_format_pgvector_text_round_trips()`; `async def test_add_conversation_without_service_uses_legacy_insert()`; `def small_embedding_dim(monkeypatch)`; `async def test_add_conversation_with_service_writes_embedding_vec_sqlite(small_embedding_dim)`; `async def test_add_conversation_with_service_writes_embedding_vec_postgres(small_embedding_dim)`; `async def test_add_conversation_falls_back_when_aembed_returns_none()`; `async def test_add_conversation_falls_back_when_aembed_raises()`; `…`
 - **tests/unit/test_cors_middleware.py** — Tests for CORS middleware configuration in server.py.
   - `class TestCORSDefaults`; `class TestCORSEnvironmentOverride`
 - **tests/unit/test_cron_parser.py** — Unit tests for the lightweight cron expression parser.
@@ -1991,7 +1999,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_emancipation_contract.py** — Unit tests for ``kestrel_sovereign.constitution.emancipation``.
   - `def test_parse_returns_none_when_block_absent()`; `def test_parse_dormant_when_disabled_explicitly()`; `def test_parse_active_minimal()`; `def test_parse_active_full()`; `def test_parse_active_requires_terms()`; `def test_parse_active_rejects_empty_terms()`; `def test_parse_rejects_non_string_terms()`; `def test_parse_rejects_non_list_proofs()`; `…`
 - **tests/unit/test_embedding_service_missing_model.py** — Soften the first-run UX when Ollama hasn't pulled the embedding model yet — #657.
-  - `class TestModelNotFoundIsWarningNotError`
+  - `class TestModelNotFoundIsWarningNotError`; `def test_cosine_similarity_returns_zero_for_dimension_mismatch()`
 - **tests/unit/test_emma_closed_loop.py** — Unit tests for the Emma closed-loop machinery (epic #1290).
   - `def test_derive_command_shell_and_compute()`; `async def test_policy_match_positive_and_scopes()`; `async def test_repo_scope_is_exact_not_substring()`; `async def test_rule_without_repo_scope_never_auto_approves()`; `def test_suggest_rule_has_trailing_boundary()`; `def test_suggest_rule_from_command_is_conservative()`; `async def store()`; `async def test_two_phase_audit(store)`; `…`
 - **tests/unit/test_encryption.py** — Unit tests for storage/encryption.py
@@ -2109,7 +2117,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_lighthouse_rest.py** — Tests for Lighthouse REST client.
   - `def client()`; `def mock_response()`; `class TestLighthouseRestClient`
 - **tests/unit/test_llm_provider_capabilities.py** — —
-  - `class BareAdapter`; `class DictCapabilitiesAdapter`; `def test_provider_capabilities_to_dict_uses_wire_values()`; `def test_adapter_capabilities_normalizes_plugin_dicts()`; `def test_base_adapter_capabilities_are_conservative()`; `def test_llm_service_route_dicts_include_capabilities()`; `def test_provider_registry_sets_sdk_capabilities_on_built_routes(monkeypatch)`; `def test_in_tree_adapter_capability_matrix()`
+  - `class BareAdapter`; `class DictCapabilitiesAdapter`; `def test_provider_capabilities_to_dict_uses_wire_values()`; `def test_adapter_capabilities_normalizes_plugin_dicts()`; `def test_base_adapter_capabilities_are_conservative()`; `def test_llm_service_route_dicts_include_capabilities()`; `def test_llm_service_embedding_provider_follows_active_route()`; `def test_llm_service_embedding_provider_degrades_when_active_route_cannot_embed()`; `…`
 - **tests/unit/test_llm_service.py** — Unit tests for LLMService core methods.
   - `def mock_config()`; `def mock_mandate_config()`; `def mock_openai_client()`; `def mock_adapter()`; `def mock_provider_registry(mock_openai_client, mock_adapter)`; `async def llm_service(mock_config, mock_mandate_config, mock_provider_registry)`; `class TestModelPreference`; `class TestCoreGeneration`; `…`
 - **tests/unit/test_llm_service_attach.py** — Unit tests for LLMService.attach_to_agent.
@@ -2132,6 +2140,8 @@ Repo entry points and standard project files.
   - `def test_strip_helper_pulls_raw_text_from_user_rows_only()`; `def test_strip_helper_leaves_metadata_untouched()`; `def test_strip_helper_does_not_mutate_input()`; `async def test_search_memory_returns_raw_user_text_to_llm()`; `async def test_recall_recent_returns_raw_user_text_to_llm()`; `def test_idempotent_on_assistant_content_that_happens_to_contain_user_input_tag()`
 - **tests/unit/test_memory_manager.py** — Unit tests for MemoryManager.
   - `class TestMemoryManagerInit`; `class TestStashMessages`; `class TestStashPop`; `class TestStashApply`; `class TestStashList`; `class TestStashDrop`; `class TestStashSave`; `class TestStashPeek`; `…`
+- **tests/unit/test_memory_retriever_cosine.py** — Tests for the vector-cosine semantic-score path on :class:`MemoryRetriever`.
+  - `def test_cosine_unit_identical_vectors_is_one()`; `def test_cosine_unit_opposite_vectors_is_zero()`; `def test_cosine_unit_orthogonal_vectors_is_half()`; `def test_cosine_unit_returns_none_on_length_mismatch()`; `def test_cosine_unit_returns_none_on_zero_norm()`; `async def test_embed_query_returns_none_without_service()`; `async def test_embed_query_returns_none_for_empty_query()`; `async def test_embed_query_returns_none_on_aembed_failure()`; `…`
 - **tests/unit/test_memory_system.py** — Unit tests for Human-Like Memory System.
   - `class TestEmotionalTagger`; `class TestTemporalAnalyzer`; `class TestAssociativeLinker`; `class TestMemoryRetriever`; `class TestDecayCalculation`; `class TestMemoryMetadata`; `class TestTemporalPattern`; `class TestMemoryEpisode`; `…`
 - **tests/unit/test_memory_wiring.py** — Integration-style tests that verify the memory pipeline is actually WIRED, not just that individual components work in isolation.
