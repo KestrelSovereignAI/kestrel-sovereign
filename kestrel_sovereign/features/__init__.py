@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, List, Type, Optional, Set
 
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.subagent_dispatch import ensure_subagent_dispatch
 # Discovery checks against the SDK base so extracted package features
 # (which inherit from kestrel_sdk.features.base.Feature) are recognized.
 # Sovereign's Feature is itself a subclass of _SdkFeature, so internal
@@ -276,6 +277,12 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         if class_name in discovered_names:
             logger.debug(f"Skipping duplicate feature: {class_name} (from {source})")
             return
+
+        # External (SDK-base) features lack the runtime-coupled subagent-dispatch
+        # methods that live on the sovereign Feature base, so the orchestrator
+        # would silently skip them. Inject the dispatch cluster so in-tree and
+        # external features are dispatchable identically. No-op for in-tree.
+        feature_class = ensure_subagent_dispatch(feature_class)
 
         feature = feature_class(agent)
         features.append(feature)
