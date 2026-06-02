@@ -54,6 +54,74 @@ class TestTokenizeForSearch:
         assert "memory" in tokens
         assert "context" in tokens
 
+    def test_negation_tokens_preserved(self):
+        """Negation must stay in the token set or recall surfaces opposite-meaning
+        memories. e.g. "do not use OpenAI" must not reduce to "use openai".
+        Codex round 1 P2 on #1500 rescue."""
+        for negator in ("not", "no", "never", "neither", "nor", "without"):
+            tokens = _tokenize_for_search(f"do {negator} use OpenAI")
+            assert negator in tokens, (
+                f"{negator!r} must not be stripped — it changes the semantics "
+                "of the query"
+            )
+
+
+class TestNegationGate:
+    """The negation equivalence-class gate prevents opposite-meaning rows
+    from satisfying tokenized fallback (codex rounds 1-4 on #1500 rescue)."""
+
+    def test_negator_missing_in_content_rejects(self):
+        # "no use openai" against opposite-meaning "normally use openai":
+        # without the gate this scored 3/3=1.0 (substring "no" hit "normally")
+        # or 2/3 (word-boundary). Both above threshold — false positive.
+        # Hard gate forces 0.0.
+        score = _token_match_score(["no", "use", "openai"], "normally use openai")
+        assert score == 0.0
+
+        for negator in ("not", "never", "neither", "nor", "without"):
+            score = _token_match_score(
+                [negator, "use", "openai"], "use openai now"
+            )
+            assert score == 0.0, f"missing {negator!r} must hard-reject the row"
+
+    def test_negator_equivalence_class_in_content_passes(self):
+        # "not use openai" should still match "never use openai" — same
+        # negated meaning, different negator word (codex round 4 P2).
+        score = _token_match_score(["not", "use", "openai"], "never use openai")
+        # Substring "not" in "never"? "never" = n-e-v-e-r → "not" not a
+        # substring. So "not" doesn't hit per-token, but the GATE passes
+        # because "never" is a recognized negator in content. Score = 2/3.
+        assert score == pytest.approx(2 / 3)
+
+    def test_negator_in_query_and_same_negator_in_content_full_score(self):
+        score = _token_match_score(["no", "use", "openai"], "do no use openai please")
+        assert score == 1.0
+
+    def test_query_without_negator_unaffected(self):
+        score = _token_match_score(["use", "openai"], "we should use openai today")
+        assert score == 1.0
+
+
+class TestTechnicalTermsUnregressed:
+    """Codex round 4 P2: word-boundary matching for short non-negators
+    regressed technical-term fallback because Python's ``\\b`` treats ``_``
+    as a word character. Plain substring is preserved for non-negators."""
+
+    def test_short_tech_terms_substring_match_api_key(self):
+        # "api" in "api_key" — substring hit, was MISS under word-boundary.
+        score = _token_match_score(["openai", "api", "key"], "openai api_key configured")
+        # api hits inside api_key, key hits inside api_key, openai hits.
+        assert score == 1.0
+
+    def test_compound_word_substring_match(self):
+        for content in (
+            "the memorystore design",
+            "memory-management subsystem",
+            "the in-memory layout",
+        ):
+            score = _token_match_score(["memory"], content)
+            assert score == 1.0, f"substring match should hit on {content!r}"
+
 
 class TestTokenMatchScore:
     def test_all_tokens_present(self):

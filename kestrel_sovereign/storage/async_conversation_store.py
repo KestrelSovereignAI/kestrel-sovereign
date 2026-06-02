@@ -79,10 +79,17 @@ def _rows_affected(result) -> int:
 
 # Stopwords excluded from tokenized fallback matching so that common
 # filler words in natural-language queries don't inflate match scores.
+#
+# DELIBERATELY KEPT IN: negation tokens (``not``, ``no``, ``never``,
+# ``neither``, ``nor``, ``without``). Stripping them would let a query
+# like "do not use OpenAI" reduce to "use openai" and match memories
+# with the OPPOSITE meaning. Negation is semantically load-bearing in
+# recall queries; better to leave it in and let the threshold gate
+# borderline matches.
 _SEARCH_STOPWORDS = frozenset({
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
     "of", "with", "by", "from", "is", "it", "as", "be", "was", "are",
-    "been", "do", "did", "does", "has", "have", "had", "not", "no",
+    "been", "do", "did", "does", "has", "have", "had",
     "this", "that", "these", "those", "my", "your", "our", "we", "i",
     "me", "you", "he", "she", "they", "them", "his", "her", "its",
     "what", "which", "who", "whom", "how", "when", "where", "why",
@@ -104,15 +111,44 @@ def _tokenize_for_search(text: str) -> List[str]:
     ]
 
 
+# Negation tokens form a semantic-equivalence class for the fallback
+# matcher. When the query contains ANY negator, the content must contain
+# AT LEAST ONE negator from this class (word-boundary-matched, so "no"
+# doesn't substring-hit inside "normally") or the row is rejected as
+# opposite-meaning. This handles both the substring false-positive
+# (codex r2 P2) and the cross-negator equivalence — "not" in the query
+# should still accept "never use OpenAI" content (codex r4 P2).
+#
+# Word-boundary matching is restricted to negators because applying it to
+# all short tokens regressed technical-term fallback: under \b the token
+# ``api`` failed to match ``api_key`` (Python treats ``_`` as a word
+# character), dropping common queries below the 0.6 threshold.
+_NEGATION_TOKENS = frozenset({
+    "no", "not", "never", "neither", "nor", "without",
+})
+
+
 def _token_match_score(query_tokens: List[str], content_lower: str) -> float:
     """Return the fraction of *query_tokens* found in *content_lower*.
 
-    Each token is checked as a substring (not word-boundary) so partial
-    matches like "mgmt" inside "management" don't hit, but "memory" inside
-    "memory management" does.  Returns 0.0–1.0.
+    Plain substring matching for all tokens, with one semantic-safety
+    exception: if any negator appears in the query, the content must carry
+    at least one negator from the equivalence class — otherwise the row
+    likely carries opposite meaning and the score is forced to 0.0.
+
+    Returns 0.0–1.0.
     """
     if not query_tokens:
         return 0.0
+
+    # Negation equivalence-class gate.
+    if any(t in _NEGATION_TOKENS for t in query_tokens):
+        if not any(
+            re.search(r"\b" + re.escape(n) + r"\b", content_lower)
+            for n in _NEGATION_TOKENS
+        ):
+            return 0.0
+
     hits = sum(1 for t in query_tokens if t in content_lower)
     return hits / len(query_tokens)
 
