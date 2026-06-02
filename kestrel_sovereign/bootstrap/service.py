@@ -6,6 +6,7 @@ them through a discovery conversation to establish their personality.
 """
 
 import asyncio
+import html
 import json
 import logging
 from datetime import datetime, timezone
@@ -14,6 +15,22 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 logger = logging.getLogger(__name__)
+
+#: Cap on how many prior turns we seed into discovery history (#1490).
+#: Bootstrap typically contributes 1 user turn + 1 wake-up greeting;
+#: 20 is generous and keeps any backfill bounded.
+_DISCOVERY_PRIOR_HISTORY_LIMIT = 20
+
+#: Per-turn character cap. A long opening story from a chatty first
+#: turn shouldn't dominate the seeded history. Truncation is marked
+#: with an ellipsis so the LLM knows content was elided.
+_DISCOVERY_PRIOR_HISTORY_CHAR_CAP = 2000
+
+#: Roles we accept when seeding discovery history. Stray system /
+#: tool / function messages from the upstream conversation store get
+#: dropped so the discovery LLM sees a clean user/assistant turn
+#: sequence.
+_DISCOVERY_PRIOR_HISTORY_ROLES = {"user", "assistant"}
 
 # Prompt file locations
 PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
@@ -278,19 +295,55 @@ And how do you like to work together - quick and direct, or more room to think t
     DISCOVERY_LLM_TIMEOUT_SECONDS = 60.0
 
     async def process_discovery_message(
-        self, user_message: str
+        self,
+        user_message: str,
+        prior_history: Optional[List[Dict[str, str]]] = None,
     ) -> Tuple[str, bool, bool]:
         """
         Process a message during discovery phase.
 
         Args:
             user_message: The user's message
+            prior_history: Optional list of ``{role, content}`` dicts
+                from conversation_history that pre-date discovery — most
+                commonly the PENDING-branch user message + wake-up
+                greeting persisted by ``_handle_bootstrap`` (#1486).
+                The caller is responsible for the privacy-aware lookup;
+                this method only seeds them into the *first* discovery
+                turn so the discovery LLM, ``generate_soul_md()`` name
+                extraction (`complete_bootstrap`), and downstream
+                consumers all see the content the user already shared
+                (#1490). Re-entrant calls leave the existing persisted
+                discovery history untouched — seeding only happens on
+                the empty-history transition.
 
         Returns:
             Tuple of (response, is_discovery_complete, offer_avatar)
         """
         # Get existing history
         history = await self.get_discovery_history()
+
+        # First discovery turn? Seed any prior conversation_history
+        # turns (PENDING-branch user message + wake-up greeting) into
+        # the discovery history so all downstream consumers see them:
+        #
+        # 1. The discovery LLM (this turn) — gets the prior content as
+        #    real chat turns instead of a synthetic system-prompt
+        #    block, so it can answer questions about it naturally.
+        # 2. ``generate_soul_md()`` later — formats the full discovery
+        #    history into the SOUL prompt; without seeding it would
+        #    miss biographical content from PENDING.
+        # 3. ``complete_bootstrap()`` — runs an "I'm <name>" scan over
+        #    user turns to greet the user by name; without seeding it
+        #    misses the name when the user introduced themselves in
+        #    T1 and discovery T1 was just "yes/no/sure".
+        #
+        # Only seed when discovery history is empty so re-entrant
+        # discovery calls don't double-prepend.
+        if not history and prior_history:
+            seeded = self._normalize_prior_history(prior_history)
+            if seeded:
+                history.extend(seeded)
 
         # Add user message to history
         history.append({"role": "user", "content": user_message})
@@ -344,10 +397,55 @@ Exchange count: {exchange_count // 2} (aim for 2-4 exchanges total)
 
 {base_prompt}
 
+IMPORTANT: Earlier turns in this discovery history may have happened before discovery formally
+began (the wake-up greeting and the user's first reply). Treat them as already-exchanged
+context — do not ask the user to repeat content they have already provided (their name, what
+they like, etc.). Build on what they said.
+
 IMPORTANT: After learning the user's name and communication preference, naturally transition
 to ask if they'd like to give you a face/avatar. This is the final step before normal operation.
 """
         return context
+
+    @staticmethod
+    def _normalize_prior_history(
+        prior_history: List[Dict[str, str]],
+    ) -> List[Dict[str, str]]:
+        """Filter, truncate, and bound prior conversation turns before
+        they get seeded into the discovery history.
+
+        - Drops entries with non-user/assistant roles (system, tool, …)
+          — discovery only models a 2-party chat.
+        - Drops entries with missing/blank content.
+        - Strips leading/trailing whitespace and HTML-escapes the
+          content. Bootstrap doesn't run user input through the
+          ``<user_input>`` wrapper that the agent's normal LLM path
+          uses, so escaping is the lightweight defense against an
+          attacker pasting ``<system>EVIL</system>`` into T1.
+        - Truncates each entry's content to
+          ``_DISCOVERY_PRIOR_HISTORY_CHAR_CAP`` with an ellipsis.
+        - Keeps only the most recent
+          ``_DISCOVERY_PRIOR_HISTORY_LIMIT`` entries.
+        """
+        normalized: List[Dict[str, str]] = []
+        for entry in prior_history:
+            if not isinstance(entry, dict):
+                continue
+            role = entry.get("role")
+            content = entry.get("content")
+            if role not in _DISCOVERY_PRIOR_HISTORY_ROLES:
+                continue
+            if not content:
+                continue
+            text = str(content).strip()
+            if not text:
+                continue
+            if len(text) > _DISCOVERY_PRIOR_HISTORY_CHAR_CAP:
+                text = text[: _DISCOVERY_PRIOR_HISTORY_CHAR_CAP - 3].rstrip() + "..."
+            normalized.append(
+                {"role": role, "content": html.escape(text, quote=False)}
+            )
+        return normalized[-_DISCOVERY_PRIOR_HISTORY_LIMIT:]
 
     def _get_default_discovery_prompt(self) -> str:
         """Default discovery prompt if file not found."""
