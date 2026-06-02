@@ -58,6 +58,21 @@ def _default_model() -> str:
     )
 
 
+def _inline_system_model() -> str:
+    # Opus 4.8 is the first Anthropic model family that accepts inline
+    # mid-conversation system turns on the native Messages API.
+    return os.environ.get("ANTHROPIC_INLINE_SYSTEM_MODEL", "claude-opus-4-8")
+
+
+def _usage_numbers(resp) -> Dict[str, int]:
+    usage = getattr(resp.raw, "usage", None)
+    return {
+        "input": getattr(usage, "input_tokens", 0) or 0,
+        "write": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        "read": getattr(usage, "cache_read_input_tokens", 0) or 0,
+    }
+
+
 @pytest.mark.asyncio
 async def test_anthropic_cache_read_on_turn_two_real_api():
     """Real two-turn conversation against Anthropic.  Asserts the
@@ -303,3 +318,124 @@ async def test_anthropic_tiny_prompt_silent_no_op_under_threshold():
     )
     # We do NOT assert cache_creation == 0 — Anthropic may decide to
     # cache anyway in the future, and that would be fine.
+
+
+@pytest.mark.asyncio
+async def test_anthropic_mid_conversation_system_message_real_api():
+    """Real Opus 4.8 run for issue #1496's inline-system transport path.
+
+    The test proves three things:
+
+      * Turn 2 introduces an inline system turn without collapsing reads
+        of the already-cached top-level system prefix.
+      * The model obeys the inline system instruction, proving the
+        operator-level turn reached the wire as ``role: "system"``.
+      * Once the inline system turn is stable history, a later request
+        reads the larger compound prefix that includes it. The read is
+        necessarily observed on turn 4: by design, the newly introduced
+        system turn is not marked on turn 2, becomes part of a marked
+        stable prefix on turn 3, then is read from cache on turn 4.
+    """
+    key = _api_key()
+    if not key:
+        pytest.skip("ANTHROPIC_API_KEY not set — skipping real-network test")
+
+    client = anthropic.AsyncAnthropic(api_key=key)
+    adapter = AnthropicAdapter()
+    model = _inline_system_model()
+    if not adapter._model_supports_inline_system(model):
+        pytest.skip(f"{model!r} does not pass the Opus 4.8 inline-system gate")
+
+    marker = "INLINE-SYSTEM-1496"
+    system_prompt = (
+        LARGE_SYSTEM_PROMPT
+        + "\nIf a later system message asks for an exact marker, obey it."
+    )
+    messages_t1 = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": "Reply with the word ready."},
+    ]
+
+    try:
+        resp_t1 = await adapter.get_response(
+            client=client,
+            model=model,
+            messages=messages_t1,
+            max_tokens=32,
+            keep_trailing_system=True,
+        )
+
+        messages_t2 = messages_t1 + [
+            {"role": "assistant", "content": resp_t1.content or ""},
+            {"role": "user", "content": "Acknowledge the current operator fact."},
+            {
+                "role": "system",
+                "content": (
+                    f"For this assistant response, include the exact marker "
+                    f"{marker}."
+                ),
+            },
+        ]
+        resp_t2 = await adapter.get_response(
+            client=client,
+            model=model,
+            messages=messages_t2,
+            max_tokens=64,
+            keep_trailing_system=True,
+        )
+        usage_t2 = _usage_numbers(resp_t2)
+
+        messages_t3 = messages_t2 + [
+            {"role": "assistant", "content": resp_t2.content or ""},
+            {"role": "user", "content": "Reply with the word stable."},
+        ]
+        resp_t3 = await adapter.get_response(
+            client=client,
+            model=model,
+            messages=messages_t3,
+            max_tokens=32,
+            keep_trailing_system=True,
+        )
+        usage_t3 = _usage_numbers(resp_t3)
+
+        messages_t4 = messages_t3 + [
+            {"role": "assistant", "content": resp_t3.content or ""},
+            {"role": "user", "content": "Reply with the word cached."},
+        ]
+        resp_t4 = await adapter.get_response(
+            client=client,
+            model=model,
+            messages=messages_t4,
+            max_tokens=32,
+            keep_trailing_system=True,
+        )
+        usage_t4 = _usage_numbers(resp_t4)
+    finally:
+        try:
+            close = getattr(client, "close", None)
+            if close is not None:
+                await close()
+        except Exception:
+            pass
+
+    print(
+        f"\n[{model}] inline-system "
+        f"T2 input={usage_t2['input']} write={usage_t2['write']} read={usage_t2['read']} | "
+        f"T3 input={usage_t3['input']} write={usage_t3['write']} read={usage_t3['read']} | "
+        f"T4 input={usage_t4['input']} write={usage_t4['write']} read={usage_t4['read']}",
+        file=sys.stderr,
+    )
+
+    assert usage_t2["read"] > 0, (
+        "Turn 2 should preserve and read the cached top-level system prefix "
+        "while introducing the inline system turn."
+    )
+    assert marker in (resp_t2.content or ""), (
+        "Turn 2 response did not include the inline-system marker; the "
+        "mid-conversation system instruction may not have reached the model."
+    )
+    assert usage_t4["read"] > usage_t3["read"], (
+        "Turn 4 should read the larger compound prefix written on turn 3, "
+        "which includes the now-stable inline system turn.\n"
+        f"T3={usage_t3} T4={usage_t4}"
+    )

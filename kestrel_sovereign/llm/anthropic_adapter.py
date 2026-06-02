@@ -10,6 +10,7 @@ Adapter for Anthropic's Claude API with support for:
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Union, AsyncIterator, Type
 
 import httpx
@@ -143,6 +144,7 @@ def _mark_message_content(msg: Dict[str, Any]) -> Dict[str, Any]:
 
 def _messages_with_penultimate_cache_marker(
     messages: List[Dict[str, Any]],
+    volatile_tail_size: int = 1,
 ) -> List[Dict[str, Any]]:
     """Attach ``cache_control`` to the history messages before the current
     user turn — covers end-of-history caching.
@@ -170,27 +172,78 @@ def _messages_with_penultimate_cache_marker(
     system-only size (Anthropic stops compounding). See
     ``tests/integration/test_anthropic_cache_real.py``.
 
-    The current user turn (``messages[-1]``) is never marked because it
-    changes every request by definition. If ``messages`` has < 2 entries
-    the final entry IS the current user turn — returned unchanged.
+    The current user turn is never marked because it changes every request by
+    definition. When a trailing inline system message has just been appended,
+    the volatile tail is the current user/tool-result turn plus that new
+    system turn, so callers pass ``volatile_tail_size=2`` and the marker stays
+    on the stable turn before both.
 
     Compound caching only works when the bytes at ``messages[-4]`` of
     turn N+1 are byte-identical to ``messages[-2]`` of turn N. That is
     the atomic-storage contract in ``agent/context_builder.py`` —
-    user-turn sent-form is persisted verbatim with
+    user/system-turn sent-form is persisted verbatim with
     ``metadata.sent_form=True`` and replayed byte-exactly on load.
     """
-    if len(messages) < 2:
+    if volatile_tail_size < 1:
+        volatile_tail_size = 1
+    latest_stable_index = len(messages) - volatile_tail_size - 1
+    if latest_stable_index < 0:
         return messages
 
-    mark_at = {len(messages) - 2}
-    if len(messages) >= 4:
-        mark_at.add(len(messages) - 4)
+    mark_at = {latest_stable_index}
+    previous_stable_index = _previous_completed_turn_index(
+        messages,
+        latest_stable_index,
+    )
+    if previous_stable_index is not None:
+        mark_at.add(previous_stable_index)
 
     return [
         _mark_message_content(msg) if i in mark_at else msg
         for i, msg in enumerate(messages)
     ]
+
+
+def _previous_completed_turn_index(
+    messages: List[Dict[str, Any]],
+    latest_stable_index: int,
+) -> Optional[int]:
+    """Return the previous stable cache breakpoint before ``latest_stable``.
+
+    Normal chat alternates user/assistant, so this is usually two slots back.
+    Inline system turns can sit between the user turn and assistant response;
+    in that shape we skip the system+user pair so the marker still points at
+    the prior completed response and can read the cache entry from the turn
+    where the inline system message was introduced.
+    """
+    candidate = latest_stable_index - 1
+    while candidate >= 0 and messages[candidate].get("role") == "system":
+        candidate -= 1
+    if candidate >= 0 and messages[candidate].get("role") == "user":
+        candidate -= 1
+    while candidate >= 0 and messages[candidate].get("role") == "system":
+        candidate -= 1
+    return candidate if candidate >= 0 else None
+
+
+def _message_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _system_content_blocks(content: Any) -> List[Dict[str, Any]]:
+    if isinstance(content, list):
+        return content
+    return [{"type": "text", "text": _message_content_to_text(content)}]
 
 
 class AnthropicAdapter(LLMAdapter):
@@ -202,19 +255,24 @@ class AnthropicAdapter(LLMAdapter):
     """
 
     def provider_capabilities(self) -> ProviderCapabilities:
-        return ProviderCapabilities(
-            supports_tools=True,
-            supports_streaming=True,
-            supports_vision=True,
-            supports_structured_output=True,
-            structured_output_mode=StructuredOutputMode.TOOL_FORCED,
-            tool_streaming_mode=ToolStreamingMode.NATIVE_DELTA,
-            vision_input_mode=VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
-            notes=(
+        kwargs = {
+            "supports_tools": True,
+            "supports_streaming": True,
+            "supports_vision": True,
+            "supports_structured_output": True,
+            "structured_output_mode": StructuredOutputMode.TOOL_FORCED,
+            "tool_streaming_mode": ToolStreamingMode.NATIVE_DELTA,
+            "vision_input_mode": VisionInputMode.ANTHROPIC_CONTENT_BLOCK,
+            "model_dependent": ("supports_inline_system",),
+            "notes": (
                 "Structured output is implemented by forcing a synthetic Anthropic tool.",
                 "Streaming with response_format falls back to non-streaming structured generation.",
+                "Mid-conversation system messages are route- and model-gated to Opus 4.8+.",
             ),
-        )
+        }
+        if "supports_inline_system" in ProviderCapabilities.__dataclass_fields__:
+            kwargs["supports_inline_system"] = True
+        return ProviderCapabilities(**kwargs)
 
     @staticmethod
     def _resolve_wire_model_id(model: str) -> str:
@@ -237,6 +295,213 @@ class AnthropicAdapter(LLMAdapter):
         if model and model.lower().startswith("anthropic/"):
             return model[len("anthropic/"):]
         return model
+
+    @staticmethod
+    def _model_supports_inline_system(model: str) -> bool:
+        """Anthropic currently gates inline system turns to Opus 4.8+."""
+        wire_model = AnthropicAdapter._resolve_wire_model_id(model or "")
+        normalized = wire_model.lower().replace("_", "-")
+        return bool(re.search(r"claude[-.]?opus[-.]?4[-.]?8", normalized))
+
+    def _route_supports_inline_system(self) -> bool:
+        """This adapter targets native Anthropic-compatible Messages routes.
+
+        Bedrock, Vertex, Foundry, and OpenAI-compatible routes use separate
+        adapters in Kestrel, so they do not inherit this affirmative gate.
+        """
+        return True
+
+    def _should_keep_inline_system(
+        self,
+        model: str,
+        keep_trailing_system: bool,
+    ) -> bool:
+        return (
+            keep_trailing_system
+            and self._route_supports_inline_system()
+            and self._model_supports_inline_system(model)
+        )
+
+    def _convert_messages_to_anthropic(
+        self,
+        messages: List[Dict[str, Any]],
+        system_prompt: Optional[str] = None,
+        *,
+        keep_trailing_system: bool = False,
+        model: str = "",
+    ) -> tuple[List[Dict[str, Any]], str]:
+        """Convert OpenAI-style chat turns into Anthropic Messages params."""
+        preserve_inline_system = self._should_keep_inline_system(
+            model,
+            keep_trailing_system,
+        )
+        system_messages: List[str] = []
+        filtered_messages: List[Dict[str, Any]] = []
+        pending_tool_results: List[Dict[str, Any]] = []
+        demoted_inline_system = False
+
+        def flush_tool_results() -> None:
+            nonlocal pending_tool_results
+            if pending_tool_results:
+                filtered_messages.append({
+                    "role": "user",
+                    "content": pending_tool_results,
+                })
+                pending_tool_results = []
+
+        for index, msg in enumerate(messages):
+            role = msg.get("role")
+
+            if role == "system":
+                content = msg.get("content", "")
+                if index == 0 or not preserve_inline_system:
+                    if index != 0:
+                        demoted_inline_system = True
+                    system_messages.append(_message_content_to_text(content))
+                    continue
+
+                flush_tool_results()
+                if (
+                    filtered_messages
+                    and filtered_messages[-1].get("role") == "system"
+                ):
+                    filtered_messages[-1]["content"].extend(
+                        _system_content_blocks(content)
+                    )
+                else:
+                    filtered_messages.append({
+                        "role": "system",
+                        "content": _system_content_blocks(content),
+                    })
+                continue
+
+            if role == "tool":
+                pending_tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", ""),
+                })
+                continue
+
+            flush_tool_results()
+            filtered_messages.append(self._convert_chat_message(msg))
+
+        flush_tool_results()
+
+        if preserve_inline_system:
+            self._validate_inline_system_messages(filtered_messages)
+        elif keep_trailing_system and demoted_inline_system:
+            logger.info(
+                "Anthropic inline system requested but unsupported for model "
+                "%s on %s; demoting non-leading system message(s) to the "
+                "top-level system prefix.",
+                model,
+                type(self).__name__,
+            )
+
+        combined_system = "\n\n".join(filter(None, system_messages))
+        if system_prompt:
+            combined_system = (
+                f"{combined_system}\n\n{system_prompt}"
+                if combined_system
+                else system_prompt
+            )
+        return filtered_messages, combined_system
+
+    def _convert_chat_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
+        role = msg.get("role")
+        converted_msg = {"role": role}
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls")
+
+        if role == "assistant" and tool_calls:
+            content_blocks = []
+            if content:
+                if isinstance(content, str):
+                    content_blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    content_blocks.extend(content)
+            for tc in tool_calls:
+                tool_input = tc.get(
+                    "function",
+                    {},
+                ).get("arguments", tc.get("arguments", {}))
+                if isinstance(tool_input, str):
+                    try:
+                        tool_input = json.loads(tool_input)
+                    except (json.JSONDecodeError, TypeError):
+                        tool_input = {}
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc.get("id", ""),
+                    "name": tc.get("function", {}).get(
+                        "name",
+                        tc.get("name", ""),
+                    ),
+                    "input": tool_input,
+                })
+            converted_msg["content"] = content_blocks
+        elif content is not None:
+            converted_msg["content"] = (
+                content if isinstance(content, (str, list)) else str(content)
+            )
+        else:
+            converted_msg["content"] = ""
+        return converted_msg
+
+    def _validate_inline_system_messages(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> None:
+        for index, msg in enumerate(messages):
+            if msg.get("role") != "system":
+                continue
+            if index == 0:
+                raise ValueError(
+                    "Anthropic inline system messages cannot be the first "
+                    "message; use the top-level system parameter."
+                )
+            previous = messages[index - 1]
+            if previous.get("role") == "system":
+                raise ValueError(
+                    "Anthropic inline system messages cannot be consecutive; "
+                    "merge adjacent system turns before sending."
+                )
+            if not self._inline_system_can_follow(previous):
+                raise ValueError(
+                    "Anthropic inline system messages must immediately follow "
+                    "a user turn, a user tool_result turn, or an assistant "
+                    "turn ending in server tool use."
+                )
+            if (
+                index + 1 < len(messages)
+                and messages[index + 1].get("role") == "system"
+            ):
+                raise ValueError(
+                    "Anthropic inline system messages cannot be consecutive; "
+                    "merge adjacent system turns before sending."
+                )
+            if (
+                index + 1 < len(messages)
+                and messages[index + 1].get("role") != "assistant"
+            ):
+                raise ValueError(
+                    "Anthropic inline system messages must be last or "
+                    "immediately followed by an assistant turn."
+                )
+
+    @staticmethod
+    def _inline_system_can_follow(message: Dict[str, Any]) -> bool:
+        role = message.get("role")
+        if role == "user":
+            return True
+        if role != "assistant":
+            return False
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        last = content[-1]
+        return isinstance(last, dict) and last.get("type") == "server_tool_use"
 
     @staticmethod
     def _apply_cache_control(
@@ -286,8 +551,12 @@ class AnthropicAdapter(LLMAdapter):
 
         messages = updated.get("messages")
         if isinstance(messages, list) and len(messages) >= 2:
+            volatile_tail_size = (
+                2 if messages[-1].get("role") == "system" else 1
+            )
             updated["messages"] = _messages_with_penultimate_cache_marker(
-                messages
+                messages,
+                volatile_tail_size=volatile_tail_size,
             )
 
         return updated
@@ -398,100 +667,12 @@ class AnthropicAdapter(LLMAdapter):
             LLMResponse with content and/or tool calls
         """
         try:
-            # Convert OpenAI message format to Anthropic format:
-            # - Extract system messages to top-level system parameter
-            # - Convert tool role messages to user messages with tool_result blocks
-            system_messages = []
-            filtered_messages = []
-            pending_tool_results = []
-            
-            for msg in messages:
-                role = msg.get("role")
-                
-                if role == "system":
-                    # Extract system messages for top-level parameter
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            block.get("text", "") for block in content 
-                            if isinstance(block, dict) and block.get("type") == "text"
-                        )
-                    system_messages.append(content)
-                    
-                elif role == "tool":
-                    # Accumulate tool results to combine into a user message
-                    # OpenAI format: {"role": "tool", "tool_call_id": "...", "content": "..."}
-                    # Anthropic format: user message with tool_result content blocks
-                    pending_tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id", ""),
-                        "content": msg.get("content", "")
-                    })
-                    
-                else:
-                    # Flush any pending tool results before adding this message
-                    if pending_tool_results:
-                        filtered_messages.append({
-                            "role": "user",
-                            "content": pending_tool_results
-                        })
-                        pending_tool_results = []
-                    
-                    # Convert the message to Anthropic format
-                    converted_msg = {"role": role}
-                    content = msg.get("content")
-                    tool_calls = msg.get("tool_calls")
-                    
-                    if role == "assistant" and tool_calls:
-                        # Convert OpenAI tool_calls to Anthropic tool_use content blocks
-                        content_blocks = []
-                        if content:
-                            # Add text content first if present
-                            if isinstance(content, str):
-                                content_blocks.append({"type": "text", "text": content})
-                            elif isinstance(content, list):
-                                content_blocks.extend(content)
-                        # Add tool_use blocks for each tool call
-                        for tc in tool_calls:
-                            tool_use_block = {
-                                "type": "tool_use",
-                                "id": tc.get("id", ""),
-                                "name": tc.get("function", {}).get("name", tc.get("name", "")),
-                                "input": tc.get("function", {}).get("arguments", tc.get("arguments", {}))
-                            }
-                            # Parse arguments if it's a string
-                            if isinstance(tool_use_block["input"], str):
-                                try:
-                                    tool_use_block["input"] = json.loads(tool_use_block["input"])
-                                except (json.JSONDecodeError, TypeError):
-                                    tool_use_block["input"] = {}
-                            content_blocks.append(tool_use_block)
-                        converted_msg["content"] = content_blocks
-                    elif content is not None:
-                        # Normalize content format
-                        if isinstance(content, str):
-                            converted_msg["content"] = content
-                        elif isinstance(content, list):
-                            converted_msg["content"] = content
-                        else:
-                            converted_msg["content"] = str(content)
-                    else:
-                        # Empty content - use empty string
-                        converted_msg["content"] = ""
-                    
-                    filtered_messages.append(converted_msg)
-            
-            # Flush any remaining tool results at the end
-            if pending_tool_results:
-                filtered_messages.append({
-                    "role": "user",
-                    "content": pending_tool_results
-                })
-            
-            # Combine extracted system messages with explicit system_prompt
-            combined_system = "\n\n".join(filter(None, system_messages))
-            if system_prompt:
-                combined_system = f"{combined_system}\n\n{system_prompt}" if combined_system else system_prompt
+            filtered_messages, combined_system = self._convert_messages_to_anthropic(
+                messages,
+                system_prompt,
+                keep_trailing_system=kwargs.get("keep_trailing_system", False),
+                model=model,
+            )
             
             api_params = {
                 "model": self._resolve_wire_model_id(model),
@@ -624,71 +805,12 @@ class AnthropicAdapter(LLMAdapter):
             for Anthropic. Use non-streaming get_response for structured output.
         """
         try:
-            # Convert OpenAI message format to Anthropic format
-            system_messages = []
-            filtered_messages = []
-            pending_tool_results = []
-            
-            for msg in messages:
-                role = msg.get("role")
-                if role == "system":
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            block.get("text", "") for block in content 
-                            if isinstance(block, dict) and block.get("type") == "text"
-                        )
-                    system_messages.append(content)
-                elif role == "tool":
-                    pending_tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id", ""),
-                        "content": msg.get("content", "")
-                    })
-                else:
-                    if pending_tool_results:
-                        filtered_messages.append({"role": "user", "content": pending_tool_results})
-                        pending_tool_results = []
-                    
-                    # Convert assistant messages with tool_calls to Anthropic format
-                    converted_msg = {"role": role}
-                    content = msg.get("content")
-                    tool_calls = msg.get("tool_calls")
-                    
-                    if role == "assistant" and tool_calls:
-                        content_blocks = []
-                        if content:
-                            if isinstance(content, str):
-                                content_blocks.append({"type": "text", "text": content})
-                            elif isinstance(content, list):
-                                content_blocks.extend(content)
-                        for tc in tool_calls:
-                            tool_input = tc.get("function", {}).get("arguments", tc.get("arguments", {}))
-                            if isinstance(tool_input, str):
-                                try:
-                                    tool_input = json.loads(tool_input)
-                                except (json.JSONDecodeError, TypeError):
-                                    tool_input = {}
-                            content_blocks.append({
-                                "type": "tool_use",
-                                "id": tc.get("id", ""),
-                                "name": tc.get("function", {}).get("name", tc.get("name", "")),
-                                "input": tool_input
-                            })
-                        converted_msg["content"] = content_blocks
-                    elif content is not None:
-                        converted_msg["content"] = content if isinstance(content, (str, list)) else str(content)
-                    else:
-                        converted_msg["content"] = ""
-                    
-                    filtered_messages.append(converted_msg)
-            
-            if pending_tool_results:
-                filtered_messages.append({"role": "user", "content": pending_tool_results})
-            
-            combined_system = "\n\n".join(filter(None, system_messages))
-            if system_prompt:
-                combined_system = f"{combined_system}\n\n{system_prompt}" if combined_system else system_prompt
+            filtered_messages, combined_system = self._convert_messages_to_anthropic(
+                messages,
+                system_prompt,
+                keep_trailing_system=kwargs.get("keep_trailing_system", False),
+                model=model,
+            )
             
             api_params = {
                 "model": self._resolve_wire_model_id(model),
@@ -778,71 +900,12 @@ class AnthropicAdapter(LLMAdapter):
                             result = execute_tool(tc)
         """
         try:
-            # Convert OpenAI message format to Anthropic format
-            system_messages = []
-            filtered_messages = []
-            pending_tool_results = []
-            
-            for msg in messages:
-                role = msg.get("role")
-                if role == "system":
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        content = " ".join(
-                            block.get("text", "") for block in content 
-                            if isinstance(block, dict) and block.get("type") == "text"
-                        )
-                    system_messages.append(content)
-                elif role == "tool":
-                    pending_tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id", ""),
-                        "content": msg.get("content", "")
-                    })
-                else:
-                    if pending_tool_results:
-                        filtered_messages.append({"role": "user", "content": pending_tool_results})
-                        pending_tool_results = []
-                    
-                    # Convert assistant messages with tool_calls to Anthropic format
-                    converted_msg = {"role": role}
-                    content = msg.get("content")
-                    tool_calls = msg.get("tool_calls")
-                    
-                    if role == "assistant" and tool_calls:
-                        content_blocks = []
-                        if content:
-                            if isinstance(content, str):
-                                content_blocks.append({"type": "text", "text": content})
-                            elif isinstance(content, list):
-                                content_blocks.extend(content)
-                        for tc in tool_calls:
-                            tool_input = tc.get("function", {}).get("arguments", tc.get("arguments", {}))
-                            if isinstance(tool_input, str):
-                                try:
-                                    tool_input = json.loads(tool_input)
-                                except (json.JSONDecodeError, TypeError):
-                                    tool_input = {}
-                            content_blocks.append({
-                                "type": "tool_use",
-                                "id": tc.get("id", ""),
-                                "name": tc.get("function", {}).get("name", tc.get("name", "")),
-                                "input": tool_input
-                            })
-                        converted_msg["content"] = content_blocks
-                    elif content is not None:
-                        converted_msg["content"] = content if isinstance(content, (str, list)) else str(content)
-                    else:
-                        converted_msg["content"] = ""
-                    
-                    filtered_messages.append(converted_msg)
-            
-            if pending_tool_results:
-                filtered_messages.append({"role": "user", "content": pending_tool_results})
-            
-            combined_system = "\n\n".join(filter(None, system_messages))
-            if system_prompt:
-                combined_system = f"{combined_system}\n\n{system_prompt}" if combined_system else system_prompt
+            filtered_messages, combined_system = self._convert_messages_to_anthropic(
+                messages,
+                system_prompt,
+                keep_trailing_system=kwargs.get("keep_trailing_system", False),
+                model=model,
+            )
             
             api_params = {
                 "model": self._resolve_wire_model_id(model),

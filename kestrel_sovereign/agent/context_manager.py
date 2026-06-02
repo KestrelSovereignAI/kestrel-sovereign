@@ -1257,7 +1257,7 @@ class ContextManager:
         counts the SAME bytes the LLM will see.
 
         Without this, the anchor can over-estimate fit for ``sent_form``
-        user rows (whose ``rendered_content`` is larger than raw
+        user/system rows (whose ``rendered_content`` may be larger than raw
         ``content``) and let the formatter fall into its just-enough
         skip path — recreating the per-turn cache churn the anchor is
         supposed to prevent (codex round 2 P1).
@@ -1270,7 +1270,11 @@ class ContextManager:
         raw = msg.get("content", "") or ""
         rendered = msg.get("rendered_content")
         meta = msg.get("metadata") or {}
-        if role == "user" and meta.get("sent_form") and rendered is not None:
+        if (
+            role in ("user", "system")
+            and meta.get("sent_form")
+            and rendered is not None
+        ):
             return rendered
         if role == "user" and not meta.get("sent_form"):
             return wrap_user_input(raw)
