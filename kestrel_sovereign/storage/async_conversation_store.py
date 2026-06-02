@@ -13,6 +13,7 @@ All queries are scoped by agent_id for multi-tenant isolation.
 import json
 import logging
 import os
+import re
 import struct
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -74,6 +75,82 @@ def _rows_affected(result) -> int:
     if hasattr(result, "rowcount") and result.rowcount is not None:
         return result.rowcount
     return 0
+
+
+# Stopwords excluded from tokenized fallback matching so that common
+# filler words in natural-language queries don't inflate match scores.
+#
+# DELIBERATELY KEPT IN: negation tokens (``not``, ``no``, ``never``,
+# ``neither``, ``nor``, ``without``). Stripping them would let a query
+# like "do not use OpenAI" reduce to "use openai" and match memories
+# with the OPPOSITE meaning. Negation is semantically load-bearing in
+# recall queries; better to leave it in and let the threshold gate
+# borderline matches.
+_SEARCH_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "it", "as", "be", "was", "are",
+    "been", "do", "did", "does", "has", "have", "had",
+    "this", "that", "these", "those", "my", "your", "our", "we", "i",
+    "me", "you", "he", "she", "they", "them", "his", "her", "its",
+    "what", "which", "who", "whom", "how", "when", "where", "why",
+    "about", "some", "any", "all", "each", "every", "so", "if", "then",
+})
+
+# Minimum fraction of query terms that must appear in content for a
+# tokenized fallback hit.  0.6 = at least 60 % of non-stopword query
+# tokens must be present — conservative enough to avoid noise while
+# still catching broad natural-language recall queries.
+_TOKEN_MATCH_THRESHOLD = 0.6
+
+
+def _tokenize_for_search(text: str) -> List[str]:
+    """Split *text* into lowercase alphanumeric tokens, dropping stopwords."""
+    return [
+        tok for tok in re.findall(r"[a-z0-9]+", text.lower())
+        if tok not in _SEARCH_STOPWORDS and len(tok) > 1
+    ]
+
+
+# Negation tokens form a semantic-equivalence class for the fallback
+# matcher. When the query contains ANY negator, the content must contain
+# AT LEAST ONE negator from this class (word-boundary-matched, so "no"
+# doesn't substring-hit inside "normally") or the row is rejected as
+# opposite-meaning. This handles both the substring false-positive
+# (codex r2 P2) and the cross-negator equivalence — "not" in the query
+# should still accept "never use OpenAI" content (codex r4 P2).
+#
+# Word-boundary matching is restricted to negators because applying it to
+# all short tokens regressed technical-term fallback: under \b the token
+# ``api`` failed to match ``api_key`` (Python treats ``_`` as a word
+# character), dropping common queries below the 0.6 threshold.
+_NEGATION_TOKENS = frozenset({
+    "no", "not", "never", "neither", "nor", "without",
+})
+
+
+def _token_match_score(query_tokens: List[str], content_lower: str) -> float:
+    """Return the fraction of *query_tokens* found in *content_lower*.
+
+    Plain substring matching for all tokens, with one semantic-safety
+    exception: if any negator appears in the query, the content must carry
+    at least one negator from the equivalence class — otherwise the row
+    likely carries opposite meaning and the score is forced to 0.0.
+
+    Returns 0.0–1.0.
+    """
+    if not query_tokens:
+        return 0.0
+
+    # Negation equivalence-class gate.
+    if any(t in _NEGATION_TOKENS for t in query_tokens):
+        if not any(
+            re.search(r"\b" + re.escape(n) + r"\b", content_lower)
+            for n in _NEGATION_TOKENS
+        ):
+            return 0.0
+
+    hits = sum(1 for t in query_tokens if t in content_lower)
+    return hits / len(query_tokens)
 
 
 class AsyncConversationStore:
@@ -1111,7 +1188,12 @@ class AsyncConversationStore:
             )
 
         query_lower = query.lower()
-        results = []
+        query_tokens = _tokenize_for_search(query)
+        use_token_fallback = len(query_tokens) >= 2
+
+        exact_results = []
+        # Candidates for the tokenized fallback: (score, dict)
+        token_candidates: List[tuple] = []
 
         for row in rows:
             row_id = row[0]
@@ -1133,23 +1215,48 @@ class AsyncConversationStore:
                 row_id, row[1], meta, content, row[4] if len(row) > 4 else None
             )
 
-            # Client-side search on canonical content (raw user speech for
-            # user turns, assistant/system unchanged).
-            if query_lower in content.lower():
-                cleaned_meta = remove_enc_flag(meta)
-                if cleaned_meta:
-                    cleaned_meta.pop('key_version', None)
+            content_lower = content.lower()
 
-                results.append({
+            cleaned_meta = None  # lazily computed
+
+            def _make_entry():
+                nonlocal cleaned_meta
+                if cleaned_meta is None:
+                    cleaned_meta = remove_enc_flag(meta)
+                    if cleaned_meta:
+                        cleaned_meta.pop('key_version', None)
+                return {
                     'role': row[1],
                     'content': content,
-                    'metadata': cleaned_meta if cleaned_meta else None
-                })
+                    'metadata': cleaned_meta if cleaned_meta else None,
+                }
 
-                if len(results) >= limit:
+            # Exact substring match (original behaviour)
+            if query_lower in content_lower:
+                exact_results.append(_make_entry())
+                if len(exact_results) >= limit:
                     break
+                continue
 
-        return results
+            # Tokenized fallback: score by fraction of query terms present
+            if use_token_fallback and len(exact_results) < limit:
+                score = _token_match_score(query_tokens, content_lower)
+                if score >= _TOKEN_MATCH_THRESHOLD:
+                    token_candidates.append((score, _make_entry()))
+
+        # If exact matches filled the limit, return them directly.
+        if len(exact_results) >= limit:
+            return exact_results
+
+        # Merge: exact matches first, then token-fallback candidates ranked
+        # by descending score, up to the requested limit.
+        remaining = limit - len(exact_results)
+        if token_candidates:
+            token_candidates.sort(key=lambda pair: pair[0], reverse=True)
+            for _score, entry in token_candidates[:remaining]:
+                exact_results.append(entry)
+
+        return exact_results
 
     async def clear_history(self) -> None:
         """Soft-delete every live message for this agent (#763).
