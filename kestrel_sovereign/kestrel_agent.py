@@ -564,6 +564,28 @@ class KestrelAgent(
             else:
                 self.privacy_agent = PrivacyAgent(self._raw_storage, self._privacy_mode)
 
+            # Bind the privacy gate for the embedding routing path
+            # (#1492). The chat path threads force_local_only
+            # explicitly, but embeddings are called from the storage
+            # layer (e.g. AsyncConversationStore.add_conversation)
+            # which has no direct view of privacy_agent. Routing this
+            # through a callable keeps the embedding path honest
+            # without each storage caller having to know about
+            # privacy modes. Captured by reference — future
+            # privacy-mode flips are picked up automatically.
+            #
+            # hasattr-guarded because tests / external integrations
+            # inject lightweight LLM-service fakes that don't
+            # implement this hook; matches the same pattern this
+            # constructor already uses for other optional LLM-service
+            # methods like ``attach_to_agent``.
+            if hasattr(self.llm_service, "set_force_local_only_provider"):
+                self.llm_service.set_force_local_only_provider(
+                    lambda pa=self.privacy_agent: (
+                        not pa.privacy_config.allows_cloud_llm()
+                    )
+                )
+
             # Initialize TaskManager for A2A unified routing
             # All stores use the abstract data layer (SQLite for sovereign, PostgreSQL for multi-tenant)
             if self._db_backend.lower() == "postgres" and self.pg_pool:

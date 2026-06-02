@@ -128,7 +128,7 @@ def test_llm_service_embedding_provider_follows_active_route():
         "client": object(),
         "capabilities": OpenAIAdapter().provider_capabilities().to_dict(),
     }
-    service.resolve_provider_routing = lambda: ([openai_route], None)
+    service.resolve_provider_routing = lambda **_: ([openai_route], None)
 
     provider = service.resolve_embedding_provider()
 
@@ -147,7 +147,98 @@ def test_llm_service_embedding_provider_degrades_when_active_route_cannot_embed(
         "client": object(),
         "capabilities": AnthropicAdapter().provider_capabilities().to_dict(),
     }
-    service.resolve_provider_routing = lambda: ([anthropic_route], None)
+    service.resolve_provider_routing = lambda **_: ([anthropic_route], None)
+
+    assert service.resolve_embedding_provider() is None
+    assert service.get_embedding_service() is None
+
+
+def test_llm_service_embedding_provider_honors_force_local_only_callback():
+    """#1492 — when the privacy gate says local-only, the embedding path
+    must filter to local routes even if a cloud route is at higher
+    priority. Reproducer: OpenAI route configured first, Ollama
+    second; ISOLATED/EPHEMERAL must reach Ollama for embeddings, not
+    OpenAI."""
+    service = LLMService.__new__(LLMService)
+    openai_route = {
+        "name": "openai:api",
+        "is_local": False,
+        "is_cloud": True,
+        "adapter": OpenAIAdapter(),
+        "client": object(),
+        "capabilities": OpenAIAdapter().provider_capabilities().to_dict(),
+    }
+    ollama_route = {
+        "name": "ollama:local",
+        "is_local": True,
+        "is_cloud": False,
+        "adapter": OpenAIAdapter(),  # adapter doesn't matter for gate test
+        "client": object(),
+        "capabilities": OpenAIAdapter().provider_capabilities().to_dict(),
+    }
+
+    def routing(**kwargs):
+        if kwargs.get("force_local_only"):
+            return [ollama_route], None
+        return [openai_route, ollama_route], None
+
+    service.resolve_provider_routing = routing
+
+    # No gate bound → cloud route wins (pre-#1492 behavior, used by
+    # CLI/test entry points without an agent attached).
+    assert service.resolve_embedding_provider() is openai_route
+
+    # Bind the gate to "local-only" (ISOLATED/EPHEMERAL).
+    service.set_force_local_only_provider(lambda: True)
+    assert service.resolve_embedding_provider() is ollama_route
+
+    # Flip back to NORMAL — cloud route reachable again.
+    service.set_force_local_only_provider(lambda: False)
+    assert service.resolve_embedding_provider() is openai_route
+
+
+def test_llm_service_embedding_provider_fails_safely_when_provider_raises():
+    """#1492 — a misbehaving privacy callback must default to local-only.
+    Better to lose embedding than to leak plaintext."""
+    service = LLMService.__new__(LLMService)
+    ollama_route = {
+        "name": "ollama:local",
+        "is_local": True,
+        "adapter": OpenAIAdapter(),
+        "client": object(),
+        "capabilities": OpenAIAdapter().provider_capabilities().to_dict(),
+    }
+
+    def routing(**kwargs):
+        if kwargs.get("force_local_only"):
+            return [ollama_route], None
+        raise AssertionError(
+            "force_local_only must be True after privacy callback raises"
+        )
+
+    service.resolve_provider_routing = routing
+
+    def boom() -> bool:
+        raise RuntimeError("privacy state read failed")
+
+    service.set_force_local_only_provider(boom)
+    # Falls closed → ollama route used.
+    assert service.resolve_embedding_provider() is ollama_route
+
+
+def test_llm_service_embedding_returns_none_when_no_local_route():
+    """#1492 — under force_local_only, if no local route exists, embedding
+    must return None (keyword fallback) rather than propagate the
+    underlying RuntimeError from resolve_provider_routing."""
+    service = LLMService.__new__(LLMService)
+
+    def routing(**kwargs):
+        if kwargs.get("force_local_only"):
+            raise RuntimeError("No local providers available.")
+        return [], None
+
+    service.resolve_provider_routing = routing
+    service.set_force_local_only_provider(lambda: True)
 
     assert service.resolve_embedding_provider() is None
     assert service.get_embedding_service() is None
