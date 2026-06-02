@@ -1645,8 +1645,51 @@ Expected Duration: {expected_duration}
             # response. The discovery UX is opt-in — the agent runs
             # fine without it — so trading it for a working chat path
             # is the right call here.
+            # Pull any prior conversation already persisted (typically
+            # the PENDING-branch first user message + wake-up greeting
+            # from #1486) so the discovery LLM, SOUL generation, and
+            # the completion-greeting name extraction all see content
+            # the user already shared rather than saying "we've just
+            # met" (#1490).
+            #
+            # PRIVACY GATE: ``BootstrapService`` seeds prior_history into
+            # the persisted ``bootstrap_discovery_history`` row in
+            # ``agent_metadata``. Under EPHEMERAL/ISOLATED the PENDING
+            # turn lives only in PrivacyAgent's in-memory session
+            # (``privacy_agent.add_conversation`` deliberately doesn't
+            # persist it), so promoting it through the seed path would
+            # write content the operator chose NOT to persist into a
+            # persistent table. Gate on ``can_store('conversation')``
+            # so EPHEMERAL/ISOLATED skip the lookup entirely — discovery
+            # behaves as it did pre-#1490 in those modes (degraded
+            # personalization is the trade-off the user explicitly
+            # opted into).
+            #
+            # Best-effort: any failure falls through to legacy
+            # "no prior context" discovery rather than blocking the
+            # user's message.
+            prior_history: List[Dict[str, str]] = []
+            if self.privacy_agent.can_store("conversation"):
+                try:
+                    fetched = await self.privacy_agent.get_conversation_history(
+                        limit=20, session_id=session_id
+                    )
+                    prior_history = [
+                        {"role": h["role"], "content": h["content"]}
+                        for h in fetched
+                        if h.get("role") and h.get("content")
+                    ]
+                except Exception as fetch_exc:
+                    logging.debug(
+                        f"[BOOTSTRAP] Could not fetch prior conversation for "
+                        f"discovery context: {fetch_exc}"
+                    )
+
             try:
-                response, is_complete, wants_avatar = await self.bootstrap_service.process_discovery_message(user_input)
+                response, is_complete, wants_avatar = await self.bootstrap_service.process_discovery_message(
+                    user_input,
+                    prior_history=prior_history,
+                )
             except Exception as exc:
                 logging.warning(
                     f"[BOOTSTRAP] Discovery LLM call failed ({exc}); "
