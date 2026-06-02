@@ -213,6 +213,13 @@ def _warn_no_llm_config_found() -> None:
 class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, StreamingMixin, ConstitutionalAwarenessMixin, RemoteBackendMixin):
     """Unified LLM service with provider fallback and remote GPU support."""
 
+    # Class-level default so tests that construct via ``__new__`` (bypassing
+    # ``__init__``) still see ``None`` rather than ``AttributeError`` when
+    # ``_current_force_local_only`` reads it. Production paths get an
+    # instance-level value via ``__init__`` (set to ``None``) and update it
+    # through :meth:`set_force_local_only_provider` (#1492).
+    _force_local_only_provider: Optional[Callable[[], bool]] = None
+
     def __init__(self, database_url: Optional[str] = None):
         """Initialize LLM service.
 
@@ -298,6 +305,21 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Metering callback for usage billing (Vending Machine)
         # Set via set_metering_callback() after initialization
         self._metering_callback = None
+
+        # Privacy gate for the embedding routing path (#1492). The chat
+        # path threads ``force_local_only`` explicitly at call time
+        # (see ``KestrelAgent`` line ~2165), but embeddings are called
+        # from the storage layer which has no direct view of the
+        # agent's current privacy mode. Bind a callable here that
+        # returns the live ``force_local_only`` state; the agent sets
+        # it once at init pointing at
+        # ``not privacy_agent.privacy_config.allows_cloud_llm()`` so
+        # any future privacy-mode change is picked up automatically.
+        # When unset (process-local ``LLMService()`` not attached to an
+        # agent) the gate defaults to OFF — matching pre-#1492
+        # behavior for tooling that legitimately runs without a
+        # privacy context (CLI scripts, tests).
+        self._force_local_only_provider: Optional[Callable[[], bool]] = None
 
         # Persistence callback for model preference (writes to database)
         # Set via set_preference_persistence_callback() after initialization
@@ -762,6 +784,44 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         capabilities = provider.get("capabilities") or {}
         return bool(capabilities.get("supports_embeddings"))
 
+    def set_force_local_only_provider(
+        self, provider: Optional[Callable[[], bool]]
+    ) -> None:
+        """Bind a callable that returns the live ``force_local_only`` state.
+
+        The chat path passes ``force_local_only`` explicitly because
+        it always has the agent's ``privacy_agent`` in scope. The
+        embedding path is invoked from the storage layer (e.g.
+        ``AsyncConversationStore.add_conversation``) which does not,
+        so without this hook ISOLATED / EPHEMERAL would silently ship
+        plaintext to whatever cloud embedding provider sits at the top
+        of priority — violating the documented "local LLM only"
+        contract (#1492).
+
+        Pass ``None`` to clear; useful in tests.
+        """
+        self._force_local_only_provider = provider
+
+    def _current_force_local_only(self) -> bool:
+        """Read the live ``force_local_only`` state for the embedding path.
+
+        Returns False if no provider is bound (process-local
+        ``LLMService()`` not attached to an agent). Fails closed: if
+        the provider callable raises, we assume local-only so a
+        broken privacy hook doesn't accidentally leak content.
+        """
+        if self._force_local_only_provider is None:
+            return False
+        try:
+            return bool(self._force_local_only_provider())
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "force_local_only provider raised %s; defaulting to "
+                "local-only to fail safely.",
+                exc,
+            )
+            return True
+
     def resolve_embedding_provider(self) -> Optional[Dict[str, Any]]:
         """Return the active chat route when it can also embed text.
 
@@ -769,10 +829,36 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         active route has no embedding API (Anthropic, for example), callers get
         ``None`` and storage falls back to keyword/LIKE search rather than
         silently using an unrelated global Ollama singleton.
+
+        Honors the bound ``force_local_only`` provider (#1492). When
+        ISOLATED / EPHEMERAL is active and the chosen route is
+        non-local, this returns ``None`` so callers fall through to
+        keyword search rather than ship plaintext to a cloud
+        embedding API. When no local route supports embeddings the
+        result is also ``None`` — never an unconfigured route.
         """
         if getattr(self, "disabled", False):
             return None
-        providers_to_use, target_model = self.resolve_provider_routing()
+
+        force_local_only = self._current_force_local_only()
+
+        # ``resolve_provider_routing`` raises RuntimeError when
+        # force_local_only=True and no local provider exists. For
+        # embedding the right answer is "fall back to keyword
+        # search," not "crash the storage write" — so catch it here.
+        try:
+            providers_to_use, target_model = self.resolve_provider_routing(
+                force_local_only=force_local_only,
+            )
+        except RuntimeError as exc:
+            logger.info(
+                "Embedding provider unavailable under force_local_only=%s: %s; "
+                "semantic storage search will use keyword fallback.",
+                force_local_only,
+                exc,
+            )
+            return None
+
         if not providers_to_use:
             return None
         provider = next(
