@@ -585,7 +585,7 @@ class TestConsolidatorWhileSalvagePending:
                 return (json.dumps(meta),) if meta else None
 
         consolidator = object.__new__(MemoryConsolidator)
-        consolidator.db = _StubDb()
+        consolidator._db = _StubDb()
 
         all_pointer = [{"metadata": {"summarized_into": "100"}}] * 2
         all_pending = [{"metadata": {"summarized_into": "200"}}] * 2

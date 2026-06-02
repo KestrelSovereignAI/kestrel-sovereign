@@ -456,8 +456,15 @@ class MemoryFeature(Feature):
                 pass
 
             memory_system_info: Dict[str, Any] = {}
+            episode_count = 0
             if self.memory_system:
                 memory_system_info = self.memory_system.get_summary()
+            if self.consolidator:
+                try:
+                    episodes = await self.consolidator.get_episodes(limit=10000)
+                    episode_count = len(episodes)
+                except Exception:
+                    pass
         except (AttributeError, TypeError, KeyError) as e:
             logger.error(f"memory_status failed: {e}")
             return ToolResult.failed(str(e))
@@ -471,11 +478,13 @@ class MemoryFeature(Feature):
         return ToolResult.ok(
             confirmation=(
                 f"Memory status: {total_messages} message(s), "
+                f"{episode_count} episode(s), "
                 f"{file_count} file(s), "
                 f"encryption={'on' if encryption_enabled else 'off'}"
             ),
             data={
                 "total_messages": total_messages,
+                "episode_count": episode_count,
                 "files_stored": file_count,
                 "encryption_enabled": encryption_enabled,
                 "agent_id": agent_id_short,
