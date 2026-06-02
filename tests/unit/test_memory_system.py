@@ -826,6 +826,168 @@ class TestMemoryConsolidatorKG:
         mock_db.execute.assert_called_once()
 
 
+class TestMemoryConsolidatorEpisodeCreation:
+    """Tests for #1489 — scheduled consolidation must produce retrievable episodes."""
+
+    @pytest.fixture
+    def _now(self):
+        return datetime.now(timezone.utc)
+
+    def _make_rows(self, count, *, date, metadata=None, agent_id="did:test:agent1"):
+        """Create mock conversation_history rows (id, content, metadata, created_at, role)."""
+        import json
+        rows = []
+        for i in range(count):
+            ts = (date + timedelta(minutes=i * 5)).isoformat()
+            meta = json.dumps(metadata or {})
+            rows.append((i + 1, f"message {i}", meta, ts, "user" if i % 2 == 0 else "assistant"))
+        return rows
+
+    @pytest.mark.asyncio
+    async def test_unenriched_messages_produce_episodes(self, _now):
+        """Messages without emotional metadata should still produce episodes (#1489)."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)
+
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) >= 1, (
+            f"Expected at least 1 episode from 5 unenriched messages, "
+            f"got {len(episodes)}; skipped={skipped}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_enriched_high_importance_messages_produce_episodes(self, _now):
+        """Messages with high emotional metadata should produce episodes."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        meta = {"emotional_intensity": 0.8, "importance": 0.9, "emotional_categories": ["joy"]}
+        rows = self._make_rows(5, date=date, metadata=meta)
+
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) >= 1
+
+    @pytest.mark.asyncio
+    async def test_enriched_low_importance_messages_skipped_with_reason(self, _now):
+        """Enriched messages below threshold should be skipped with a clear reason."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        meta = {"emotional_intensity": 0.1, "importance": 0.3, "emotional_categories": ["neutral"]}
+        rows = self._make_rows(5, date=date, metadata=meta)
+
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 0
+        assert len(skipped) >= 1
+        reasons = [r for _, _, r in skipped]
+        assert "below_emotional_threshold" in reasons
+
+    @pytest.mark.asyncio
+    async def test_too_few_messages_skipped_with_reason(self, _now):
+        """Clusters below MIN_EPISODE_MESSAGES should report below_min_messages."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(2, date=date)
+
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 0
+        assert len(skipped) >= 1
+        reasons = [r for _, _, r in skipped]
+        assert "below_min_messages" in reasons
+
+    @pytest.mark.asyncio
+    async def test_run_consolidation_reports_skip_reasons(self, _now):
+        """run_consolidation report should include skip_reasons (#1489)."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)
+
+        mock_db = AsyncMock()
+        mock_db.fetchall.return_value = rows
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = 5
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        report = await consolidator.run_consolidation()
+
+        assert "clusters_skipped" in report
+        assert "skip_reasons" in report
+        assert report["episodes_created"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_load_marker_state_uses_correct_db_attr(self):
+        """_load_marker_state must use self._db, not self.db (#1489 bugfix)."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        mock_db = AsyncMock()
+        mock_db.fetchone.return_value = None
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+
+        # Should NOT raise AttributeError (the pre-fix code used self.db)
+        result = await consolidator._load_marker_state(42)
+
+        assert result is None
+        mock_db.fetchone.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_episodes_retrievable_after_consolidation(self, _now):
+        """After consolidation, get_episodes should return the created episodes."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)
+
+        mock_db = AsyncMock()
+        mock_db.fetchall.side_effect = [
+            rows,   # _create_episodes query
+            [],     # _detect_patterns query
+            [],     # _archive_decayed query
+            # get_episodes query — return what was saved
+        ]
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = 5
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        report = await consolidator.run_consolidation()
+
+        assert report["episodes_created"] >= 1
+        # Verify _save_episode was called (INSERT into memory_episodes)
+        insert_calls = [
+            c for c in mock_db.execute.call_args_list
+            if "memory_episodes" in str(c)
+        ]
+        assert len(insert_calls) >= 1, "Expected at least one INSERT into memory_episodes"
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

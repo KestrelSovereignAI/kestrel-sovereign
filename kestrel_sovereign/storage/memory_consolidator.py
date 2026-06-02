@@ -93,13 +93,21 @@ class MemoryConsolidator:
             "patterns_found": 0,
             "messages_archived": 0,
             "total_messages_processed": 0,
+            "clusters_skipped": 0,
+            "skip_reasons": [],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
         try:
             # 1. Create episodes from high-importance clusters
-            episodes = await self._create_episodes()
+            episodes, skipped = await self._create_episodes()
             report["episodes_created"] = len(episodes)
+            report["clusters_skipped"] = len(skipped)
+            if skipped:
+                report["skip_reasons"] = [
+                    {"date": d, "messages": n, "reason": r}
+                    for d, n, r in skipped
+                ]
 
             # 2. Detect temporal patterns
             patterns = await self._detect_patterns()
@@ -128,7 +136,7 @@ class MemoryConsolidator:
 
         return report
 
-    async def _create_episodes(self) -> List[MemoryEpisode]:
+    async def _create_episodes(self) -> Tuple[List[MemoryEpisode], List[Tuple[str, int, str]]]:
         """
         Group related messages into narrative episodes.
 
@@ -137,8 +145,12 @@ class MemoryConsolidator:
         - Group by day
         - Within each day, find high-emotion clusters
         - Create episode if cluster has enough messages
+
+        Returns:
+            Tuple of (created episodes, skipped clusters as (date, count, reason))
         """
         episodes: List[MemoryEpisode] = []
+        report_skipped: List[Tuple[str, int, str]] = []
 
         # Get messages from last 30 days
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
@@ -152,7 +164,7 @@ class MemoryConsolidator:
         )
 
         if not rows:
-            return episodes
+            return episodes, report_skipped
 
         # Group messages by date
         by_date: Dict[str, List[Dict]] = defaultdict(list)
@@ -186,21 +198,41 @@ class MemoryConsolidator:
         # For each day, check if there's a significant cluster
         for date_key, messages in by_date.items():
             if len(messages) < self.MIN_EPISODE_MESSAGES:
+                report_skipped.append(
+                    (date_key, len(messages), "below_min_messages")
+                )
                 continue
 
             # Calculate average emotional intensity
             intensities = []
             importances = []
+            enriched_count = 0
             for msg in messages:
                 meta = msg.get("metadata", {})
                 intensities.append(meta.get("emotional_intensity", 0.0))
                 importances.append(meta.get("importance", 0.5))
+                # A message is "enriched" if the tagger has run on it —
+                # detect by the presence of emotional_categories or an
+                # explicit importance value.
+                if meta.get("emotional_categories") or "importance" in meta:
+                    enriched_count += 1
 
             avg_intensity = sum(intensities) / len(intensities) if intensities else 0
             avg_importance = sum(importances) / len(importances) if importances else 0.5
 
-            # Only create episode if emotionally significant
-            if avg_intensity < 0.3 and avg_importance < 0.6:
+            # Only apply the emotional-significance gate when messages
+            # actually carry emotional metadata.  Messages with default
+            # metadata (intensity=0.0, importance=0.5) are "unenriched" —
+            # the tagger never ran or the metadata was lost.  Gating on
+            # emotional significance for unenriched clusters silently
+            # drops every conversation that wasn't explicitly tagged,
+            # which is the root cause of #1489 (scheduled consolidation
+            # produces zero episodes for agents with hundreds of messages).
+            has_enrichment = enriched_count > 0
+            if has_enrichment and avg_intensity < 0.3 and avg_importance < 0.6:
+                report_skipped.append(
+                    (date_key, len(messages), "below_emotional_threshold")
+                )
                 continue
 
             # C / #1311 pending-state idempotency (Emma 2026-05-21):
@@ -219,6 +251,9 @@ class MemoryConsolidator:
                     "salvage settles",
                     date_key,
                 )
+                report_skipped.append(
+                    (date_key, len(messages), "pending_salvage")
+                )
                 continue
 
             # Create episode
@@ -229,7 +264,7 @@ class MemoryConsolidator:
                 episodes.append(episode)
                 await self._save_episode(episode)
 
-        return episodes
+        return episodes, report_skipped
 
     async def _all_messages_have_pending_salvage(
         self, messages: List[Dict[str, Any]]
@@ -285,7 +320,7 @@ class MemoryConsolidator:
         has no salvage_state field (treated as ``durable-folded`` for
         the pending-check above)."""
         try:
-            row = await self.db.fetchone(
+            row = await self._db.fetchone(
                 "SELECT metadata FROM conversation_history WHERE id = ?",
                 (marker_id,),
             )
