@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-01
-**Scope:** 1619 tracked files (1041 `.py`, 295 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-02
+**Scope:** 1622 tracked files (1043 `.py`, 296 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -455,6 +455,8 @@ Repo entry points and standard project files.
   - `async def collect_session_log(data, session_id, focus)`
 - **kestrel_sovereign/features/strategic_memory/talon_handoff.py** — Signal -> Talon Dispatch.
   - `async def pick_top_issue(data)`; `async def dispatch_to_talon(data, sender, recipient)`
+- **kestrel_sovereign/features/subagent_dispatch.py** — Make the A2A subagent-dispatch pattern universal across all features.
+  - `def ensure_subagent_dispatch(feature_class)`
 - **kestrel_sovereign/features/talon/__init__.py** — TalonCoordinatorFeature - thin dispatch to external kestrel-talon.
 - **kestrel_sovereign/features/talon/coordinator.py** — TalonCoordinatorFeature - lightweight dispatch to external Talon daemon.
   - `class TalonCoordinatorFeature`
@@ -1385,6 +1387,7 @@ Repo entry points and standard project files.
 - **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
 - **docs/development/README.md** — Development Documentation — Developer notes, experiments, and technical development guides.
 - **docs/development/SCOUT_PLAN_CODE.md** — Scout-Plan-Code: Agentic Development Workflow — **Date:** November 30, 2025 **Status:** Proposed **Integration:** A2A Protocol, Feedback System, Task Manager
+- **docs/development/WORKFLOW_AUTHORING.md** — Authoring multi-agent Workflow scripts — When a Claude session uses the Workflow tool to fan out across subagents — typically `observation → diagnosis → synthesis` — the synthesis stage tends to overreach.
 - **docs/development/remote_ollama.md** — Nice, that narrows it down a lot.
 - **docs/diagrams/02-privacy-problem.md** — 02 - The Privacy Problem — Why current AI platforms like ChatGPT fail you, and why data sovereignty matters.
 - **docs/diagrams/03-privacy-modes.md** — 03 - Privacy Modes — Kestrel's privacy system uses **independent flags** with **named presets** for complete control.
@@ -1774,7 +1777,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_avatar_storage.py** — Unit tests for avatar storage in AsyncFileStore
   - `async def file_store(tmp_path)`; `async def file_store_with_agent(tmp_path)`; `class TestAvatarStorage`
 - **tests/unit/test_bootstrap_discovery_fallthrough.py** — Regression: ``_handle_bootstrap`` falls through on discovery LLM error.
-  - `async def test_handle_bootstrap_falls_through_when_discovery_llm_fails()`; `async def test_handle_bootstrap_swallows_skip_discovery_failure()`
+  - `async def test_handle_bootstrap_falls_through_when_discovery_llm_fails()`; `async def test_handle_bootstrap_pending_persists_user_message_and_greeting()`; `async def test_handle_bootstrap_pending_does_not_persist_user_when_greeting_fails()`; `async def test_handle_bootstrap_swallows_skip_discovery_failure()`
 - **tests/unit/test_bootstrap_feature.py** — Unit tests for the Bootstrap Feature (#153).
   - `def tmp_agent_dir(tmp_path)`; `def extra_dir(tmp_path)`; `def loader(tmp_agent_dir)`; `def mock_agent()`; `class TestTruncateContent`; `class TestBootstrapLoaderBasic`; `class TestBootstrapLoaderBudgets`; `class TestBootstrapLoaderReload`; `…`
 - **tests/unit/test_bootstrap_files.py** — Tests for the bootstrap file convention (#153).
@@ -2018,6 +2021,8 @@ Repo entry points and standard project files.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
   - `def fake_tool()`; `def agent_with_tool(fake_tool)`; `class TestExecuteNamedToolGovernance`; `class TestExecuteNamedToolSubagentDispatch`
+- **tests/unit/test_external_feature_subagent_dispatch.py** — External (SDK-base) features must be dispatchable like in-tree features.
+  - `def test_sdk_base_feature_lacks_dispatch_by_default()`; `def test_injection_makes_external_feature_dispatchable()`; `def test_intree_feature_returned_unchanged()`; `def test_injection_does_not_clobber_feature_supplied_dispatch()`; `def test_dispatch_method_closure_is_present_on_sovereign_base()`; `async def test_external_feature_executes_as_subagent_end_to_end()`
 - **tests/unit/test_extract_raw_user_content.py** — Tests for ``context_builder.extract_raw_user_content``.
   - `def test_strips_full_sent_form_with_retrieved_context()`; `def test_strips_sent_form_without_retrieved_context()`; `def test_strips_sent_form_round_trips_wrap_user_input()`; `def test_legacy_raw_content_unchanged()`; `def test_preserves_inner_newlines_in_raw()`; `def test_preserves_inner_tag_like_content()`; `def test_malformed_partial_wrappers_left_alone()`; `def test_retrieved_context_only_no_user_input_wrap()`
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
