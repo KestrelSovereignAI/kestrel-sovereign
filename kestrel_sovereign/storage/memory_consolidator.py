@@ -166,6 +166,11 @@ class MemoryConsolidator:
         if not rows:
             return episodes, report_skipped
 
+        # Probe once: which message IDs are already covered by ANY existing
+        # episode (consolidator or session)? Used per-cluster to skip / pare
+        # down messages so nightly runs don't duplicate prior work (#1489 P2).
+        covered_message_ids = await self._covered_message_ids()
+
         # Group messages by date
         by_date: Dict[str, List[Dict]] = defaultdict(list)
         for row in rows:
@@ -196,14 +201,39 @@ class MemoryConsolidator:
             })
 
         # For each day, check if there's a significant cluster
-        for date_key, messages in by_date.items():
-            if len(messages) < self.MIN_EPISODE_MESSAGES:
+        for date_key, day_messages in by_date.items():
+            original_count = len(day_messages)
+            if original_count < self.MIN_EPISODE_MESSAGES:
                 report_skipped.append(
-                    (date_key, len(messages), "below_min_messages")
+                    (date_key, original_count, "below_min_messages")
                 )
                 continue
 
-            # Calculate average emotional intensity
+            # Message-level idempotency (#1489 P2). Dedup BEFORE the
+            # emotional / pending-salvage gates so they don't average over
+            # messages already locked into a prior episode (codex round 4):
+            # otherwise a day with many already-covered low-importance
+            # messages plus a few new high-importance ones can fail the
+            # emotional-threshold gate against the *old* messages and
+            # permanently shadow the new span.
+            messages = [
+                m for m in day_messages
+                if str(m["id"]) not in covered_message_ids
+            ]
+
+            if not messages:
+                report_skipped.append(
+                    (date_key, original_count, "already_consolidated")
+                )
+                continue
+
+            if len(messages) < self.MIN_EPISODE_MESSAGES:
+                report_skipped.append(
+                    (date_key, len(messages), "below_min_after_dedup")
+                )
+                continue
+
+            # Calculate average emotional intensity (post-dedup messages only)
             intensities = []
             importances = []
             enriched_count = 0
@@ -265,6 +295,36 @@ class MemoryConsolidator:
                 await self._save_episode(episode)
 
         return episodes, report_skipped
+
+    async def _covered_message_ids(self) -> set:
+        """Return the set of message IDs already covered by any existing
+        episode for this agent.
+
+        Used by ``_create_episodes`` to dedup against prior consolidator AND
+        session-episode runs. Daily-consolidator episodes have IDs of the
+        form ``episode:<agent>:YYYY-MM-DD:<suffix>``, while session episodes
+        use ``episode:<agent>:YYYY-MM-DD-HHMM:<suffix>``. Querying by
+        ``agent_id`` alone (no LIKE on the date) catches both, and avoids
+        N-per-day queries (#1489 P2).
+        """
+        rows = await self._db.fetchall(
+            """SELECT key_message_ids FROM memory_episodes
+               WHERE agent_id = ?""",
+            (self.agent_id,),
+        )
+        covered: set = set()
+        for row in rows or []:
+            kmi = row[0] if isinstance(row, (tuple, list)) else row
+            if isinstance(kmi, str):
+                try:
+                    parsed = json.loads(kmi)
+                    if isinstance(parsed, list):
+                        covered.update(str(x) for x in parsed)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            elif isinstance(kmi, list):
+                covered.update(str(x) for x in kmi)
+        return covered
 
     async def _all_messages_have_pending_salvage(
         self, messages: List[Dict[str, Any]]

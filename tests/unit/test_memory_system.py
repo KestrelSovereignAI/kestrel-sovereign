@@ -854,6 +854,8 @@ class TestMemoryConsolidatorEpisodeCreation:
         mock_db = AsyncMock()
         mock_db.fetchall.return_value = rows
         mock_db.execute = AsyncMock()
+        # No prior episode for this day — idempotency probe returns None
+        mock_db.fetchval.return_value = None
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         episodes, skipped = await consolidator._create_episodes()
@@ -875,6 +877,7 @@ class TestMemoryConsolidatorEpisodeCreation:
         mock_db = AsyncMock()
         mock_db.fetchall.return_value = rows
         mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         episodes, skipped = await consolidator._create_episodes()
@@ -931,13 +934,22 @@ class TestMemoryConsolidatorEpisodeCreation:
         rows = self._make_rows(5, date=date)
 
         mock_db = AsyncMock()
-        mock_db.fetchall.return_value = rows
+        # fetchall sequence: conversation_history, _covered_message_ids,
+        # then any remaining queries from later phases (empty results).
+        mock_db.fetchall.side_effect = [
+            rows,   # conversation_history
+            [],     # _covered_message_ids: no prior episodes
+            [],     # _detect_patterns (or whatever follows)
+            [],     # _archive_decayed
+            [],     # safety extra
+        ]
         mock_db.execute = AsyncMock()
-        mock_db.fetchval.return_value = 5
+        mock_db.fetchval.return_value = 5  # COUNT(*) total_messages_processed
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         report = await consolidator.run_consolidation()
 
+        assert "error" not in report, f"Unexpected error in report: {report.get('error')}"
         assert "clusters_skipped" in report
         assert "skip_reasons" in report
         assert report["episodes_created"] >= 1
@@ -967,18 +979,22 @@ class TestMemoryConsolidatorEpisodeCreation:
         rows = self._make_rows(5, date=date)
 
         mock_db = AsyncMock()
+        # fetchall sequence: conversation_history, _covered_message_ids
+        # (empty — no prior episodes), then later-phase queries.
         mock_db.fetchall.side_effect = [
-            rows,   # _create_episodes query
-            [],     # _detect_patterns query
-            [],     # _archive_decayed query
-            # get_episodes query — return what was saved
+            rows,   # conversation_history
+            [],     # _covered_message_ids
+            [],     # _detect_patterns
+            [],     # _archive_decayed
+            [],     # safety extra
         ]
         mock_db.execute = AsyncMock()
-        mock_db.fetchval.return_value = 5
+        mock_db.fetchval.return_value = 5  # COUNT(*) total_messages_processed
 
         consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
         report = await consolidator.run_consolidation()
 
+        assert "error" not in report, f"Unexpected error in report: {report.get('error')}"
         assert report["episodes_created"] >= 1
         # Verify _save_episode was called (INSERT into memory_episodes)
         insert_calls = [
@@ -986,6 +1002,164 @@ class TestMemoryConsolidatorEpisodeCreation:
             if "memory_episodes" in str(c)
         ]
         assert len(insert_calls) >= 1, "Expected at least one INSERT into memory_episodes"
+
+    @pytest.mark.asyncio
+    async def test_day_already_fully_consolidated_is_skipped_not_duplicated(self, _now):
+        """A day whose messages are all already in an episode must not be
+        re-consolidated on the next nightly run (#1489 P2 — codex round 1)."""
+        import json
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)  # ids 1..5
+
+        mock_db = AsyncMock()
+        # First fetchall is conversation_history; second is the dedup probe
+        # against memory_episodes returning an existing episode that covers
+        # every message in the cluster.
+        mock_db.fetchall.side_effect = [
+            rows,
+            [(json.dumps(["1", "2", "3", "4", "5"]),)],
+        ]
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 0, (
+            "A day with all messages covered by an existing episode must not "
+            "produce a duplicate"
+        )
+        reasons = [r for _, _, r in skipped]
+        assert "already_consolidated" in reasons
+
+    @pytest.mark.asyncio
+    async def test_partial_day_consolidation_picks_up_only_new_messages(self, _now):
+        """A midday consolidation that produced an episode from the morning's
+        messages must not lock the afternoon out: the next run should pick up
+        only the new messages (#1489 P2 — codex round 2)."""
+        import json
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(10, date=date)  # ids 1..10
+
+        mock_db = AsyncMock()
+        # Existing episode covers only the early ids 1..3.
+        mock_db.fetchall.side_effect = [
+            rows,
+            [(json.dumps(["1", "2", "3"]),)],
+        ]
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 1, "Should create an episode for the new messages"
+        assert episodes[0].key_message_ids == ["4", "5", "6", "7", "8", "9", "10"], (
+            "Episode should cover only the messages not already in a prior episode"
+        )
+
+    @pytest.mark.asyncio
+    async def test_session_episode_covers_messages_consolidator_dedups(self, _now):
+        """A session episode (id format ``episode:<agent>:YYYY-MM-DD-HHMM:<suffix>``)
+        covering the cluster's messages must dedup the nightly consolidator,
+        not just same-format daily episodes (#1489 P2 — codex round 3)."""
+        import json
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(5, date=date)
+
+        mock_db = AsyncMock()
+        # The episodes probe is now a single agent-wide query (no LIKE on
+        # the date), so it returns both consolidator-format AND session-format
+        # episodes. Here only a session episode exists, and it already covers
+        # all 5 messages.
+        mock_db.fetchall.side_effect = [
+            rows,
+            [(json.dumps(["1", "2", "3", "4", "5"]),)],
+        ]
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 0
+        reasons = [r for _, _, r in skipped]
+        assert "already_consolidated" in reasons
+
+    @pytest.mark.asyncio
+    async def test_dedup_gates_run_on_new_messages_not_full_cluster(self, _now):
+        """Emotional-threshold averaging must run on post-dedup messages so
+        a few new high-importance messages aren't shadowed by many old
+        low-importance ones (#1489 P2 — codex round 4)."""
+        import json
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        # 7 already-covered low-importance enriched messages
+        # + 5 new high-importance enriched messages.
+        low = {"emotional_intensity": 0.05, "importance": 0.1, "emotional_categories": ["neutral"]}
+        high = {"emotional_intensity": 0.9, "importance": 0.95, "emotional_categories": ["joy"]}
+        low_rows = []
+        for i in range(7):
+            ts = (date + timedelta(minutes=i * 5)).isoformat()
+            low_rows.append((i + 1, f"low {i}", json.dumps(low), ts, "user"))
+        high_rows = []
+        for i in range(5):
+            ts = (date + timedelta(minutes=(7 + i) * 5)).isoformat()
+            high_rows.append((8 + i, f"high {i}", json.dumps(high), ts, "user"))
+        rows = low_rows + high_rows
+
+        mock_db = AsyncMock()
+        # Covered: ids 1..7 (the low-importance ones)
+        mock_db.fetchall.side_effect = [
+            rows,
+            [(json.dumps([str(i) for i in range(1, 8)]),)],
+        ]
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 1, (
+            "New high-importance messages must produce an episode even when "
+            "the full-day averages (including covered messages) would fail "
+            "the emotional gate"
+        )
+        assert episodes[0].key_message_ids == ["8", "9", "10", "11", "12"]
+
+    @pytest.mark.asyncio
+    async def test_partial_day_below_min_after_dedup_is_skipped(self, _now):
+        """If only a few new messages remain after dedup and they fall below
+        MIN_EPISODE_MESSAGES, the cluster is skipped with a distinct reason
+        rather than padded with already-covered messages."""
+        import json
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        date = _now - timedelta(days=1)
+        rows = self._make_rows(6, date=date)  # ids 1..6
+
+        mock_db = AsyncMock()
+        # Existing episode covers ids 1..5; only id 6 is new.
+        mock_db.fetchall.side_effect = [
+            rows,
+            [(json.dumps(["1", "2", "3", "4", "5"]),)],
+        ]
+        mock_db.execute = AsyncMock()
+        mock_db.fetchval.return_value = None
+
+        consolidator = MemoryConsolidator(db=mock_db, agent_id="did:test:agent1")
+        episodes, skipped = await consolidator._create_episodes()
+
+        assert len(episodes) == 0
+        reasons = [r for _, _, r in skipped]
+        assert "below_min_after_dedup" in reasons
 
 
 # Run tests
