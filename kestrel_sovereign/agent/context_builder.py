@@ -449,7 +449,7 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             if role not in ('user', 'assistant', 'system'):
                 role = 'user' if role == 'human' else 'assistant'
 
-            # Select the bytes to emit (#1402). For user turns flagged
+            # Select the bytes to emit (#1402). For user/system turns flagged
             # ``sent_form`` we replay the rendered transport form verbatim
             # — this is the byte-identical prefix the LLM saw at write
             # time, which is the prerequisite for Anthropic's cache_control
@@ -462,7 +462,11 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             # whose rendered_content is missing (should not happen post
             # #1402 — get_conversation_history splits in-memory even when
             # the DB write is disabled).
-            if role == 'user' and meta.get('sent_form') and rendered_content is not None:
+            if (
+                role in ('user', 'system')
+                and meta.get('sent_form')
+                and rendered_content is not None
+            ):
                 content = rendered_content
             elif role == 'user' and not meta.get('sent_form'):
                 content = wrap_user_input(raw_content)

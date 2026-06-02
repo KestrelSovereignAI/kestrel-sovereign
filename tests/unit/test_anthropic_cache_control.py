@@ -122,6 +122,127 @@ def test_messages_with_penultimate_marker_list_content_preserved():
     assert penult_content[1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
 
 
+def test_messages_with_trailing_system_marks_last_stable_turn():
+    """A newly appended inline system turn is fresh input, so the marker
+    stays on the stable assistant response before current-user + system.
+    """
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2 current"},
+        {"role": "system", "content": [{"type": "text", "text": "auto on"}]},
+    ]
+
+    marked = _messages_with_penultimate_cache_marker(
+        messages,
+        volatile_tail_size=2,
+    )
+
+    assert marked[-1] == messages[-1]
+    assert marked[-2] == messages[-2]
+    stable = marked[1]["content"]
+    assert isinstance(stable, list)
+    assert stable[-1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
+
+
+def test_messages_with_stable_inline_system_compounds_to_prior_marker():
+    """On the next turn, the latest assistant marker includes the stable
+    inline system in its prefix while the second marker still queries the
+    breakpoint written before the system was introduced.
+    """
+    messages = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "system", "content": [{"type": "text", "text": "auto on"}]},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3 current"},
+    ]
+
+    marked = _messages_with_penultimate_cache_marker(messages)
+
+    assert marked[4]["content"][-1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
+    assert marked[1]["content"][-1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
+    assert marked[3] == messages[3]
+
+
+def test_convert_messages_preserves_supported_inline_system():
+    adapter = AnthropicAdapter()
+    messages = [
+        {"role": "system", "content": "prefix"},
+        {"role": "user", "content": "q1"},
+        {"role": "system", "content": "operator fact"},
+    ]
+
+    converted, system = adapter._convert_messages_to_anthropic(
+        messages,
+        keep_trailing_system=True,
+        model="claude-opus-4-8-20260501",
+    )
+
+    assert system == "prefix"
+    assert converted == [
+        {"role": "user", "content": "q1"},
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": "operator fact"}],
+        },
+    ]
+
+
+def test_convert_messages_demotes_unsupported_inline_system(caplog):
+    adapter = AnthropicAdapter()
+    messages = [
+        {"role": "system", "content": "prefix"},
+        {"role": "user", "content": "q1"},
+        {"role": "system", "content": "operator fact"},
+    ]
+
+    with caplog.at_level("INFO"):
+        converted, system = adapter._convert_messages_to_anthropic(
+            messages,
+            keep_trailing_system=True,
+            model="claude-sonnet-4-6-20260101",
+        )
+
+    assert converted == [{"role": "user", "content": "q1"}]
+    assert system == "prefix\n\noperator fact"
+    assert "demoting non-leading system" in caplog.text
+
+
+def test_inline_system_validator_rejects_illegal_positions():
+    adapter = AnthropicAdapter()
+
+    with pytest.raises(ValueError, match="cannot be the first"):
+        adapter._validate_inline_system_messages([
+            {"role": "system", "content": "bad"},
+            {"role": "user", "content": "q"},
+        ])
+
+    with pytest.raises(ValueError, match="cannot be consecutive"):
+        adapter._validate_inline_system_messages([
+            {"role": "user", "content": "q"},
+            {"role": "system", "content": "one"},
+            {"role": "system", "content": "two"},
+        ])
+
+    with pytest.raises(ValueError, match="must be last"):
+        adapter._validate_inline_system_messages([
+            {"role": "user", "content": "q"},
+            {"role": "system", "content": "operator"},
+            {"role": "user", "content": "bad next"},
+        ])
+
+    with pytest.raises(ValueError, match="must immediately follow"):
+        adapter._validate_inline_system_messages([
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1"}],
+            },
+            {"role": "system", "content": "bad"},
+        ])
+
+
 # ---------------------------------------------------------------------------
 # Adapter-level _apply_cache_control
 # ---------------------------------------------------------------------------

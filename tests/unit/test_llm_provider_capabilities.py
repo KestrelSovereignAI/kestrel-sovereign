@@ -36,6 +36,7 @@ class DictCapabilitiesAdapter:
             "supports_vision": True,
             "supports_structured_output": True,
             "supports_embeddings": True,
+            "supports_inline_system": True,
             "structured_output_mode": "json_schema",
             "tool_streaming_mode": "native_delta",
             "vision_input_mode": "openai_image_url",
@@ -62,6 +63,7 @@ def test_provider_capabilities_to_dict_uses_wire_values():
         "supports_vision": False,
         "supports_structured_output": False,
         "supports_embeddings": False,
+        "supports_inline_system": False,
         "structured_output_mode": "json_schema",
         "tool_streaming_mode": "native_delta",
         "vision_input_mode": "openai_image_url",
@@ -80,6 +82,7 @@ def test_adapter_capabilities_normalizes_plugin_dicts():
     assert capabilities.supports_tools is True
     assert capabilities.supports_structured_output is True
     assert capabilities.supports_embeddings is True
+    assert capabilities.supports_inline_system is True
     assert capabilities.embedding_model == "text-embedding-3-small"
     assert capabilities.embedding_dim == 1536
     assert capabilities.structured_output_mode == StructuredOutputMode.JSON_SCHEMA
@@ -500,6 +503,9 @@ def test_in_tree_adapter_capability_matrix():
         assert capabilities.supports_vision is supports_vision
         assert capabilities.supports_structured_output is supports_structured_output
         assert capabilities.supports_embeddings is supports_embeddings
+        if isinstance(adapter, AnthropicAdapter):
+            assert capabilities.supports_inline_system is True
+            assert "supports_inline_system" in capabilities.model_dependent
         assert capabilities.embedding_model == embedding_model
         assert capabilities.embedding_dim == embedding_dim
         assert capabilities.structured_output_mode == structured_output_mode
