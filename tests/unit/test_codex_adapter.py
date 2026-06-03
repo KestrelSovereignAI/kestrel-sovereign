@@ -1044,3 +1044,185 @@ class TestOpenAIPlanProviderRegistry:
             except ProviderInitializationError:
                 providers = []  # no routes could initialize — invariant holds
         assert not any(p.name == "openai:plan" for p in providers)
+
+
+class TestDiscoveredRouteCapFromThreadStart:
+    """``CodexAdapter._record_discovered_route_cap_from_thread_start``
+    folds the per-turn cap codex reports on ``thread/start`` into the
+    catalog so the existing context-status surface + ContextManager
+    budget sizing reflect THIS session's ground truth instead of an
+    empirical static guess that goes stale when OpenAI tunes the
+    subscription tier."""
+
+    def _adapter(self) -> CodexAdapter:
+        # Direct construction; this method doesn't touch any of the
+        # async/auth machinery — it's pure parsing.
+        return CodexAdapter.__new__(CodexAdapter)
+
+    def test_records_auto_compact_token_limit_camel_case(self):
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {"thread": {"id": "thr_1", "autoCompactTokenLimit": 49152}},
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 49152
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_records_snake_case_field_too(self):
+        """Codex-rs may emit snake_case in some versions; both should
+        be honored so the parser doesn't break when the wire format
+        drifts."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {"thread": {"id": "thr_1", "auto_compact_token_limit": 49152}},
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 49152
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_picks_smallest_when_multiple_fields_present(self):
+        """``modelContextWindow`` reports the full window;
+        ``autoCompactTokenLimit`` is the per-turn ceiling — the
+        smaller value is the real binding constraint, so the parser
+        takes the min."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {
+                    "thread": {
+                        "id": "thr_1",
+                        "modelContextWindow": 1_000_000,
+                        "maxContextWindow": 1_000_000,
+                        "autoCompactTokenLimit": 32_768,
+                    },
+                },
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 32_768
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_missing_model_id_still_records_on_the_route(self):
+        """Codex round 1 P2 on this PR: discovery is keyed by ROUTE,
+        not by full model id, because downstream lookups are
+        route-qualified and the route covers every model on it. A
+        missing/auto model id (the common ``model = "auto"`` case)
+        must NOT skip recording — the cap applies to whatever model
+        codex picks for this session."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                None,
+                {"thread": {"id": "thr_1", "autoCompactTokenLimit": 49152}},
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 49152
+            assert catalog.get_route_context_cap("openai:plan") == 49152
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_missing_cap_fields_silently_skip(self):
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            # No relevant fields — should be a no-op.
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {"thread": {"id": "thr_1", "somethingElse": True}},
+            )
+            # No discovered entry recorded; whatever value is returned
+            # comes from the file layer fallback (unconstrained by
+            # this test — we just assert no crash + the discovered
+            # cache stays clear).
+            from kestrel_sovereign.llm.model_catalog import (
+                get_catalog_service as svc_factory,
+            )
+            assert svc_factory()._discovered_route_context_caps == {}
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_boolean_value_does_not_get_treated_as_int(self):
+        """``True`` is an int subclass in Python — the parser must not
+        treat a stray bool flag named ``autoCompactTokenLimit: True``
+        as a 1-token cap."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {"thread": {"id": "thr_1", "autoCompactTokenLimit": True}},
+            )
+            assert catalog._discovered_route_context_caps == {}
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_finds_cap_in_thread_settings_nested_block(self):
+        """Codex round 2 P2 on this PR: codex sometimes places the
+        ThreadSettings snapshot one level deeper under
+        ``thread.settings`` rather than at the thread root. The parser
+        must descend one level so the cap isn't silently missed."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {
+                    "thread": {
+                        "id": "thr_1",
+                        "settings": {"autoCompactTokenLimit": 40960},
+                    },
+                },
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 40960
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_finds_cap_in_thread_thread_settings_camel_case(self):
+        """Same nested-snapshot case, but with the camelCase key
+        codex's binary strings table reveals
+        (``thread.threadSettings``)."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {
+                    "thread": {
+                        "id": "thr_1",
+                        "threadSettings": {"autoCompactTokenLimit": 28672},
+                    },
+                },
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 28672
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_finds_cap_at_top_level_too(self):
+        """The thread settings snapshot may be at the response root or
+        nested — both shapes should resolve."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_thread_start(
+                "openai:plan/gpt-5.5",
+                {"autoCompactTokenLimit": 24576, "thread": {"id": "thr_1"}},
+            )
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 24576
+        finally:
+            catalog.clear_discovered_route_context_caps()

@@ -501,12 +501,138 @@ class CodexAdapter(LLMAdapter):
                 raise CodexAppServerError(
                     f"thread/start returned no thread id: {result!r}"
                 )
+            # #1503 follow-up: codex's ``thread/start`` response carries
+            # the server-reported per-thread / per-plan context window.
+            # Codex's binary surfaces fields named ``model_context_window``,
+            # ``max_context_window``, ``auto_compact_token_limit``, and
+            # ``effective_context_window_percent`` on its ThreadSettings
+            # snapshot. The smallest is the actual per-turn ceiling for
+            # this session under THIS plan — feed it to the catalog as
+            # the runtime-discovered route cap so context-status + the
+            # ContextManager elastic budget track ground truth instead
+            # of an empirical static guess that goes stale every time
+            # OpenAI tunes the subscription tier.
+            self._record_discovered_route_cap_from_thread_start(m, result)
             if session_id:
                 self._session_threads[session_id] = (thread_id, fingerprint)
             return thread_id, True
         finally:
             if lock is not None:
                 lock.release()
+
+    # Field names codex's ``thread/start`` response carries on its
+    # ThreadSettings snapshot (verified from the codex binary strings
+    # table). camelCase first per codex-rs convention, snake_case
+    # fallbacks in case the wire format drifts.
+    _DISCOVERED_CAP_FIELDS = (
+        "autoCompactTokenLimit",
+        "auto_compact_token_limit",
+        "modelContextWindow",
+        "model_context_window",
+        "maxContextWindow",
+        "max_context_window",
+    )
+
+    # Catalog route key this adapter discovers caps for. CodexAdapter
+    # is openai:plan-only by design; if a future adapter ever serves a
+    # different capped route (e.g. a hypothetical openai:plan-pro
+    # bridge) it would carry its own route key here. Hardcoded
+    # because ``self.name`` is the SDK identifier ("openai_plan") and
+    # downstream catalog / context-status look up by the route form
+    # ``"openai:plan"`` — codex round 1 P2 on this PR.
+    _DISCOVERED_CAP_ROUTE_KEY = "openai:plan"
+
+    def _record_discovered_route_cap_from_thread_start(
+        self,
+        full_model_id: Optional[str],
+        thread_start_result: Optional[Dict[str, Any]],
+    ) -> None:
+        """Capture the per-turn ceiling codex reports on ``thread/start``.
+
+        Codex's response carries (server-named) fields on the thread
+        settings snapshot that describe the actual upstream ceiling
+        for this session under this plan. ``autoCompactTokenLimit``
+        is the closest to a per-turn cap (it's where codex itself
+        starts compacting); ``modelContextWindow`` /
+        ``maxContextWindow`` describe the model's headroom. Take the
+        smallest positive integer of whatever fields are present and
+        fold it into the catalog as a runtime-discovered route cap
+        keyed by ``openai:plan`` (the route, NOT the model id —
+        downstream lookups are route-qualified) so context-status +
+        the ContextManager elastic budget read it.
+
+        Best-effort: missing fields / unparseable values silently
+        degrade to "no discovery this turn" (operator's env override
+        and the static config layers still apply via the normal
+        precedence chain). ``full_model_id`` is taken only for the
+        diagnostic log; the discovery applies to the entire route.
+        """
+        if not isinstance(thread_start_result, dict):
+            return
+        # Probe the top level of the response AND its nested
+        # ``thread`` / ``threadSettings`` / ``thread_settings`` /
+        # ``settings`` blocks, because the field placement isn't stable
+        # across codex versions (the v0.135 strings table shows both
+        # shapes). Also descend ONE level into the thread block so a
+        # ``{"thread": {"settings": {...}}}`` shape is found — codex
+        # round 2 P2 on this PR.
+        probe_sources: List[Dict[str, Any]] = [thread_start_result]
+        _SETTINGS_KEYS = ("thread", "threadSettings", "thread_settings", "settings")
+        for nest_key in _SETTINGS_KEYS:
+            nested = thread_start_result.get(nest_key)
+            if isinstance(nested, dict):
+                probe_sources.append(nested)
+                # Codex sometimes places the snapshot one level deeper
+                # under ``thread.settings`` / ``thread.threadSettings``.
+                for inner_key in _SETTINGS_KEYS:
+                    inner = nested.get(inner_key)
+                    if isinstance(inner, dict):
+                        probe_sources.append(inner)
+        candidates: List[int] = []
+        for src in probe_sources:
+            for field in self._DISCOVERED_CAP_FIELDS:
+                value = src.get(field)
+                if isinstance(value, bool):
+                    # ``True`` is technically an int subclass; skip it
+                    # so a stray bool flag doesn't get treated as a
+                    # 1-token cap.
+                    continue
+                if isinstance(value, int) and value > 0:
+                    candidates.append(value)
+        if not candidates:
+            return
+        discovered_cap = min(candidates)
+        try:
+            from .model_catalog import get_catalog_service
+            catalog = get_catalog_service()
+        except Exception as e:
+            logger.debug(
+                "codex discovered route cap %d for %s but catalog "
+                "service unavailable (%s); not recording",
+                discovered_cap, full_model_id, e,
+            )
+            return
+        try:
+            catalog.set_discovered_route_context_cap(
+                self._DISCOVERED_CAP_ROUTE_KEY, discovered_cap,
+            )
+            logger.info(
+                "codex thread/start: discovered route cap for %s = %d "
+                "(model=%s, fields={%s})",
+                self._DISCOVERED_CAP_ROUTE_KEY, discovered_cap,
+                full_model_id or "auto",
+                ", ".join(
+                    f"{field}={src.get(field)}"
+                    for src in probe_sources for field in self._DISCOVERED_CAP_FIELDS
+                    if isinstance(src.get(field), int)
+                    and not isinstance(src.get(field), bool)
+                ),
+            )
+        except Exception as e:
+            logger.debug(
+                "failed to record discovered route cap %d on %s: %s",
+                discovered_cap, self._DISCOVERED_CAP_ROUTE_KEY, e,
+            )
 
     def _make_tool_call_handler(
         self, executor: ToolExecutor, thread_id: str,

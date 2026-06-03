@@ -196,6 +196,21 @@ class ModelCatalogService:
         # so a character heuristic alone is ambiguous — codex round-3
         # P2 on PR #1396).
         self._route_context_caps: Dict[str, int] = {}
+        # ``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` and
+        # ``KESTREL_ROUTE_CONTEXT_CAP_*`` overrides — kept separate from
+        # file-based values so the runtime-discovered layer can beat the
+        # file layer without sliding under the operator's explicit env
+        # knob. Precedence at lookup: env > discovered > file (highest
+        # priority wins).
+        self._env_route_context_caps: Dict[str, int] = {}
+        # Runtime-discovered route caps from the upstream server's
+        # session/thread response (e.g. ``model_context_window`` /
+        # ``auto_compact_token_limit`` from codex's ``thread/start``).
+        # Ground truth for THIS session under THIS plan, so they take
+        # precedence over file-based defaults — but env overrides still
+        # beat them so the operator never loses their force-this-value
+        # knob.
+        self._discovered_route_context_caps: Dict[str, int] = {}
         self._display_names: Dict[str, str] = {}
         self._tool_support: Dict[str, bool] = {}
         # vendor -> {"small": model_id, "medium": ..., "large": ...}
@@ -299,7 +314,7 @@ class ModelCatalogService:
             self._loaded = True  # Mark as loaded to avoid retry loops
 
     def _apply_route_cap_env_overrides(self) -> None:
-        """Apply ``KESTREL_*_CONTEXT_CAP`` env overrides to ``_route_context_caps``.
+        """Apply ``KESTREL_*_CONTEXT_CAP`` env overrides to ``_env_route_context_caps``.
 
         Mapped from ``KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>=<int>`` so
         the operator can tune a route's effective window without editing
@@ -312,6 +327,11 @@ class ModelCatalogService:
         missing-catalog defaults path can apply the same env-override
         layer (#1506 codex round 3 P2 — without this, the env overrides
         also vanish whenever the catalog file is absent).
+
+        Stored in a SEPARATE dict from the file-based layer so the
+        runtime-discovered layer in ``get_route_context_cap`` can beat
+        the file values without sliding under the operator's explicit
+        env knob.
         """
         for env_key, env_val in os.environ.items():
             if env_val == "":
@@ -328,7 +348,7 @@ class ModelCatalogService:
             else:
                 continue
             try:
-                self._route_context_caps[target_key] = int(env_val)
+                self._env_route_context_caps[target_key] = int(env_val)
                 logger.info(
                     "route context cap override from env: %s = %s",
                     target_key, env_val,
@@ -397,17 +417,98 @@ class ModelCatalogService:
 
         return ModelCategory.CHAT
 
+    def set_discovered_route_context_cap(
+        self, model_id: str, cap: int
+    ) -> None:
+        """Record a runtime-discovered per-turn cap from the upstream
+        server (e.g. codex's ``thread/start`` ``model_context_window``).
+
+        Stored separately from the static config layers so the
+        operator's env-var override remains the highest priority knob,
+        but the discovered value otherwise wins over file-based
+        defaults (which are guesses calibrated to the previous tier).
+        Best-effort: a non-int ``cap`` is silently dropped.
+        """
+        self._ensure_loaded()
+        try:
+            self._discovered_route_context_caps[str(model_id)] = int(cap)
+        except (TypeError, ValueError):
+            logger.debug(
+                "discovered route cap for %r was non-integer (%r); ignored",
+                model_id, cap,
+            )
+
+    def clear_discovered_route_context_caps(self) -> None:
+        """Wipe the runtime-discovered cap layer.
+
+        Useful for tests and for forcing a re-discover on the next
+        session (e.g. after a subscription tier change). Not exposed
+        as user surface — operators should set the env override knob
+        instead to force a specific value.
+        """
+        self._discovered_route_context_caps.clear()
+
+    def get_matched_route_cap_key(self, model_id: str) -> Optional[str]:
+        """Return the route key that ``get_route_context_cap`` would
+        match on, across ALL layers (env / discovered / file). Used by
+        the context-status endpoint to show the route NAME alongside
+        the cap value even when the cap came from env / discovered
+        (the endpoint previously iterated only the file layer, so
+        env-only and discovered-only deployments showed ``route: null``
+        — codex round 2 P3 on this PR).
+
+        Layer order matches ``get_route_context_cap`` so the route key
+        attributed to the cap is the one that won precedence.
+        """
+        self._ensure_loaded()
+        model_lower = model_id.lower()
+
+        def _best_key(layer: Dict[str, int]) -> Optional[str]:
+            best_key: Optional[str] = None
+            best_len = -1
+            for known_route in layer:
+                key_lower = known_route.lower()
+                if (
+                    model_lower == key_lower
+                    or model_lower.startswith(key_lower + "/")
+                ) and len(key_lower) > best_len:
+                    best_key = known_route
+                    best_len = len(key_lower)
+            return best_key
+
+        for layer in (
+            self._env_route_context_caps,
+            self._discovered_route_context_caps,
+            self._route_context_caps,
+        ):
+            matched = _best_key(layer)
+            if matched is not None:
+                return matched
+        return None
+
     def get_route_context_cap(self, model_id: str) -> Optional[int]:
         """Return a route-level per-turn payload cap for ``model_id``, or None.
 
-        Reads exclusively from the dedicated ``[route_context_caps]``
-        TOML section (and env overrides). The structural separation
-        is load-bearing: Ollama bare model IDs share the
-        ``word:word`` shape (e.g. ``llama3.2:3b``), so a character
-        heuristic on ``_context_limits`` would let Ollama entries
-        match as if they were route caps on a route-qualified
-        selection like ``ollama:local/llama3.2:3b`` (codex round-3
-        P2 on PR #1396).
+        Precedence (highest wins, longest-route-key wins for ties
+        within a layer):
+
+        1. ``KESTREL_*_CONTEXT_CAP`` env vars (already merged into
+           ``_route_context_caps``). The operator's explicit override
+           — always wins so they can force a specific value.
+        2. Runtime-discovered values from upstream server responses
+           (``_discovered_route_context_caps``). Ground truth for
+           THIS session under THIS plan/account.
+        3. ``kestrel.toml [llm.route_context_caps]`` and
+           ``model_catalog.toml [route_context_caps]`` (both already
+           merged into ``_route_context_caps`` by ``load()``).
+
+        Reads exclusively from the dedicated dicts (and env overrides
+        on top). The structural separation is load-bearing: Ollama
+        bare model IDs share the ``word:word`` shape (e.g.
+        ``llama3.2:3b``), so a character heuristic on
+        ``_context_limits`` would let Ollama entries match as if they
+        were route caps on a route-qualified selection like
+        ``ollama:local/llama3.2:3b`` (codex round-3 P2 on PR #1396).
 
         Matching rule: the route key must equal the model string,
         OR the model string must start with ``"<route_key>/"``. A
@@ -418,17 +519,34 @@ class ModelCatalogService:
         """
         self._ensure_loaded()
         model_lower = model_id.lower()
-        best_match: Optional[int] = None
-        best_len = -1
-        for known_route, limit in self._route_context_caps.items():
-            key_lower = known_route.lower()
-            if (
-                model_lower == key_lower
-                or model_lower.startswith(key_lower + "/")
-            ) and len(key_lower) > best_len:
-                best_match = limit
-                best_len = len(key_lower)
-        return best_match
+
+        def _best_for(layer: Dict[str, int]) -> Optional[int]:
+            """Longest-route-key wins within a layer."""
+            best: Optional[int] = None
+            best_len = -1
+            for known_route, limit in layer.items():
+                key_lower = known_route.lower()
+                if (
+                    model_lower == key_lower
+                    or model_lower.startswith(key_lower + "/")
+                ) and len(key_lower) > best_len:
+                    best = limit
+                    best_len = len(key_lower)
+            return best
+
+        # Layer 1: env vars — operator's explicit override, always wins.
+        env_cap = _best_for(self._env_route_context_caps)
+        if env_cap is not None:
+            return env_cap
+
+        # Layer 2: runtime-discovered values from upstream session events.
+        # Ground truth for THIS session under THIS plan.
+        discovered = _best_for(self._discovered_route_context_caps)
+        if discovered is not None:
+            return discovered
+
+        # Layer 3: static config (kestrel.toml + model_catalog.toml).
+        return _best_for(self._route_context_caps)
 
     def get_context_limit(self, model_id: str) -> Optional[int]:
         """
