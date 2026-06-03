@@ -4,13 +4,90 @@ Embedding Service for Kestrel.
 Provides text embeddings using Ollama's embedding models.
 This replaces the need for local sentence-transformers installation.
 """
+import hashlib
 import logging
+from dataclasses import dataclass
 from typing import Any, List, Optional
 import numpy as np
 
 from kestrel_sovereign.kestrel_config.defaults import get_ollama_url
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class EmbeddingProfile:
+    """Identity of an embedding configuration (#1477).
+
+    Two vectors produced by the same ``EmbeddingProfile`` live in the
+    same semantic coordinate space and can be compared by cosine.
+    Vectors with different profile ids — even at the same dimension —
+    cannot. The 12-char hex digest is stable across restarts so old
+    rows match new ones whenever the operator's config didn't change.
+
+    ``space_id`` defaults to ``"<provider>:<model>"`` but operators can
+    override to force-merge profiles they have evidence live in the
+    same space (e.g. two providers wrapping the same upstream model).
+    ``normalized`` records whether the provider returns L2-normalized
+    vectors — semantically equivalent unit vectors from a model that
+    returns both normalized and raw outputs would otherwise have
+    different cosine semantics under the same model name.
+    """
+
+    provider: str
+    model: str
+    dim: int
+    space_id: str
+    normalized: bool
+
+    @property
+    def profile_id(self) -> str:
+        """Stable 12-char hex digest derived from (space_id, dim, normalized).
+
+        ``space_id`` defaults to ``"<provider>:<model>"`` so distinct
+        provider/model pairs naturally land on distinct ids. When an
+        operator sets ``embedding_space_id`` capability to force-merge
+        two services they have evidence live in the same coordinate
+        space (e.g. an OpenRouter-wrapped model vs the upstream
+        original), both services produce the SAME profile id and
+        their rows are visible to each other in cosine kNN. Including
+        the raw provider/model in the hash would defeat the override.
+        (Codex P2 on #1477.)
+        """
+        payload = (
+            f"{self.space_id}|{int(self.dim)}"
+            f"|{str(bool(self.normalized)).lower()}"
+        )
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def derive_embedding_profile(
+    *,
+    provider: str,
+    model: str,
+    dim: int,
+    normalized: bool = False,
+    space_id: Optional[str] = None,
+) -> EmbeddingProfile:
+    """Build an ``EmbeddingProfile`` from raw fields.
+
+    ``space_id`` defaults to ``"<provider>:<model>"`` when None — the
+    "two different vendors of the same upstream model" override is
+    opt-in and rare.
+    """
+    if not provider or not model or not dim or int(dim) <= 0:
+        raise ValueError(
+            "derive_embedding_profile requires non-empty provider, model, "
+            f"and positive dim (got provider={provider!r}, model={model!r}, "
+            f"dim={dim!r})"
+        )
+    return EmbeddingProfile(
+        provider=str(provider),
+        model=str(model),
+        dim=int(dim),
+        space_id=str(space_id) if space_id else f"{provider}:{model}",
+        normalized=bool(normalized),
+    )
 
 # Optional ollama import
 try:
@@ -182,6 +259,46 @@ class EmbeddingService:
             self._handle_embed_error(e, "Async batch embedding failed")
             return [None] * len(texts)
 
+    def describe(self) -> Optional[EmbeddingProfile]:
+        """Return the ``EmbeddingProfile`` for this Ollama-only service.
+
+        Hard-codes ``provider="ollama"`` and the well-known dims for
+        the two default models (#1477). Returns ``None`` for any
+        model not in the known dim table — the legacy service has no
+        provider capability metadata to probe, so storage falls back
+        to leaving ``embedding_profile_id`` NULL (= invisible to
+        profile-filtered kNN) rather than guessing a dim and risking
+        mixed-profile garbage. Operators that want stamping for
+        unusual Ollama models should use the
+        :class:`ProviderEmbeddingService` path via ``LLMService``
+        instead.
+        """
+        # Known dims for the two recommended Ollama embedding models.
+        # Other models fall through to None — operators get a clear
+        # signal (NULL profile id) and stable behavior rather than a
+        # silently-wrong guess.
+        known_dims = {
+            "nomic-embed-text": 768,
+            "mxbai-embed-large": 1024,
+        }
+        dim = known_dims.get(self.model)
+        if not dim:
+            return None
+        try:
+            return derive_embedding_profile(
+                provider="ollama",
+                model=self.model,
+                dim=dim,
+                normalized=False,
+            )
+        except ValueError:
+            return None
+
+    def current_profile_id(self) -> Optional[str]:
+        """Convenience: ``describe().profile_id`` or ``None``."""
+        profile = self.describe()
+        return profile.profile_id if profile else None
+
 
 class ProviderEmbeddingService:
     """Embedding service backed by an initialized LLM provider route.
@@ -201,6 +318,16 @@ class ProviderEmbeddingService:
         capabilities = provider.get("capabilities") or {}
         self.model = capabilities.get("embedding_model")
         self.embedding_dim = capabilities.get("embedding_dim")
+        # #1477 normalization flag — capability-declared; defaults to
+        # False because most providers (OpenAI, Vertex, Ollama
+        # nomic-embed-text) return raw vectors and let the caller
+        # cosine-normalize. Operators flip this for providers known
+        # to return unit vectors.
+        self._normalized = bool(capabilities.get("embedding_normalized", False))
+        # Optional space-id override to merge two providers that wrap
+        # the same upstream model (rare). Default profile uses
+        # ``"<provider>:<model>"``.
+        self._space_id = capabilities.get("embedding_space_id")
 
     async def aembed(self, text: str) -> Optional[List[float]]:
         return await self.adapter.aembed(
@@ -216,6 +343,50 @@ class ProviderEmbeddingService:
             model=self.model,
         )
 
+    def describe(self) -> Optional[EmbeddingProfile]:
+        """Return the ``EmbeddingProfile`` for this service, or ``None``.
+
+        ``None`` indicates the service is missing the metadata needed
+        to build a stable profile id (no embedding_model or no
+        embedding_dim in capabilities). Storage code treats this as
+        "don't stamp" and the row's ``embedding_profile_id`` stays
+        NULL — making it invisible to profile-filtered kNN reads,
+        consistent with pre-0.21 rows. Better to lose recall than to
+        mix vectors with no provenance.
+        """
+        if not self.model or not self.embedding_dim:
+            return None
+        # ``provider`` is the route's vendor — the human-readable label
+        # operators see in config (``"openai"``, ``"anthropic"``,
+        # ``"ollama"``). Falls back to the full ``"<vendor>:<route>"``
+        # name when vendor isn't set (shouldn't happen for routes built
+        # via ``ProviderRegistry`` but defensive against third-party
+        # adapters).
+        provider_label = (
+            self.provider.get("vendor")
+            or self.provider.get("name")
+            or "unknown"
+        )
+        try:
+            return derive_embedding_profile(
+                provider=provider_label,
+                model=self.model,
+                dim=self.embedding_dim,
+                normalized=self._normalized,
+                space_id=self._space_id,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Could not derive embedding profile for %s: %s",
+                provider_label, exc,
+            )
+            return None
+
+    def current_profile_id(self) -> Optional[str]:
+        """Convenience: ``describe().profile_id`` or ``None``."""
+        profile = self.describe()
+        return profile.profile_id if profile else None
+
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:
     """
@@ -226,9 +397,22 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
         b: Second vector
 
     Returns:
-        Cosine similarity score (0-1, higher is more similar)
+        Cosine similarity score in ``[-1, 1]`` (higher = more similar);
+        ``0.0`` when either vector is zero, empty, or has a different
+        length from the other. The length guard catches mismatched-dim
+        bugs that ``numpy.dot`` would otherwise execute happily,
+        returning a meaningless number.
     """
+    if not a or not b:
+        return 0.0
     if len(a) != len(b):
+        # #1477 — defense-in-depth alongside the embedding_profile_id
+        # filter. The kNN backends should never feed a mismatched-dim
+        # row through to here (they enforce dim at the column level)
+        # and the profile filter cuts mixed-model rows; but if a
+        # caller bypasses those layers, we still fail safe instead of
+        # returning a mathematically-defined-but-meaningless dot
+        # product.
         return 0.0
 
     a_np = np.array(a)

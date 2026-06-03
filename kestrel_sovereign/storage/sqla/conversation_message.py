@@ -181,6 +181,16 @@ class ConversationMessage(SovereignBase):
         nullable=True,
     )
 
+    # #1477 — semantic-space identity for the embedding above.
+    # NULL means "pre-0.21 row or no provider metadata at write
+    # time"; profile-filtered kNN skips these rows so they can't
+    # silently mix with rows from a different model living in a
+    # different coordinate space. Operators run ``kestrel-sovereign
+    # embeddings reindex`` once per agent to backfill.
+    embedding_profile_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+
 
 def build_conversation_message_spec(dimension: int) -> VectorTableSpec:
     """Build a ``VectorTableSpec`` for ``conversation_history``.
@@ -224,5 +234,10 @@ def build_conversation_message_spec(dimension: int) -> VectorTableSpec:
             "agent_id": ConversationMessage.agent_id,
             "role": ConversationMessage.role,
             "deleted_at": ConversationMessage.deleted_at,
+            # #1477 — kNN skips rows whose profile id doesn't match
+            # the caller-provided one. MemoryRetriever passes the
+            # service's ``current_profile_id()``; legacy NULL rows
+            # are excluded by the same filter.
+            "embedding_profile_id": ConversationMessage.embedding_profile_id,
         },
     )

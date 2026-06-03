@@ -200,8 +200,45 @@ class MemoryRetriever:
         row_embeddings: Dict[Any, List[float]] = {}
         if query_embedding is not None:
             ids = [m.get("id") for m in history if m.get("id") is not None]
+            # #1477 — only load rows stamped with the current
+            # embedding profile id. Cross-profile rows return as
+            # absent (no entry in the dict) → ``_score_semantic``
+            # naturally falls through to keyword overlap for those
+            # rows. ``None`` (no service / no profile metadata)
+            # means "no filter" — preserves legacy behavior.
+            current_profile_id: Optional[str] = None
+            embedding_service_for_profile = getattr(
+                self.conversations, "embedding_service", None
+            )
+            if embedding_service_for_profile is not None and hasattr(
+                embedding_service_for_profile, "current_profile_id"
+            ):
+                try:
+                    current_profile_id = (
+                        embedding_service_for_profile.current_profile_id()
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed during retriever "
+                        "load: %s", exc,
+                    )
             try:
-                row_embeddings = await self.conversations.get_message_embeddings(ids)
+                row_embeddings = await self.conversations.get_message_embeddings(
+                    ids, embedding_profile_id=current_profile_id,
+                )
+            except TypeError:
+                # Older store version without the keyword (defense
+                # against in-process mismatch / tests that stub the
+                # store). Fall through to the unfiltered legacy call.
+                try:
+                    row_embeddings = await self.conversations.get_message_embeddings(
+                        ids
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Could not load row embeddings for vector cosine "
+                        "(falling back to keyword overlap): %s", e,
+                    )
             except Exception as e:
                 # Embedding load failure must NOT block retrieval —
                 # the keyword path is a complete fallback.

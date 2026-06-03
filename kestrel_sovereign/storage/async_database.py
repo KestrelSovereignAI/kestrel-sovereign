@@ -608,6 +608,35 @@ class AsyncDatabase:
                 "scoring until next boot.", e, exc_info=True,
             )
 
+        # #1477 — add ``embedding_profile_id`` column to all three
+        # embedded tables + create the ``embedding_profiles``
+        # registry. Each migration is idempotent + transactional
+        # internally; failures here are non-fatal because the kNN
+        # filter treats a missing column as "no profile id to
+        # match" (column missing → SELECT errors out → caller
+        # falls through to keyword search). Operators see clear
+        # logs on the next boot.
+        try:
+            from .sqla.migrations import (
+                migrate_add_embedding_profile_id,
+                migrate_create_embedding_profiles,
+            )
+            await migrate_create_embedding_profiles(self)
+            for table in (
+                "conversation_history",
+                "saved_items",
+                "document_chunks",
+            ):
+                await migrate_add_embedding_profile_id(self, table=table)
+        except Exception as e:
+            logger.error(
+                "embedding_profile_id migration failed: %s. "
+                "Storage writes will leave the column NULL; profile-"
+                "filtered kNN reads will skip those rows. Operators "
+                "should re-run ``kestrel-sovereign embeddings reindex`` "
+                "once the underlying cause is fixed.", e, exc_info=True,
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(

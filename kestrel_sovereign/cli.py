@@ -2113,6 +2113,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
+    # kestrel embeddings audit | reindex  (#1477)
+    from kestrel_sovereign.cli_embeddings import add_embeddings_subparser
+    add_embeddings_subparser(subparsers)
+
     # kestrel start [name] [--subprocess]
     start_p = subparsers.add_parser("start", help="Start host and/or agents")
     start_p.add_argument("name", nargs="?", help="Agent name (omit for all)")
@@ -2500,6 +2504,7 @@ def main() -> int:
     from kestrel_sovereign.cli_docker_remote import cmd_docker
     from kestrel_sovereign.cli_ipfs import cmd_ipfs
     from kestrel_sovereign.cli_runpod import cmd_runpod
+    from kestrel_sovereign.cli_embeddings import run as cmd_embeddings
 
     commands = {
         "start": cmd_start,
@@ -2531,6 +2536,7 @@ def main() -> int:
         "docker": cmd_docker,
         "ipfs": cmd_ipfs,
         "runpod": cmd_runpod,
+        "embeddings": cmd_embeddings,
     }
 
     handler = commands.get(args.command)

@@ -133,10 +133,14 @@ async def test_add_conversation_with_service_writes_embedding_vec_sqlite(
     small_embedding_dim,
 ):
     """SQLite: the embedding goes in as packed float32 bytes against
-    a single ``?`` placeholder (BLOB column)."""
+    a single ``?`` placeholder (BLOB column). #1477 adds an
+    ``embedding_profile_id`` column written alongside the vec — the
+    bind position shifts by one accordingly."""
     embedding = [0.1, 0.2, 0.3, 0.4]
     svc = MagicMock()
     svc.aembed = AsyncMock(return_value=embedding)
+    svc.current_profile_id = MagicMock(return_value="abc123def456")
+    svc.describe = MagicMock(return_value=None)  # registry upsert skipped
 
     store, db = _make_store(backend_type="sqlite", embedding_service=svc)
     await store.add_conversation(role="assistant", content="hello")
@@ -144,11 +148,14 @@ async def test_add_conversation_with_service_writes_embedding_vec_sqlite(
     svc.aembed.assert_awaited_once_with("hello")
     sql, params = _insert_call(db)
     assert "embedding_vec" in sql
+    assert "embedding_profile_id" in sql
     # No ::vector cast on SQLite.
     assert "::vector" not in sql
-    # Bind value at the trailing slot is packed bytes.
-    assert isinstance(params[-1], (bytes, bytearray))
-    assert params[-1] == _serialize_embedding(embedding)
+    # Trailing bind is the profile id (added by #1477).
+    assert params[-1] == "abc123def456"
+    # Bind value at position -2 is now the packed bytes (embedding).
+    assert isinstance(params[-2], (bytes, bytearray))
+    assert params[-2] == _serialize_embedding(embedding)
 
 
 @pytest.mark.asyncio
@@ -156,10 +163,13 @@ async def test_add_conversation_with_service_writes_embedding_vec_postgres(
     small_embedding_dim,
 ):
     """Postgres: the embedding goes in as a pgvector text literal +
-    ``?::vector`` cast (asyncpg + pgvector)."""
+    ``?::vector`` cast (asyncpg + pgvector). #1477 appends
+    ``embedding_profile_id`` after the vector bind."""
     embedding = [0.1, 0.2, 0.3, 0.4]
     svc = MagicMock()
     svc.aembed = AsyncMock(return_value=embedding)
+    svc.current_profile_id = MagicMock(return_value="abc123def456")
+    svc.describe = MagicMock(return_value=None)  # registry upsert skipped
 
     store, db = _make_store(backend_type="postgres", embedding_service=svc)
     await store.add_conversation(role="assistant", content="hello")
@@ -167,8 +177,11 @@ async def test_add_conversation_with_service_writes_embedding_vec_postgres(
     sql, params = _insert_call(db)
     assert "embedding_vec" in sql
     assert "::vector" in sql
-    # Bind value at the trailing slot is the bracketed text literal.
-    bound = params[-1]
+    assert "embedding_profile_id" in sql
+    # Trailing bind is the profile id (added by #1477).
+    assert params[-1] == "abc123def456"
+    # The vector bind sits one slot earlier — bracketed text literal.
+    bound = params[-2]
     assert isinstance(bound, str)
     assert bound.startswith("[") and bound.endswith("]")
 
@@ -279,21 +292,21 @@ async def test_add_conversation_falls_back_when_migration_not_run(
     small_embedding_dim,
 ):
     """A live deployment where Phase-2 migration hasn't completed yet
-    (column missing) raises on the embedding INSERT. Catch it, log,
-    and retry with the legacy column list so the row still lands.
+    (``embedding_vec`` column missing) raises on the embedding INSERT.
 
-    Simulated by making the FIRST ``execute_commit`` raise — the
-    fallback re-executes the legacy SQL."""
+    With #1477 the write path tries three shapes in order:
+    1. ``embedding_vec`` + ``embedding_profile_id`` — fails (no vec col).
+    2. ``embedding_vec`` only — also fails (no vec col).
+    3. legacy column list — succeeds.
+
+    The row must still land regardless."""
     embedding = [0.1, 0.2, 0.3, 0.4]
     svc = MagicMock()
     svc.aembed = AsyncMock(return_value=embedding)
 
     store, db = _make_store(embedding_service=svc)
 
-    call_count = {"n": 0}
-
     async def execute_commit(sql, params):
-        call_count["n"] += 1
         if "embedding_vec" in sql:
             raise RuntimeError('column "embedding_vec" does not exist')
         return 1
@@ -301,15 +314,58 @@ async def test_add_conversation_falls_back_when_migration_not_run(
     db.execute_commit = AsyncMock(side_effect=execute_commit)
     await store.add_conversation(role="assistant", content="hello")
 
-    # First call tried the embedding-aware SQL; second call retried
-    # with the legacy column list and succeeded.
     insert_calls = [
         c for c in db.execute_commit.call_args_list
         if "INSERT INTO conversation_history" in c.args[0]
     ]
-    assert len(insert_calls) == 2
+    assert len(insert_calls) == 3
     assert "embedding_vec" in insert_calls[0].args[0]
-    assert "embedding_vec" not in insert_calls[1].args[0]
+    assert "embedding_profile_id" in insert_calls[0].args[0]
+    # Middle attempt is vec-only (no profile_id).
+    assert "embedding_vec" in insert_calls[1].args[0]
+    assert "embedding_profile_id" not in insert_calls[1].args[0]
+    # Final fallback omits both new columns.
+    assert "embedding_vec" not in insert_calls[2].args[0]
+    assert "embedding_profile_id" not in insert_calls[2].args[0]
+
+
+@pytest.mark.asyncio
+async def test_add_conversation_partial_migration_keeps_embedding_vec(
+    small_embedding_dim,
+):
+    """#1477 codex P2 regression: when ``embedding_vec`` is present but
+    ``embedding_profile_id`` is NOT (partial migration), the write
+    must still land the embedding into ``embedding_vec``. Pre-fix
+    the catch-all retry dropped both columns and regressed those
+    deployments from storing vectors to not."""
+    embedding = [0.1, 0.2, 0.3, 0.4]
+    svc = MagicMock()
+    svc.aembed = AsyncMock(return_value=embedding)
+    svc.current_profile_id = MagicMock(return_value="abc123def456")
+    svc.describe = MagicMock(return_value=None)
+
+    store, db = _make_store(embedding_service=svc)
+
+    async def execute_commit(sql, params):
+        # Reject only the combined INSERT — accept the vec-only retry.
+        if "embedding_profile_id" in sql:
+            raise RuntimeError(
+                'column "embedding_profile_id" does not exist'
+            )
+        return 1
+
+    db.execute_commit = AsyncMock(side_effect=execute_commit)
+    await store.add_conversation(role="assistant", content="hello")
+
+    insert_calls = [
+        c for c in db.execute_commit.call_args_list
+        if "INSERT INTO conversation_history" in c.args[0]
+    ]
+    # Combined INSERT failed, vec-only INSERT succeeded. No third call.
+    assert len(insert_calls) == 2
+    # The second (successful) call writes vec but NOT profile_id.
+    assert "embedding_vec" in insert_calls[1].args[0]
+    assert "embedding_profile_id" not in insert_calls[1].args[0]
 
 
 # ----------------------------------------------------------------- provider lookup

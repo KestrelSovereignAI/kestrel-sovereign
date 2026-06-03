@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from .async_database import AsyncDatabase
 
@@ -516,7 +516,32 @@ class SavedItemsStore:
             )
         )
         if embedding is not None:
-            await self._write_embedding_vec(item_id, embedding)
+            # #1477 — derive the active profile id so kNN can filter
+            # out rows from a different semantic coordinate space.
+            embedding_service = self._get_embedding_service()
+            profile_id: Optional[str] = None
+            if embedding_service is not None and hasattr(
+                embedding_service, "current_profile_id"
+            ):
+                try:
+                    profile_id = embedding_service.current_profile_id()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed for saved_item %s: %s",
+                        item_id, exc,
+                    )
+            await self._write_embedding_vec(item_id, embedding, profile_id)
+            if profile_id is not None and embedding_service is not None:
+                from .sqla.embedding_profile import upsert_embedding_profile
+                try:
+                    await upsert_embedding_profile(
+                        self.db, embedding_service, profile_id,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "embedding_profiles registry upsert failed for "
+                        "saved_item %s: %s", item_id, exc,
+                    )
         await self.db.commit()
 
         return SavedItem(
@@ -743,10 +768,14 @@ class SavedItemsStore:
         return [SavedItem.from_row(row) for row in rows]
 
     async def _write_embedding_vec(
-        self, item_id: str, embedding: List[float]
+        self,
+        item_id: str,
+        embedding: List[float],
+        profile_id: Optional[str] = None,
     ) -> None:
-        """Write the embedding to the parallel ``embedding_vec`` column
-        so it's discoverable by the vector backend.
+        """Write the embedding (and #1477 profile id) to the parallel
+        ``embedding_vec`` column so it's discoverable by the vector
+        backend.
 
         - On Postgres, formats the list as pgvector's text shape
           (``[v1,v2,…]``) and binds with a ``::vector`` cast.
@@ -756,16 +785,58 @@ class SavedItemsStore:
         - On any other dialect, treats the column as binary like
           SQLite.
 
+        ``profile_id`` is co-written into the parallel
+        ``embedding_profile_id`` column. NULL is allowed (pre-#1477
+        deployments without the migration); kNN filters by the
+        active profile so NULL rows correctly stay out of mixed-
+        coordinate-space recall.
+
         Errors here are non-fatal: the legacy ``embedding`` BYTEA / BLOB
         column is already written, so search degrades gracefully to
         the in-Python fallback path on the next ``search()`` call.
+        Failure paths attempt to stamp the profile id even when
+        the vector column is missing — without this, partial-
+        migration deployments (only #1477 ran, not Phase-2) would
+        get NULL stamps that the legacy in-Python search now
+        filters out (codex P2 round 4 on #1477).
         """
         backend_type = getattr(self.db, "backend_type", None)
         try:
             if backend_type == "postgres":
                 vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
                 await self.db.execute(
-                    "UPDATE saved_items SET embedding_vec = ?::vector WHERE id = ?",
+                    "UPDATE saved_items SET embedding_vec = ?::vector, "
+                    "embedding_profile_id = ? WHERE id = ?",
+                    (vec_text, profile_id, item_id),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE saved_items SET embedding_vec = ?, "
+                    "embedding_profile_id = ? WHERE id = ?",
+                    (_serialize_embedding(embedding), profile_id, item_id),
+                )
+            return
+        except Exception as e:
+            # Most likely cause: a migration hasn't run yet on this DB
+            # (one of the columns doesn't exist). Try the two columns
+            # INDEPENDENTLY so each one lands wherever its column is
+            # present — without this, a partial-migration state (only
+            # one of the two columns) regresses BOTH writes.
+            logger.info(
+                "Could not write saved_items.embedding_vec + "
+                "embedding_profile_id for %s in one UPDATE (%s); "
+                "trying each column independently.", item_id, e,
+            )
+
+        # Best-effort vec-only write.
+        try:
+            if backend_type == "postgres":
+                vec_text = "[" + ",".join(
+                    repr(float(v)) for v in embedding
+                ) + "]"
+                await self.db.execute(
+                    "UPDATE saved_items SET embedding_vec = ?::vector "
+                    "WHERE id = ?",
                     (vec_text, item_id),
                 )
             else:
@@ -773,16 +844,28 @@ class SavedItemsStore:
                     "UPDATE saved_items SET embedding_vec = ? WHERE id = ?",
                     (_serialize_embedding(embedding), item_id),
                 )
-        except Exception as e:
-            # Most likely cause: the Phase-2 migration hasn't run yet
-            # on this DB (the column doesn't exist). Log info and move
-            # on — the legacy path keeps working unchanged.
-            logger.info(
-                "Could not write saved_items.embedding_vec for %s: %s. "
-                "Vector search will use the in-Python fallback path "
-                "until the next boot's migration runs.",
-                item_id, e,
+        except Exception as e2:
+            logger.debug(
+                "saved_items.embedding_vec write failed for %s: %s "
+                "(column likely missing — Phase-2 migration pending).",
+                item_id, e2,
             )
+        # Best-effort profile-id-only write so the legacy in-Python
+        # fallback (which now filters by profile id) still sees this
+        # row when only the Phase-2 column is missing.
+        if profile_id is not None:
+            try:
+                await self.db.execute(
+                    "UPDATE saved_items SET embedding_profile_id = ? "
+                    "WHERE id = ?",
+                    (profile_id, item_id),
+                )
+            except Exception as e3:
+                logger.debug(
+                    "saved_items.embedding_profile_id write failed for "
+                    "%s: %s (column likely missing — #1477 migration "
+                    "pending).", item_id, e3,
+                )
 
     def _get_vector_session_factory(self):
         """Lazy-build a SQLAlchemy session factory pointed at the same
@@ -914,6 +997,32 @@ class SavedItemsStore:
             if item_type:
                 filter_kwargs["item_type"] = item_type
 
+            # #1477 — filter kNN to rows stamped with the active
+            # embedding profile id so cross-model rows can't sneak
+            # into cosine. ``None`` (no service / no embedding
+            # metadata) means "don't add the filter" — the kNN runs
+            # over every row matching the other filters, which
+            # preserves legacy behavior for deployments that haven't
+            # finished the migration yet. Rows with NULL
+            # ``embedding_profile_id`` are excluded when a non-None
+            # profile id is set (the backends translate the kwarg
+            # to ``= ?``, and NULL doesn't equal anything).
+            current_profile_id: Optional[str] = None
+            embedding_service_for_profile = self._get_embedding_service()
+            if embedding_service_for_profile is not None and hasattr(
+                embedding_service_for_profile, "current_profile_id"
+            ):
+                try:
+                    current_profile_id = (
+                        embedding_service_for_profile.current_profile_id()
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed at read time: %s", exc
+                    )
+            if current_profile_id is not None:
+                filter_kwargs["embedding_profile_id"] = current_profile_id
+
             # Factory dispatch: PgVectorBackend on PG (post-Phase-2
             # migration), PurePythonBackend on SQLite.
             backend = get_vector_backend(session_factory, spec)
@@ -964,27 +1073,67 @@ class SavedItemsStore:
     ) -> List[Dict[str, Any]]:
         """Fallback used when the SQLAlchemy session factory isn't
         available (in-memory SQLite, ``AsyncDatabase.from_pool``,
-        etc.). Same shape as the pre-1447 search path."""
+        etc.). Same shape as the pre-1447 search path.
 
-        # Get all items with embeddings
-        if item_type:
-            rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
+        #1477: also applies the profile-id filter here so mixed-
+        profile rows can't sneak into cosine on the legacy path. We
+        try with the filter first; if the column doesn't exist (pre-
+        migration DB), retry the legacy query unchanged. Catches the
+        codex P2 about the fallback path bypassing the new filter.
+        """
+        # Derive current profile id once.
+        current_profile_id: Optional[str] = None
+        embedding_service_for_profile = self._get_embedding_service()
+        if embedding_service_for_profile is not None and hasattr(
+            embedding_service_for_profile, "current_profile_id"
+        ):
+            try:
+                current_profile_id = (
+                    embedding_service_for_profile.current_profile_id()
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "current_profile_id() failed in legacy search: %s", exc,
+                )
+
+        profile_clause = ""
+        profile_params: Tuple[Any, ...] = ()
+        if current_profile_id is not None:
+            profile_clause = " AND embedding_profile_id = ?"
+            profile_params = (current_profile_id,)
+
+        # Get all items with embeddings (optionally filtered by profile).
+        async def _fetch(with_profile: bool):
+            clause = profile_clause if with_profile else ""
+            params_tail = profile_params if with_profile else ()
+            if item_type:
+                return await self.db.fetchall(
+                    f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
+                              ipfs_cid, embedding, source_type, source_ref, schema_id,
+                              tags, metadata, created_at, updated_at
+                       FROM saved_items
+                       WHERE agent_id = ? AND item_type = ? AND embedding IS NOT NULL{clause}""",
+                    (self.agent_id, item_type, *params_tail),
+                )
+            return await self.db.fetchall(
+                f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
                           ipfs_cid, embedding, source_type, source_ref, schema_id,
                           tags, metadata, created_at, updated_at
                    FROM saved_items
-                   WHERE agent_id = ? AND item_type = ? AND embedding IS NOT NULL""",
-                (self.agent_id, item_type)
+                   WHERE agent_id = ? AND embedding IS NOT NULL{clause}""",
+                (self.agent_id, *params_tail),
             )
-        else:
-            rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
-                   FROM saved_items
-                   WHERE agent_id = ? AND embedding IS NOT NULL""",
-                (self.agent_id,)
+
+        try:
+            rows = await _fetch(with_profile=current_profile_id is not None)
+        except Exception as exc:
+            # Profile column doesn't exist yet (#1477 migration
+            # hasn't run on this DB). Retry without the filter.
+            logger.debug(
+                "Legacy saved_items search failed with profile filter "
+                "(%s); retrying unfiltered.", exc,
             )
+            rows = await _fetch(with_profile=False)
 
         if not rows:
             # Fall back to text search with the original query string —

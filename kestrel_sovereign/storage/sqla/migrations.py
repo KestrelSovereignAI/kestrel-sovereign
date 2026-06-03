@@ -508,6 +508,168 @@ async def _migrate_pg_greenfield(db: "AsyncDatabase", *, table: str) -> None:
     )
 
 
+# --- #1477 embedding_profile_id stamping ------------------------------------
+
+async def migrate_add_embedding_profile_id(
+    db: "AsyncDatabase", *, table: str
+) -> None:
+    """Add a nullable ``embedding_profile_id`` column to ``table``.
+
+    Idempotent across both backends and tables — pre-checks the
+    column via ``information_schema`` / ``pragma_table_info``.
+    Wrapped in ``db.transaction()`` so a partial failure rolls back
+    cleanly. Existing rows stay NULL; profile-filtered kNN will skip
+    them so a deployment that upgrades into 0.21 sees no false
+    positives from un-stamped rows. Operators can backfill with the
+    ``kestrel-sovereign embeddings reindex`` subcommand once per
+    agent.
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        rows = await db.fetchall(
+            f"""SELECT 1 FROM information_schema.columns
+                WHERE table_name = '{table}'
+                  AND column_name = 'embedding_profile_id'""",
+            (),
+        )
+        if rows:
+            logger.debug(
+                "%s.embedding_profile_id already present — skipping #1477 PG migration.",
+                table,
+            )
+            return
+        table_exists = await db.fetchall(
+            f"""SELECT 1 FROM information_schema.tables
+                WHERE table_name = '{table}'""",
+            (),
+        )
+        if not table_exists:
+            logger.debug(
+                "%s table not yet present — skipping #1477 PG migration.", table,
+            )
+            return
+        async with db.transaction():
+            await db.execute(
+                f"ALTER TABLE {table} ADD COLUMN embedding_profile_id TEXT",
+                (),
+            )
+            # An index on the new column accelerates the profile
+            # filter in the kNN WHERE clause; without it pgvector
+            # has to scan every row that matches the other filters
+            # before applying the cosine sort. Cheap to add on a
+            # nullable column.
+            await db.execute(
+                f"""CREATE INDEX IF NOT EXISTS idx_{table}_embedding_profile_id
+                    ON {table}(embedding_profile_id)
+                    WHERE embedding_profile_id IS NOT NULL""",
+                (),
+            )
+        logger.info(
+            "%s #1477 PG migration complete: added embedding_profile_id TEXT + "
+            "partial index.", table,
+        )
+    elif backend_type == "sqlite":
+        rows = await db.fetchall(
+            f"SELECT name FROM pragma_table_info('{table}') "
+            f"WHERE name = 'embedding_profile_id'",
+            (),
+        )
+        if rows:
+            logger.debug(
+                "%s.embedding_profile_id already present — skipping #1477 SQLite migration.",
+                table,
+            )
+            return
+        table_exists = await db.fetchall(
+            f"SELECT 1 FROM sqlite_master WHERE type='table' AND name='{table}'",
+            (),
+        )
+        if not table_exists:
+            logger.debug(
+                "%s table not yet present — skipping #1477 SQLite migration.",
+                table,
+            )
+            return
+        async with db.transaction():
+            await db.execute(
+                f"ALTER TABLE {table} ADD COLUMN embedding_profile_id TEXT", (),
+            )
+            await db.execute(
+                f"""CREATE INDEX IF NOT EXISTS idx_{table}_embedding_profile_id
+                    ON {table}(embedding_profile_id)""",
+                (),
+            )
+        logger.info(
+            "%s #1477 SQLite migration complete: added embedding_profile_id TEXT.",
+            table,
+        )
+
+
+async def migrate_create_embedding_profiles(db: "AsyncDatabase") -> None:
+    """Create the ``embedding_profiles`` registry table (#1477).
+
+    Tiny operator-visibility table — one row per
+    ``(provider, model, dim, space_id, normalized)`` seen in the
+    deployment. Storage code upserts on every successful write; the
+    audit CLI reads it. The kNN filter does NOT join this table — it
+    matches against the stamped id directly — so this is purely a
+    human-readable mapping.
+
+    Idempotent + transactional.
+    """
+    backend_type = getattr(db, "backend_type", None)
+    if backend_type == "postgres":
+        rows = await db.fetchall(
+            """SELECT 1 FROM information_schema.tables
+               WHERE table_name = 'embedding_profiles'""",
+            (),
+        )
+        if rows:
+            logger.debug(
+                "embedding_profiles already present — skipping #1477 PG migration."
+            )
+            return
+        async with db.transaction():
+            await db.execute(
+                """CREATE TABLE embedding_profiles (
+                    id          TEXT PRIMARY KEY,
+                    provider    TEXT NOT NULL,
+                    model       TEXT NOT NULL,
+                    dim         INTEGER NOT NULL,
+                    space_id    TEXT NOT NULL,
+                    normalized  BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )""",
+                (),
+            )
+        logger.info("embedding_profiles created (PG, #1477).")
+    elif backend_type == "sqlite":
+        rows = await db.fetchall(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND "
+            "name='embedding_profiles'",
+            (),
+        )
+        if rows:
+            logger.debug(
+                "embedding_profiles already present — skipping #1477 SQLite migration."
+            )
+            return
+        async with db.transaction():
+            await db.execute(
+                """CREATE TABLE embedding_profiles (
+                    id          TEXT PRIMARY KEY,
+                    provider    TEXT NOT NULL,
+                    model       TEXT NOT NULL,
+                    dim         INTEGER NOT NULL,
+                    space_id    TEXT NOT NULL,
+                    normalized  INTEGER NOT NULL DEFAULT 0,
+                    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                )""",
+                (),
+            )
+        logger.info("embedding_profiles created (SQLite, #1477).")
+
+
 async def _migrate_sqlite_greenfield(db: "AsyncDatabase", *, table: str) -> None:
     """SQLite greenfield migration — add ``embedding_vec BLOB`` to a
     table that has no existing embedding column.

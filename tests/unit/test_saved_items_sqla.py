@@ -53,7 +53,12 @@ def test_build_saved_item_spec_matches_entity_columns():
     assert spec.id_column is SavedItem.id
     assert spec.embedding_column is SavedItem.embedding
     assert spec.required_filter_keys == ("agent_id",)
-    assert set(spec.filter_columns) == {"agent_id", "item_type"}
+    assert set(spec.filter_columns) == {
+        "agent_id",
+        "item_type",
+        # #1477 — profile-id filter for semantic-space scoping.
+        "embedding_profile_id",
+    }
     assert spec.tenant_id_filter_key is None
     assert spec.dimension == 768
 
