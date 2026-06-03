@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-02
-**Scope:** 1622 tracked files (1043 `.py`, 296 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-03
+**Scope:** 1623 tracked files (1044 `.py`, 296 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1537,7 +1537,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_agent_tools_e2e.py** — Integration tests for unified Feature/A2A agent tools system.
   - `def skip_if_no_ollama()`; `async def llm_service()`; `async def model_agent(llm_service)`; `async def kestrel_agent(llm_service, temp_db)`; `async def cleanup_test_model()`; `async def test_model_agent_creation(model_agent)`; `async def test_model_agent_get_tools(model_agent)`; `async def test_model_agent_get_agent_card(model_agent)`; `…`
 - **tests/integration/test_anthropic_cache_real.py** — Integration test: Anthropic cache_control works end-to-end (issue #705).
-  - `async def test_anthropic_cache_read_on_turn_two_real_api()`; `async def test_anthropic_cache_compounds_across_three_turns_with_two_history_markers()`; `async def test_anthropic_tiny_prompt_silent_no_op_under_threshold()`
+  - `async def test_anthropic_cache_read_on_turn_two_real_api()`; `async def test_anthropic_cache_compounds_across_three_turns_with_two_history_markers()`; `async def test_anthropic_tiny_prompt_silent_no_op_under_threshold()`; `async def test_anthropic_mid_conversation_system_message_real_api()`
 - **tests/integration/test_api_e2e.py** — End-to-End API Test
   - `def api_key()`; `def client(monkeypatch)`; `def anyio_backend()`; `def test_invoke_agent_e2e(client, api_key)`
 - **tests/integration/test_approval_live_server.py** — Live-server integration test for the approval SSE path (#748).
@@ -1757,7 +1757,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
   - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_idle_shape_includes_silently_pruned_flag()`; `def test_context_status_returns_idle_shape_when_no_session_id()`; `def test_context_status_returns_idle_shape_for_empty_session_id()`; `def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_history()`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
-  - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_apply_cache_control_marks_all_three_positions()`; `…`
+  - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
 - **tests/unit/test_anthropic_wire_model_id.py** — Unit tests for AnthropicAdapter wire model-id normalization (#1420).
   - `def test_resolve_wire_model_id_strips_anthropic_prefix()`; `def test_resolve_wire_model_id_is_case_insensitive()`; `def test_resolve_wire_model_id_passes_through_bare_id()`; `def test_resolve_wire_model_id_passes_through_other_vendor_prefix()`; `def test_resolve_wire_model_id_handles_empty_and_none_gracefully()`; `def test_resolve_wire_model_id_does_not_strip_prefix_inside_id()`; `def test_resolve_wire_model_id_inherited_by_claude_max()`; `async def test_get_response_sends_bare_model_id_when_prefixed()`; `…`
 - **tests/unit/test_api_key_query_param.py** — Unit tests for API key query parameter restriction (GitHub issue #149).
@@ -2309,6 +2309,8 @@ Repo entry points and standard project files.
   - `def kestrel_data_key(monkeypatch)`; `def legacy_agent_dir(tmp_path, kestrel_data_key)`; `def post_ceremony_agent_dir(legacy_agent_dir, kestrel_data_key)`; `async def test_legacy_agent_signs_ecdsa(legacy_agent_dir)`; `async def test_hybrid_agent_signs_hybrid_format(post_ceremony_agent_dir)`; `async def test_hybrid_round_trip_verifies(post_ceremony_agent_dir)`; `async def test_hybrid_tamper_detected(post_ceremony_agent_dir)`; `async def test_hybrid_payload_tamper_detected(post_ceremony_agent_dir)`; `…`
 - **tests/unit/test_sealed_capsule.py** — Sealed capsule tests — Wave 4 sub-PR 3 (#919).
   - `def hybrid_kp()`; `def test_round_trip_basic(hybrid_kp)`; `def test_open_capsule_two_calling_conventions(hybrid_kp)`; `def test_round_trip_empty_payload(hybrid_kp)`; `def test_round_trip_large_payload(hybrid_kp)`; `def test_distinct_seals_produce_distinct_envelopes(hybrid_kp)`; `def test_envelope_has_expected_structure(hybrid_kp)`; `def test_wrong_recipient_aead_authentication_fails(hybrid_kp)`; `…`
+- **tests/unit/test_search_history_tokenized_fallback.py** — Regression: broad natural-language queries must find relevant memories.
+  - `class TestTokenizeForSearch`; `class TestNegationGate`; `class TestTechnicalTermsUnregressed`; `class TestTokenMatchScore`; `async def test_broad_query_finds_relevant_row_via_token_fallback()`; `async def test_exact_substring_still_works()`; `async def test_token_fallback_does_not_match_low_overlap()`; `async def test_exact_matches_ranked_before_token_fallback()`; `…`
 - **tests/unit/test_secondary_endpoint_contracts.py** — Focused contract tests for remaining database/files/observability/saved-items routes.
   - `def test_database_table_query_contract_supports_search_and_pagination()`; `def test_file_get_and_observability_summary_contracts()`; `def test_saved_items_listing_filters_and_schema_contracts()`; `def test_saved_items_item_crud_search_and_pin_contracts()`
 - **tests/unit/test_security_endpoint_contracts.py** — Focused contract tests for security endpoints.
