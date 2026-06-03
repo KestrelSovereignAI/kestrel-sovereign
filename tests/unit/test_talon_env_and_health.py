@@ -333,6 +333,85 @@ async def test_talon_job_log_unknown_id():
     assert "Unknown" in result.error
 
 
+@pytest.mark.asyncio
+async def test_status_survives_feature_restart(tmp_path, monkeypatch):
+    """A CLI-background job dispatched before a restart must still be
+    visible in ``talon_status`` from a freshly-constructed feature
+    (Kestrel restart) — its public metadata persists to jobs.json.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-restart"
+    fake_bin.write_text(
+        "#!/bin/sh\necho 'restart-marker-output'\nexit 0\n"
+    )
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(
+        _scheduler=None, storage_path=str(tmp_path / "agent.db")
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["claim", "--repo", "x/y", "--issue", "7"],
+            label="claim:x/y#7",
+            extra_meta={"repo": "x/y", "issue": 7},
+        )
+
+    job_id = result["job_id"]
+    # Wait for the original feature's process handle to exit.
+    await feat._jobs[job_id]["process"].wait()
+
+    # Simulate a Kestrel restart: a fresh feature has an empty in-memory
+    # _jobs dict and must reload from the durable registry.
+    fresh = TalonCoordinatorFeature(agent)
+    assert job_id not in fresh._jobs
+
+    status = await fresh.talon_status()
+    matching = [j for j in status.data["jobs"] if j["id"] == job_id]
+    assert matching, f"Job {job_id} lost after restart"
+    job = matching[0]
+    assert job["repo"] == "x/y"
+    assert job["issue"] == 7
+    assert "process" not in job
+    assert job["status"] in ("complete", "running")
+
+
+@pytest.mark.asyncio
+async def test_job_log_tail_after_restart(tmp_path, monkeypatch):
+    """``talon_job_log`` must tail a known durable log after a restart,
+    even though the fresh feature never tracked the job in memory.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-restart-log"
+    fake_bin.write_text(
+        "#!/bin/sh\necho 'persisted-log-line'\nexit 0\n"
+    )
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(
+        _scheduler=None, storage_path=str(tmp_path / "agent.db")
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["dummy"], label="dummy", extra_meta={"repo": "x/y", "issue": 9},
+        )
+
+    job_id = result["job_id"]
+    await feat._jobs[job_id]["process"].wait()
+
+    fresh = TalonCoordinatorFeature(agent)
+    log_result = await fresh.talon_job_log(job_id, lines=50)
+    assert log_result.data["success"] is True
+    assert "persisted-log-line" in log_result.data["content"]
+
+
 # ----- Self-modification safeguards -----------------------------------
 
 

@@ -1396,7 +1396,12 @@ class TalonCoordinatorFeature(Feature):
         the last call (updates ``status`` to ``complete`` or
         ``failed`` based on returncode), then summarises.
         """
+        # Pull in any CLI jobs persisted before a restart so they are
+        # visible again even without an in-memory process handle.
+        self._reload_persisted_jobs()
+
         # Reap finished background CLI jobs
+        jobs_changed = False
         for jid, info in list(self._jobs.items()):
             if info.get("method") != "cli_background":
                 continue
@@ -1404,6 +1409,18 @@ class TalonCoordinatorFeature(Feature):
                 continue
             proc = info.get("process")
             if proc is None:
+                # Reloaded after restart: no live handle. Fall back to
+                # pid liveness to decide running vs complete.
+                if self._pid_alive(info.get("pid")):
+                    info["status"] = "running"
+                else:
+                    info["status"] = "complete"
+                    info.setdefault("returncode", None)
+                    info.setdefault(
+                        "completed_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    jobs_changed = True
                 continue
             rc = proc.returncode
             if rc is None:
@@ -1412,6 +1429,10 @@ class TalonCoordinatorFeature(Feature):
             info["status"] = "complete" if rc == 0 else "failed"
             info["returncode"] = rc
             info["completed_at"] = datetime.now(timezone.utc).isoformat()
+            jobs_changed = True
+
+        if jobs_changed:
+            self._persist_jobs()
 
         # Reconcile A2A-dispatched jobs against Talon's task_store.
         # Mesh used to do this via inbox polling for complete/reject
@@ -1512,6 +1533,8 @@ class TalonCoordinatorFeature(Feature):
         self, job_id: str, lines: int = 200,
     ) -> ToolResult:
         """Return the last ``lines`` lines of a job's combined log."""
+        # Reload persisted CLI jobs so logs are tail-able after restart.
+        self._reload_persisted_jobs()
         info = self._jobs.get(job_id)
         if not info:
             return ToolResult.failed(
@@ -1912,6 +1935,82 @@ class TalonCoordinatorFeature(Feature):
         base.mkdir(parents=True, exist_ok=True)
         return base
 
+    def _jobs_registry_path(self) -> Path:
+        """Durable registry of CLI-background job metadata.
+
+        Lives next to the per-agent log files so it survives Kestrel
+        restarts (``<storage_path>/talon_jobs/jobs.json``).
+        """
+        return self._job_log_dir() / "jobs.json"
+
+    @staticmethod
+    def _pid_alive(pid: Any) -> bool:
+        """Return True if ``pid`` names a live process (signal 0 probe)."""
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid_int <= 0:
+            return False
+        try:
+            os.kill(pid_int, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but is owned by another user — still alive.
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _persist_jobs(self) -> None:
+        """Write CLI-background job metadata to the durable registry.
+
+        Excludes non-serialisable fields (the asyncio ``process``
+        handle) so ``talon_status`` and ``talon_job_log`` keep working
+        after a feature/server restart.
+        """
+        registry: Dict[str, Any] = {}
+        for jid, info in self._jobs.items():
+            if info.get("method") != "cli_background":
+                continue
+            registry[jid] = {
+                k: v for k, v in info.items() if k != "process"
+            }
+        path = self._jobs_registry_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(registry, f)
+            os.replace(tmp, path)
+        except OSError as e:
+            logger.warning(f"Failed to persist talon job registry: {e}")
+
+    def _reload_persisted_jobs(self) -> None:
+        """Merge durably-persisted CLI jobs into the in-memory map.
+
+        In-process jobs (which still hold a live ``process`` handle)
+        win; only job_ids absent from memory are reloaded so a
+        restarted feature regains status/log visibility.
+        """
+        path = self._jobs_registry_path()
+        if not path.is_file():
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                registry = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning(f"Failed to read talon job registry: {e}")
+            return
+        if not isinstance(registry, dict):
+            return
+        for jid, info in registry.items():
+            if jid in self._jobs or not isinstance(info, dict):
+                continue
+            # Reloaded jobs have no live process handle.
+            info.pop("process", None)
+            self._jobs[jid] = info
+
     async def _dispatch_via_cli_background(
         self,
         args: List[str],
@@ -1982,6 +2081,7 @@ class TalonCoordinatorFeature(Feature):
         if extra_meta:
             info.update(extra_meta)
         self._jobs[job_id] = info
+        self._persist_jobs()
 
         logger.info(
             f"Dispatched talon job {job_id} (pid={proc.pid}, "
