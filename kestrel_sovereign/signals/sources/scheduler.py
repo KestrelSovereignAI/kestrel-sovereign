@@ -86,6 +86,11 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # Consolidation writes episodes/patterns into memory storage.
     # Owner confirmed ARTIFACT (#893): no follow-up cognition triggered.
     ("memory_consolidate", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
+    # Restart coordinator (#1512). ACTION — no LLM cost. Scans the
+    # restart_requests table, evaluates safety, and spawns a detached
+    # subprocess to execute the restart. Idle by default; only fires
+    # when a row is pending.
+    ("restart_coordinator", SignalMode.ACTION, frozenset()),
 ]
 
 

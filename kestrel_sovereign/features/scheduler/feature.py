@@ -158,6 +158,14 @@ class SchedulerFeature(Feature):
                 ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
             ])
 
+        # Restart coordinator (#1512) — installs only if the
+        # RestartCoordinatorFeature is loaded. Cheap (no LLM; idle
+        # unless a request is pending) so 1/min is fine. Emits one
+        # restart.completed signal per row after the agent boots
+        # back up post-restart.
+        if "RestartCoordinatorFeature" in agent.features:
+            defaults.append(("restart_coordinator", "* * * * *", "{}"))
+
         for task_name, cron, args in defaults:
             if task_name in existing_names:
                 logger.debug("Schedule '%s' already exists, skipping", task_name)
