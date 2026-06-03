@@ -217,7 +217,29 @@ class ProviderRegistry:
         hints = list(route_cfg.get("selection_hints") or [])
         base_url = route_cfg.get("base_url")
 
-        return ProviderInfo(
+        # Optional embedding sibling (#1494). When the active chat
+        # provider can't embed (Anthropic has no embedding API), the
+        # sibling fills the gap. Route-level config wins over
+        # vendor-level so an operator can override on a per-route
+        # basis if needed. The string is the provider's lookup name:
+        # ``"<vendor>"`` (first matching route for that vendor) or
+        # ``"<vendor>:<route>"`` (exact). Resolution + privacy
+        # filtering happens in :class:`LLMService`; here we only
+        # carry the raw string into ``ProviderInfo`` so it survives
+        # the SDK boundary.
+        embedding_sibling = route_cfg.get("embedding_sibling")
+        if embedding_sibling is None:
+            embedding_sibling = vendor_cfg.get("embedding_sibling")
+        if embedding_sibling is not None and not isinstance(embedding_sibling, str):
+            raise ValueError(
+                f"Route {vendor}:{route}: embedding_sibling must be a string "
+                f"(got {type(embedding_sibling).__name__})"
+            )
+        normalized_sibling = (
+            embedding_sibling.strip() if embedding_sibling else None
+        ) or None
+
+        info = ProviderInfo(
             name=f"{vendor}:{route}",
             vendor=vendor,
             route=route,
@@ -230,6 +252,13 @@ class ProviderRegistry:
             selection_hints=hints,
             capabilities=adapter.provider_capabilities(),
         )
+        # ProviderInfo is an SDK dataclass and we don't want to change
+        # its public schema for a sovereign-only config knob. Stash
+        # the string as a private attr; ``LLMService._convert_providers_format``
+        # surfaces it as ``embedding_sibling`` on the dict shape that
+        # routing code consumes.
+        info._kestrel_embedding_sibling = normalized_sibling  # type: ignore[attr-defined]
+        return info
 
     def _build_client_and_adapter(
         self,
