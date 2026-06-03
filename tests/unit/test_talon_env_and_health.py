@@ -337,7 +337,8 @@ async def test_talon_job_log_unknown_id():
 async def test_status_survives_feature_restart(tmp_path, monkeypatch):
     """A CLI-background job dispatched before a restart must still be
     visible in ``talon_status`` from a freshly-constructed feature
-    (Kestrel restart) — its public metadata persists to jobs.json.
+    (Kestrel restart) — its public metadata persists to jobs.json,
+    and the exit-code sidecar makes status authoritative.
     """
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
     fake_bin = tmp_path / "kestrel-talon-restart"
@@ -361,13 +362,12 @@ async def test_status_survives_feature_restart(tmp_path, monkeypatch):
         )
 
     job_id = result["job_id"]
-    # Wait for the original feature's process handle to exit.
+    # Wait for the wrapper to exit — sidecar is written before exit.
     await feat._jobs[job_id]["process"].wait()
 
-    # Simulate a Kestrel restart: a fresh feature has an empty in-memory
-    # _jobs dict and must reload from the durable registry.
+    # Simulate a Kestrel restart: a fresh feature reloads from disk.
     fresh = TalonCoordinatorFeature(agent)
-    assert job_id not in fresh._jobs
+    assert job_id in fresh._jobs, "eager reload should populate _jobs"
 
     status = await fresh.talon_status()
     matching = [j for j in status.data["jobs"] if j["id"] == job_id]
@@ -376,7 +376,121 @@ async def test_status_survives_feature_restart(tmp_path, monkeypatch):
     assert job["repo"] == "x/y"
     assert job["issue"] == 7
     assert "process" not in job
-    assert job["status"] in ("complete", "running")
+    # Strict: exit-sidecar must yield a definitive complete + rc=0.
+    assert job["status"] == "complete"
+    assert job["returncode"] == 0
+
+
+@pytest.mark.asyncio
+async def test_failed_job_reported_as_failed_after_restart(tmp_path, monkeypatch):
+    """A CLI-background job that exits non-zero must surface as
+    ``failed`` after a Kestrel restart (not silently ``complete``).
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-fail"
+    fake_bin.write_text(
+        "#!/bin/sh\necho 'failure-output'\nexit 17\n"
+    )
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(
+        _scheduler=None, storage_path=str(tmp_path / "agent.db")
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["bogus"], label="fail", extra_meta={"repo": "x/y", "issue": 13},
+        )
+    job_id = result["job_id"]
+    await feat._jobs[job_id]["process"].wait()
+
+    fresh = TalonCoordinatorFeature(agent)
+    status = await fresh.talon_status()
+    job = next(j for j in status.data["jobs"] if j["id"] == job_id)
+    assert job["status"] == "failed"
+    assert job["returncode"] == 17
+
+
+@pytest.mark.asyncio
+async def test_dispatch_after_restart_preserves_old_jobs(tmp_path, monkeypatch):
+    """Dispatching a new job from a fresh feature must NOT truncate
+    older persisted jobs out of jobs.json — the registry must be
+    additive across restart-then-dispatch sequences.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-mix"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n")
+    fake_bin.chmod(0o755)
+
+    agent = SimpleNamespace(
+        _scheduler=None, storage_path=str(tmp_path / "agent.db")
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        first = await feat._dispatch_via_cli_background(
+            ["a"], label="a", extra_meta={"repo": "x/y", "issue": 1},
+        )
+    await feat._jobs[first["job_id"]]["process"].wait()
+
+    # Fresh feature dispatches a second job. The first must still be
+    # persisted (not erased by _persist_jobs writing only in-memory).
+    fresh = TalonCoordinatorFeature(agent)
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        second = await fresh._dispatch_via_cli_background(
+            ["b"], label="b", extra_meta={"repo": "x/y", "issue": 2},
+        )
+    await fresh._jobs[second["job_id"]]["process"].wait()
+
+    # Construct a third feature; it should see both jobs on disk.
+    third = TalonCoordinatorFeature(agent)
+    assert first["job_id"] in third._jobs
+    assert second["job_id"] in third._jobs
+
+
+@pytest.mark.asyncio
+async def test_no_sidecar_dead_pid_reports_finished_unknown(tmp_path, monkeypatch):
+    """When a persisted job has no exit sidecar and its pid is dead,
+    status must be ``finished_unknown`` — never silently ``complete``.
+    A job killed by SIGKILL or system shutdown before the wrapper
+    could write its sidecar lands here.
+    """
+    agent = SimpleNamespace(
+        _scheduler=None, storage_path=str(tmp_path / "agent.db")
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    # Hand-write a registry entry for a job whose pid is guaranteed dead
+    # (pid 1 is init; signal 0 is permitted but won't ProcessLookupError).
+    # We pick a pid we know does not exist by spawning and reaping a
+    # short subprocess and capturing its pid post-exit.
+    import subprocess as _subp
+    dead = _subp.Popen(["/bin/sh", "-c", "exit 0"])
+    dead.wait()
+    fake_pid = dead.pid
+
+    registry_path = feat._jobs_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        '{"orphan": {"method": "cli_background", "status": "running",'
+        ' "pid": ' + str(fake_pid) + ', "label": "orphan",'
+        ' "exit_path": "' + str(tmp_path / "nope.exit") + '",'
+        ' "log_path": "' + str(tmp_path / "nope.log") + '",'
+        ' "command": "x", "started_at": "2026-06-03T00:00:00+00:00"}}'
+    )
+
+    fresh = TalonCoordinatorFeature(agent)
+    status = await fresh.talon_status()
+    job = next(j for j in status.data["jobs"] if j["id"] == "orphan")
+    assert job["status"] == "finished_unknown"
+    assert job["returncode"] is None
 
 
 @pytest.mark.asyncio
