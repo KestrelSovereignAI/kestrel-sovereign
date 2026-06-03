@@ -1330,7 +1330,7 @@ export async function updateContextStatus() {
         }
 
         const status = await API.getContextStatus(sessionId);
-        const { message_count, utilization_percent, status: contextState, warnings } = status;
+        const { message_count, utilization_percent, status: contextState, warnings, route_cap } = status;
 
         // Color based on utilization
         let color, icon;
@@ -1346,6 +1346,36 @@ export async function updateContextStatus() {
         } else {
             color = '#ef4444';  // red
             icon = kicon('warning');
+        }
+
+        // #1503: route per-turn cap labeling. On capped routes (notably
+        // ``openai:plan`` on ChatGPT-Plus), ``TokenCounter`` already
+        // returns the cap as ``context_limit`` — so the existing
+        // utilization % above is ALREADY measured against the route
+        // cap, modulo the response reserve. The route_cap block exists
+        // so the UI can NAME the cap (instead of letting the operator
+        // think they're full of the model's 256K window) and surface
+        // the actionable knob in the tooltip. A separate percentage
+        // segment would be redundant — operator just needs to know
+        // what they're being limited by (codex round 2 P2 on #1503).
+        let routeCapBadge = '';
+        let routeCapTooltip = '';
+        if (route_cap && route_cap.cap_tokens) {
+            const routeLabel = _esc(route_cap.route || 'route');
+            const capTok = Number(route_cap.cap_tokens || 0).toLocaleString();
+            const projected = Number(route_cap.projected_turn_payload || 0).toLocaleString();
+            const headroom = Number(route_cap.headroom_tokens || 0).toLocaleString();
+            const knobHint = route_cap.knob
+                ? `\nRaise via ${route_cap.knob} or [llm.route_context_caps] in kestrel.toml.`
+                : '\nRaise via [llm.route_context_caps] in kestrel.toml.';
+            // Cheap-poll path (full=false) skips RAG measurement —
+            // mark the pill % as a FLOOR for capped routes with RAG
+            // (codex round 1 P2 on #1503).
+            const ragFloorHint = route_cap.includes_rag === false
+                ? '\nRetrieval/RAG not measured in this poll — open breakdown for full picture.'
+                : '';
+            routeCapTooltip = `\nRoute cap (${routeLabel}): ${projected} / ${capTok} tokens used; ${headroom} tokens headroom.${_esc(knobHint)}${_esc(ragFloorHint)}`;
+            routeCapBadge = ` <span style="color:${color};opacity:0.75;font-size:0.65rem;">@ ${routeLabel}</span>`;
         }
 
         contextStatusElement.style.color = color;
@@ -1384,8 +1414,8 @@ export async function updateContextStatus() {
                   onclick="window.openContextBreakdownPopup()"
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
-                  title="Click for per-section context breakdown · ${message_count} messages · ${utilization_percent.toFixed(1)}% of window used${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}">
-                ${icon} ${message_count} msgs · ${utilization_percent.toFixed(0)}%${compressButton}
+                  title="Click for per-section context breakdown · ${message_count} messages · ${utilization_percent.toFixed(1)}% of window used${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
+                ${icon} ${message_count} msgs · ${utilization_percent.toFixed(0)}%${routeCapBadge}${compressButton}
             </span>
         `;
 
@@ -1706,6 +1736,53 @@ function renderContextBreakdown(status) {
         </div>
     `;
 
+    // #1503: Route per-turn cap section. Names the cap that the existing
+    // whole-window number is already measuring against on capped routes
+    // (TokenCounter returns the cap as context_limit on routes like
+    // ``openai:plan``), and surfaces the actionable knob the operator
+    // can raise. Hidden when no route cap applies.
+    const rc = status.route_cap;
+    let routeCapBlock = '';
+    if (rc && rc.cap_tokens) {
+        const rcUtil = Number(rc.utilization_percent || 0);
+        let rcColor;
+        if (rcUtil < 50) rcColor = '#22c55e';
+        else if (rcUtil < 80) rcColor = '#eab308';
+        else if (rcUtil < 95) rcColor = '#f97316';
+        else rcColor = '#ef4444';
+        const knobLine = rc.knob
+            ? `Raise via <code>${_esc(rc.knob)}</code> env var, or <code>[llm.route_context_caps]</code> in <code>kestrel.toml</code>.`
+            : `Raise via <code>[llm.route_context_caps]</code> in <code>kestrel.toml</code>.`;
+        const headroomNote = rcUtil >= 95
+            ? `<div style="font-size:0.75rem;color:${rcColor};margin-top:0.25rem;font-weight:500">Next turn will likely bust this cap and stall upstream.</div>`
+            : '';
+        // Popup runs full=true → includes_rag=true, so projection is
+        // accurate. Surface the affirmation so users know the popup
+        // figure isn't the same floor the pill shows.
+        const ragNote = rc.includes_rag
+            ? `<span style="color:#22c55e">✓ includes retrieval</span>`
+            : `<span style="color:var(--text-secondary)">projection excludes retrieval — open the popup once for a RAG-included figure</span>`;
+        routeCapBlock = `
+            <div style="margin-bottom:0.5rem;padding:0.75rem;background:${rcColor}15;border-left:3px solid ${rcColor};border-radius:4px">
+                <div style="display:flex;justify-content:space-between;align-items:baseline">
+                    <div>
+                        <div style="font-size:0.7rem;color:var(--text-secondary);text-transform:uppercase">Route per-turn cap</div>
+                        <div style="font-size:1.1rem;font-weight:600;color:${rcColor}">${_esc(rc.route || 'route')} — ${rcUtil.toFixed(1)}%</div>
+                    </div>
+                    <div style="text-align:right;color:var(--text-secondary);font-size:0.85rem">
+                        <div>${fmt(rc.projected_turn_payload)} / ${fmt(rc.cap_tokens)} tokens</div>
+                        <div style="font-size:0.7rem;margin-top:0.15rem">${fmt(rc.headroom_tokens)} tokens of headroom</div>
+                    </div>
+                </div>
+                ${headroomNote}
+                <div style="font-size:0.7rem;margin-top:0.4rem">${ragNote}</div>
+                <div style="font-size:0.7rem;color:var(--text-secondary);margin-top:0.4rem">
+                    This cap is below the model's full context window — it's the binding constraint for the next turn on this route. ${knobLine}
+                </div>
+            </div>
+        `;
+    }
+
     return `
         <div style="font-size:0.875rem">
             <div style="display:flex; justify-content:space-between; align-items:baseline; padding-bottom:0.75rem; border-bottom:2px solid var(--border-color); margin-bottom:0.5rem">
@@ -1718,6 +1795,7 @@ function renderContextBreakdown(status) {
                     <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(breakdown.model || '')} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
                 </div>
             </div>
+            ${routeCapBlock}
             ${dynamicSection}
             ${notesBlock}
             ${sessionNote}

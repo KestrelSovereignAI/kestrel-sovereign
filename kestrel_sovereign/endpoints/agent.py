@@ -651,6 +651,7 @@ async def get_context_status(
                 "status": "idle",
                 "warnings": [],
                 "breakdown": None,
+                "route_cap": None,
                 "silently_pruned_path_active": False,
             }
 
@@ -827,6 +828,78 @@ async def get_context_status(
         except Exception:
             silently_pruned_path_active = True
 
+        # #1503: route per-turn cap visibility. Some subscription tiers
+        # (notably ChatGPT-Plus on ``openai:plan``) enforce a per-turn
+        # payload cap well below the model's full context window. Pure
+        # whole-window utilization is misleading on those routes — a
+        # session at 3 % on a 256K model can still bust a 32768-token
+        # route cap. Surface the cap so the UI can show binding
+        # headroom before the turn fires (catches the over-cap failure
+        # mode handled reactively by #1395 / #1410).
+        route_cap_block: Optional[Dict[str, Any]] = None
+        try:
+            from kestrel_sovereign.llm.model_catalog import get_catalog_service
+            catalog = get_catalog_service()
+            cap_tokens = catalog.get_route_context_cap(current_model)
+            if isinstance(cap_tokens, int) and cap_tokens > 0:
+                projected = max(0, int(total_measured))
+                cap_util_percent = (
+                    (projected / cap_tokens) * 100.0 if cap_tokens else 0.0
+                )
+                # The route key is the longest prefix of ``current_model``
+                # that exists in ``_route_context_caps``. Re-derive it so
+                # the UI can show which route the cap applies to.
+                route_id: Optional[str] = None
+                for known_route in getattr(catalog, "_route_context_caps", {}):
+                    if (
+                        current_model.lower() == known_route.lower()
+                        or current_model.lower().startswith(
+                            known_route.lower() + "/"
+                        )
+                    ) and (
+                        route_id is None or len(known_route) > len(route_id)
+                    ):
+                        route_id = known_route
+                # Operator knob hint per route (best-effort). ``openai:plan``
+                # uses ``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` (#1395 wiring);
+                # other routes leave the knob hint empty.
+                knob = (
+                    "KESTREL_OPENAI_PLAN_CONTEXT_CAP"
+                    if route_id == "openai:plan"
+                    else None
+                )
+                # IMPORTANT: ``TokenCounter.get_context_limit()`` already
+                # returns the route cap on capped routes (see
+                # ``agent/token_counter.py:241-246``), so ``context_limit``
+                # above is typically equal to ``cap_tokens`` — the
+                # existing whole-window pill is therefore already
+                # measuring against the route cap (modulo the response
+                # reserve). The route_cap block exists so the UI can
+                # NAME that cap, show the actionable knob, and report
+                # raw headroom — not to provide a separate percentage
+                # that would be redundant with the existing pill
+                # (codex round 2 P2 on #1503).
+                route_cap_block = {
+                    "route": route_id,
+                    "cap_tokens": cap_tokens,
+                    "projected_turn_payload": projected,
+                    "utilization_percent": round(cap_util_percent, 1),
+                    "headroom_tokens": max(0, cap_tokens - projected),
+                    "knob": knob,
+                    # On the cheap footer poll (``full=False``) the
+                    # breakdown was measured without RAG, so the
+                    # projection is a FLOOR — the real turn payload may
+                    # be higher. The popup (``full=True``) runs RAG and
+                    # the projection is accurate. The UI uses this flag
+                    # to label the pill / popup honestly (codex round 1
+                    # P2 on #1503).
+                    "includes_rag": bool(full),
+                }
+        except Exception as e:
+            # Catalog probe must never break the endpoint — degrade to
+            # "no route cap surface" rather than 500ing the footer poll.
+            logger.debug(f"route_cap probe failed for breakdown: {e}")
+
         return {
             "model": current_model,
             "message_count": message_count,
@@ -843,6 +916,9 @@ async def get_context_status(
             # messages_kept_after_pruning + raw_tokens), episodes,
             # memories, rag, and dynamic_context_overhead.
             "breakdown": breakdown,
+            # Route-level per-turn cap (#1503). ``None`` when the active
+            # route declares no cap or the catalog probe failed.
+            "route_cap": route_cap_block,
             # While C has not shipped, this stays True per the
             # auto-detection invariant. When C lands and the prune
             # path emits sync salvage records, flip this to False.

@@ -279,6 +279,212 @@ def test_context_status_full_path_labels_rag_when_no_user_turn_available():
         _restore_app(app, original)
 
 
+def test_context_status_surfaces_route_cap_when_binding(monkeypatch):
+    """#1503: when the active route declares a per-turn cap below the
+    model's full context window, the response carries a ``route_cap``
+    block so the UI can show the binding constraint before the turn
+    fires."""
+    from kestrel_sovereign.llm import model_catalog
+
+    history = [{"content": "x" * 1000}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="openai:plan/gpt-5.5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(15000, 250_000)
+    )
+    agent.context_builder = ctx_builder
+
+    fake_catalog = MagicMock()
+    fake_catalog.get_route_context_cap = MagicMock(return_value=32768)
+    fake_catalog._route_context_caps = {"openai:plan": 32768}
+    monkeypatch.setattr(
+        model_catalog, "get_catalog_service", lambda: fake_catalog
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=256_000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/api/agent/context-status?session_id=session-1",
+                        headers=_api_headers(),
+                    )
+        assert response.status_code == 200
+        payload = response.json()
+        rc = payload.get("route_cap")
+        assert rc is not None, "route_cap block must be present on capped routes"
+        assert rc["route"] == "openai:plan"
+        assert rc["cap_tokens"] == 32768
+        assert rc["projected_turn_payload"] == 15000
+        # 15000 / 32768 ≈ 45.78 %
+        assert abs(rc["utilization_percent"] - 45.8) < 0.5
+        assert rc["headroom_tokens"] == 32768 - 15000
+        # ``is_binding_constraint`` was removed in round 2 — TokenCounter
+        # already returns the route cap as ``context_limit`` so a
+        # cap-vs-context-limit comparison was always False on the very
+        # routes the feature was meant to surface. The block is now
+        # shown whenever a cap exists; the operator sees the cap name
+        # and the knob regardless of the cap-vs-window relationship.
+        assert "is_binding_constraint" not in rc
+        assert rc["knob"] == "KESTREL_OPENAI_PLAN_CONTEXT_CAP"
+        # Cheap-poll path: includes_rag=False so the UI labels the
+        # projection as a floor (codex round 1 P2).
+        assert rc["includes_rag"] is False
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch):
+    """When the popup polls with ``full=true`` the breakdown measures
+    RAG, so the route-cap projection is accurate. The ``includes_rag``
+    flag flips to True so the UI can drop its floor warning (codex
+    round 1 P2 on #1503)."""
+    from kestrel_sovereign.llm import model_catalog
+
+    history = [{"content": "x" * 1000}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="openai:plan/gpt-5.5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(15000, 250_000)
+    )
+    agent.context_builder = ctx_builder
+
+    fake_catalog = MagicMock()
+    fake_catalog.get_route_context_cap = MagicMock(return_value=32768)
+    fake_catalog._route_context_caps = {"openai:plan": 32768}
+    monkeypatch.setattr(
+        model_catalog, "get_catalog_service", lambda: fake_catalog
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=256_000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/api/agent/context-status?session_id=session-1&full=true",
+                        headers=_api_headers(),
+                    )
+        rc = response.json()["route_cap"]
+        assert rc is not None
+        assert rc["includes_rag"] is True
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_route_cap_absent_when_no_cap(monkeypatch):
+    """Routes without a configured per-turn cap should report
+    ``route_cap = None`` so the UI doesn't render the secondary
+    indicator."""
+    from kestrel_sovereign.llm import model_catalog
+
+    history = [{"content": "x" * 1000}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="anthropic:api/claude-opus-4-7")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(5000, 250_000)
+    )
+    agent.context_builder = ctx_builder
+
+    fake_catalog = MagicMock()
+    fake_catalog.get_route_context_cap = MagicMock(return_value=None)
+    fake_catalog._route_context_caps = {}
+    monkeypatch.setattr(
+        model_catalog, "get_catalog_service", lambda: fake_catalog
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=256_000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/api/agent/context-status?session_id=session-1",
+                        headers=_api_headers(),
+                    )
+        assert response.json().get("route_cap") is None
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch):
+    """Even when the configured cap is nominally wider than the model's
+    discovered context limit, the cap block is still surfaced — the
+    operator should always know which route limit is being applied
+    (codex round 2 P2 on #1503: previously a binding-only gate hid the
+    cap on the very routes TokenCounter already routes to)."""
+    from kestrel_sovereign.llm import model_catalog
+
+    history = [{"content": "x" * 1000}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="openai:plan-pro/gpt-5.5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(
+        return_value=_breakdown_payload(5000, 250_000)
+    )
+    agent.context_builder = ctx_builder
+
+    fake_catalog = MagicMock()
+    fake_catalog.get_route_context_cap = MagicMock(return_value=512_000)
+    fake_catalog._route_context_caps = {"openai:plan-pro": 512_000}
+    monkeypatch.setattr(
+        model_catalog, "get_catalog_service", lambda: fake_catalog
+    )
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=256_000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.get(
+                        "/api/agent/context-status?session_id=session-1",
+                        headers=_api_headers(),
+                    )
+        rc = response.json()["route_cap"]
+        assert rc is not None
+        assert rc["route"] == "openai:plan-pro"
+        assert rc["cap_tokens"] == 512_000
+        assert "is_binding_constraint" not in rc
+    finally:
+        _restore_app(app, original)
+
+
 def test_context_status_idle_shape_includes_silently_pruned_flag():
     """Idle path (no session_id) must still surface the flags the
     popup expects, so a session-less open does not throw on missing
