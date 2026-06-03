@@ -1226,3 +1226,199 @@ class TestDiscoveredRouteCapFromThreadStart:
             assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 24576
         finally:
             catalog.clear_discovered_route_context_caps()
+
+
+class TestDiscoveredRouteCapFromEvent:
+    """#1518: codex's per-session per-plan ceiling is reported on the
+    notification stream via ``thread/tokenUsage/updated`` carrying
+    ``tokenUsage.modelContextWindow``. Verified live against a Pro
+    account 2026-06-03 (modelContextWindow=258400). The recorder
+    folds that value into the catalog's discovered layer so the next
+    turn's ContextManager sizes against ground truth instead of a
+    static empirical guess."""
+
+    def _adapter(self) -> CodexAdapter:
+        return CodexAdapter.__new__(CodexAdapter)
+
+    def test_captures_model_context_window_from_token_usage_event(self):
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            # Shape of the live params, redacted to relevant fields.
+            self._adapter()._record_discovered_route_cap_from_event(
+                {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "tokenUsage": {
+                        "total": {"totalTokens": 32038, "inputTokens": 32033},
+                        "last": {"totalTokens": 32038, "inputTokens": 32033},
+                        "modelContextWindow": 258400,
+                    },
+                }
+            )
+            assert catalog.get_route_context_cap("openai:plan") == 258400
+            assert catalog.get_route_context_cap("openai:plan/gpt-5.5") == 258400
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_accepts_snake_case_field_too(self):
+        """Defensive parity with the thread/start recorder: if a future
+        codex version emits snake_case on this event, the recorder
+        still finds the value."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_event(
+                {
+                    "tokenUsage": {"model_context_window": 196608},
+                }
+            )
+            assert catalog.get_route_context_cap("openai:plan") == 196608
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_snake_case_outer_key_also_supported(self):
+        """The event params themselves may use ``token_usage`` instead
+        of ``tokenUsage`` on a wire-format drift; recorder probes both."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_event(
+                {"token_usage": {"modelContextWindow": 131072}}
+            )
+            assert catalog.get_route_context_cap("openai:plan") == 131072
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_missing_token_usage_block_silently_skips(self):
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_event(
+                {"threadId": "thr_1", "turnId": "turn_1"}
+            )
+            assert catalog._discovered_route_context_caps == {}
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_missing_model_context_window_field_silently_skips(self):
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            self._adapter()._record_discovered_route_cap_from_event(
+                {"tokenUsage": {"total": {"totalTokens": 100}}}
+            )
+            assert catalog._discovered_route_context_caps == {}
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_non_positive_value_silently_skips(self):
+        """A zero/negative or non-int ``modelContextWindow`` must be
+        ignored — never poison the cache with a value that would
+        force the next turn to fail-closed."""
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            for bad in (0, -1, "not-an-int", None, True, False):
+                self._adapter()._record_discovered_route_cap_from_event(
+                    {"tokenUsage": {"modelContextWindow": bad}}
+                )
+            assert catalog._discovered_route_context_caps == {}
+        finally:
+            catalog.clear_discovered_route_context_caps()
+
+    def test_none_params_does_not_crash(self):
+        """The recorder gets called for every matching event; a future
+        codex version that sends an empty params object must not
+        crash the turn pipeline."""
+        # Should be a no-op, not a raise.
+        self._adapter()._record_discovered_route_cap_from_event(None)
+        self._adapter()._record_discovered_route_cap_from_event({})
+
+    def test_event_method_set_is_what_run_turn_loop_uses(self):
+        """Codex round 1 P2 on #1518: the event-method allowlist on
+        the class must be the SAME set ``_run_turn`` checks against
+        before calling ``_record_discovered_route_cap_from_event``.
+        Otherwise snake_case event names appear in the allowlist but
+        never reach the recorder. The fix collapses the literal in the
+        loop to use ``CodexAdapter._DISCOVERED_CAP_EVENT_METHODS``;
+        this test pins the membership so the two stay in sync."""
+        methods = CodexAdapter._DISCOVERED_CAP_EVENT_METHODS
+        assert "thread/tokenUsage/updated" in methods
+        assert "thread/token_usage/updated" in methods
+
+    def test_anti_flood_guard_works_when_env_override_is_set(
+        self, caplog, monkeypatch
+    ):
+        """Codex round 2 P3 on #1518: previously the anti-flood guard
+        compared the codex-reported cap against ``get_route_context_cap``,
+        which returns the env override when one is set. That made
+        ``previous != cap`` true every turn and the recorder flooded
+        host.log with misleading "now N" lines even though the
+        effective cap was unchanged. The fix compares against the
+        DISCOVERED layer's own current value."""
+        import logging
+        from kestrel_sovereign.llm.model_catalog import (
+            get_catalog_service, ModelCatalogService,
+        )
+        # Force a fresh catalog with an env override active so the
+        # discovered layer is the only place where "same value seen
+        # again" is detectable.
+        monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
+        # Force the singleton to reload from env.
+        import kestrel_sovereign.llm.model_catalog as _mc
+        monkeypatch.setattr(_mc, "_catalog_service", None)
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            with caplog.at_level(
+                logging.INFO,
+                logger="kestrel_sovereign.llm.codex_adapter",
+            ):
+                for _ in range(3):
+                    self._adapter()._record_discovered_route_cap_from_event(
+                        {"tokenUsage": {"modelContextWindow": 258400}}
+                    )
+            change_logs = [
+                r for r in caplog.records if "route cap for" in r.getMessage()
+            ]
+            assert len(change_logs) == 1, (
+                "anti-flood guard should fire once, not once per turn"
+            )
+        finally:
+            catalog.clear_discovered_route_context_caps()
+            monkeypatch.setattr(_mc, "_catalog_service", None)
+
+    def test_steady_state_does_not_re_log_unchanged_cap(self, caplog):
+        """Codex emits the event on every turn. Logging the captured
+        value every time would flood ``host.log``. Verify the log
+        message only fires when the discovered value actually changes."""
+        import logging
+        from kestrel_sovereign.llm.model_catalog import get_catalog_service
+        catalog = get_catalog_service()
+        catalog.clear_discovered_route_context_caps()
+        try:
+            with caplog.at_level(
+                logging.INFO,
+                logger="kestrel_sovereign.llm.codex_adapter",
+            ):
+                # First call records + logs.
+                self._adapter()._record_discovered_route_cap_from_event(
+                    {"tokenUsage": {"modelContextWindow": 258400}}
+                )
+                # Second call records same value; should NOT log again.
+                self._adapter()._record_discovered_route_cap_from_event(
+                    {"tokenUsage": {"modelContextWindow": 258400}}
+                )
+            change_logs = [
+                r for r in caplog.records if "route cap for" in r.getMessage()
+            ]
+            assert len(change_logs) == 1
+        finally:
+            catalog.clear_discovered_route_context_caps()

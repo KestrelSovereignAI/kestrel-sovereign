@@ -634,6 +634,88 @@ class CodexAdapter(LLMAdapter):
                 discovered_cap, self._DISCOVERED_CAP_ROUTE_KEY, e,
             )
 
+    # Notification methods (codex sends these on the wire after a turn
+    # advances; ``method`` is the JSON-RPC method name). Only the first
+    # is the canonical per-turn ceiling, but accept either of the
+    # historical snake_case spellings in case codex versions differ.
+    _DISCOVERED_CAP_EVENT_METHODS = frozenset({
+        "thread/tokenUsage/updated",
+        "thread/token_usage/updated",
+    })
+
+    def _record_discovered_route_cap_from_event(
+        self,
+        params: Optional[Dict[str, Any]],
+    ) -> None:
+        """Capture the per-turn ceiling codex reports on the wire.
+
+        Codex's ``thread/tokenUsage/updated`` notification carries
+        ``tokenUsage.modelContextWindow`` — the per-session, per-plan
+        ceiling the upstream actually enforces for the current
+        thread. Verified on a live ChatGPT-Pro session 2026-06-03
+        (#1518). The event fires AFTER each turn's final answer is
+        emitted but before ``turn/completed``, so the captured value
+        applies starting at the NEXT turn (the catalog's discovered
+        layer then wins precedence per #1517).
+
+        Best-effort: missing fields / unparseable values silently
+        degrade to "no discovery this turn" (operator's env override
+        and the static config layers still apply via the normal
+        precedence chain). Catalog write failures are logged at debug
+        and dropped — the recorder cannot crash the turn pipeline.
+        """
+        if not isinstance(params, dict):
+            return
+        token_usage = params.get("tokenUsage") or params.get("token_usage")
+        if not isinstance(token_usage, dict):
+            return
+        for field in ("modelContextWindow", "model_context_window"):
+            value = token_usage.get(field)
+            if isinstance(value, bool):
+                # ``True`` is an int subclass; reject so a stray flag
+                # doesn't get treated as a 1-token cap.
+                continue
+            if isinstance(value, int) and value > 0:
+                self._fold_discovered_cap(value, source=f"tokenUsage.{field}")
+                return
+
+    def _fold_discovered_cap(self, cap: int, *, source: str) -> None:
+        """Push a discovered cap into the catalog. Shared sink for the
+        thread/start path and the event path so they stay symmetric in
+        catalog state, logging, and error handling."""
+        try:
+            from .model_catalog import get_catalog_service
+            catalog = get_catalog_service()
+        except Exception as e:
+            logger.debug(
+                "discovered route cap %d from %s but catalog service "
+                "unavailable (%s); not recording",
+                cap, source, e,
+            )
+            return
+        try:
+            # Compare against the DISCOVERED layer specifically, not the
+            # merged precedence value. ``get_route_context_cap`` returns
+            # the env override when one's set, which would never equal
+            # the codex-reported value and so would defeat the anti-flood
+            # guard (codex round 2 P3 on #1518).
+            previous = getattr(catalog, "_discovered_route_context_caps", {}).get(
+                self._DISCOVERED_CAP_ROUTE_KEY
+            )
+            catalog.set_discovered_route_context_cap(
+                self._DISCOVERED_CAP_ROUTE_KEY, cap,
+            )
+            if previous != cap:
+                logger.info(
+                    "codex %s: route cap for %s now %d (was %s)",
+                    source, self._DISCOVERED_CAP_ROUTE_KEY, cap, previous,
+                )
+        except Exception as e:
+            logger.debug(
+                "failed to record discovered route cap %d on %s from %s: %s",
+                cap, self._DISCOVERED_CAP_ROUTE_KEY, source, e,
+            )
+
     def _make_tool_call_handler(
         self, executor: ToolExecutor, thread_id: str,
         allowed_tools: frozenset,
@@ -998,6 +1080,16 @@ class CodexAdapter(LLMAdapter):
             ):
                 method = ev.get("method")
                 p = ev.get("params") or {}
+                # #1518: codex's per-session per-plan ceiling is reported on
+                # the notification stream (NOT on the thread/start response —
+                # confirmed by live observation 2026-06-03 against pro plan,
+                # see #1518 body for the dump). ``thread/tokenUsage/updated``
+                # carries ``tokenUsage.modelContextWindow`` which is the real
+                # binding constraint codex enforces for THIS thread. Capture
+                # it and let the catalog's discovered layer win over the
+                # static config. Best-effort; no-op when the field is absent.
+                if method in self._DISCOVERED_CAP_EVENT_METHODS:
+                    self._record_discovered_route_cap_from_event(p)
                 if method == "item/agentMessage/delta":
                     delta = p.get("delta") or ""
                     if delta:
