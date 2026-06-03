@@ -821,12 +821,13 @@ class ComputerUseFeature(Feature):
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
-    async def shell(self, command: str, timeout: int = 60) -> ToolResult:
+    async def shell(self, command: str, timeout: int | str = 60) -> ToolResult:
         """Run a shell command after policy + approval.
 
         Args:
             command: The shell command to run; tokenized with shlex.
-            timeout: Wall-clock seconds before the process is killed.
+            timeout: Wall-clock seconds before the process is killed. Coerced
+                to int at the boundary; a non-numeric value is rejected.
 
         Returns:
             ToolResult.ok when the command exits 0; PARTIAL when the
@@ -839,6 +840,21 @@ class ComputerUseFeature(Feature):
         argv = split_command(command)
         if not argv:
             return ToolResult.failed(error="empty command")
+
+        # The LLM may pass ``timeout`` as a string (e.g. "60"); the backend
+        # does numeric comparisons on it (asyncio.wait_for's ``<= 0`` check),
+        # so coerce to int at the boundary and reject non-numeric / non-positive
+        # values rather than letting a TypeError surface deep in the exec path.
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                error=f"timeout must be an integer number of seconds, got {timeout!r}"
+            )
+        if timeout <= 0:
+            return ToolResult.failed(
+                error=f"timeout must be a positive number of seconds, got {timeout}"
+            )
 
         # Capability depends on which backend is wired up; gate semantics
         # treat the two as distinct constitutional grants.
