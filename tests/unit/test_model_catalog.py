@@ -479,6 +479,101 @@ class TestContextLimits:
         # other API.
         assert svc.get_context_limit("llama3.2:3b") == 128000
 
+    def test_matched_route_key_spans_all_layers(self, monkeypatch, tmp_path):
+        """Codex round 2 P3 on the dynamic-cap PR: the matched-route
+        helper used by the context-status endpoint must look across
+        env + discovered + file layers so the route NAME is reported
+        even when the cap value came from env-only or discovered-only.
+        Previously the endpoint scanned only the file dict, so the
+        route attribution silently vanished on those layers."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        # File dict EMPTY — only an env override applies.
+        monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
+        svc = ModelCatalogService(config_path=tmp_path / "does_not_exist.toml")
+        svc.load()
+        assert svc.get_matched_route_cap_key("openai:plan/gpt-5.5") == "openai:plan"
+
+        # Now drop env and add a discovered-only entry.
+        monkeypatch.delenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", raising=False)
+        svc2 = ModelCatalogService(config_path=tmp_path / "does_not_exist.toml")
+        svc2.load()
+        svc2.set_discovered_route_context_cap("openai:plan", 49152)
+        assert svc2.get_matched_route_cap_key("openai:plan/gpt-5.5") == "openai:plan"
+
+    def test_matched_route_key_returns_none_when_no_layer_matches(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        monkeypatch.delenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", raising=False)
+        svc = ModelCatalogService(config_path=tmp_path / "does_not_exist.toml")
+        svc.load()
+        assert svc.get_matched_route_cap_key("openai:plan/gpt-5.5") is None
+
+    def test_discovered_route_cap_beats_file_layers(self, monkeypatch, tmp_path):
+        """Runtime-discovered values (e.g. from codex's thread/start
+        response) take precedence over kestrel.toml + model_catalog.toml
+        because they reflect what THIS account's THIS plan actually
+        offers right now, not the operator's empirical guess from a
+        previous tier."""
+        monkeypatch.delenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", raising=False)
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        project_dir_path = tmp_path / "project"
+        project_dir_path.mkdir()
+        (project_dir_path / "kestrel.toml").write_text(
+            '[llm.route_context_caps]\n"openai:plan" = 32768\n'
+        )
+        monkeypatch.setenv("KESTREL_HOME", str(project_dir_path))
+        from kestrel_sovereign import paths as _paths
+        _paths._resolve_cached.cache_clear()
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        # Before discovery: file layer wins.
+        assert svc.get_route_context_cap("openai:plan") == 32768
+        # Codex reports 49152 from thread/start. Discovery wins now.
+        svc.set_discovered_route_context_cap("openai:plan/gpt-5.5", 49152)
+        assert svc.get_route_context_cap("openai:plan/gpt-5.5") == 49152
+
+    def test_env_override_beats_discovered_route_cap(self, monkeypatch, tmp_path):
+        """Operator's env-var override is the highest-priority knob —
+        even if codex's server reports a higher cap, the operator can
+        force a lower one."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+        monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        svc.set_discovered_route_context_cap("openai:plan", 65536)
+        assert svc.get_route_context_cap("openai:plan") == 16384
+
+    def test_discovered_cap_non_integer_value_silently_dropped(self, monkeypatch, tmp_path):
+        """Garbage from a future codex wire-format shift must not crash
+        ``load()`` or poison the cache — silently drop with a debug log."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        monkeypatch.delenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", raising=False)
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        svc.set_discovered_route_context_cap("openai:plan", "not-an-int")  # type: ignore[arg-type]
+        svc.set_discovered_route_context_cap("openai:plan", None)  # type: ignore[arg-type]
+        assert svc.get_route_context_cap("openai:plan") == 20480
+
+    def test_clear_discovered_caps_falls_back_to_file_layer(self, monkeypatch, tmp_path):
+        """The clear hook lets tests / forced re-discoveries reset
+        without leaving stale per-session values cached."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        monkeypatch.delenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", raising=False)
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        svc.set_discovered_route_context_cap("openai:plan", 65536)
+        assert svc.get_route_context_cap("openai:plan") == 65536
+        svc.clear_discovered_route_context_caps()
+        assert svc.get_route_context_cap("openai:plan") == 20480
+
     def test_kestrel_toml_caps_applied_when_catalog_file_missing(self, monkeypatch, tmp_path):
         """Codex round 3 P2 on #1506: when ``model_catalog.toml`` is
         absent (pip-install / Cloud Run / unified-config deployments),

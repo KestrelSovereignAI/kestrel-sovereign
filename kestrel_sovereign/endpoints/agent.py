@@ -846,20 +846,41 @@ async def get_context_status(
                 cap_util_percent = (
                     (projected / cap_tokens) * 100.0 if cap_tokens else 0.0
                 )
-                # The route key is the longest prefix of ``current_model``
-                # that exists in ``_route_context_caps``. Re-derive it so
-                # the UI can show which route the cap applies to.
+                # Resolve the route key the cap applied to so the UI
+                # can show its name. Use the catalog's matched-route
+                # helper, which spans ALL precedence layers (env var,
+                # discovered, file) — the previous local loop only
+                # scanned the file layer, so env-only / discovered-only
+                # deployments showed ``route: null`` and the knob hint
+                # vanished (codex round 2 P3 on the dynamic-cap PR).
                 route_id: Optional[str] = None
-                for known_route in getattr(catalog, "_route_context_caps", {}):
-                    if (
-                        current_model.lower() == known_route.lower()
-                        or current_model.lower().startswith(
-                            known_route.lower() + "/"
-                        )
-                    ) and (
-                        route_id is None or len(known_route) > len(route_id)
-                    ):
-                        route_id = known_route
+                helper = getattr(catalog, "get_matched_route_cap_key", None)
+                if callable(helper):
+                    try:
+                        candidate = helper(current_model)
+                        # Validate the return is a real string — a mocked
+                        # catalog (MagicMock) auto-returns a child mock
+                        # that's truthy but not a route name, so guard
+                        # explicitly rather than smuggling the mock
+                        # through into the response shape.
+                        if isinstance(candidate, str) and candidate:
+                            route_id = candidate
+                    except Exception:
+                        route_id = None
+                if route_id is None:
+                    # Fall back to the legacy file-layer scan when the
+                    # helper is absent or returned no real match. This
+                    # also catches mocked-catalog test paths cleanly.
+                    for known_route in getattr(catalog, "_route_context_caps", {}):
+                        if (
+                            current_model.lower() == known_route.lower()
+                            or current_model.lower().startswith(
+                                known_route.lower() + "/"
+                            )
+                        ) and (
+                            route_id is None or len(known_route) > len(route_id)
+                        ):
+                            route_id = known_route
                 # Operator knob hint per route (best-effort). ``openai:plan``
                 # uses ``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` (#1395 wiring);
                 # other routes leave the knob hint empty.

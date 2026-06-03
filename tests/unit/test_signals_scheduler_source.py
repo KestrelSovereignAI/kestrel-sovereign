@@ -82,7 +82,7 @@ async def dispatcher_components(tmp_path):
 
 
 def test_all_cron_tasks_are_classified():
-    """Spec from #893 + #1512: the canonical built-in cron task set.
+    """Spec from #893 + #1510 + #1512: the canonical built-in cron task set.
     If a new one is added or one removed, this test fails loudly so
     the classification table stays in sync with the scheduler's
     defaults."""
@@ -95,6 +95,7 @@ def test_all_cron_tasks_are_classified():
         "training_cycle",
         "reflect",
         "memory_consolidate",
+        "talon_monitor",  # #1510
         "restart_coordinator",  # #1512
     ])
 
@@ -111,6 +112,7 @@ def test_action_vs_artifact_split_matches_design():
         "signal_dispatch",
         "trash_retention",
         "training_cycle",
+        "talon_monitor",  # #1510 — polls jobs, emits signals, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
     }
     assert by_mode[SignalMode.ARTIFACT] == {

@@ -1162,31 +1162,87 @@ class SavedItemsStore:
         item_type: Optional[str] = None,
         limit: int = 10
     ) -> List[Dict[str, Any]]:
-        """Fallback text search using LIKE."""
+        """Fallback text search using LIKE.
+
+        #1477 hardening (codex P2 on #1491): applies the active
+        ``embedding_profile_id`` filter so a foreign-profile row
+        can't surface here either. The cosine isolation principle
+        doesn't strictly require it (LIKE doesn't compare vectors)
+        but the operator expectation after a profile switch /
+        reindex is "old rows are dormant in every search path,"
+        not just the embedding one.
+        """
         query_lower = f"%{query.lower()}%"
 
-        if item_type:
-            rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
-                          ipfs_cid, embedding, source_type, source_ref, schema_id,
-                          tags, metadata, created_at, updated_at
-                   FROM saved_items
-                   WHERE agent_id = ? AND item_type = ?
-                     AND (LOWER(name) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(content) LIKE ?)
-                   ORDER BY created_at DESC LIMIT ?""",
-                (self.agent_id, item_type, query_lower, query_lower, query_lower, limit)
+        current_profile_id: Optional[str] = None
+        embedding_service_for_profile = self._get_embedding_service()
+        if embedding_service_for_profile is not None and hasattr(
+            embedding_service_for_profile, "current_profile_id"
+        ):
+            try:
+                current_profile_id = (
+                    embedding_service_for_profile.current_profile_id()
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "current_profile_id() failed in text_search: %s", exc,
+                )
+
+        profile_clause = ""
+        profile_params: Tuple[Any, ...] = ()
+        if current_profile_id is not None:
+            # NULL-tolerant: foreign-profile rows are excluded but
+            # rows with NULL ``embedding_profile_id`` (text-only
+            # saves, ``aembed`` returned None, embedding service
+            # unavailable at write time, pre-#1477 deployments)
+            # stay reachable via keyword search. Codex P2 round 3
+            # caught the earlier ``= ?`` filter dropping legitimate
+            # text-only saves.
+            profile_clause = (
+                " AND (embedding_profile_id = ? "
+                "OR embedding_profile_id IS NULL)"
             )
-        else:
-            rows = await self.db.fetchall(
-                """SELECT id, agent_id, item_type, name, summary, content, content_hash,
+            profile_params = (current_profile_id,)
+
+        async def _run(with_profile: bool):
+            clause = profile_clause if with_profile else ""
+            params_tail = profile_params if with_profile else ()
+            if item_type:
+                return await self.db.fetchall(
+                    f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
+                              ipfs_cid, embedding, source_type, source_ref, schema_id,
+                              tags, metadata, created_at, updated_at
+                       FROM saved_items
+                       WHERE agent_id = ? AND item_type = ?
+                         AND (LOWER(name) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(content) LIKE ?)
+                         {clause}
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (self.agent_id, item_type, query_lower, query_lower,
+                     query_lower, *params_tail, limit),
+                )
+            return await self.db.fetchall(
+                f"""SELECT id, agent_id, item_type, name, summary, content, content_hash,
                           ipfs_cid, embedding, source_type, source_ref, schema_id,
                           tags, metadata, created_at, updated_at
                    FROM saved_items
                    WHERE agent_id = ?
                      AND (LOWER(name) LIKE ? OR LOWER(summary) LIKE ? OR LOWER(content) LIKE ?)
+                     {clause}
                    ORDER BY created_at DESC LIMIT ?""",
-                (self.agent_id, query_lower, query_lower, query_lower, limit)
+                (self.agent_id, query_lower, query_lower, query_lower,
+                 *params_tail, limit),
             )
+
+        try:
+            rows = await _run(with_profile=current_profile_id is not None)
+        except Exception as exc:
+            # Profile column missing → pre-#1477 DB. Retry without
+            # the filter so the legacy behaviour still works.
+            logger.debug(
+                "saved_items _text_search with profile filter failed "
+                "(%s); retrying unfiltered.", exc,
+            )
+            rows = await _run(with_profile=False)
 
         return [
             {"item": SavedItem.from_row(row).to_dict(), "score": 1.0}
