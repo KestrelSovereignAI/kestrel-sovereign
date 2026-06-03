@@ -92,6 +92,11 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # transition. The COGNITION wake comes from that downstream
     # signal, not from the monitor task itself.
     ("talon_monitor", SignalMode.ACTION, frozenset()),
+    # Restart coordinator (#1512). ACTION — no LLM cost. Scans the
+    # restart_requests table, evaluates safety, and spawns a detached
+    # subprocess to execute the restart. Idle by default; only fires
+    # when a row is pending.
+    ("restart_coordinator", SignalMode.ACTION, frozenset()),
 ]
 
 
