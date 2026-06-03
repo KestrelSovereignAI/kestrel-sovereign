@@ -240,6 +240,57 @@ async def test_shell_allowed_runs(workspace: Path):
 
 
 @pytest.mark.asyncio
+async def test_shell_coerces_string_timeout(workspace: Path):
+    # The LLM may pass timeout as a string ("60"); the backend does a
+    # numeric ``<= 0`` comparison, so the boundary must coerce to int
+    # rather than raising TypeError deep in the exec path (issue #1302).
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    envelope = await feature.shell(command="echo hi", timeout="5")
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["returncode"] == 0
+
+
+@pytest.mark.asyncio
+async def test_shell_rejects_non_numeric_timeout(workspace: Path):
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    envelope = await feature.shell(command="echo hi", timeout="soon")
+    assert envelope.status is not ToolResultStatus.OK
+    assert "timeout must be an integer" in envelope.error
+    # Rejected before reaching the approval gate.
+    assert queue.calls == []
+
+
+@pytest.mark.asyncio
+async def test_shell_rejects_non_positive_timeout(workspace: Path):
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    envelope = await feature.shell(command="echo hi", timeout="0")
+    assert envelope.status is not ToolResultStatus.OK
+    assert "timeout must be a positive" in envelope.error
+    assert queue.calls == []
+
+
+@pytest.mark.asyncio
 async def test_audit_log_records_denied_calls(workspace: Path):
     queue = FakeApprovalQueue()
     agent = FakeAgent(
