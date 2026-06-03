@@ -2054,7 +2054,15 @@ class TalonCoordinatorFeature(Feature):
         win; only job_ids absent from memory are reloaded so a
         restarted feature regains status/log visibility.
         """
-        path = self._jobs_registry_path()
+        try:
+            path = self._jobs_registry_path()
+        except (TypeError, OSError) as e:
+            # Test stubs / discovery harness can construct the
+            # feature with a Mock agent whose ``storage_path`` is
+            # not a valid path. Skip reload silently in that case;
+            # real agents always have a real storage_path.
+            logger.debug("Talon job registry path unavailable: %s", e)
+            return
         if not path.is_file():
             return
         try:
