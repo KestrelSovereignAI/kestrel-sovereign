@@ -479,6 +479,214 @@ class TestContextLimits:
         # other API.
         assert svc.get_context_limit("llama3.2:3b") == 128000
 
+    def test_kestrel_toml_caps_applied_when_catalog_file_missing(self, monkeypatch, tmp_path):
+        """Codex round 3 P2 on #1506: when ``model_catalog.toml`` is
+        absent (pip-install / Cloud Run / unified-config deployments),
+        ``load()`` previously returned at the missing-catalog guard
+        BEFORE the new merge — so a cap set only in ``kestrel.toml``
+        was still silently ignored. The merge must run on the defaults
+        path too."""
+        # KESTREL_DB_PATH could pre-empt our project-root probe in a
+        # documented operator environment — clear it (codex round 4 P2).
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        # No model_catalog.toml at all.
+        project_dir_path = tmp_path / "project"
+        project_dir_path.mkdir()
+        (project_dir_path / "kestrel.toml").write_text(
+            '[llm.route_context_caps]\n"openai:plan" = 32768\n'
+        )
+        monkeypatch.setenv("KESTREL_HOME", str(project_dir_path))
+        from kestrel_sovereign import paths as _paths
+        _paths._resolve_cached.cache_clear()
+
+        svc = ModelCatalogService(config_path=tmp_path / "does_not_exist.toml")
+        svc.load()  # Hits the missing-catalog defaults path.
+        # kestrel.toml cap survives — was the regression codex caught.
+        assert svc.get_route_context_cap("openai:plan") == 32768
+
+    def test_env_overrides_apply_even_when_catalog_file_missing(self, monkeypatch, tmp_path):
+        """Same defaults-path concern as the test above, but for the env
+        override layer. Lifted out of ``load()`` into a shared helper so
+        both paths apply env overrides identically."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        project_dir_path = tmp_path / "project"
+        project_dir_path.mkdir()
+        monkeypatch.setenv("KESTREL_HOME", str(project_dir_path))
+        from kestrel_sovereign import paths as _paths
+        _paths._resolve_cached.cache_clear()
+        monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "65536")
+
+        svc = ModelCatalogService(config_path=tmp_path / "does_not_exist.toml")
+        svc.load()  # Defaults path.
+        assert svc.get_route_context_cap("openai:plan") == 65536
+
+    def test_kestrel_toml_route_caps_resolved_via_kestrel_db_path_first(self, monkeypatch, tmp_path):
+        """Codex round 2 P2 on #1506: the helper must follow the same
+        search order as ``config.load_section('llm')`` — agent-specific
+        ``KESTREL_DB_PATH/kestrel.toml`` is checked before the project
+        root, so an agent-scoped cap takes precedence over the global
+        one."""
+        # Agent-scoped kestrel.toml has the higher-precedence cap.
+        agent_dir = tmp_path / "agent_db"
+        agent_dir.mkdir()
+        (agent_dir / "kestrel.toml").write_text(
+            '[llm.route_context_caps]\n"openai:plan" = 65536\n'
+        )
+        # Project-root kestrel.toml has a different (lower-precedence) cap.
+        project_dir_path = tmp_path / "project"
+        project_dir_path.mkdir()
+        (project_dir_path / "kestrel.toml").write_text(
+            '[llm.route_context_caps]\n"openai:plan" = 32768\n'
+        )
+
+        monkeypatch.setenv("KESTREL_DB_PATH", str(agent_dir))
+        monkeypatch.setenv("KESTREL_HOME", str(project_dir_path))
+        from kestrel_sovereign import paths as _paths
+        _paths._resolve_cached.cache_clear()
+
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        # Agent-scoped 65536 wins over both project-root 32768 and
+        # catalog default 20480.
+        assert svc.get_route_context_cap("openai:plan") == 65536
+
+    def test_kestrel_toml_route_caps_resolved_via_kestrel_home(self, monkeypatch, tmp_path):
+        """#1506 codex round 1 P2: the kestrel.toml probe must resolve
+        through ``paths.project_dir`` (which honors ``KESTREL_HOME``)
+        rather than ``Path.cwd()`` — otherwise pip-installed,
+        Cloud-Run, and ``KESTREL_HOME``-overridden deployments silently
+        skip the merge even though the operator configured the cap in
+        the supported project location."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        # Project dir resolves to kestrel_home_dir via KESTREL_HOME.
+        kestrel_home_dir = tmp_path / "kestrel_home"
+        kestrel_home_dir.mkdir()
+        (kestrel_home_dir / "kestrel.toml").write_text(
+            '[llm.route_context_caps]\n"openai:plan" = 49152\n'
+        )
+
+        # Process cwd is somewhere else (e.g. /tmp). Without project_dir
+        # resolution, the helper would probe ``./kestrel.toml`` and miss
+        # the file entirely.
+        elsewhere = tmp_path / "not_the_project"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+        monkeypatch.setenv("KESTREL_HOME", str(kestrel_home_dir))
+
+        # Reset the project_dir LRU cache so the new env var is honored.
+        from kestrel_sovereign import paths as _paths
+        _paths._resolve_cached.cache_clear()
+
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        assert svc.get_route_context_cap("openai:plan") == 49152
+
+    def test_kestrel_toml_route_caps_merge_into_catalog(self, monkeypatch, tmp_path):
+        """#1506: ``kestrel.toml [llm.route_context_caps]`` is honored
+        by the catalog. Operators reasonably expect LLM-routing config
+        in ``kestrel.toml`` next to route_priority and vendor routes;
+        before this layer was added, setting the cap there was a silent
+        no-op."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        catalog_content = '''
+[route_context_caps]
+"openai:plan" = 20480
+'''
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text(catalog_content)
+
+        kestrel_toml = tmp_path / "kestrel.toml"
+        kestrel_toml.write_text('''
+[llm.route_context_caps]
+"openai:plan" = 32768
+"anthropic:plan" = 65536
+''')
+        # Run the catalog with the cwd set to where kestrel.toml lives.
+        monkeypatch.chdir(tmp_path)
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+
+        # kestrel.toml overrides model_catalog.toml's value for openai:plan.
+        assert svc.get_route_context_cap("openai:plan") == 32768
+        # Caps declared only in kestrel.toml are picked up too.
+        assert svc.get_route_context_cap("anthropic:plan") == 65536
+
+    def test_kestrel_toml_missing_does_not_break_catalog_load(self, monkeypatch, tmp_path):
+        """If kestrel.toml is absent, the catalog still loads cleanly
+        with just the model_catalog.toml caps."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        catalog_content = '''
+[route_context_caps]
+"openai:plan" = 20480
+'''
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text(catalog_content)
+        monkeypatch.chdir(tmp_path)
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()  # must not raise even though kestrel.toml is missing
+        assert svc.get_route_context_cap("openai:plan") == 20480
+
+    def test_env_overrides_kestrel_toml_route_cap(self, monkeypatch, tmp_path):
+        """Precedence: env var > kestrel.toml > model_catalog.toml.
+
+        The env override is the highest-priority knob because operators
+        need a no-redeploy way to bump the cap when ChatGPT-Plus shifts;
+        kestrel.toml sits between env and the catalog default."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+        kestrel_toml = tmp_path / "kestrel.toml"
+        kestrel_toml.write_text('[llm.route_context_caps]\n"openai:plan" = 32768\n')
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("KESTREL_OPENAI_PLAN_CONTEXT_CAP", "16384")
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        # Env wins.
+        assert svc.get_route_context_cap("openai:plan") == 16384
+
+    def test_kestrel_toml_malformed_route_caps_block_is_ignored(self, monkeypatch, tmp_path):
+        """A non-table value at [llm.route_context_caps] is logged at
+        debug and ignored — must NOT raise from catalog.load()."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+        # Use a top-level string at the path the helper probes for.
+        kestrel_toml = tmp_path / "kestrel.toml"
+        kestrel_toml.write_text(
+            '[llm]\nroute_context_caps = "not a table"\n'
+        )
+        monkeypatch.chdir(tmp_path)
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()  # must not raise
+        # Catalog default stands when kestrel.toml block is malformed.
+        assert svc.get_route_context_cap("openai:plan") == 20480
+
+    def test_kestrel_toml_non_integer_value_is_skipped(self, monkeypatch, tmp_path):
+        """Non-integer cap values in the kestrel.toml block are skipped
+        with a debug log; valid sibling entries still merge."""
+        monkeypatch.delenv("KESTREL_DB_PATH", raising=False)
+        catalog = tmp_path / "model_catalog.toml"
+        catalog.write_text('[route_context_caps]\n"openai:plan" = 20480\n')
+        kestrel_toml = tmp_path / "kestrel.toml"
+        kestrel_toml.write_text('''
+[llm.route_context_caps]
+"openai:plan" = "not an int"
+"anthropic:plan" = 65536
+''')
+        monkeypatch.chdir(tmp_path)
+        svc = ModelCatalogService(config_path=catalog)
+        svc.load()
+        # Bad value skipped → catalog default stands for openai:plan.
+        assert svc.get_route_context_cap("openai:plan") == 20480
+        # Sibling integer entry merges in cleanly.
+        assert svc.get_route_context_cap("anthropic:plan") == 65536
+
     def test_env_override_openai_plan_context_cap(self, monkeypatch):
         """``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` overrides the TOML cap.
 

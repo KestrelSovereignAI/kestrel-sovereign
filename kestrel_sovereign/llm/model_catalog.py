@@ -78,6 +78,87 @@ logger = logging.getLogger(__name__)
 DEFAULT_CATALOG_PATH = Path("model_catalog.toml")
 DEFAULT_CACHE_PATH = Path(__file__).parent.parent / "model_discovery_cache.json"
 
+def _read_kestrel_toml_route_caps(
+    path: Optional[Path] = None,
+) -> Dict[str, int]:
+    """Return ``[llm.route_context_caps]`` from ``kestrel.toml`` if present.
+
+    Honors the SAME search order as ``config.load_section('llm')`` so the
+    merge picks up the cap regardless of which supported config location
+    the operator used:
+
+    1. ``KESTREL_DB_PATH/kestrel.toml`` — agent-specific config (codex
+       round 2 P2 on #1506)
+    2. project-root ``kestrel.toml`` resolved via ``paths.project_dir``
+       (codex round 1 P2 on #1506)
+
+    Best-effort: any I/O error, missing file, missing block, or
+    non-integer value degrades to an empty dict + debug log; this helper
+    NEVER raises so it can sit on the catalog-load hot path. #1506.
+
+    ``path`` is an injection hook for tests — when set, that single file
+    is read and the search order above is bypassed.
+    """
+    if path is not None:
+        candidate_paths = [path]
+    else:
+        candidate_paths = []
+        # Mirror config.load_section's order: KESTREL_DB_PATH first.
+        db_path = os.environ.get("KESTREL_DB_PATH")
+        if db_path:
+            candidate_paths.append(Path(db_path) / "kestrel.toml")
+        try:
+            # Late import to avoid pulling paths.py into model_catalog's
+            # already-busy import surface at module-load time.
+            from kestrel_sovereign.paths import project_dir
+            candidate_paths.append(project_dir() / "kestrel.toml")
+        except Exception as e:
+            logger.debug(
+                "project_dir resolution failed for kestrel.toml route caps "
+                "(%s); falling back to cwd", e
+            )
+            candidate_paths.append(Path("kestrel.toml"))
+
+    for target in candidate_paths:
+        try:
+            if not target.exists():
+                continue
+            with open(target, "rb") as f:
+                data = tomllib.load(f)
+            block = (data.get("llm") or {}).get("route_context_caps") or {}
+            if not isinstance(block, dict):
+                logger.debug(
+                    "kestrel.toml [llm.route_context_caps] at %s is not a "
+                    "table; ignored", target,
+                )
+                continue
+            out: Dict[str, int] = {}
+            for k, v in block.items():
+                try:
+                    out[str(k)] = int(v)
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "kestrel.toml [llm.route_context_caps] %r=%r at %s "
+                        "is not an integer; ignored",
+                        k, v, target,
+                    )
+            if out:
+                logger.info(
+                    "loaded %d route_context_caps from kestrel.toml at %s: %s",
+                    len(out), target, out,
+                )
+                # Use the FIRST kestrel.toml that actually carries the
+                # block. Mirrors load_section's "first hit wins" so an
+                # agent-specific override at KESTREL_DB_PATH takes
+                # precedence over the project-root file.
+                return out
+        except Exception as e:
+            logger.debug(
+                "kestrel.toml route_context_caps probe failed at %s (%s); "
+                "ignored", target, e,
+            )
+    return {}
+
 
 class ModelCatalogService:
     """
@@ -127,8 +208,22 @@ class ModelCatalogService:
 
     def load(self) -> None:
         """Load configuration from TOML file."""
+        # #1506 codex round 3 P2: when ``model_catalog.toml`` is absent
+        # (pip-install, Cloud Run, migrated unified-config deployments
+        # that put everything in ``kestrel.toml``), the catalog still
+        # needs to honor ``kestrel.toml [llm.route_context_caps]``.
+        # Pre-fetch the kestrel.toml caps so they survive the
+        # missing-catalog early return below; env overrides further
+        # down get a chance to layer on top later if load() proceeds.
+        kestrel_toml_caps = _read_kestrel_toml_route_caps()
         if not self.config_path.exists():
-            logger.warning(f"Model catalog not found at {self.config_path}, using defaults")
+            logger.warning(
+                f"Model catalog not found at {self.config_path}, using defaults"
+            )
+            # Even without a catalog file, route caps configured in
+            # kestrel.toml + the env-override layer must still apply.
+            self._route_context_caps = dict(kestrel_toml_caps)
+            self._apply_route_cap_env_overrides()
             self._loaded = True
             return
 
@@ -160,38 +255,21 @@ class ModelCatalogService:
                 self._config.get("route_context_caps", {})
             )
 
-            # Env overrides for route-level per-turn caps (#1395). Mapped
-            # from KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>=<int> so the
-            # operator can tune a route's effective window without
-            # editing the TOML — useful when ChatGPT-Plus's per-turn cap
-            # shifts (it's empirical, not advertised by OpenAI).
-            # KESTREL_OPENAI_PLAN_CONTEXT_CAP is honored as the
-            # documented shortcut for the canonical case.
-            for env_key, env_val in os.environ.items():
-                if env_val == "":
-                    continue
-                if env_key == "KESTREL_OPENAI_PLAN_CONTEXT_CAP":
-                    target_key = "openai:plan"
-                elif env_key.startswith("KESTREL_ROUTE_CONTEXT_CAP_"):
-                    rest = env_key[len("KESTREL_ROUTE_CONTEXT_CAP_"):]
-                    parts = rest.split("_", 1)
-                    if len(parts) != 2:
-                        continue
-                    vendor, route = parts
-                    target_key = f"{vendor.lower()}:{route.lower()}"
-                else:
-                    continue
-                try:
-                    self._route_context_caps[target_key] = int(env_val)
-                    logger.info(
-                        "route context cap override from env: %s = %s",
-                        target_key, env_val,
-                    )
-                except ValueError:
-                    logger.warning(
-                        "env override %s=%r is not an integer; ignored",
-                        env_key, env_val,
-                    )
+            # #1506: also merge ``[llm.route_context_caps]`` from
+            # ``kestrel.toml``. Operators reasonably expect LLM-routing
+            # config to live in ``kestrel.toml`` next to route_priority
+            # and the vendor.routes blocks. Precedence overall:
+            #   1. KESTREL_*_CONTEXT_CAP env vars — highest (applied
+            #      via ``_apply_route_cap_env_overrides`` below)
+            #   2. ``kestrel.toml [llm.route_context_caps]`` — operator
+            #      override (kestrel_toml_caps prefetched above)
+            #   3. ``model_catalog.toml [route_context_caps]`` — default
+            # Best-effort: any read / parse error degrades to "as if the
+            # block were absent" and a debug log, NEVER raises out of
+            # ``load()``.
+            self._route_context_caps.update(kestrel_toml_caps)
+
+            self._apply_route_cap_env_overrides()
 
             # Parse display name overrides — support both old and new key names
             self._display_names = (
@@ -219,6 +297,47 @@ class ModelCatalogService:
         except Exception as e:
             logger.error(f"Failed to load model catalog: {e}")
             self._loaded = True  # Mark as loaded to avoid retry loops
+
+    def _apply_route_cap_env_overrides(self) -> None:
+        """Apply ``KESTREL_*_CONTEXT_CAP`` env overrides to ``_route_context_caps``.
+
+        Mapped from ``KESTREL_ROUTE_CONTEXT_CAP_<VENDOR>_<ROUTE>=<int>`` so
+        the operator can tune a route's effective window without editing
+        the TOML — useful when ChatGPT-Plus's per-turn cap shifts
+        (it's empirical, not advertised by OpenAI).
+        ``KESTREL_OPENAI_PLAN_CONTEXT_CAP`` is honored as the documented
+        shortcut for the canonical case.
+
+        Lifted out of ``load()`` so both the catalog-file path and the
+        missing-catalog defaults path can apply the same env-override
+        layer (#1506 codex round 3 P2 — without this, the env overrides
+        also vanish whenever the catalog file is absent).
+        """
+        for env_key, env_val in os.environ.items():
+            if env_val == "":
+                continue
+            if env_key == "KESTREL_OPENAI_PLAN_CONTEXT_CAP":
+                target_key = "openai:plan"
+            elif env_key.startswith("KESTREL_ROUTE_CONTEXT_CAP_"):
+                rest = env_key[len("KESTREL_ROUTE_CONTEXT_CAP_"):]
+                parts = rest.split("_", 1)
+                if len(parts) != 2:
+                    continue
+                vendor, route = parts
+                target_key = f"{vendor.lower()}:{route.lower()}"
+            else:
+                continue
+            try:
+                self._route_context_caps[target_key] = int(env_val)
+                logger.info(
+                    "route context cap override from env: %s = %s",
+                    target_key, env_val,
+                )
+            except ValueError:
+                logger.warning(
+                    "env override %s=%r is not an integer; ignored",
+                    env_key, env_val,
+                )
 
     def _ensure_loaded(self) -> None:
         """Ensure configuration is loaded."""
