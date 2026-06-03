@@ -101,7 +101,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `33` discoverable modules and `33` exported `Feature` subclasses.
+- Current audited snapshot: `34` discoverable modules and `34` exported `Feature` subclasses.
 
 - `audit_anchor`
 - `bootstrap`
@@ -123,6 +123,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `model`
 - `peers`
 - `response_audit`
+- `restart_coordinator`
 - `save`
 - `scheduler`
 - `security`
@@ -159,6 +160,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `ModelAgent`
 - `PeersFeature`
 - `ResponseAuditFeature`
+- `RestartCoordinatorFeature`
 - `SaveFeature`
 - `SchedulerFeature`
 - `SecurityFeature`
