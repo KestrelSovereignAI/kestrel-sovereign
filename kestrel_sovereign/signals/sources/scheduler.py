@@ -86,6 +86,12 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # Consolidation writes episodes/patterns into memory storage.
     # Owner confirmed ARTIFACT (#893): no follow-up cognition triggered.
     ("memory_consolidate", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
+    # Talon CLI-background job monitor (#1510). ACTION — no LLM cost.
+    # Polls the durable jobs.json registry, detects state transitions,
+    # and ENQUEUES one talon.job_complete COGNITION signal per
+    # transition. The COGNITION wake comes from that downstream
+    # signal, not from the monitor task itself.
+    ("talon_monitor", SignalMode.ACTION, frozenset()),
 ]
 
 
