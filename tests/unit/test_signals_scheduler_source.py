@@ -81,10 +81,11 @@ async def dispatcher_components(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_all_seven_cron_tasks_are_classified():
-    """Issue #893 spec: 7 built-in cron tasks. If a new one is added or
-    one removed, this test fails loudly so the classification table
-    stays in sync with the scheduler's defaults."""
+def test_all_cron_tasks_are_classified():
+    """Spec from #893 + #1512: the canonical built-in cron task set.
+    If a new one is added or one removed, this test fails loudly so
+    the classification table stays in sync with the scheduler's
+    defaults."""
     names = [t[0] for t in CRON_TASKS]
     assert sorted(names) == sorted([
         "backup_snapshot",
@@ -94,6 +95,7 @@ def test_all_seven_cron_tasks_are_classified():
         "training_cycle",
         "reflect",
         "memory_consolidate",
+        "restart_coordinator",  # #1512
     ])
 
 
@@ -109,6 +111,7 @@ def test_action_vs_artifact_split_matches_design():
         "signal_dispatch",
         "trash_retention",
         "training_cycle",
+        "restart_coordinator",  # #1512 — scans, spawns subprocess
     }
     assert by_mode[SignalMode.ARTIFACT] == {
         "morning_signal",
@@ -150,7 +153,7 @@ def test_state_mutating_tasks_declare_memory():
 # ---------------------------------------------------------------------------
 
 
-def test_build_cron_registrations_returns_seven_correctly_named():
+def test_build_cron_registrations_match_cron_tasks_table():
     async def _lookup(name, args):
         return None
 

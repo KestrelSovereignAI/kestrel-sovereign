@@ -177,12 +177,12 @@ async def list_requests(
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY requested_at DESC"
-    rows = await db.fetch_all(sql, tuple(params))
+    rows = await db.fetchall(sql, tuple(params))
     return [RestartRequest.from_row(r) for r in rows]
 
 
 async def get_request(db, request_id: str) -> Optional[RestartRequest]:
-    rows = await db.fetch_all(
+    rows = await db.fetchall(
         "SELECT id, requested_by_agent, reason, requested_at, "
         "desired_window, urgency, policy, status, status_reason, "
         "completed_at FROM restart_requests WHERE id = ?",

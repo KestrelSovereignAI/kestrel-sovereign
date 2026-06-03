@@ -26,6 +26,7 @@ from kestrel_sovereign.features.restart_coordinator.store import (
     list_requests,
     update_status,
 )
+from kestrel_sovereign.storage.async_database import AsyncDatabase
 from kestrel_sovereign.storage.db import SQLiteBackend
 
 
@@ -59,10 +60,16 @@ class _StubRegistry:
 
 
 async def _backend(tmp_path):
-    backend = SQLiteBackend(str(tmp_path / "restart.db"))
-    await backend.connect()
-    await ensure_restart_requests_table(backend)
-    return backend
+    """Wrap SQLiteBackend in AsyncDatabase to match the production
+    surface ``resolve_feature_database`` returns. ``AsyncDatabase``
+    exposes ``fetchall`` (no underscore) while the bare backend uses
+    ``fetch_all`` — store code must work against the wrapper.
+    """
+    raw = SQLiteBackend(str(tmp_path / "restart.db"))
+    await raw.connect()
+    db = AsyncDatabase(raw)
+    await ensure_restart_requests_table(db)
+    return db
 
 
 def _make_agent(backend, did="did:test:agent", dispatcher=None,
