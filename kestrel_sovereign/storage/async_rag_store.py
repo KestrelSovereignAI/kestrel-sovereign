@@ -618,19 +618,21 @@ class AsyncRAGStore:
                         "current_profile_id() failed in BM25: %s", exc,
                     )
 
-            # When the profile filter is active, request a very
-            # generous candidate window so foreign-profile rows
-            # dominating the top ranks can't starve the filter
-            # (codex P2 round 4). BM25 ``get_scores`` already
-            # computes the score for every document; passing a
-            # huge ``raw_limit`` just slices the already-sorted
-            # list deeper — negligible cost over a small ``limit``.
-            # ``len(self._bm25_index.documents)`` would give the
-            # exact upper bound but the attribute isn't on the
-            # async wrapper's public contract; 100_000 is enough
-            # for realistic RAG corpora and a no-op for smaller
-            # ones (BM25 returns at most ``len(documents)``).
-            raw_limit = 100_000 if current_profile_id is not None else limit
+            # When the profile filter is active, pass the index's
+            # full corpus size as ``raw_limit`` so foreign-profile
+            # rows dominating the top ranks can't starve the
+            # filter (codex P2 rounds 4 + 6). BM25 ``get_scores``
+            # already computes a score per document; slicing the
+            # already-sorted list deeper is the same O(N) work.
+            # ``BM25Index.search`` caps at ``len(documents)``
+            # internally, so passing a huge ``raw_limit`` just
+            # surfaces every positive-score hit.
+            raw_limit = limit
+            if current_profile_id is not None:
+                doc_count = len(
+                    getattr(self._bm25_index, "documents", None) or []
+                )
+                raw_limit = max(doc_count, limit)
             results = await self._bm25_index.asearch(query, raw_limit)
 
             if current_profile_id is not None and results:
@@ -665,6 +667,10 @@ class AsyncRAGStore:
                     results = results[:limit]
                 else:
                     profile_by_id: Dict[int, Optional[str]] = {}
+                    # Track which ids we successfully looked up so a
+                    # transient batch failure can't be confused with
+                    # a legitimate NULL stamp (codex P2 round 6).
+                    looked_up: set[int] = set()
                     for start in range(0, len(ids), _BATCH):
                         chunk = ids[start:start + _BATCH]
                         placeholders = ",".join("?" for _ in chunk)
@@ -677,12 +683,14 @@ class AsyncRAGStore:
                             )
                             for row in profile_rows:
                                 profile_by_id[row[0]] = row[1]
+                            looked_up.update(chunk)
                         except Exception as exc:
                             # Mid-batch error (transient, partial
                             # result). Fail closed: candidates from
-                            # this batch are dropped (their profile
-                            # is unknown), which is safer than
-                            # leaking unknown-profile rows.
+                            # this batch stay OUT of ``looked_up``
+                            # so the final filter drops them.
+                            # Safer than treating an unknown lookup
+                            # as a legitimate NULL stamp.
                             logger.warning(
                                 "BM25 profile lookup batch %d-%d failed "
                                 "(%s); dropping those candidates to "
@@ -692,7 +700,8 @@ class AsyncRAGStore:
 
                     results = [
                         r for r in results
-                        if profile_by_id.get(int(r.doc_id))
+                        if int(r.doc_id) in looked_up
+                        and profile_by_id.get(int(r.doc_id))
                         in (current_profile_id, None)
                     ][:limit]
 
