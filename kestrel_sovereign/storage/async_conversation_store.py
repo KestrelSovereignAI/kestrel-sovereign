@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
+from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
 from .encryption import (
     get_fernet, get_agent_fernet, encrypt_string, decrypt_string, remove_enc_flag,
     DecryptionError
@@ -327,7 +328,10 @@ class AsyncConversationStore:
         return str(uuid.uuid4())
 
     async def get_message_embeddings(
-        self, message_ids: List[int]
+        self,
+        message_ids: List[int],
+        *,
+        embedding_profile_id: Optional[str] = None,
     ) -> Dict[int, List[float]]:
         """Load embeddings for the given message ids.
 
@@ -335,6 +339,17 @@ class AsyncConversationStore:
         non-NULL ``embedding_vec``. Rows without an embedding are
         absent from the result — caller treats absence as
         "fall back to keyword overlap."
+
+        Args:
+            message_ids: Conversation_history row ids to fetch.
+            embedding_profile_id: When provided (#1477), only rows
+                stamped with this exact profile id are returned —
+                rows from a different model living in a different
+                semantic coordinate space are filtered out at the
+                SQL layer rather than blended into cosine. ``None``
+                means "no profile filter" (preserves legacy
+                behaviour for pre-migration / mixed-corpus
+                deployments).
 
         Decode handling:
 
@@ -366,14 +381,24 @@ class AsyncConversationStore:
         for start in range(0, len(message_ids), CHUNK):
             chunk = message_ids[start:start + CHUNK]
             placeholders = ",".join("?" for _ in chunk)
+            profile_clause = ""
+            profile_params: Tuple[Any, ...] = ()
+            if embedding_profile_id is not None:
+                # #1477 — cross-profile rows stay out of cosine. We
+                # add the predicate at the SQL layer so the row never
+                # round-trips just to be discarded by the caller.
+                profile_clause = " AND embedding_profile_id = ?"
+                profile_params = (embedding_profile_id,)
             sql = (
                 f"SELECT id, embedding_vec FROM conversation_history "
                 f"WHERE agent_id = ? AND id IN ({placeholders}) "
-                f"AND embedding_vec IS NOT NULL"
+                f"AND embedding_vec IS NOT NULL{profile_clause}"
             )
             try:
                 rows.extend(
-                    await self.db.fetchall(sql, (self.agent_id, *chunk))
+                    await self.db.fetchall(
+                        sql, (self.agent_id, *chunk, *profile_params)
+                    )
                 )
             except Exception as e:
                 # Most likely cause: the Phase-2 migration hasn't run
@@ -517,13 +542,50 @@ class AsyncConversationStore:
         # column set with no behavioural change.
         embedding_vec_val: Optional[List[float]] = await self._maybe_embed(content)
 
+        # #1477 — derive the active embedding profile id so the row
+        # can be filtered out of kNN reads that don't share the
+        # same semantic coordinate space. Never blocks the write —
+        # if the service can't describe itself the row's profile id
+        # stays NULL (= invisible to profile-filtered kNN, harmless).
+        profile_id: Optional[str] = None
+        embedding_service: Optional[Any] = None
+        if embedding_vec_val is not None:
+            embedding_service = self._lazy_embedding_service()
+            if embedding_service is not None and hasattr(
+                embedding_service, "current_profile_id"
+            ):
+                try:
+                    profile_id = embedding_service.current_profile_id()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed for agent %s: %s",
+                        self.agent_id, exc,
+                    )
+
         await self._insert_message(
             role=role,
             content=to_store,
             rendered_content=rendered_to_store,
             metadata=json.dumps(meta) if meta else None,
             embedding=embedding_vec_val,
+            embedding_profile_id=profile_id,
         )
+
+        # Upsert the profile descriptor into the registry table so
+        # ``kestrel-sovereign embeddings audit`` can map id →
+        # human-readable fields. Best-effort: registry write must
+        # NEVER block message persistence. Cached in-process to
+        # avoid an UPSERT per turn.
+        if profile_id is not None and embedding_service is not None:
+            try:
+                await _upsert_embedding_profile(
+                    self.db, embedding_service, profile_id,
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "Failed to upsert embedding_profiles row for agent %s: %s",
+                    self.agent_id, exc,
+                )
 
     async def _maybe_embed(self, content: str) -> Optional[List[float]]:
         """Compute an embedding for ``content`` if a service is wired.
@@ -605,9 +667,10 @@ class AsyncConversationStore:
         rendered_content: Optional[str],
         metadata: Optional[str],
         embedding: Optional[List[float]],
+        embedding_profile_id: Optional[str] = None,
     ) -> None:
         """Persist a conversation row, optionally co-writing
-        ``embedding_vec``.
+        ``embedding_vec`` and ``embedding_profile_id``.
 
         Dual SQL paths because the ``embedding_vec`` bind shape is
         dialect-specific:
@@ -622,7 +685,9 @@ class AsyncConversationStore:
         When ``embedding`` is ``None`` (no service / failure / empty
         content) we fall back to the legacy column list — preserving
         bit-identical INSERT shape with prior versions so any tooling
-        sniffing the SQL surface keeps working.
+        sniffing the SQL surface keeps working. ``embedding_profile_id``
+        is always written alongside ``embedding_vec`` — they share
+        the same row state (#1477).
         """
         base_cols = "agent_id, role, content, rendered_content, metadata, created_at"
         base_vals_suffix = f", {self._now_sql()}"
@@ -647,28 +712,55 @@ class AsyncConversationStore:
                 emb_bind = _serialize_embedding(embedding)
                 emb_placeholder = "?"
 
+            # Co-write profile id when we have one; the column may
+            # be NULL (pre-#1477 deployments without the migration)
+            # so we keep the legacy two-column path as the fallback
+            # below.
             sql = (
                 f"INSERT INTO conversation_history "
-                f"({base_cols}, embedding_vec) "
-                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder})"
+                f"({base_cols}, embedding_vec, embedding_profile_id) "
+                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder}, ?)"
             )
-            await self.db.execute_commit(sql, base_params + (emb_bind,))
+            await self.db.execute_commit(
+                sql, base_params + (emb_bind, embedding_profile_id),
+            )
         except Exception as e:
-            # Most likely cause: the Phase-2 migration hasn't run yet
-            # so the column doesn't exist. Don't drop the row — retry
-            # with the legacy column list. The retriever falls back to
-            # keyword overlap for this message until the next boot
-            # finishes the migration.
+            # The most informative thing to try first is "drop the
+            # NEW column but keep the embedding_vec" — that catches
+            # the partial-migration shape where Phase-2 ran (vec
+            # column exists) but #1477 hasn't (profile_id column
+            # doesn't). Without this middle step we would regress
+            # those deployments from storing vectors to dropping
+            # them entirely. (Codex P2 on #1477.)
             logger.info(
-                "Could not write conversation_history.embedding_vec for "
-                "agent %s (%s); falling back to legacy INSERT path.",
-                self.agent_id, e,
+                "Could not write conversation_history.embedding_vec + "
+                "embedding_profile_id for agent %s (%s); retrying "
+                "without embedding_profile_id.", self.agent_id, e,
             )
-            sql = (
-                f"INSERT INTO conversation_history ({base_cols}) "
-                f"VALUES (?, ?, ?, ?, ?{base_vals_suffix})"
-            )
-            await self.db.execute_commit(sql, base_params)
+            try:
+                sql = (
+                    f"INSERT INTO conversation_history "
+                    f"({base_cols}, embedding_vec) "
+                    f"VALUES (?, ?, ?, ?, ?{base_vals_suffix}, {emb_placeholder})"
+                )
+                await self.db.execute_commit(sql, base_params + (emb_bind,))
+            except Exception as e2:
+                # Even the legacy embedding_vec column is missing
+                # (Phase-2 migration hasn't run either). Fall all
+                # the way back to the original column list so the
+                # message still persists; the retriever uses
+                # keyword overlap until the next boot finishes the
+                # migrations.
+                logger.info(
+                    "Legacy embedding_vec-only INSERT also failed for "
+                    "agent %s (%s); persisting the message without any "
+                    "embedding column.", self.agent_id, e2,
+                )
+                sql = (
+                    f"INSERT INTO conversation_history ({base_cols}) "
+                    f"VALUES (?, ?, ?, ?, ?{base_vals_suffix})"
+                )
+                await self.db.execute_commit(sql, base_params)
 
     def _decrypt_with_fallback(self, content: str, meta: Optional[Dict]) -> tuple[str, bool]:
         """Decrypt content, trying per-agent key first then global.

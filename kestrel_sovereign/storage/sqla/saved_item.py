@@ -74,6 +74,15 @@ class SavedItem(SovereignBase):
         "embedding_vec", PortableVector(SAVED_ITEM_EMBEDDING_DIM), nullable=True
     )
 
+    # #1477 — semantic-space identity stamp. NULL on rows written
+    # before 0.21 or when no embedding provider was available at
+    # write time. Profile-filtered kNN skips NULL rows so they can't
+    # silently mix with rows from a different model living in a
+    # different coordinate space.
+    embedding_profile_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+
     # Provenance + categorization. JSON-encoded blobs stored as TEXT —
     # matches the existing ``json.dumps(...)`` writes in
     # ``SavedItemsStore``. Decoding is the caller's responsibility.
@@ -124,5 +133,7 @@ def build_saved_item_spec(dimension: int) -> VectorTableSpec:
         filter_columns={
             "agent_id": SavedItem.agent_id,
             "item_type": SavedItem.item_type,
+            # #1477 — see ``conversation_message.build_conversation_message_spec``.
+            "embedding_profile_id": SavedItem.embedding_profile_id,
         },
     )

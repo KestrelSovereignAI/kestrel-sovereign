@@ -66,6 +66,14 @@ class DocumentChunk(SovereignBase):
         nullable=True,
     )
 
+    # #1477 — semantic-space identity for this row's embedding.
+    # NULL on rows from before this column existed; profile-filtered
+    # kNN skips NULL so cross-model recall can't silently mix
+    # different coordinate spaces.
+    embedding_profile_id: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+
 
 def build_document_chunk_spec(dimension: int) -> VectorTableSpec:
     """Build a ``VectorTableSpec`` for ``document_chunks`` at a given dim.
@@ -89,5 +97,9 @@ def build_document_chunk_spec(dimension: int) -> VectorTableSpec:
         embedding_column=DocumentChunk.embedding,
         dimension=dimension,
         required_filter_keys=(),
-        filter_columns={"file_hash": DocumentChunk.file_hash},
+        filter_columns={
+            "file_hash": DocumentChunk.file_hash,
+            # #1477 — see ``conversation_message.build_conversation_message_spec``.
+            "embedding_profile_id": DocumentChunk.embedding_profile_id,
+        },
     )

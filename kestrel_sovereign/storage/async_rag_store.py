@@ -162,12 +162,40 @@ class AsyncRAGStore:
                 if chunk_id is not None:
                     new_chunk_ids.append((chunk_id, embedding))
 
-        # Dual-write embedding_vec for every chunk we just inserted.
-        # Outside the INSERT loop because the column might not exist
-        # yet on a DB whose Phase-2 migration hasn't run — the helper
-        # catches that and logs info.
+        # #1477 — derive the active embedding profile id once (same
+        # for every chunk we just batched) so kNN can filter
+        # cross-model rows out of semantic recall.
+        profile_id: Optional[str] = None
+        if compute_embeddings and new_chunk_ids:
+            embedding_service = self._get_embedding_service()
+            if embedding_service is not None and hasattr(
+                embedding_service, "current_profile_id"
+            ):
+                try:
+                    profile_id = embedding_service.current_profile_id()
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed for RAG chunk batch: %s",
+                        exc,
+                    )
+            if profile_id is not None and embedding_service is not None:
+                from .sqla.embedding_profile import upsert_embedding_profile
+                try:
+                    await upsert_embedding_profile(
+                        self.db, embedding_service, profile_id,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "RAG profile registry upsert failed (non-fatal): %s",
+                        exc,
+                    )
+
+        # Dual-write embedding_vec + embedding_profile_id for every
+        # chunk we just inserted. Outside the INSERT loop because the
+        # column might not exist yet on a DB whose Phase-2 migration
+        # hasn't run — the helper catches that and logs info.
         for chunk_id, embedding in new_chunk_ids:
-            await self._write_embedding_vec(chunk_id, embedding)
+            await self._write_embedding_vec(chunk_id, embedding, profile_id)
 
         await self.db.commit()
         self._bm25_built = False  # Invalidate BM25 index
@@ -175,24 +203,61 @@ class AsyncRAGStore:
         return len(chunks)
 
     async def _write_embedding_vec(
-        self, chunk_id: int, embedding: List[float]
+        self,
+        chunk_id: int,
+        embedding: List[float],
+        profile_id: Optional[str] = None,
     ) -> None:
-        """Dual-write the embedding to the parallel ``embedding_vec`` column.
+        """Dual-write the embedding (+ #1477 profile id) to the parallel
+        ``embedding_vec`` column.
 
         - On Postgres, formats the list as pgvector's text shape
           (``[v1,v2,…]``) and binds with a ``::vector`` cast.
         - On SQLite, packs to float32 little-endian bytes — same shape
           stored in the legacy ``embedding`` BLOB column.
 
-        Errors are non-fatal: the most likely cause is that the
-        Phase-2 migration hasn't created the column yet on this DB,
-        in which case the legacy ``embedding`` column is already
-        written and search degrades to the in-Python fallback.
+        ``profile_id`` may be NULL on pre-#1477 deployments; kNN
+        filters by the active profile so NULL rows correctly stay
+        out of mixed-coordinate-space recall.
+
+        Errors are non-fatal: the most likely cause is that a
+        migration hasn't created the column yet on this DB, in which
+        case the legacy ``embedding`` column is already written and
+        search degrades to the in-Python fallback.
         """
         backend_type = getattr(self.db, "backend_type", None)
         try:
             if backend_type == "postgres":
                 vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
+                await self.db.execute(
+                    "UPDATE document_chunks SET embedding_vec = ?::vector, "
+                    "embedding_profile_id = ? WHERE chunk_id = ?",
+                    (vec_text, profile_id, chunk_id),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE document_chunks SET embedding_vec = ?, "
+                    "embedding_profile_id = ? WHERE chunk_id = ?",
+                    (_serialize_embedding(embedding), profile_id, chunk_id),
+                )
+            return
+        except Exception as e:
+            # Partial-migration shape (only one of the two new columns
+            # present). Try each column independently so the row gets
+            # the maximum amount of metadata its DB supports. (Codex
+            # P2 round 4 on #1477.)
+            logger.info(
+                "Could not write document_chunks.embedding_vec + "
+                "embedding_profile_id for chunk %s in one UPDATE (%s); "
+                "trying each column independently.", chunk_id, e,
+            )
+
+        # Best-effort vec-only write.
+        try:
+            if backend_type == "postgres":
+                vec_text = "[" + ",".join(
+                    repr(float(v)) for v in embedding
+                ) + "]"
                 await self.db.execute(
                     "UPDATE document_chunks SET embedding_vec = ?::vector "
                     "WHERE chunk_id = ?",
@@ -204,13 +269,28 @@ class AsyncRAGStore:
                     "WHERE chunk_id = ?",
                     (_serialize_embedding(embedding), chunk_id),
                 )
-        except Exception as e:
-            logger.info(
-                "Could not write document_chunks.embedding_vec for chunk %s: "
-                "%s. Vector search will use the in-Python fallback until the "
-                "next boot's migration runs.",
-                chunk_id, e,
+        except Exception as e2:
+            logger.debug(
+                "document_chunks.embedding_vec write failed for chunk "
+                "%s: %s (column likely missing — Phase-2 migration "
+                "pending).", chunk_id, e2,
             )
+        # Best-effort profile-id-only write so the legacy in-Python
+        # fallback (which filters by profile id) still sees this
+        # chunk when only the Phase-2 column is missing.
+        if profile_id is not None:
+            try:
+                await self.db.execute(
+                    "UPDATE document_chunks SET embedding_profile_id = ? "
+                    "WHERE chunk_id = ?",
+                    (profile_id, chunk_id),
+                )
+            except Exception as e3:
+                logger.debug(
+                    "document_chunks.embedding_profile_id write failed "
+                    "for chunk %s: %s (column likely missing — #1477 "
+                    "migration pending).", chunk_id, e3,
+                )
     
     async def search_chunks(
         self,
@@ -350,8 +430,30 @@ class AsyncRAGStore:
             packed = _serialize_embedding(query_embedding)
             spec = build_document_chunk_spec(dimension=len(query_embedding))
 
+            # #1477 — filter kNN by the active embedding profile id
+            # so chunks from a different model living in a different
+            # coordinate space stay out of cosine. ``None`` means
+            # "no filter" — preserves legacy behaviour pre-migration.
+            filter_kwargs: Optional[Dict[str, Any]] = None
+            current_profile_id: Optional[str] = None
+            embedding_service_for_profile = self._get_embedding_service()
+            if embedding_service_for_profile is not None and hasattr(
+                embedding_service_for_profile, "current_profile_id"
+            ):
+                try:
+                    current_profile_id = (
+                        embedding_service_for_profile.current_profile_id()
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed at RAG read time: %s",
+                        exc,
+                    )
+            if current_profile_id is not None:
+                filter_kwargs = {"embedding_profile_id": current_profile_id}
+
             backend = get_vector_backend(session_factory, spec)
-            top_k = await backend.knn(packed, k=limit, filter=None)
+            top_k = await backend.knn(packed, k=limit, filter=filter_kwargs)
         except Exception as e:
             logger.warning(
                 "Vector-backend RAG search failed (%s); falling back to "
@@ -402,18 +504,61 @@ class AsyncRAGStore:
         Reads the legacy ``embedding`` BYTEA / BLOB column and runs
         cosine in Python. Matches the pre-#1447 RAG search behavior
         exactly, including the #1404 ``min_score`` floor.
+
+        #1477: also applies the profile-id filter so cross-model chunks
+        can't sneak into cosine on the legacy path. Tries with the
+        filter first; if the column doesn't exist (pre-migration DB),
+        retries unfiltered. Catches the codex P2 about the legacy
+        fallback bypassing the new filter.
         """
         try:
             from kestrel_sovereign.llm.embedding_service import cosine_similarity
 
-            rows = await self.db.fetchall(
-                "SELECT chunk_id, file_hash, content, embedding FROM document_chunks "
-                "WHERE embedding IS NOT NULL"
-            )
+            # Derive current profile id once for the read.
+            current_profile_id: Optional[str] = None
+            embedding_service_for_profile = self._get_embedding_service()
+            if embedding_service_for_profile is not None and hasattr(
+                embedding_service_for_profile, "current_profile_id"
+            ):
+                try:
+                    current_profile_id = (
+                        embedding_service_for_profile.current_profile_id()
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed in legacy RAG "
+                        "search: %s", exc,
+                    )
+
+            if current_profile_id is not None:
+                try:
+                    rows = await self.db.fetchall(
+                        "SELECT chunk_id, file_hash, content, embedding "
+                        "FROM document_chunks "
+                        "WHERE embedding IS NOT NULL "
+                        "AND embedding_profile_id = ?",
+                        (current_profile_id,),
+                    )
+                except Exception as exc:
+                    # Profile column doesn't exist yet (#1477 migration
+                    # hasn't run on this DB). Retry without the filter.
+                    logger.debug(
+                        "Legacy RAG search failed with profile filter "
+                        "(%s); retrying unfiltered.", exc,
+                    )
+                    rows = await self.db.fetchall(
+                        "SELECT chunk_id, file_hash, content, embedding "
+                        "FROM document_chunks WHERE embedding IS NOT NULL"
+                    )
+            else:
+                rows = await self.db.fetchall(
+                    "SELECT chunk_id, file_hash, content, embedding "
+                    "FROM document_chunks WHERE embedding IS NOT NULL"
+                )
             if not rows:
                 return []
 
-            scored = []
+            scored: List[Dict[str, Any]] = []
             for row in rows:
                 chunk_id, file_hash, content, embedding_blob = row
                 if embedding_blob:
