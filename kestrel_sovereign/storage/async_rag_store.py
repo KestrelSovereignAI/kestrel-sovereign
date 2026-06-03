@@ -581,7 +581,17 @@ class AsyncRAGStore:
             return []
 
     async def _search_by_bm25(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search using BM25 keyword matching."""
+        """Search using BM25 keyword matching.
+
+        #1477 hardening (codex P2 on #1491): post-filters results by
+        the active ``embedding_profile_id`` so a foreign-profile
+        chunk can't sneak into the hybrid merge via BM25. The
+        cosine isolation principle doesn't strictly require this
+        (BM25 doesn't compare vectors) but the operator expectation
+        after a profile switch is "old chunks are dormant in every
+        search path." Over-fetches to ``limit * 3`` so we still
+        return ``limit`` candidates after the filter trims.
+        """
         if not BM25_AVAILABLE:
             return []
 
@@ -593,8 +603,98 @@ class AsyncRAGStore:
             if not self._bm25_index:
                 return []
 
-            # Search
-            results = await self._bm25_index.asearch(query, limit)
+            # #1477 — resolve the current profile id (best-effort).
+            current_profile_id: Optional[str] = None
+            embedding_service_for_profile = self._get_embedding_service()
+            if embedding_service_for_profile is not None and hasattr(
+                embedding_service_for_profile, "current_profile_id"
+            ):
+                try:
+                    current_profile_id = (
+                        embedding_service_for_profile.current_profile_id()
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(
+                        "current_profile_id() failed in BM25: %s", exc,
+                    )
+
+            # When the profile filter is active, request a very
+            # generous candidate window so foreign-profile rows
+            # dominating the top ranks can't starve the filter
+            # (codex P2 round 4). BM25 ``get_scores`` already
+            # computes the score for every document; passing a
+            # huge ``raw_limit`` just slices the already-sorted
+            # list deeper — negligible cost over a small ``limit``.
+            # ``len(self._bm25_index.documents)`` would give the
+            # exact upper bound but the attribute isn't on the
+            # async wrapper's public contract; 100_000 is enough
+            # for realistic RAG corpora and a no-op for smaller
+            # ones (BM25 returns at most ``len(documents)``).
+            raw_limit = 100_000 if current_profile_id is not None else limit
+            results = await self._bm25_index.asearch(query, raw_limit)
+
+            if current_profile_id is not None and results:
+                # Lookup profile ids for the candidate chunk_ids in
+                # bounded batches so SQLite's default ~999-variable
+                # parameter limit doesn't crash the IN-list and
+                # silently disable the filter (codex P2 round 5).
+                # NULL-tolerant: rows that never got an embedding
+                # stamp (compute_embeddings=False, aembed failed,
+                # pre-#1477) stay in the results; only foreign-
+                # profile rows drop (codex P2 round 3).
+                _BATCH = 500
+                ids = [int(r.doc_id) for r in results]
+
+                # First detect pre-migration shape: if the column
+                # doesn't exist, fall back to the unfiltered legacy
+                # behaviour rather than dropping every BM25 result.
+                column_present = True
+                try:
+                    await self.db.fetchall(
+                        "SELECT embedding_profile_id FROM document_chunks "
+                        "LIMIT 1", (),
+                    )
+                except Exception as exc:
+                    column_present = False
+                    logger.debug(
+                        "BM25 profile filter unavailable (column missing): "
+                        "%s; returning unfiltered results.", exc,
+                    )
+
+                if not column_present:
+                    results = results[:limit]
+                else:
+                    profile_by_id: Dict[int, Optional[str]] = {}
+                    for start in range(0, len(ids), _BATCH):
+                        chunk = ids[start:start + _BATCH]
+                        placeholders = ",".join("?" for _ in chunk)
+                        try:
+                            profile_rows = await self.db.fetchall(
+                                f"SELECT chunk_id, embedding_profile_id "
+                                f"FROM document_chunks "
+                                f"WHERE chunk_id IN ({placeholders})",
+                                tuple(chunk),
+                            )
+                            for row in profile_rows:
+                                profile_by_id[row[0]] = row[1]
+                        except Exception as exc:
+                            # Mid-batch error (transient, partial
+                            # result). Fail closed: candidates from
+                            # this batch are dropped (their profile
+                            # is unknown), which is safer than
+                            # leaking unknown-profile rows.
+                            logger.warning(
+                                "BM25 profile lookup batch %d-%d failed "
+                                "(%s); dropping those candidates to "
+                                "avoid leaking foreign-profile rows.",
+                                start, start + len(chunk), exc,
+                            )
+
+                    results = [
+                        r for r in results
+                        if profile_by_id.get(int(r.doc_id))
+                        in (current_profile_id, None)
+                    ][:limit]
 
             return [
                 {
@@ -636,19 +736,66 @@ class AsyncRAGStore:
         logger.debug(f"Built BM25 index with {len(rows)} documents")
 
     async def _search_by_like(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        """Fallback LIKE-based search."""
+        """Fallback LIKE-based search.
+
+        #1477 hardening (codex P2 on #1491): applies the active
+        ``embedding_profile_id`` filter so a foreign-profile chunk
+        can't surface here either. Falls back to the legacy
+        unfiltered query if the column doesn't exist (pre-migration
+        DB).
+        """
         words = query.lower().split()
         if not words:
             return []
 
         conditions = " OR ".join(["LOWER(content) LIKE ?" for _ in words])
-        params = tuple(f"%{word}%" for word in words)
+        like_params = tuple(f"%{word}%" for word in words)
 
-        rows = await self.db.fetchall(
-            f"SELECT chunk_id, file_hash, content FROM document_chunks "
-            f"WHERE {conditions} LIMIT ?",
-            params + (limit,)
-        )
+        # Resolve current profile id (best-effort).
+        current_profile_id: Optional[str] = None
+        embedding_service_for_profile = self._get_embedding_service()
+        if embedding_service_for_profile is not None and hasattr(
+            embedding_service_for_profile, "current_profile_id"
+        ):
+            try:
+                current_profile_id = (
+                    embedding_service_for_profile.current_profile_id()
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(
+                    "current_profile_id() failed in LIKE search: %s", exc,
+                )
+
+        profile_clause = ""
+        profile_params: Tuple[Any, ...] = ()
+        if current_profile_id is not None:
+            # NULL-tolerant: same reasoning as the BM25 branch —
+            # non-embedded chunks (compute_embeddings=False, aembed
+            # failure, pre-#1477) stay searchable; only foreign-
+            # profile chunks are excluded.
+            profile_clause = (
+                " AND (embedding_profile_id = ? "
+                "OR embedding_profile_id IS NULL)"
+            )
+            profile_params = (current_profile_id,)
+
+        try:
+            rows = await self.db.fetchall(
+                f"SELECT chunk_id, file_hash, content FROM document_chunks "
+                f"WHERE ({conditions}){profile_clause} LIMIT ?",
+                like_params + profile_params + (limit,),
+            )
+        except Exception as exc:
+            # Pre-migration DB → retry unfiltered.
+            logger.debug(
+                "RAG LIKE search with profile filter failed (%s); "
+                "retrying unfiltered.", exc,
+            )
+            rows = await self.db.fetchall(
+                f"SELECT chunk_id, file_hash, content FROM document_chunks "
+                f"WHERE {conditions} LIMIT ?",
+                like_params + (limit,),
+            )
 
         return [
             {
