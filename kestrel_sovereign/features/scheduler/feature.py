@@ -158,6 +158,14 @@ class SchedulerFeature(Feature):
                 ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
             ])
 
+        # Talon-job monitor (#1510) — installs only if the Talon
+        # coordinator feature is loaded. Cheap (no LLM, just file/PID
+        # checks) so 1/min cadence is OK. Emits one
+        # talon.job_complete COGNITION signal per state transition;
+        # the dispatcher coalesces if two adjacent polls double-fire.
+        if "TalonCoordinatorFeature" in agent.features:
+            defaults.append(("talon_monitor", "* * * * *", "{}"))
+
         for task_name, cron, args in defaults:
             if task_name in existing_names:
                 logger.debug("Schedule '%s' already exists, skipping", task_name)

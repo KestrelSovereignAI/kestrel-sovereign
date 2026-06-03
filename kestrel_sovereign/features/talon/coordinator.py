@@ -275,6 +275,34 @@ class TalonCoordinatorFeature(Feature):
 
     async def initialize(self):
         logger.info("TalonCoordinatorFeature initialized")
+        # Self-register the talon.job_complete signal source on the
+        # agent's signal registry. Owning the registration here (vs.
+        # in agent boot) keeps it scoped to this feature so when
+        # Talon eventually extracts to an external feature package
+        # the registration travels with it. No-op if signal_registry
+        # is absent (test stubs, headless agents) — and idempotent
+        # on a second initialize() since a duplicate registration
+        # would otherwise raise and shadow real-failure warnings.
+        registry = getattr(self.agent, "signal_registry", None)
+        if registry is not None and hasattr(registry, "register"):
+            from kestrel_sovereign.signals.sources.talon import (
+                SOURCE_NAME as _TALON_SOURCE_NAME,
+                build_talon_job_complete_registration,
+            )
+            already = (
+                hasattr(registry, "get")
+                and registry.get(_TALON_SOURCE_NAME) is not None
+            )
+            if not already:
+                try:
+                    registry.register(
+                        build_talon_job_complete_registration()
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "TalonCoordinatorFeature could not register "
+                        "talon.job_complete signal source: %s", e,
+                    )
 
     # ------------------------------------------------------------------
     # Tools
@@ -1594,6 +1622,159 @@ class TalonCoordinatorFeature(Feature):
         )
 
     @tool(
+        name="talon_monitor",
+        description=(
+            "Poll active Talon CLI-background jobs and emit one "
+            "talon.job_complete signal per state transition. Wired "
+            "into the scheduler so completion wakes the agent "
+            "without explicit polling. ACTION; no LLM turn."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon monitor",
+    )
+    async def talon_monitor(self) -> ToolResult:
+        """Scan the durable registry, detect terminal-state transitions,
+        and enqueue COGNITION signals via the agent's SignalDispatcher.
+
+        Designed to be called by the scheduler (``cron.talon_monitor``)
+        every minute as an ACTION task — no LLM cost. Each job emits
+        exactly one signal per state transition; ``last_signaled_status``
+        is persisted in ``jobs.json`` so wakeups survive Kestrel restart
+        without re-firing for jobs that already woke a prior cognition.
+        """
+        # Lazy import to avoid a circular dependency between the
+        # coordinator and the signal-source module that builds the
+        # signal envelope referencing the same registry.
+        from kestrel_sovereign.signals.sources.talon import (
+            build_signal_for_completed_job,
+        )
+
+        self._reload_persisted_jobs()
+
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        terminal_states = ("complete", "failed", "finished_unknown")
+        transitions: List[Dict[str, Any]] = []
+        signals_emitted = 0
+        signals_skipped_no_dispatcher = 0
+        jobs_changed = False
+
+        for jid, info in list(self._jobs.items()):
+            if info.get("method") != "cli_background":
+                continue
+
+            # Step 1 — refresh the in-memory status from the most
+            # authoritative source available.
+            proc = info.get("process")
+            current_status: Optional[str] = info.get("status")
+            if proc is not None:
+                rc = proc.returncode
+                if rc is None:
+                    current_status = "running"
+                else:
+                    current_status = "complete" if rc == 0 else "failed"
+                    info["returncode"] = rc
+                    info.setdefault(
+                        "completed_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+            elif current_status in ("dispatched", "running"):
+                rc_sidecar = self._read_exit_sidecar(info.get("exit_path"))
+                if rc_sidecar is not None:
+                    current_status = (
+                        "complete" if rc_sidecar == 0 else "failed"
+                    )
+                    info["returncode"] = rc_sidecar
+                    info.setdefault(
+                        "completed_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                elif not self._pid_alive(info.get("pid")):
+                    current_status = "finished_unknown"
+                    info.setdefault("returncode", None)
+                    info.setdefault(
+                        "completed_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                else:
+                    current_status = "running"
+
+            if info.get("status") != current_status:
+                info["status"] = current_status
+                jobs_changed = True
+
+            # Step 2 — emit a signal once per transition into a
+            # terminal state.
+            if current_status not in terminal_states:
+                continue
+            last_signaled = info.get("last_signaled_status")
+            if last_signaled == current_status:
+                continue
+
+            log_tail = self._tail_job_log(info.get("log_path"), lines=20)
+            target_agent = (
+                getattr(self.agent, "did", None)
+                or getattr(self.agent, "agent_id", None)
+                or ""
+            )
+            signal = build_signal_for_completed_job(
+                jid, info,
+                target_agent=str(target_agent),
+                log_tail=log_tail,
+            )
+
+            if dispatcher is None or not hasattr(
+                dispatcher, "enqueue_signal"
+            ):
+                signals_skipped_no_dispatcher += 1
+                # Don't update last_signaled_status — without a
+                # dispatcher we have NOT actually woken anyone, so
+                # next poll should retry.
+                continue
+
+            try:
+                enq = dispatcher.enqueue_signal(signal)
+                if asyncio.iscoroutine(enq):
+                    await enq
+            except Exception as e:
+                logger.warning(
+                    "talon_monitor failed to enqueue signal for %s: %s",
+                    jid, e,
+                )
+                continue
+
+            info["last_signaled_status"] = current_status
+            signals_emitted += 1
+            jobs_changed = True
+            transitions.append({
+                "job_id": jid,
+                "status": current_status,
+                "returncode": info.get("returncode"),
+            })
+
+        if jobs_changed:
+            self._persist_jobs()
+
+        return ToolResult.ok(
+            confirmation=(
+                f"Talon monitor: scanned {len(self._jobs)} job(s), "
+                f"emitted {signals_emitted} signal(s)"
+                + (
+                    f", skipped {signals_skipped_no_dispatcher} "
+                    f"(no dispatcher)"
+                    if signals_skipped_no_dispatcher else ""
+                )
+            ),
+            data={
+                "scanned": len(self._jobs),
+                "signals_emitted": signals_emitted,
+                "signals_skipped_no_dispatcher": (
+                    signals_skipped_no_dispatcher
+                ),
+                "transitions": transitions,
+            },
+        )
+
+    @tool(
         name="talon_pause",
         description="Pause the autonomous Talon loop (kill switch).",
         category=ToolCategory.SYSTEM,
@@ -1973,6 +2154,27 @@ class TalonCoordinatorFeature(Feature):
         was awaiting them.
         """
         return self._job_log_dir() / f"{job_id}.exit"
+
+    @staticmethod
+    def _tail_job_log(path: Any, lines: int = 20) -> str:
+        """Best-effort tail of a job's combined log file.
+
+        Used by ``talon_monitor`` to attach a short context snippet to
+        the COGNITION signal it emits, so the agent does not have to
+        call ``talon_job_log`` as a follow-up tool just to see what
+        happened. Returns ``""`` on any read error — the signal is
+        still useful without it.
+        """
+        if not path:
+            return ""
+        try:
+            with open(str(path), "r", encoding="utf-8") as f:
+                buf = f.readlines()
+        except (OSError, UnicodeDecodeError):
+            return ""
+        if not buf:
+            return ""
+        return "".join(buf[-lines:])
 
     @staticmethod
     def _read_exit_sidecar(path: Any) -> Optional[int]:

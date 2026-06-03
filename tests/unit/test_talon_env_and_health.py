@@ -719,3 +719,220 @@ async def test_workspace_status_reports_unsafe(monkeypatch):
     assert result.status is ToolResultStatus.PARTIAL
     assert result.data["safe"] is False
     assert "running agent's source tree" in result.data["unsafe_reason"]
+
+
+# ----- talon_monitor (#1510) -----------------------------------------
+
+
+class _CapturingDispatcher:
+    """Minimal SignalDispatcher stand-in — collects enqueued signals."""
+
+    def __init__(self):
+        self.signals = []
+
+    def enqueue_signal(self, signal):
+        self.signals.append(signal)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_monitor_emits_one_signal_per_transition(tmp_path, monkeypatch):
+    """When a CLI background job transitions from running to a
+    terminal state, talon_monitor must enqueue exactly one signal —
+    and a subsequent poll with no further state change must not
+    enqueue a second one.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-mon"
+    fake_bin.write_text("#!/bin/sh\necho 'mon-out'\nexit 0\n")
+    fake_bin.chmod(0o755)
+
+    dispatcher = _CapturingDispatcher()
+    agent = SimpleNamespace(
+        _scheduler=None,
+        storage_path=str(tmp_path / "agent.db"),
+        dispatcher=dispatcher,
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["x"], label="x", extra_meta={"repo": "x/y", "issue": 11},
+        )
+
+    job_id = result["job_id"]
+    await feat._jobs[job_id]["process"].wait()
+    # Detach the live process handle so the monitor's terminal-state
+    # path (sidecar / pid liveness) is exercised — same code path
+    # that would run after a Kestrel restart.
+    feat._jobs[job_id]["process"] = None
+
+    poll1 = await feat.talon_monitor()
+    assert poll1.data["signals_emitted"] == 1
+    assert len(dispatcher.signals) == 1
+    sig = dispatcher.signals[0]
+    assert sig.payload["job_id"] == job_id
+    assert sig.payload["status"] == "complete"
+
+    # A second poll with no further state change must NOT re-emit.
+    poll2 = await feat.talon_monitor()
+    assert poll2.data["signals_emitted"] == 0
+    assert len(dispatcher.signals) == 1
+
+
+@pytest.mark.asyncio
+async def test_monitor_no_signal_for_in_flight_jobs(tmp_path, monkeypatch):
+    """A running job (process handle, no return code yet) must not
+    trigger a signal. Only terminal transitions wake cognition.
+    """
+    dispatcher = _CapturingDispatcher()
+    agent = SimpleNamespace(
+        _scheduler=None,
+        storage_path=str(tmp_path / "agent.db"),
+        dispatcher=dispatcher,
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    # Hand-build a running-job record.
+    feat._jobs["live"] = {
+        "method": "cli_background",
+        "status": "running",
+        "pid": os.getpid(),
+        "process": None,
+        "exit_path": str(tmp_path / "live.exit"),  # doesn't exist
+        "log_path": str(tmp_path / "live.log"),
+        "started_at": "2026-06-03T00:00:00+00:00",
+        "label": "live",
+    }
+    result = await feat.talon_monitor()
+    assert result.data["signals_emitted"] == 0
+    assert dispatcher.signals == []
+    # Status must still classify as running so the next poll keeps
+    # watching.
+    assert feat._jobs["live"]["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_monitor_signal_survives_simulated_restart(tmp_path, monkeypatch):
+    """When the durable registry records last_signaled_status, a
+    fresh feature constructed after a Kestrel restart must NOT
+    re-emit the signal for jobs that already woke a prior cognition.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-restart-mon"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n")
+    fake_bin.chmod(0o755)
+
+    d1 = _CapturingDispatcher()
+    agent = SimpleNamespace(
+        _scheduler=None,
+        storage_path=str(tmp_path / "agent.db"),
+        dispatcher=d1,
+    )
+    feat = TalonCoordinatorFeature(agent)
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["x"], label="x", extra_meta={"repo": "x/y", "issue": 12},
+        )
+    job_id = result["job_id"]
+    await feat._jobs[job_id]["process"].wait()
+    feat._jobs[job_id]["process"] = None
+
+    poll1 = await feat.talon_monitor()
+    assert poll1.data["signals_emitted"] == 1
+
+    # Simulated restart — a fresh feature reloads from disk. The
+    # persisted last_signaled_status must prevent re-emission.
+    d2 = _CapturingDispatcher()
+    fresh_agent = SimpleNamespace(
+        _scheduler=None,
+        storage_path=str(tmp_path / "agent.db"),
+        dispatcher=d2,
+    )
+    fresh = TalonCoordinatorFeature(fresh_agent)
+    poll2 = await fresh.talon_monitor()
+    assert poll2.data["signals_emitted"] == 0
+    assert d2.signals == []
+
+
+@pytest.mark.asyncio
+async def test_monitor_finished_unknown_emits_signal(tmp_path, monkeypatch):
+    """A finished_unknown transition (dead pid, no sidecar) must
+    still wake the agent. The status itself is the actionable
+    information — "we don't know how it ended".
+    """
+    dispatcher = _CapturingDispatcher()
+    agent = SimpleNamespace(
+        _scheduler=None,
+        storage_path=str(tmp_path / "agent.db"),
+        dispatcher=dispatcher,
+    )
+    feat = TalonCoordinatorFeature(agent)
+
+    # Spawn-and-reap a real child so the pid we record is genuinely
+    # dead at monitor time (pid reuse risk is tolerable here — the
+    # window between reap and monitor is microseconds in this test).
+    import subprocess as _subp
+    dead = _subp.Popen(["/bin/sh", "-c", "exit 0"])
+    dead.wait()
+
+    feat._jobs["orphan"] = {
+        "method": "cli_background",
+        "status": "running",
+        "pid": dead.pid,
+        "process": None,
+        "exit_path": str(tmp_path / "missing.exit"),
+        "log_path": str(tmp_path / "missing.log"),
+        "started_at": "2026-06-03T00:00:00+00:00",
+        "label": "orphan",
+    }
+
+    result = await feat.talon_monitor()
+    assert result.data["signals_emitted"] == 1
+    sig = dispatcher.signals[0]
+    assert sig.payload["status"] == "finished_unknown"
+
+
+@pytest.mark.asyncio
+async def test_monitor_no_dispatcher_does_not_mark_signaled(tmp_path, monkeypatch):
+    """If the agent has no dispatcher, the monitor must NOT mark
+    a transition as already-signaled — otherwise a delayed
+    dispatcher registration would silently lose the wake. Next poll
+    with a real dispatcher should still fire.
+    """
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+    fake_bin = tmp_path / "kestrel-talon-no-disp"
+    fake_bin.write_text("#!/bin/sh\nexit 0\n")
+    fake_bin.chmod(0o755)
+
+    # First feature has NO dispatcher at all.
+    agent = SimpleNamespace(
+        _scheduler=None, storage_path=str(tmp_path / "agent.db"),
+    )
+    feat = TalonCoordinatorFeature(agent)
+    with patch.object(
+        TalonCoordinatorFeature, "_find_talon_bin", return_value=str(fake_bin),
+    ):
+        result = await feat._dispatch_via_cli_background(
+            ["x"], label="x", extra_meta={"repo": "x/y", "issue": 14},
+        )
+    job_id = result["job_id"]
+    await feat._jobs[job_id]["process"].wait()
+    feat._jobs[job_id]["process"] = None
+
+    poll1 = await feat.talon_monitor()
+    assert poll1.data["signals_emitted"] == 0
+    assert poll1.data["signals_skipped_no_dispatcher"] == 1
+    # last_signaled_status must NOT have been set.
+    assert "last_signaled_status" not in feat._jobs[job_id]
+
+    # Second pass with a real dispatcher must still fire.
+    dispatcher = _CapturingDispatcher()
+    feat.agent.dispatcher = dispatcher
+    poll2 = await feat.talon_monitor()
+    assert poll2.data["signals_emitted"] == 1
+    assert len(dispatcher.signals) == 1
