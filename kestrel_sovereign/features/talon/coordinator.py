@@ -14,6 +14,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -263,6 +264,10 @@ class TalonCoordinatorFeature(Feature):
         # message_id -> {pid, started_at, log_path, command, repo,
         # issue, status, returncode, completed_at, process}
         self._jobs: Dict[str, Dict[str, Any]] = {}
+        # Eager reload so a fresh feature instance immediately sees
+        # jobs from a previous process — dispatch-then-persist would
+        # otherwise truncate the registry to the new job alone.
+        self._reload_persisted_jobs()
 
     @property
     def tool_description(self) -> str:
@@ -1396,7 +1401,12 @@ class TalonCoordinatorFeature(Feature):
         the last call (updates ``status`` to ``complete`` or
         ``failed`` based on returncode), then summarises.
         """
+        # Pull in any CLI jobs persisted before a restart so they are
+        # visible again even without an in-memory process handle.
+        self._reload_persisted_jobs()
+
         # Reap finished background CLI jobs
+        jobs_changed = False
         for jid, info in list(self._jobs.items()):
             if info.get("method") != "cli_background":
                 continue
@@ -1404,6 +1414,33 @@ class TalonCoordinatorFeature(Feature):
                 continue
             proc = info.get("process")
             if proc is None:
+                # Reloaded after restart: no live handle. The sidecar
+                # exit file is the authoritative source of truth — if
+                # it exists, the wrapper recorded the exit code. If
+                # not, fall back to pid liveness (best-effort; PID
+                # reuse can produce a false 'running').
+                rc = self._read_exit_sidecar(info.get("exit_path"))
+                if rc is not None:
+                    info["status"] = "complete" if rc == 0 else "failed"
+                    info["returncode"] = rc
+                    info.setdefault(
+                        "completed_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    jobs_changed = True
+                elif self._pid_alive(info.get("pid")):
+                    info["status"] = "running"
+                else:
+                    # Process gone, no sidecar: status genuinely unknown.
+                    # Do NOT claim 'complete' — that would lie about
+                    # failures that exited before the wrapper wrote.
+                    info["status"] = "finished_unknown"
+                    info.setdefault("returncode", None)
+                    info.setdefault(
+                        "completed_at",
+                        datetime.now(timezone.utc).isoformat(),
+                    )
+                    jobs_changed = True
                 continue
             rc = proc.returncode
             if rc is None:
@@ -1412,6 +1449,10 @@ class TalonCoordinatorFeature(Feature):
             info["status"] = "complete" if rc == 0 else "failed"
             info["returncode"] = rc
             info["completed_at"] = datetime.now(timezone.utc).isoformat()
+            jobs_changed = True
+
+        if jobs_changed:
+            self._persist_jobs()
 
         # Reconcile A2A-dispatched jobs against Talon's task_store.
         # Mesh used to do this via inbox polling for complete/reject
@@ -1484,7 +1525,9 @@ class TalonCoordinatorFeature(Feature):
         done = [
             {**_public(info), "id": jid}
             for jid, info in self._jobs.items()
-            if info.get("status") in ("complete", "failed", "reject")
+            if info.get("status") in (
+                "complete", "failed", "reject", "finished_unknown",
+            )
         ]
 
         data = {
@@ -1512,6 +1555,8 @@ class TalonCoordinatorFeature(Feature):
         self, job_id: str, lines: int = 200,
     ) -> ToolResult:
         """Return the last ``lines`` lines of a job's combined log."""
+        # Reload persisted CLI jobs so logs are tail-able after restart.
+        self._reload_persisted_jobs()
         info = self._jobs.get(job_id)
         if not info:
             return ToolResult.failed(
@@ -1912,6 +1957,129 @@ class TalonCoordinatorFeature(Feature):
         base.mkdir(parents=True, exist_ok=True)
         return base
 
+    def _jobs_registry_path(self) -> Path:
+        """Durable registry of CLI-background job metadata.
+
+        Lives next to the per-agent log files so it survives Kestrel
+        restarts (``<storage_path>/talon_jobs/jobs.json``).
+        """
+        return self._job_log_dir() / "jobs.json"
+
+    def _job_exit_path(self, job_id: str) -> Path:
+        """Sidecar file the dispatch wrapper writes its exit code to.
+
+        Used after a Kestrel restart to recover the true exit status
+        of CLI background jobs that finished while no in-process handle
+        was awaiting them.
+        """
+        return self._job_log_dir() / f"{job_id}.exit"
+
+    @staticmethod
+    def _read_exit_sidecar(path: Any) -> Optional[int]:
+        """Read an exit-code sidecar; ``None`` if absent or malformed."""
+        if not path:
+            return None
+        try:
+            with open(str(path), "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except (OSError, UnicodeDecodeError):
+            return None
+        if not content:
+            return None
+        try:
+            return int(content)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _pid_alive(pid: Any) -> bool:
+        """Return True if ``pid`` names a live process (signal 0 probe)."""
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            return False
+        if pid_int <= 0:
+            return False
+        try:
+            os.kill(pid_int, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but is owned by another user — still alive.
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _persist_jobs(self) -> None:
+        """Write CLI-background job metadata to the durable registry.
+
+        Excludes non-serialisable fields (the asyncio ``process``
+        handle) so ``talon_status`` and ``talon_job_log`` keep working
+        after a feature/server restart.
+        """
+        registry: Dict[str, Any] = {}
+        for jid, info in self._jobs.items():
+            if info.get("method") != "cli_background":
+                continue
+            registry[jid] = {
+                k: v for k, v in info.items() if k != "process"
+            }
+        path = self._jobs_registry_path()
+        # Use a unique tmp file per writer so concurrent _persist_jobs
+        # calls from sibling feature instances cannot clobber each
+        # other's pre-replace temp content. os.replace() is atomic on
+        # POSIX so the final rename remains race-free.
+        tmp_path: Optional[str] = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=path.name + ".", suffix=".tmp", dir=str(path.parent),
+            )
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(registry, f)
+            os.replace(tmp_path, path)
+            tmp_path = None
+        except OSError as e:
+            logger.warning(f"Failed to persist talon job registry: {e}")
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    def _reload_persisted_jobs(self) -> None:
+        """Merge durably-persisted CLI jobs into the in-memory map.
+
+        In-process jobs (which still hold a live ``process`` handle)
+        win; only job_ids absent from memory are reloaded so a
+        restarted feature regains status/log visibility.
+        """
+        try:
+            path = self._jobs_registry_path()
+        except (TypeError, OSError) as e:
+            # Test stubs / discovery harness can construct the
+            # feature with a Mock agent whose ``storage_path`` is
+            # not a valid path. Skip reload silently in that case;
+            # real agents always have a real storage_path.
+            logger.debug("Talon job registry path unavailable: %s", e)
+            return
+        if not path.is_file():
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                registry = json.load(f)
+        except (OSError, ValueError) as e:
+            logger.warning(f"Failed to read talon job registry: {e}")
+            return
+        if not isinstance(registry, dict):
+            return
+        for jid, info in registry.items():
+            if jid in self._jobs or not isinstance(info, dict):
+                continue
+            # Reloaded jobs have no live process handle.
+            info.pop("process", None)
+            self._jobs[jid] = info
+
     async def _dispatch_via_cli_background(
         self,
         args: List[str],
@@ -1946,6 +2114,7 @@ class TalonCoordinatorFeature(Feature):
 
         job_id = uuid.uuid4().hex
         log_path = self._job_log_dir() / f"{job_id}.log"
+        exit_path = self._job_exit_path(job_id)
         cmd = [talon_bin] + args
 
         try:
@@ -1953,9 +2122,20 @@ class TalonCoordinatorFeature(Feature):
         except OSError as e:
             return {"dispatched": False, "error": f"Cannot open log file: {e}"}
 
+        # Wrap with sh -c so the exit code is written to a sidecar file
+        # atomically when the subprocess terminates. The sidecar is the
+        # authoritative source of truth for status after a Kestrel
+        # restart, when no live process handle exists.
+        exit_quoted = shlex.quote(str(exit_path))
+        wrapper_script = (
+            f'"$@"; rc=$?; printf "%s" "$rc" > {exit_quoted}.tmp && '
+            f'mv {exit_quoted}.tmp {exit_quoted}; exit "$rc"'
+        )
+        wrapped = ["sh", "-c", wrapper_script, "_talon_wrapper"] + cmd
+
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *wrapped,
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
@@ -1977,11 +2157,13 @@ class TalonCoordinatorFeature(Feature):
             "pid": proc.pid,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "log_path": str(log_path),
+            "exit_path": str(exit_path),
             "process": proc,
         }
         if extra_meta:
             info.update(extra_meta)
         self._jobs[job_id] = info
+        self._persist_jobs()
 
         logger.info(
             f"Dispatched talon job {job_id} (pid={proc.pid}, "
