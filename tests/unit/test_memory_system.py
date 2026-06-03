@@ -831,7 +831,14 @@ class TestMemoryConsolidatorEpisodeCreation:
 
     @pytest.fixture
     def _now(self):
-        return datetime.now(timezone.utc)
+        # Pin to mid-day UTC so message timestamps generated via
+        # ``_now - timedelta(days=1) + timedelta(minutes=N*5)`` never
+        # straddle midnight UTC. A live ``datetime.now`` made
+        # ``test_partial_day_consolidation_picks_up_only_new_messages``
+        # flaky depending on UTC time-of-day at CI launch — the 45-min
+        # span produced two ``date_key`` groups when launched within
+        # 45 min of midnight UTC, yielding two episodes instead of one.
+        return datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
     def _make_rows(self, count, *, date, metadata=None, agent_id="did:test:agent1"):
         """Create mock conversation_history rows (id, content, metadata, created_at, role)."""
