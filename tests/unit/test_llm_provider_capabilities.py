@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import Any, Dict, Optional
 from unittest.mock import AsyncMock, Mock
 
 from kestrel_sdk.llm import (
@@ -245,6 +246,326 @@ def test_llm_service_embedding_returns_none_when_no_local_route():
 
     assert service.resolve_embedding_provider() is None
     assert service.get_embedding_service() is None
+
+
+# --- #1494 embedding-sibling-route tests ------------------------------------
+
+def _route(
+    name: str,
+    vendor: str,
+    adapter,
+    *,
+    is_local: bool = False,
+    embedding_sibling: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build the dict shape produced by ``_convert_providers_format`` so
+    each sibling-route test can wire a small provider table without
+    hand-rolling every key. ``adapter`` chooses whether embeddings are
+    supported (OpenAI does, Anthropic doesn't)."""
+    return {
+        "name": name,
+        "vendor": vendor,
+        "route": name.split(":", 1)[1] if ":" in name else "api",
+        "adapter": adapter,
+        "client": object(),
+        "model": "auto",
+        "is_local": is_local,
+        "is_cloud": not is_local,
+        "capabilities": adapter.provider_capabilities().to_dict(),
+        "embedding_sibling": embedding_sibling,
+    }
+
+
+def test_sibling_used_when_primary_lacks_embeddings():
+    """#1494 — Anthropic chat + OpenAI sibling + cloud-allowed →
+    embedding routes to OpenAI (not the chat provider)."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="openai:api",
+    )
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service.providers = [anthropic, openai]
+    service.resolve_provider_routing = lambda **_: ([anthropic], None)
+
+    assert service.resolve_embedding_provider() is openai
+
+
+def test_sibling_skipped_when_primary_has_own_embeddings():
+    """OpenAI chat + sibling configured anyway → own embeddings win.
+    The sibling is only a fallback for providers that can't embed."""
+    service = LLMService.__new__(LLMService)
+    openai = _route(
+        "openai:api", "openai", OpenAIAdapter(),
+        embedding_sibling="ollama:local",
+    )
+    ollama = _route("ollama:local", "ollama", OpenAIAdapter(), is_local=True)
+    service.providers = [openai, ollama]
+    service.resolve_provider_routing = lambda **_: ([openai], None)
+
+    # Primary supports embeddings → it wins. Sibling unused.
+    assert service.resolve_embedding_provider() is openai
+
+
+def test_sibling_rejected_when_non_local_under_force_local_only():
+    """ISOLATED/EPHEMERAL must reject a cloud sibling. Privacy wins —
+    operator who configured ``embedding_sibling = "openai"`` for
+    Anthropic gets zero embeddings in local-only modes."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="openai:api",
+    )
+    openai = _route("openai:api", "openai", OpenAIAdapter(), is_local=False)
+    service.providers = [anthropic, openai]
+    # Under force_local_only, resolve_provider_routing would normally
+    # filter to local routes — but if no local route exists it raises
+    # ``RuntimeError("No local providers available.")`` which the
+    # embedding path catches and returns None. To exercise the sibling
+    # path specifically (primary route IS the Anthropic one because
+    # the routing layer returned it under non-local-only resolution),
+    # we simulate the chain: routing returns Anthropic, the sibling
+    # path then filters by force_local_only and rejects the cloud
+    # sibling.
+    service.resolve_provider_routing = lambda **kwargs: (
+        [anthropic],
+        None,
+    )
+    service.set_force_local_only_provider(lambda: True)
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_local_sibling_accepted_under_force_local_only():
+    """Operator who configured a local sibling (Ollama) keeps semantic
+    memory in ISOLATED/EPHEMERAL — the privacy invariant is preserved."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="ollama:local",
+    )
+    ollama = _route("ollama:local", "ollama", OpenAIAdapter(), is_local=True)
+    service.providers = [anthropic, ollama]
+    service.resolve_provider_routing = lambda **kwargs: ([anthropic], None)
+    service.set_force_local_only_provider(lambda: True)
+
+    assert service.resolve_embedding_provider() is ollama
+
+
+def test_sibling_returns_none_when_primary_has_no_sibling_configured():
+    """Anthropic chat + no sibling → embedding path returns None and
+    storage falls back to keyword search. Pre-#1494 behavior preserved
+    when no sibling is set."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling=None,
+    )
+    service.providers = [anthropic]
+    service.resolve_provider_routing = lambda **_: ([anthropic], None)
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_sibling_returns_none_when_sibling_not_initialized():
+    """Operator configured ``embedding_sibling = "openai:api"`` but
+    didn't set ``OPENAI_API_KEY`` — OpenAI never initialized, so the
+    sibling lookup misses and we fall back to keyword."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="openai:api",
+    )
+    # OpenAI NOT in providers — simulating "key missing, route skipped".
+    service.providers = [anthropic]
+    service.resolve_provider_routing = lambda **_: ([anthropic], None)
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_sibling_returns_none_when_sibling_cannot_embed():
+    """Sibling pointed at another non-embedding provider (e.g.
+    Anthropic→Anthropic). Should NOT recurse — sibling resolution is
+    one hop only."""
+    service = LLMService.__new__(LLMService)
+    anthropic_a = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="claude-max:plan",
+    )
+    anthropic_b = _route(
+        "claude-max:plan", "claude-max",
+        AnthropicAdapter(),  # adapter has no embedding capability
+        embedding_sibling=None,
+    )
+    service.providers = [anthropic_a, anthropic_b]
+    service.resolve_provider_routing = lambda **_: ([anthropic_a], None)
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_sibling_lookup_accepts_vendor_only_form():
+    """``embedding_sibling = "openai"`` (no route) resolves to the first
+    matching initialized route for that vendor."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="openai",
+    )
+    openai_api = _route("openai:api", "openai", OpenAIAdapter())
+    openai_compat = _route("openai:compat", "openai", OpenAIAdapter())
+    service.providers = [anthropic, openai_api, openai_compat]
+    service.resolve_provider_routing = lambda **_: ([anthropic], None)
+
+    assert service.resolve_embedding_provider() is openai_api
+
+
+def test_sibling_lookup_skips_disabled_routes():
+    """#1494 — codex P2 regression: a sibling route disabled after a
+    permanent auth failure (``_disabled_routes``) must NOT be returned
+    by the sibling lookup. Otherwise every storage write keeps
+    retrying known-bad credentials until the process restarts."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="openai:api",
+    )
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service.providers = [anthropic, openai]
+    service._disabled_routes = {"openai:api": "auth_failed"}
+    # Mimic the real ``_available_providers`` filter.
+    service._available_providers = lambda: [
+        p for p in service.providers if p["name"] not in service._disabled_routes
+    ]
+    service.resolve_provider_routing = lambda **_: ([anthropic], None)
+
+    # Sibling is disabled → fall through to keyword (None).
+    assert service.resolve_embedding_provider() is None
+
+
+def test_sibling_does_not_recurse_via_siblings_own_sibling():
+    """Sibling resolution is one hop only — even if the sibling itself
+    declares a sibling that supports embeddings, we don't chain. This
+    keeps "what provider embedded this row?" predictable for
+    embedding_profile_id stamping (#1477)."""
+    service = LLMService.__new__(LLMService)
+    anthropic = _route(
+        "anthropic:api", "anthropic", AnthropicAdapter(),
+        embedding_sibling="claude-max:plan",
+    )
+    # Sibling can't embed but declares its own sibling that can. We
+    # must NOT follow the chain — return None.
+    claude_max = _route(
+        "claude-max:plan", "claude-max", AnthropicAdapter(),
+        embedding_sibling="openai:api",
+    )
+    openai = _route("openai:api", "openai", OpenAIAdapter())
+    service.providers = [anthropic, claude_max, openai]
+    service.resolve_provider_routing = lambda **_: ([anthropic], None)
+
+    assert service.resolve_embedding_provider() is None
+
+
+def test_provider_registry_parses_route_level_sibling():
+    """Route-level ``embedding_sibling`` reaches the dict shape via the
+    private-attr bridge between ProviderInfo and the routing dict."""
+    from kestrel_sovereign.llm.provider_registry import ProviderRegistry
+
+    registry = ProviderRegistry({})
+    vendor_cfg = {"is_cloud": True}
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        "model": "claude-3-opus-20240229",
+        "embedding_sibling": "openai:api",
+    }
+    # Patch the secret resolver so initialization can proceed
+    # without a real API key.
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+    info = registry._build_route("anthropic", "api", vendor_cfg, route_cfg)
+    assert info is not None
+    assert getattr(info, "_kestrel_embedding_sibling", None) == "openai:api"
+
+    # _convert_providers_format propagates the attr to the dict.
+    service = LLMService.__new__(LLMService)
+    [route_dict] = service._convert_providers_format([info])
+    assert route_dict["embedding_sibling"] == "openai:api"
+
+
+def test_provider_registry_route_level_sibling_overrides_vendor_level():
+    """Route-level config wins over vendor-level. Operator can DRY the
+    vendor-level setting yet override on a specific route."""
+    from kestrel_sovereign.llm.provider_registry import ProviderRegistry
+
+    registry = ProviderRegistry({})
+    vendor_cfg = {
+        "is_cloud": True,
+        "embedding_sibling": "openai:api",
+    }
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        "embedding_sibling": "ollama:local",
+    }
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+    info = registry._build_route("anthropic", "api", vendor_cfg, route_cfg)
+    assert info is not None
+    assert getattr(info, "_kestrel_embedding_sibling", None) == "ollama:local"
+
+
+def test_provider_registry_vendor_level_sibling_propagates_when_route_omits():
+    """If route omits the key, vendor-level supplies it."""
+    from kestrel_sovereign.llm.provider_registry import ProviderRegistry
+
+    registry = ProviderRegistry({})
+    vendor_cfg = {
+        "is_cloud": True,
+        "embedding_sibling": "openai:api",
+    }
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        # no embedding_sibling at route level
+    }
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+    info = registry._build_route("anthropic", "api", vendor_cfg, route_cfg)
+    assert info is not None
+    assert getattr(info, "_kestrel_embedding_sibling", None) == "openai:api"
+
+
+def test_provider_registry_rejects_non_string_sibling():
+    """Type errors on the config side fail loudly at registry init —
+    better to crash with a clear message than to silently ignore."""
+    from kestrel_sovereign.llm.provider_registry import ProviderRegistry
+    import pytest
+
+    registry = ProviderRegistry({})
+    vendor_cfg = {"is_cloud": True}
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        "embedding_sibling": ["openai:api"],  # type error: list not string
+    }
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+    with pytest.raises(ValueError, match="embedding_sibling must be a string"):
+        registry._build_route("anthropic", "api", vendor_cfg, route_cfg)
+
+
+def test_provider_registry_blank_sibling_normalizes_to_none():
+    """``embedding_sibling = ""`` or whitespace normalizes to None —
+    saves a class of confusing 'set but empty' bugs."""
+    from kestrel_sovereign.llm.provider_registry import ProviderRegistry
+
+    registry = ProviderRegistry({})
+    vendor_cfg = {"is_cloud": True}
+    route_cfg = {
+        "adapter": "AnthropicAdapter",
+        "api_key_env": "X_UNSET_KEY",
+        "embedding_sibling": "   ",
+    }
+    registry._resolve_secret = lambda rc, env_key, plain_key: "fake-key"
+    info = registry._build_route("anthropic", "api", vendor_cfg, route_cfg)
+    assert info is not None
+    assert getattr(info, "_kestrel_embedding_sibling", None) is None
 
 
 def test_llm_service_embedding_provider_honors_disabled_policy():

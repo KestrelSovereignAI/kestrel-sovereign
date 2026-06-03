@@ -822,20 +822,79 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             )
             return True
 
+    def _lookup_sibling_provider(
+        self, sibling_name: str
+    ) -> Optional[Dict[str, Any]]:
+        """Look up a sibling provider by ``"<vendor>"`` or ``"<vendor>:<route>"``.
+
+        Returns the dict from the *available* providers list (i.e.
+        routes that were initialized successfully AND haven't been
+        added to ``_disabled_routes`` after a permanent auth failure
+        during this session, #655), or ``None`` if no such provider
+        matches. ``"<vendor>"`` resolves to the first matching
+        available route — explicit ``"<vendor>:<route>"`` pins to
+        that exact route.
+
+        Using ``_available_providers()`` instead of raw
+        ``self.providers`` mirrors what the chat path does and means
+        a sibling route that's already known to have bad credentials
+        gets skipped here too — storage falls back to keyword search
+        on the embedding side rather than retrying known-bad creds
+        on every write.
+        """
+        # ``_available_providers`` is supplied by the chat-routing
+        # path; tests that build LLMService via ``__new__`` may
+        # legitimately leave it unimplemented. Fall back to
+        # ``self.providers`` in that case so test fixtures don't
+        # have to stub the helper.
+        if hasattr(self, "_available_providers") and callable(
+            getattr(self, "_available_providers")
+        ):
+            try:
+                candidates = self._available_providers()
+            except Exception:
+                candidates = getattr(self, "providers", None) or []
+        else:
+            candidates = getattr(self, "providers", None) or []
+        if not candidates:
+            return None
+        if ":" in sibling_name:
+            return next(
+                (p for p in candidates if p.get("name") == sibling_name),
+                None,
+            )
+        # Vendor-only lookup — first matching route wins.
+        return next(
+            (p for p in candidates if p.get("vendor") == sibling_name),
+            None,
+        )
+
     def resolve_embedding_provider(self) -> Optional[Dict[str, Any]]:
-        """Return the active chat route when it can also embed text.
+        """Return a provider that can embed text for the active chat session.
 
-        Embeddings intentionally follow the selected chat provider. If the
-        active route has no embedding API (Anthropic, for example), callers get
-        ``None`` and storage falls back to keyword/LIKE search rather than
-        silently using an unrelated global Ollama singleton.
+        Resolution order (#1494 — sibling-route per chat provider):
 
-        Honors the bound ``force_local_only`` provider (#1492). When
-        ISOLATED / EPHEMERAL is active and the chosen route is
-        non-local, this returns ``None`` so callers fall through to
-        keyword search rather than ship plaintext to a cloud
-        embedding API. When no local route supports embeddings the
-        result is also ``None`` — never an unconfigured route.
+        1. Active chat route supports embeddings → return it. (Today's
+           "embedding follows chat provider" behavior — preserved as
+           the default.)
+        2. Active route has ``embedding_sibling`` configured AND the
+           sibling exists in ``self.providers`` AND it supports
+           embeddings AND it passes the ``force_local_only`` filter →
+           return the sibling.
+        3. Otherwise → ``None``. Storage callers fall back to
+           keyword / LIKE search; never an unrelated global Ollama
+           singleton, never a cloud route under local-only mode.
+
+        Privacy gate (#1492): the bound ``force_local_only`` provider
+        is applied at every routing call here AND on the sibling
+        lookup. A cloud sibling for an ISOLATED/EPHEMERAL session is
+        rejected — privacy wins, even at the cost of losing
+        embedding for the operator who configured a non-local sibling.
+
+        Sibling resolution is one hop only. The chosen sibling is
+        used directly; ``embedding_sibling`` on the sibling itself is
+        intentionally ignored to prevent cycles and to keep "what
+        provider embedded this row?" predictable.
         """
         if getattr(self, "disabled", False):
             return None
@@ -873,6 +932,48 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         )
         if self._provider_supports_embeddings(provider):
             return provider
+
+        # #1494 — primary route can't embed. Consult sibling if
+        # configured.
+        sibling_name = provider.get("embedding_sibling")
+        if sibling_name:
+            sibling = self._lookup_sibling_provider(sibling_name)
+            if sibling is None:
+                logger.warning(
+                    "Active LLM route %s declared embedding_sibling=%r but no "
+                    "such initialized provider was found; semantic storage "
+                    "search will use keyword fallback.",
+                    provider.get("name"),
+                    sibling_name,
+                )
+                return None
+            if force_local_only and not sibling.get("is_local"):
+                logger.info(
+                    "Active LLM route %s declared embedding_sibling=%r but the "
+                    "sibling is non-local under force_local_only=True; "
+                    "semantic storage search will use keyword fallback "
+                    "(privacy mode overrides sibling).",
+                    provider.get("name"),
+                    sibling_name,
+                )
+                return None
+            if not self._provider_supports_embeddings(sibling):
+                logger.warning(
+                    "Active LLM route %s declared embedding_sibling=%r but the "
+                    "sibling does not advertise supports_embeddings; semantic "
+                    "storage search will use keyword fallback.",
+                    provider.get("name"),
+                    sibling_name,
+                )
+                return None
+            logger.info(
+                "Active LLM route %s has no embedding capability; using "
+                "configured sibling %s for embeddings.",
+                provider.get("name"),
+                sibling.get("name"),
+            )
+            return sibling
+
         logger.info(
             "Active LLM route %s does not support embeddings; semantic "
             "storage search will use keyword fallback.",
@@ -971,6 +1072,14 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 "base_url": getattr(provider, "base_url", None),
                 "selection_hints": hints,
                 "capabilities": capabilities,
+                # #1494 sibling string carried over the SDK boundary
+                # via a private attr in ``ProviderRegistry._build_route``.
+                # Default ``None`` for entry-point providers and any
+                # ``ProviderInfo`` constructed by third-party plugins
+                # that don't set the attr.
+                "embedding_sibling": getattr(
+                    provider, "_kestrel_embedding_sibling", None
+                ),
             })
         return out
 
