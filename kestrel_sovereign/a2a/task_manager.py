@@ -552,6 +552,7 @@ class TaskManager:
         self,
         params: TaskSendParams,
         agent_name: str,
+        artifacts: Optional[list[Artifact]] = None,
     ) -> Task:
         """
         Create a new task from send parameters.
@@ -559,6 +560,12 @@ class TaskManager:
         Args:
             params: Task creation parameters including message
             agent_name: Name of the agent handling this task
+            artifacts: Optional artifacts/references the SENDER attached
+                at task-creation time (send-side handoff payload). These
+                are persisted on the task at SUBMITTED so the recipient
+                can retrieve them before producing any response — the
+                send-side mirror of the responder-side
+                ``add_artifact`` flow.
 
         Returns:
             The created Task object
@@ -601,13 +608,16 @@ class TaskManager:
             if chain:
                 outbound_metadata["causation_chain"] = chain
 
-        # Create task
+        # Create task. Sender-supplied artifacts (if any) are attached
+        # at creation so the recipient can retrieve the handoff payload
+        # the moment the task surfaces, without a second round-trip.
         task = Task(
             id=params.id,
             sessionId=params.sessionId,
             status=TaskStatus(state=TaskState.SUBMITTED),
             history=[params.message],
             metadata=outbound_metadata,
+            artifacts=list(artifacts) if artifacts else None,
         )
 
         # Save to store

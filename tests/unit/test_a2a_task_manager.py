@@ -214,6 +214,62 @@ class TestTaskManager:
         assert len(task.history) == 1
 
     @pytest.mark.asyncio
+    async def test_create_task_persists_sender_artifacts(self, task_manager):
+        """Send-side: artifacts attached at create time are persisted on
+        the task at SUBMITTED so the recipient can retrieve them from the
+        store before producing any response. Covers recipient retrieval
+        and ordering/metadata preservation (#1525)."""
+        from kestrel_sovereign.a2a.types import DataPart
+
+        params = TaskSendParams(
+            message=Message(role="user", parts=[TextPart(text="Orchestrate this plan")]),
+        )
+        sender_artifacts = [
+            Artifact(
+                name="plan",
+                description="proactive operating model",
+                parts=[TextPart(text="step one")],
+                index=0,
+                metadata={"origin": "saved_item"},
+            ),
+            Artifact(
+                name="references",
+                parts=[DataPart(data={"ref_type": "memory", "id": "m1"})],
+                index=0,
+                metadata={"kind": "reference"},
+            ),
+        ]
+
+        created = await task_manager.create_task(
+            params, agent_name="test-agent", artifacts=sender_artifacts,
+        )
+        assert created.artifacts is not None
+        assert len(created.artifacts) == 2
+
+        # Recipient retrieval: round-trip through the store.
+        fetched = await task_manager.task_store.get(params.id)
+        assert fetched is not None
+        assert fetched.artifacts is not None
+        assert len(fetched.artifacts) == 2
+        # Ordering preserved: plan first, references second.
+        assert fetched.artifacts[0].name == "plan"
+        assert fetched.artifacts[0].metadata == {"origin": "saved_item"}
+        assert fetched.artifacts[0].parts[0].text == "step one"
+        # Structured metadata (DataPart) survives, not only raw text.
+        assert fetched.artifacts[1].name == "references"
+        assert fetched.artifacts[1].parts[0].data == {"ref_type": "memory", "id": "m1"}
+
+    @pytest.mark.asyncio
+    async def test_create_task_without_artifacts_leaves_none(self, task_manager):
+        """No send-side artifacts → task.artifacts stays None (existing
+        responder-side attach flow remains the only writer)."""
+        params = TaskSendParams(
+            message=Message(role="user", parts=[TextPart(text="hi")]),
+        )
+        task = await task_manager.create_task(params, agent_name="test-agent")
+        assert task.artifacts is None
+
+    @pytest.mark.asyncio
     async def test_update_status_valid_transition(self, task_manager):
         """Test valid state transitions."""
         params = TaskSendParams(

@@ -389,6 +389,115 @@ async def test_send_a2a_task_carries_skill_id_and_returns_task_id():
 
 
 @pytest.mark.asyncio
+async def test_send_a2a_task_attaches_sender_artifacts_on_wire():
+    """Send-side artifact support (#1525): a sender can attach durable
+    handoff payload to an outgoing task. The artifacts land on the wire
+    payload with names, ordering, and structured metadata preserved."""
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="art1"))
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_task(
+            "meridian", "Please orchestrate this plan.",
+            skill_id="workflow.assign",
+            artifacts=[
+                {"name": "plan", "text": "step one", "index": 0,
+                 "last_chunk": True, "metadata": {"origin": "saved_item"}},
+                {"name": "evidence", "data": {"diff": "+1 -1"}},
+            ],
+        )
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["artifacts_attached"] == 2
+    posted_body = client.post.call_args.kwargs["json"]
+    arts = posted_body["artifacts"]
+    assert len(arts) == 2
+    # Ordering + names + metadata preserved.
+    assert arts[0]["name"] == "plan"
+    assert arts[0]["parts"] == [{"type": "text", "text": "step one"}]
+    assert arts[0]["index"] == 0
+    assert arts[0]["lastChunk"] is True
+    assert arts[0]["metadata"] == {"origin": "saved_item"}
+    # Structured data part carries metadata, not just raw text.
+    assert arts[1]["name"] == "evidence"
+    assert arts[1]["parts"] == [{"type": "data", "data": {"diff": "+1 -1"}}]
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_task_attaches_references_as_data_artifacts():
+    """Durable references serialize into the ``references`` artifact
+    group as structured DataParts with monotonic indices (#1525)."""
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="ref1"))
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_task(
+            "meridian", "Use these.",
+            references=[
+                {"ref_type": "memory", "id": "m1", "label": "plan"},
+                {"ref_type": "recall", "id": "r2"},
+            ],
+        )
+
+    assert result.status is ToolResultStatus.OK
+    assert result.data["artifacts_attached"] == 2
+    arts = client.post.call_args.kwargs["json"]["artifacts"]
+    assert [a["name"] for a in arts] == ["references", "references"]
+    assert [a["index"] for a in arts] == [0, 1]
+    assert all(a["metadata"] == {"kind": "reference"} for a in arts)
+    assert arts[0]["parts"][0] == {
+        "type": "data",
+        "data": {"ref_type": "memory", "id": "m1", "label": "plan"},
+    }
+    assert arts[1]["parts"][0]["data"] == {"ref_type": "recall", "id": "r2"}
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_task_without_artifacts_omits_wire_key():
+    """No artifacts/references → the ``artifacts`` key is absent from the
+    payload so legacy recipients see an unchanged wire shape (#1525)."""
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="bare1"))
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_task("meridian", "no payload")
+
+    assert result.data["artifacts_attached"] == 0
+    assert "artifacts" not in client.post.call_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_question_attaches_sender_artifacts_on_wire():
+    """send_a2a_question also supports send-side artifacts so a question
+    can carry the context the recipient needs to answer (#1525)."""
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="q-art"))
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_question(
+            "meridian", "Does this plan look right?",
+            artifacts=[{"name": "plan", "text": "the plan body"}],
+        )
+
+    assert result.status is ToolResultStatus.OK
+    arts = client.post.call_args.kwargs["json"]["artifacts"]
+    assert arts[0]["name"] == "plan"
+    assert arts[0]["parts"] == [{"type": "text", "text": "the plan body"}]
+
+
+@pytest.mark.asyncio
 async def test_get_peer_task_result_reassembles_artifacts_in_index_order():
     """When the receiver chunked a long reply into multiple Artifacts
     (because per-tool argument cap is 10K), ``get_peer_task_result``

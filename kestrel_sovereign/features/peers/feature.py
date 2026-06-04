@@ -74,6 +74,87 @@ def _discover_host_url() -> Optional[str]:
     return None
 
 
+# Canonical artifact group name for send-side references (durable
+# pointers to saved-memory / recall items, URIs, etc.). Kept distinct
+# from the responder-side ``reply_body`` convention so a recipient can
+# tell sender-attached handoff payload apart from a responder's reply.
+REFERENCES_ARTIFACT_NAME = "references"
+
+
+def _normalize_outbound_artifact(item: Any, default_index: int) -> Dict[str, Any]:
+    """Normalize one sender-supplied artifact into an A2A artifact wire
+    dict (the shape the recipient's ``/tasks/send`` endpoint validates
+    into an ``Artifact``).
+
+    Accepts either a bare string (becomes a single text part) or a dict
+    with any of: ``name``, ``description``, ``metadata``, ``index``,
+    ``last_chunk``/``lastChunk``, and a body given as ``parts`` (already
+    wire-shaped), ``text`` (→ TextPart), or ``data`` (→ DataPart for
+    structured payloads). Supporting ``data`` is what lets a handoff
+    carry structured metadata rather than only raw text.
+    """
+    if not isinstance(item, dict):
+        return {
+            "name": "attachment",
+            "parts": [{"type": "text", "text": str(item)}],
+            "index": default_index,
+        }
+
+    parts = item.get("parts")
+    if not parts:
+        if item.get("text") is not None:
+            parts = [{"type": "text", "text": str(item["text"])}]
+        elif item.get("data") is not None:
+            parts = [{"type": "data", "data": item["data"]}]
+        else:
+            parts = []
+
+    artifact: Dict[str, Any] = {
+        "name": item.get("name") or "attachment",
+        "parts": parts,
+        "index": item.get("index", default_index),
+    }
+    if item.get("description") is not None:
+        artifact["description"] = item["description"]
+    if item.get("metadata") is not None:
+        artifact["metadata"] = item["metadata"]
+    last_chunk = item.get("last_chunk", item.get("lastChunk"))
+    if last_chunk is not None:
+        artifact["lastChunk"] = bool(last_chunk)
+    return artifact
+
+
+def _normalize_outbound_reference(ref: Any, index: int) -> Dict[str, Any]:
+    """Normalize one durable reference into a structured-data artifact
+    in the ``references`` group. A reference is a pointer (saved-memory
+    or recall item id, URI, etc.); we carry it as a ``DataPart`` so the
+    recipient gets the structured descriptor intact rather than a
+    stringified blob."""
+    data = ref if isinstance(ref, dict) else {"ref": str(ref)}
+    return {
+        "name": REFERENCES_ARTIFACT_NAME,
+        "parts": [{"type": "data", "data": data}],
+        "index": index,
+        "metadata": {"kind": "reference"},
+    }
+
+
+def _coerce_outbound_artifacts(
+    artifacts: Optional[List[Any]],
+    references: Optional[List[Any]],
+) -> List[Dict[str, Any]]:
+    """Build the outbound ``artifacts`` wire list from sender-supplied
+    ``artifacts`` and ``references``. Artifacts keep their own ordering;
+    references are appended as a separate ``references`` group with
+    monotonic indices so the recipient can reassemble them in order."""
+    wire: List[Dict[str, Any]] = []
+    for i, item in enumerate(artifacts or []):
+        wire.append(_normalize_outbound_artifact(item, i))
+    for i, ref in enumerate(references or []):
+        wire.append(_normalize_outbound_reference(ref, i))
+    return wire
+
+
 class PeersFeature(Feature):
     """Inter-agent communication — ask questions to sibling agents in the multi_agent."""
 
@@ -277,6 +358,8 @@ class PeersFeature(Feature):
         skill_id: str = "",
         session_id: str = "",
         extra_metadata: Optional[Dict[str, Any]] = None,
+        artifacts: Optional[List[Any]] = None,
+        references: Optional[List[Any]] = None,
     ) -> Tuple[
         Optional[Dict[str, Any]],
         Optional[list],
@@ -350,6 +433,13 @@ class PeersFeature(Feature):
             },
             "metadata": outbound_metadata,
         }
+        # Send-side artifacts/references: durable handoff payload the
+        # sender attaches at creation time. Only put the key on the wire
+        # when there's something to attach so legacy recipients that
+        # ignore unknown keys see no change.
+        outbound_artifacts = _coerce_outbound_artifacts(artifacts, references)
+        if outbound_artifacts:
+            payload["artifacts"] = outbound_artifacts
 
         try:
             async with httpx.AsyncClient() as client:
@@ -468,7 +558,15 @@ class PeersFeature(Feature):
             "respond there. Do NOT block your turn waiting for the "
             "answer; the supervisor will wake you. For fire-and-forget "
             "use send_a2a_message; for tracked work you'll check on "
-            "later use send_a2a_task."
+            "later use send_a2a_task.\n\n"
+            "SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or "
+            "``references`` to attach durable payload (planning docs, "
+            "evidence, saved-memory/recall references) to the question "
+            "so the recipient can retrieve it from the task store while "
+            "answering. This is the SEND side — distinct from the "
+            "RESPONDER-side attach_artifact_to_a2a_task tool a recipient "
+            "uses to attach output onto an incoming task before "
+            "responding."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a ask",
@@ -479,6 +577,8 @@ class PeersFeature(Feature):
         message: str,
         session_id: str = "",
         timeout_seconds: int = 300,
+        artifacts: Optional[List[Any]] = None,
+        references: Optional[List[Any]] = None,
     ) -> ToolResult:
         """
         Submit an A2A question to a peer agent under the fire-and-resume
@@ -516,6 +616,7 @@ class PeersFeature(Feature):
                 "a2a_verb": "question",
                 "reply_expected": True,
             },
+            artifacts=artifacts, references=references,
         )
         if err is not None:
             return err
@@ -1421,7 +1522,20 @@ class PeersFeature(Feature):
             "(or receive the a2a.task_complete signal). Use this for "
             "delegated work you'll check on later. For an answer "
             "now use send_a2a_question; for a fire-and-forget "
-            "notification use send_a2a_message."
+            "notification use send_a2a_message.\n\n"
+            "SEND-SIDE ARTIFACTS: pass ``artifacts`` and/or "
+            "``references`` to hand off durable payload (planning docs, "
+            "evidence bundles, saved-memory/recall references, logs, "
+            "diffs) WITH the task — the recipient retrieves them from "
+            "the task store via get_task_result/check_task_status. "
+            "This is the SEND side; it is distinct from the "
+            "RESPONDER-side attach_artifact_to_a2a_task tool, which a "
+            "RECIPIENT uses to attach output onto an INCOMING task "
+            "before responding. Each artifact is a dict like "
+            "{'name': 'plan', 'text': '...'} (or 'data': {...} for "
+            "structured metadata, optional 'index'/'last_chunk' for "
+            "chunked bodies). Each reference is a dict descriptor like "
+            "{'ref_type': 'memory', 'id': '...', 'label': '...'}."
         ),
         category=ToolCategory.COMMUNICATION,
         command_prefix="!a2a send",
@@ -1432,6 +1546,8 @@ class PeersFeature(Feature):
         message: str,
         skill_id: str = "",
         session_id: str = "",
+        artifacts: Optional[List[Any]] = None,
+        references: Optional[List[Any]] = None,
     ) -> ToolResult:
         """
         Submit an A2A task to a peer agent and wake their cognition loop.
@@ -1444,18 +1560,31 @@ class PeersFeature(Feature):
                 empty — the receiver routes via their default handler.
             session_id: Optional A2A session id; auto-generated when
                 empty so multiple sends are independent sessions.
+            artifacts: Optional send-side handoff payload. Each item is
+                a dict with ``name`` and a body (``text`` for raw text,
+                ``data`` for a structured dict, or pre-shaped
+                ``parts``), plus optional ``description``, ``metadata``,
+                ``index``, ``last_chunk``. Persisted on the recipient's
+                task at SUBMITTED so the recipient can retrieve them.
+            references: Optional durable references (pointers to
+                saved-memory / recall items, URIs). Each item is a dict
+                descriptor; carried as structured-data artifacts in the
+                ``references`` group.
         """
         task_data, _chain, err = await self._post_a2a_task(
             recipient=recipient, message=message,
             skill_id=skill_id, session_id=session_id,
             extra_metadata={"a2a_verb": "task"},
+            artifacts=artifacts, references=references,
         )
         if err is not None:
             return err
+        attached = len(_coerce_outbound_artifacts(artifacts, references))
         return ToolResult.ok(
             confirmation=(
                 f"A2A task {task_data['id']} submitted to {recipient} "
-                f"(state={(task_data.get('status') or {}).get('state','?')}). "
+                f"(state={(task_data.get('status') or {}).get('state','?')}, "
+                f"{attached} artifact(s) attached). "
                 f"Recipient's dispatcher has been signaled."
             ),
             data={
@@ -1464,6 +1593,7 @@ class PeersFeature(Feature):
                 "session_id": task_data["sessionId"],
                 "state": (task_data.get("status") or {}).get("state"),
                 "recipient": recipient,
+                "artifacts_attached": attached,
             },
         )
 
