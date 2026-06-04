@@ -478,6 +478,16 @@ class TalonCoordinatorFeature(Feature):
             or str(workspace.parent)
         )
 
+        # Revision-aware dispatch (#1529). The authoritative fix lives in the
+        # kestrel-talon `claim` flow: GitOperations.create_worktree/create_branch
+        # detect an existing remote `issue-<n>-*` branch and base the worktree on
+        # `origin/<branch>` instead of the base branch, so revision work appends
+        # as a fast-forward; push_branch maps a non-fast-forward rejection to a
+        # clear blocked message. This detection is NOT passed to Talon (it runs
+        # its own detection); it only surfaces the branch in dispatch metadata so
+        # the run is visibly a revision before the subprocess starts.
+        revision_branch = self._detect_existing_issue_branch(workspace, issue)
+
         try:
             execution = TalonExecution(
                 repo=repo_resolved,
@@ -530,16 +540,22 @@ class TalonCoordinatorFeature(Feature):
                 "repo": repo_resolved,
                 "issue": issue,
                 "workspace": str(workspace),
+                "revision_of_branch": revision_branch,
                 **invocation.metadata(),
             },
         )
 
         if cli_result.get("dispatched"):
+            revision_note = (
+                f", revising existing branch {revision_branch}"
+                if revision_branch
+                else ""
+            )
             return ToolResult.ok(
                 confirmation=(
                     f"Dispatched {repo_resolved}#{issue} to talon via CLI "
                     f"background (job_id={cli_result.get('job_id', '?')}, "
-                    f"pid={cli_result.get('pid', '?')})"
+                    f"pid={cli_result.get('pid', '?')}{revision_note})"
                 ),
                 data=cli_result,
             )
@@ -1232,6 +1248,44 @@ class TalonCoordinatorFeature(Feature):
                 "error": stderr.decode(errors="replace")[-500:] or "git fetch failed",
             }
         return {"ok": True}
+
+    def _detect_existing_issue_branch(
+        self, workspace: Path, issue: int,
+    ) -> Optional[str]:
+        """Best-effort detection of an existing remote branch for ``issue``.
+
+        A claimed issue may already have an open PR whose branch
+        (``issue-<n>-<slug>``) is ahead of the workspace base branch. The
+        kestrel-talon ``claim`` flow performs the authoritative detection and
+        bases its worktree on that branch (see GitOperations.create_worktree);
+        this method is purely informational — it surfaces the detected ref in
+        dispatch metadata so operators can see the run is a revision before the
+        subprocess starts. It does not influence Talon's branch selection.
+        Returns the branch name (no remote prefix) or ``None`` when nothing
+        matches, git is unavailable, or no GitHub token is present.
+        """
+        try:
+            env = self._build_subprocess_env()
+        except RuntimeError:
+            return None
+        try:
+            proc = subprocess.run(
+                ["git", "ls-remote", "--heads", "origin", f"issue-{issue}-*"],
+                cwd=str(workspace),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=env,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+        for line in proc.stdout.strip().splitlines():
+            parts = line.split("\trefs/heads/", 1)
+            if len(parts) == 2 and parts[1].strip():
+                return parts[1].strip()
+        return None
 
     @staticmethod
     def _resolve_repo(repo: str) -> str:

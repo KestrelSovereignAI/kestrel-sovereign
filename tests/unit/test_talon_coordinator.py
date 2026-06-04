@@ -335,3 +335,88 @@ class TestCLIDispatch:
             result = await feature._dispatch_via_cli(["claim", "--repo", "a/b", "--issue", "1"])
             assert result["dispatched"] is False
             assert "not found" in result["error"]
+
+
+class TestRevisionBranchDetection:
+    """Sovereign-side detection of an existing PR branch for a claimed
+    issue, surfaced in dispatch metadata so revision jobs are visible (#1529)."""
+
+    def _make_workspace(self, tmp_path):
+        """A local bare remote + working clone with one commit on main."""
+        import subprocess
+
+        remote = tmp_path / "remote.git"
+        work = tmp_path / "work"
+        subprocess.run(
+            ["git", "init", "--bare", "-b", "main", str(remote)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(["git", "clone", str(remote), str(work)], check=True, capture_output=True)
+        for k, v in (("user.email", "t@t.t"), ("user.name", "t")):
+            subprocess.run(["git", "config", k, v], cwd=work, check=True, capture_output=True)
+        (work / "README.md").write_text("hi\n")
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "init"], cwd=work, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"], cwd=work, check=True, capture_output=True)
+        return work
+
+    def test_detects_existing_remote_branch(self, tmp_path, monkeypatch):
+        import subprocess
+
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        work = self._make_workspace(tmp_path)
+        # Push an issue-7 branch to the remote (an existing open PR branch).
+        subprocess.run(["git", "checkout", "-b", "issue-7-model-castle-entities"], cwd=work, check=True, capture_output=True)
+        (work / "model.py").write_text("x = 1\n")
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "pr"], cwd=work, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "issue-7-model-castle-entities"], cwd=work, check=True, capture_output=True)
+
+        feature = TalonCoordinatorFeature(_make_agent())
+        branch = feature._detect_existing_issue_branch(work, 7)
+        assert branch == "issue-7-model-castle-entities"
+
+    def test_returns_none_when_no_branch(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        work = self._make_workspace(tmp_path)
+        feature = TalonCoordinatorFeature(_make_agent())
+        assert feature._detect_existing_issue_branch(work, 99) is None
+
+    def test_returns_none_without_token(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("GH_TOKEN", raising=False)
+        monkeypatch.delenv("GITHUB_PAT", raising=False)
+        feature = TalonCoordinatorFeature(_make_agent())
+        assert feature._detect_existing_issue_branch(tmp_path, 7) is None
+
+    @pytest.mark.asyncio
+    async def test_claim_surfaces_revision_branch_in_metadata(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("KESTREL_TALON_WORKSPACE_ROOT", str(tmp_path))
+        monkeypatch.setenv("KESTREL_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
+        feature = TalonCoordinatorFeature(_make_agent())
+        ready_state = {
+            "repo": "org/repo",
+            "path": str(tmp_path / "org__repo"),
+            "exists": True,
+            "is_git": True,
+            "head": "main",
+            "clean": True,
+            "last_fetch_at": None,
+            "safe": True,
+        }
+        with patch.object(feature, "_dispatch_via_a2a", new_callable=AsyncMock) as mock_mesh, \
+             patch.object(feature, "_dispatch_via_cli_background", new_callable=AsyncMock) as mock_bg, \
+             patch.object(feature, "_detect_existing_issue_branch", return_value="issue-7-foo"), \
+             patch.object(TalonCoordinatorFeature, "_workspace_state", return_value=ready_state):
+            mock_mesh.return_value = {"dispatched": False, "reason": "no_a2a_host"}
+            mock_bg.return_value = {
+                "dispatched": True,
+                "method": "cli_background",
+                "job_id": "abc",
+                "pid": 1234,
+            }
+            result = await feature.talon_claim(repo="org/repo", issue=7)
+            assert result.status is ToolResultStatus.OK
+            assert mock_bg.call_args.kwargs["extra_meta"]["revision_of_branch"] == "issue-7-foo"
+            assert "issue-7-foo" in result.confirmation
