@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from kestrel_sdk.signals import SignalMode, Trust
+from kestrel_sdk.signals import SignalMode, Trust, Visibility
 from kestrel_sovereign.signals.sources.a2a_question_answered import (
     PROMPT_TEMPLATE,
     REPLY_TEXT_INLINE_CAP_BYTES,
@@ -38,6 +38,24 @@ class TestRegistration:
             f"retention_days must be 90 per the Sovereign decision on #1444. "
             f"Got {reg.retention_days}."
         )
+
+    def test_registration_supplies_result_summary(self):
+        """#1522: USER_VISIBLE alone makes ``signal_completed`` a
+        metadata-only toast — the UI side channel has nothing to render.
+        The source must set ``result_summary`` so the agent's response
+        text (the COGNITION dispatch artifact) becomes the event body
+        the chat pane appends live."""
+        reg = build_a2a_question_answered_registration()
+        assert reg.result_summary is not None, (
+            "Source must opt into result_summary so the signal_completed "
+            "event carries the resumed turn's response for the chat UI."
+        )
+        # The COGNITION artifact is the agent's own response string —
+        # surface it verbatim.
+        assert reg.result_summary("the answer is 4") == "the answer is 4"
+        # Defensive: None / non-str bodies don't blow up the callback.
+        assert reg.result_summary(None) == ""
+        assert reg.result_summary(42) == "42"
 
     def test_prompt_template_exists_in_package(self):
         assert PROMPT_TEMPLATE.exists(), (
@@ -159,6 +177,26 @@ class TestSignalBuilder:
             "full body through the host proxy. Citing only task_id (or "
             "a nonexistent get_a2a_task) makes the truncated reply "
             "unrecoverable — codex round 2 P2b on PR #1453."
+        )
+
+    def test_signal_is_user_visible_for_live_chat_render(self):
+        """#1522: the wake must be USER_VISIBLE (not INTERNAL) so the
+        dispatcher emits a ``signal_completed`` SSE event after the
+        resumed turn logs. INTERNAL signals never reach the UI side
+        channel (see SignalDispatcher._log_safe), which is exactly the
+        bug — the A2A wake response persisted but the open chat tab
+        never rendered it live."""
+        sig = build_signal_for_question_answered(
+            task_id="t-1", recipient="Meridian",
+            original_question="What is 2+2?",
+            reply_text="4", state="completed",
+            target_agent="did:test:sender",
+        )
+        assert sig.visibility == Visibility.USER_VISIBLE, (
+            "A reply-capable A2A wake must be USER_VISIBLE so the open "
+            "chat renders the resumed turn live (#1522). INTERNAL would "
+            "log silently and the UI would only see it on a manual "
+            "refresh."
         )
 
     def test_causation_chain_threaded_through(self):

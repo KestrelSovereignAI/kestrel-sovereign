@@ -150,6 +150,26 @@ def _a2a_question_answered_redact(payload: dict) -> str:
     )
 
 
+def _a2a_question_answered_result_summary(body: Any) -> str:
+    """Bounded inline body for the ``signal_completed`` UI side-channel
+    (#1522).
+
+    For a COGNITION dispatch ``result.artifact`` is the agent's own
+    response string (see ``SignalDispatcher._success`` —
+    ``artifact=cognition_result``). Surfacing it here is what lets the
+    active chat UI render the resumed turn live: a reply-capable A2A
+    wake resolves while a chat tab is open, the dispatcher emits
+    ``signal_completed`` with this text, and the frontend appends it
+    inline instead of leaving the turn invisible until a manual
+    refresh. The store caps the returned text at
+    ``MAX_RESULT_SUMMARY_BYTES`` as defense in depth."""
+    if body is None:
+        return ""
+    if isinstance(body, str):
+        return body
+    return str(body)
+
+
 def build_a2a_question_answered_registration() -> SourceRegistration:
     return SourceRegistration(
         name=SOURCE_NAME,
@@ -168,6 +188,11 @@ def build_a2a_question_answered_registration() -> SourceRegistration:
         coalescing_window=timedelta(seconds=10),
         attention_policy=AttentionPolicy(),
         resources=frozenset(),
+        # #1522: surface the resumed turn's response on the
+        # ``signal_completed`` UI side-channel so an open chat tab
+        # renders the wake live. Paired with visibility=USER_VISIBLE +
+        # session_id on the signal (see build_signal_for_question_answered).
+        result_summary=_a2a_question_answered_result_summary,
         # The sender firing a signal back to itself would only happen if
         # they sent a question to themselves — already blocked at the
         # PeersFeature layer, but redundant guard.
@@ -243,7 +268,25 @@ def build_signal_for_question_answered(
             "truncated": truncated,
         },
         target_agent=target_agent,
-        visibility=Visibility.INTERNAL,
+        # #1522: USER_VISIBLE (was INTERNAL) so the dispatcher emits a
+        # ``signal_completed`` SSE event after the resumed turn logs,
+        # letting an open chat tab render the response live instead of
+        # only on a manual refresh. The ``result_summary`` callback on
+        # the registration supplies the agent's response text as the
+        # event body; the frontend ``signal_completed`` handler
+        # (chat.js ``handleSignalCompleted``) appends it to the active
+        # pane.
+        #
+        # session_id is intentionally left at its default (None). The
+        # conversation session this wake lands in is resolved INSIDE
+        # process_input by the time-gap heuristic at dispatch time and
+        # is not surfaced back onto the signal — it is NOT the A2A
+        # protocol sessionId carried in origin_session_id (a uuid4 from
+        # send time, different namespace). The frontend does not match
+        # on session_id: the notifications SSE stream is pinned to the
+        # selected agent, so the wake renders into the visible pane,
+        # the same precedent as task_notification.
+        visibility=Visibility.USER_VISIBLE,
         caller=recipient or None,
         urgency=Urgency.NORMAL,
         # Dedupe key prevents subscription + startup-replay racing for

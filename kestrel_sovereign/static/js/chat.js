@@ -655,6 +655,21 @@ export function connectNotifications() {
             }
         });
 
+        // #1522: an autonomous cognition wake (e.g. an A2A reply
+        // resuming an asked question) runs as a background turn — it is
+        // NOT driven by sendMessage, so the chat pane never sees its
+        // stream. The dispatcher emits `signal_completed` after the
+        // turn logs; render the response into the active pane so the
+        // open chat shows it live instead of only on a manual refresh.
+        notificationEventSource.addEventListener('signal_completed', (e) => {
+            try {
+                const data = JSON.parse(e.data);
+                handleSignalCompleted(data);
+            } catch (err) {
+                console.error('Failed to handle signal_completed event:', err);
+            }
+        });
+
         notificationEventSource.addEventListener('ping', () => {
             // Keepalive - no action needed
         });
@@ -776,6 +791,74 @@ function showTaskNotification(message, type) {
 
     // Also show a Toast notification
     Toast.show(message, type === 'failed' ? 'error' : 'info');
+}
+
+// Dedupe set for rendered cognition wakes (#1522). EventSource
+// reconnects and the dispatcher's startup-replay sweep can redeliver the
+// same `signal_completed`; keying on signal_id keeps the pane from
+// double-painting one wake.
+const renderedWakeSignalIds = new Set();
+
+/**
+ * Render an autonomous cognition wake into the active chat pane (#1522).
+ *
+ * A non-user-prompt turn — an A2A reply resuming an asked question, a
+ * scheduled wake, etc. — runs in the dispatcher background and never
+ * streams through the chat composer, so the open chat would otherwise
+ * stay blank until a manual refresh re-loaded history. The dispatcher
+ * emits `signal_completed` after the turn logs; this handler appends the
+ * agent's response to the visible pane in real time.
+ *
+ * Scope is deliberately narrow:
+ *   - `visibility === 'user_visible'` — INTERNAL/ADMIN signals stay off
+ *     the chat stream.
+ *   - `mode === 'cognition'` — only agent turns render as chat messages;
+ *     ACTION-mode side effects don't.
+ *   - non-empty `result_summary` — metadata-only emits have nothing to
+ *     paint (the body lives in chat history instead).
+ *
+ * The notifications SSE stream is pinned to the selected agent (same as
+ * task notifications), so the visible pane is the correct destination —
+ * no session_id matching required.
+ */
+export async function handleSignalCompleted(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    if (payload.visibility !== 'user_visible') return;
+    if (payload.mode !== 'cognition') return;
+    const body = payload.result_summary;
+    if (!body) return;
+
+    const sigId = payload.signal_id;
+    if (sigId) {
+        if (renderedWakeSignalIds.has(sigId)) return;
+        renderedWakeSignalIds.add(sigId);
+    }
+
+    const target = resolvePaneElement();
+    if (!target) return;
+
+    const div = document.createElement('div');
+    div.className = 'message agent-message signal-wake-message';
+
+    const attribution = document.createElement('div');
+    attribution.className = 'signal-wake-attribution';
+    const source = String(payload.source || 'signal');
+    const caller = payload.caller ? ` · ${payload.caller}` : '';
+    attribution.innerHTML =
+        `${kicon('bird')} <span>Autonomous wake (${escapeHtml(source)}${escapeHtml(caller)})</span>`;
+    div.appendChild(attribution);
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+    await finalizeAgentContent(contentDiv, String(body));
+    div.appendChild(contentDiv);
+
+    target.appendChild(div);
+
+    const c = getChatContainer();
+    if (c && target.parentNode === c) {
+        c.scrollTop = c.scrollHeight;
+    }
 }
 
 /**
