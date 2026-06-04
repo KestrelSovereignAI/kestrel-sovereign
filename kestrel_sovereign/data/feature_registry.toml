@@ -289,6 +289,7 @@ list_issues = { description = "List GitHub issues", category = "data_access", ta
 create_issue = { description = "Create a GitHub issue", category = "data_access", tags = ["github", "issues"] }
 list_prs = { description = "List pull requests", category = "data_access", tags = ["github", "prs"] }
 create_pr = { description = "Create a pull request", category = "data_access", tags = ["github", "prs"] }
+get_repo_info = { description = "Get arbitrary repository metadata including visibility (avoids gh CLI fallback)", category = "data_access", tags = ["github", "metadata"] }
 
 [web_search]
 package = "kestrel-feature-web-search"
