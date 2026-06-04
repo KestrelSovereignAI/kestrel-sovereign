@@ -6,7 +6,105 @@ listener management, and background task notification queuing.
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
+
+
+def describe_background_task(task) -> Tuple[str, str]:
+    """Derive a human-meaningful ``source/name`` label for a terminal
+    background task from its metadata.
+
+    Only keys that a real producer actually stamps on ``Task.metadata``
+    are read here — reading speculative keys no one writes would give a
+    false sense of coverage (#1526). The genuine producers are:
+
+    - ``TaskManager.execute_skill`` stamps ``agent_id`` + ``skill`` when
+      a peer agent runs one of our skills (``a2a/task_manager.py``).
+    - The inbound A2A submit endpoint passes the caller-supplied
+      ``sender`` (and optionally ``task_type``) straight through
+      ``create_task`` (``endpoints/agent.py`` → ``TaskSendParams.metadata``).
+    - ``TaskManager.create_task`` attaches a ``causation_chain`` whenever
+      a task is spawned during a signal-driven turn.
+
+    Scheduled tasks themselves never reach this callback directly: the
+    scheduler dispatches a *signal* (``cron.<task_name>``), not an A2A
+    task (``features/scheduler/feature.py``). The only thread connecting
+    a later spawned task back to that schedule is the causation chain, so
+    that is the canonical path for labelling scheduler-originated work —
+    a task whose chain records ``cron.restart_coordinator`` renders as
+    ``cron/restart_coordinator`` instead of the historical
+    ``unknown/task``.
+
+    Preferring the most specific identifiers available keeps completion
+    notifications from collapsing to ``unknown/task`` whenever a richer
+    field is present.
+
+    Returns a ``(source, name)`` tuple; the caller joins them as
+    ``source/name``.
+    """
+    md = getattr(task, "metadata", None)
+    if not isinstance(md, dict):
+        md = {}
+
+    source = md.get("agent_id") or md.get("sender")
+    name = md.get("skill") or md.get("task_type")
+
+    if source and name:
+        return str(source), str(name)
+    if source:
+        return str(source), "task"
+    if name:
+        return "unknown", str(name)
+
+    # Fall back to the originating signal source recorded in the
+    # causation chain — e.g. a cron task (``cron.restart_coordinator``)
+    # that woke a turn which then spawned this task. The most recent
+    # frame is the proximate cause. ``cron.restart_coordinator`` renders
+    # as ``cron/restart_coordinator``; a single-segment source renders
+    # as ``<source>/task``.
+    frame_source = _causation_chain_source(md)
+    if frame_source:
+        head, sep, tail = frame_source.partition(".")
+        if sep and tail:
+            return head, tail
+        return frame_source, "task"
+
+    return "unknown", "task"
+
+
+def _causation_chain_source(metadata: Dict[str, Any]) -> str:
+    """Return the source of the most recent causation-chain frame, or ''.
+
+    Defensive against the wire-serialized chain shape produced by
+    ``signals.sources.a2a.serialize_chain_for_metadata`` (a list of
+    dicts, each with a ``source`` key).
+    """
+    chain = metadata.get("causation_chain")
+    if not isinstance(chain, list) or not chain:
+        return ""
+    frame = chain[-1]
+    if isinstance(frame, dict):
+        src = frame.get("source")
+        if src:
+            return str(src)
+    return ""
+
+
+def background_task_identifiers(task) -> str:
+    """Build the identifier suffix for a completion notification.
+
+    Always exposes the FULL task id (not a truncated prefix) so the toast
+    text is directly resolvable via ``check_task_status`` and correlates
+    with task-registry records (#1526). The historical bug truncated this
+    to an 8-char prefix that ``check_task_status`` could not resolve.
+
+    No scheduler ``execution_id`` is surfaced: that id is the
+    ``task_execution_log`` row id, generated *after* the scheduled run
+    completes (``features/scheduler/runner.py``), so it never exists on
+    the A2A task this callback receives. Correlation with scheduler
+    history instead flows through the ``cron/<task_name>`` label that
+    :func:`describe_background_task` derives from the causation chain.
+    """
+    return f"task: {getattr(task, 'id', 'unknown')}"
 
 
 class EventManagerMixin:
@@ -60,15 +158,19 @@ class EventManagerMixin:
         state = task.status.state
         task_id = task.id
 
-        # ---- 1. SSE notification (legacy path; unchanged) ----------------
+        # ---- 1. SSE notification (legacy path) ---------------------------
 
-        # Get task description from metadata
-        agent_id = task.metadata.get("agent_id", "unknown") if task.metadata else "unknown"
-        skill_id = task.metadata.get("skill", "task") if task.metadata else "task"
+        # Derive a meaningful source/name label and identifier suffix from
+        # whatever metadata the producer stamped. Falls back to the
+        # historical "unknown/task" only when nothing better is present, and
+        # always exposes the full task id so the toast is resolvable (#1526).
+        source, name = describe_background_task(task)
+        label = f"{source}/{name}"
+        identifiers = background_task_identifiers(task)
 
         # Format notification based on state
         if state == TaskState.COMPLETED:
-            msg = f"\u2705 Background task completed: {agent_id}/{skill_id} (task: {task_id[:8]})"
+            msg = f"\u2705 Background task completed: {label} ({identifiers})"
         elif state == TaskState.FAILED:
             error_msg = ""
             if task.status.message and task.status.message.parts:
@@ -76,9 +178,9 @@ class EventManagerMixin:
                     if hasattr(part, 'text'):
                         error_msg = f": {part.text}"
                         break
-            msg = f"\u274c Background task failed: {agent_id}/{skill_id}{error_msg} (task: {task_id[:8]})"
+            msg = f"\u274c Background task failed: {label}{error_msg} ({identifiers})"
         elif state == TaskState.CANCELED:
-            msg = f"\u26a0\ufe0f Background task canceled: {agent_id}/{skill_id} (task: {task_id[:8]})"
+            msg = f"\u26a0\ufe0f Background task canceled: {label} ({identifiers})"
         else:
             return  # Don't notify for non-terminal states
 
