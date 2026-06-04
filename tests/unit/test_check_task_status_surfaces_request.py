@@ -156,3 +156,52 @@ async def test_get_task_result_includes_request_content_for_completed_task():
     assert data["request_content"] == "please ack"
     assert data["message"] == "acknowledged"
     assert data["sender"] == "Emma"
+
+
+@pytest.mark.asyncio
+async def test_check_task_status_surfaces_sender_attached_artifacts():
+    """Recipient retrieval (#1525): a SENDER-attached artifact (text body
+    + a structured-data reference) must be readable by the recipient via
+    ``check_task_status``. The text part is surfaced as ``text`` and the
+    data part as ``data``, with ordering and metadata preserved."""
+    from kestrel_sovereign.a2a.types import Artifact, DataPart
+
+    user_message = Message(role="user", parts=[TextPart(text="orchestrate")])
+    task = Task(
+        id="task-1525",
+        sessionId="sess-1",
+        status=TaskStatus(state=TaskState.SUBMITTED),
+        history=[user_message],
+        metadata={"sender": "Emma", "a2a_verb": "task"},
+        artifacts=[
+            Artifact(
+                name="plan",
+                description="proactive operating model",
+                parts=[TextPart(text="step one"), TextPart(text=" step two")],
+                index=0,
+            ),
+            Artifact(
+                name="references",
+                parts=[DataPart(data={"ref_type": "memory", "id": "m1"})],
+                index=0,
+                metadata={"kind": "reference"},
+            ),
+        ],
+    )
+
+    async def get_task(task_id):
+        return task if task_id == task.id else None
+
+    feature = TaskFeature(agent=None)
+    feature.task_manager = MagicMock()
+    feature.task_manager.get_task = get_task
+
+    result = await feature.check_task_status(task_id=task.id)
+    assert result.status.value == "ok", result
+    arts = (result.data or {}).get("artifacts") or []
+    assert [a["name"] for a in arts] == ["plan", "references"]
+    # Text parts concatenated in order so a chunked body reassembles.
+    assert arts[0]["text"] == "step one step two"
+    assert arts[0]["description"] == "proactive operating model"
+    # Structured reference survives as data, not stringified.
+    assert arts[1]["data"] == {"ref_type": "memory", "id": "m1"}

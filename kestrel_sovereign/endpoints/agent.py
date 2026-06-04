@@ -1103,7 +1103,15 @@ async def send_task(request: Request):
             "sender": "<agent name or did>",
             "skill": "<workflow.* skill id>",
             ...
-          }
+          },
+          "artifacts": [                 # optional — send-side handoff
+            {                            # payload (docs, refs, evidence)
+              "name": "plan",
+              "parts": [{"type":"text", "text": "..."}],
+              "index": 0,
+              "lastChunk": true
+            }
+          ]
         }
 
     The endpoint calls ``task_manager.create_task`` which persists the
@@ -1139,6 +1147,7 @@ async def send_task(request: Request):
         )
 
     from kestrel_sovereign.a2a.types import (
+        Artifact,
         Message,
         TextPart,
         TaskSendParams,
@@ -1168,6 +1177,27 @@ async def send_task(request: Request):
             message=message,
             metadata=body.get("metadata") or {},
         )
+        # Send-side artifacts/references: a sender may attach durable
+        # handoff payload (planning docs, evidence bundles, saved-memory
+        # references, logs, diffs) at task-creation time. This is the
+        # send-side mirror of the responder-side attach flow — the
+        # artifacts land on the task at SUBMITTED so the recipient can
+        # retrieve them before doing any work. Validate here because
+        # this is the untrusted-input boundary.
+        raw_artifacts = body.get("artifacts") or []
+        if not isinstance(raw_artifacts, list):
+            raise HTTPException(
+                status_code=400,
+                detail="task 'artifacts' must be a list of artifact objects",
+            )
+        sender_artifacts = []
+        for a in raw_artifacts:
+            if not isinstance(a, dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail="each artifact must be an object",
+                )
+            sender_artifacts.append(Artifact.model_validate(a))
     except HTTPException:
         raise
     except Exception as e:
@@ -1194,6 +1224,7 @@ async def send_task(request: Request):
     try:
         task = await agent.task_manager.create_task(
             params=params, agent_name=local_name,
+            artifacts=sender_artifacts or None,
         )
     except Exception as e:
         logger.error(

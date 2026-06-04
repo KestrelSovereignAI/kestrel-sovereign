@@ -151,6 +151,7 @@ class TaskFeature(Feature):
                     "description": artifact.description,
                 }
                 if artifact.parts:
+                    text_segments: List[str] = []
                     for part in artifact.parts:
                         if hasattr(part, "data"):
                             # Same hazard as run_workflow: a migrated
@@ -164,6 +165,15 @@ class TaskFeature(Feature):
                             artifact_data["data"] = self._serialize_step_payload(
                                 part.data
                             )
+                        elif getattr(part, "text", None) is not None:
+                            # Surface text-part bodies too so a recipient
+                            # can read sender-attached text artifacts
+                            # (e.g. a handoff plan) — not just structured
+                            # data parts (#1525). Concatenated in part
+                            # order to reassemble a chunked body.
+                            text_segments.append(part.text or "")
+                    if text_segments:
+                        artifact_data["text"] = "".join(text_segments)
                 artifacts.append(artifact_data)
 
         return {
@@ -1085,6 +1095,11 @@ class TaskFeature(Feature):
     @tool(
         name="attach_artifact_to_a2a_task",
         description=(
+            "RESPONDER-SIDE artifact attach: the RECIPIENT of an "
+            "incoming A2A task uses this to attach its own output. To "
+            "attach payload as the SENDER of an outgoing task, pass "
+            "``artifacts``/``references`` to send_a2a_task / "
+            "send_a2a_question instead. "
             "Attach one chunk of long-form output as an Artifact to "
             "an incoming A2A task BEFORE calling respond_to_a2a_task. "
             "Use this when your reply exceeds the per-tool argument "
