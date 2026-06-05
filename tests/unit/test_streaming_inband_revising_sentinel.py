@@ -352,7 +352,11 @@ async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
 
     assistant_rows = [r for r in persisted if r["role"] == "assistant"]
     assert len(assistant_rows) == 1
-    assert assistant_rows[0]["content"] == "Checking that now.Final post-tool answer."
+    # #1547: the pre-tool prose and post-tool synthesis must NOT glue into
+    # "Checking that now.Final post-tool answer." A ToolCallStarted marker
+    # fired here, so the persisted turn carries a paragraph break at the
+    # revise boundary — matching what the chat client weld renders.
+    assert assistant_rows[0]["content"] == "Checking that now.\n\nFinal post-tool answer."
     assert THINKING_SENTINEL_PREFIX not in assistant_rows[0]["content"]
     assert "Now synthesize" not in assistant_rows[0]["content"]
 

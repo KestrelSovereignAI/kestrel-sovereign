@@ -111,6 +111,63 @@ def strip_revise_sentinels(chunk: str) -> str:
     return "".join(out)
 
 
+def _strip_and_weld_revise_sentinels(text: str) -> str:
+    """Strip in-band stream sentinels and weld a paragraph boundary at
+    each revise point — the server-side mirror of the chat client's
+    ``stripStreamSentinels`` (kestrel-sovereign #1547).
+
+    Why this exists: the post-tool half of a streamed turn can carry
+    embedded revise sentinels (the orchestrator emits one before each
+    follow-up tool call). Persisting the raw join would (a) leak
+    ``\\x1eKESTREL:REVISE:...`` wire bytes into the assistant row and
+    (b) glue the prose on either side of a removed sentinel into
+    "...part one.🔧 part two". The browser strips the same markers and
+    welds a break where they sat between two non-whitespace chars; this
+    function reproduces that exactly so the persisted turn equals what
+    the user actually saw.
+
+    Operates on a complete string (not a packet stream), so the
+    cross-packet edge cases the client handles don't arise here. The
+    pre-tool half needs no welding of its own: its boundary against the
+    post-tool half was already recorded as a ``\\n\\n`` in
+    ``full_response`` at the first ``ToolCallStarted`` marker, mirroring
+    the client's weld at the first revise sentinel.
+    """
+    prefixes = (REVISE_SENTINEL_PREFIX, THINKING_SENTINEL_PREFIX)
+    if not any(p in text for p in prefixes):
+        return text
+    result = ""
+    i = 0
+    n = len(text)
+    weld_pending = False  # a removed revise sentinel awaits its next visible char
+    while i < n:
+        nxt_idx = -1
+        nxt_prefix = ""
+        for p in prefixes:
+            idx = text.find(p, i)
+            if idx >= 0 and (nxt_idx < 0 or idx < nxt_idx):
+                nxt_idx, nxt_prefix = idx, p
+        seg_end = nxt_idx if nxt_idx >= 0 else n
+        seg = text[i:seg_end]
+        if seg:
+            if weld_pending and seg.strip():
+                if result and not result[-1].isspace() and not seg[0].isspace():
+                    result += "\n\n"
+                weld_pending = False
+            result += seg
+        if nxt_idx < 0:
+            break
+        close = text.find(REVISE_SENTINEL_SUFFIX, nxt_idx + len(nxt_prefix))
+        if close < 0:
+            # Unterminated sentinel at the tail — drop the remainder,
+            # matching the client's partial-buffer behavior.
+            break
+        if nxt_prefix == REVISE_SENTINEL_PREFIX:
+            weld_pending = True
+        i = close + len(REVISE_SENTINEL_SUFFIX)
+    return result
+
+
 class StreamingMixin:
     """Mixin class providing streaming response methods."""
 
@@ -413,8 +470,21 @@ class StreamingMixin:
                 # the user hadn't already seen. The narration check
                 # downstream wants the user-visible prose that
                 # PRECEDED any tool call, not the inter-tool prose.
+                acc = "".join(full_response)
                 if pre_tool_prose_snapshot is None:
-                    pre_tool_prose_snapshot = "".join(full_response)
+                    pre_tool_prose_snapshot = acc
+                # #1547: record a paragraph boundary in the accumulated
+                # visible text at this revise point. The marker itself
+                # is wire metadata (not in ``full_response``), so without
+                # a boundary the pre-revision prose welds onto whatever
+                # the model emits next — the dominant inline-execution
+                # (codex app-server) path streams "Let me check." then a
+                # ToolCallStarted then "The answer is 42." as plain text,
+                # and ``"".join(full_response)`` glued them. Idempotent:
+                # only break when the accumulator ends non-whitespace, so
+                # parallel/back-to-back markers don't stack blank lines.
+                if acc and not acc[-1].isspace():
+                    full_response.append("\n\n")
             elif isinstance(item, LLMResponse):
                 # Tool calls detected at end of stream
                 tool_response = item
@@ -508,7 +578,17 @@ class StreamingMixin:
             # reasoning it had just shown the user. Surfaced by Meridian's
             # "I don't see my own quantum response" transcript.
             pre_tool_text = "".join(full_response)
-            post_tool_text = "".join(tool_response_chunks)
+            # #1547: strip + weld the post-tool half exactly as the chat
+            # client does, so embedded follow-up revise sentinels neither
+            # leak wire bytes into the assistant row nor glue the prose
+            # around them. The pre/post seam itself was already welded in
+            # ``full_response`` at the first ToolCallStarted marker (or
+            # left glued when no marker fired — matching the client, which
+            # only welds where a revise sentinel actually arrived), so the
+            # two halves join with a plain concat here.
+            post_tool_text = _strip_and_weld_revise_sentinels(
+                "".join(tool_response_chunks)
+            )
             tool_final_text = pre_tool_text + post_tool_text
             # Narration check (#1042 layer 3): the hook receives the
             # pre-tool prose snapshot taken at the first ToolCallStarted

@@ -953,6 +953,99 @@ nav {
 
 .message-content {
     word-wrap: break-word;
+    line-height: 1.55;
+}
+
+/* Markdown block typography.
+ *
+ * The chat bubble renders marked.js output, but historically nothing
+ * styled the generated block elements, so headings/lists/quotes fell
+ * back to bare UA defaults with zero margins — reading as flat,
+ * undifferentiated text (kestrel-sovereign #1547). These rules give
+ * the rendered markdown a real vertical rhythm. First/last-child
+ * margin collapse keeps the bubble from gaining stray top/bottom gaps. */
+.message-content > :first-child,
+.response-content > :first-child {
+    margin-top: 0;
+}
+
+.message-content > :last-child,
+.response-content > :last-child {
+    margin-bottom: 0;
+}
+
+.message-content p {
+    margin: 0.5rem 0;
+}
+
+.message-content h1,
+.message-content h2,
+.message-content h3,
+.message-content h4,
+.message-content h5,
+.message-content h6 {
+    margin: 1rem 0 0.5rem;
+    line-height: 1.25;
+    font-weight: 600;
+}
+
+.message-content h1 { font-size: 1.5rem; }
+.message-content h2 { font-size: 1.3rem; }
+.message-content h3 { font-size: 1.15rem; }
+.message-content h4 { font-size: 1rem; }
+.message-content h5 { font-size: 0.9rem; }
+.message-content h6 { font-size: 0.85rem; color: var(--text-secondary); }
+
+.message-content ul,
+.message-content ol {
+    margin: 0.5rem 0;
+    padding-left: 1.5rem;
+}
+
+.message-content li {
+    margin: 0.2rem 0;
+}
+
+.message-content li > ul,
+.message-content li > ol {
+    margin: 0.2rem 0;
+}
+
+.message-content blockquote {
+    margin: 0.5rem 0;
+    padding: 0.25rem 0 0.25rem 1rem;
+    border-left: 3px solid var(--border-color);
+    color: var(--text-secondary);
+}
+
+.message-content hr {
+    border: none;
+    border-top: 1px solid var(--border-color);
+    margin: 1rem 0;
+}
+
+.message-content table {
+    border-collapse: collapse;
+    margin: 0.5rem 0;
+    display: block;
+    overflow-x: auto;
+}
+
+.message-content th,
+.message-content td {
+    border: 1px solid var(--border-color);
+    padding: 0.35rem 0.6rem;
+    text-align: left;
+}
+
+.message-content th {
+    background: var(--bg-tertiary);
+    font-weight: 600;
+}
+
+.message-content a {
+    color: var(--accent-color);
+    text-decoration: underline;
 }
 
 .message-content pre {
