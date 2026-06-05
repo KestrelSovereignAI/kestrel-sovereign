@@ -1062,10 +1062,22 @@ nav {
     font-size: 0.875rem;
 }
 
+/* Inline code must stand out FROM the bubble. The bubble background is
+ * --bg-tertiary, so the old `background: var(--bg-tertiary)` made every
+ * `code` chip the exact same color as the bubble — invisible, and the
+ * chip padding then made the following punctuation float ("running=0 ,").
+ * A translucent neutral fill + border reads as a chip on both the light
+ * and dark bubble, and the accent text color makes backticked tokens pop. */
 .message-content :not(pre) > code {
-    background: var(--bg-tertiary);
-    padding: 0.125rem 0.375rem;
-    border-radius: 4px;
+    background: rgba(125, 125, 140, 0.16);
+    border: 1px solid rgba(125, 125, 140, 0.30);
+    padding: 0.05rem 0.3rem;
+    border-radius: 5px;
+    /* Inherit the bubble's text color so the chip stays legible on every
+     * surface — light/dark agent bubbles and the blue user bubble. The
+     * fill + border + monospace already make it read as code. */
+    color: inherit;
+    white-space: pre-wrap;
 }
 
 /* Tool activity indicators */
