@@ -112,9 +112,33 @@ class SchedulerFeature(Feature):
             db=self._db,
             agent_id=self._agent_id,
             executor=self._dispatch_scheduled_task,
+            misfire_grace_seconds=self._load_misfire_grace_seconds(),
         )
         await self._runner.start()
         logger.info("SchedulerFeature initialized")
+
+    @staticmethod
+    def _load_misfire_grace_seconds() -> int:
+        """Read ``[scheduler] misfire_grace_seconds`` from kestrel.toml.
+
+        Defaults to ``DEFAULT_MISFIRE_GRACE_SECONDS`` (host-suspend
+        resilience, #1545). Operators set 0 to disable the rail and restore
+        legacy fire-every-overdue-task behaviour."""
+        from kestrel_sovereign.config import load_section
+        from kestrel_sovereign.features.scheduler.runner import (
+            DEFAULT_MISFIRE_GRACE_SECONDS,
+        )
+
+        cfg = load_section("scheduler") or {}
+        raw = cfg.get("misfire_grace_seconds", DEFAULT_MISFIRE_GRACE_SECONDS)
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid scheduler.misfire_grace_seconds=%r, using %ds",
+                raw, DEFAULT_MISFIRE_GRACE_SECONDS,
+            )
+            return DEFAULT_MISFIRE_GRACE_SECONDS
 
     async def post_all_features_loaded(self, agent):
         """Register default scheduled tasks after all features are loaded.

@@ -112,6 +112,12 @@ class HeartbeatResult:
     timestamp: str = ""
     duration_ms: int = 0
     reason: Optional[str] = None   # Skip/error reason
+    # Host-suspend awareness (#1545): when the inter-tick wall gap implies
+    # ticks were slept through, this tick records how long the gap was and
+    # how many beats it swallowed, so a resumed heartbeat is auditable
+    # rather than silently re-anchored.
+    missed_beats: int = 0
+    gap_seconds: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -129,6 +135,13 @@ class HeartbeatRunner:
         self._task: Optional[asyncio.Task] = None
         self._history: List[Dict[str, Any]] = []
         self._running = False
+        # Wall-clock captured immediately BEFORE each inter-tick sleep, for
+        # suspend-gap detection (#1545). Measuring only the sleep span — not
+        # sleep+tick — keeps a slow LLM/dispatch tick from being misread as a
+        # host suspend. The detected gap (seconds, missed beats) is stashed
+        # here and consumed by the next tick into its HeartbeatResult.
+        self._pre_sleep_wall: Optional[float] = None
+        self._pending_gap: tuple[float, int] = (0.0, 0)
 
     @property
     def is_running(self) -> bool:
@@ -195,13 +208,20 @@ class HeartbeatRunner:
 
     async def _loop(self) -> None:
         """Main heartbeat loop."""
-        # Initial delay: wait one interval before first tick
+        # Initial delay: wait one interval before first tick. Anchor before
+        # the sleep so a suspend during it is caught at the top of the loop.
+        self._pre_sleep_wall = time.time()
         try:
             await asyncio.sleep(self.config.interval_seconds)
         except asyncio.CancelledError:
             return
 
         while self._running:
+            # A host suspend freezes the inter-tick sleep: if the just-ended
+            # sleep spanned far more wall-clock than one interval, beats were
+            # slept through (#1545). Measured across the sleep only — never
+            # across the tick — so a slow tick is not misread as a suspend.
+            self._note_sleep_elapsed()
             try:
                 result = await self._tick()
                 logger.info(
@@ -213,10 +233,48 @@ class HeartbeatRunner:
             except Exception as e:
                 logger.error(f"Heartbeat tick error: {e}", exc_info=True)
 
+            self._pre_sleep_wall = time.time()
             try:
                 await asyncio.sleep(self.config.interval_seconds)
             except asyncio.CancelledError:
                 break
+
+    def _note_sleep_elapsed(self) -> None:
+        """Compare the wall-clock span of the just-finished inter-tick sleep
+        against the configured interval. A sleep that lasted multiple
+        intervals means the host was suspended and beats were slept through;
+        stash the gap and missed-beat count for the upcoming tick and log it.
+
+        Only the sleep is measured (anchored in ``_pre_sleep_wall`` right
+        before ``asyncio.sleep``), so normal long ticks never register as a
+        gap."""
+        if self._pre_sleep_wall is None:
+            return
+        elapsed = time.time() - self._pre_sleep_wall
+        missed = self._compute_missed_beats(elapsed, self.config.interval_seconds)
+        if missed > 0:
+            gap = max(0.0, elapsed - self.config.interval_seconds)
+            logger.warning(
+                "Heartbeat resumed after ~%.0f min idle; ~%d beat(s) "
+                "slept through and dropped; re-anchoring cadence",
+                elapsed / 60.0, missed,
+            )
+            self._pending_gap = (gap, missed)
+
+    @staticmethod
+    def _compute_missed_beats(elapsed_seconds: float, interval_seconds: float) -> int:
+        """How many scheduled ticks were skipped given the wall-clock elapsed
+        between two consecutive ticks. One interval elapsed is the normal
+        case (0 missed); N intervals means N-1 were slept through."""
+        if interval_seconds <= 0:
+            return 0
+        beats = int(elapsed_seconds // interval_seconds)
+        return max(0, beats - 1)
+
+    def _consume_pending_gap(self) -> tuple[float, int]:
+        gap = self._pending_gap
+        self._pending_gap = (0.0, 0)
+        return gap
 
     async def _tick(self) -> HeartbeatResult:
         """Execute a single heartbeat tick.
@@ -268,6 +326,12 @@ class HeartbeatRunner:
                 duration_ms=duration_ms,
                 reason=f"dispatch_signal failed: {type(e).__name__}",
             )
+
+        # Stamp any suspend gap the loop detected before this tick so the
+        # resumed beat is auditable in history (#1545).
+        gap_seconds, missed_beats = self._consume_pending_gap()
+        result.gap_seconds = gap_seconds
+        result.missed_beats = missed_beats
 
         self._record_result(result)
         return result
