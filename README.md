@@ -123,15 +123,23 @@ If you later want to switch your data dir, move it: `mv ~/.kestrel /new/path && 
 
 All commands work on Windows, macOS, and Linux. Pass the agent directory as an argument:
 
+> **Running `kestrel` directly.** The commands below are written as bare
+> `kestrel …`. That works whenever the `kestrel` console script is on your
+> `PATH` — i.e. your project venv is activated (`source .venv/bin/activate`,
+> or `.venv\Scripts\activate` on Windows) or you installed it globally with
+> `uv tool install`. Working from a source clone *without* activating? Prefix
+> any command with `uv run` (e.g. `uv run kestrel status`) and uv will resolve
+> the project environment for you.
+
 ```bash
-uv run kestrel health                       # Check prerequisites
-uv run kestrel create MyAgent               # Create a new agent
-uv run kestrel start MyAgent                # Start an agent
-uv run kestrel stop MyAgent                 # Stop an agent
-uv run kestrel status                       # Show all running agents
-uv run kestrel list                         # List available agents
-uv run kestrel shell MyAgent                # CLI chat interface
-uv run kestrel config ./agent_data/MyAgent  # Show agent config
+kestrel health                       # Check prerequisites
+kestrel create MyAgent               # Create a new agent
+kestrel start MyAgent                # Start an agent
+kestrel stop MyAgent                 # Stop an agent
+kestrel status                       # Show all running agents
+kestrel list                         # List available agents
+kestrel shell MyAgent                # CLI chat interface
+kestrel config ./agent_data/MyAgent  # Show agent config
 ```
 
 ### Feature management (`kestrel feature`)
@@ -139,12 +147,12 @@ uv run kestrel config ./agent_data/MyAgent  # Show agent config
 Kestrel ships a lean core. Optional feature packages register `Feature` classes through the `kestrel_sovereign.features` entry-point group. Provider packages, such as cloud, voice, and storage backends, register with provider-specific entry-point groups and are consumed by their owning core or feature module.
 
 ```bash
-uv run kestrel feature list                   # Show installed + available features
-uv run kestrel feature info <name>            # Detailed info about a feature
-uv run kestrel feature install <name>         # Install a feature package
-uv run kestrel feature enable <name>          # Enable an installed feature
-uv run kestrel feature disable <name>         # Disable without uninstalling
-uv run kestrel feature scaffold <name>        # Generate a new feature package skeleton
+kestrel feature list                   # Show installed + available features
+kestrel feature info <name>            # Detailed info about a feature
+kestrel feature install <name>         # Install a feature package
+kestrel feature enable <name>          # Enable an installed feature
+kestrel feature disable <name>         # Disable without uninstalling
+kestrel feature scaffold <name>        # Generate a new feature package skeleton
 ```
 
 The canonical inventory of features lives in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/kestrel_sovereign/data/feature_registry.toml).
@@ -164,9 +172,9 @@ log_level = "INFO"
 
 Create or edit config:
 ```bash
-uv run kestrel config ./agent_data/myagent --init           # Create config
-uv run kestrel config ./agent_data/myagent --set-port 8899  # Change port
-uv run kestrel config ./agent_data/myagent --set-name MyAgent  # Change name
+kestrel config ./agent_data/myagent --init           # Create config
+kestrel config ./agent_data/myagent --set-port 8899  # Change port
+kestrel config ./agent_data/myagent --set-name MyAgent  # Change name
 ```
 
 ### Running Multiple Agents
@@ -175,15 +183,15 @@ Each agent runs on its own port. Create configs for each:
 
 ```bash
 # Agent 1: Alpha on port 8888
-uv run kestrel create Alpha --port 8888
-uv run kestrel start Alpha
+kestrel create Alpha --port 8888
+kestrel start Alpha
 
 # Agent 2: Helper on port 8889
-uv run kestrel create Helper --port 8889
-uv run kestrel start Helper
+kestrel create Helper --port 8889
+kestrel start Helper
 
 # Check status of all agents
-uv run kestrel status
+kestrel status
 ```
 
 ### Alternative: Direct Commands
@@ -192,18 +200,35 @@ uv run kestrel status
 # Start server directly (set KESTREL_DB_PATH first).
 # Pip-installed users invoke the in-package module (the wheel only ships
 # `kestrel_sovereign/`, no top-level `server.py`):
-KESTREL_DB_PATH=./agent_data/myagent uv run uvicorn kestrel_sovereign.server:app --port 8888
+KESTREL_DB_PATH=./agent_data/myagent uvicorn kestrel_sovereign.server:app --port 8888
 
 # CLI chat (no server needed)
-uv run python -m kestrel_sovereign.main ./agent_data/myagent
+python -m kestrel_sovereign.main ./agent_data/myagent
 
 # Source-clone shorthand: a thin re-export shim at the repo root keeps
 # the historical commands working when you've cloned the repo:
-#   uv run uvicorn server:app --port 8888
-#   uv run python main.py ./agent_data/myagent
+#   uvicorn server:app --port 8888
+#   python main.py ./agent_data/myagent
 ```
 
 > **Note:** `KESTREL_DB_PATH` is a **directory** path, not a file path. The database file `kestrel_prime.db` is created inside the specified directory. For example, setting `KESTREL_DB_PATH=./agent_data/myagent` stores the database at `./agent_data/myagent/kestrel_prime.db`.
+
+> **Keeping the host awake (long sessions / 24/7).** Kestrel does not manage
+> host power state itself — a long-running agent that must survive an idle
+> machine relies on the OS staying awake. For a dedicated deployment, prefer a
+> service supervisor (launchd/systemd) or an always-on host (Mac mini, VPS,
+> cloud container). For a foreground run on a laptop that would otherwise
+> sleep, wrap the command in the platform's keep-awake utility:
+>
+> - **macOS:** `caffeinate -s <command>` (e.g. `caffeinate -s kestrel start MyAgent`). `-s` prevents idle sleep while on AC power.
+> - **Linux (systemd):** `systemd-inhibit --what=sleep:idle --why="kestrel agent" <command>` holds a sleep inhibitor for the command's lifetime.
+> - **Windows:** there is no built-in command wrapper. Either disable sleep under **Settings → System → Power**, or hold an execution-state assertion for the session, e.g. in PowerShell:
+>   ```powershell
+>   $sig = '[DllImport("kernel32.dll")] public static extern uint SetThreadExecutionState(uint e);'
+>   $t = Add-Type -MemberDefinition $sig -Name Power -Namespace Win32 -PassThru
+>   $t::SetThreadExecutionState(0x80000003)  # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+>   kestrel start MyAgent
+>   ```
 
 <a id="web-ui-sovereign-console"></a>
 ## 🖥️ Web UI (Sovereign Console)
