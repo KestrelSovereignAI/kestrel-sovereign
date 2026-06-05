@@ -77,9 +77,21 @@ The split between `blocked_by_policy` and `blocked_by_user` is the point:
 **a sandbox or approval-layer rejection is never described as a user
 denial unless the approval record explicitly says the user denied it.**
 The attribution rule is a single function, `classify_denial`, which reads
-only the approval queue's own `(approved, scope)` contract — an explicit
-user submit carries the user's chosen scope (`once`/`session`/`always`),
-whereas `denied` / `timeout` / `cancelled` are not user decisions.
+only the approval queue's own `(approved, scope)` contract:
+
+- `user_denied` — a human pressed deny via the deny tool /
+  `!security-deny` (`SecurityFeature.deny_request`). This is the canonical
+  user denial.
+- `once` / `session` / `always` with `approved=False` — a human denied
+  through the web UI `/approve` endpoint (which only accepts those
+  scopes). Also a user denial.
+- `denied` — an operator/auto **policy** DENY. `request_approval`
+  early-returns this *without ever asking a human*, so it is **not** a
+  user denial. (This was the #1542 bug: the deny tool used to emit
+  `denied` too, colliding with policy denials and making `blocked_by_user`
+  unreachable for the real UI deny path. The tool now emits `user_denied`.)
+- `timeout` / `cancelled` / `cancelled_all` — no user ever decided; not a
+  user denial.
 
 ### Evidence in review/merge notes
 

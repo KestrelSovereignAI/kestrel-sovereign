@@ -351,12 +351,20 @@ def classify_execution(
 def classify_denial(command: str, scope: Optional[str]) -> TestCommandResult:
     """Attribute an approval denial precisely, per the #1542 rule.
 
-    Reads only the approval queue's ``scope`` contract:
+    Reads only the approval queue's ``scope`` contract, where the scope
+    returned alongside ``approved=False`` carries the denial's provenance:
 
-      * an explicit user submit carries the user's chosen scope
-        (``once`` / ``session`` / ``always``) with ``approved=False`` —
-        that is the only path that is a genuine *user* denial.
-      * ``denied`` is an operator/auto policy DENY (no human asked).
+      * ``user_denied`` — a human pressed deny via the deny tool /
+        ``!security-deny`` (``SecurityFeature.deny_request`` submits this
+        scope, and ``ApprovalQueue.request_approval`` returns it). This is
+        the canonical real *user* denial path.
+      * ``once`` / ``session`` / ``always`` with ``approved=False`` — a
+        human denied through the web UI ``/approve`` endpoint, which only
+        accepts those scopes. Also a genuine user denial.
+      * ``denied`` — an operator/auto policy DENY. ``request_approval``
+        early-returns this *without* a human ever being asked, so it is
+        NOT a user denial (this is the exact collision #1542 fixed: the
+        deny tool used to also emit ``denied``).
       * ``timeout`` / ``cancelled`` / ``cancelled_all`` mean no user ever
         decided — emphatically not a user denial.
 
@@ -365,7 +373,7 @@ def classify_denial(command: str, scope: Optional[str]) -> TestCommandResult:
     mislabeled as the user saying no.
     """
     s = (scope or "").strip().lower()
-    if s in ("once", "session", "always"):
+    if s in ("user_denied", "once", "session", "always"):
         return TestCommandResult(
             command=command,
             state=VerificationState.BLOCKED_BY_USER,

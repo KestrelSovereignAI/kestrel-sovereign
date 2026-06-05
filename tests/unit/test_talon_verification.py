@@ -1,5 +1,8 @@
 """Tests for the Talon test-evidence verification layer (#1542)."""
 
+import asyncio
+from unittest.mock import MagicMock
+
 import pytest
 
 from kestrel_sovereign.features.talon.verification import (
@@ -75,6 +78,13 @@ class TestClassifyDenial:
     @pytest.mark.parametrize("scope", ["once", "session", "always"])
     def test_user_denial_only_for_explicit_user_scope(self, scope):
         r = classify_denial("rm -rf /", scope)
+        assert r.state is VerificationState.BLOCKED_BY_USER
+        assert "user" in r.summary.lower()
+
+    def test_user_denied_scope_is_user_denial(self):
+        # The real ApprovalQueue contract: an explicit deny via the deny
+        # tool / !security-deny returns scope "user_denied" (#1542).
+        r = classify_denial("rm -rf /", "user_denied")
         assert r.state is VerificationState.BLOCKED_BY_USER
         assert "user" in r.summary.lower()
 
@@ -252,3 +262,86 @@ class TestEvidenceAggregation:
         assert ci.state == "passed"
         assert ci.checks[0]["name"] == "test"
         assert CIStatus.from_mapping(None) is None
+
+
+def _queue_approver(queue):
+    """Approver that drives the *real* ApprovalQueue, mirroring the
+    coordinator's ``_make_verify_approver`` adapter (returns the queue's
+    own ``(approved, scope)`` tuple)."""
+
+    async def _approve(command):
+        approved, scope = await queue.request_approval(
+            feature_name="talon",
+            tool_name="verify_command",
+            tool_args={"command": command},
+        )
+        return bool(approved), str(scope)
+
+    return _approve
+
+
+class TestRealApprovalQueueProvenance:
+    """Regression: drive the real ApprovalQueue / SecurityFeature deny
+    paths, not mocked approver tuples (#1542 review follow-up).
+
+    Both an explicit user denial and an operator/auto policy DENY resolve
+    through ``ApprovalQueue.request_approval`` — historically *both* as
+    ``(False, "denied")``, which made ``blocked_by_user`` unreachable for
+    the real UI deny path. These tests pin the corrected provenance.
+    """
+
+    @pytest.mark.asyncio
+    async def test_user_deny_via_security_feature_is_blocked_by_user(self):
+        from kestrel_sovereign.features.security.approval_queue import (
+            ApprovalQueue,
+        )
+        from kestrel_sovereign.features.security.feature import SecurityFeature
+
+        queue = ApprovalQueue()
+        feature = SecurityFeature(MagicMock())
+        feature.approval_queue = queue
+
+        verifier = TalonVerifier(execute=_exec_ok, approve=_queue_approver(queue))
+        verify_task = asyncio.create_task(
+            verifier.verify_command("make custom-tests")
+        )
+
+        # Wait for the approval request to be queued, then deny it exactly
+        # the way the UI / !security-deny tool does.
+        for _ in range(400):
+            if queue.pending_count == 1:
+                break
+            await asyncio.sleep(0.005)
+        assert queue.pending_count == 1, "approval request was never queued"
+
+        pending = queue.pending_requests[0]
+        deny_result = await feature.deny_request(pending.id)
+        assert deny_result.data["decision"] == "user_denied"
+
+        result = await verify_task
+        assert result.state is VerificationState.BLOCKED_BY_USER
+
+    @pytest.mark.asyncio
+    async def test_operator_policy_deny_is_blocked_by_policy(self, tmp_path):
+        from kestrel_sovereign.features.security.approval_queue import (
+            ApprovalQueue,
+        )
+        from kestrel_sovereign.features.security.permissions import (
+            PermissionLevel,
+            PermissionStore,
+        )
+
+        store = PermissionStore(str(tmp_path / "perms.db"))
+        await store.initialize()
+        await store.register_tool(
+            "talon", "verify_command", PermissionLevel.DENY
+        )
+
+        queue = ApprovalQueue(permission_store=store)
+        verifier = TalonVerifier(execute=_exec_ok, approve=_queue_approver(queue))
+
+        result = await verifier.verify_command("make custom-tests")
+        assert result.state is VerificationState.BLOCKED_BY_POLICY
+        assert "not a user denial" in result.summary
+        # The operator DENY must never be reported as a queued user prompt.
+        assert queue.pending_count == 0
