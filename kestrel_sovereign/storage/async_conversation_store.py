@@ -1358,7 +1358,27 @@ class AsyncConversationStore:
 
         query_lower = query.lower()
         query_tokens = _tokenize_for_search(query)
-        use_token_fallback = len(query_tokens) >= 2
+
+        # Query-side wrapper projection (#1554). #1550 stripped transport
+        # wrappers from candidate CONTENT before matching, but a
+        # wrapper-only query string (e.g. ``--- END MEMORIES ---`` or
+        # ``RELEVANT MEMORIES from past conversations``) was still treated
+        # as an ordinary tokenized search. Once candidate content is
+        # wrapper-stripped, ordinary canonical words like ``memory`` /
+        # ``memories`` / ``end`` still satisfy the 0.6 tokenized threshold,
+        # so a query that is itself pure retrieved-context transport syntax
+        # matched unrelated rows. Project the query through the same
+        # stripper: if no meaningful tokens survive, the query is pure
+        # transport syntax and must not drive the tokenized fallback at
+        # all. The exact-substring path below runs against the
+        # wrapper-stripped candidate content, so such a query can only hit
+        # when the literal string survives stripping in genuine canonical
+        # user/assistant text (not baked-in transport).
+        stripped_query_tokens = _tokenize_for_search(_strip_search_wrappers(query))
+        query_is_wrapper_only = bool(query_tokens) and not stripped_query_tokens
+        use_token_fallback = (
+            not query_is_wrapper_only and len(stripped_query_tokens) >= 2
+        )
 
         exact_results = []
         # Candidates for the tokenized fallback: (score, dict)
@@ -1417,9 +1437,12 @@ class AsyncConversationStore:
                     break
                 continue
 
-            # Tokenized fallback: score by fraction of query terms present
+            # Tokenized fallback: score by fraction of query terms present.
+            # Scored against the wrapper-stripped query tokens (#1554) so a
+            # pure-transport query can never reach this path — it is gated
+            # out above via ``query_is_wrapper_only``.
             if use_token_fallback and len(exact_results) < limit:
-                score = _token_match_score(query_tokens, content_lower)
+                score = _token_match_score(stripped_query_tokens, content_lower)
                 if score >= _TOKEN_MATCH_THRESHOLD:
                     token_candidates.append((score, _make_entry()))
 
