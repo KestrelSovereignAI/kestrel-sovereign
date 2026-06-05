@@ -274,6 +274,80 @@ async def test_search_does_not_match_retrieved_context_wrappers():
     assert len(results) == 0
 
 
+# Rendered transport form: canonical user text is a plain weather question,
+# but the baked <retrieved_context> wrapper + "RELEVANT MEMORIES" heading
+# carry the wrapper-only query terms. Such a row is NOT flagged sent_form
+# here (metadata is None), so _resolve_canonical does not strip it — the
+# search projection must.
+WRAPPER_ONLY_ROW_CONTENT = (
+    "<retrieved_context>\n<memories>\n"
+    "--- RELEVANT MEMORIES (from past conversations) ---\n"
+    "NOTE: These are retrieved from earlier conversations, not the current session.\n"
+    "[Memory 1] User: Meridian and the first kestrel agent, constitution governance\n"
+    "</memories>\n</retrieved_context>\n"
+    "<user_input>\nwhat is the weather like today\n</user_input>"
+)
+
+
+@pytest.mark.asyncio
+async def test_search_does_not_match_wrapper_only_terms_when_unstripped():
+    """#1537 regression: a query of wrapper-only terms must NOT match a row
+    solely because that phrase appears in rendered/retrieved-context wrapper
+    text. The row's canonical user content is an unrelated weather question."""
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    fake_row = (
+        1, "user", WRAPPER_ONLY_ROW_CONTENT, None, "2026-01-01 00:00:00", None,
+    )
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=[fake_row])
+
+    # The heading phrase lives only in the wrapper; canonical content is
+    # the weather question. Must not match.
+    results = await store.search_history(
+        "RELEVANT MEMORIES from past conversations", limit=10
+    )
+    assert len(results) == 0, (
+        "wrapper-only terms must not make an unrelated row searchable"
+    )
+
+    # And the broad token query whose terms appear ONLY in the wrapper
+    # memory line must likewise not match the canonical weather row.
+    results = await store.search_history(
+        "Meridian Kestrel constitution governance", limit=10
+    )
+    assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_content_still_matches_when_wrapped():
+    """#1537 must not break #1500: a row whose canonical user text contains
+    the broad query terms still matches even when wrapped in <user_input>
+    and a retrieved-context block that the search projection strips."""
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    wrapped = (
+        "<retrieved_context>\n<memories>\n"
+        "--- RELEVANT MEMORIES (from past conversations) ---\n"
+        "</memories>\n</retrieved_context>\n"
+        f"<user_input>\n{STORED_CONTENT}\n</user_input>"
+    )
+    fake_row = (1, "user", wrapped, None, "2026-01-01 00:00:00", None)
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=[fake_row])
+
+    results = await store.search_history(BROAD_QUERY, limit=10)
+    assert len(results) == 1, "canonical content must still match via token fallback"
+
+
 @pytest.mark.asyncio
 async def test_single_word_query_uses_exact_only():
     """Single-word queries should not activate token fallback."""

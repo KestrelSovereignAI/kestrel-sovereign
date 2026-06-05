@@ -112,6 +112,54 @@ def _tokenize_for_search(text: str) -> List[str]:
     ]
 
 
+# Transport-wrapper markers that get baked into rendered user turns
+# (see ``agent/context_builder.py`` and ``agent/memory_manager.py``).
+# These are prompt-replay transport, NOT canonical conversation content,
+# so they must never make an otherwise-unrelated row searchable (#1537).
+#
+# ``_resolve_canonical`` already strips wrappers for rows explicitly
+# flagged ``sent_form``. This projection is defense-in-depth for the
+# residual cases — rows where the flag is missing or the anchored
+# ``extract_raw_user_content`` grammar didn't fully strip — so a query
+# like ``"RELEVANT MEMORIES from past conversations"`` can't match a row
+# whose actual user text is unrelated and whose returned content is later
+# wrapper-stripped by ``MemoryFeature._strip_sent_form_for_recall``.
+_SEARCH_WRAPPER_BLOCK_RES = (
+    re.compile(r"<retrieved_context>.*?</retrieved_context>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<memories>.*?</memories>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<documents>.*?</documents>", re.DOTALL | re.IGNORECASE),
+)
+# Display-only heading emitted when baking retrieved memories into the
+# user template. Carries words ("relevant", "memories", "conversations")
+# that would otherwise satisfy the tokenized fallback on their own.
+_SEARCH_WRAPPER_HEADING_RE = re.compile(r"-*\s*RELEVANT MEMORIES.*", re.IGNORECASE)
+
+
+def _strip_search_wrappers(text: str) -> str:
+    """Project *text* to its wrapper-free form for SEARCH MATCHING only.
+
+    Rendered user turns carry transport wrappers — ``<retrieved_context>``,
+    ``<memories>``, ``<documents>`` blocks plus the ``RELEVANT MEMORIES``
+    display heading — baked in for byte-stable prompt replay (#1402).
+    Those wrappers are generated retrieval-context, not conversation
+    content; matching against them reintroduces the #1500/#1537 false
+    positive where a query of wrapper-only terms matches a row whose
+    actual user text is unrelated.
+
+    This is a matching-only projection: the row's canonical ``content``
+    (already split out by ``_resolve_canonical``) is what gets returned —
+    this stripped form only decides whether the row is a hit. Idempotent
+    on canonical rows that carry no wrappers.
+    """
+    if not text:
+        return text
+    s = text
+    for pattern in _SEARCH_WRAPPER_BLOCK_RES:
+        s = pattern.sub(" ", s)
+    s = _SEARCH_WRAPPER_HEADING_RE.sub(" ", s)
+    return s.replace("<user_input>", " ").replace("</user_input>", " ")
+
+
 # Negation tokens form a semantic-equivalence class for the fallback
 # matcher. When the query contains ANY negator, the content must contain
 # AT LEAST ONE negator from this class (word-boundary-matched, so "no"
@@ -1307,7 +1355,17 @@ class AsyncConversationStore:
                 row_id, row[1], meta, content, row[4] if len(row) > 4 else None
             )
 
-            content_lower = content.lower()
+            # Match against a wrapper-stripped projection (#1537): even
+            # after the canonical/transport split, a row whose ``sent_form``
+            # flag is missing (or whose anchored grammar didn't fully
+            # strip) can still carry generated <retrieved_context> /
+            # <memories> / <documents> blocks and the "RELEVANT MEMORIES"
+            # heading. Those are transport, not conversation content —
+            # matching on them would resurface the #1500 false positive
+            # where wrapper-only query terms make an unrelated row a hit.
+            # The returned ``content`` stays canonical; only the matching
+            # text is stripped.
+            content_lower = _strip_search_wrappers(content).lower()
 
             cleaned_meta = None  # lazily computed
 
