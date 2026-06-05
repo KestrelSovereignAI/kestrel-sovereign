@@ -605,6 +605,42 @@ test('revise boundary: existing whitespace at the seam is not double-spaced', as
         `existing whitespace seam must be preserved verbatim; got: ${JSON.stringify(finalText)}`);
 });
 
+test('revise boundary: SSE-only revise (no in-band sentinel) still welds', async () => {
+    // Codex review: the SSE `revising` event is the reliability backup
+    // for the in-band sentinel. If the sentinel is absent/lost but the
+    // SSE fires, the pre/post prose must still weld — not glue on a
+    // period — matching the server, which welds off the ToolCallStarted.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('weld-sse');
+    apiModule.default.setHostAgent('weld-sse');
+    mountChatPane('weld-sse');
+    pane.sessionId = 'sess-weld-sse';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('Let me check.');
+    await new Promise((r) => setTimeout(r, 5));
+    // Server fires the `revising` SSE event; NO in-band sentinel arrives.
+    pane.pendingRevise = true;
+    ctrl.push('The answer is 42.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'Let me check.\n\nThe answer is 42.',
+        `SSE-only revise must weld the boundary; got: ${JSON.stringify(finalText)}`);
+});
+
 test('complete sentinel followed by split sentinel prefix buffers the second marker', async () => {
     renderCalls.length = 0; finalizeCalls.length = 0;
 

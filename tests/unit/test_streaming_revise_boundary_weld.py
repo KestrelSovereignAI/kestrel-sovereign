@@ -191,3 +191,44 @@ async def test_inline_execution_path_welds_pre_and_post_tool_prose():
     # a boundary in the accumulated text.
     assert assistant_rows[0]["content"] == "Let me check that.\n\nThe answer is 42."
     assert "\x1e" not in assistant_rows[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_right_after_marker_persists_no_dangling_boundary():
+    """Codex review: the revise boundary is armed lazily. If the user
+    cancels after the marker but before any post-tool text arrives, the
+    persisted turn must NOT carry a trailing ``\\n\\n`` the client never
+    rendered (the client leaves its pendingReviseBoundary unconsumed)."""
+    from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
+    from kestrel_sdk.llm import ToolCallStarted
+
+    persisted = []
+    agent = _build_inline_agent(persisted)
+
+    # is_request_cancelled flips True only once the stream is exhausted —
+    # i.e. the user hits Stop after the LLM finished but before tools run.
+    cancel_state = {"cancelled": False}
+    agent.is_request_cancelled = MagicMock(
+        side_effect=lambda _rid: cancel_state["cancelled"]
+    )
+
+    async def stream(**kw):
+        yield "Let me check."
+        yield ToolCallStarted(index=0, id="tc1", name="github")
+        yield LLMResponse(
+            content="", tool_calls=[ToolCall(id="tc1", name="github", arguments={})]
+        )
+        cancel_state["cancelled"] = True  # Stop pressed post-stream
+
+    agent.llm_service = MagicMock()
+    agent.llm_service.stream_with_tool_detection = lambda **kw: stream()
+
+    async for _ in agent.process_input_streaming("go", session_id="s", request_id="r"):
+        pass
+
+    assistant_rows = [r for r in persisted if r["role"] == "assistant"]
+    assert len(assistant_rows) == 1
+    assert assistant_rows[0]["content"] == "Let me check.", (
+        "a turn cancelled right after the marker must persist exactly the "
+        "pre-tool prose — no dangling boundary the client never drew"
+    )

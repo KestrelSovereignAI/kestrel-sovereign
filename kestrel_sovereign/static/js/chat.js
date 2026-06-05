@@ -1283,9 +1283,14 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // A legacy SSE revising event can still arrive before
                     // the in-band sentinel. Clear the flag without clearing
                     // the visible accumulator; the sentinel itself is the
-                    // only thing that should disappear.
+                    // only thing that should disappear. #1547: the SSE
+                    // event is the reliability backup for the in-band
+                    // sentinel, so it ALSO arms the revise boundary — if
+                    // the sentinel is ever absent/lost, the pre/post prose
+                    // still welds instead of gluing on a period.
                     if (pane.pendingRevise) {
                         pane.pendingRevise = false;
+                        pendingReviseBoundary = true;
                     }
                     const chunk = sawSentinel ? textBefore + textAfter : textBefore;
                     if (!chunk) {
