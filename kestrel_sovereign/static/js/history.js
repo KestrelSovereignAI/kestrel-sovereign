@@ -9,7 +9,8 @@ import {
     updateContextStatus,
     wipeAgentChatPane,
     renderToolActivityHtml,
-    splitToolActivity,
+    segmentToolActivity,
+    renderAgentContentHtml,
 } from './chat.js';
 
 // ============================================================================
@@ -261,11 +262,20 @@ window.loadConversation = async function(sessionId) {
         }
 
         data.messages.forEach(msg => {
-            if (msg.role !== 'system') {
-                let toolHtml = '';
-                let preludeContent = '';
-                let content = msg.content;
-                if (msg.role === 'assistant' && msg.metadata?.tool_events?.length > 0) {
+            if (msg.role === 'system') return;
+            const isEncrypted = msg.encrypted && !state.showDecrypted;
+            let toolHtml = '';
+            let bodyHtml = null;
+            const content = msg.content;
+            if (msg.role === 'assistant' && !isEncrypted) {
+                if (segmentToolActivity(content).some((seg) => seg.kind === 'tools')) {
+                    // Inline tool markers present (the common persisted shape):
+                    // render cards + prose in document order, the same as the
+                    // live bubble.
+                    bodyHtml = renderAgentContentHtml(content);
+                } else if (msg.metadata?.tool_events?.length > 0) {
+                    // No inline markers, but a structured tool-event record \u2014
+                    // surface it as a card block above the prose.
                     const toolActivityText = msg.metadata.tool_events.map(ev => {
                         if (ev.type === 'start') return `\u{1F527} Calling ${ev.tool}...`;
                         if (ev.type === 'complete') return `\u2713 ${ev.tool} complete (${ev.ms}ms)`;
@@ -274,23 +284,16 @@ window.loadConversation = async function(sessionId) {
                     }).filter(Boolean).join('\n');
                     toolHtml = renderToolActivityHtml(toolActivityText);
                 }
-                if (msg.role === 'assistant') {
-                    const split = splitToolActivity(content);
-                    if (split.hasToolActivity) {
-                        if (!toolHtml) toolHtml = renderToolActivityHtml(split.toolActivity);
-                        preludeContent = split.prelude;
-                        content = split.response;
-                    }
-                }
-                addMessageToChat(
-                    msg.role,
-                    content,
-                    msg.encrypted && !state.showDecrypted,
-                    msg.id,
-                    toolHtml,
-                    preludeContent,
-                );
             }
+            addMessageToChat(
+                msg.role,
+                content,
+                isEncrypted,
+                msg.id,
+                toolHtml,
+                '',
+                bodyHtml,
+            );
         });
 
         renderConversationHistory({ conversations: state.conversations, encrypted_at_rest: state.encryptedAtRest });
@@ -423,6 +426,7 @@ function addMessageToChat(
     messageId = null,
     toolActivityHtml = '',
     preludeContent = '',
+    bodyHtml = null,
 ) {
     // Append into the visible (mounted) agent's pane element — the
     // viewport (#chat-container) is now the scroll host and panes are
@@ -523,7 +527,11 @@ function addMessageToChat(
         // hard-purge affordances render briefly then get blown away.
         const contentDiv = document.createElement('div');
         contentDiv.className = 'message-content';
-        if (role === 'assistant' && window.marked) {
+        if (bodyHtml !== null) {
+            // Pre-rendered cards + prose (assistant turns with tool activity),
+            // already in document order — see renderAgentContentHtml.
+            contentDiv.innerHTML = bodyHtml;
+        } else if (role === 'assistant' && window.marked) {
             contentDiv.innerHTML = marked.parse(content);
         } else {
             contentDiv.textContent = content;
