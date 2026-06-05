@@ -1037,3 +1037,147 @@ async def test_signal_source_registered_idempotent(tmp_path):
     await feat2.initialize()
     # Still exactly one registration.
     assert len(registry.registered) == 1
+
+
+# ---------------------------------------------------------------------------
+# Chat-visible restart_status events (#1551)
+# ---------------------------------------------------------------------------
+
+
+def _attach_emit_capture(feat) -> list:
+    """Give the feature's agent a capturing ``emit_event`` and return the
+    list it records ``(event_type, payload)`` tuples into.
+    """
+    captured: list = []
+
+    async def _emit(event_type, data):
+        captured.append((event_type, data))
+
+    feat.agent.emit_event = _emit
+    return captured
+
+
+def _restart_status_events(captured) -> list:
+    return [d for (t, d) in captured if t == "restart_status"]
+
+
+@pytest.mark.asyncio
+async def test_request_restart_emits_pending_status_event(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    captured = _attach_emit_capture(feat)
+    result = await feat.request_restart(reason="kestrel.toml change landed")
+    req_id = result.data["request"]["id"]
+
+    events = _restart_status_events(captured)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["request_id"] == req_id
+    assert ev["status"] == "pending"
+    assert ev["operation"] == "restart_only"
+    assert ev["requested_by_agent"] == "did:test:agent"
+    assert ev["reason"] == "kestrel.toml change landed"
+    assert ev["deferral_reason"] == ""
+
+
+@pytest.mark.asyncio
+async def test_request_restart_without_emit_event_is_safe(tmp_path):
+    """Headless/test agents without ``emit_event`` must not break the
+    request lifecycle — the status event is best-effort only.
+    """
+    feat, backend = await _make_feature(tmp_path)
+    # Ensure no emit_event surface exists on the agent.
+    assert not hasattr(feat.agent, "emit_event")
+    result = await feat.request_restart(reason="no emitter present")
+    assert result.status is ToolResultStatus.OK
+    rows = await list_requests(backend)
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_coordinator_executing_emits_status_event(tmp_path):
+    feat, backend = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+    captured = _attach_emit_capture(feat)
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ):
+        await feat.restart_coordinator()
+
+    states = [e["status"] for e in _restart_status_events(captured)
+              if e["request_id"] == req_id]
+    assert "executing" in states
+
+
+@pytest.mark.asyncio
+async def test_coordinator_defer_emits_status_with_reason(tmp_path):
+    # Busy agent → idle_agents_only policy defers; the deferral and its
+    # reason must surface as a status event (#1551).
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    agent._active_request_ids = {"req-1"}
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+    captured = _attach_emit_capture(feat)
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 0
+    deferred_events = [
+        e for e in _restart_status_events(captured)
+        if e["request_id"] == req_id and e["deferral_reason"]
+    ]
+    assert len(deferred_events) == 1
+    ev = deferred_events[0]
+    assert ev["status"] == "pending"
+    assert "active request" in ev["deferral_reason"]
+
+
+@pytest.mark.asyncio
+async def test_cancel_emits_canceled_status_event(tmp_path):
+    feat, _ = await _make_feature(tmp_path)
+    created = await feat.request_restart(reason="r")
+    req_id = created.data["request"]["id"]
+    captured = _attach_emit_capture(feat)
+
+    await feat.cancel_restart_request(req_id, reason="never mind")
+
+    events = [e for e in _restart_status_events(captured)
+              if e["request_id"] == req_id]
+    assert len(events) == 1
+    assert events[0]["status"] == "canceled"
+    assert "never mind" in events[0]["status_reason"]
+
+
+@pytest.mark.asyncio
+async def test_post_restart_sweep_emits_completed_status_event(tmp_path):
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    dispatcher = _CapturingDispatcher()
+    agent = _make_agent(backend, dispatcher=dispatcher)
+    captured: list = []
+
+    async def _emit(event_type, data):
+        captured.append((event_type, data))
+
+    agent.emit_event = _emit
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+
+    events = [e for e in _restart_status_events(captured)
+              if e["request_id"] == req.id]
+    assert len(events) == 1
+    assert events[0]["status"] == "completed"
+    assert events[0]["completed_at"]

@@ -325,6 +325,13 @@ class KestrelAgent(
         # Event listeners for SSE notifications
         self._event_listeners: List[Any] = []
 
+        # Events emitted while no SSE listener is connected are buffered
+        # here and replayed to the first listener that connects. Covers the
+        # host-startup gap: feature.initialize() can emit_event (e.g. the
+        # restart `completed` status — #1551) before the browser reconnects
+        # its notifications stream. Bounded in EventManagerMixin.
+        self._pending_events: List[Any] = []
+
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
         self._background_tasks: set[asyncio.Task] = set()

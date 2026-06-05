@@ -33,6 +33,7 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 
+from .events import EVENT_NAME, build_restart_status_event
 from .store import (
     KNOWN_OPERATIONS,
     KNOWN_POLICIES,
@@ -245,6 +246,9 @@ class RestartCoordinatorFeature(Feature):
             req.id, operation, urgency, policy, req.update_profile,
             req.update_target_ref, reason[:80],
         )
+        # Surface the filed request as a chat-visible status event so the
+        # Sovereign sees it without relying on agent prose (#1551).
+        await self._emit_status_event(req, state="pending")
         return ToolResult.ok(
             confirmation=(
                 f"Filed {operation} request {req.id} ({urgency}, {policy})"
@@ -338,6 +342,10 @@ class RestartCoordinatorFeature(Feature):
                     "current_status": current,
                 },
             )
+        await self._emit_status_event(
+            row, state="canceled",
+            status_reason=(reason.strip() or "canceled by agent"),
+        )
         return ToolResult.ok(
             confirmation=f"Canceled restart request {row.id}",
             data={"canceled": True, "request_id": row.id},
@@ -389,6 +397,11 @@ class RestartCoordinatorFeature(Feature):
                         "request_id": req.id,
                         "reason": decision["reason"],
                     })
+                    # Surface the deferred attempt + its reason (#1551).
+                    await self._emit_status_event(
+                        req, state="pending",
+                        deferral_reason=decision["reason"],
+                    )
                     continue
                 # Hard reject.
                 await update_status(
@@ -397,6 +410,9 @@ class RestartCoordinatorFeature(Feature):
                     status_reason=decision["reason"],
                     completed_at=datetime.now(timezone.utc).isoformat(),
                     expected_current_status=req.status,
+                )
+                await self._emit_status_event(
+                    req, state="rejected", status_reason=decision["reason"],
                 )
                 continue
 
@@ -431,6 +447,10 @@ class RestartCoordinatorFeature(Feature):
                 })
                 continue
 
+            # Surface the transition out of pending — ``updating`` (update
+            # profile running) or ``executing`` (restart dispatched) (#1551).
+            await self._emit_status_event(req, state=initial_state)
+
             # update_then_restart: run the allowlisted update profile
             # against the local checkout BEFORE restarting. A failure
             # here records the audit log and decides retryable vs
@@ -440,6 +460,22 @@ class RestartCoordinatorFeature(Feature):
                 if handled is not None:
                     # Either deferred (retryable) or rejected (terminal).
                     deferred.append(handled)
+                    # Reflect the post-update outcome the helper landed
+                    # the row on — fetch the fresh status so a rejected
+                    # update reads as rejected, a retryable one as a
+                    # deferred pending (#1551).
+                    fresh = await get_request(self._db, req.id)
+                    if fresh is not None:
+                        if fresh.status == "rejected":
+                            await self._emit_status_event(
+                                fresh, state="rejected",
+                                status_reason=fresh.status_reason,
+                            )
+                        else:
+                            await self._emit_status_event(
+                                fresh, state=fresh.status,
+                                deferral_reason=handled.get("reason", ""),
+                            )
                     continue
                 # Re-run the safety gate before the restart now that the
                 # (possibly slow) update has completed.
@@ -461,6 +497,13 @@ class RestartCoordinatorFeature(Feature):
                             f"{decision['reason']}"
                         ),
                     })
+                    await self._emit_status_event(
+                        req, state="pending",
+                        deferral_reason=(
+                            "update ok; restart deferred — "
+                            f"{decision['reason']}"
+                        ),
+                    )
                     continue
                 # Update done and still safe — NOW cross into ``executing``
                 # right before the spawn so the post-restart sweep
@@ -477,6 +520,7 @@ class RestartCoordinatorFeature(Feature):
                         "reason": "lost race after update before restart",
                     })
                     continue
+                await self._emit_status_event(req, state="executing")
 
             try:
                 self._spawn_restart_subprocess()
@@ -489,6 +533,10 @@ class RestartCoordinatorFeature(Feature):
                     status="pending",
                     status_reason=f"spawn failed: {e}",
                     expected_current_status="executing",
+                )
+                await self._emit_status_event(
+                    req, state="pending",
+                    deferral_reason=f"spawn failed: {e}",
                 )
                 continue
 
@@ -513,6 +561,40 @@ class RestartCoordinatorFeature(Feature):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    async def _emit_status_event(
+        self,
+        req,
+        *,
+        state: str,
+        deferral_reason: str = "",
+        status_reason: str = "",
+    ) -> None:
+        """Surface a chat-visible ``restart_status`` event (#1551).
+
+        Best-effort: a restart is an audited deployment primitive, so
+        the Sovereign should see it in chat — but a missing/raising
+        ``emit_event`` (headless host, test agent) must never break the
+        request lifecycle. Failures are logged at debug and swallowed.
+        """
+        emit = getattr(self.agent, "emit_event", None)
+        if emit is None:
+            return
+        agent_did = getattr(self.agent, "did", "") or ""
+        payload = build_restart_status_event(
+            req,
+            state=state,
+            deferral_reason=deferral_reason,
+            status_reason=status_reason,
+            agent_did=str(agent_did),
+        )
+        try:
+            await emit(EVENT_NAME, payload)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(
+                "restart_status emit failed for %s: %s",
+                getattr(req, "id", "?"), e,
+            )
 
     def _evaluate_safety(self, req) -> Dict[str, Any]:
         """Return ``{safe, reason, deferable}`` for one request.
@@ -938,4 +1020,12 @@ class RestartCoordinatorFeature(Feature):
                 status_reason="post-restart sweep observed agent re-init",
                 completed_at=now,
                 expected_current_status="executing",
+            )
+            # Mirror the COGNITION wake with a chat-visible status event so
+            # the completed restart shows in chat, not only as an agent
+            # turn (#1551).
+            row.completed_at = now
+            await self._emit_status_event(
+                row, state="completed",
+                status_reason="post-restart sweep observed agent re-init",
             )

@@ -494,6 +494,16 @@ async def notifications_sse(request: Request):
             # Send initial connection event
             yield f"event: connected\ndata: {json.dumps({'status': 'connected'})}\n\n"
 
+            # Replay any events buffered while no listener was connected —
+            # e.g. the restart `completed` status emitted from
+            # feature.initialize() during host startup, before this
+            # reconnect landed (#1551). Drained once; registering the
+            # listener above first means any event emitted from here on
+            # goes to the queue instead, so nothing is dropped or doubled.
+            if hasattr(agent, "get_pending_events"):
+                for ev_type, ev_data in agent.get_pending_events():
+                    yield f"event: {ev_type}\ndata: {json.dumps(ev_data)}\n\n"
+
             ping_interval = SSE_PING_INTERVAL_SECONDS
             # Wave 5C: revising events are time-sensitive — the chat
             # UI uses them to retract pre-tool prose BEFORE post-tool

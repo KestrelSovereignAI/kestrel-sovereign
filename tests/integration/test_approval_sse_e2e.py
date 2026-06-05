@@ -186,3 +186,64 @@ async def test_approval_request_reaches_sse_and_decision_resolves_caller():
         pass
     # Listener should have been removed by the finally block.
     assert agent._event_listeners == []
+
+
+@pytest.mark.asyncio
+async def test_event_buffered_before_connect_is_replayed_on_sse_connect():
+    """An event emitted while NO listener is connected (the host-startup
+    reality the restart `completed` status straddles — #1551) must be
+    buffered and replayed to the SSE stream when the browser reconnects.
+
+    This is the production path the mocked unit tests can't see: at boot,
+    feature.initialize() emits into an empty _event_listeners list. Without
+    the buffer/replay the event is dropped; with it, the first reconnecting
+    SSE client receives it.
+    """
+    app = FastAPI()
+    app.include_router(agent_router)
+
+    agent = _ApprovalAgent()
+    app.state.agent = agent
+
+    # Emit BEFORE any SSE stream exists — exactly the startup gap.
+    assert agent._event_listeners == []
+    await agent.emit_event(
+        "restart_status",
+        {"request_id": "abc123", "status": "completed"},
+    )
+
+    disconnect = asyncio.Event()
+    request = _build_request(app, disconnect)
+    response = await notifications_sse(request)
+
+    async def stream_reader():
+        buffer = ""
+        async for chunk in response.body_iterator:
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8")
+            buffer += chunk
+            while "\n\n" in buffer:
+                block, buffer = buffer.split("\n\n", 1)
+                event_type = None
+                data_line = None
+                for line in block.splitlines():
+                    if line.startswith("event: "):
+                        event_type = line[len("event: "):].strip()
+                    elif line.startswith("data: "):
+                        data_line = line[len("data: "):]
+                if event_type == "restart_status" and data_line:
+                    return json.loads(data_line)
+
+    reader_task = asyncio.create_task(stream_reader())
+    payload = await asyncio.wait_for(reader_task, timeout=5.0)
+    assert payload == {"request_id": "abc123", "status": "completed"}
+
+    # Drained once — the buffer is now empty.
+    assert agent.get_pending_events() == []
+
+    disconnect.set()
+    try:
+        async for _ in response.body_iterator:
+            pass
+    except Exception:
+        pass
