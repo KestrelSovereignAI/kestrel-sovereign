@@ -46,6 +46,10 @@ from kestrel_sovereign.features.talon.runtime import (
     sanitize_env_for_backend,
     write_talon_preference,
 )
+from kestrel_sovereign.features.talon.verification import (
+    CommandExecution,
+    TalonVerifier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -972,6 +976,211 @@ class TalonCoordinatorFeature(Feature):
             confirmation="Talon preference updated",
             data={"success": True, **result},
         )
+
+    @tool(
+        name="talon_verify",
+        description=(
+            "Reviewer-side audited test verification. Run one or more "
+            "test commands and report a precise result state per command "
+            "(passed / failed / blocked_by_policy / blocked_by_user / "
+            "blocked_by_sandbox / tooling_error). Allowlisted project test "
+            "commands (e.g. `uv run pytest ...`) run without prompting; "
+            "anything else is approval-gated. Use this instead of ad-hoc "
+            "shell so test evidence is structured and audited, and so a "
+            "sandbox/policy block is never mislabeled as a user denial."
+        ),
+        category=ToolCategory.SYSTEM,
+        command_prefix="!talon verify",
+    )
+    async def talon_verify(
+        self,
+        commands: str,
+        repo: str = "self",
+        cwd: Optional[str] = None,
+        timeout: int = 600,
+        note: str = "",
+    ) -> ToolResult:
+        """Run targeted verification commands and report structured evidence.
+
+        Args:
+            commands: One command per line (blank lines ignored).
+                Allowlisted test runners run directly; non-allowlisted
+                commands require approval and the block reason is recorded
+                precisely.
+            repo: ``owner/name`` (or ``self``) — used to locate the
+                workspace clone to run in when ``cwd`` is not given.
+            cwd: Working directory override. Defaults to the repo's
+                workspace clone if present, else the project directory.
+            timeout: Per-command wall-clock cap in seconds.
+            note: Optional reviewer note included in the evidence (e.g.
+                "local tests could not run; CI is the remaining hard gate").
+
+        Returns:
+            ``ToolResult.ok`` when every command passed; ``partial`` when
+            any command failed, was blocked, or could not run (the tool
+            itself ran fine — the LLM must not claim a clean pass).
+            ``data`` carries the full ``VerificationEvidence`` dict and
+            ``confirmation`` carries the markdown evidence block for
+            review/merge notes.
+        """
+        command_list = [c.strip() for c in str(commands).splitlines() if c.strip()]
+        if not command_list:
+            return ToolResult.failed(
+                "talon_verify: no commands provided (one per line).",
+                data={"success": False, "overall_state": "not_run"},
+            )
+
+        try:
+            run_cwd = self._resolve_verify_cwd(repo, cwd)
+        except ValueError as e:
+            return ToolResult.failed(
+                str(e), data={"success": False, "overall_state": "not_run"}
+            )
+
+        verifier = TalonVerifier(
+            execute=self._make_verify_executor(run_cwd),
+            approve=self._make_verify_approver(repo, run_cwd),
+        )
+        try:
+            timeout_int = max(1, int(timeout))
+        except (TypeError, ValueError):
+            timeout_int = 600
+
+        evidence = await verifier.verify_commands(
+            command_list, timeout=timeout_int, note=note
+        )
+        data = {
+            "success": True,
+            "repo": self._resolve_repo(repo),
+            "cwd": str(run_cwd),
+            **evidence.to_dict(),
+        }
+        confirmation = evidence.to_markdown()
+        if evidence.all_passed:
+            return ToolResult.ok(confirmation=confirmation, data=data)
+        return ToolResult.partial(
+            confirmation,
+            f"verification overall state: {evidence.overall_state.value}",
+            data=data,
+        )
+
+    def _resolve_verify_cwd(self, repo: str, cwd: Optional[str]) -> Path:
+        """Pick the directory to run verification commands in.
+
+        ``cwd`` wins when given. Otherwise prefer the repo's workspace
+        clone (the sandboxed checkout Talon worked in); fall back to the
+        project directory. Raises ``ValueError`` if the resolved path is
+        not a directory.
+        """
+        if cwd:
+            path = Path(cwd).expanduser().resolve()
+            if not path.is_dir():
+                raise ValueError(f"talon_verify: cwd is not a directory: {path}")
+            return path
+        repo_resolved = self._resolve_repo(repo)
+        workspace = self._workspace_path_for(repo_resolved)
+        if (workspace / ".git").exists():
+            return workspace
+        from kestrel_sovereign.paths import project_dir
+
+        return project_dir()
+
+    def _make_verify_executor(self, run_cwd: Path):
+        """Build an async executor that runs a command in ``run_cwd``.
+
+        Returns a :class:`CommandExecution` whose ``ran`` flag records
+        whether the process actually executed, so the verifier can tell
+        a real exit code from a tooling/sandbox failure.
+        """
+
+        async def _execute(command: str, *, timeout: int = 600) -> CommandExecution:
+            try:
+                argv = shlex.split(command)
+            except ValueError as e:
+                return CommandExecution(ran=False, error=f"unparseable command: {e}")
+            if not argv:
+                return CommandExecution(ran=False, error="empty command")
+
+            env = dict(os.environ)
+            started = time.monotonic()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    cwd=str(run_cwd),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+            except FileNotFoundError as e:
+                return CommandExecution(
+                    ran=False, error=f"command not found: {argv[0]} ({e})"
+                )
+            except PermissionError as e:
+                return CommandExecution(
+                    ran=False,
+                    sandbox_denied=True,
+                    error=f"sandbox refused to execute {argv[0]}: {e}",
+                )
+            except Exception as e:  # noqa: BLE001
+                return CommandExecution(ran=False, error=f"failed to launch: {e}")
+
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                duration_ms = int((time.monotonic() - started) * 1000)
+                return CommandExecution(
+                    ran=False,
+                    duration_ms=duration_ms,
+                    error=f"command timed out after {timeout}s",
+                )
+            duration_ms = int((time.monotonic() - started) * 1000)
+            return CommandExecution(
+                ran=True,
+                returncode=proc.returncode,
+                stdout=stdout_b.decode(errors="replace"),
+                stderr=stderr_b.decode(errors="replace"),
+                duration_ms=duration_ms,
+            )
+
+        return _execute
+
+    def _make_verify_approver(self, repo: str, run_cwd: Path):
+        """Build an async approver for non-allowlisted verify commands.
+
+        Returns ``None`` (fail-closed, reported as ``blocked_by_policy``)
+        when no SecurityFeature/approval queue is available. An explicit
+        operator DENY is reported by the approval queue as a non-user
+        scope, so :func:`verification.classify_denial` never mislabels it
+        as a user denial.
+        """
+
+        async def _approve(command: str) -> Optional[tuple[bool, str]]:
+            security = self._get_security_feature()
+            queue = getattr(security, "approval_queue", None) if security else None
+            if queue is None:
+                return None
+            try:
+                approved, scope = await queue.request_approval(
+                    feature_name="talon",
+                    tool_name="verify_command",
+                    tool_args={
+                        "command": command,
+                        "repo": self._resolve_repo(repo),
+                        "cwd": str(run_cwd),
+                    },
+                )
+                return bool(approved), str(scope)
+            except (TimeoutError, asyncio.TimeoutError):
+                return False, "timeout"
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"talon_verify approval failed: {e}", exc_info=True)
+                return None
+
+        return _approve
 
     @tool(
         name="talon_workspace_status",

@@ -16,6 +16,16 @@ Dispatched against: `{payload[repo]}#{payload[issue]}` — label: `{payload[labe
 
 If the tail is empty, the job exited before any output was produced. Full log path: `{payload[log_path]}`. Time range: `{payload[started_at]}` → `{payload[completed_at]}`.
 
+**Test evidence (implementation side):**
+
+```
+{payload[test_evidence]}
+```
+
+CI status reported by Talon: `{payload[ci_status]}`.
+
+Test evidence is the implementation-side gate: which targeted tests Talon ran, their exit codes, and the CI status it observed. If it is empty, Talon did not report structured evidence — do NOT assume tests passed. As the reviewer, run independent verification with `talon_verify(...)` (allowlisted test commands run without prompting; the result state distinguishes `passed` / `failed` / `blocked_by_policy` / `blocked_by_user` / `blocked_by_sandbox` / `tooling_error`). If local tests cannot run, say so precisely and treat CI as the remaining hard merge gate — do not describe a sandbox/policy block as the user denying anything unless the approval record explicitly says so.
+
 The job record stays in the durable registry — you can call `talon_status()` to see the full job listing or `talon_job_log(job_id="{payload[job_id]}")` to tail more lines. You can also dispatch a fresh Talon job for the same issue if a retry is warranted.
 
 source={source}
