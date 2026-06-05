@@ -78,120 +78,138 @@ function groupToolActivity(lines) {
     return groups;
 }
 
-function isToolActivityLine(line) {
-    const text = String(line || '').trim();
-    return (
-        isToolActivityStartLine(text) ||
-        /^\u2713\s+.+\s+(?:complete|done)(?:\s+\(.+\))?$/u.test(text) ||
-        /^\u274C\s+.+\s+failed(?::.*)?$/u.test(text)
-    );
-}
+// Tool-activity markers are recognized STRUCTURALLY as bounded tokens.
+// Each token self-terminates (at "...", the complete/done keyword, or the
+// failed clause), so prose welded onto EITHER side splits out cleanly:
+//   START: 🔧 Calling <name>[: detail]...
+//   DONE:  ✓ <name> complete|done [(detail)]
+//   ERROR: ❌ <name> failed[: detail]
+// The error detail excludes the marker code points (🔧 ✓ ❌) so a
+// detail glued to a following marker — "❌ x failed: timeout🔧 Calling
+// y..." — terminates at that marker instead of swallowing it (codex
+// review). Start ("...") and done (keyword/paren) are already self-bounded.
+const TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n\u{1F527}✓❌]*)?/gu;
 
-function isToolActivityStartLine(line) {
-    return /^\u{1F527}\s+Calling\s+.+(?:\.\.\.)?$/u.test(String(line || '').trim());
-}
+// A turn is only treated as tool activity when it contains at least one
+// 🔧 Calling start marker. Done/error markers (✓/❌) are recognized only
+// in that company — so a fast-item turn's done-only markers still card,
+// but ordinary prose that happens to read "✓ migration complete" or
+// "❌ build failed" never gets mistaken for a tool card.
+const TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
 
-// Server emitters yield tool markers with only a TRAILING newline
-// (orchestrator_engine.py and codex_adapter.py). The LLM's preceding
-// text chunk is not guaranteed to end with `\n`, so the accumulated
-// buffer often looks like `"...so we get a grounded success or
-// failure.🔧 Calling list_peers..."` — a single glued line that the
-// anchored `^🔧` matchers below can't see. Normalize here so the
-// downstream line-prefix logic recognizes the section boundary
-// regardless of upstream newline discipline. Gated on the presence
-// of a 🔧-Calling marker so ordinary assistant prose containing
-// phrases like "Done: ✓ migration complete" is left untouched.
-const TOOL_MARKER_PRESENCE_PATTERN = /\u{1F527}\s+Calling\s+/u;
-const TOOL_MARKER_PREFIX_PATTERN = /([^\n])(\u{1F527}\s+Calling\s+|✓\s+\S[^\n]*?\s+(?:complete|done)\b|❌\s+\S[^\n]*?\s+failed\b)/gu;
-function normalizeToolMarkerLineBreaks(text) {
-    if (!TOOL_MARKER_PRESENCE_PATTERN.test(text)) return text;
-    return text.replace(TOOL_MARKER_PREFIX_PATTERN, '$1\n$2');
-}
+// The orchestrator emits a bare `---` line as the wire delimiter between
+// the tool-activity block and the synthesized answer. It is protocol,
+// not prose — dropped (only where it appears, leading the prose right
+// after a tools block) so it never renders as a stray <hr> while genuine
+// markdown rules elsewhere survive.
 
-export function splitToolActivity(content) {
-    const text = normalizeToolMarkerLineBreaks(String(content || ''));
-    const [beforeSeparator, ...afterSeparatorParts] = text.split('\n---\n');
-    const beforeLines = beforeSeparator.split('\n');
-    const toolStartIndex = beforeLines.findIndex(isToolActivityStartLine);
-    if (toolStartIndex < 0) {
-        return {
-            prelude: '',
-            toolActivity: '',
-            response: text,
-            hasToolActivity: false,
-        };
+/**
+ * Segment a (possibly partial) assistant message into an ordered list of
+ * ``{ kind: 'prose' | 'tools', text }`` blocks. Adjacent tool markers
+ * (separated only by whitespace) coalesce into one tools block — one
+ * card group — while real prose between them stays prose, so a
+ * multi-iteration turn renders as cards/prose/cards/prose in document
+ * order instead of one leading card group followed by inline marker text.
+ */
+export function segmentToolActivity(content) {
+    const text = String(content || '');
+    // No start marker → no tool activity at all; the whole message is
+    // prose (and any literal `---` is a real markdown rule, left alone).
+    if (!TOOL_START_PRESENCE.test(text)) {
+        return text.trim() ? [{ kind: 'prose', text }] : [];
     }
 
-    const prelude = beforeLines.slice(0, toolStartIndex).join('\n').trimEnd();
-    if (afterSeparatorParts.length > 0) {
-        const toolActivity = beforeLines.slice(toolStartIndex).join('\n');
-        const response = afterSeparatorParts.join('\n---\n');
-        return {
-            prelude,
-            toolActivity,
-            response,
-            hasToolActivity: !!toolActivity.trim(),
-        };
-    }
-
-    const toolAndMaybeResponse = beforeLines.slice(toolStartIndex);
-    const responseStart = toolAndMaybeResponse.findIndex((line) => line.trim() && !isToolActivityLine(line));
-    if (responseStart >= 0) {
-        const toolActivity = toolAndMaybeResponse.slice(0, responseStart).join('\n');
-        const response = toolAndMaybeResponse.slice(responseStart).join('\n');
-        return {
-            prelude,
-            toolActivity,
-            response,
-            hasToolActivity: true,
-        };
-    }
-
-    const toolActivity = toolAndMaybeResponse.join('\n');
-    return {
-        prelude,
-        toolActivity,
-        response: '',
-        hasToolActivity: !!toolActivity.trim(),
+    const segments = [];
+    const appendProse = (raw) => {
+        // Whitespace-only gaps merely separate tokens — they must not
+        // break a run of adjacent markers into two card groups.
+        if (!raw || !raw.trim()) return;
+        const last = segments[segments.length - 1];
+        if (last && last.kind === 'prose') last.text += raw;
+        else segments.push({ kind: 'prose', text: raw });
     };
+    const appendTool = (marker) => {
+        const last = segments[segments.length - 1];
+        if (last && last.kind === 'tools') last.text += `\n${marker}`;
+        else segments.push({ kind: 'tools', text: marker });
+    };
+
+    const re = new RegExp(TOOL_MARKER_TOKEN);
+    let idx = 0;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        // Prose that opens AFTER a marker (idx > 0): its leading spaces/
+        // tabs on the same line are the server's inline separator
+        // ("✓ x complete The next..."), not content — drop them. We strip
+        // only same-line whitespace (no `\n`), so indentation that begins
+        // on a NEW line (a 4-space markdown code block) is preserved.
+        let before = text.slice(idx, m.index);
+        if (idx > 0) before = before.replace(/^[ \t]+/, '');
+        appendProse(before);
+        appendTool(m[0]);
+        idx = re.lastIndex;
+        if (m.index === re.lastIndex) re.lastIndex++; // tokens are non-empty; pure safety
+    }
+    let tail = text.slice(idx);
+    if (idx > 0) tail = tail.replace(/^[ \t]+/, '');
+    appendProse(tail);
+
+    // Clean prose blocks WITHOUT touching content indentation (codex
+    // review): drop the wire `---` delimiter the orchestrator emits at the
+    // head of the prose right after a tools block, then trim surrounding
+    // blank lines and trailing whitespace. A leading 4-space code block
+    // (indentation that follows a newline) survives.
+    for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (seg.kind !== 'prose') continue;
+        let t = seg.text;
+        if (i > 0 && segments[i - 1].kind === 'tools') {
+            t = t.replace(/^(?:[ \t]*\r?\n)*[ \t]*---[ \t]*(?:\r?\n|$)/, '');
+        }
+        t = t.replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\s+$/, '');
+        seg.text = t;
+    }
+    return segments.filter((seg) => seg.kind === 'tools' || seg.text);
 }
 
-function renderStreamingResponseSections({ prelude, toolActivity, response, hasToolActivity }, originalContent) {
-    if (!hasToolActivity) {
-        return renderStreamingMarkdown(originalContent);
-    }
+function segmentsHaveTools(segments) {
+    return segments.some((seg) => seg.kind === 'tools');
+}
 
-    const sections = [];
-    if (prelude) {
-        sections.push(`<div class="response-content response-prelude">${renderStreamingMarkdown(prelude)}</div>`);
+/**
+ * Render a full assistant message to an HTML string: tool runs become
+ * grouped cards, prose becomes markdown, in document order. The single
+ * shared renderer for the streaming bubble, the finalized bubble, and
+ * the history-reload path, so all three agree on layout. ``streaming``
+ * selects the partial-tolerant markdown pass for the in-flight bubble.
+ */
+export function renderAgentContentHtml(content, { streaming = false } = {}) {
+    const renderProse = streaming ? renderStreamingMarkdown : renderMarkdown;
+    const segments = segmentToolActivity(content);
+    if (!segmentsHaveTools(segments)) {
+        return renderProse(content);
     }
-    if (toolActivity) {
-        sections.push(renderToolActivityHtml(toolActivity));
-    }
-    if (response) {
-        sections.push(`<div class="response-content">${renderStreamingMarkdown(response)}</div>`);
-    }
-    return sections.join('');
+    return segments
+        .map((seg, i) => {
+            if (seg.kind === 'tools') return renderToolActivityHtml(seg.text);
+            const cls = i === 0 ? 'response-content response-prelude' : 'response-content';
+            return `<div class="${cls}">${renderProse(seg.text)}</div>`;
+        })
+        .join('');
 }
 
 async function finalizeAgentContent(contentDiv, content) {
-    const split = splitToolActivity(content);
-    const { toolActivity, response, hasToolActivity, prelude } = split;
-    if (!hasToolActivity) {
+    // No tool activity → the plain finalize path (markdown + highlight +
+    // mermaid in one shot). Keeps the common turn on the simplest route.
+    if (!segmentsHaveTools(segmentToolActivity(content))) {
         await finalizeMarkdown(contentDiv, content);
         return;
     }
-
-    const preludeHtml = prelude
-        ? `<div class="response-content response-prelude">${renderMarkdown(prelude)}</div>`
-        : '';
-    contentDiv.innerHTML = `${preludeHtml}${renderToolActivityHtml(toolActivity)}`;
-    if (response) {
-        const responseDiv = document.createElement('div');
-        responseDiv.className = 'response-content';
-        contentDiv.appendChild(responseDiv);
-        await finalizeMarkdown(responseDiv, response);
-    }
+    // With tool runs: one innerHTML write keeps card/prose ordering exact;
+    // highlight + mermaid then run once over the whole container.
+    contentDiv.innerHTML = renderAgentContentHtml(content);
+    highlightCodeBlocks(contentDiv);
+    await renderMermaidDiagrams(contentDiv);
 }
 
 export function renderToolActivityHtml(activityText) {
@@ -2037,16 +2055,10 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
         const thinkingHtml = renderThinkingBubbles(thinkingItems);
-        const split = splitToolActivity(content);
-
-        if (split.hasToolActivity) {
-            contentDiv.innerHTML = `${thinkingHtml}${renderStreamingResponseSections(split, content)}`;
-            highlightCodeBlocks(contentDiv, true);
-        } else {
-            // No tool indicators - regular markdown
-            contentDiv.innerHTML = `${thinkingHtml}${renderStreamingMarkdown(content)}`;
-            highlightCodeBlocks(contentDiv, true);
-        }
+        // renderAgentContentHtml handles both cases: tool runs become
+        // grouped cards in document order, no tools → a single markdown pass.
+        contentDiv.innerHTML = `${thinkingHtml}${renderAgentContentHtml(content, { streaming: true })}`;
+        highlightCodeBlocks(contentDiv, true);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
         // detached panes update their `scrollPos` lazily on remount.

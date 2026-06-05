@@ -106,12 +106,15 @@ globalThis.CSS = { escape: (s) => String(s) };
 
 const {
     renderToolActivityHtml,
-    splitToolActivity,
+    segmentToolActivity,
     updateStreamingMessage,
     finalizeStreamingMessage,
 } = await import(
     '../../kestrel_sovereign/static/js/chat.js'
 );
+
+const toolSegments = (segs) => segs.filter((s) => s.kind === 'tools');
+const proseText = (segs) => segs.filter((s) => s.kind === 'prose').map((s) => s.text).join('\n');
 
 test('renderToolActivityHtml returns a collapsed details block per tool call', () => {
     const html = renderToolActivityHtml([
@@ -184,9 +187,8 @@ test('finalizeStreamingMessage preserves expandable tool activity after stream c
     assert.match(contentDiv.innerHTML, /tool-activity-expandable/);
     assert.equal((contentDiv.innerHTML.match(/tool-activity-call/g) || []).length, 2);
     assert.match(contentDiv.innerHTML, /Calling memory_agency_feature/);
-    const responseDiv = contentDiv.children.find((child) => child.classList?.contains('response-content'));
-    assert.ok(responseDiv, 'final renderer must append a response-content child');
-    assert.match(responseDiv.innerHTML, /I tried to save it\./);
+    assert.match(contentDiv.innerHTML, /class="response-content"/);
+    assert.match(contentDiv.innerHTML, /I tried to save it\./);
 });
 
 test('finalizeStreamingMessage keeps pre-tool prose outside tool calls', async () => {
@@ -204,123 +206,180 @@ test('finalizeStreamingMessage keeps pre-tool prose outside tool calls', async (
     assert.match(contentDiv.innerHTML, /I will check that now\./);
     assert.match(contentDiv.innerHTML, /tool-activity-container/);
     assert.match(contentDiv.innerHTML, /Tool call: lookup/);
-    const responseDiv = contentDiv.children.find((child) => child.classList?.contains('response-content'));
-    assert.ok(responseDiv, 'final renderer must append final response content');
-    assert.match(responseDiv.innerHTML, /The lookup finished\./);
+    assert.match(contentDiv.innerHTML, /class="response-content"/);
+    assert.match(contentDiv.innerHTML, /The lookup finished\./);
+    // Prelude prose precedes the tool card, response follows it.
+    assert.ok(
+        contentDiv.innerHTML.indexOf('I will check that now') <
+            contentDiv.innerHTML.indexOf('tool-activity-container'),
+        'pre-tool prose must render before the tool card',
+    );
 });
 
-test('splitToolActivity leaves normal markdown horizontal rules alone', () => {
+
+test('segmentToolActivity leaves a tool-free message (with markdown rule) whole', () => {
     const content = 'Intro paragraph\n---\nDetails after a normal markdown rule';
-    const split = splitToolActivity(content);
+    const segs = segmentToolActivity(content);
 
-    assert.equal(split.hasToolActivity, false);
-    assert.equal(split.toolActivity, '');
-    assert.equal(split.response, content);
+    assert.equal(toolSegments(segs).length, 0, 'no tool activity without a \u{1F527} start');
+    assert.equal(segs.length, 1);
+    assert.equal(segs[0].kind, 'prose');
+    // The markdown horizontal rule is preserved verbatim — only the wire
+    // delimiter adjacent to a tools block is stripped.
+    assert.equal(segs[0].text, content);
 });
 
-test('splitToolActivity preserves final text when no separator is emitted', () => {
-    const split = splitToolActivity([
+test('segmentToolActivity keeps trailing non-marker text as a prose block', () => {
+    const segs = segmentToolActivity([
         '\u{1F527} Calling search_memory...',
-        '\u2713 search_memory complete (11ms)',
+        '✓ search_memory complete (11ms)',
         'Error: Maximum tool call iterations exceeded',
     ].join('\n'));
 
-    assert.equal(split.hasToolActivity, true);
+    const tools = toolSegments(segs);
+    assert.equal(tools.length, 1);
     assert.equal(
-        split.toolActivity,
-        '\u{1F527} Calling search_memory...\n\u2713 search_memory complete (11ms)',
+        tools[0].text,
+        '\u{1F527} Calling search_memory...\n✓ search_memory complete (11ms)',
     );
-    assert.equal(split.response, 'Error: Maximum tool call iterations exceeded');
+    assert.equal(proseText(segs), 'Error: Maximum tool call iterations exceeded');
 });
 
-test('splitToolActivity keeps prose before the first tool call as prelude', () => {
-    const split = splitToolActivity([
+test('segmentToolActivity keeps prose before the first tool call ahead of the card', () => {
+    const segs = segmentToolActivity([
         'I will check that now.',
         '\u{1F527} Calling lookup...',
-        '\u2713 lookup complete (7ms)',
+        '✓ lookup complete (7ms)',
         '---',
         'The lookup finished.',
     ].join('\n'));
 
-    assert.equal(split.hasToolActivity, true);
-    assert.equal(split.prelude, 'I will check that now.');
-    assert.equal(split.toolActivity, '\u{1F527} Calling lookup...\n\u2713 lookup complete (7ms)');
-    assert.equal(split.response, 'The lookup finished.');
+    assert.deepEqual(segs.map((s) => s.kind), ['prose', 'tools', 'prose']);
+    assert.equal(segs[0].text, 'I will check that now.');
+    assert.equal(segs[1].text, '\u{1F527} Calling lookup...\n✓ lookup complete (7ms)');
+    assert.equal(segs[2].text, 'The lookup finished.');
 });
 
-test('splitToolActivity does not collapse ordinary checkmark replies', () => {
-    const content = '\u2713 Done - here is the summary.';
-    const split = splitToolActivity(content);
+test('segmentToolActivity does not card ordinary checkmark replies', () => {
+    const content = '✓ Done - here is the summary.';
+    const segs = segmentToolActivity(content);
 
-    assert.equal(split.hasToolActivity, false);
-    assert.equal(split.toolActivity, '');
-    assert.equal(split.response, content);
+    assert.equal(toolSegments(segs).length, 0);
+    assert.equal(proseText(segs), content);
 });
 
-test('splitToolActivity requires a tool start line before completion or error statuses', () => {
+test('segmentToolActivity requires a start marker before done/error markers count', () => {
     for (const content of [
-        '\u2713 Migration complete',
-        '\u274C Build failed: missing dependency',
+        '✓ Migration complete',
+        '❌ Build failed: missing dependency',
     ]) {
-        const split = splitToolActivity(content);
-
-        assert.equal(split.hasToolActivity, false);
-        assert.equal(split.toolActivity, '');
-        assert.equal(split.response, content);
+        const segs = segmentToolActivity(content);
+        assert.equal(toolSegments(segs).length, 0, content);
+        assert.equal(proseText(segs), content);
     }
 });
 
-test('splitToolActivity recognizes a tool start glued onto the end of prose', () => {
-    // Server emitters yield `\uD83D\uDD27 Calling X...\n` with only a trailing
-    // newline; the LLM's last text chunk often lacks one, so the
-    // accumulated buffer glues prose and marker onto a single source
-    // line. The render must still split them.
-    const split = splitToolActivity(
+test('segmentToolActivity recognizes a tool start glued onto the end of prose', () => {
+    // Server emitters yield the start marker with only a trailing newline;
+    // the LLM's last text chunk often lacks one, so the buffer glues prose
+    // and marker onto a single source line.
+    const segs = segmentToolActivity(
         'I will check that now.\u{1F527} Calling lookup...\n'
-        + '\u2713 lookup complete (7ms)\n'
+        + '✓ lookup complete (7ms)\n'
         + '---\n'
         + 'The lookup finished.',
     );
 
-    assert.equal(split.hasToolActivity, true);
-    assert.equal(split.prelude, 'I will check that now.');
-    assert.equal(
-        split.toolActivity,
-        '\u{1F527} Calling lookup...\n\u2713 lookup complete (7ms)',
-    );
-    assert.equal(split.response, 'The lookup finished.');
+    assert.deepEqual(segs.map((s) => s.kind), ['prose', 'tools', 'prose']);
+    assert.equal(segs[0].text, 'I will check that now.');
+    assert.equal(segs[1].text, '\u{1F527} Calling lookup...\n✓ lookup complete (7ms)');
+    assert.equal(segs[2].text, 'The lookup finished.');
 });
 
-test('splitToolActivity leaves marker-shaped prose untouched when no tool start exists', () => {
-    // Ordinary assistant prose that happens to contain `✓ X complete`
-    // or `❌ X failed` substrings must NOT have line breaks injected —
-    // the bubble would render with surprising paragraph splits even
-    // though no tool was called. Gated by the presence of a 🔧 Calling
-    // marker.
+test('segmentToolActivity leaves marker-shaped prose untouched when no tool start exists', () => {
     for (const content of [
         'Done: ✓ migration complete and ready to ship',
         'Heads up❌ build failed: missing dependency',
         'Status report: ✓ phase 1 complete, ✓ phase 2 complete',
     ]) {
-        const split = splitToolActivity(content);
-
-        assert.equal(split.hasToolActivity, false);
-        assert.equal(split.toolActivity, '');
-        assert.equal(split.response, content);
+        const segs = segmentToolActivity(content);
+        assert.equal(toolSegments(segs).length, 0, content);
+        assert.equal(proseText(segs), content);
     }
 });
 
-test('splitToolActivity splits a completion marker glued onto a start line', () => {
-    // codex_adapter emits `\u2713 X complete\n` and `\u274C X failed\n` with no
-    // leading newline. When a fast item collapses start+complete in the
-    // same chunk, the buffer can read `\uD83D\uDD27 Calling X...\u2713 X complete`.
-    const split = splitToolActivity(
-        '\u{1F527} Calling lookup...\u2713 lookup complete',
+test('segmentToolActivity recovers a completion marker glued onto a start marker', () => {
+    // A fast item collapses start+complete in one chunk with no newline.
+    const segs = segmentToolActivity('\u{1F527} Calling lookup...✓ lookup complete');
+
+    const tools = toolSegments(segs);
+    assert.equal(tools.length, 1);
+    assert.equal(tools[0].text, '\u{1F527} Calling lookup...\n✓ lookup complete');
+});
+
+test('segmentToolActivity cards EVERY iteration of a multi-batch turn (#1547 follow-up)', () => {
+    // The screenshot bug: later tool runs glued onto prose
+    // ("✓ github complete The merged fix is installed.") rendered as
+    // inline text instead of cards. Each run must become its own card
+    // group with surrounding prose split out — no newlines required.
+    const content =
+        'Picking up the loop.'
+        + '\u{1F527} Calling memory_feature... ✓ memory_feature complete '
+        + '\u{1F527} Calling github... ✓ github complete '
+        + 'The merged fix is installed, but the gate still fails.'
+        + '\u{1F527} Calling talon... ✓ talon complete '
+        + 'Dispatched Talon.';
+    const segs = segmentToolActivity(content);
+
+    assert.deepEqual(segs.map((s) => s.kind), ['prose', 'tools', 'prose', 'tools', 'prose']);
+    assert.equal(segs[0].text, 'Picking up the loop.');
+    assert.equal(segs[2].text, 'The merged fix is installed, but the gate still fails.');
+    assert.equal(segs[4].text, 'Dispatched Talon.');
+    assert.match(segs[1].text, /memory_feature complete/);
+    assert.match(segs[1].text, /github complete/);
+});
+
+test('segmentToolActivity bounds an error detail glued onto the next marker', () => {
+    // Codex review: `❌ X failed: <detail>` must not swallow a following
+    // glued marker into its detail. Each run stays a distinct token and
+    // trailing prose stays prose.
+    const segs = segmentToolActivity(
+        '\u{1F527} Calling search...❌ search failed: timeout'
+        + '\u{1F527} Calling fallback...✓ fallback complete Final answer.',
     );
 
-    assert.equal(split.hasToolActivity, true);
-    assert.equal(
-        split.toolActivity,
-        '\u{1F527} Calling lookup...\n\u2713 lookup complete',
+    assert.deepEqual(segs.map((s) => s.kind), ['tools', 'prose']);
+    // Both runs coalesce into one card group (no prose between them)...
+    assert.match(segs[0].text, /search failed: timeout/);
+    assert.match(segs[0].text, /Calling fallback\.\.\./);
+    assert.match(segs[0].text, /fallback complete/);
+    // ...and the error detail did NOT eat the fallback start marker.
+    assert.ok(
+        !/timeout\u{1F527}/u.test(segs[0].text),
+        'error detail must terminate at the next marker, got: ' + JSON.stringify(segs[0].text),
     );
+    assert.equal(segs[1].text, 'Final answer.');
+});
+
+test('segmentToolActivity preserves a post-tool indented code block (codex review)', () => {
+    // Blanket-trimming prose stripped the leading 4 spaces of a markdown
+    // code block that followed a tool call, so it stopped rendering as
+    // code. Indentation that begins on a NEW line must survive; only the
+    // inline separator space and the wire delimiter are removed.
+    const segs = segmentToolActivity(
+        '\u{1F527} Calling lookup...✓ lookup complete\n---\n    indented code\nnext',
+    );
+
+    assert.deepEqual(segs.map((s) => s.kind), ['tools', 'prose']);
+    assert.equal(segs[1].text, '    indented code\nnext');
+});
+
+test('segmentToolActivity strips the inline separator but keeps later indentation', () => {
+    // "✓ x complete The answer" → inline space dropped; but a fenced/
+    // indented block after a newline keeps its leading spaces.
+    const segs = segmentToolActivity(
+        '\u{1F527} Calling lookup...✓ lookup complete The answer is:\n    code line',
+    );
+    assert.deepEqual(segs.map((s) => s.kind), ['tools', 'prose']);
+    assert.equal(segs[1].text, 'The answer is:\n    code line');
 });
