@@ -482,8 +482,12 @@ test('inband sentinel fused into a single chunk: pre + sentinel + post', async (
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'Savingfresh start',
-        `fused chunk must strip only the sentinel; got: ${JSON.stringify(finalText)}`);
+    // #1547: stripping the sentinel must NOT weld the pre-revision and
+    // post-revision prose into "Savingfresh start". A paragraph break
+    // is inserted because the boundary would otherwise glue two
+    // non-whitespace chars.
+    assert.equal(finalText, 'Saving\n\nfresh start',
+        `fused chunk must strip the sentinel and weld a boundary; got: ${JSON.stringify(finalText)}`);
 });
 
 test('multiple inband sentinels in one chunk preserve intervening prose', async () => {
@@ -516,10 +520,125 @@ test('multiple inband sentinels in one chunk preserve intervening prose', async 
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'beforebetweenafter',
-        `multiple sentinels must strip markers only; got: ${JSON.stringify(finalText)}`);
+    // #1547: each stripped revise sentinel between two non-whitespace
+    // prose segments welds a paragraph break instead of gluing them.
+    assert.equal(finalText, 'before\n\nbetween\n\nafter',
+        `multiple sentinels must strip markers and weld boundaries; got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('KESTREL:REVISE'));
     assert.ok(!finalText.includes('\x1e'));
+});
+
+// =====================================================================
+// #1547 — revise-boundary weld: pre/post prose must never glue on a
+// period (the "edited after the fact" / period-no-space artifact).
+// =====================================================================
+
+test('revise boundary: cross-packet pre/post prose is not glued on a period', async () => {
+    // The dominant inline-execution path streams pre-tool prose, then a
+    // standalone revise sentinel packet, then post-tool prose. Stripping
+    // the sentinel must not produce "...check.The answer...".
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('weld-cross');
+    apiModule.default.setHostAgent('weld-cross');
+    mountChatPane('weld-cross');
+    pane.sessionId = 'sess-weld1';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('Let me check that.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.push('\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.push('The answer is 42.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'Let me check that.\n\nThe answer is 42.',
+        `cross-packet boundary must weld, not glue; got: ${JSON.stringify(finalText)}`);
+    assert.ok(!/\.The answer/.test(finalText),
+        `period must not be glued to the next sentence; got: ${JSON.stringify(finalText)}`);
+});
+
+test('revise boundary: existing whitespace at the seam is not double-spaced', async () => {
+    // When the post-revision text already opens with whitespace, the
+    // weld must be a no-op — no synthetic break stacked on a real one.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('weld-ws');
+    apiModule.default.setHostAgent('weld-ws');
+    mountChatPane('weld-ws');
+    pane.sessionId = 'sess-weld2';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    // Fused: pre ends, sentinel, post opens with a leading newline.
+    ctrl.push(
+        'Checking now.' +
+        '\x1eKESTREL:REVISE:{"index":0,"tool_call_id":"tc1","tool_name":"x"}\x1e' +
+        '\nDone — here is the result.',
+    );
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'Checking now.\nDone — here is the result.',
+        `existing whitespace seam must be preserved verbatim; got: ${JSON.stringify(finalText)}`);
+});
+
+test('revise boundary: SSE-only revise (no in-band sentinel) still welds', async () => {
+    // Codex review: the SSE `revising` event is the reliability backup
+    // for the in-band sentinel. If the sentinel is absent/lost but the
+    // SSE fires, the pre/post prose must still weld — not glue on a
+    // period — matching the server, which welds off the ToolCallStarted.
+    renderCalls.length = 0; finalizeCalls.length = 0;
+
+    const pane = getOrCreateChatPane('weld-sse');
+    apiModule.default.setHostAgent('weld-sse');
+    mountChatPane('weld-sse');
+    pane.sessionId = 'sess-weld-sse';
+
+    const ctrl = controlledStream();
+    const origStream = apiModule.default.streamInvoke;
+    apiModule.default.streamInvoke = () => ctrl.iter;
+
+    messageInput.value = 'go';
+    const sendPromise = sendMessage();
+    await Promise.resolve(); await Promise.resolve();
+
+    ctrl.push('Let me check.');
+    await new Promise((r) => setTimeout(r, 5));
+    // Server fires the `revising` SSE event; NO in-band sentinel arrives.
+    pane.pendingRevise = true;
+    ctrl.push('The answer is 42.');
+    await new Promise((r) => setTimeout(r, 5));
+    ctrl.end();
+    await sendPromise;
+
+    apiModule.default.streamInvoke = origStream;
+
+    const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
+    assert.equal(finalText, 'Let me check.\n\nThe answer is 42.',
+        `SSE-only revise must weld the boundary; got: ${JSON.stringify(finalText)}`);
 });
 
 test('complete sentinel followed by split sentinel prefix buffers the second marker', async () => {
@@ -552,8 +671,11 @@ test('complete sentinel followed by split sentinel prefix buffers the second mar
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'beforebetweenafter',
-        `adjacent split sentinel must strip markers only; got: ${JSON.stringify(finalText)}`);
+    // #1547: both boundaries weld — the second one spans the packet edge
+    // (its sentinel was split across chunks and reassembled), so the loop
+    // welds "between" against "after" via leadingReviseBoundary.
+    assert.equal(finalText, 'before\n\nbetween\n\nafter',
+        `adjacent split sentinel must strip markers and weld boundaries; got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('KESTREL:REVISE'));
     assert.ok(!finalText.includes('\x1e'));
 });
@@ -629,8 +751,10 @@ test('inband sentinel split across chunk boundary: buffering wrapper reassembles
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'Savingclean post-tool',
-        `split sentinel should reassemble and strip only the marker; got: ${JSON.stringify(finalText)}`);
+    // #1547: reassembled, stripped, and the marked boundary welds a
+    // paragraph break instead of gluing "Savingclean post-tool".
+    assert.equal(finalText, 'Saving\n\nclean post-tool',
+        `split sentinel should reassemble, strip the marker, and weld; got: ${JSON.stringify(finalText)}`);
     assert.ok(!finalText.includes('\x1e'));
     assert.ok(!finalText.includes('KESTREL:REVISE'));
 });
@@ -748,8 +872,11 @@ test('partial prefix split inside the sentinel prefix string (codex P2 of #1089)
     apiModule.default.streamInvoke = origStream;
 
     const finalText = finalizeCalls[finalizeCalls.length - 1] || '';
-    assert.equal(finalText, 'Savingfresh post-tool',
-        `partial-prefix split must reassemble and strip only the marker; got: ${JSON.stringify(finalText)}`);
+    // #1547: the marker is reassembled and stripped, and the boundary it
+    // marked (spanning the packet edge) welds a paragraph break rather
+    // than gluing "Savingfresh post-tool".
+    assert.equal(finalText, 'Saving\n\nfresh post-tool',
+        `partial-prefix split must reassemble, strip the marker, and weld; got: ${JSON.stringify(finalText)}`);
     assert.ok(finalText.includes('Saving'));
     assert.ok(!finalText.includes('KESTREL'));
     assert.ok(!finalText.includes('\x1e'));

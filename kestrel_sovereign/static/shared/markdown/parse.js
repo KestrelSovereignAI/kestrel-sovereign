@@ -110,29 +110,29 @@ function renderStreamingMarkdown(content) {
     // Normalize excessive newlines before processing
     let processedContent = normalizeNewlines(content);
 
-    // Close unclosed code blocks (```)
+    // Close unclosed *fenced code blocks* (```) only.
+    //
+    // A fence is a BLOCK construct: until its closer arrives, marked
+    // treats everything after the opening ``` as code to the end of
+    // input, so the rest of the bubble renders as one giant code block.
+    // Appending a synthetic closer keeps it a bounded <pre> that simply
+    // grows as more lines stream in — stable, no flicker.
     const codeBlockMatches = processedContent.match(/```/g) || [];
     if (codeBlockMatches.length % 2 !== 0) {
         processedContent += '\n```';
     }
 
-    // Close unclosed inline code (single `)
-    const inlineCodeCount = (processedContent.match(/(?<!`)`(?!`)/g) || []).length;
-    if (inlineCodeCount % 2 !== 0) {
-        processedContent += '`';
-    }
-
-    // Close unclosed bold (**)
-    const boldMatches = processedContent.match(/\*\*/g) || [];
-    if (boldMatches.length % 2 !== 0) {
-        processedContent += '**';
-    }
-
-    // Close unclosed italic (single * not part of **)
-    const italicMatches = processedContent.match(/(?<!\*)\*(?!\*)/g) || [];
-    if (italicMatches.length % 2 !== 0) {
-        processedContent += '*';
-    }
+    // NOTE: we deliberately do NOT synthesize closers for inline
+    // emphasis (`**`, `*`) or inline code (`) anymore (#1547). Those
+    // were counted with naive regexes that can't tell an emphasis
+    // delimiter from a list bullet (`* item`), a multiplication sign,
+    // or a stray asterisk. An odd count wrapped a synthetic delimiter
+    // around a large span, so the whole bubble flipped bold/italic for
+    // a frame and then reverted when the next chunk balanced the count
+    // — the "all the text gets bigger/bold then snaps back" flicker.
+    // Inline constructs render fine unclosed: marked emits the literal
+    // characters until the real closer streams in, then re-resolves to
+    // emphasis. That's the standard, non-flickering streaming behavior.
 
     try {
         // Match the finalize-path options (renderMarkdown above) so the

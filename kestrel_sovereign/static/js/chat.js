@@ -251,15 +251,48 @@ function stripStreamSentinels(chunk) {
     let sawSentinel = false;
     const thoughts = [];
     let pos = 0;
+    // #1547: a revise sentinel marks the boundary between the agent's
+    // pre-revision prose and its post-revision (post-tool) synthesis.
+    // Removing the sentinel without a separator welds them into
+    // "...let me check.The answer is 42." We weld a paragraph break at
+    // every such boundary. Three positions are possible relative to this
+    // packet's visible text, and each is reported so the streaming loop
+    // (which alone holds `fullContent`, the left side of a packet-edge
+    // boundary) can finish the weld:
+    //   * mid-packet  — both sides present here → welded inline below.
+    //   * leading     — sentinel precedes this packet's first visible
+    //                   char (left side is the previous packet) →
+    //                   `leadingReviseBoundary`.
+    //   * trailing    — sentinel after the last visible char (right side
+    //                   is the next packet) → `reviseBoundaryPending`.
+    let reviseBoundaryPending = false;
+    let leadingReviseBoundary = false;
+    let sawVisible = false;
+
+    const appendVisible = (seg) => {
+        if (!seg) return;
+        if (reviseBoundaryPending && /\S/.test(seg)) {
+            // Weld only when we'd otherwise glue two non-whitespace
+            // chars. When `textBefore` is empty the left side lives in a
+            // previous packet (`fullContent`); leave that weld to the
+            // loop via `leadingReviseBoundary` and don't break here.
+            if (textBefore && !/\s$/.test(textBefore) && !/^\s/.test(seg)) {
+                textBefore += '\n\n';
+            }
+            reviseBoundaryPending = false;
+        }
+        textBefore += seg;
+        if (/\S/.test(seg)) sawVisible = true;
+    };
 
     while (pos < chunk.length) {
         const found = findNextStreamSentinel(chunk, pos);
         if (!found) {
-            textBefore += chunk.slice(pos);
+            appendVisible(chunk.slice(pos));
             break;
         }
 
-        textBefore += chunk.slice(pos, found.idx);
+        appendVisible(chunk.slice(pos, found.idx));
 
         const payloadStart = found.idx + found.prefix.length;
         const closeIdx = chunk.indexOf(found.suffix, payloadStart);
@@ -271,6 +304,11 @@ function stripStreamSentinels(chunk) {
         const payloadText = chunk.slice(payloadStart, closeIdx);
         if (found.kind === 'revise') {
             sawSentinel = true;
+            reviseBoundaryPending = true;
+            // A revise sentinel ahead of any visible char in this packet
+            // means the boundary spans the packet edge — the loop welds
+            // this packet's leading prose against the prior fullContent.
+            if (!sawVisible) leadingReviseBoundary = true;
         } else {
             try {
                 const payload = JSON.parse(payloadText);
@@ -287,6 +325,8 @@ function stripStreamSentinels(chunk) {
         textAfter: '',
         sawSentinel,
         thoughts,
+        reviseBoundaryPending,
+        leadingReviseBoundary,
     };
 }
 
@@ -1187,6 +1227,11 @@ export async function sendMessage(overrideText, overrideAgent) {
                 //   (B) Partial prefix at chunk tail (any non-empty
                 //       prefix of REVISE_SENTINEL_PREFIX)
                 let sentinelBuffer = '';
+                // #1547: carries a revise-boundary weld across packet
+                // edges. Set when a revise sentinel ended a packet with
+                // no visible char after it; consumed when the next
+                // packet's leading visible text is welded onto fullContent.
+                let pendingReviseBoundary = false;
                 for await (const rawChunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
@@ -1207,7 +1252,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // Strip any complete sentinels in processable.
                     // Revise markers and thinking markers are wire
                     // metadata; visible prose stays in the accumulator.
-                    let { textBefore, textAfter, sawSentinel, thoughts } =
+                    let { textBefore, textAfter, sawSentinel, thoughts, reviseBoundaryPending, leadingReviseBoundary } =
                         stripStreamSentinels(processable);
                     if (thoughts.length) {
                         appendThinkingItems(pane.thinkingItems, thoughts);
@@ -1238,13 +1283,41 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // A legacy SSE revising event can still arrive before
                     // the in-band sentinel. Clear the flag without clearing
                     // the visible accumulator; the sentinel itself is the
-                    // only thing that should disappear.
+                    // only thing that should disappear. #1547: the SSE
+                    // event is the reliability backup for the in-band
+                    // sentinel, so it ALSO arms the revise boundary — if
+                    // the sentinel is ever absent/lost, the pre/post prose
+                    // still welds instead of gluing on a period.
                     if (pane.pendingRevise) {
                         pane.pendingRevise = false;
+                        pendingReviseBoundary = true;
                     }
                     const chunk = sawSentinel ? textBefore + textAfter : textBefore;
-                    if (!chunk) continue;
+                    if (!chunk) {
+                        // No visible text this packet, but a revise
+                        // sentinel still arms the boundary for the next
+                        // packet (#1547).
+                        if (reviseBoundaryPending || leadingReviseBoundary) {
+                            pendingReviseBoundary = true;
+                        }
+                        continue;
+                    }
+                    // #1547: weld the packet-edge revise boundary — a
+                    // prior packet ended on a revise sentinel (carried in
+                    // `pendingReviseBoundary`), or this packet opened with
+                    // one (`leadingReviseBoundary`). Either way the left
+                    // side is the accumulated `fullContent`; don't glue
+                    // "...check.The answer".
+                    if ((pendingReviseBoundary || leadingReviseBoundary)
+                        && /^\S/.test(chunk)
+                        && fullContent && !/\s$/.test(fullContent)) {
+                        fullContent += '\n\n';
+                    }
                     fullContent += chunk;
+                    // The carried/leading boundary is now resolved; the
+                    // only boundary still pending is one this packet ended
+                    // on (a trailing sentinel with no visible char after).
+                    pendingReviseBoundary = reviseBoundaryPending;
                     // The server resolves the effective session_id and
                     // returns it as the X-Session-Id response header,
                     // which streamInvoke captures before yielding the
