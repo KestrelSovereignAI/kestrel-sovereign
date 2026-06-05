@@ -728,6 +728,21 @@ export function connectNotifications() {
             }
         });
 
+        // #1551: restart/update is an audited deployment primitive. The
+        // coordinator emits `restart_status` as it drives a request
+        // through its lifecycle (pending → executing → completed, plus
+        // deferred/rejected/canceled). Render each as a system/status
+        // bubble so the Sovereign sees the request first-class rather
+        // than only via the agent's prose.
+        notificationEventSource.addEventListener('restart_status', (e) => {
+            try {
+                const data = JSON.parse(e.data);
+                handleRestartStatus(data);
+            } catch (err) {
+                console.error('Failed to handle restart_status event:', err);
+            }
+        });
+
         notificationEventSource.addEventListener('ping', () => {
             // Keepalive - no action needed
         });
@@ -917,6 +932,104 @@ export async function handleSignalCompleted(payload) {
     if (c && target.parentNode === c) {
         c.scrollTop = c.scrollHeight;
     }
+}
+
+// State → accent colour for the restart-status bubble's left border.
+const RESTART_STATE_ACCENTS = {
+    pending: 'rgba(59, 130, 246, 0.8)',    // blue — filed / deferred
+    updating: 'rgba(168, 85, 247, 0.8)',   // purple — update profile running
+    executing: 'rgba(245, 158, 11, 0.9)',  // amber — restart dispatched
+    completed: 'rgba(34, 197, 94, 0.9)',   // green — landed
+    rejected: 'rgba(239, 68, 68, 0.9)',    // red — terminal reject
+    canceled: 'rgba(245, 158, 11, 0.8)',   // amber — canceled by agent
+};
+
+/**
+ * Render a restart/update lifecycle event as a chat-visible system
+ * bubble (#1551).
+ *
+ * A restart is an audited deployment primitive; the Sovereign needs
+ * first-class evidence it was requested and where it stands, rather
+ * than trusting the agent's prose. The coordinator emits one
+ * `restart_status` event per lifecycle transition; this paints each
+ * into the active pane with the request id, requesting agent,
+ * operation, target ref/profile, policy/urgency, current state, and
+ * any deferral reason.
+ */
+export function handleRestartStatus(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const requestId = String(payload.request_id || '');
+    if (!requestId) return;
+
+    const target = resolvePaneElement();
+    if (!target) return;
+
+    const state = String(payload.status || 'pending');
+    const deferralReason = String(payload.deferral_reason || '');
+    const statusReason = String(payload.status_reason || '');
+
+    // The coordinator re-emits a request's status every cron poll, and the
+    // startup replay buffer can redeliver buffered events; a request that
+    // stays pending under a busy agent would otherwise stack one
+    // near-identical "deferred" bubble per poll (#1551 P2). Suppress a
+    // redraw only when the most recent bubble for THIS request already
+    // shows the same state + reason. Genuine transitions
+    // (pending → executing → completed) and changed deferral reasons carry
+    // a different signature and still append their own bubble, so the
+    // lifecycle stays visible.
+    const statusSig = [state, deferralReason, statusReason].join('|');
+    const priorBubbles = Array.from(
+        target.querySelectorAll('.restart-status-message'),
+    ).filter((el) => el.dataset.requestId === requestId);
+    if (priorBubbles.length) {
+        const last = priorBubbles[priorBubbles.length - 1];
+        if (last.dataset.statusSig === statusSig) return;
+    }
+
+    const accent = RESTART_STATE_ACCENTS[state] || RESTART_STATE_ACCENTS.pending;
+    const isUpdate = String(payload.operation || '') === 'update_then_restart';
+    const shortId = requestId.length > 12 ? requestId.slice(0, 12) : requestId;
+
+    const div = document.createElement('div');
+    div.className = 'message restart-status-message';
+    div.dataset.requestId = requestId;
+    div.dataset.state = state;
+    div.dataset.statusSig = statusSig;
+    div.style.borderLeftColor = accent;
+
+    const rows = [];
+    const operationLabel = isUpdate ? 'update + restart' : 'restart';
+    rows.push(['Operation', operationLabel]);
+    if (isUpdate) {
+        if (payload.update_profile) rows.push(['Profile', String(payload.update_profile)]);
+        if (payload.target_ref) rows.push(['Target ref', String(payload.target_ref)]);
+    }
+    rows.push(['Policy / urgency',
+        `${String(payload.policy || '—')} · ${String(payload.urgency || '—')}`]);
+    if (payload.requested_by_agent) {
+        rows.push(['Requested by', String(payload.requested_by_agent)]);
+    }
+    if (payload.reason) rows.push(['Reason', String(payload.reason)]);
+    if (deferralReason) rows.push(['Deferred', deferralReason]);
+    else if (statusReason) rows.push(['Detail', statusReason]);
+
+    const detailRows = rows.map(([k, v]) =>
+        `<div class="restart-status-row">` +
+        `<span class="restart-status-key">${escapeHtml(k)}</span>` +
+        `<span class="restart-status-val">${escapeHtml(v)}</span></div>`
+    ).join('');
+
+    div.innerHTML =
+        `<div class="restart-status-header">` +
+        `${kicon('refresh')} ` +
+        `<span class="restart-status-title">Restart request ${escapeHtml(shortId)}</span>` +
+        `<span class="restart-status-state restart-status-state-${escapeHtml(state)}">` +
+        `${escapeHtml(state)}</span></div>` +
+        `<div class="restart-status-body">${detailRows}</div>`;
+
+    target.appendChild(div);
+    const c = getChatContainer();
+    if (c) c.scrollTop = c.scrollHeight;
 }
 
 /**

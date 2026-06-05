@@ -581,6 +581,67 @@ class TestEventSystem:
         assert len(successful_calls) == 1
         assert successful_calls[0] == ("test_event", {"test": "data"})
 
+    @pytest.mark.asyncio
+    async def test_emit_event_with_no_listeners_buffers_for_replay(self, tmp_path):
+        """An event emitted while no listener is connected must be buffered
+        and returned by get_pending_events — the host-startup reality the
+        restart `completed` status straddles (#1551).
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        # No listeners connected — the boot reality.
+        assert agent._event_listeners == []
+        await agent.emit_event("restart_status", {"status": "completed"})
+
+        drained = agent.get_pending_events()
+        assert drained == [("restart_status", {"status": "completed"})]
+        # Drain-once: a second drain is empty.
+        assert agent.get_pending_events() == []
+
+    @pytest.mark.asyncio
+    async def test_emit_event_with_listener_does_not_buffer(self, tmp_path):
+        """When a listener IS connected the event delivers live and is NOT
+        also buffered (no double-delivery on a later reconnect).
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        calls = []
+
+        async def listener(event_type, data):
+            calls.append((event_type, data))
+
+        agent.add_event_listener(listener)
+        await agent.emit_event("restart_status", {"status": "pending"})
+
+        assert calls == [("restart_status", {"status": "pending"})]
+        assert agent.get_pending_events() == []
+
+    @pytest.mark.asyncio
+    async def test_pending_events_buffer_is_bounded(self, tmp_path):
+        """A headless host that never opens an SSE stream must not grow the
+        buffer without bound — oldest events drop past the cap.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db")
+        )
+
+        cap = agent._MAX_PENDING_EVENTS
+        for i in range(cap + 25):
+            await agent.emit_event("restart_status", {"n": i})
+
+        drained = agent.get_pending_events()
+        assert len(drained) == cap
+        # Oldest dropped; the most recent event is retained.
+        assert drained[-1] == ("restart_status", {"n": cap + 24})
+        assert drained[0] == ("restart_status", {"n": 25})
+
 
 # =============================================================================
 # Tests for Cancellation

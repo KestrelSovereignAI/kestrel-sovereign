@@ -110,14 +110,31 @@ def background_task_identifiers(task) -> str:
 class EventManagerMixin:
     """Mixin providing event/notification methods for KestrelAgent."""
 
+    # Cap on events buffered for replay to a reconnecting listener. Bounds
+    # memory on a headless host that never opens an SSE stream; the oldest
+    # buffered events drop first once the cap is exceeded.
+    _MAX_PENDING_EVENTS = 100
+
     async def emit_event(self, event_type: str, data: Dict[str, Any]) -> None:
         """
         Emit an event to all registered listeners (for SSE notifications).
+
+        When NO listener is connected, the event is buffered and replayed
+        to the first listener that connects (see ``get_pending_events``).
+        Without this, events emitted while the browser's SSE stream is
+        momentarily absent are silently lost — notably the restart
+        ``completed`` status emitted from ``feature.initialize()`` during
+        host startup, BEFORE the browser reconnects its notifications
+        stream. That is the one transition that straddles the restart, so
+        losing it defeated the issue's primary acceptance criterion (#1551).
 
         Args:
             event_type: Type of event (e.g., 'approval_request')
             data: Event data to send
         """
+        if not self._event_listeners:
+            self._buffer_pending_event(event_type, data)
+            return
         for listener in self._event_listeners:
             try:
                 await listener(event_type, data)
@@ -125,6 +142,22 @@ class EventManagerMixin:
                 logging.warning(f"Failed to emit event to listener: {e}")
             except Exception as e:
                 logging.warning(f"Failed to emit event to listener: {e}", exc_info=True)
+
+    def _buffer_pending_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Buffer an event emitted while no listener was connected.
+
+        Drained by ``get_pending_events`` when a client reconnects. The
+        attribute is lazily created so minimal agent stand-ins that only
+        set ``_event_listeners`` keep working.
+        """
+        buf = getattr(self, "_pending_events", None)
+        if buf is None:
+            buf = []
+            self._pending_events = buf
+        buf.append((event_type, data))
+        overflow = len(buf) - self._MAX_PENDING_EVENTS
+        if overflow > 0:
+            del buf[:overflow]
 
     def add_event_listener(self, listener) -> None:
         """Add an event listener for SSE notifications."""
@@ -298,3 +331,21 @@ class EventManagerMixin:
         notifications = self._pending_task_notifications.copy()
         self._pending_task_notifications.clear()
         return notifications
+
+    def get_pending_events(self) -> List[Tuple[str, Dict[str, Any]]]:
+        """Drain events buffered while no SSE listener was connected.
+
+        Structured counterpart to ``get_pending_notifications`` for the
+        ``emit_event`` bus. The notifications SSE generator calls this
+        right after registering its listener so a client reconnecting
+        after a host restart still receives events emitted during startup
+        — notably the restart ``completed`` status (#1551). Drain-once
+        semantics, same as task notifications: the first reconnecting
+        client consumes the buffer.
+        """
+        buf = getattr(self, "_pending_events", None)
+        if not buf:
+            return []
+        drained = list(buf)
+        buf.clear()
+        return drained
