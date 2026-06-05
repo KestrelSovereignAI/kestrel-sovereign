@@ -50,6 +50,10 @@ def _schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault("policy", "idle_agents_only")
     payload.setdefault("requested_at", "")
     payload.setdefault("completed_at", "")
+    payload.setdefault("operation", "restart_only")
+    payload.setdefault("update_profile", "")
+    payload.setdefault("target_ref", "")
+    payload.setdefault("resolved_ref", "")
     return payload
 
 
@@ -57,6 +61,7 @@ def _redact(payload: Dict[str, Any]) -> str:
     return (
         f"restart.completed "
         f"request_id={payload.get('request_id','?')} "
+        f"operation={payload.get('operation','?')} "
         f"urgency={payload.get('urgency','?')} "
         f"policy={payload.get('policy','?')}"
     )
@@ -93,7 +98,22 @@ def build_signal_for_restart_completed(
 
     ``request`` is the ``RestartRequest`` dataclass row (or any object
     exposing the same id/reason/urgency/policy/requested_at fields).
+
+    For ``update_then_restart`` requests the payload also carries the
+    requested operation, the target ref/branch, and the resolved commit
+    the update landed on, so the woken agent can verify it booted into
+    the code it asked for.
     """
+    # The actual commit the update checked out, recorded by the
+    # coordinator's update run (empty for restart_only requests).
+    resolved_ref = ""
+    log_dict_fn = getattr(request, "update_log_dict", None)
+    if callable(log_dict_fn):
+        try:
+            resolved_ref = str(log_dict_fn().get("resolved_ref", "") or "")
+        except Exception:
+            resolved_ref = ""
+
     payload: Dict[str, Any] = {
         "request_id": str(getattr(request, "id", "")),
         "reason": str(getattr(request, "reason", "")),
@@ -101,6 +121,10 @@ def build_signal_for_restart_completed(
         "policy": str(getattr(request, "policy", "idle_agents_only")),
         "requested_at": str(getattr(request, "requested_at", "")),
         "completed_at": str(completed_at),
+        "operation": str(getattr(request, "operation", "restart_only")),
+        "update_profile": str(getattr(request, "update_profile", "")),
+        "target_ref": str(getattr(request, "update_target_ref", "")),
+        "resolved_ref": resolved_ref,
     }
     return Signal(
         source=SOURCE_NAME,

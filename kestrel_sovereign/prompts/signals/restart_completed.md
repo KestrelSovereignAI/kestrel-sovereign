@@ -8,6 +8,8 @@
 
 Urgency `{payload[urgency]}`, policy `{payload[policy]}`. Requested `{payload[requested_at]}`, restart landed `{payload[completed_at]}`.
 
+Operation `{payload[operation]}`. For `update_then_restart` this restart also ran the `{payload[update_profile]}` update profile to bring the local checkout to target ref `{payload[target_ref]}`; the update resolved to commit `{payload[resolved_ref]}`. Verify you booted into that ref — most directly by comparing your running `git rev-parse HEAD` (or reported version) against `{payload[resolved_ref]}`. For `restart_only` no code was updated; only runtime state was reset.
+
 If your reason for restarting was a code or config change, verify the new behaviour now — most commonly:
   * a new feature surface should appear in your tool listing,
   * a kestrel.toml value should reflect its new setting via the relevant runtime introspection tool,

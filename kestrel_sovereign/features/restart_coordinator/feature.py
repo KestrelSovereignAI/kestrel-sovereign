@@ -19,6 +19,7 @@ runtime layout.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import shutil
@@ -33,6 +34,7 @@ from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 
 from .store import (
+    KNOWN_OPERATIONS,
     KNOWN_POLICIES,
     KNOWN_URGENCIES,
     PENDING_STATES,
@@ -41,10 +43,35 @@ from .store import (
     get_request,
     insert_request,
     list_requests,
+    record_update_log,
     update_status,
 )
+from .update_profiles import (
+    KNOWN_UPDATE_PROFILES,
+    default_sovereign_repo_path,
+    get_update_profile,
+    is_valid_target_ref,
+    repo_is_git_checkout,
+)
+
+# Cap on captured stdout/stderr per update step kept in the durable log.
+_OUTPUT_TAIL_CHARS = 2000
 
 logger = logging.getLogger(__name__)
+
+
+def _tail(raw: Any) -> str:
+    """Decode subprocess output bytes and keep the trailing tail only."""
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        text = raw.decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    text = text.strip()
+    if len(text) > _OUTPUT_TAIL_CHARS:
+        return text[-_OUTPUT_TAIL_CHARS:]
+    return text
 
 
 class RestartCoordinatorFeature(Feature):
@@ -54,7 +81,11 @@ class RestartCoordinatorFeature(Feature):
     def tool_description(self) -> str:
         return (
             "Request a safe Kestrel host restart and track its outcome. "
-            "Agent files a request; host coordinator executes when safe."
+            "Agent files a request; host coordinator executes when safe. "
+            "A plain restart NEVER updates code. To pull/install a new ref "
+            "before restarting, set operation='update_then_restart' with an "
+            "explicit, allowlisted update profile — that step is always "
+            "explicit and audited, never an implicit side effect of restart."
         )
 
     async def initialize(self):
@@ -88,6 +119,12 @@ class RestartCoordinatorFeature(Feature):
                     "failed: %s", e,
                 )
 
+        # Recover any row left in ``updating`` by a host that went down
+        # mid-update (operator restart, crash) BEFORE the executing
+        # sweep — such a row never reached the restart and must be
+        # retried, not reported as a completed update-and-restart.
+        await self._reset_interrupted_updates()
+
         # Sweep — any ``executing`` row owned by this agent that
         # survived a restart needs to land in ``completed`` and wake
         # the agent so it can verify the post-restart state. The
@@ -100,7 +137,16 @@ class RestartCoordinatorFeature(Feature):
             "File a durable restart request. The host coordinator "
             "evaluates safety and executes when conditions are met. "
             "Returns a request_id you can pass to list_restart_requests "
-            "or cancel_restart_request."
+            "or cancel_restart_request.\n\n"
+            "operation='restart_only' (default) restarts the current code "
+            "and NEVER updates it. operation='update_then_restart' first "
+            "runs an explicit, allowlisted update profile (e.g. "
+            "'sovereign_local_uv_sync': git fetch + checkout target_ref + "
+            "uv sync) against a local checkout, then restarts into the new "
+            "code. Update mode requires update_profile and target_ref; "
+            "repo_path defaults to the local Sovereign checkout. "
+            "Updating/installing is always explicit and audited — it is "
+            "never an implicit side effect of a plain restart."
         ),
         category=ToolCategory.SYSTEM,
         command_prefix="!restart request",
@@ -111,6 +157,11 @@ class RestartCoordinatorFeature(Feature):
         urgency: str = "normal",
         policy: str = "idle_agents_only",
         desired_window: str = "",
+        operation: str = "restart_only",
+        update_profile: str = "",
+        target_ref: str = "",
+        repo_path: str = "",
+        allow_migrations: bool = False,
     ) -> ToolResult:
         if not reason or not reason.strip():
             return ToolResult.failed(
@@ -129,6 +180,44 @@ class RestartCoordinatorFeature(Feature):
                 f"got {policy!r}",
                 data={"created": False},
             )
+        if operation not in KNOWN_OPERATIONS:
+            return ToolResult.failed(
+                f"operation must be one of {sorted(KNOWN_OPERATIONS)}; "
+                f"got {operation!r}",
+                data={"created": False},
+            )
+
+        # Validate and normalise the update-mode parameters up front so an
+        # unsafe/unknown profile never reaches the durable table.
+        update_repo_path = ""
+        update_target_ref = ""
+        if operation == "update_then_restart":
+            if update_profile not in KNOWN_UPDATE_PROFILES:
+                return ToolResult.failed(
+                    "update_then_restart requires a known update_profile; "
+                    f"got {update_profile!r}. Allowed: "
+                    f"{sorted(KNOWN_UPDATE_PROFILES)}",
+                    data={"created": False},
+                )
+            update_target_ref = (target_ref or "").strip()
+            if not is_valid_target_ref(update_target_ref):
+                return ToolResult.failed(
+                    "update_then_restart requires a valid target_ref "
+                    "(branch/tag/sha); "
+                    f"got {target_ref!r}",
+                    data={"created": False},
+                )
+            update_repo_path = (repo_path or "").strip()
+            if not update_repo_path:
+                update_repo_path = default_sovereign_repo_path()
+            if not repo_is_git_checkout(update_repo_path):
+                return ToolResult.failed(
+                    "update_then_restart requires repo_path to be a local "
+                    "git checkout; "
+                    f"got {update_repo_path!r}. Pass repo_path explicitly.",
+                    data={"created": False},
+                )
+
         if self._db is None:
             return ToolResult.failed(
                 "Restart coordinator storage unavailable",
@@ -143,14 +232,22 @@ class RestartCoordinatorFeature(Feature):
             urgency=urgency,
             policy=policy,
             desired_window=desired_window,
+            operation=operation,
+            update_repo_path=update_repo_path,
+            update_target_ref=update_target_ref,
+            update_profile=(update_profile if operation == "update_then_restart"
+                            else ""),
+            update_allow_migrations=bool(allow_migrations),
         )
         logger.info(
-            "Restart request filed: id=%s urgency=%s policy=%s reason=%s",
-            req.id, urgency, policy, reason[:80],
+            "Restart request filed: id=%s op=%s urgency=%s policy=%s "
+            "profile=%s ref=%s reason=%s",
+            req.id, operation, urgency, policy, req.update_profile,
+            req.update_target_ref, reason[:80],
         )
         return ToolResult.ok(
             confirmation=(
-                f"Filed restart request {req.id} ({urgency}, {policy})"
+                f"Filed {operation} request {req.id} ({urgency}, {policy})"
             ),
             data={"created": True, "request": req.to_public_dict()},
         )
@@ -303,13 +400,28 @@ class RestartCoordinatorFeature(Feature):
                 )
                 continue
 
-            # Move to executing BEFORE spawning the subprocess. If
-            # the spawn fails we move back to pending so the next
-            # poll retries.
+            # Move out of the pending state BEFORE doing work. A plain
+            # restart goes straight to ``executing`` (the spawn window is
+            # milliseconds). An ``update_then_restart`` first goes to
+            # ``updating`` — the git fetch/checkout + ``uv sync`` can take
+            # minutes, and a row in ``updating`` must NOT be mistaken by
+            # the post-restart sweep for a completed restart if the host
+            # reboots for an unrelated reason mid-update. Only once the
+            # update is done do we move to ``executing`` (right before the
+            # spawn), so the sweep's "executing → completed" wake fires
+            # only for restarts we actually performed.
+            initial_state = (
+                "updating" if req.operation == "update_then_restart"
+                else "executing"
+            )
             moved = await update_status(
                 self._db, req.id,
-                status="executing",
-                status_reason="dispatched to detached restart subprocess",
+                status=initial_state,
+                status_reason=(
+                    "running update profile before restart"
+                    if initial_state == "updating"
+                    else "dispatched to detached restart subprocess"
+                ),
                 expected_current_status=req.status,
             )
             if not moved:
@@ -318,6 +430,53 @@ class RestartCoordinatorFeature(Feature):
                     "reason": "lost race against another transition",
                 })
                 continue
+
+            # update_then_restart: run the allowlisted update profile
+            # against the local checkout BEFORE restarting. A failure
+            # here records the audit log and decides retryable vs
+            # terminal; only a clean update proceeds to the spawn.
+            if req.operation == "update_then_restart":
+                handled = await self._handle_update_then_restart(req)
+                if handled is not None:
+                    # Either deferred (retryable) or rejected (terminal).
+                    deferred.append(handled)
+                    continue
+                # Re-run the safety gate before the restart now that the
+                # (possibly slow) update has completed.
+                decision = self._evaluate_safety(req)
+                if not decision["safe"]:
+                    await update_status(
+                        self._db, req.id,
+                        status="pending",
+                        status_reason=(
+                            "update succeeded but agent became unsafe to "
+                            f"restart: {decision['reason']}"
+                        ),
+                        expected_current_status="updating",
+                    )
+                    deferred.append({
+                        "request_id": req.id,
+                        "reason": (
+                            "update ok; restart deferred — "
+                            f"{decision['reason']}"
+                        ),
+                    })
+                    continue
+                # Update done and still safe — NOW cross into ``executing``
+                # right before the spawn so the post-restart sweep
+                # recognizes the restart we are about to perform.
+                moved = await update_status(
+                    self._db, req.id,
+                    status="executing",
+                    status_reason="update complete; dispatching restart",
+                    expected_current_status="updating",
+                )
+                if not moved:
+                    deferred.append({
+                        "request_id": req.id,
+                        "reason": "lost race after update before restart",
+                    })
+                    continue
 
             try:
                 self._spawn_restart_subprocess()
@@ -488,6 +647,180 @@ class RestartCoordinatorFeature(Feature):
         now = datetime.now(timezone.utc)
         return (now - requested).total_seconds() > 300
 
+    async def _handle_update_then_restart(
+        self, req,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the request's update profile before its restart.
+
+        Called while the row is in ``updating`` (set by the caller before
+        the slow update begins). Returns ``None`` when the update
+        succeeded and the caller should proceed to spawn the restart.
+        Returns a ``{request_id, reason}`` dict when the request was
+        handled here — moved back to ``pending`` (retryable) or to
+        ``rejected`` (terminal) — and the caller should NOT restart.
+        """
+        now = lambda: datetime.now(timezone.utc).isoformat()  # noqa: E731
+
+        profile = get_update_profile(req.update_profile)
+        # Defensive re-validation: a row could have been inserted
+        # outside request_restart. Unknown profile / bad inputs are
+        # unsafe and unfixable by retry → terminal reject.
+        if profile is None:
+            await update_status(
+                self._db, req.id,
+                status="rejected",
+                status_reason=(
+                    f"unknown update profile {req.update_profile!r}"
+                ),
+                completed_at=now(),
+                expected_current_status="updating",
+            )
+            return {
+                "request_id": req.id,
+                "reason": f"rejected: unknown update profile "
+                          f"{req.update_profile!r}",
+            }
+        if not is_valid_target_ref(req.update_target_ref) or \
+                not repo_is_git_checkout(req.update_repo_path):
+            await update_status(
+                self._db, req.id,
+                status="rejected",
+                status_reason=(
+                    "invalid update target_ref/repo_path: "
+                    f"ref={req.update_target_ref!r} "
+                    f"repo={req.update_repo_path!r}"
+                ),
+                completed_at=now(),
+                expected_current_status="updating",
+            )
+            return {
+                "request_id": req.id,
+                "reason": "rejected: invalid update target_ref/repo_path",
+            }
+
+        update = await self._run_update(req, profile)
+        try:
+            await record_update_log(
+                self._db, req.id, json.dumps(update),
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "restart_coordinator: failed to persist update log for "
+                "%s: %s", req.id, e,
+            )
+
+        if not update["ok"]:
+            # Fetch/checkout/install failed before any restart. Leave the
+            # request retryable — the next poll re-runs the idempotent
+            # profile — with a clear reason naming the failed step.
+            await update_status(
+                self._db, req.id,
+                status="pending",
+                status_reason=(
+                    f"update failed at step {update.get('failed_step')!r}; "
+                    "left retryable (see update_log)"
+                ),
+                expected_current_status="updating",
+            )
+            return {
+                "request_id": req.id,
+                "reason": (
+                    f"update failed at step {update.get('failed_step')!r}; "
+                    "retryable"
+                ),
+            }
+        return None
+
+    async def _run_update(self, req, profile) -> Dict[str, Any]:
+        """Execute a profile's update steps, capturing each outcome.
+
+        Returns a JSON-serialisable audit dict: per-step results, the
+        resolved commit, and the migration outcome. Stops at the first
+        mutating step that fails.
+        """
+        steps = profile.build_steps(
+            repo_path=req.update_repo_path,
+            target_ref=req.update_target_ref,
+            allow_migrations=bool(req.update_allow_migrations),
+        )
+        results: List[Dict[str, Any]] = []
+        resolved_ref = ""
+        ok = True
+        failed_step: Optional[str] = None
+        for step in steps:
+            outcome = await self._run_update_step(step)
+            results.append(outcome)
+            if step.name == "resolve_ref" and outcome.get("ok"):
+                resolved_ref = (outcome.get("stdout_tail") or "").strip()
+            if not outcome.get("ok") and not step.read_only:
+                ok = False
+                failed_step = step.name
+                break
+
+        if not profile.supports_migrations:
+            migration = {
+                "ran": False,
+                "reason": (
+                    f"profile {profile.name!r} defines no explicit "
+                    "migration step; sovereign schema migrates additively "
+                    "on the next boot"
+                ),
+            }
+        elif not req.update_allow_migrations:
+            migration = {
+                "ran": False,
+                "reason": "allow_migrations=false on the request",
+            }
+        else:
+            migration = {"ran": True, "reason": "profile-defined migration"}
+
+        return {
+            "ok": ok,
+            "profile": profile.name,
+            "repo_path": req.update_repo_path,
+            "target_ref": req.update_target_ref,
+            "resolved_ref": resolved_ref,
+            "allow_migrations": bool(req.update_allow_migrations),
+            "steps": results,
+            "migration": migration,
+            "failed_step": failed_step,
+        }
+
+    async def _run_update_step(self, step) -> Dict[str, Any]:
+        """Run one allowlisted argv step; capture rc + truncated output.
+
+        Uses ``create_subprocess_exec`` (argv list, never a shell) so a
+        crafted ref/path can never inject a command.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *step.argv,
+                cwd=step.cwd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            rc = proc.returncode
+        except Exception as e:
+            return {
+                "step": step.name,
+                "argv": list(step.argv),
+                "returncode": None,
+                "ok": False,
+                "error": str(e),
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
+        return {
+            "step": step.name,
+            "argv": list(step.argv),
+            "returncode": rc,
+            "ok": rc == 0,
+            "stdout_tail": _tail(stdout),
+            "stderr_tail": _tail(stderr),
+        }
+
     def _spawn_restart_subprocess(self) -> None:
         """Spawn a detached ``kestrel restart`` subprocess.
 
@@ -513,6 +846,39 @@ class RestartCoordinatorFeature(Feature):
             start_new_session=True,
             close_fds=True,
         )
+
+    async def _reset_interrupted_updates(self) -> None:
+        """Reset rows stuck in ``updating`` back to ``pending`` for retry.
+
+        A row reaches ``updating`` only while an ``update_then_restart``
+        profile runs (git fetch/checkout + ``uv sync``). At boot, any
+        such row is necessarily a leftover from a previous process whose
+        host went down mid-update — the update never finished and we
+        never restarted into the new code. Unlike an ``executing`` row,
+        this must NOT be reported as a completed restart (its
+        ``resolved_ref`` would be empty/stale and the checkout may be
+        half-applied). The profile steps are idempotent, so the safe
+        recovery is to make the request retryable; the next coordinator
+        poll re-runs the update cleanly.
+        """
+        if self._db is None:
+            return
+        agent_id = getattr(self.agent, "did", "") or ""
+        if not agent_id:
+            return
+        stuck = await list_requests(
+            self._db, status="updating", agent_id=str(agent_id),
+        )
+        for row in stuck:
+            await update_status(
+                self._db, row.id,
+                status="pending",
+                status_reason=(
+                    "host restarted mid-update before the restart could "
+                    "run; update incomplete — reset to pending for retry"
+                ),
+                expected_current_status="updating",
+            )
 
     async def _reap_post_restart_rows(self) -> None:
         """Sweep ``executing`` rows this agent filed, mark complete,

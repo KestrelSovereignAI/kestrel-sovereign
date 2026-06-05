@@ -13,11 +13,12 @@ existing tables are modified.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +28,12 @@ logger = logging.getLogger(__name__)
 TERMINAL_STATES = frozenset({"completed", "rejected", "canceled"})
 
 # In-flight states the coordinator considers when picking the next
-# request to execute. ``executing`` is in-flight but already past the
-# safety gate — the coordinator only moves it to ``completed`` (or
-# leaves it for the post-restart sweep to mark).
+# request to execute. Two further in-flight states exist but are NOT
+# candidates and NOT cancelable: ``updating`` (an update_then_restart
+# row whose allowlisted update profile is mid-run — reset to pending on
+# boot if interrupted) and ``executing`` (already past the safety gate;
+# the coordinator only moves it to ``completed`` or leaves it for the
+# post-restart sweep to mark).
 PENDING_STATES = frozenset({"pending", "approved"})
 
 # All policies the coordinator understands. Anything else is rejected
@@ -40,6 +44,33 @@ KNOWN_POLICIES = frozenset(
 
 # All urgencies the coordinator understands.
 KNOWN_URGENCIES = frozenset({"low", "normal", "high", "critical"})
+
+# Operation modes. ``restart_only`` (the historical behaviour, default)
+# spawns ``kestrel restart``. ``update_then_restart`` first runs an
+# allowlisted update/install profile against a local checkout, then
+# restarts — an explicit, audited step, never an implicit side effect of
+# a plain restart.
+KNOWN_OPERATIONS = frozenset({"restart_only", "update_then_restart"})
+
+# Columns added after the original #1512 schema. Applied additively via
+# ALTER TABLE so a feature loading against a pre-existing table picks
+# them up without losing data.
+_ADDED_COLUMNS = (
+    ("operation", "TEXT DEFAULT 'restart_only'"),
+    ("update_repo_path", "TEXT DEFAULT ''"),
+    ("update_target_ref", "TEXT DEFAULT ''"),
+    ("update_profile", "TEXT DEFAULT ''"),
+    ("update_allow_migrations", "INTEGER DEFAULT 0"),
+    ("update_log", "TEXT DEFAULT ''"),
+)
+
+# Canonical column order shared by every SELECT below and ``from_row``.
+_COLUMNS = (
+    "id, requested_by_agent, reason, requested_at, desired_window, "
+    "urgency, policy, status, status_reason, completed_at, operation, "
+    "update_repo_path, update_target_ref, update_profile, "
+    "update_allow_migrations, update_log"
+)
 
 
 @dataclass
@@ -54,22 +85,48 @@ class RestartRequest:
     status: str
     status_reason: str
     completed_at: Optional[str]
+    operation: str = "restart_only"
+    update_repo_path: str = ""
+    update_target_ref: str = ""
+    update_profile: str = ""
+    update_allow_migrations: bool = False
+    update_log: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
         cols = list(row)
+
+        def g(i: int, default: Any = None) -> Any:
+            return cols[i] if i < len(cols) else default
+
         return cls(
-            id=str(cols[0]),
-            requested_by_agent=str(cols[1] or ""),
-            reason=str(cols[2] or ""),
-            requested_at=str(cols[3] or ""),
-            desired_window=str(cols[4] or ""),
-            urgency=str(cols[5] or "normal"),
-            policy=str(cols[6] or "idle_agents_only"),
-            status=str(cols[7] or "pending"),
-            status_reason=str(cols[8] or ""),
-            completed_at=(str(cols[9]) if cols[9] is not None else None),
+            id=str(g(0)),
+            requested_by_agent=str(g(1) or ""),
+            reason=str(g(2) or ""),
+            requested_at=str(g(3) or ""),
+            desired_window=str(g(4) or ""),
+            urgency=str(g(5) or "normal"),
+            policy=str(g(6) or "idle_agents_only"),
+            status=str(g(7) or "pending"),
+            status_reason=str(g(8) or ""),
+            completed_at=(str(g(9)) if g(9) is not None else None),
+            operation=str(g(10) or "restart_only"),
+            update_repo_path=str(g(11) or ""),
+            update_target_ref=str(g(12) or ""),
+            update_profile=str(g(13) or ""),
+            update_allow_migrations=bool(int(g(14) or 0)),
+            update_log=str(g(15) or ""),
         )
+
+    def update_log_dict(self) -> Dict[str, Any]:
+        """Parse ``update_log`` JSON into a dict (``{}`` if empty/invalid)."""
+        if not self.update_log:
+            return {}
+        try:
+            data = json.loads(self.update_log)
+        except (ValueError, TypeError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def to_public_dict(self) -> dict:
         return {
@@ -83,6 +140,12 @@ class RestartRequest:
             "status": self.status,
             "status_reason": self.status_reason,
             "completed_at": self.completed_at,
+            "operation": self.operation,
+            "update_repo_path": self.update_repo_path,
+            "update_target_ref": self.update_target_ref,
+            "update_profile": self.update_profile,
+            "update_allow_migrations": self.update_allow_migrations,
+            "update": self.update_log_dict(),
         }
 
 
@@ -100,10 +163,25 @@ async def ensure_restart_requests_table(db) -> None:
             policy TEXT DEFAULT 'idle_agents_only',
             status TEXT DEFAULT 'pending',
             status_reason TEXT DEFAULT '',
-            completed_at TEXT
+            completed_at TEXT,
+            operation TEXT DEFAULT 'restart_only',
+            update_repo_path TEXT DEFAULT '',
+            update_target_ref TEXT DEFAULT '',
+            update_profile TEXT DEFAULT '',
+            update_allow_migrations INTEGER DEFAULT 0,
+            update_log TEXT DEFAULT ''
         )
         """
     )
+    # Additively backfill the #1539 columns on a pre-existing table.
+    for col, col_def in _ADDED_COLUMNS:
+        try:
+            await db.execute(
+                f"ALTER TABLE restart_requests ADD COLUMN {col} {col_def}"
+            )
+        except Exception:
+            # Column already exists — expected on every non-first run.
+            pass
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_restart_requests_status
@@ -126,6 +204,11 @@ async def insert_request(
     urgency: str = "normal",
     policy: str = "idle_agents_only",
     desired_window: str = "",
+    operation: str = "restart_only",
+    update_repo_path: str = "",
+    update_target_ref: str = "",
+    update_profile: str = "",
+    update_allow_migrations: bool = False,
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
@@ -135,12 +218,14 @@ async def insert_request(
         INSERT INTO restart_requests (
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
-            completed_at
+            completed_at, operation, update_repo_path, update_target_ref,
+            update_profile, update_allow_migrations, update_log
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '')
         """,
         (req_id, requested_by_agent, reason, now, desired_window,
-         urgency, policy),
+         urgency, policy, operation, update_repo_path, update_target_ref,
+         update_profile, 1 if update_allow_migrations else 0),
     )
     return RestartRequest(
         id=req_id,
@@ -153,6 +238,12 @@ async def insert_request(
         status="pending",
         status_reason="",
         completed_at=None,
+        operation=operation,
+        update_repo_path=update_repo_path,
+        update_target_ref=update_target_ref,
+        update_profile=update_profile,
+        update_allow_migrations=update_allow_migrations,
+        update_log="",
     )
 
 
@@ -169,11 +260,7 @@ async def list_requests(
     if agent_id:
         where.append("requested_by_agent = ?")
         params.append(agent_id)
-    sql = (
-        "SELECT id, requested_by_agent, reason, requested_at, "
-        "desired_window, urgency, policy, status, status_reason, "
-        "completed_at FROM restart_requests"
-    )
+    sql = f"SELECT {_COLUMNS} FROM restart_requests"
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY requested_at DESC"
@@ -183,14 +270,25 @@ async def list_requests(
 
 async def get_request(db, request_id: str) -> Optional[RestartRequest]:
     rows = await db.fetchall(
-        "SELECT id, requested_by_agent, reason, requested_at, "
-        "desired_window, urgency, policy, status, status_reason, "
-        "completed_at FROM restart_requests WHERE id = ?",
+        f"SELECT {_COLUMNS} FROM restart_requests WHERE id = ?",
         (request_id,),
     )
     if not rows:
         return None
     return RestartRequest.from_row(rows[0])
+
+
+async def record_update_log(db, request_id: str, update_log: str) -> None:
+    """Persist the observed update steps/outcomes JSON onto the row.
+
+    Kept separate from :func:`update_status` so the durable audit trail
+    of what the update profile actually did survives independently of
+    the request's lifecycle state.
+    """
+    await db.execute(
+        "UPDATE restart_requests SET update_log = ? WHERE id = ?",
+        (update_log, request_id),
+    )
 
 
 async def update_status(
