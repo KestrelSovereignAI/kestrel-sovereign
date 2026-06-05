@@ -258,6 +258,13 @@ class _CoalescingState:
                 del per_source[key]
         return False
 
+    def reset(self) -> None:
+        """Drop all remembered dedupe keys. Called on host-resume: the
+        wall-clock windows expired while the process was suspended, so the
+        stored timestamps are stale and the next same-keyed signal should be
+        treated as fresh."""
+        self._seen.clear()
+
 
 class _RateLimitState:
     """Sliding window of dispatch timestamps per source."""
@@ -295,6 +302,14 @@ class _RateLimitState:
 
         times.append(now)
         return False
+
+    def reset(self) -> None:
+        """Drop all recorded dispatch timestamps. Called on host-resume:
+        these are ``time.monotonic()`` values, which DON'T advance during
+        system suspend, so after a long sleep the sliding window is frozen
+        and would wrongly report quotas as saturated. The real hour elapsed
+        while asleep, so starting the window fresh is the correct state."""
+        self._times.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +350,25 @@ class SignalDispatcher:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def notify_resume(self, gap_seconds: float) -> None:
+        """Re-anchor throttling state after a host suspend/resume (#1545).
+
+        Coalescing keys off wall-clock and rate-limiting off ``monotonic``,
+        so across a suspend they disagree: coalescing windows expire (a
+        repeat signal fires again) while the monotonic rate-limit window is
+        frozen (quotas look saturated though the hour really elapsed).
+        Clearing both restores a consistent, correct post-sleep baseline.
+
+        Invoked by the ``system.resumed`` ACTION handler, which the
+        ResumeMonitor dispatches once per detected suspend.
+        """
+        self._rate.reset()
+        self._coalescing.reset()
+        logger.info(
+            "Dispatcher throttling windows re-anchored after ~%.0fs host suspend",
+            gap_seconds,
+        )
 
     async def dispatch_signal(self, signal: Signal) -> SignalResult:
         """Awaits the full lifecycle. Used by callers that need the result

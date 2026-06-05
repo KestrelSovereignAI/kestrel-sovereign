@@ -1147,6 +1147,55 @@ class KestrelAgent(
             if self._heartbeat_config.enabled:
                 await self.heartbeat_runner.start()
 
+            # Host sleep/wake resilience (#1545). The ResumeMonitor watches
+            # for a wall-clock-vs-monotonic divergence (a host suspend) and
+            # dispatches one `system.resumed` ACTION signal; its handler
+            # re-anchors the dispatcher's throttling windows, which otherwise
+            # disagree about elapsed time across a sleep. The scheduler and
+            # heartbeat detect staleness on their own ticks, so they self-heal
+            # independently of this signal — the monitor is the observable
+            # spine plus the dispatcher's re-anchor trigger.
+            from kestrel_sovereign.resume_monitor import (
+                ResumeMonitor,
+                ResumeMonitorConfig,
+            )
+            from kestrel_sovereign.signals.sources.system_resumed import (
+                SOURCE_NAME as RESUME_SOURCE_NAME,
+                build_system_resumed_registration,
+            )
+
+            async def _resume_action_handler(payload: dict):
+                gap = float(payload.get("gap_seconds", 0.0))
+                self.dispatcher.notify_resume(gap)
+                return {"re_anchored": True, "gap_seconds": gap}
+
+            self.signal_registry.register(
+                build_system_resumed_registration(handler=_resume_action_handler)
+            )
+
+            self._resume_monitor_config = ResumeMonitorConfig.from_config()
+
+            async def _on_resume(gap_seconds: float) -> None:
+                from kestrel_sdk.signals import Signal, SignalMode, Visibility
+
+                signal = Signal(
+                    source=RESUME_SOURCE_NAME,
+                    kind="resumed",
+                    mode=SignalMode.ACTION,
+                    payload={"gap_seconds": gap_seconds},
+                    target_agent=self.did,
+                    visibility=Visibility.INTERNAL,
+                )
+                await self.dispatcher.dispatch_signal(signal)
+
+            self.resume_monitor = ResumeMonitor(
+                on_resume=_on_resume,
+                tick_seconds=self._resume_monitor_config.tick_seconds,
+                threshold_seconds=self._resume_monitor_config.threshold_seconds,
+            )
+            if self._resume_monitor_config.enabled:
+                await self.resume_monitor.start()
+
             # Default schedules are now set up by SchedulerFeature.post_all_features_loaded()
 
         # C / #1311 durable salvage worker — only starts when the
@@ -2721,6 +2770,13 @@ Expected Duration: {expected_duration}
                 await self.heartbeat_runner.stop()
             except Exception as e:
                 logging.warning(f"Error stopping heartbeat: {e}")
+
+        # Stop resume monitor (#1545)
+        if hasattr(self, 'resume_monitor') and self.resume_monitor:
+            try:
+                await self.resume_monitor.stop()
+            except Exception as e:
+                logging.warning(f"Error stopping resume monitor: {e}")
 
         # Stop C / #1311 durable salvage worker. Drains in-flight
         # summary tasks; the janitor catches up the rest on next start.

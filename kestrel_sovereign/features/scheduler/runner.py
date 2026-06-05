@@ -25,6 +25,15 @@ logger = logging.getLogger(__name__)
 # How often the runner wakes up to check for due tasks (seconds)
 POLL_INTERVAL = 30
 
+# Default misfire grace (seconds). A task more than this far past its
+# scheduled time is assumed to have been slept through (host suspend) or
+# starved, and is skipped-and-re-anchored to its next occurrence rather
+# than fired late in a post-wake burst (#1545). 600s (10 min) is well
+# above normal poll jitter (POLL_INTERVAL=30s plus execution time) yet
+# short enough that a brief lid-close coalesces a missed hourly/daily run
+# to the next one. 0 disables the rail (legacy fire-everything behaviour).
+DEFAULT_MISFIRE_GRACE_SECONDS = 600
+
 
 @dataclass
 class ScheduledTask:
@@ -82,6 +91,7 @@ class SchedulerRunner:
         agent_id: str,
         executor: TaskExecutor,
         poll_interval: int = POLL_INTERVAL,
+        misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
     ):
         """
         Args:
@@ -89,11 +99,15 @@ class SchedulerRunner:
             agent_id: The owning agent's identifier.
             executor: Async callable(task_name, args_dict) -> result_text.
             poll_interval: Seconds between poll cycles.
+            misfire_grace_seconds: A due task more than this many seconds late
+                is skipped-and-re-anchored instead of executed (host-suspend
+                resilience, #1545). 0 disables the rail.
         """
         self._db = db
         self._agent_id = agent_id
         self._executor = executor
         self._poll_interval = poll_interval
+        self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -139,7 +153,8 @@ class SchedulerRunner:
 
     async def _tick(self):
         """Single poll cycle: find due tasks and run them."""
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
         rows = await self._db.fetchall(
             """
             SELECT id, agent_id, task_name, cron_expression, args_json,
@@ -162,7 +177,107 @@ class SchedulerRunner:
                 next_run_at=row[7],
                 created_at=row[8],
             )
-            await self._execute_task(task)
+            # Misfire grace (#1545): a task far past its scheduled time was
+            # almost certainly slept through (host suspend) or starved.
+            # Firing it late — and firing every overdue task at once in the
+            # first post-wake tick — is rarely what the operator wants for
+            # "run around time T" cron work. Skip-and-re-anchor to the next
+            # occurrence instead. Within grace, behave exactly as before.
+            late = self._seconds_late(task.next_run_at, now)
+            if self._misfire_grace_seconds and late > self._misfire_grace_seconds:
+                await self._skip_misfire(task, now, late)
+            else:
+                await self._execute_task(task)
+
+    @staticmethod
+    def _seconds_late(next_run_at_iso: Optional[str], now: datetime) -> float:
+        """Seconds between a task's scheduled ``next_run_at`` and ``now``.
+
+        Returns 0.0 if the timestamp is missing or unparseable (treat as
+        on-time rather than infinitely late — an unparseable timestamp is a
+        separate bug that should not silently suppress execution)."""
+        if not next_run_at_iso:
+            return 0.0
+        try:
+            scheduled = datetime.fromisoformat(next_run_at_iso)
+        except (ValueError, TypeError):
+            return 0.0
+        if scheduled.tzinfo is None:
+            scheduled = scheduled.replace(tzinfo=timezone.utc)
+        return max(0.0, (now - scheduled).total_seconds())
+
+    async def _skip_misfire(self, task: ScheduledTask, now: datetime, late: float):
+        """Record a skipped (slept-through) run and re-anchor the task to its
+        next occurrence WITHOUT executing it.
+
+        Writes a ``skipped_misfire`` row to ``task_execution_log`` so the
+        skip is auditable (and visible in ``!schedule history``), then
+        advances ``next_run_at`` past ``now``. ``last_run_at`` is left
+        untouched — the task did not actually run."""
+        now_iso = now.isoformat()
+        logger.warning(
+            "Scheduled task %s (%s) was %.0fs late (> %ds grace); "
+            "skipping the slept-through run and re-anchoring",
+            task.id, task.task_name, late, self._misfire_grace_seconds,
+        )
+
+        record_id = str(uuid.uuid4())
+        try:
+            await self._db.execute(
+                """
+                INSERT INTO task_execution_log
+                    (id, task_id, agent_id, status, result_text, duration_ms,
+                     executed_at, outcome_signal)
+                VALUES (?, ?, ?, 'skipped_misfire', ?, 0, ?, NULL)
+                """,
+                (
+                    record_id, task.id, self._agent_id,
+                    f"skipped: {late:.0f}s late (> {self._misfire_grace_seconds}s "
+                    "misfire grace); assumed host suspend",
+                    now_iso,
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to record misfire skip for task %s: %s", task.id, e
+            )
+
+        # Re-read in case cron/enabled changed; mirror _execute_task's care.
+        cron_expr = task.cron_expression
+        task_still_live = True
+        try:
+            fresh = await self._db.fetchone(
+                "SELECT cron_expression, enabled FROM scheduled_tasks WHERE id = ?",
+                (task.id,),
+            )
+            if fresh is None:
+                task_still_live = False
+            else:
+                cron_expr = fresh[0]
+                if not bool(fresh[1]):
+                    task_still_live = False
+        except Exception as e:
+            logger.warning("Failed to re-read task %s for misfire: %s", task.id, e)
+
+        if not task_still_live:
+            return
+
+        try:
+            next_iso = next_run(cron_expr, after=now).isoformat()
+        except CronParseError:
+            logger.warning(
+                "Could not compute next_run for misfired task %s", task.id
+            )
+            return
+        try:
+            await self._db.execute(
+                "UPDATE scheduled_tasks SET next_run_at = ? WHERE id = ? AND enabled = 1",
+                (next_iso, task.id),
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to re-anchor misfired task %s: %s", task.id, e
+            )
 
     async def _execute_task(self, task: ScheduledTask):
         """Execute a single task and record the result."""
