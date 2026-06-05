@@ -74,6 +74,27 @@ uses Claude OAuth or API billing according to `auth_lane`, and
 the Codex model unless you need to pin one; Talon/Codex should otherwise use
 its current default model.
 
+### Test evidence gates (review loop)
+
+Running tests is a **first-class evidence gate**, not just a habit. The
+loop has three gates owned by three layers:
+
+- **Implementation** — Talon runs targeted tests and reports evidence
+  (commands, exit codes, CI status) before PR handoff; it rides back on
+  the `talon.job_complete` signal's `test_evidence` / `ci_status` fields.
+- **Review** — the Sovereign reviewer runs independent verification via
+  the `talon_verify` tool (allowlisted test commands run without
+  prompting; everything else is approval-gated). Result states:
+  `passed` / `failed` / `blocked_by_policy` / `blocked_by_user` /
+  `blocked_by_sandbox` / `tooling_error`. A sandbox/policy block is
+  **never** reported as a user denial unless the approval record says so.
+- **Merge** — CI is the repository merge gate.
+
+Restart/update (RestartCoordinator) is **not** part of this — it is only
+the deployment primitive. Full runbook:
+[`docs/architecture/testing/TEST_EVIDENCE_GATES.md`](docs/architecture/testing/TEST_EVIDENCE_GATES.md).
+Verification layer: `kestrel_sovereign/features/talon/verification.py`.
+
 ### Environment Variables
 
 ```bash

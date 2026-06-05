@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
+from kestrel_sovereign.features.talon.verification import CommandExecution
 
 
 def _make_agent():
@@ -502,3 +503,50 @@ class TestTalonWait:
         assert result.data["status"] == "failed"
         assert result.data["timed_out"] is False
         assert feature._jobs["job-b"]["error"] == "boom"
+
+
+class TestTalonVerify:
+    @pytest.mark.asyncio
+    async def test_verify_no_commands_fails(self, tmp_path):
+        feature = TalonCoordinatorFeature(_make_agent())
+        result = await feature.talon_verify(commands="   \n\n", cwd=str(tmp_path))
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["overall_state"] == "not_run"
+
+    @pytest.mark.asyncio
+    async def test_verify_invalid_cwd_fails(self, tmp_path):
+        feature = TalonCoordinatorFeature(_make_agent())
+        result = await feature.talon_verify(
+            commands="uv run pytest", cwd=str(tmp_path / "nope")
+        )
+        assert result.status is ToolResultStatus.ERROR
+
+    @pytest.mark.asyncio
+    async def test_verify_allowlisted_pass(self, tmp_path):
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        async def fake_exec(command, *, timeout=600):
+            return CommandExecution(ran=True, returncode=0, stdout="2 passed")
+
+        with patch.object(feature, "_make_verify_executor", return_value=fake_exec):
+            result = await feature.talon_verify(
+                commands="uv run pytest tests/unit", cwd=str(tmp_path)
+            )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["overall_state"] == "passed"
+        assert result.data["all_passed"] is True
+        assert "## Test Evidence" in result.confirmation
+
+    @pytest.mark.asyncio
+    async def test_verify_failed_is_partial(self, tmp_path):
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        async def fake_exec(command, *, timeout=600):
+            return CommandExecution(ran=True, returncode=1, stderr="1 failed")
+
+        with patch.object(feature, "_make_verify_executor", return_value=fake_exec):
+            result = await feature.talon_verify(
+                commands="uv run pytest tests/unit", cwd=str(tmp_path)
+            )
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["overall_state"] == "failed"

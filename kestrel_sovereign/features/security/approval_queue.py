@@ -56,7 +56,12 @@ class ApprovalRequest:
 
     # For resumption after approval
     resume_event: asyncio.Event = field(default_factory=asyncio.Event)
-    user_decision: Optional[str] = None  # "once", "session", "always"
+    # Approval scope ("once"/"session"/"always") on approve, or the
+    # denial provenance on deny: "user_denied" (a human pressed deny via
+    # the deny tool) vs "cancelled"/"cancelled_all" (task torn down, not a
+    # user decision). Distinct from the operator/auto policy "denied" that
+    # ``request_approval`` early-returns without ever creating a request.
+    user_decision: Optional[str] = None
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization."""
@@ -178,7 +183,14 @@ class ApprovalQueue:
         Returns:
             Tuple of (approved: bool, scope: str)
             - approved: True if user approved, False if denied or timeout
-            - scope: "once", "session", "always", or "timeout"
+            - scope: on approve, "once"/"session"/"always" (or "auto" /
+              "auto_approve:<id>" for policy auto-approval). On deny, the
+              scope carries provenance: "user_denied" for an explicit human
+              denial, "denied" for an operator/auto policy DENY,
+              "timeout"/"cancelled"/"cancelled_all" when no user ever
+              decided. Consumers MUST NOT treat anything but "user_denied"
+              (or a user-chosen approve scope returned with approved=False)
+              as a user denial (#1542).
         """
         if self._permission_store is not None:
             try:

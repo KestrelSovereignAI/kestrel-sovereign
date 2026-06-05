@@ -70,6 +70,12 @@ def _schema(payload: Dict[str, Any]) -> Dict[str, Any]:
     payload.setdefault("log_tail", "")
     payload.setdefault("started_at", "")
     payload.setdefault("completed_at", "")
+    # Implementation-side test evidence (#1542): a short rendered summary
+    # of which targeted tests Talon ran and the CI status it observed, so
+    # the reviewer wake can cite test evidence instead of re-deriving it.
+    # Optional — older Talon builds won't populate it.
+    payload.setdefault("test_evidence", "")
+    payload.setdefault("ci_status", "")
     return payload
 
 
@@ -141,6 +147,8 @@ def build_signal_for_completed_job(
         "log_tail": log_tail or "",
         "started_at": str(info.get("started_at", "")),
         "completed_at": str(info.get("completed_at", "")),
+        "test_evidence": str(info.get("test_evidence", "")),
+        "ci_status": str(info.get("ci_status", "")),
     }
     return Signal(
         source=SOURCE_NAME,

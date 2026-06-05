@@ -2,6 +2,11 @@
 
 A comprehensive guide to running and writing tests for Kestrel Sovereign.
 
+> For where tests sit in the **Agent/Talon review loop** (targeted tests
+> during implementation, independent verification during review, CI
+> before merge) and the structured result states the reviewer reports,
+> see [`TEST_EVIDENCE_GATES.md`](TEST_EVIDENCE_GATES.md).
+
 ## Test Pyramid Strategy
 
 Tests are organized in a pyramid structure - run from the bottom up:

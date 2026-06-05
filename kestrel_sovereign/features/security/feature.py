@@ -659,10 +659,18 @@ class SecurityFeature(Feature):
                 data={"request_id": request_id},
             )
 
-        if self.approval_queue.submit_decision(full_id, False, "denied"):
+        # Carry distinct provenance for an explicit user denial. Operator/
+        # auto policy DENY resolves through ``request_approval``'s early
+        # return as ``(False, "denied")``; a human pressing deny here must
+        # be distinguishable from that so downstream consumers (e.g. the
+        # Talon verifier's ``classify_denial``) can surface ``blocked_by_user``
+        # only for a real user denial and never mislabel a policy/sandbox
+        # block as one (#1542). The resulting ``request.user_decision`` still
+        # audits as ``user_denied`` via ``_persist_decision``.
+        if self.approval_queue.submit_decision(full_id, False, "user_denied"):
             return ToolResult.ok(
                 confirmation=f"Denied {request_id[:8]}",
-                data={"request_id": full_id, "decision": "denied"},
+                data={"request_id": full_id, "decision": "user_denied"},
             )
         return ToolResult.failed(
             f"Request '{request_id}' is no longer pending "
