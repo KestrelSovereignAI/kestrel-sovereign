@@ -360,3 +360,26 @@ test('segmentToolActivity bounds an error detail glued onto the next marker', ()
     );
     assert.equal(segs[1].text, 'Final answer.');
 });
+
+test('segmentToolActivity preserves a post-tool indented code block (codex review)', () => {
+    // Blanket-trimming prose stripped the leading 4 spaces of a markdown
+    // code block that followed a tool call, so it stopped rendering as
+    // code. Indentation that begins on a NEW line must survive; only the
+    // inline separator space and the wire delimiter are removed.
+    const segs = segmentToolActivity(
+        '\u{1F527} Calling lookup...✓ lookup complete\n---\n    indented code\nnext',
+    );
+
+    assert.deepEqual(segs.map((s) => s.kind), ['tools', 'prose']);
+    assert.equal(segs[1].text, '    indented code\nnext');
+});
+
+test('segmentToolActivity strips the inline separator but keeps later indentation', () => {
+    // "✓ x complete The answer" → inline space dropped; but a fenced/
+    // indented block after a newline keeps its leading spaces.
+    const segs = segmentToolActivity(
+        '\u{1F527} Calling lookup...✓ lookup complete The answer is:\n    code line',
+    );
+    assert.deepEqual(segs.map((s) => s.kind), ['tools', 'prose']);
+    assert.equal(segs[1].text, 'The answer is:\n    code line');
+});

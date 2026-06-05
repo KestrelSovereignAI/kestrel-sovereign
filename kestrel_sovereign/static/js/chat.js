@@ -138,27 +138,36 @@ export function segmentToolActivity(content) {
     let idx = 0;
     let m;
     while ((m = re.exec(text)) !== null) {
-        appendProse(text.slice(idx, m.index));
+        // Prose that opens AFTER a marker (idx > 0): its leading spaces/
+        // tabs on the same line are the server's inline separator
+        // ("✓ x complete The next..."), not content — drop them. We strip
+        // only same-line whitespace (no `\n`), so indentation that begins
+        // on a NEW line (a 4-space markdown code block) is preserved.
+        let before = text.slice(idx, m.index);
+        if (idx > 0) before = before.replace(/^[ \t]+/, '');
+        appendProse(before);
         appendTool(m[0]);
         idx = re.lastIndex;
         if (m.index === re.lastIndex) re.lastIndex++; // tokens are non-empty; pure safety
     }
-    appendProse(text.slice(idx));
+    let tail = text.slice(idx);
+    if (idx > 0) tail = tail.replace(/^[ \t]+/, '');
+    appendProse(tail);
 
-    // Drop the wire `---` delimiter where the orchestrator emits it: the
-    // leading line of the prose block immediately following a tools
-    // block. Targeted so genuine markdown rules anywhere else survive.
+    // Clean prose blocks WITHOUT touching content indentation (codex
+    // review): drop the wire `---` delimiter the orchestrator emits at the
+    // head of the prose right after a tools block, then trim surrounding
+    // blank lines and trailing whitespace. A leading 4-space code block
+    // (indentation that follows a newline) survives.
     for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
         if (seg.kind !== 'prose') continue;
+        let t = seg.text;
         if (i > 0 && segments[i - 1].kind === 'tools') {
-            const lines = seg.text.split('\n');
-            let k = 0;
-            while (k < lines.length && lines[k].trim() === '') k++;
-            if (k < lines.length && lines[k].trim() === '---') lines.splice(k, 1);
-            seg.text = lines.join('\n');
+            t = t.replace(/^(?:[ \t]*\r?\n)*[ \t]*---[ \t]*(?:\r?\n|$)/, '');
         }
-        seg.text = seg.text.trim();
+        t = t.replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\s+$/, '');
+        seg.text = t;
     }
     return segments.filter((seg) => seg.kind === 'tools' || seg.text);
 }
