@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-04
-**Scope:** 1637 tracked files (1056 `.py`, 298 `.md`, 283 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-05
+**Scope:** 1640 tracked files (1058 `.py`, 298 `.md`, 284 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -116,7 +116,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/doctrine_bundle.py** — Doctrine bundle hashing, anchoring, and verification.
   - `class DoctrineBundleError`; `class DoctrineBundleDriftError`; `class DoctrineBundleNotAnchoredError`; `class DoctrineBundleSnapshot`; `def compute_doctrine_bundle_hash()`; `def resolve_anchored_paths()`; `async def anchor_doctrine_bundle(agent)`; `async def verify_doctrine_bundle(agent)`; `…`
 - **kestrel_sovereign/agent/event_manager.py** — Event manager mixin for KestrelAgent.
-  - `class EventManagerMixin`
+  - `def describe_background_task(task)`; `def background_task_identifiers(task)`; `class EventManagerMixin`
 - **kestrel_sovereign/agent/memory_manager.py** — Memory Manager for Kestrel Agent.
   - `class MemoryManager`
 - **kestrel_sovereign/agent/model_preference.py** — Model preference and solvency mixin for KestrelAgent.
@@ -1523,6 +1523,7 @@ Repo entry points and standard project files.
 - **tests/frontend/sendmessage_adopts_session_id.test.mjs** — (mjs asset)
 - **tests/frontend/sendmessage_interrupts_when_busy.test.mjs** — (mjs asset)
 - **tests/frontend/session_id_property.test.mjs** — (mjs asset)
+- **tests/frontend/signal_completed_wake.test.mjs** — (mjs asset)
 - **tests/frontend/tool_activity_expandable.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
 - **tests/frontend/trash_grouping.test.mjs** — (mjs asset)
@@ -1793,6 +1794,8 @@ Repo entry points and standard project files.
   - `def test_auto_resolution_uses_selection_hints_over_discovery_order()`; `def test_auto_resolution_prefers_featured_when_no_selection_hints_exist()`; `def test_auto_resolution_avoids_preview_models_when_choosing_fallback()`; `def test_auto_resolution_for_subscription_route_shares_vendor_catalog()`; `def test_shipped_llm_config_uses_auto_models_for_primary_routes()`
 - **tests/unit/test_avatar_storage.py** — Unit tests for avatar storage in AsyncFileStore
   - `async def file_store(tmp_path)`; `async def file_store_with_agent(tmp_path)`; `class TestAvatarStorage`
+- **tests/unit/test_background_task_notification.py** — Regression tests for background-task completion notification formatting.
+  - `def test_execute_skill_metadata_preserved()`; `def test_inbound_sender_and_task_type_used()`; `def test_scheduler_origin_via_causation_chain()`; `def test_causation_chain_single_segment_source()`; `def test_real_producer_keys_win_over_causation_chain()`; `def test_empty_metadata_falls_back_to_unknown_task()`; `def test_task_type_only_metadata()`; `def test_identifiers_expose_full_task_id()`; `…`
 - **tests/unit/test_bootstrap_discovery_fallthrough.py** — Regression: ``_handle_bootstrap`` falls through on discovery LLM error.
   - `async def test_handle_bootstrap_falls_through_when_discovery_llm_fails()`; `async def test_handle_bootstrap_pending_persists_user_message_and_greeting()`; `async def test_handle_bootstrap_pending_does_not_persist_user_when_greeting_fails()`; `async def test_handle_bootstrap_swallows_skip_discovery_failure()`
 - **tests/unit/test_bootstrap_feature.py** — Unit tests for the Bootstrap Feature (#153).
@@ -1831,7 +1834,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_check_policy_guard.py** — Reflection test for the LLMService._check_policy() guard.
   - `class TestPolicyGuardCoverage`; `class TestCheckPolicyBehavior`
 - **tests/unit/test_check_task_status_surfaces_request.py** — ``check_task_status``, ``get_task_result`` and ``list_my_tasks`` must surface the SENDER'S request text — not just the (often empty) agent reply slot.
-  - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_get_task_result_includes_request_content_for_completed_task()`
+  - `async def test_check_task_status_returns_request_content_for_submitted_task()`; `async def test_check_task_status_returns_both_request_and_reply_for_completed_task()`; `async def test_list_my_tasks_includes_request_content_per_row()`; `async def test_get_task_result_includes_request_content_for_completed_task()`; `async def test_check_task_status_surfaces_sender_attached_artifacts()`
 - **tests/unit/test_clean_install_verify.py** — Unit tests for scripts/ci/clean_install_verify.py.
   - `def test_wizard_artifacts_passes_on_post_wizard_tree(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_env_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_data_key_missing(tmp_path, monkeypatch, capsys)`; `def test_wizard_artifacts_fails_when_route_priority_empty(tmp_path, monkeypatch, capsys)`; `def test_identity_passes_when_did_present(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_db_missing(tmp_path, monkeypatch, capsys)`; `def test_identity_fails_when_no_agent_node(tmp_path, monkeypatch, capsys)`; `def test_constitution_passes_with_full_anchor(tmp_path, monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli.py** — Unit tests for the unified kestrel CLI.
@@ -2344,6 +2347,8 @@ Repo entry points and standard project files.
   - `def test_kestrel_agent_get_feature_resolves_class_name()`; `def test_kestrel_agent_get_feature_resolves_lowercase_alias()`; `def test_kestrel_agent_get_feature_resolves_against_real_security_feature()`; `def test_kestrel_agent_get_feature_resolves_tool_name()`; `def test_kestrel_agent_get_feature_returns_none_when_missing()`; `def test_feature_security_lookup_finds_registered_security_feature(module_path, handler_attr, handler_kwargs, tmp_path)`
 - **tests/unit/test_send_a2a_question_supervisor.py** — Unit tests for the sender-side subscription supervisor (#1444 step 3+5+7).
   - `class TestSSEParsing`; `class TestSupervisorHappyPath`; `class TestSupervisor404HardCut`; `class TestSupervisorDeadlineAccurateExpiry`; `class TestSupervisorDeadlineInsideStreamLoop`; `class TestSupervisorStalledStream`; `class TestSupervisorDedupSignal`
+- **tests/unit/test_send_task_endpoint.py** — ``POST /api/agent/tasks/send`` — send-side artifact ingress (#1525).
+  - `def app_with_send(monkeypatch)`; `def test_send_task_persists_sender_artifacts(app_with_send)`; `def test_send_task_without_artifacts_passes_none(app_with_send)`; `def test_send_task_rejects_non_list_artifacts(app_with_send)`; `def test_send_task_rejects_malformed_artifact(app_with_send)`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
   - `def test_health_returns_503_when_agent_missing()`; `def test_health_detailed_uses_health_feature_from_feature_dict()`
 - **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
