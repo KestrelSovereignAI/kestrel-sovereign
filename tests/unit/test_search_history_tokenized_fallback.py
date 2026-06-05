@@ -348,6 +348,123 @@ async def test_canonical_content_still_matches_when_wrapped():
     assert len(results) == 1, "canonical content must still match via token fallback"
 
 
+# Genuine canonical user/assistant rows whose plain text happens to carry
+# wrapper words ("memories", "memory", "end", "past", "conversations",
+# "relevant"). After #1550 wrapper-stripped candidate content, a
+# wrapper-only query was still tokenized and matched these via the 0.6
+# threshold — the #1554 false positive. These rows are NOT transport; their
+# canonical text simply uses ordinary English that overlaps wrapper terms.
+_CANONICAL_WRAPPER_WORD_ROWS = [
+    (
+        1, "user",
+        "I keep losing the plot at the end of long memory-management threads",
+        None, "2026-01-01 00:00:00", None,
+    ),
+    (
+        2, "assistant",
+        "In our past conversations the relevant memories about Meridian came up",
+        None, "2026-01-02 00:00:00", None,
+    ),
+]
+
+
+@pytest.mark.asyncio
+async def test_wrapper_only_query_end_memories_returns_zero():
+    """#1554: ``--- END MEMORIES ---`` is pure transport syntax. After
+    candidate content is wrapper-stripped, ordinary canonical words like
+    ``end`` / ``memory`` would satisfy the tokenized fallback. The query
+    must be rejected — it has no meaningful non-wrapper tokens."""
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=list(_CANONICAL_WRAPPER_WORD_ROWS))
+
+    results = await store.search_history("--- END MEMORIES ---", limit=10)
+    assert len(results) == 0, (
+        "wrapper-only delimiter query must not match canonical rows that "
+        "merely contain words like 'end' or 'memory'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_wrapper_only_query_relevant_memories_returns_zero():
+    """#1554: ``RELEVANT MEMORIES from past conversations`` is the bare
+    retrieved-memory heading. It must not match canonical rows that use the
+    same ordinary words (relevant/memories/past/conversations)."""
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=list(_CANONICAL_WRAPPER_WORD_ROWS))
+
+    results = await store.search_history(
+        "RELEVANT MEMORIES from past conversations", limit=10
+    )
+    assert len(results) == 0, (
+        "wrapper-only heading query must not match canonical rows via "
+        "tokenized fallback"
+    )
+
+
+@pytest.mark.asyncio
+async def test_query_with_wrapper_words_plus_real_term_not_rejected():
+    """#1554 boundary: the gate fires only when NOTHING meaningful survives
+    stripping. A query mixing wrapper words with a genuine term (here a
+    delimiter heading that does not match the anchored wrapper grammar,
+    leaving a real token) must still tokenize and match canonical content."""
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    stored = "notes about the meridian end-of-session memory checkpoint"
+    fake_row = (1, "user", stored, None, "2026-01-01 00:00:00", None)
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=[fake_row])
+
+    # "meridian" is not a wrapper word; it survives stripping, so the query
+    # is not wrapper-only and the tokenized fallback stays active.
+    results = await store.search_history("meridian memory checkpoint", limit=10)
+    assert len(results) == 1
+    assert results[0]["content"] == stored
+
+
+@pytest.mark.asyncio
+async def test_broad_recall_unaffected_by_wrapper_only_gate():
+    """#1554 must not regress #1500 broad recall: a query that contains real
+    non-wrapper terms (even alongside wrapper-ish words) still tokenizes and
+    matches via the fallback."""
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    stored = (
+        "meridian, and our discussion of the first kestrel agent. "
+        "It seems our context and memory mgmt needs some work, "
+        "I keep losing the plot..."
+    )
+    fake_row = (1, "user", stored, None, "2026-01-01 00:00:00", None)
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=[fake_row])
+
+    results = await store.search_history(
+        "Meridian first Kestrel agent context memory management losing plot",
+        limit=10,
+    )
+    assert len(results) == 1, "broad canonical recall must still work"
+    assert results[0]["content"] == stored
+
+
 @pytest.mark.asyncio
 async def test_single_word_query_uses_exact_only():
     """Single-word queries should not activate token fallback."""
