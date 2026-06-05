@@ -128,23 +128,51 @@ _SEARCH_WRAPPER_BLOCK_RES = (
     re.compile(r"<retrieved_context>.*?</retrieved_context>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<memories>.*?</memories>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<documents>.*?</documents>", re.DOTALL | re.IGNORECASE),
+    # The plain-text memory block emitted by
+    # ``MemoryManager.retrieve_memories`` / ``_build_memory_context``
+    # (``--- RELEVANT MEMORIES (from past conversations) --- ... ---
+    # END MEMORIES ---``). The XML ``<memories>`` envelope is only added
+    # one layer up in ``ContextManager.build_context``; rows persisted
+    # via an older rendering path (or where the envelope was stripped but
+    # the inner block was not) carry the bare delimiters. The whole
+    # region is retrieved-context transport — the recalled ``[Memory N]``
+    # lines are copies of canonical rows that remain independently
+    # searchable — so the entire span must be removed from the match
+    # text, not just the heading line (#1549).
+    re.compile(
+        r"-*\s*RELEVANT MEMORIES.*?-+\s*END MEMORIES\s*-*",
+        re.DOTALL | re.IGNORECASE,
+    ),
 )
-# Display-only heading emitted when baking retrieved memories into the
-# user template. Carries words ("relevant", "memories", "conversations")
-# that would otherwise satisfy the tokenized fallback on their own.
-_SEARCH_WRAPPER_HEADING_RE = re.compile(r"-*\s*RELEVANT MEMORIES.*", re.IGNORECASE)
+# Display-only marker lines emitted when baking retrieved memories into
+# the user template. These carry words ("relevant", "memories",
+# "conversations", "retrieved", "earlier") that would otherwise satisfy
+# the tokenized fallback on their own. Stripped line-by-line as a
+# fallback for the residual case where the bare memory block above was
+# truncated mid-render (token budget) and lost its ``END MEMORIES``
+# footer, so the DOTALL span match can't anchor (#1549).
+_SEARCH_WRAPPER_LINE_RES = (
+    re.compile(r"-*\s*RELEVANT MEMORIES.*", re.IGNORECASE),
+    re.compile(
+        r"NOTE: These are retrieved from earlier conversations,"
+        r" not the current session\.",
+        re.IGNORECASE,
+    ),
+    re.compile(r"-+\s*END MEMORIES\s*-*", re.IGNORECASE),
+)
 
 
 def _strip_search_wrappers(text: str) -> str:
     """Project *text* to its wrapper-free form for SEARCH MATCHING only.
 
     Rendered user turns carry transport wrappers — ``<retrieved_context>``,
-    ``<memories>``, ``<documents>`` blocks plus the ``RELEVANT MEMORIES``
-    display heading — baked in for byte-stable prompt replay (#1402).
-    Those wrappers are generated retrieval-context, not conversation
-    content; matching against them reintroduces the #1500/#1537 false
-    positive where a query of wrapper-only terms matches a row whose
-    actual user text is unrelated.
+    ``<memories>``, ``<documents>`` blocks plus the plain-text
+    ``--- RELEVANT MEMORIES ... --- END MEMORIES ---`` block (heading,
+    ``NOTE:`` line, and recalled ``[Memory N]`` lines) — baked in for
+    byte-stable prompt replay (#1402). Those wrappers are generated
+    retrieval-context, not conversation content; matching against them
+    reintroduces the #1500/#1537/#1549 false positive where a query of
+    wrapper-only terms matches a row whose actual user text is unrelated.
 
     This is a matching-only projection: the row's canonical ``content``
     (already split out by ``_resolve_canonical``) is what gets returned —
@@ -156,7 +184,8 @@ def _strip_search_wrappers(text: str) -> str:
     s = text
     for pattern in _SEARCH_WRAPPER_BLOCK_RES:
         s = pattern.sub(" ", s)
-    s = _SEARCH_WRAPPER_HEADING_RE.sub(" ", s)
+    for pattern in _SEARCH_WRAPPER_LINE_RES:
+        s = pattern.sub(" ", s)
     return s.replace("<user_input>", " ").replace("</user_input>", " ")
 
 

@@ -202,6 +202,120 @@ async def test_search_memory_preserves_broad_token_fallback():
     assert "<user_input>" not in returned
 
 
+@pytest.mark.parametrize(
+    "wrapper_phrase",
+    [
+        "RELEVANT MEMORIES from past conversations",
+        "NOTE: These are retrieved from earlier conversations, not the current session.",
+        "--- END MEMORIES ---",
+    ],
+)
+@pytest.mark.asyncio
+async def test_search_memory_ignores_bare_memory_block_wrappers(wrapper_phrase):
+    """Live #1549: after #1538, ``search_memory`` still returned hits for
+    retrieved-context wrapper phrases when the persisted row carried the
+    *bare* plain-text memory block — the ``--- RELEVANT MEMORIES ... ---
+    END MEMORIES ---`` delimiters, the ``NOTE:`` line, and the recalled
+    ``[Memory N]`` lines — WITHOUT the ``<retrieved_context>`` /
+    ``<memories>`` XML envelope that #1538's block regex anchored on.
+
+    Each of the three exact phrases the live agent surfaced as false
+    positives must now return zero canonical results. Wires a REAL
+    AsyncConversationStore so the full ``search_history`` match path runs.
+    """
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    # Bare block: the memory_manager.py format with NO XML envelope, then
+    # an unrelated raw user turn. ``extract_raw_user_content`` leaves this
+    # untouched (it does not start with <retrieved_context>), so the
+    # wrapper-stripping projection is the only thing standing between the
+    # query and a false positive.
+    bare = (
+        "--- RELEVANT MEMORIES (from past conversations) ---\n"
+        "NOTE: These are retrieved from earlier conversations, not the current session.\n\n"
+        "[Memory 1] (2026-05-19 10:00) User: Meridian and the first kestrel agent\n"
+        "  Importance: 0.8, Emotion: 0.3\n"
+        "--- END MEMORIES ---\n"
+        "<user_input>\nwhat is the weather like today\n</user_input>"
+    )
+    fake_row = (1, "user", bare, None, "2026-01-01 00:00:00", None)
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=[fake_row])
+
+    feature = MemoryFeature.__new__(MemoryFeature)
+    feature._get_conversation_store = lambda: store
+
+    out = await feature.search_memory(query=wrapper_phrase, limit=10)
+    assert out.status is ToolResultStatus.OK
+    assert out.data["count"] == 0, (
+        f"wrapper-only phrase {wrapper_phrase!r} must not match the bare "
+        "memory block — it is transport, not canonical content"
+    )
+    assert out.data["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_search_memory_recovers_canonical_row_alongside_bare_block_rows():
+    """Control for #1549: the broad query must still recover the canonical
+    2026-05-19 user message even when other rows carry the bare memory
+    block that copies its text. The recalled ``[Memory N]`` copy inside the
+    block is stripped from matching; the standalone canonical row is not."""
+    from kestrel_sovereign.storage.async_conversation_store import (
+        AsyncConversationStore,
+    )
+
+    store = AsyncConversationStore.__new__(AsyncConversationStore)
+    store.agent_id = "test-agent"
+    store._agent_fernet = None
+    store._global_fernet = None
+    store._migrate_on_read = False
+
+    canonical = (
+        "<user_input>\n"
+        "Meridian and our discussion of the first Kestrel agent\n"
+        "</user_input>"
+    )
+    bare_block_row = (
+        1,
+        "user",
+        (
+            "--- RELEVANT MEMORIES (from past conversations) ---\n"
+            "NOTE: These are retrieved from earlier conversations, not the current session.\n"
+            "[Memory 1] User: Meridian and our discussion of the first Kestrel agent\n"
+            "--- END MEMORIES ---\n"
+            "<user_input>\nunrelated follow-up question\n</user_input>"
+        ),
+        None,
+        "2026-06-04 00:00:00",
+        None,
+    )
+    canonical_row = (2, "user", canonical, None, "2026-05-19 00:00:00", None)
+    store.db = MagicMock()
+    store.db.fetchall = AsyncMock(return_value=[bare_block_row, canonical_row])
+
+    feature = MemoryFeature.__new__(MemoryFeature)
+    feature._get_conversation_store = lambda: store
+
+    out = await feature.search_memory(
+        query="Meridian and our discussion of the first Kestrel agent", limit=10
+    )
+    assert out.status is ToolResultStatus.OK
+    contents = [r["content"] for r in out.data["results"]]
+    assert any(
+        "meridian and our discussion of the first kestrel agent" in c.lower()
+        and "--- end memories ---" not in c.lower()
+        for c in contents
+    ), "the standalone canonical 2026-05-19 row must still be recovered"
+
+
 def test_idempotent_on_assistant_content_that_happens_to_contain_user_input_tag():
     """Defense-in-depth: if an assistant row's persisted text accidentally
     starts with ``<user_input>`` (e.g. the model emitted it as part of
