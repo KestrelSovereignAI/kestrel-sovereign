@@ -338,3 +338,25 @@ test('segmentToolActivity cards EVERY iteration of a multi-batch turn (#1547 fol
     assert.match(segs[1].text, /memory_feature complete/);
     assert.match(segs[1].text, /github complete/);
 });
+
+test('segmentToolActivity bounds an error detail glued onto the next marker', () => {
+    // Codex review: `❌ X failed: <detail>` must not swallow a following
+    // glued marker into its detail. Each run stays a distinct token and
+    // trailing prose stays prose.
+    const segs = segmentToolActivity(
+        '\u{1F527} Calling search...❌ search failed: timeout'
+        + '\u{1F527} Calling fallback...✓ fallback complete Final answer.',
+    );
+
+    assert.deepEqual(segs.map((s) => s.kind), ['tools', 'prose']);
+    // Both runs coalesce into one card group (no prose between them)...
+    assert.match(segs[0].text, /search failed: timeout/);
+    assert.match(segs[0].text, /Calling fallback\.\.\./);
+    assert.match(segs[0].text, /fallback complete/);
+    // ...and the error detail did NOT eat the fallback start marker.
+    assert.ok(
+        !/timeout\u{1F527}/u.test(segs[0].text),
+        'error detail must terminate at the next marker, got: ' + JSON.stringify(segs[0].text),
+    );
+    assert.equal(segs[1].text, 'Final answer.');
+});

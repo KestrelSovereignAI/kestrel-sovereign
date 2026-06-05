@@ -84,7 +84,11 @@ function groupToolActivity(lines) {
 //   START: 🔧 Calling <name>[: detail]...
 //   DONE:  ✓ <name> complete|done [(detail)]
 //   ERROR: ❌ <name> failed[: detail]
-const TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n]*)?/gu;
+// The error detail excludes the marker code points (🔧 ✓ ❌) so a
+// detail glued to a following marker — "❌ x failed: timeout🔧 Calling
+// y..." — terminates at that marker instead of swallowing it (codex
+// review). Start ("...") and done (keyword/paren) are already self-bounded.
+const TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n\u{1F527}✓❌]*)?/gu;
 
 // A turn is only treated as tool activity when it contains at least one
 // 🔧 Calling start marker. Done/error markers (✓/❌) are recognized only
