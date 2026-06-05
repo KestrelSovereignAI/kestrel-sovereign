@@ -335,3 +335,170 @@ class TestCLIDispatch:
             result = await feature._dispatch_via_cli(["claim", "--repo", "a/b", "--issue", "1"])
             assert result["dispatched"] is False
             assert "not found" in result["error"]
+
+
+class TestTalonWait:
+    @pytest.mark.asyncio
+    async def test_unknown_job(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        result = await feature.talon_wait(job_id="nope", timeout_seconds=0)
+        assert result.status is ToolResultStatus.ERROR
+        assert "Unknown job_id" in result.error
+
+    @pytest.mark.asyncio
+    async def test_terminal_before_timeout_complete(self, tmp_path):
+        feature = TalonCoordinatorFeature(_make_agent())
+        log = tmp_path / "job.log"
+        log.write_text("line-1\nline-2\nall done\n")
+        feature._jobs["job-x"] = {
+            "method": "cli_background",
+            "status": "complete",
+            "returncode": 0,
+            "log_path": str(log),
+        }
+        result = await feature.talon_wait(
+            job_id="job-x", timeout_seconds=30, poll_interval_seconds=1,
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "complete"
+        assert result.data["returncode"] == 0
+        assert result.data["timed_out"] is False
+        assert "all done" in result.data["log_tail"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_before_timeout_failed(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._jobs["job-f"] = {
+            "method": "cli_background",
+            "status": "failed",
+            "returncode": 2,
+        }
+        result = await feature.talon_wait(
+            job_id="job-f", timeout_seconds=30,
+        )
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["status"] == "failed"
+        assert result.data["returncode"] == 2
+        assert result.data["timed_out"] is False
+
+    @pytest.mark.asyncio
+    async def test_timeout_while_running(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        # method=a2a so _reap_cli_job is a no-op and the job stays
+        # 'running'; timeout_seconds=0 returns after a single poll with
+        # no sleep.
+        feature._jobs["job-r"] = {"method": "a2a", "status": "running"}
+        result = await feature.talon_wait(
+            job_id="job-r", timeout_seconds=0, poll_interval_seconds=1,
+        )
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["status"] == "running"
+        assert result.data["timed_out"] is True
+        assert result.data["timeout_seconds"] == 0
+
+    @pytest.mark.asyncio
+    async def test_max_duration_rejected(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._jobs["job-r"] = {"method": "a2a", "status": "running"}
+        too_long = TalonCoordinatorFeature._TALON_WAIT_MAX_SECONDS + 1
+        result = await feature.talon_wait(
+            job_id="job-r", timeout_seconds=too_long,
+        )
+        assert result.status is ToolResultStatus.ERROR
+        assert "exceeds the maximum" in result.error
+        assert result.data["max_seconds"] == (
+            TalonCoordinatorFeature._TALON_WAIT_MAX_SECONDS
+        )
+
+    @pytest.mark.asyncio
+    async def test_reaps_cli_job_via_sidecar(self, tmp_path):
+        """A running cli_background job whose exit sidecar appears is
+        reaped to terminal state during the wait (shared _reap_cli_job).
+        """
+        agent = _make_agent()
+        # Isolate the durable registry under tmp_path so _persist_jobs
+        # does not write to a shared relative path (storage_path drives
+        # _job_log_dir, not KESTREL_HOME).
+        agent.storage_path = str(tmp_path / "agent_data" / "kestrel_prime.db")
+        feature = TalonCoordinatorFeature(agent)
+        exit_file = tmp_path / "job.exit"
+        exit_file.write_text("0")
+        feature._jobs["job-s"] = {
+            "method": "cli_background",
+            "status": "running",
+            "process": None,
+            "exit_path": str(exit_file),
+            "pid": 999999,
+        }
+        result = await feature.talon_wait(
+            job_id="job-s", timeout_seconds=30, poll_interval_seconds=1,
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "complete"
+        assert result.data["returncode"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reconciles_a2a_job_completed(self, tmp_path):
+        """An a2a job reaches terminal state during the wait when Talon's
+        task endpoint reports COMPLETED — the default dispatch transport.
+
+        Without the shared _reconcile_a2a_job call in the poll loop this
+        would time out (a2a is a no-op for _reap_cli_job).
+        """
+        agent = _make_agent()
+        agent.storage_path = str(tmp_path / "agent_data" / "kestrel_prime.db")
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["job-a"] = {"method": "a2a", "status": "running"}
+
+        completed_payload = json.dumps(
+            {"status": {"state": "completed"}}
+        ).encode()
+
+        class _Resp:
+            def read(self):
+                return completed_payload
+
+        with patch.object(
+            feature, "_discover_host_url", return_value="http://localhost:9999"
+        ), patch(
+            "kestrel_sovereign.features.talon.coordinator.urllib.request.urlopen",
+            return_value=_Resp(),
+        ):
+            result = await feature.talon_wait(
+                job_id="job-a", timeout_seconds=30, poll_interval_seconds=1,
+            )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["status"] == "complete"
+        assert result.data["timed_out"] is False
+
+    @pytest.mark.asyncio
+    async def test_reconciles_a2a_job_failed(self, tmp_path):
+        """An a2a job whose task endpoint reports FAILED ends the wait in
+        the 'failed' terminal state with an ERROR result.
+        """
+        agent = _make_agent()
+        agent.storage_path = str(tmp_path / "agent_data" / "kestrel_prime.db")
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs["job-b"] = {"method": "a2a", "status": "running"}
+
+        failed_payload = json.dumps(
+            {"status": {"state": "failed", "message": {"text": "boom"}}}
+        ).encode()
+
+        class _Resp:
+            def read(self):
+                return failed_payload
+
+        with patch.object(
+            feature, "_discover_host_url", return_value="http://localhost:9999"
+        ), patch(
+            "kestrel_sovereign.features.talon.coordinator.urllib.request.urlopen",
+            return_value=_Resp(),
+        ):
+            result = await feature.talon_wait(
+                job_id="job-b", timeout_seconds=30, poll_interval_seconds=1,
+            )
+        assert result.status is ToolResultStatus.ERROR
+        assert result.data["status"] == "failed"
+        assert result.data["timed_out"] is False
+        assert feature._jobs["job-b"]["error"] == "boom"

@@ -259,6 +259,11 @@ class TalonCoordinatorFeature(Feature):
     and checking status. Prefers mesh dispatch over CLI fallback.
     """
 
+    # Conservative ceiling on a single blocking ``talon_wait``. Waits
+    # longer than this should rely on the ``talon_monitor`` cron signal
+    # to wake the agent rather than holding a turn open.
+    _TALON_WAIT_MAX_SECONDS = 3600
+
     def __init__(self, agent):
         super().__init__(agent)
         # message_id -> {pid, started_at, log_path, command, repo,
@@ -1444,48 +1449,8 @@ class TalonCoordinatorFeature(Feature):
         # Reap finished background CLI jobs
         jobs_changed = False
         for jid, info in list(self._jobs.items()):
-            if info.get("method") != "cli_background":
-                continue
-            if info.get("status") not in ("dispatched", "running"):
-                continue
-            proc = info.get("process")
-            if proc is None:
-                # Reloaded after restart: no live handle. The sidecar
-                # exit file is the authoritative source of truth — if
-                # it exists, the wrapper recorded the exit code. If
-                # not, fall back to pid liveness (best-effort; PID
-                # reuse can produce a false 'running').
-                rc = self._read_exit_sidecar(info.get("exit_path"))
-                if rc is not None:
-                    info["status"] = "complete" if rc == 0 else "failed"
-                    info["returncode"] = rc
-                    info.setdefault(
-                        "completed_at",
-                        datetime.now(timezone.utc).isoformat(),
-                    )
-                    jobs_changed = True
-                elif self._pid_alive(info.get("pid")):
-                    info["status"] = "running"
-                else:
-                    # Process gone, no sidecar: status genuinely unknown.
-                    # Do NOT claim 'complete' — that would lie about
-                    # failures that exited before the wrapper wrote.
-                    info["status"] = "finished_unknown"
-                    info.setdefault("returncode", None)
-                    info.setdefault(
-                        "completed_at",
-                        datetime.now(timezone.utc).isoformat(),
-                    )
-                    jobs_changed = True
-                continue
-            rc = proc.returncode
-            if rc is None:
-                info["status"] = "running"
-                continue
-            info["status"] = "complete" if rc == 0 else "failed"
-            info["returncode"] = rc
-            info["completed_at"] = datetime.now(timezone.utc).isoformat()
-            jobs_changed = True
+            if self._reap_cli_job(info):
+                jobs_changed = True
 
         if jobs_changed:
             self._persist_jobs()
@@ -1506,45 +1471,12 @@ class TalonCoordinatorFeature(Feature):
             and info.get("status") in ("dispatched", "running")
         ]
         if host_url and a2a_jobs_to_check:
+            a2a_changed = False
             for jid, info in a2a_jobs_to_check:
-                url = (
-                    f"{host_url}/api/agents/talon/api/agent/tasks/{jid}"
-                )
-                req = urllib.request.Request(
-                    url,
-                    method="GET",
-                    headers={"Content-Type": "application/json"},
-                )
-                try:
-                    raw = await asyncio.to_thread(
-                        lambda: urllib.request.urlopen(req, timeout=5).read()
-                    )
-                    task_payload = json.loads(raw)
-                except (urllib.error.URLError, urllib.error.HTTPError, ValueError):
-                    # Network blip / Talon offline / task not yet
-                    # visible to Talon's task_store. Leave the
-                    # coordinator's row in its current state; the
-                    # next talon_status call will retry.
-                    continue
-                state = (
-                    task_payload.get("status", {}) or {}
-                ).get("state") or task_payload.get("status")
-                # Map A2A TaskState → coordinator status. SUBMITTED
-                # and WORKING stay "running"; COMPLETED→complete;
-                # FAILED/CANCELED→failed.
-                if state in ("submitted", "working"):
-                    info["status"] = "running"
-                elif state == "completed":
-                    info["status"] = "complete"
-                    info["completed_at"] = datetime.now(timezone.utc).isoformat()
-                elif state in ("failed", "canceled"):
-                    info["status"] = "failed"
-                    info["completed_at"] = datetime.now(timezone.utc).isoformat()
-                    err_msg = (
-                        (task_payload.get("status", {}) or {})
-                        .get("message", {}) or {}
-                    )
-                    info["error"] = err_msg.get("text") or state
+                if await self._reconcile_a2a_job(jid, info, host_url):
+                    a2a_changed = True
+            if a2a_changed:
+                self._persist_jobs()
 
         def _public(info: Dict[str, Any]) -> Dict[str, Any]:
             # Strip non-serialisable fields (the asyncio Process handle).
@@ -1628,6 +1560,143 @@ class TalonCoordinatorFeature(Feature):
                 "content": "".join(tail),
             },
         )
+
+    @tool(
+        name="talon_wait",
+        description=(
+            "Block the current turn until a specific Talon job reaches a "
+            "terminal state (complete/failed/finished_unknown) or the "
+            "timeout expires, polling the durable job registry instead "
+            "of shelling out to `sleep`. Returns the terminal status, "
+            "the return code when known, a log tail, and timeout "
+            "metadata if the job is still running. Use this when "
+            "actively supervising a job this turn; use talon_monitor "
+            "(the cron/signal path) for unattended completions."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!talon wait",
+    )
+    async def talon_wait(
+        self,
+        job_id: str,
+        timeout_seconds: int = 600,
+        poll_interval_seconds: int = 10,
+    ) -> ToolResult:
+        """Wait for a dispatched Talon job to finish.
+
+        Args:
+            job_id: The job_id returned by talon_claim.
+            timeout_seconds: Maximum seconds to wait before returning
+                still-running (capped at the enforced maximum).
+            poll_interval_seconds: Seconds between registry polls.
+        """
+        try:
+            timeout_val = int(timeout_seconds)
+            poll_val = int(poll_interval_seconds)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                "timeout_seconds and poll_interval_seconds must be "
+                f"integers, got {timeout_seconds!r}, "
+                f"{poll_interval_seconds!r}"
+            )
+        if timeout_val < 0 or poll_val <= 0:
+            return ToolResult.failed(
+                "timeout_seconds must be >= 0 and poll_interval_seconds "
+                "must be > 0"
+            )
+        if timeout_val > self._TALON_WAIT_MAX_SECONDS:
+            return ToolResult.failed(
+                f"timeout_seconds {timeout_val} exceeds the maximum "
+                f"{self._TALON_WAIT_MAX_SECONDS}s for talon_wait; rely on "
+                f"talon_monitor to wake the agent instead",
+                data={
+                    "job_id": job_id,
+                    "requested_seconds": timeout_val,
+                    "max_seconds": self._TALON_WAIT_MAX_SECONDS,
+                },
+            )
+
+        terminal_states = (
+            "complete", "failed", "reject", "finished_unknown",
+        )
+
+        # Pull in CLI jobs persisted before a restart so a freshly
+        # reloaded feature can still wait on them.
+        self._reload_persisted_jobs()
+        if job_id not in self._jobs:
+            return ToolResult.failed(
+                f"Unknown job_id: {job_id}", data={"job_id": job_id},
+            )
+
+        # Resolve the host URL once so each poll can reconcile A2A jobs
+        # against Talon's task_store (the default dispatch transport);
+        # without this the loop only sees CLI-background transitions.
+        host_url = self._discover_host_url()
+
+        start = time.monotonic()
+        while True:
+            info = self._jobs.get(job_id)
+            if info is None:
+                return ToolResult.failed(
+                    f"Unknown job_id: {job_id}", data={"job_id": job_id},
+                )
+            changed = self._reap_cli_job(info)
+            if info.get("method") == "a2a" and host_url:
+                if await self._reconcile_a2a_job(job_id, info, host_url):
+                    changed = True
+            if changed:
+                self._persist_jobs()
+
+            status = info.get("status")
+            elapsed = int(time.monotonic() - start)
+
+            if status in terminal_states:
+                rc = info.get("returncode")
+                log_tail = self._tail_job_log(info.get("log_path"), lines=20)
+                data = {
+                    "job_id": job_id,
+                    "status": status,
+                    "returncode": rc,
+                    "waited_seconds": elapsed,
+                    "log_tail": log_tail,
+                    "timed_out": False,
+                }
+                if status == "complete":
+                    return ToolResult.ok(
+                        confirmation=(
+                            f"Talon job {job_id[:8]} completed after "
+                            f"{elapsed}s (rc={rc})"
+                        ),
+                        data=data,
+                    )
+                return ToolResult.failed(
+                    f"Talon job {job_id[:8]} ended in '{status}' after "
+                    f"{elapsed}s (rc={rc})",
+                    data=data,
+                )
+
+            if elapsed >= timeout_val:
+                log_tail = self._tail_job_log(info.get("log_path"), lines=20)
+                return ToolResult.partial(
+                    confirmation=(
+                        f"Talon job {job_id[:8]} still '{status}' after "
+                        f"{elapsed}s"
+                    ),
+                    error=(
+                        f"Timeout after {timeout_val}s; job not terminal"
+                    ),
+                    data={
+                        "job_id": job_id,
+                        "status": status,
+                        "returncode": info.get("returncode"),
+                        "waited_seconds": elapsed,
+                        "log_tail": log_tail,
+                        "timed_out": True,
+                        "timeout_seconds": timeout_val,
+                    },
+                )
+
+            await asyncio.sleep(poll_val)
 
     @tool(
         name="talon_monitor",
@@ -2354,6 +2423,119 @@ class TalonCoordinatorFeature(Feature):
         if not buf:
             return ""
         return "".join(buf[-lines:])
+
+    def _reap_cli_job(self, info: Dict[str, Any]) -> bool:
+        """Refresh a single ``cli_background`` job's status in place.
+
+        Returns ``True`` when the job's persisted state changed so the
+        caller knows to re-persist the registry. No-op (returns
+        ``False``) for jobs that are not ``cli_background`` or are no
+        longer in ``dispatched``/``running``. Shared by ``talon_status``
+        and ``talon_wait`` so the reaping logic lives in one place.
+        """
+        if info.get("method") != "cli_background":
+            return False
+        if info.get("status") not in ("dispatched", "running"):
+            return False
+        proc = info.get("process")
+        if proc is None:
+            # Reloaded after restart: no live handle. The sidecar exit
+            # file is the authoritative source of truth — if it exists,
+            # the wrapper recorded the exit code. If not, fall back to
+            # pid liveness (best-effort; PID reuse can produce a false
+            # 'running').
+            rc = self._read_exit_sidecar(info.get("exit_path"))
+            if rc is not None:
+                info["status"] = "complete" if rc == 0 else "failed"
+                info["returncode"] = rc
+                info.setdefault(
+                    "completed_at",
+                    datetime.now(timezone.utc).isoformat(),
+                )
+                return True
+            if self._pid_alive(info.get("pid")):
+                info["status"] = "running"
+                return False
+            # Process gone, no sidecar: status genuinely unknown. Do NOT
+            # claim 'complete' — that would lie about failures that
+            # exited before the wrapper wrote.
+            info["status"] = "finished_unknown"
+            info.setdefault("returncode", None)
+            info.setdefault(
+                "completed_at",
+                datetime.now(timezone.utc).isoformat(),
+            )
+            return True
+        rc = proc.returncode
+        if rc is None:
+            info["status"] = "running"
+            return False
+        info["status"] = "complete" if rc == 0 else "failed"
+        info["returncode"] = rc
+        info["completed_at"] = datetime.now(timezone.utc).isoformat()
+        return True
+
+    async def _reconcile_a2a_job(
+        self, jid: str, info: Dict[str, Any], host_url: str
+    ) -> bool:
+        """Refresh a single ``a2a`` job's status against Talon's task_store.
+
+        Queries the recipient's A2A task by id and maps its TaskState
+        back to coordinator status: SUBMITTED/WORKING→running,
+        COMPLETED→complete, FAILED/CANCELED→failed. Returns ``True`` when
+        the persisted state changed so the caller knows to re-persist the
+        registry. No-op (returns ``False``) for jobs that are not ``a2a``,
+        are no longer ``dispatched``/``running``, or when the network
+        query fails. Shared by ``talon_status`` and ``talon_wait`` so the
+        A2A reconciliation lives in one place — mirroring ``_reap_cli_job``
+        for the CLI transport.
+        """
+        if info.get("method") != "a2a":
+            return False
+        if info.get("status") not in ("dispatched", "running"):
+            return False
+        if not host_url:
+            return False
+        url = f"{host_url}/api/agents/talon/api/agent/tasks/{jid}"
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            raw = await asyncio.to_thread(
+                lambda: urllib.request.urlopen(req, timeout=5).read()
+            )
+            task_payload = json.loads(raw)
+        except (urllib.error.URLError, urllib.error.HTTPError, ValueError):
+            # Network blip / Talon offline / task not yet visible to
+            # Talon's task_store. Leave the coordinator's row in its
+            # current state; the next poll will retry.
+            return False
+        state = (
+            task_payload.get("status", {}) or {}
+        ).get("state") or task_payload.get("status")
+        # Map A2A TaskState → coordinator status. SUBMITTED and WORKING
+        # stay "running"; COMPLETED→complete; FAILED/CANCELED→failed.
+        if state in ("submitted", "working"):
+            if info.get("status") != "running":
+                info["status"] = "running"
+                return True
+            return False
+        if state == "completed":
+            info["status"] = "complete"
+            info["completed_at"] = datetime.now(timezone.utc).isoformat()
+            return True
+        if state in ("failed", "canceled"):
+            info["status"] = "failed"
+            info["completed_at"] = datetime.now(timezone.utc).isoformat()
+            err_msg = (
+                (task_payload.get("status", {}) or {})
+                .get("message", {}) or {}
+            )
+            info["error"] = err_msg.get("text") or state
+            return True
+        return False
 
     @staticmethod
     def _read_exit_sidecar(path: Any) -> Optional[int]:

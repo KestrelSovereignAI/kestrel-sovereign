@@ -51,6 +51,10 @@ class TaskFeature(Feature):
     - Query task status and results
     """
 
+    # Conservative ceiling on a single blocking ``wait``. A pause longer
+    # than this should be a scheduled/cron resume, not a held agent turn.
+    _MAX_WAIT_SECONDS = 1800
+
     def __init__(self, agent=None):
         if agent is not None:
             super().__init__(agent)
@@ -1340,5 +1344,69 @@ class TaskFeature(Feature):
                 "status": last_status,
                 "waited_seconds": elapsed,
                 "timeout_seconds": timeout_val,
+            },
+        )
+
+    @tool(
+        name="wait",
+        description=(
+            "Pause for a bounded number of seconds, then resume — the "
+            "native alternative to shelling out to `sleep` between polls "
+            "in an autonomous work loop. Enforces a conservative maximum "
+            "duration and returns the observed elapsed time. This is the "
+            "generic wait; to block on a specific job use that feature's "
+            "own wait helper (e.g. talon_wait), and for a Kestrel "
+            "background task use wait_for_task."
+        ),
+        category=ToolCategory.UTILITY,
+        command_prefix="!wait",
+    )
+    async def wait(
+        self,
+        duration_seconds: int,
+        reason: str = "",
+    ) -> ToolResult:
+        """
+        Pause execution for a bounded duration without using a shell.
+
+        Args:
+            duration_seconds: Seconds to wait (0 to the enforced maximum).
+            reason: Optional human-readable note on why we are waiting
+                (recorded in the audited tool result).
+        """
+        try:
+            duration = int(duration_seconds)
+        except (TypeError, ValueError):
+            return ToolResult.failed(
+                f"duration_seconds must be an integer, got {duration_seconds!r}"
+            )
+        if duration < 0:
+            return ToolResult.failed(
+                f"duration_seconds must be >= 0, got {duration}"
+            )
+        if duration > self._MAX_WAIT_SECONDS:
+            return ToolResult.failed(
+                f"duration_seconds {duration} exceeds the maximum "
+                f"{self._MAX_WAIT_SECONDS}s for a single wait; schedule a "
+                f"resume instead of holding the turn",
+                data={
+                    "requested_seconds": duration,
+                    "max_seconds": self._MAX_WAIT_SECONDS,
+                },
+            )
+
+        start = time.monotonic()
+        await asyncio.sleep(duration)
+        elapsed = round(time.monotonic() - start, 3)
+
+        confirmation = f"Waited {elapsed}s"
+        if reason:
+            confirmation += f" ({reason})"
+        return ToolResult.ok(
+            confirmation=confirmation,
+            data={
+                "requested_seconds": duration,
+                "elapsed_seconds": elapsed,
+                "reason": reason,
             },
         )
