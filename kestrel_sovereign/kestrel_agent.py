@@ -302,6 +302,25 @@ class KestrelAgent(
         # the invariant is enforced for them and silently waived for fakes.
         if hasattr(self.llm_service, "attach_to_agent"):
             self.llm_service.attach_to_agent(did)
+        # #1563: give every stateful adapter (currently just
+        # CodexAdapter) a reference to this agent so the failure-
+        # result rewrite can cross-reference the SecurityFeature's
+        # audit log when classifying a tool failure. Without this,
+        # the audit slot defaults to empty and audit-backed
+        # USER_DENIED gets misclassified as SANDBOX_BLOCKED from
+        # the raw "rejected by user" pattern alone. Best-effort:
+        # adapters that don't expose ``attach_agent_for_audit``
+        # (legacy / external) are silently skipped.
+        for provider in getattr(self.llm_service, "providers", []):
+            adapter = provider.get("adapter")
+            if adapter is not None and hasattr(adapter, "attach_agent_for_audit"):
+                try:
+                    adapter.attach_agent_for_audit(self)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "attach_agent_for_audit failed on %s: %s",
+                        type(adapter).__name__, exc,
+                    )
         self.pg_pool = pg_pool
         # Note: agent_id is a @property that returns self.did (see below).
         # Do NOT set self.agent_id = ... here; it would shadow the property.

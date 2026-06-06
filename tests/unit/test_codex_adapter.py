@@ -161,9 +161,20 @@ class TestResultMarshalling:
         assert r["contentItems"][0]["text"] == "salamander"
 
     def test_error_payload(self):
+        """Failure results now route through the #1563 pre-response
+        rewrite: the raw error is wrapped in a typed Outcome /
+        Recovery block so the LLM cannot echo a misleading raw
+        string as a literal claim (e.g. Codex's "rejected by user"
+        as user denial). The original raw text is preserved INSIDE
+        the block as diagnostic context.
+        """
         r = _result_to_codex_response({"success": False, "error": "denied"})
         assert r["success"] is False
-        assert r["contentItems"][0]["text"] == "denied"
+        text = r["contentItems"][0]["text"]
+        assert "Outcome:" in text
+        assert "Recovery:" in text
+        # Raw error preserved for the LLM's diagnostic context.
+        assert "denied" in text
 
     def test_non_string_serialized(self):
         r = _result_to_codex_response({"success": True, "result": {"x": 1}})
