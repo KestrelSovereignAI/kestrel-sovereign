@@ -381,17 +381,17 @@ def _is_toolresult(obj: Any) -> bool:
 # LLM gets actionable next-step guidance, not just a typed label.
 _RECOVERY_HINTS: Dict[str, str] = {
     "user_denied": (
-        "Recovery: respect the user's denial. Stop attempting this "
+        "respect the user's denial. Stop attempting this "
         "command. Ask the user whether they want a different approach."
     ),
     "policy_blocked": (
-        "Recovery: try the operator-approval queue (file a request "
+        "try the operator-approval queue (file a request "
         "via the security feature), or use a tool that runs without "
         "this policy gate. Do NOT claim the user denied — this was "
         "a policy/plumbing refusal, not a user decision."
     ),
     "sandbox_blocked": (
-        "Recovery: this is a sandbox refusal, NOT a user denial. "
+        "this is a sandbox refusal, NOT a user denial. "
         "Try a less-privileged path, request elevation via the "
         "restart_coordinator update path if appropriate, or surface "
         "the block honestly to the user. The Codex CLI's literal "
@@ -399,13 +399,13 @@ _RECOVERY_HINTS: Dict[str, str] = {
         "evidence the user decided anything."
     ),
     "tooling_error": (
-        "Recovery: check that the tool/binary is installed and "
+        "check that the tool/binary is installed and "
         "reachable, retry once if the error looks transient (RPC "
         "timeout, network blip), or surface the tooling problem to "
         "the user. Do NOT attribute this to a user denial."
     ),
     "unconfirmed": (
-        "Recovery: the outcome is unconfirmed. Tell the user the "
+        "the outcome is unconfirmed. Tell the user the "
         "command result could not be confirmed and ask how they "
         "want to proceed. Do NOT guess that the user denied it."
     ),

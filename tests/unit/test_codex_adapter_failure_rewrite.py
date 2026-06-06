@@ -250,3 +250,25 @@ async def test_handler_passes_audit_for_toolresult_failures():
     # And get_audit_log was actually called (proof we crossed the
     # is_failure branch for a ToolResult).
     assert permission_store.get_audit_log.await_count == 1
+
+
+def test_recovery_line_has_no_doubled_prefix():
+    """Cosmetic regression: the rendered Recovery line must NOT
+    contain ``"Recovery: Recovery: ..."``. The renderer prepends
+    ``"Recovery: "`` once; the hint strings themselves must not
+    repeat the prefix.
+    """
+    raw = "Rejected(\"rejected by user\")"
+    block = classify_and_render_failure(raw, tool_name="bash")
+    assert "Recovery: Recovery:" not in block, (
+        "Recovery line was doubled — hint string starts with prefix"
+    )
+    # All five outcomes should have the same single-prefix shape.
+    for raw_err in (
+        "Rejected(\"rejected by user\")",   # sandbox_blocked
+        "binary not found",                   # tooling_error
+        "approval request timed out",         # policy_blocked
+        "",                                   # unconfirmed
+    ):
+        block = classify_and_render_failure(raw_err, tool_name="bash")
+        assert "Recovery: Recovery:" not in block, block
