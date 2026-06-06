@@ -339,6 +339,9 @@ class KestrelAgent(
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set[str] = set()
+        # Monotonic registration time per active request id so the
+        # restart coordinator can age out stale markers (#1558).
+        self._active_request_started_at: dict[str, float] = {}
         self._cancelled_requests: set = set()
         self._privacy_transition_lock = asyncio.Lock()
 

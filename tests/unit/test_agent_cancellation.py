@@ -18,13 +18,17 @@ class TestAgentCancellation:
         agent = MagicMock(spec=KestrelAgent)
         agent._current_request_id = None
         agent._active_request_ids = set()
+        agent._active_request_started_at = {}
         agent._cancelled_requests = set()
-        
+
         # Bind actual methods
+        agent.register_active_request = KestrelAgent.register_active_request.__get__(agent)
         agent.cancel_current_request = KestrelAgent.cancel_current_request.__get__(agent)
         agent.is_request_cancelled = KestrelAgent.is_request_cancelled.__get__(agent)
         agent._cleanup_cancelled_request = KestrelAgent._cleanup_cancelled_request.__get__(agent)
-        
+        agent.active_request_ages = KestrelAgent.active_request_ages.__get__(agent)
+        agent.prune_stale_active_requests = KestrelAgent.prune_stale_active_requests.__get__(agent)
+
         return agent
 
     def test_cancel_when_no_active_request(self, mock_agent):
@@ -87,10 +91,63 @@ class TestAgentCancellation:
         """Multiple requests can be cancelled and tracked."""
         mock_agent._cancelled_requests.add("req-1")
         mock_agent._cancelled_requests.add("req-2")
-        
+
         assert mock_agent.is_request_cancelled("req-1") is True
         assert mock_agent.is_request_cancelled("req-2") is True
         assert mock_agent.is_request_cancelled("req-3") is False
+
+    def test_register_stamps_started_at(self, mock_agent):
+        """Registering an active request records a monotonic start time."""
+        mock_agent.register_active_request("req-1")
+
+        assert "req-1" in mock_agent._active_request_ids
+        assert "req-1" in mock_agent._active_request_started_at
+        ages = mock_agent.active_request_ages()
+        assert "req-1" in ages
+        assert ages["req-1"] >= 0.0
+
+    def test_cleanup_drops_started_at(self, mock_agent):
+        """Cleanup removes the registration timestamp too."""
+        mock_agent.register_active_request("req-1")
+        mock_agent._cleanup_cancelled_request("req-1")
+
+        assert "req-1" not in mock_agent._active_request_started_at
+        assert mock_agent.active_request_ages() == {}
+
+    def test_prune_removes_stale_request(self, mock_agent):
+        """A request older than the window is pruned and returned."""
+        mock_agent.register_active_request("stale")
+        # Back-date the registration well past the threshold.
+        mock_agent._active_request_started_at["stale"] -= 1000
+
+        pruned = mock_agent.prune_stale_active_requests(900)
+
+        assert pruned == ["stale"]
+        assert "stale" not in mock_agent._active_request_ids
+        assert "stale" not in mock_agent._active_request_started_at
+        # current_request_id pointed at the pruned id → cleared.
+        assert mock_agent._current_request_id is None
+
+    def test_prune_keeps_fresh_request(self, mock_agent):
+        """A fresh request is not pruned."""
+        mock_agent.register_active_request("fresh")
+
+        pruned = mock_agent.prune_stale_active_requests(900)
+
+        assert pruned == []
+        assert "fresh" in mock_agent._active_request_ids
+
+    def test_prune_stamps_unknown_request_clock(self, mock_agent):
+        """An id with no recorded start time is stamped, not pruned blind."""
+        # Simulate a foreign/legacy registration straight into the set.
+        mock_agent._active_request_ids.add("foreign")
+
+        pruned = mock_agent.prune_stale_active_requests(900)
+
+        assert pruned == []
+        assert "foreign" in mock_agent._active_request_ids
+        # The staleness clock now started for it.
+        assert "foreign" in mock_agent._active_request_started_at
 
 
 class TestStopEndpoint:

@@ -183,6 +183,7 @@ class MockAgent:
         self._pending_task_notifications: list = []
         self._current_request_id: Optional[str] = None
         self._active_request_ids: set = set()
+        self._active_request_started_at: dict = {}
         self._cancelled_requests: set = set()
         self._session_briefed = False
         self._cached_features_prompt = ""

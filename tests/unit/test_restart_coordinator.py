@@ -330,6 +330,91 @@ async def test_executor_defers_when_agent_reports_active_request(tmp_path):
     assert "busy" in result.data["deferred"][0]["reason"]
 
 
+def _attach_lifecycle(agent):
+    """Bind the real RequestLifecycleMixin surface onto a mock agent so
+    the coordinator's stale-request sweep (#1558) can run against it.
+    """
+    from kestrel_sovereign.agent.request_lifecycle import (
+        RequestLifecycleMixin,
+    )
+
+    agent._current_request_id = None
+    agent._active_request_started_at = {}
+    agent._cancelled_requests = set()
+    for name in (
+        "register_active_request",
+        "prune_stale_active_requests",
+        "active_request_ages",
+        "_cleanup_cancelled_request",
+    ):
+        setattr(
+            agent, name,
+            getattr(RequestLifecycleMixin, name).__get__(agent),
+        )
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_executor_sweeps_stale_active_request_and_executes(tmp_path):
+    """A stale active request id (endpoint cleanup never ran) must NOT
+    deadlock idle_agents_only — the coordinator sweeps it and executes
+    (#1558).
+    """
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_lifecycle(agent)
+    agent.register_active_request("stale-req")
+    # Back-date past the staleness window so the sweep treats it as
+    # abandoned rather than in-flight.
+    agent._active_request_started_at["stale-req"] -= 1000
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    created = await feat.request_restart(reason="r")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == req_id
+    # The stale marker was swept out.
+    assert "stale-req" not in agent._active_request_ids
+    row = await get_request(backend, req_id)
+    assert row.status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_executor_still_defers_for_fresh_active_request(tmp_path):
+    """A genuinely fresh active request still defers idle_agents_only,
+    and the deferral reason exposes the request age (#1558).
+    """
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_lifecycle(agent)
+    agent.register_active_request("fresh-req")
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    await feat.request_restart(reason="r")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 0
+    assert len(result.data["deferred"]) == 1
+    reason = result.data["deferred"][0]["reason"]
+    assert "busy" in reason
+    # Observability: oldest active-request age + stale window surfaced.
+    assert "stale window" in reason
+    # The fresh id was NOT swept.
+    assert "fresh-req" in agent._active_request_ids
+
+
 @pytest.mark.asyncio
 async def test_executor_executes_on_busy_with_timeout_policy(tmp_path):
     backend = await _backend(tmp_path)
