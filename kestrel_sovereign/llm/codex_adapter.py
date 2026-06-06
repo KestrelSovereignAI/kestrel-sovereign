@@ -284,15 +284,55 @@ def _format_command_summary(command: Any) -> Optional[str]:
     return text
 
 
-def _result_to_codex_response(result: Any) -> Dict[str, Any]:
+def _result_to_codex_response(
+    result: Any,
+    *,
+    tool_name: str = "",
+    feature_name: str = "",
+    recent_decisions: Optional[list] = None,
+) -> Dict[str, Any]:
     """Marshal a kestrel tool result into the codex
     ``CodexDynamicToolCallResponse`` shape.
 
     Kestrel tool dispatchers conventionally return a dict with
     ``success: bool`` and either ``result`` (payload) or ``error`` (msg).
     Anything else is best-effort serialized.
+
+    On a FAILURE result, the raw ``error`` text is rewritten through
+    :func:`classify_and_render_failure` so the LLM never sees Codex's
+    misleading ``"rejected by user"`` substring as a literal claim of
+    user denial when no audit row backs it (#1563 root cause). The
+    typed outcome + recovery hint replaces the raw string in the
+    LLM-visible ``inputText``; the raw error is preserved inside the
+    rendered block so the LLM still has the original wording for
+    debugging context.
     """
-    if isinstance(result, dict):
+    # ToolResult (#1061): kestrel's standard envelope. After PR-E
+    # every in-tree @tool returns one — the legacy ``{success: bool}``
+    # dict path is the EXCEPTION now, not the rule. Catch ToolResult
+    # before the dict / non-dict branches so a ``ToolResult.failed(...)``
+    # carrying a misleading raw error string still routes through the
+    # classifier (codex P1 round 1 — a direct repro showed the rewrite
+    # would otherwise stringify it raw with ``success=True``).
+    if _is_toolresult(result):
+        status = str(getattr(result, "status", "")).lower()
+        err = getattr(result, "error", None)
+        # ``ToolResultStatus.ERROR`` / ``PARTIAL`` are non-success;
+        # ``OK`` is success. The status enum string-coerces with a
+        # ``ToolResultStatus.OK`` repr on Python 3.13, but
+        # ``str(enum) == "ToolResultStatus.OK"`` — match either.
+        success = "error" not in status and "partial" not in status
+        if success:
+            data = getattr(result, "data", None)
+            confirmation = getattr(result, "confirmation", None)
+            text = (
+                confirmation
+                if isinstance(confirmation, str) and confirmation
+                else data
+            )
+        else:
+            text = err if isinstance(err, str) and err else str(result)
+    elif isinstance(result, dict):
         success = bool(result.get("success", True))
         if success and "result" in result:
             text = result["result"]
@@ -308,10 +348,112 @@ def _result_to_codex_response(result: Any) -> Dict[str, Any]:
             text = json.dumps(text, default=str)
         except Exception:
             text = str(text)
+    if not success:
+        text = classify_and_render_failure(
+            text,
+            tool_name=tool_name,
+            feature_name=feature_name,
+            recent_decisions=recent_decisions,
+        )
     return {
         "contentItems": [{"type": "inputText", "text": text}],
         "success": success,
     }
+
+
+def _is_toolresult(obj: Any) -> bool:
+    """Duck-typed ToolResult check — avoids a hard import of
+    ``kestrel_sdk.tools.result`` at the LLM-adapter layer so a future
+    SDK move can't break the codex marshaller. The contract this
+    relies on is the public ``status`` + ``error`` + ``data`` +
+    ``confirmation`` field set documented at the ToolResult class.
+    """
+    return (
+        hasattr(obj, "status")
+        and hasattr(obj, "error")
+        and hasattr(obj, "data")
+        and hasattr(obj, "confirmation")
+    )
+
+
+# Recovery hints per outcome — what the LLM should TRY NEXT for each
+# typed failure. Pairs with the escalation classifier so a downstream
+# LLM gets actionable next-step guidance, not just a typed label.
+_RECOVERY_HINTS: Dict[str, str] = {
+    "user_denied": (
+        "Recovery: respect the user's denial. Stop attempting this "
+        "command. Ask the user whether they want a different approach."
+    ),
+    "policy_blocked": (
+        "Recovery: try the operator-approval queue (file a request "
+        "via the security feature), or use a tool that runs without "
+        "this policy gate. Do NOT claim the user denied — this was "
+        "a policy/plumbing refusal, not a user decision."
+    ),
+    "sandbox_blocked": (
+        "Recovery: this is a sandbox refusal, NOT a user denial. "
+        "Try a less-privileged path, request elevation via the "
+        "restart_coordinator update path if appropriate, or surface "
+        "the block honestly to the user. The Codex CLI's literal "
+        "\"rejected by user\" wording is its sandbox diagnostic, not "
+        "evidence the user decided anything."
+    ),
+    "tooling_error": (
+        "Recovery: check that the tool/binary is installed and "
+        "reachable, retry once if the error looks transient (RPC "
+        "timeout, network blip), or surface the tooling problem to "
+        "the user. Do NOT attribute this to a user denial."
+    ),
+    "unconfirmed": (
+        "Recovery: the outcome is unconfirmed. Tell the user the "
+        "command result could not be confirmed and ask how they "
+        "want to proceed. Do NOT guess that the user denied it."
+    ),
+}
+
+
+def classify_and_render_failure(
+    raw_error: str,
+    *,
+    tool_name: str = "",
+    feature_name: str = "",
+    recent_decisions: Optional[list] = None,
+) -> str:
+    """Convert a raw tool error string into the LLM-visible failure
+    block: typed outcome + classifier reasoning + recovery hint +
+    preserved raw error.
+
+    The block format is deliberately structured so the downstream
+    LLM can parse it (or just read the ``Outcome:`` and ``Recovery:``
+    lines) without having to interpret the misleading raw wording
+    Codex hands us. The raw error stays inside the block so any
+    other diagnostic value (file paths, exit codes, etc.) is not
+    lost.
+    """
+    from kestrel_sovereign.llm.escalation_classifier import (
+        classify_escalation_failure,
+    )
+    decision = classify_escalation_failure(
+        raw_error,
+        recent_decisions=recent_decisions or [],
+        tool_name=tool_name,
+        feature_name=feature_name,
+    )
+    outcome = decision.outcome.value
+    hint = _RECOVERY_HINTS.get(outcome, _RECOVERY_HINTS["unconfirmed"])
+    raw_block = (raw_error or "").strip()
+    if not raw_block:
+        raw_block = "(no raw error message)"
+    return (
+        f"Tool failed.\n"
+        f"Outcome: {outcome}\n"
+        f"Reason: {decision.reason}\n"
+        f"Evidence: {decision.evidence_source}\n"
+        f"Recovery: {hint}\n"
+        f"Raw error (for diagnostic context — do NOT echo verbatim "
+        f"as a user denial claim):\n"
+        f"  {raw_block}"
+    )
 
 
 _CODEX_RETRY_BASE_SECONDS = 5.0
@@ -361,6 +503,59 @@ class CodexAdapter(LLMAdapter):
         # the same thread (same session_id) would race on the turn-sink
         # registration; the lock makes them queue cleanly instead.
         self._thread_locks: Dict[str, "asyncio.Lock"] = {}
+        # #1563 pre-response rewrite: optional agent reference whose
+        # ``SecurityFeature.permission_store`` we can cross-reference
+        # when classifying a failure. When unset (test stubs, headless
+        # host) the classifier falls through to raw-error pattern
+        # matching, which is sufficient for the primary bug — a Codex
+        # ``"rejected by user"`` sandbox string still classifies as
+        # SANDBOX_BLOCKED on raw-error patterns alone. The audit
+        # cross-check is defense-in-depth: even with no audit, the
+        # post-response audit hook (#1568) catches any LLM that
+        # produces user-denial wording from the rewritten typed
+        # block.
+        self._agent_for_audit: Any = None
+
+    def attach_agent_for_audit(self, agent: Any) -> None:
+        """Bind the running agent so failure-result rewrite can pull
+        recent ``SecurityFeature.permission_store.get_audit_log`` rows
+        (#1563). Optional — see ``_recent_security_decisions``.
+        Idempotent; safe to call before every turn.
+        """
+        self._agent_for_audit = agent
+
+    async def _recent_security_decisions(self, limit: int = 50) -> list:
+        """Pull recent audit rows for the pre-response classifier.
+
+        Best-effort: missing agent / SecurityFeature / permission_store
+        / read failure all degrade to an empty list so the classifier
+        falls through to raw-error pattern matching. A failure-result
+        rewrite must never raise out of this path.
+        """
+        agent = self._agent_for_audit
+        if agent is None:
+            return []
+        try:
+            features = getattr(agent, "features", {}) or {}
+            if isinstance(features, dict):
+                security = features.get("SecurityFeature")
+            else:
+                security = next(
+                    (f for f in features
+                     if type(f).__name__ == "SecurityFeature"),
+                    None,
+                )
+            if security is None:
+                return []
+            store = getattr(security, "permission_store", None)
+            if store is None or not hasattr(store, "get_audit_log"):
+                return []
+            return await store.get_audit_log(limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "CodexAdapter: recent_security_decisions failed: %s", exc,
+            )
+            return []
 
     def provider_capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
@@ -795,10 +990,18 @@ class CodexAdapter(LLMAdapter):
                         "arguments": effective_args,
                         "result": err_result,
                     })
+                # Same classifier-rewrite the success-shaped failure
+                # path uses, so a raised-exception tool error never
+                # bypasses the honesty contract (#1563).
+                rendered = classify_and_render_failure(
+                    f"tool {name!r} raised: {e}",
+                    tool_name=name,
+                    recent_decisions=await self._recent_security_decisions(),
+                )
                 return {
                     "contentItems": [{
                         "type": "inputText",
-                        "text": f"tool {name!r} failed: {e}",
+                        "text": rendered,
                     }],
                     "success": False,
                 }
@@ -818,7 +1021,28 @@ class CodexAdapter(LLMAdapter):
                     "arguments": effective_args,
                     "result": result,
                 })
-            return _result_to_codex_response(result)
+            # Pass tool/feature scope + audit slice so the classifier
+            # has the right evidence to classify a failure against
+            # (#1563). For success results these are unused. The
+            # failure-detection here must mirror _result_to_codex_response
+            # so a ToolResult.failed / PARTIAL handler path still gets
+            # the audit (codex P1 round 2 — the previous dict-only check
+            # missed the ToolResult path entirely).
+            is_failure = False
+            if _is_toolresult(result):
+                status = str(getattr(result, "status", "")).lower()
+                is_failure = "error" in status or "partial" in status
+            elif isinstance(result, dict):
+                is_failure = not bool(result.get("success", True))
+            return _result_to_codex_response(
+                result,
+                tool_name=name,
+                recent_decisions=(
+                    await self._recent_security_decisions()
+                    if is_failure
+                    else None
+                ),
+            )
 
         return handler
 
