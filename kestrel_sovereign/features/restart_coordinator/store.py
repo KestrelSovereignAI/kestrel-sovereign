@@ -62,6 +62,7 @@ _ADDED_COLUMNS = (
     ("update_profile", "TEXT DEFAULT ''"),
     ("update_allow_migrations", "INTEGER DEFAULT 0"),
     ("update_log", "TEXT DEFAULT ''"),
+    ("requester_request_id", "TEXT DEFAULT ''"),
 )
 
 # Canonical column order shared by every SELECT below and ``from_row``.
@@ -69,7 +70,7 @@ _COLUMNS = (
     "id, requested_by_agent, reason, requested_at, desired_window, "
     "urgency, policy, status, status_reason, completed_at, operation, "
     "update_repo_path, update_target_ref, update_profile, "
-    "update_allow_migrations, update_log"
+    "update_allow_migrations, update_log, requester_request_id"
 )
 
 
@@ -91,6 +92,7 @@ class RestartRequest:
     update_profile: str = ""
     update_allow_migrations: bool = False
     update_log: str = ""
+    requester_request_id: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -116,6 +118,7 @@ class RestartRequest:
             update_profile=str(g(13) or ""),
             update_allow_migrations=bool(int(g(14) or 0)),
             update_log=str(g(15) or ""),
+            requester_request_id=str(g(16) or ""),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -146,6 +149,7 @@ class RestartRequest:
             "update_profile": self.update_profile,
             "update_allow_migrations": self.update_allow_migrations,
             "update": self.update_log_dict(),
+            "requester_request_id": self.requester_request_id,
         }
 
 
@@ -169,7 +173,8 @@ async def ensure_restart_requests_table(db) -> None:
             update_target_ref TEXT DEFAULT '',
             update_profile TEXT DEFAULT '',
             update_allow_migrations INTEGER DEFAULT 0,
-            update_log TEXT DEFAULT ''
+            update_log TEXT DEFAULT '',
+            requester_request_id TEXT DEFAULT ''
         )
         """
     )
@@ -209,6 +214,7 @@ async def insert_request(
     update_target_ref: str = "",
     update_profile: str = "",
     update_allow_migrations: bool = False,
+    requester_request_id: str = "",
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
@@ -219,13 +225,15 @@ async def insert_request(
             id, requested_by_agent, reason, requested_at,
             desired_window, urgency, policy, status, status_reason,
             completed_at, operation, update_repo_path, update_target_ref,
-            update_profile, update_allow_migrations, update_log
+            update_profile, update_allow_migrations, update_log,
+            requester_request_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '')
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '', ?)
         """,
         (req_id, requested_by_agent, reason, now, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
-         update_profile, 1 if update_allow_migrations else 0),
+         update_profile, 1 if update_allow_migrations else 0,
+         requester_request_id),
     )
     return RestartRequest(
         id=req_id,
@@ -244,6 +252,7 @@ async def insert_request(
         update_profile=update_profile,
         update_allow_migrations=update_allow_migrations,
         update_log="",
+        requester_request_id=requester_request_id,
     )
 
 
