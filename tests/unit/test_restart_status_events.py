@@ -494,3 +494,142 @@ class _AgentWithGet:
 
     def get_feature(self, name):
         return self._agent.features.get(name)
+
+
+# ---------------------------------------------------------------------------
+# #1571 - always-on operational state block
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operational_block_surfaces_restart_events_without_config(
+    tmp_path,
+):
+    """The operational state block must surface restart lifecycle
+    events even when the proactive ``[preturn_state]`` feature is
+    not configured (#1571). The block does not consult config at
+    all, so no patch is needed — it is always-on.
+    """
+    from kestrel_sovereign.agent.preturn_state import (
+        build_operational_state_block,
+    )
+
+    db = await _backend(tmp_path)
+    agent = _make_agent(db, did="did:test:emma")
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {"RestartCoordinatorFeature": feat}
+    wrapped = _AgentWithGet(agent)
+
+    # No events -> block silent.
+    assert await build_operational_state_block(wrapped) is None
+
+    # Seed a pending event; block must render with operational header.
+    req = await insert_request(
+        db, requested_by_agent="did:test:emma", reason="r",
+    )
+    await feat._emit_status_event(req, state="pending")
+
+    block = await build_operational_state_block(wrapped)
+    assert block is not None
+    assert "OPERATIONAL STATE" in block
+    assert "1 pending" in block
+    assert "END OPERATIONAL STATE" in block
+
+
+@pytest.mark.asyncio
+async def test_operational_block_did_scoped(tmp_path):
+    """Peer agents' restart events must not appear in this agent's
+    operational block (#1571).
+    """
+    from kestrel_sovereign.agent.preturn_state import (
+        build_operational_state_block,
+    )
+
+    db = await _backend(tmp_path)
+    agent = _make_agent(db, did="did:test:emma")
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {"RestartCoordinatorFeature": feat}
+    wrapped = _AgentWithGet(agent)
+
+    await record_event(
+        db, request_id="emma-r1", state="pending",
+        agent_id="did:test:emma", payload={},
+    )
+    await record_event(
+        db, request_id="meridian-r1", state="executing",
+        agent_id="did:test:meridian", payload={},
+    )
+
+    block = await build_operational_state_block(wrapped)
+    assert block is not None
+    assert "1 pending" in block
+    assert "executing" not in block
+
+
+@pytest.mark.asyncio
+async def test_operational_block_silent_without_feature(tmp_path):
+    """Agents without the RestartCoordinatorFeature must not see an
+    empty operational block — silent return, no header noise.
+    """
+    from kestrel_sovereign.agent.preturn_state import (
+        build_operational_state_block,
+    )
+
+    agent = SimpleNamespace(
+        did="did:test:agent",
+        features={},
+        get_feature=lambda name: None,
+    )
+    assert await build_operational_state_block(agent) is None
+
+
+@pytest.mark.asyncio
+async def test_preturn_block_does_not_duplicate_restart_section(
+    tmp_path, monkeypatch,
+):
+    """When ``[preturn_state]`` IS enabled, the opt-in state block
+    must no longer carry the restart-status line — it lives on the
+    always-on operational path now (#1571). Otherwise the agent
+    would see the same lifecycle summary twice.
+    """
+    import kestrel_sovereign.config as cfg
+    from kestrel_sovereign.agent.preturn_state import (
+        build_operational_state_block,
+        build_preturn_state_block,
+    )
+
+    # Patch the real source-of-truth: build_preturn_state_block does
+    # ``from kestrel_sovereign.config import load_section`` inside
+    # the function, so the local-module name in preturn_state is
+    # never consulted.
+    monkeypatch.setattr(
+        cfg, "load_section",
+        lambda s: {"enabled": True, "agents": ["Emma"], "max_tokens": 500}
+        if s == "preturn_state" else {},
+    )
+
+    db = await _backend(tmp_path)
+    agent = _make_agent(db, did="did:test:emma")
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    agent.features = {"RestartCoordinatorFeature": feat}
+    agent._agent_name = "Emma"
+    agent.storage_path = None
+    wrapped = _AgentWithGet(agent)
+
+    await record_event(
+        db, request_id="emma-r1", state="pending",
+        agent_id="did:test:emma", payload={},
+    )
+
+    op_block = await build_operational_state_block(wrapped)
+    state_block = await build_preturn_state_block(wrapped)
+
+    assert op_block is not None
+    assert "1 pending" in op_block
+    if state_block is not None:
+        # The opt-in block may render other sections, but restart
+        # must not duplicate here.
+        assert "Restart events" not in state_block
