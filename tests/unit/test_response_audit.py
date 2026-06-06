@@ -489,3 +489,117 @@ class TestResponseAuditFeature:
         await hook.execute(_make_hook_input("Third response that is long enough to audit"))
         assert hook.audit_count == 3
         assert hook.last_risk_level == 1
+
+
+# =========================================================================
+# #1563 escalation-attribution integration tests
+# =========================================================================
+
+
+def _make_security_feature(audit_rows=None):
+    """Mock SecurityFeature with a permission_store.get_audit_log."""
+    security = MagicMock()
+    permission_store = MagicMock()
+    permission_store.get_audit_log = AsyncMock(
+        return_value=list(audit_rows or []),
+    )
+    security.permission_store = permission_store
+    return security
+
+
+@pytest.mark.asyncio
+async def test_post_response_hook_flags_user_denial_without_audit():
+    """The #1563 root case: agent's response says 'rejected by user'
+    but the security audit shows only auto_allowed rows. The audit
+    hook must elevate risk via the escalation-attribution check.
+    """
+    agent = _make_agent({"risk_level": 1, "reasoning": "clean"})
+    agent.features = {
+        "SecurityFeature": _make_security_feature(audit_rows=[
+            {"feature": "shell", "tool": "shell",
+             "decision": "auto_allowed", "user_choice": None},
+        ]),
+    }
+    hook = ResponseAuditHook(agent=agent, mode="warn")
+    inp = HookInput(
+        session_id="test-session",
+        hook_event_name=HookEvent.POST_RESPONSE.value,
+        response_text=(
+            "I tried to run the command but the user rejected the "
+            "escalation. I'll need to fall back to another approach."
+        ),
+        tool_results=[
+            {"name": "shell", "result": {
+                "status": "error",
+                "error": "CreateProcess { message: \"Rejected(\\\"rejected by user\\\")\" }",
+            }},
+        ],
+    )
+    out = await hook.execute(inp)
+    # The escalation check pushes risk past the default threshold of
+    # 3; warn-mode annotates the response with the audit warning.
+    assert hook.last_risk_level >= 3
+    # Offending phrase regex matches any of the forbidden user-denial
+    # variants (``user rejected`` / ``user denied`` / ``rejected by
+    # user``); the test passes when ANY of them was captured.
+    offender = (hook.last_narration_verdict.offending_verb or "").lower()
+    assert any(
+        phrase in offender
+        for phrase in ("user rejected", "user denied", "rejected by user")
+    ), f"expected a user-denial phrase, got {offender!r}"
+    assert "sandbox_blocked" in hook.last_narration_verdict.reasoning
+
+
+@pytest.mark.asyncio
+async def test_post_response_hook_allows_audit_backed_user_denial():
+    """When SecurityFeature.permission_store DOES carry a user_denied
+    row, the same response wording is honest and passes."""
+    agent = _make_agent({"risk_level": 1, "reasoning": "clean"})
+    agent.features = {
+        "SecurityFeature": _make_security_feature(audit_rows=[
+            {"feature": "shell", "tool": "shell",
+             "decision": "user_denied", "user_choice": "user_denied"},
+        ]),
+    }
+    hook = ResponseAuditHook(agent=agent, mode="warn")
+    inp = HookInput(
+        session_id="test-session",
+        hook_event_name=HookEvent.POST_RESPONSE.value,
+        response_text=(
+            "The user explicitly denied the escalation request at the "
+            "approval prompt."
+        ),
+        tool_results=[
+            {"name": "shell", "result": {
+                "status": "error",
+                "error": "Rejected(\"rejected by user\")",
+            }},
+        ],
+    )
+    out = await hook.execute(inp)
+    # Audit backs the narration → escalation check returns risk_boost=0
+    # and the response passes.
+    assert hook.last_narration_verdict.risk_boost == 0
+
+
+@pytest.mark.asyncio
+async def test_post_response_hook_missing_security_feature_does_not_break():
+    """When SecurityFeature is absent (test stub, headless host) the
+    hook must NOT crash — it gracefully falls back to raw-error
+    pattern matching."""
+    agent = _make_agent({"risk_level": 1, "reasoning": "clean"})
+    # Note: agent.features intentionally lacks SecurityFeature.
+    hook = ResponseAuditHook(agent=agent, mode="warn")
+    inp = HookInput(
+        session_id="test-session",
+        hook_event_name=HookEvent.POST_RESPONSE.value,
+        response_text="rejected by user",
+        tool_results=[
+            {"name": "shell", "result": {
+                "status": "error", "error": "rejected by user",
+            }},
+        ],
+    )
+    out = await hook.execute(inp)
+    # No audit → classifier defaults to raw-error path → SANDBOX_BLOCKED.
+    assert hook.last_narration_verdict.risk_boost == 2

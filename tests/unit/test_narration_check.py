@@ -288,3 +288,233 @@ class TestVerdictShape:
         v = analyze_narration(None, None)
         with pytest.raises(Exception):
             v.risk_boost = 99  # frozen dataclass → can't mutate
+
+
+# ---------------------------------------------------------------------------
+# Escalation-attribution check (#1563 wire-up)
+# ---------------------------------------------------------------------------
+
+from kestrel_sovereign.security.narration_check import (
+    check_escalation_attribution,
+)
+
+
+def _failing_tool_result(error: str = ""):
+    return [
+        {
+            "name": "shell",
+            "result": {"status": "error", "error": error},
+        }
+    ]
+
+
+def _user_denied_audit_row():
+    return {
+        "feature": "shell",
+        "tool": "shell",
+        "action": "tool_execution",
+        "decision": "user_denied",
+        "user_choice": "user_denied",
+    }
+
+
+class TestEscalationAttributionNoViolation:
+    """Responses that do NOT make a user-denial claim must pass."""
+
+    def test_no_response_text(self):
+        v = check_escalation_attribution(
+            "", _failing_tool_result("anything"),
+        )
+        assert v.risk_boost == 0
+
+    def test_response_without_user_denial_wording(self):
+        v = check_escalation_attribution(
+            "The shell command failed because the binary is missing.",
+            _failing_tool_result("binary not found"),
+        )
+        assert v.risk_boost == 0
+
+    def test_response_makes_audit_backed_user_denial_claim(self):
+        """When the audit DOES carry a user_denied row, the wording
+        is honest and must pass."""
+        v = check_escalation_attribution(
+            "The user explicitly denied the escalation at the prompt.",
+            _failing_tool_result("Rejected(\"rejected by user\")"),
+            recent_decisions=[_user_denied_audit_row()],
+            tool_name="shell", feature_name="shell",
+        )
+        assert v.risk_boost == 0
+
+
+class TestEscalationAttributionViolation:
+    """The #1563 reproduction: response narrates user denial, no audit."""
+
+    def test_codex_rejection_with_empty_audit_flags(self):
+        v = check_escalation_attribution(
+            "I attempted to run the command but the user rejected the escalation.",
+            _failing_tool_result(
+                "CreateProcess { message: \"Rejected(\\\"rejected by user\\\")\" }",
+            ),
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+        assert "sandbox_blocked" in v.reasoning
+
+    def test_rejected_by_user_wording_without_audit_flags(self):
+        v = check_escalation_attribution(
+            "The command was rejected by user.",
+            _failing_tool_result("any error"),
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+
+    def test_user_denied_wording_without_audit_flags(self):
+        v = check_escalation_attribution(
+            "user denied the escalation request.",
+            _failing_tool_result("approval timed out"),
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+        # Classifier should label this policy_blocked, not user_denied.
+        assert "policy_blocked" in v.reasoning
+
+
+class TestEscalationAttributionEvidence:
+    """Edge cases around the audit-backed/unbacked decision."""
+
+    def test_audit_row_for_wrong_tool_does_not_back_claim(self):
+        """A user_denied row for ``other_tool`` cannot vouch for a
+        ``shell`` denial claim."""
+        wrong_tool_row = _user_denied_audit_row()
+        wrong_tool_row["tool"] = "other_tool"
+        v = check_escalation_attribution(
+            "The user explicitly denied this command.",
+            _failing_tool_result("any error"),
+            recent_decisions=[wrong_tool_row],
+            tool_name="shell", feature_name="shell",
+        )
+        assert v.risk_boost == 2
+
+    def test_per_scope_audit_choice_backs_claim(self):
+        """Web-UI per-scope user_choice (once/session/always) on a
+        deny row counts as a real user denial."""
+        for choice in ("once", "session", "always"):
+            row = _user_denied_audit_row()
+            row["decision"] = "denied"
+            row["user_choice"] = choice
+            v = check_escalation_attribution(
+                "The user denied the escalation.",
+                _failing_tool_result("anything"),
+                recent_decisions=[row],
+                tool_name="shell", feature_name="shell",
+            )
+            assert v.risk_boost == 0, (
+                f"choice={choice!r} should back the claim"
+            )
+
+    def test_no_tool_results_still_classifies_as_unconfirmed(self):
+        """The agent narrated user denial with no tool result visible
+        — classifier defaults to UNCONFIRMED, still a violation."""
+        v = check_escalation_attribution(
+            "rejected by user",
+            tool_results=None,
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+        assert "unconfirmed" in v.reasoning
+
+
+class TestEscalationAttributionCodexRound1Fixes:
+    """Regression coverage for the codex round-1 findings."""
+
+    def test_passive_denied_by_user_wording_caught(self):
+        """codex P2 r1: 'denied by user' was previously missed."""
+        v = check_escalation_attribution(
+            "The command was denied by user.",
+            _failing_tool_result("any error"),
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+
+    def test_passive_declined_by_the_user_wording_caught(self):
+        v = check_escalation_attribution(
+            "The escalation was declined by the user.",
+            _failing_tool_result("any error"),
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+
+    def test_user_refused_wording_caught(self):
+        v = check_escalation_attribution(
+            "user refused the escalation request",
+            _failing_tool_result("any error"),
+            recent_decisions=[],
+        )
+        assert v.risk_boost == 2
+
+    def test_uses_latest_failing_tool_result_not_earliest(self):
+        """codex P1 r1 #2: when multiple failing tools are present,
+        the check must classify the LATEST one — the response refers
+        to the most recent failure, not an earlier audit-backed denial.
+        """
+        # Earlier failure: user denied this one (audit row present).
+        # Later failure: sandbox refusal with no audit backing.
+        v = check_escalation_attribution(
+            "The escalation was rejected by user.",
+            tool_results=[
+                {"name": "tool_a", "result": {
+                    "status": "error",
+                    "error": "Rejected(\"rejected by user\")",
+                }},
+                {"name": "tool_b", "result": {
+                    "status": "error",
+                    "error": "sandbox refused new escalation",
+                }},
+            ],
+            recent_decisions=[{
+                "feature": "shell", "tool": "tool_a",
+                "decision": "user_denied", "user_choice": "user_denied",
+            }],
+        )
+        # Classifier scopes audit to ``tool_b`` (the latest failure),
+        # finds no audit row for it, classifies as sandbox_blocked,
+        # flags the violation.
+        assert v.risk_boost == 2
+        assert "sandbox_blocked" in v.reasoning
+
+    def test_derives_tool_scope_from_failing_result(self):
+        """codex P1 r1 #1: the check must derive the tool name from
+        the failing result so an unrelated user_denied row in the
+        audit cannot corroborate the current narration.
+        """
+        v = check_escalation_attribution(
+            "rejected by user",
+            tool_results=[{
+                "name": "shell",
+                "result": {"status": "error", "error": "Rejected"},
+            }],
+            recent_decisions=[{
+                "feature": "approval", "tool": "an_unrelated_tool",
+                "decision": "user_denied", "user_choice": "user_denied",
+            }],
+        )
+        # Audit row is for an unrelated tool → cannot back the claim.
+        assert v.risk_boost == 2
+
+    def test_codex_p2_r2_no_tool_results_with_unrelated_audit_still_flags(self):
+        """codex P2 r2: when tool_results is None / empty AND an
+        unrelated user_denied row exists in the audit, the audit
+        lookup MUST be disabled — otherwise the unrelated row
+        corroborates the narration silently.
+        """
+        v = check_escalation_attribution(
+            "rejected by user",
+            tool_results=None,
+            recent_decisions=[{
+                "feature": "approval", "tool": "an_unrelated_tool",
+                "decision": "user_denied", "user_choice": "user_denied",
+            }],
+        )
+        # Audit lookup was disabled because we had no tool scope to
+        # match against → classifier defaults to UNCONFIRMED → flagged.
+        assert v.risk_boost == 2
