@@ -185,6 +185,59 @@ async def _approvals_section(agent: Any) -> Optional[str]:
     return f"Pending approvals: {count} awaiting the Sovereign"
 
 
+async def _restart_status_section(agent: Any) -> Optional[str]:
+    """Render the most recent restart lifecycle events as non-
+    instructional context (#1562 / #1551 follow-up).
+
+    These rows live in ``restart_status_events`` and exist so the
+    agent knows whether a restart/update was requested, deferred,
+    executed, or rejected since her last turn — without having to
+    treat the data as an instruction or a developer message. The
+    block is summary-only: a one-line per-state count plus the
+    latest transition, so it can never crowd the real prompt.
+    """
+    feat = _get_feature(agent, "RestartCoordinatorFeature")
+    if feat is None:
+        return None
+    # In a shared multi-agent database, the global recency listing
+    # would leak peer agents' restart lifecycle into this agent's
+    # state block. Scope the query to the current agent's DID via
+    # the dedicated agent-scoped store helper (codex P2 r1).
+    db = getattr(feat, "_db", None)
+    agent_did = getattr(agent, "did", None) or getattr(
+        agent, "_did", None,
+    )
+    if db is None or not agent_did:
+        return None
+    try:
+        from kestrel_sovereign.features.restart_coordinator.event_store import (
+            list_recent_events_for_agent_context,
+        )
+        rows = await list_recent_events_for_agent_context(
+            db, agent_id=str(agent_did), limit=20,
+        )
+        events = [r.to_public_dict() for r in rows]
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("preturn_state: restart status events failed: %s", exc)
+        return None
+    if not events:
+        return None
+    by_state: dict[str, int] = {}
+    for e in events:
+        s = str(e.get("state", "")).strip() or "unknown"
+        by_state[s] = by_state.get(s, 0) + 1
+    parts = ", ".join(
+        f"{n} {state}" for state, n in sorted(by_state.items())
+    )
+    latest = events[0]  # newest first from list_recent_events_for_history
+    request_id = str(latest.get("request_id", ""))[:8]
+    state = str(latest.get("state", ""))
+    return (
+        f"Restart events (recent {len(events)}): {parts}; "
+        f"latest: {request_id}… → {state}"
+    )
+
+
 async def _pinned_section(agent: Any) -> Optional[str]:
     feat = _get_feature(agent, "MemoryAgencyFeature")
     if feat is None or not hasattr(feat, "memory_pinned"):
@@ -234,6 +287,7 @@ async def build_preturn_state_block(agent: Any) -> Optional[str]:
         sections.append(await _scheduled_section(agent))
         sections.append(await _a2a_inbox_section(agent))
         sections.append(await _approvals_section(agent))
+        sections.append(await _restart_status_section(agent))
         sections.append(await _pinned_section(agent))
     except Exception as exc:  # noqa: BLE001 - never break a turn
         logger.warning(
