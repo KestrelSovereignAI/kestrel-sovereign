@@ -394,11 +394,13 @@ async def test_executor_still_defers_for_fresh_active_request(tmp_path):
     backend = await _backend(tmp_path)
     agent = _make_agent(backend)
     _attach_lifecycle(agent)
-    agent.register_active_request("fresh-req")
 
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
+    # File while idle, then an unrelated fresh request goes in flight —
+    # one that is NOT the requester's own turn, so it still blocks (#1561).
     await feat.request_restart(reason="r")
+    agent.register_active_request("fresh-req")
 
     with patch.object(
         RestartCoordinatorFeature, "_spawn_restart_subprocess",
@@ -413,6 +415,100 @@ async def test_executor_still_defers_for_fresh_active_request(tmp_path):
     assert "stale window" in reason
     # The fresh id was NOT swept.
     assert "fresh-req" in agent._active_request_ids
+
+
+@pytest.mark.asyncio
+async def test_executor_executes_when_only_requester_turn_active(tmp_path):
+    """The chat/agent turn that filed the restart is itself an active
+    request marker. When it is the ONLY thing in flight the restart must
+    proceed — the requester's own marker must not deadlock the restart it
+    asked for (#1561).
+    """
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_lifecycle(agent)
+    # The in-flight chat turn that will file the restart.
+    agent.register_active_request("chat-turn-1")
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    created = await feat.request_restart(reason="config landed")
+    req_id = created.data["request"]["id"]
+    # The row records the requester's turn.
+    row = await get_request(backend, req_id)
+    assert row.requester_request_id == "chat-turn-1"
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == req_id
+    # The requester marker was NOT swept (it's fresh, in flight) — it was
+    # merely ignored for this restart's blocker count.
+    assert "chat-turn-1" in agent._active_request_ids
+
+
+@pytest.mark.asyncio
+async def test_executor_defers_when_requester_plus_other_active(tmp_path):
+    """Requester turn plus a second, unrelated active request → the
+    second request still blocks an idle_agents_only restart (#1561).
+    """
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_lifecycle(agent)
+    # A pre-existing unrelated request, then the chat turn that files the
+    # restart (so _current_request_id points at the requester's turn).
+    agent.register_active_request("other-req")
+    agent.register_active_request("chat-turn-1")
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    created = await feat.request_restart(reason="config landed")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 0
+    assert len(result.data["deferred"]) == 1
+    reason = result.data["deferred"][0]["reason"]
+    assert "busy" in reason
+    # Only the unrelated request counts as a blocker.
+    assert "1 active request id(s)" in reason
+
+
+@pytest.mark.asyncio
+async def test_executor_defers_for_unrelated_active_request(tmp_path):
+    """A restart filed with no requester turn must still defer when an
+    unrelated request is active — the ignore only applies to the
+    requester's own marker (#1561).
+    """
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_lifecycle(agent)
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    # File while idle so requester_request_id is empty, then an unrelated
+    # request goes in flight.
+    created = await feat.request_restart(reason="config landed")
+    req_id = created.data["request"]["id"]
+    row = await get_request(backend, req_id)
+    assert row.requester_request_id == ""
+    agent.register_active_request("unrelated-req")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 0
+    assert len(result.data["deferred"]) == 1
+    assert "busy" in result.data["deferred"][0]["reason"]
 
 
 @pytest.mark.asyncio

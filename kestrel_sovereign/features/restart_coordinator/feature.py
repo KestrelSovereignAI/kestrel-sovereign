@@ -234,6 +234,13 @@ class RestartCoordinatorFeature(Feature):
             )
 
         agent_id = getattr(self.agent, "did", "") or ""
+        # Record the in-flight chat/agent turn that filed this request so
+        # the coordinator can ignore the requester's own active-request
+        # marker when judging idleness — that marker should not block the
+        # very restart it asked for (#1561).
+        requester_request_id = (
+            getattr(self.agent, "_current_request_id", "") or ""
+        )
         req = await insert_request(
             self._db,
             requested_by_agent=str(agent_id),
@@ -247,6 +254,7 @@ class RestartCoordinatorFeature(Feature):
             update_profile=(update_profile if operation == "update_then_restart"
                             else ""),
             update_allow_migrations=bool(allow_migrations),
+            requester_request_id=str(requester_request_id),
         )
         logger.info(
             "Restart request filed: id=%s op=%s urgency=%s policy=%s "
@@ -625,7 +633,14 @@ class RestartCoordinatorFeature(Feature):
                 "reason": "policy=manual_only; awaiting explicit dispatch",
             }
 
-        idle = self._agent_appears_idle()
+        # The chat/agent turn that filed this request is itself an active
+        # request marker. It must NOT block the restart it requested when
+        # it is the only thing in flight — ignore the requester's own
+        # marker for this specific row (#1561). Other active requests are
+        # still respected so a busy agent stays protected.
+        idle = self._agent_appears_idle(
+            ignore_request_id=getattr(req, "requester_request_id", "") or "",
+        )
         if idle["idle"]:
             return {"safe": True, "deferable": True, "reason": ""}
 
@@ -652,13 +667,21 @@ class RestartCoordinatorFeature(Feature):
             "reason": f"agent busy ({idle['reason']})",
         }
 
-    def _agent_appears_idle(self) -> Dict[str, Any]:
+    def _agent_appears_idle(
+        self, ignore_request_id: str = "",
+    ) -> Dict[str, Any]:
         """Idle check against the agent's own in-flight surface.
 
         The default ``KestrelAgent`` exposes ``_active_request_ids``
         (set of in-flight cognition request IDs) and
         ``_background_tasks`` (asyncio tasks the dispatcher started).
         Either non-empty → not idle.
+
+        ``ignore_request_id`` is the chat/agent turn that filed the
+        restart being evaluated. That turn's own active-request marker
+        must not block the very restart it requested, so it is excluded
+        from the active-request count for that specific row (#1561). All
+        other active requests still count as busy.
 
         Optional dispatcher hooks ``in_flight_signals`` /
         ``active_count`` are consulted first if present (gives feature
@@ -716,8 +739,15 @@ class RestartCoordinatorFeature(Feature):
                         "restart_coordinator: stale-request sweep "
                         "failed: %s", e,
                     )
+            # Count blockers EXCLUDING the requester's own turn — that
+            # marker should not defer the restart it filed (#1561). The
+            # stale-request sweep above is the backstop for abandoned
+            # markers; this is the normal path for requester-self restarts.
             try:
-                n = len(active_ids)
+                blockers = [
+                    rid for rid in active_ids if rid != ignore_request_id
+                ]
+                n = len(blockers)
             except TypeError:
                 n = 0
             if n:
@@ -725,7 +755,7 @@ class RestartCoordinatorFeature(Feature):
                     "idle": False,
                     "reason": (
                         f"{n} active request id(s)"
-                        f"{self._active_request_age_suffix()}"
+                        f"{self._active_request_age_suffix(ignore_request_id)}"
                     ),
                 }
 
@@ -752,13 +782,15 @@ class RestartCoordinatorFeature(Feature):
             }
         return {"idle": True, "reason": ""}
 
-    def _active_request_age_suffix(self) -> str:
+    def _active_request_age_suffix(self, ignore_request_id: str = "") -> str:
         """Append the oldest active-request age to a busy deferral reason.
 
         Observability for #1558: when a restart defers on ``agent busy``,
         the operator can see how old the in-flight request markers are
         relative to the staleness sweep window, so a near-stale id is
-        visible before it ages out.
+        visible before it ages out. The requester's own turn is excluded
+        so the reported age reflects only the requests still blocking the
+        restart (#1561).
         """
         ages_fn = getattr(self.agent, "active_request_ages", None)
         if not callable(ages_fn):
@@ -767,6 +799,9 @@ class RestartCoordinatorFeature(Feature):
             ages = ages_fn()
         except Exception:
             return ""
+        ages = {
+            rid: age for rid, age in ages.items() if rid != ignore_request_id
+        }
         if not ages:
             return ""
         oldest = max(ages.values())
