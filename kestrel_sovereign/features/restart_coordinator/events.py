@@ -21,6 +21,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from .event_store import dedupe_signature
+
 EVENT_NAME = "restart_status"
 
 
@@ -41,9 +43,17 @@ def build_restart_status_event(
 
     ``deferral_reason`` is set only when the coordinator defers (the row
     stays ``pending`` but the attempt was held back, e.g. "agent busy").
+
+    ``dedupe_signature = "{request_id}:{state}"`` is the stable key the
+    frontend uses to find-or-update an existing status bubble. It
+    intentionally excludes volatile fields like ``deferral_reason``
+    (which carries a changing ``oldest 63s of 900s stale window`` age
+    after #1558) so repeated coordinator polls collapse into a single
+    bubble instead of spawning duplicates (#1560 / #1562).
     """
+    request_id = str(getattr(request, "id", ""))
     return {
-        "request_id": str(getattr(request, "id", "")),
+        "request_id": request_id,
         "requested_by_agent": str(
             getattr(request, "requested_by_agent", "") or agent_did
         ),
@@ -57,6 +67,7 @@ def build_restart_status_event(
         "deferral_reason": str(deferral_reason or ""),
         "status_reason": str(status_reason or ""),
         "completed_at": _opt_str(getattr(request, "completed_at", None)),
+        "dedupe_signature": dedupe_signature(request_id, str(state)),
     }
 
 

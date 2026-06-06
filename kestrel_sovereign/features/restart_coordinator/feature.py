@@ -33,6 +33,11 @@ from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
 
+from .event_store import (
+    ensure_restart_status_events_table,
+    list_recent_events_for_history,
+    record_event as record_status_event,
+)
 from .events import EVENT_NAME, build_restart_status_event
 from .store import (
     KNOWN_OPERATIONS,
@@ -108,6 +113,19 @@ class RestartCoordinatorFeature(Feature):
             except Exception as e:
                 logger.warning(
                     "RestartCoordinatorFeature: table init failed: %s", e,
+                )
+            try:
+                # #1562 — typed restart-status event records. Additive
+                # CREATE TABLE IF NOT EXISTS, no existing column touched.
+                await ensure_restart_status_events_table(self._db)
+                logger.info(
+                    "RestartCoordinatorFeature: "
+                    "restart_status_events table ready"
+                )
+            except Exception as e:
+                logger.warning(
+                    "RestartCoordinatorFeature: "
+                    "status-event table init failed: %s", e,
                 )
 
         # Self-register the restart.completed signal source on the
@@ -289,6 +307,43 @@ class RestartCoordinatorFeature(Feature):
             data={
                 "count": len(rows),
                 "requests": [r.to_public_dict() for r in rows],
+            },
+        )
+
+    @tool(
+        name="list_restart_status_events",
+        description=(
+            "List recent restart_status lifecycle events for chat-"
+            "history reload and the agent's pre-turn snapshot. Newest "
+            "first; uses the typed event records persisted alongside "
+            "each SSE emit (#1562)."
+        ),
+        category=ToolCategory.DATA_ACCESS,
+        command_prefix="!restart events",
+    )
+    async def list_restart_status_events(
+        self, limit: int = 100, since: str = "",
+    ) -> ToolResult:
+        if self._db is None:
+            return ToolResult.failed(
+                "Restart coordinator storage unavailable",
+                data={"events": []},
+            )
+        try:
+            limit_int = int(limit)
+        except (TypeError, ValueError):
+            limit_int = 100
+        limit_int = max(1, min(1000, limit_int))
+        rows = await list_recent_events_for_history(
+            self._db,
+            limit=limit_int,
+            since=(since.strip() or None),
+        )
+        return ToolResult.ok(
+            confirmation=f"{len(rows)} restart status event(s)",
+            data={
+                "count": len(rows),
+                "events": [e.to_public_dict() for e in rows],
             },
         )
 
@@ -584,10 +639,14 @@ class RestartCoordinatorFeature(Feature):
         the Sovereign should see it in chat — but a missing/raising
         ``emit_event`` (headless host, test agent) must never break the
         request lifecycle. Failures are logged at debug and swallowed.
+
+        Every emit is also persisted to ``restart_status_events`` so
+        the lifecycle trail survives reload/history navigation, the
+        frontend can dedupe by stable ``dedupe_signature``, and the
+        agent's pre-turn state block can render restart context as
+        non-instructional state (#1562). The persistence is the audit
+        primary; the SSE emit is the live-paint side-channel.
         """
-        emit = getattr(self.agent, "emit_event", None)
-        if emit is None:
-            return
         agent_did = getattr(self.agent, "did", "") or ""
         payload = build_restart_status_event(
             req,
@@ -596,6 +655,46 @@ class RestartCoordinatorFeature(Feature):
             status_reason=status_reason,
             agent_did=str(agent_did),
         )
+
+        # Audit row first. If the persist fails AND a DB is available,
+        # skip the SSE emit too — a UI bubble with no durable backing
+        # row would reappear differently on reload (codex P2 r1).
+        # When no DB is configured at all (headless host, test stub),
+        # the SSE emit is still safe because there's no audit promise
+        # to break.
+        persist_ok = True
+        if self._db is not None:
+            try:
+                await record_status_event(
+                    self._db,
+                    request_id=str(getattr(req, "id", "")),
+                    state=str(state),
+                    agent_id=str(
+                        getattr(req, "requested_by_agent", "") or agent_did
+                    ),
+                    payload=payload,
+                    operation=str(
+                        getattr(req, "operation", "restart_only")
+                    ),
+                    urgency=str(getattr(req, "urgency", "normal")),
+                    policy=str(
+                        getattr(req, "policy", "idle_agents_only")
+                    ),
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                persist_ok = False
+                logger.warning(
+                    "restart_status persist failed for %s, skipping "
+                    "SSE emit to avoid phantom bubble: %s",
+                    getattr(req, "id", "?"), e,
+                )
+
+        if not persist_ok:
+            return
+
+        emit = getattr(self.agent, "emit_event", None)
+        if emit is None:
+            return
         try:
             await emit(EVENT_NAME, payload)
         except Exception as e:  # pragma: no cover - defensive
