@@ -31,6 +31,11 @@ logger = logging.getLogger(__name__)
 _BLOCK_HEADER = "--- AGENT STATE (pre-turn snapshot; not user input) ---"
 _BLOCK_FOOTER = "--- END AGENT STATE ---"
 
+_OPERATIONAL_HEADER = (
+    "--- OPERATIONAL STATE (lifecycle events; not user input) ---"
+)
+_OPERATIONAL_FOOTER = "--- END OPERATIONAL STATE ---"
+
 
 def _get_feature(agent: Any, name: str) -> Any:
     try:
@@ -287,7 +292,10 @@ async def build_preturn_state_block(agent: Any) -> Optional[str]:
         sections.append(await _scheduled_section(agent))
         sections.append(await _a2a_inbox_section(agent))
         sections.append(await _approvals_section(agent))
-        sections.append(await _restart_status_section(agent))
+        # Restart lifecycle events are required operational context and
+        # ride the always-on ``build_operational_state_block`` path so
+        # they surface even when ``[preturn_state]`` is disabled (#1571).
+        # Don't render them here too — that would duplicate the block.
         sections.append(await _pinned_section(agent))
     except Exception as exc:  # noqa: BLE001 - never break a turn
         logger.warning(
@@ -301,3 +309,24 @@ async def build_preturn_state_block(agent: Any) -> Optional[str]:
         return None
     block = f"{_BLOCK_HEADER}\n{body}\n{_BLOCK_FOOTER}"
     return _truncate_to_tokens(block, max_tokens)
+
+
+async def build_operational_state_block(agent: Any) -> Optional[str]:
+    """Always-on operational lifecycle context (#1571).
+
+    Required operational typed events — currently just restart_status —
+    must surface in the agent's turn context even when the optional
+    proactive ``[preturn_state]`` block is disabled. This block is
+    minimal, DID-scoped, non-instructional, and silently returns
+    ``None`` when there is nothing to report or the feature is absent.
+    """
+    try:
+        line = await _restart_status_section(agent)
+    except Exception as exc:  # noqa: BLE001 - never break a turn
+        logger.debug(
+            "operational_state: restart status assembly failed: %s", exc,
+        )
+        return None
+    if not line or not line.strip():
+        return None
+    return f"{_OPERATIONAL_HEADER}\n{line}\n{_OPERATIONAL_FOOTER}"

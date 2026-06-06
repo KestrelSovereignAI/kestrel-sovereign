@@ -2108,10 +2108,26 @@ Expected Duration: {expected_duration}
         # budget-aware injection path as the constitutional canary; the
         # canary stays last (a directive the model must echo), the state
         # snapshot precedes it. Best-effort: never blocks the turn.
+        #
+        # The operational block (#1571) carries required lifecycle events
+        # — currently restart_status — and runs unconditionally so the
+        # agent sees them even when the proactive [preturn_state] feature
+        # is off. Order: operational block first (closest to the user
+        # turn), then opt-in state snapshot, then whatever the canary path
+        # appends downstream.
         try:
             from kestrel_sovereign.agent.preturn_state import (
+                build_operational_state_block,
                 build_preturn_state_block,
             )
+
+            _op_block = await build_operational_state_block(self)
+            if _op_block:
+                system_prompt_addendum = (
+                    f"{_op_block}\n\n{system_prompt_addendum}"
+                    if system_prompt_addendum
+                    else _op_block
+                )
 
             _state_block = await build_preturn_state_block(self)
             if _state_block:
