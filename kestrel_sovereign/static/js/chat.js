@@ -505,6 +505,8 @@ export function wipeAgentChatPane(agentName, html = '') {
     const pane = getOrCreateChatPane(agentName);
     pane.generation += 1;
     pane.streamingMsgDiv = null;
+    pane.streamBaseline = 0;
+    pane.streamRawContentLength = 0;
     pane.fullContent = '';
     pane.thinkingItems = [];
     pane.sessionId = null;
@@ -961,41 +963,115 @@ export function handleRestartStatus(payload) {
     const requestId = String(payload.request_id || '');
     if (!requestId) return;
 
-    const target = resolvePaneElement();
+    // Resolve both the pane element (where the bubble lands) and the
+    // pane object (so we can detect an active assistant stream and
+    // interrupt it cleanly — #1560 stream-boundary).
+    const paneObj = resolvePaneObject();
+    const target = paneObj ? paneObj.element : resolvePaneElement();
     if (!target) return;
 
     const state = String(payload.status || 'pending');
-    const deferralReason = String(payload.deferral_reason || '');
-    const statusReason = String(payload.status_reason || '');
 
-    // The coordinator re-emits a request's status every cron poll, and the
-    // startup replay buffer can redeliver buffered events; a request that
-    // stays pending under a busy agent would otherwise stack one
-    // near-identical "deferred" bubble per poll (#1551 P2). Suppress a
-    // redraw only when the most recent bubble for THIS request already
-    // shows the same state + reason. Genuine transitions
-    // (pending → executing → completed) and changed deferral reasons carry
-    // a different signature and still append their own bubble, so the
-    // lifecycle stays visible.
-    const statusSig = [state, deferralReason, statusReason].join('|');
-    const priorBubbles = Array.from(
-        target.querySelectorAll('.restart-status-message'),
-    ).filter((el) => el.dataset.requestId === requestId);
-    if (priorBubbles.length) {
-        const last = priorBubbles[priorBubbles.length - 1];
-        if (last.dataset.statusSig === statusSig) return;
+    // Stable dedupe key from #1562. Format ``{request_id}:{state}``.
+    // The backend always populates ``dedupe_signature``; the fallback
+    // is for legacy/test payloads that pre-date the field. Volatile
+    // fields like ``deferral_reason`` (age text changing every cron
+    // poll after #1558) are intentionally excluded so the same
+    // (request, state) pair updates one bubble in place instead of
+    // spawning duplicates (the 7f9ee2dab18b 3-bubbles-for-1-row case).
+    const dedupeSig = String(
+        payload.dedupe_signature || `${requestId}:${state}`,
+    );
+
+    // Find-or-update: if a bubble for this exact (request, state)
+    // already exists, repaint its body inline so the latest
+    // ``deferral_reason`` / ``status_reason`` are visible without
+    // a new DOM row appearing. Genuine state transitions carry a
+    // different signature and still produce a fresh bubble below.
+    const existing = target.querySelector(
+        `.restart-status-message[data-dedupe-signature="${
+            cssAttrEscape(dedupeSig)
+        }"]`,
+    );
+    if (existing) {
+        renderRestartStatusBody(existing, payload);
+        return;
     }
 
-    const accent = RESTART_STATE_ACCENTS[state] || RESTART_STATE_ACCENTS.pending;
-    const isUpdate = String(payload.operation || '') === 'update_then_restart';
-    const shortId = requestId.length > 12 ? requestId.slice(0, 12) : requestId;
+    // Stream-boundary interrupt (#1560): if an assistant stream is
+    // currently writing into the pane, finalize the in-flight bubble
+    // at its CURRENT content so the upcoming status bubble lands in
+    // chronological order, then null the streaming pointer so the
+    // streaming loop opens a fresh bubble below the status on its
+    // next chunk. Without this the status appears below the live
+    // bubble while the agent's text continues filling the bubble
+    // above — making the bubble above look chronologically later
+    // than the bubble below.
+    if (paneObj && paneObj.streamingMsgDiv) {
+        try {
+            const live = paneObj.streamingMsgDiv;
+            const rawLen = Number(paneObj.streamRawContentLength) || 0;
+            const baseline = paneObj.streamBaseline || 0;
+            if (rawLen <= baseline) {
+                // Codex P2 round 1: stream-boundary hit during the
+                // no-content preamble — the bubble was just
+                // allocated and the streaming loop has not written
+                // any raw content into it yet. Removing it (rather
+                // than finalizing) avoids a blank assistant bubble
+                // sitting above the status.
+                live.remove();
+            } else {
+                const contentDiv = live.querySelector('.message-content');
+                if (contentDiv) contentDiv.classList.remove('streaming');
+                // Codex P1 round 1: use the RAW cumulative content
+                // length the streaming loop publishes, not the
+                // rendered ``textContent.length`` — markdown / code
+                // fences / thinking bubbles make the rendered length
+                // diverge from the raw string length, which would
+                // corrupt ``fullContent.slice(streamBaseline)`` on
+                // the next chunk write.
+                paneObj.streamBaseline = rawLen;
+            }
+            paneObj.streamingMsgDiv = null;
+        } catch (err) {
+            console.warn(
+                'restart_status: stream-boundary finalize failed',
+                err,
+            );
+        }
+    }
 
     const div = document.createElement('div');
     div.className = 'message restart-status-message';
     div.dataset.requestId = requestId;
     div.dataset.state = state;
-    div.dataset.statusSig = statusSig;
+    div.dataset.dedupeSignature = dedupeSig;
+    // Keep the legacy ``data-status-sig`` attr for any external CSS
+    // / tests that still inspect it; it now equals ``dedupe-signature``.
+    div.dataset.statusSig = dedupeSig;
+    const accent = RESTART_STATE_ACCENTS[state] || RESTART_STATE_ACCENTS.pending;
     div.style.borderLeftColor = accent;
+    renderRestartStatusBody(div, payload);
+    target.appendChild(div);
+    const c = getChatContainer();
+    if (c) c.scrollTop = c.scrollHeight;
+}
+
+
+/**
+ * Render the body (header + rows) of a restart_status bubble. Used
+ * both on initial create and on in-place update — calling it again
+ * on the same div repaints the bubble's body without moving it,
+ * which is how same-(request, state) dedupe surfaces a fresh
+ * ``deferral_reason`` to the user (#1560).
+ */
+function renderRestartStatusBody(div, payload) {
+    const requestId = String(payload.request_id || div.dataset.requestId || '');
+    const state = String(payload.status || div.dataset.state || 'pending');
+    const deferralReason = String(payload.deferral_reason || '');
+    const statusReason = String(payload.status_reason || '');
+    const isUpdate = String(payload.operation || '') === 'update_then_restart';
+    const shortId = requestId.length > 12 ? requestId.slice(0, 12) : requestId;
 
     const rows = [];
     const operationLabel = isUpdate ? 'update + restart' : 'restart';
@@ -1026,10 +1102,31 @@ export function handleRestartStatus(payload) {
         `<span class="restart-status-state restart-status-state-${escapeHtml(state)}">` +
         `${escapeHtml(state)}</span></div>` +
         `<div class="restart-status-body">${detailRows}</div>`;
+}
 
-    target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+
+/**
+ * Resolve the chat pane *object* (not just the element) so callers
+ * can inspect / mutate streaming state. Mirrors ``resolvePaneElement``
+ * but returns the full pane record.
+ */
+function resolvePaneObject() {
+    if (state.mountedChatAgent === undefined) return null;
+    return state.chatPanes.get(state.mountedChatAgent) || null;
+}
+
+
+/**
+ * Minimal CSS-attribute-selector escaper: doubles internal quotes
+ * and backslashes so the dedupe_signature (which can include ``:``
+ * but is otherwise safe) survives interpolation into a
+ * ``[data-dedupe-signature="…"]`` selector. The signature shape is
+ * ``{uuid4-hex}:{state}`` — no quotes or backslashes are possible.
+ * This guard exists so a future format change cannot silently break
+ * the dedupe lookup or open an injection vector.
+ */
+function cssAttrEscape(value) {
+    return String(value).replace(/(["\\])/g, '\\$1');
 }
 
 /**
@@ -1338,6 +1435,18 @@ export async function sendMessage(overrideText, overrideAgent) {
         if (state.useStreaming) {
             const msgDiv = addMessageStreaming('agent', pane.element);
             pane.streamingMsgDiv = msgDiv;
+            // Cumulative content offset of the CURRENT streaming bubble's
+            // first character. Stays at 0 for a normal stream; bumped
+            // when ``handleRestartStatus`` interrupts mid-stream and the
+            // loop opens a fresh bubble below the status (#1560). The
+            // slice ``fullContent.slice(pane.streamBaseline)`` is what
+            // the active bubble displays.
+            pane.streamBaseline = 0;
+            // Raw cumulative content length the streaming loop
+            // publishes for off-path observers (#1560). Starts at 0
+            // because no chunks have arrived yet — see comments at
+            // the ``fullContent += chunk`` site below.
+            pane.streamRawContentLength = 0;
             pane.thinkingItems = [];
             let fullContent = '';
 
@@ -1445,6 +1554,15 @@ export async function sendMessage(overrideText, overrideAgent) {
                         fullContent += '\n\n';
                     }
                     fullContent += chunk;
+                    // #1560 / #1562: expose the RAW cumulative content
+                    // length to off-path observers (specifically
+                    // ``handleRestartStatus`` deciding the
+                    // stream-boundary baseline). Reading the rendered
+                    // DOM ``textContent.length`` would diverge from
+                    // the raw string for markdown / code fences /
+                    // thinking bubbles, corrupting the post-status
+                    // slice (codex P1 round 1).
+                    pane.streamRawContentLength = fullContent.length;
                     // The carried/leading boundary is now resolved; the
                     // only boundary still pending is one this packet ended
                     // on (a trailing sentinel with no visible char after).
@@ -1470,11 +1588,33 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // different agent). When they come back, the
                     // streaming text is already there.
                     if (isPaneFresh()) {
-                        updateStreamingMessage(msgDiv, fullContent, pane.element, pane.thinkingItems);
+                        // #1560 stream-boundary: if a restart_status
+                        // landed mid-stream, ``handleRestartStatus``
+                        // nulled ``pane.streamingMsgDiv``; open a
+                        // fresh bubble for the post-status remainder
+                        // so the lifecycle stays chronological in the
+                        // DOM.
+                        if (!pane.streamingMsgDiv) {
+                            pane.streamingMsgDiv = addMessageStreaming(
+                                'agent', pane.element,
+                            );
+                        }
+                        const slice = fullContent.slice(
+                            pane.streamBaseline || 0,
+                        );
+                        updateStreamingMessage(
+                            pane.streamingMsgDiv, slice,
+                            pane.element, pane.thinkingItems,
+                        );
                     }
                 }
-                if (isPaneFresh()) {
-                    await finalizeStreamingMessage(msgDiv, fullContent, pane);
+                if (isPaneFresh() && pane.streamingMsgDiv) {
+                    const slice = fullContent.slice(
+                        pane.streamBaseline || 0,
+                    );
+                    await finalizeStreamingMessage(
+                        pane.streamingMsgDiv, slice, pane,
+                    );
                 }
                 if (isCurrentVisible()) {
                     await checkForModelChange(fullContent);
@@ -1528,6 +1668,8 @@ export async function sendMessage(overrideText, overrideAgent) {
         }
     } finally {
         pane.streamingMsgDiv = null;
+        pane.streamBaseline = 0;
+        pane.streamRawContentLength = 0;
         pane.pendingRevise = false;
         pane.reviseConsumedRequestId = null;
         state.waitingAgents.delete(dispatchAgent);
