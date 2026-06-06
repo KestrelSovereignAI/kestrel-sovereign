@@ -1,7 +1,11 @@
 """Response audit hook - evaluates LLM responses for integrity."""
 import logging
 from kestrel_sdk.hooks.base import Hook, HookEvent, HookInput, HookOutput
-from kestrel_sovereign.security.narration_check import analyze_narration
+from kestrel_sovereign.security.narration_check import (
+    NarrationVerdict,
+    analyze_narration,
+    check_escalation_attribution,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +56,47 @@ class ResponseAuditHook(Hook):
             input.pre_tool_prose,
             input.tool_results,
         )
+        self.last_narration_verdict = narration_verdict
+
+        # #1563 wire-up: also catch dishonest escalation-attribution
+        # wording in the response itself (e.g. "the user rejected
+        # escalation" when no audit row backs it). Routes through the
+        # #1540 classifier so the contract stays in one place. Reads
+        # the most recent slice of the security audit so the check
+        # has the same evidence the LLM should have used.
+        recent_decisions = await self._recent_security_decisions(limit=50)
+        escalation_verdict = check_escalation_attribution(
+            input.response_text,
+            input.tool_results,
+            recent_decisions=recent_decisions,
+        )
+        # Fold both verdicts together: take the most severe risk
+        # boost, concatenate reasonings so the operator sees every
+        # rule that fired.
+        if escalation_verdict.risk_boost > narration_verdict.risk_boost:
+            narration_verdict = escalation_verdict
+        elif (
+            escalation_verdict.risk_boost > 0
+            and narration_verdict.risk_boost > 0
+        ):
+            narration_verdict = NarrationVerdict(
+                risk_boost=max(
+                    narration_verdict.risk_boost,
+                    escalation_verdict.risk_boost,
+                ),
+                reasoning=(
+                    f"{narration_verdict.reasoning} | "
+                    f"{escalation_verdict.reasoning}"
+                ),
+                offending_verb=(
+                    narration_verdict.offending_verb
+                    or escalation_verdict.offending_verb
+                ),
+                offending_tool=(
+                    narration_verdict.offending_tool
+                    or escalation_verdict.offending_tool
+                ),
+            )
         self.last_narration_verdict = narration_verdict
 
         # Honesty doctrine: a narration violation is a constitutional
@@ -152,6 +197,42 @@ class ResponseAuditHook(Hook):
                 )
 
         return HookOutput.allow(f"Audit passed (risk {risk_level})")
+
+    async def _recent_security_decisions(
+        self, limit: int = 50,
+    ) -> list:
+        """Pull recent security-audit rows for the escalation check.
+
+        #1563: the escalation-attribution check needs to verify whether
+        a user-denial narrative is actually backed by a real audit row
+        — the classifier's USER_DENIED branch turns ONLY on that
+        evidence. Best-effort: a missing SecurityFeature / permission
+        store / aiosqlite read failure must NOT break the audit, so
+        every error path returns an empty list and the classifier
+        falls through to the raw-error pattern matcher.
+        """
+        try:
+            features = getattr(self.agent, "features", {})
+            if isinstance(features, dict):
+                security = features.get("SecurityFeature")
+            else:
+                security = next(
+                    (f for f in features
+                     if type(f).__name__ == "SecurityFeature"),
+                    None,
+                )
+            if security is None:
+                return []
+            store = getattr(security, "permission_store", None)
+            if store is None or not hasattr(store, "get_audit_log"):
+                return []
+            return await store.get_audit_log(limit=limit)
+        except Exception as exc:  # noqa: BLE001 - never fail an audit
+            logger.debug(
+                "ResponseAuditHook: recent_security_decisions failed: %s",
+                exc,
+            )
+            return []
 
     async def _notify_audit_anchor(self, risk_level: int, reasoning: str):
         """Notify AuditAnchorFeature for tamper-proof logging on elevated risk."""

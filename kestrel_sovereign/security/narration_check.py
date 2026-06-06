@@ -250,3 +250,139 @@ def analyze_narration(
         offending_verb=verb,
         offending_tool=offender_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Escalation-attribution check (#1563 wire-up of the #1540 classifier)
+# ---------------------------------------------------------------------------
+
+
+# Phrases the agent must not use unless an audit row actually attributes
+# the failure to a user denial. Codex's raw ``Rejected("rejected by
+# user")`` substring lands here even when no Kestrel approval row backs
+# it — that's the exact #1563 reproduction.
+_FORBIDDEN_USER_DENIAL_RE = re.compile(
+    r"\b(rejected by (?:the )?user"
+    r"|denied by (?:the )?user"
+    r"|declined by (?:the )?user"
+    r"|refused by (?:the )?user"
+    r"|user (?:explicitly )?(?:denied|rejected|declined|refused)"
+    r"|escalation (?:rejected|denied|declined|refused) by (?:the )?user"
+    r"|you denied the escalation"
+    r"|user denial)\b",
+    re.IGNORECASE,
+)
+
+
+def check_escalation_attribution(
+    response_text: Optional[str],
+    tool_results: Optional[List[Dict[str, Any]]],
+    *,
+    recent_decisions: Optional[List[Dict[str, Any]]] = None,
+    tool_name: str = "",
+    feature_name: str = "",
+) -> NarrationVerdict:
+    """Catch dishonest escalation-attribution wording in the response.
+
+    The #1563 root case: the LLM, having observed a Codex sandbox
+    rejection like ``CreateProcess { message: "Rejected(\"rejected by
+    user\")" }``, narrates "the user rejected escalation" — when the
+    security audit has no denial row at all and the user never
+    decided anything. The Codex string's ``"by user"`` substring is
+    the sandbox's INTERNAL diagnostic, not Kestrel-attributable
+    provenance.
+
+    This check runs alongside ``analyze_narration``. It scans the
+    response for forbidden user-denial wording; if found, it routes
+    the most-recent failing tool result through
+    :func:`classify_escalation_failure` and flags as a narration
+    violation when the classifier's outcome is anything other than
+    ``USER_DENIED``.
+
+    Returns:
+        ``NarrationVerdict`` with ``risk_boost == 0`` when the
+        response makes no user-denial claim, OR makes one that the
+        audit confirms. Returns ``risk_boost == 2`` when the agent
+        narrated user denial but the classifier disagreed —
+        equivalent severity to the past-tense-success violation
+        above so the existing audit threshold logic catches it.
+    """
+    if not response_text:
+        return NarrationVerdict(risk_boost=0, reasoning="")
+    match = _FORBIDDEN_USER_DENIAL_RE.search(response_text)
+    if not match:
+        return NarrationVerdict(risk_boost=0, reasoning="")
+
+    # The response narrated user denial. Verify against the audit.
+    # Pull the MOST-RECENT failing tool result's raw error string —
+    # that's what the classifier operates on. We iterate from the
+    # END of ``tool_results`` so a turn with multiple escalations
+    # picks the one the response most likely refers to (codex P1
+    # round 1 — front-iteration would let an earlier audit-backed
+    # denial corroborate a later unbacked sandbox refusal). When no
+    # tool failures are visible, fall back to empty + ``unknown``;
+    # the classifier then defaults to UNCONFIRMED, still NOT a user
+    # denial, still trips the violation.
+    raw_error = ""
+    selected_tool_name = tool_name
+    selected_feature_name = feature_name
+    if tool_results:
+        for tr in reversed(tool_results):
+            result = tr.get("result")
+            if not _result_indicates_failure(result):
+                continue
+            if isinstance(result, dict):
+                err = result.get("error") or result.get("message") or ""
+                if isinstance(err, str):
+                    raw_error = err
+            # If the caller didn't pin a tool/feature scope, derive
+            # them from the selected failing result so the classifier
+            # only matches audit rows ACTUALLY about this tool —
+            # otherwise any unrelated user_denied row in the last 50
+            # would falsely corroborate the narration (codex P1
+            # round 1).
+            if not selected_tool_name:
+                selected_tool_name = str(tr.get("name") or "")
+            if not selected_feature_name:
+                selected_feature_name = str(tr.get("feature") or "")
+            break
+
+    # Lazy import to avoid a circular dep between this honesty-layer
+    # module and the llm package.
+    from kestrel_sovereign.llm.escalation_classifier import (
+        EscalationOutcome,
+        classify_escalation_failure,
+    )
+    # codex P2 round 2: when we could not derive a tool scope from
+    # the response's failing results AND the caller did not pin one,
+    # the audit-row lookup must be DISABLED — otherwise any unrelated
+    # ``user_denied`` row in the last 50 silently corroborates this
+    # narration. Force the classifier through its raw-error /
+    # default path by passing an empty audit set.
+    scoped_audit: list = (
+        list(recent_decisions or []) if selected_tool_name else []
+    )
+    decision = classify_escalation_failure(
+        raw_error,
+        recent_decisions=scoped_audit,
+        tool_name=selected_tool_name,
+        feature_name=selected_feature_name,
+    )
+    if decision.outcome is EscalationOutcome.USER_DENIED:
+        # Audit confirms the wording. Narration is honest.
+        return NarrationVerdict(risk_boost=0, reasoning="")
+
+    offending_phrase = match.group(0)
+    return NarrationVerdict(
+        risk_boost=2,
+        reasoning=(
+            f"Response narrated user denial ({offending_phrase!r}) but "
+            f"the security audit does not corroborate it: "
+            f"classifier returned {decision.outcome.value!r} "
+            f"({decision.reason}). This violates the #1540 honesty "
+            f"contract — only an audit-backed USER_DENIED outcome may "
+            f"be narrated as a user denial."
+        ),
+        offending_verb=offending_phrase.lower(),
+        offending_tool="",
+    )
