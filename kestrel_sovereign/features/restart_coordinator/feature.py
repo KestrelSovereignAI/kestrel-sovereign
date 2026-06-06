@@ -58,6 +58,14 @@ from .update_profiles import (
 # Cap on captured stdout/stderr per update step kept in the durable log.
 _OUTPUT_TAIL_CHARS = 2000
 
+# Active request ids older than this are treated as abandoned markers
+# (endpoint cleanup never ran — client disconnect, crashed generator)
+# and swept before judging agent liveness. A genuine streaming cognition
+# request completes in seconds-to-minutes; 15 minutes is far longer than
+# any real turn yet breaks the deadlock well inside the ~20 min window
+# observed in #1558.
+STALE_ACTIVE_REQUEST_SECONDS = 900
+
 logger = logging.getLogger(__name__)
 
 
@@ -686,6 +694,28 @@ class RestartCoordinatorFeature(Feature):
         active_ids = getattr(self.agent, "_active_request_ids", None)
         if active_ids is not None:
             any_surface_seen = True
+            # A finished/abandoned stream should have been cleared by the
+            # endpoint's `finally` (`_cleanup_cancelled_request`). A client
+            # disconnect or crashed generator can leave a request id
+            # registered forever, permanently blocking `idle_agents_only`
+            # restarts (#1558). Sweep ids older than the staleness window
+            # before counting so a stale marker can never deadlock us.
+            pruner = getattr(self.agent, "prune_stale_active_requests", None)
+            if callable(pruner):
+                try:
+                    pruned = pruner(STALE_ACTIVE_REQUEST_SECONDS)
+                    if pruned:
+                        logger.info(
+                            "restart_coordinator: swept %d stale active "
+                            "request id(s) (older than %ds): %s",
+                            len(pruned), STALE_ACTIVE_REQUEST_SECONDS,
+                            pruned,
+                        )
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug(
+                        "restart_coordinator: stale-request sweep "
+                        "failed: %s", e,
+                    )
             try:
                 n = len(active_ids)
             except TypeError:
@@ -693,7 +723,10 @@ class RestartCoordinatorFeature(Feature):
             if n:
                 return {
                     "idle": False,
-                    "reason": f"{n} active request id(s)",
+                    "reason": (
+                        f"{n} active request id(s)"
+                        f"{self._active_request_age_suffix()}"
+                    ),
                 }
 
         bg_tasks = getattr(self.agent, "_background_tasks", None)
@@ -718,6 +751,29 @@ class RestartCoordinatorFeature(Feature):
                 "reason": "no idleness introspection on agent",
             }
         return {"idle": True, "reason": ""}
+
+    def _active_request_age_suffix(self) -> str:
+        """Append the oldest active-request age to a busy deferral reason.
+
+        Observability for #1558: when a restart defers on ``agent busy``,
+        the operator can see how old the in-flight request markers are
+        relative to the staleness sweep window, so a near-stale id is
+        visible before it ages out.
+        """
+        ages_fn = getattr(self.agent, "active_request_ages", None)
+        if not callable(ages_fn):
+            return ""
+        try:
+            ages = ages_fn()
+        except Exception:
+            return ""
+        if not ages:
+            return ""
+        oldest = max(ages.values())
+        return (
+            f"; oldest {int(oldest)}s of "
+            f"{STALE_ACTIVE_REQUEST_SECONDS}s stale window"
+        )
 
     @staticmethod
     def _request_aged_past_timeout(req) -> bool:
