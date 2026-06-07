@@ -599,6 +599,12 @@ role = "technical_reviewer"
 # the Mews approval panel adds rows to a parallel DB allowlist (revocable
 # the same way); these TOML entries are the operator-seeded baseline.
 #
+# Three approval paths can fire for a tool call: codex-native sandbox
+# shell (Path 1, since #1575), this internal computer_use gate keyed on
+# argv (Path 2), and the LLM-driven ComputerUseFeature.shell call keyed
+# on {"command": ...} (Path 3). See docs/architecture/APPROVAL_PATHS.md
+# for the coverage matrix and which auto-mode covers which.
+#
 # [[security.auto_approve.shell]]
 # pattern = "^gh issue (create|comment) -R KestrelSovereignAI/kestrel-sovereign(?:\\s|$)"
 # repo_scope = "KestrelSovereignAI/kestrel-sovereign"
