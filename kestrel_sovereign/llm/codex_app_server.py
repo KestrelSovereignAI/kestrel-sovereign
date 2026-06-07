@@ -198,6 +198,14 @@ class CodexAppServerClient:
         self._server_request_handlers: Dict[
             Tuple[str, Optional[str]], ServerRequestHandler
         ] = {}
+        # #1581: agent reference for typed-event audit on default
+        # declines (``_DEFAULT_APPROVAL_REPLIES`` path). Set via
+        # ``attach_audit_agent`` from the adapter's
+        # ``_ensure_codex_approval_bridge`` so a re-bind on the
+        # adapter side also redirects audit here. ``None`` means
+        # no decline event is recorded — default for unattached
+        # clients (tests, headless callers).
+        self._audit_agent: Any = None
         self._stderr_tail: list[str] = []
         # Resolved CODEX_HOME path used by ``_spawn`` (#1410). Captured at
         # spawn time so accessors (``recent_codex_log``) can query the
@@ -873,6 +881,26 @@ class CodexAppServerClient:
                     return
             elif method in _DEFAULT_APPROVAL_REPLIES:
                 result = _DEFAULT_APPROVAL_REPLIES[method]
+                # #1581: surface the auto-default decline as a typed
+                # event in the agent's next-turn operational state
+                # block. Without this, declines via the hardcoded
+                # default table (the elicitation/permissions/userInput
+                # RPCs that #1575's bridge intentionally doesn't cover)
+                # are completely invisible to the agent. Best-effort —
+                # never breaks dispatch on an audit-store failure.
+                #
+                # Two reply shapes carry a decline today:
+                #   {"decision": "decline"}  — commandExecution, fileChange
+                #   {"action":   "decline"}  — mcpServer/elicitation/request
+                # Codex review #1581 round 1 caught that the second
+                # shape was being silently dropped from the audit.
+                if isinstance(result, dict):
+                    decline_value = (
+                        result.get("decision")
+                        or result.get("action")
+                    )
+                    if str(decline_value or "").lower() == "decline":
+                        await self._record_default_decline(method, params or {})
             elif method == "item/tool/call":
                 # No bridge registered (e.g. text-only turn). Reply with
                 # an explicit failure rather than silently saying ok.
@@ -892,6 +920,63 @@ class CodexAppServerClient:
                 self._send({"id": mid, "error": {"message": str(e)}})
             except Exception:
                 pass
+
+    def attach_audit_agent(self, agent: Any) -> None:
+        """Bind the agent so default-decline RPCs (the
+        ``_DEFAULT_APPROVAL_REPLIES`` path) can write typed events
+        into the agent's audit store (#1581). Idempotent; passing
+        ``None`` detaches.
+
+        Called from the adapter's
+        ``_ensure_codex_approval_bridge`` so a rebind on the adapter
+        side also redirects audit here.
+        """
+        self._audit_agent = agent
+
+    async def _record_default_decline(
+        self, method: str, params: Dict[str, Any],
+    ) -> None:
+        """Persist an auto-default decline as a typed event for the
+        attached agent's next-turn operational state block. No-op
+        when no agent is attached or the audit store isn't reachable
+        (tests, headless callers, transient DB failure)."""
+        # getattr — older fixtures construct the client without going
+        # through __init__, so the attr may not exist.
+        agent = getattr(self, "_audit_agent", None)
+        if agent is None:
+            return
+        try:
+            from kestrel_sovereign.features.storage_access import (
+                resolve_feature_database,
+            )
+            db = resolve_feature_database(agent)
+            if db is None:
+                return
+            from kestrel_sovereign.llm.codex_decline_events import (
+                ensure_codex_decline_events_table, record_decline,
+            )
+            await ensure_codex_decline_events_table(db)
+            agent_id = (
+                getattr(agent, "did", None)
+                or getattr(agent, "_agent_name", None)
+                or "anonymous"
+            )
+            # Surface SOMETHING for ``tool`` so the operational block
+            # can render it. The default-decline RPCs (elicitation /
+            # permissions / requestUserInput) don't carry a single
+            # canonical "tool" field, so use the method as a label.
+            await record_decline(
+                db,
+                agent_id=str(agent_id),
+                request=method,
+                tool=method.rsplit("/", 1)[0],
+                reason="auto_default",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "codex_decline_events: default-decline record failed "
+                "(%s) — %s", method, exc,
+            )
 
     def register_server_request_handler(
         self, method: str, handler: ServerRequestHandler,
