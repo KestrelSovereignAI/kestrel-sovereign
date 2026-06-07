@@ -41,6 +41,17 @@ class SaveFeature(Feature):
     def tool_description(self) -> str:
         return "Save content for later retrieval - stashes, files, excerpts, structured items"
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        # #1578 (B): SaveFeature owns durable operator-critical tools
+        # (save_item, save_stash, save_file, etc.) that the agent
+        # needs available from turn 1. Forcing a subagent-dispatch
+        # hop first creates a UX cliff where an LLM trying to use
+        # save_item fluently hits "not advertised". Pinned by
+        # _promote_startup_feature_tools so LRU eviction can't
+        # silently drop these in a long session (#1580 / D).
+        return True
+
     async def initialize(self):
         """Initialize the save feature with required references."""
         self.storage = getattr(self.agent, 'storage', None)

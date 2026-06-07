@@ -438,3 +438,209 @@ class TestFeatureDispatchUnaffected:
         agent._register_explored_feature_tools(feature)
         tools_after = agent._build_feature_tools()
         assert len(tools_after) == 0
+
+
+# =============================================================================
+# #1580 (D) — pin tier + evicted-name logging
+# =============================================================================
+
+class TestPinTier:
+
+    def test_pinned_feature_survives_eviction(self, agent):
+        """A pinned (startup-promoted) feature's tools must NOT be
+        evicted when the cap is exceeded — even when it's the oldest.
+        Otherwise long sessions silently drop operationally-critical
+        tools like get_peer_task_result / save_item."""
+        agent.MAX_DIRECT_TOOLS = 5
+
+        # Pinned feature with 3 tools, registered first (would
+        # normally be LRU-oldest).
+        pinned_tools = [_make_mock_tool(f"pinned_{i}") for i in range(3)]
+        pinned = _make_mock_feature("pinned_feature", pinned_tools)
+        agent._register_explored_feature_tools(pinned)
+        agent._pinned_features.add("pinned_feature")
+
+        # Then an unpinned feature with 3 tools → total 6 > cap 5.
+        # The pinned one would have been oldest, but must NOT be
+        # evicted.
+        evictable_tools = [_make_mock_tool(f"evict_{i}") for i in range(3)]
+        evictable = _make_mock_feature("evictable_feature", evictable_tools)
+        agent._register_explored_feature_tools(evictable)
+
+        # The unpinned feature must have been the one evicted (it
+        # was the only candidate); the pinned one survives.
+        assert "pinned_feature" in agent._explored_features
+        assert all(f"pinned_{i}" in agent._direct_tools for i in range(3))
+
+    def test_all_pinned_logs_warning_and_stops(self, agent, caplog):
+        """If every explored feature is pinned and the cap is
+        exceeded, eviction is impossible. The loop must bail with a
+        warning rather than spin forever or evict a pinned feature.
+
+        Build the over-cap state directly (rather than via
+        sequential register+pin, which would evict the second feature
+        before its pin lands) to isolate the all-pinned eviction
+        contract."""
+        import logging
+        agent.MAX_DIRECT_TOOLS = 2
+
+        # Stuff state with two pinned features, total 4 tools.
+        for tag in ("a", "b"):
+            for i in range(2):
+                name = f"{tag}_{i}"
+                agent._direct_tools[name] = MagicMock()
+                agent._direct_tool_defs.append({
+                    "type": "function",
+                    "function": {"name": name, "description": "",
+                                 "parameters": {"type": "object"}},
+                })
+                agent._tool_to_feature[name] = f"{tag}_feature"
+            agent._explored_features[f"{tag}_feature"] = True
+            agent._pinned_features.add(f"{tag}_feature")
+
+        assert len(agent._direct_tools) == 4  # over cap 2
+
+        with caplog.at_level(logging.WARNING):
+            agent._maybe_evict_direct_tools()
+
+        # Nothing was evicted — both pinned features survived.
+        assert "a_feature" in agent._explored_features
+        assert "b_feature" in agent._explored_features
+        # Warning surfaced naming the pinned features.
+        assert any(
+            "all" in r.message.lower() and "pinned" in r.message.lower()
+            for r in caplog.records
+        )
+
+    def test_eviction_log_includes_tool_names(self, agent, caplog):
+        """#1580 (D) acceptance: eviction must log the actual tool
+        names, not just a count, so regressions are visible in audit."""
+        import logging
+        agent.MAX_DIRECT_TOOLS = 2
+
+        tools_old = [_make_mock_tool("old_named_tool")]
+        agent._register_explored_feature_tools(
+            _make_mock_feature("old_feat", tools_old)
+        )
+        tools_new = [
+            _make_mock_tool(f"new_tool_{i}") for i in range(2)
+        ]
+
+        with caplog.at_level(logging.INFO):
+            agent._register_explored_feature_tools(
+                _make_mock_feature("new_feat", tools_new)
+            )
+
+        evict_logs = [
+            r.message for r in caplog.records
+            if "Evicted" in r.message and "old_feat" in r.message
+        ]
+        assert evict_logs, "eviction was not logged"
+        assert "old_named_tool" in evict_logs[0], (
+            "evicted tool name must appear in the log line (not just count)"
+        )
+
+
+# =============================================================================
+# #1577 (A) — end-to-end: build_all_tools → codex per-turn handler
+# =============================================================================
+
+class TestAllToolsReachCodexHandler:
+    """Pin the contract: tool names returned by ``_build_all_tools()``
+    end up in the codex adapter's per-turn ``allowed_tools`` set, so
+    a tool the agent advertised is actually callable for that turn.
+
+    Without this pin, the "Kestrel did not register an
+    item/tool/call handler for this turn." failure Emma hit could
+    regress silently — the RPC layer and the registry layer are each
+    tested in isolation but no test wires the seam."""
+
+    @pytest.mark.asyncio
+    async def test_advertised_tools_reach_handler_allowed_set(self):
+        """An agent's ``_build_all_tools()`` output, when threaded
+        through the codex adapter via ``_run_turn``, must produce a
+        handler whose ``allowed_tools`` includes every advertised
+        tool name."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from tests.unit.test_codex_adapter import (
+            _FakeAppServer, _TEXT_TURN,
+        )
+
+        adapter = CodexAdapter()
+        adapter._client = _FakeAppServer(list(_TEXT_TURN))
+
+        # Build a fake "advertised" tool list — the shape
+        # ``_build_all_tools`` returns: OpenAI function-tool envelopes.
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"do {name}",
+                    "parameters": {"type": "object"},
+                },
+            }
+            for name in (
+                "save_item", "strategy_add_decision",
+                "get_peer_task_result",
+            )
+        ]
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        captured = {}
+        orig_register = adapter._make_tool_call_handler
+
+        def _spy_make_handler(executor, thread_id, allowed_tools, executed_log=None):
+            captured["allowed_tools"] = set(allowed_tools)
+            return orig_register(executor, thread_id, allowed_tools, executed_log)
+
+        adapter._make_tool_call_handler = _spy_make_handler
+
+        await adapter.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            tools=tools,
+            session_id="s",
+            tool_executor=exe,
+        )
+
+        assert captured["allowed_tools"] == {
+            "save_item", "strategy_add_decision", "get_peer_task_result",
+        }, "every advertised tool must reach the per-turn allowed set"
+
+    @pytest.mark.asyncio
+    async def test_text_only_turn_registers_no_handler(self):
+        """Negative pin: a turn with ``tools=None`` must NOT register
+        an item/tool/call handler — that's the defense-in-depth path
+        Emma's failure surfaced (a stale tool call on a text-only
+        turn would otherwise execute against the orchestrator's full
+        registry)."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from tests.unit.test_codex_adapter import (
+            _FakeAppServer, _TEXT_TURN,
+        )
+
+        adapter = CodexAdapter()
+        adapter._client = _FakeAppServer(list(_TEXT_TURN))
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        await adapter.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="text-only",
+            tool_executor=exe,
+        )
+        # Append-only history — the bridge handlers may register
+        # globally (#1575) but item/tool/call must NOT, because no
+        # tools were advertised this turn.
+        registered_tool_call = [
+            k for k in adapter._client.registered_history
+            if k[0] == "item/tool/call"
+        ]
+        assert registered_tool_call == [], (
+            "text-only turn must not register an item/tool/call handler"
+        )
