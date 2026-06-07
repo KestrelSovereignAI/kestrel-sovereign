@@ -311,22 +311,81 @@ async def build_preturn_state_block(agent: Any) -> Optional[str]:
     return _truncate_to_tokens(block, max_tokens)
 
 
-async def build_operational_state_block(agent: Any) -> Optional[str]:
-    """Always-on operational lifecycle context (#1571).
+async def _codex_decline_section(agent: Any) -> Optional[str]:
+    """Render the agent's most recent codex sandbox-approval declines
+    as a one-line summary (#1581).
 
-    Required operational typed events — currently just restart_status —
-    must surface in the agent's turn context even when the optional
-    proactive ``[preturn_state]`` block is disabled. This block is
-    minimal, DID-scoped, non-instructional, and silently returns
-    ``None`` when there is nothing to report or the feature is absent.
+    DID-scoped read of ``codex_decline_events``. Silent when no rows
+    exist or the table hasn't been created (decline events only
+    surface when codex actually emits an approval RPC AND we decline
+    it — most agents will see nothing here most of the time).
+
+    Without this, declines via codex's hardcoded default-reply table
+    (elicitation/permissions/userInput) AND the bridge's fail-closed
+    paths (policy DENY, queue denied, missing CU, malformed payload)
+    are completely invisible to the agent on her next turn.
     """
+    from kestrel_sovereign.features.storage_access import (
+        resolve_feature_database,
+    )
+    db = resolve_feature_database(agent)
+    agent_id = getattr(agent, "did", None) or getattr(
+        agent, "_did", None,
+    )
+    if db is None or not agent_id:
+        return None
     try:
-        line = await _restart_status_section(agent)
-    except Exception as exc:  # noqa: BLE001 - never break a turn
+        from kestrel_sovereign.llm.codex_decline_events import (
+            list_recent_declines_for_agent,
+        )
+        rows = await list_recent_declines_for_agent(
+            db, agent_id=str(agent_id), limit=10,
+        )
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
-            "operational_state: restart status assembly failed: %s", exc,
+            "operational_state: codex_decline read failed: %s", exc,
         )
         return None
-    if not line or not line.strip():
+    if not rows:
         return None
-    return f"{_OPERATIONAL_HEADER}\n{line}\n{_OPERATIONAL_FOOTER}"
+    by_reason: dict[str, int] = {}
+    for ev in rows:
+        key = ev.reason.split(":", 1)[0]
+        by_reason[key] = by_reason.get(key, 0) + 1
+    counts = ", ".join(
+        f"{n} {r}" for r, n in sorted(by_reason.items())
+    )
+    latest = rows[0]
+    latest_tool = latest.tool[:80]
+    return (
+        f"Codex declines (recent {len(rows)}): {counts}; "
+        f"latest: {latest.request} → {latest_tool!r}"
+    )
+
+
+async def build_operational_state_block(agent: Any) -> Optional[str]:
+    """Always-on operational lifecycle context (#1571, #1581).
+
+    Required operational typed events — restart_status (#1571) plus
+    codex sandbox-approval declines (#1581) — must surface in the
+    agent's turn context even when the optional proactive
+    ``[preturn_state]`` block is disabled. This block is minimal,
+    DID-scoped, non-instructional, and silently returns ``None``
+    when there is nothing to report.
+    """
+    lines: List[str] = []
+    for section in (_restart_status_section, _codex_decline_section):
+        try:
+            line = await section(agent)
+        except Exception as exc:  # noqa: BLE001 - never break a turn
+            logger.debug(
+                "operational_state: %s failed: %s",
+                section.__name__, exc,
+            )
+            continue
+        if line and line.strip():
+            lines.append(line)
+    if not lines:
+        return None
+    body = "\n".join(lines)
+    return f"{_OPERATIONAL_HEADER}\n{body}\n{_OPERATIONAL_FOOTER}"
