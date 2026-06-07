@@ -379,6 +379,14 @@ class KestrelAgent(
         self._direct_tools: dict = {}
         self._direct_tool_defs: list = []
         self._tool_to_feature: dict = {}  # tool_name -> feature tool_name
+        # #1580 (D): pinned features are exempt from LRU eviction.
+        # Populated by `_promote_startup_feature_tools` for every
+        # feature whose `promote_tools_on_startup = True` (Peers /
+        # Tasks / Spawn today, plus #1578 / B's Save and Strategy
+        # additions). Without a pin tier, a long session that
+        # explores many features could silently evict operationally
+        # critical tools (get_peer_task_result, save_item, etc.).
+        self._pinned_features: set = set()
 
         # Initialize constitution audit tracking
         self._init_constitution_audit_tracking()
@@ -1522,10 +1530,19 @@ class KestrelAgent(
                 feature.set_task_manager(self.task_manager)
 
     def _promote_startup_feature_tools(self) -> None:
-        """Promote direct tools for features that opt into startup exposure."""
+        """Promote direct tools for features that opt into startup exposure.
+
+        Startup-promoted features are also pinned (#1580 / D) so LRU
+        eviction can never silently drop them. Without the pin tier,
+        a session that explores many features past
+        ``MAX_DIRECT_TOOLS`` could evict ``get_peer_task_result``,
+        ``save_item``, etc. — invisible to the agent and a recipe for
+        the kind of orchestration failure that Emma surfaced.
+        """
         for feature in self.features.values():
             if getattr(feature, "promote_tools_on_startup", False):
                 self._register_explored_feature_tools(feature)
+                self._pinned_features.add(feature.tool_name)
 
     async def _disable_feature(self, feature_name: str):
         """Disable a feature and remove its runtime registrations."""

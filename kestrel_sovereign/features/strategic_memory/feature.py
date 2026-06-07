@@ -90,6 +90,18 @@ class StrategicMemoryFeature(Feature):
             "stakeholders, decisions, blockers, and learned patterns"
         )
 
+    @property
+    def promote_tools_on_startup(self) -> bool:
+        # #1578 (B): the decision-log/strategy tools (strategy_add_decision,
+        # strategy_open_decisions, etc.) are part of an agent's
+        # operational memory loop. Forcing a subagent-dispatch hop
+        # before they're advertised means an agent trying to record
+        # a strategic decision on turn 1 hits "not advertised" —
+        # exactly the failure Emma surfaced. Pinned by
+        # _promote_startup_feature_tools so LRU eviction can't
+        # silently drop them (#1580 / D).
+        return True
+
     async def initialize(self):
         """Load strategic memory from STRATEGY.yaml."""
         try:

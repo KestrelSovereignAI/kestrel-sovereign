@@ -128,9 +128,35 @@ class ToolRegistryMixin:
         )
 
     def _maybe_evict_direct_tools(self) -> None:
-        """Evict least-recently-explored feature's tools if over limit."""
+        """Evict least-recently-explored feature's tools if over limit.
+
+        Skips features in ``_pinned_features`` (#1580 / D). The pin
+        tier protects startup-promoted operationally-critical features
+        (Peers / Tasks / Spawn / Save / StrategicMemory) so a long
+        session can't silently drop tools the agent depends on for
+        basic orchestration. Logged eviction lists the actual tool
+        names (not just a count) so the operator can spot a
+        regression in the audit trail.
+        """
+        pinned = getattr(self, "_pinned_features", set())
         while len(self._direct_tools) > self.MAX_DIRECT_TOOLS:
-            oldest = next(iter(self._explored_features))
+            # Find oldest UNPINNED feature.
+            oldest = next(
+                (k for k in self._explored_features if k not in pinned),
+                None,
+            )
+            if oldest is None:
+                # Every remaining feature is pinned — eviction is
+                # impossible. Log and bail so we don't loop forever.
+                logging.warning(
+                    "[DYNAMIC-TOOLS] Cannot evict: all %d explored "
+                    "features are pinned (%s). Direct-tool count %d "
+                    "exceeds cap %d; raise MAX_DIRECT_TOOLS or unpin.",
+                    len(self._explored_features),
+                    sorted(pinned), len(self._direct_tools),
+                    self.MAX_DIRECT_TOOLS,
+                )
+                return
             del self._explored_features[oldest]
             to_remove = [k for k, v in self._tool_to_feature.items() if v == oldest]
             for name in to_remove:
@@ -140,7 +166,18 @@ class ToolRegistryMixin:
                 d for d in self._direct_tool_defs
                 if d["function"]["name"] not in to_remove
             ]
-            logging.info(f"[DYNAMIC-TOOLS] Evicted {len(to_remove)} tools from {oldest}")
+            # Log the actual evicted names, not just a count (#1580 /
+            # D). Without names, regressions are impossible to spot
+            # in retro audit.
+            preview = sorted(to_remove)[:10]
+            tail = (
+                f" (+{len(to_remove) - 10} more)"
+                if len(to_remove) > 10 else ""
+            )
+            logging.info(
+                "[DYNAMIC-TOOLS] Evicted %d tool(s) from %s: %s%s",
+                len(to_remove), oldest, ", ".join(preview), tail,
+            )
 
     def _build_features_prompt_section(self) -> str:
         """
