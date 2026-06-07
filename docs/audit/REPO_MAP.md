@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-06
-**Scope:** 1651 tracked files (1067 `.py`, 299 `.md`, 285 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-07
+**Scope:** 1657 tracked files (1072 `.py`, 299 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -124,7 +124,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/agent/orchestrator_engine.py** — Orchestrator engine mixin for tool execution and response handling.
   - `class IterationTracker`; `class ContextStats`; `class ToolNotRegisteredError`; `class OrchestratorEngineMixin`
 - **kestrel_sovereign/agent/preturn_state.py** — Pre-turn state-load block (epic #1290, D3).
-  - `async def build_preturn_state_block(agent)`
+  - `async def build_preturn_state_block(agent)`; `async def build_operational_state_block(agent)`
 - **kestrel_sovereign/agent/request_lifecycle.py** — Request lifecycle mixin for KestrelAgent.
   - `class RequestLifecycleMixin`
 - **kestrel_sovereign/agent/salvage.py** — Durable salvage primitive for the context system (epic #1307 / C).
@@ -409,6 +409,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/response_audit/hook.py** — Response audit hook - evaluates LLM responses for integrity.
   - `class ResponseAuditHook`
 - **kestrel_sovereign/features/restart_coordinator/__init__.py** — Restart Coordinator Feature (#1512).
+- **kestrel_sovereign/features/restart_coordinator/event_store.py** — Durable typed-event store for restart_status events (#1562).
+  - `def dedupe_signature(request_id, state)`; `class RestartStatusEvent`; `async def ensure_restart_status_events_table(db)`; `async def record_event(db)`; `async def list_events_for_request(db, request_id)`; `async def list_recent_events_for_history(db)`; `async def list_recent_events_for_agent_context(db)`; `async def latest_event_for_signature(db, dedupe_sig)`
 - **kestrel_sovereign/features/restart_coordinator/events.py** — Chat-visible restart-status events (#1551).
   - `def build_restart_status_event(request)`
 - **kestrel_sovereign/features/restart_coordinator/feature.py** — RestartCoordinatorFeature — durable, host-mediated restart requests.
@@ -603,7 +605,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/llm/claude_max_adapter.py** — Claude Max Subscription Adapter
   - `class ClaudeMaxAdapter`
 - **kestrel_sovereign/llm/codex_adapter.py** — Codex Provider Adapter — OpenAI ChatGPT subscription via the official ``@openai/codex`` app-server.
-  - `class CodexAdapter`
+  - `def classify_and_render_failure(raw_error)`; `class CodexAdapter`
 - **kestrel_sovereign/llm/codex_app_server.py** — Codex app-server JSON-RPC client.
   - `class CodexAppServerError`; `class CodexAppServerTransportError`; `class CodexAppServerConnectionClosed`; `def resolve_codex_binary()`; `class CodexAppServerClient`
 - **kestrel_sovereign/llm/constitutional_awareness.py** — Constitutional awareness for LLM Service.
@@ -616,6 +618,8 @@ Repo entry points and standard project files.
   - `class EmbeddingProfile`; `def derive_embedding_profile()`; `class EmbeddingService`; `class ProviderEmbeddingService`; `def cosine_similarity(a, b)`; `async def semantic_search(query, documents, embedding_service, top_k)`; `def get_embedding_service(model, base_url)`; `def get_provider_embedding_service(llm_service)`; `…`
 - **kestrel_sovereign/llm/error_handling.py** — Error handling decorators and utilities for LLM operations.
   - `class LLMError`; `class LLMProviderError`; `class LLMProviderTimeoutError`; `class LLMProviderAuthError`; `class LLMProviderQuotaError`; `class LLMProviderUnavailableError`; `class LLMAllProvidersFailedError`; `def handle_llm_errors(provider_name, log_errors, reraise_as)`; `…`
+- **kestrel_sovereign/llm/escalation_classifier.py** — Classify a tool-escalation failure outcome honestly (#1540 / #1563).
+  - `class EscalationOutcome`; `class EscalationDecision`; `def classify_escalation_failure(raw_error)`; `def format_escalation_outcome(decision)`
 - **kestrel_sovereign/llm/google_adapter.py** — Google Gemini Adapter
   - `class GoogleAdapter`
 - **kestrel_sovereign/llm/gpt5_overlay.py** — GPT-5 system-prompt overlay.
@@ -722,7 +726,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/multikey.py** — Multikey / multibase encoding for Kestrel public keys.
   - `def encode_varint(value)`; `def decode_varint(data)`; `def base58btc_encode(data)`; `def base58btc_decode(s)`; `def public_key_to_multibase(suite, public_key)`; `def multibase_to_public_key(multibase_str)`; `def multibase_to_kem_public_key(multibase_str)`
 - **kestrel_sovereign/security/narration_check.py** — Deterministic narration check for streaming agents (#1042 layer 3).
-  - `class NarrationVerdict`; `def summarize_tool_result_for_audit(result)`; `def analyze_narration(pre_tool_prose, tool_results)`
+  - `class NarrationVerdict`; `def summarize_tool_result_for_audit(result)`; `def analyze_narration(pre_tool_prose, tool_results)`; `def check_escalation_attribution(response_text, tool_results)`
 - **kestrel_sovereign/security/release_manifest.py** — Release manifest — Wave 5 sub-PR 1 of Quantum Hardening (#921, #920).
   - `class ArtifactEntry`; `class ReleaseManifest`; `class ReleaseManifestError`; `def signable_payload(manifest)`; `def compute_manifest_id(manifest)`; `def new_manifest()`; `def add_artifact_entry(manifest, path, content)`; `def add_artifact_entry_from_path(manifest, rel_path, abs_path)`; `…`
 - **kestrel_sovereign/security/sealed_capsule.py** — Sealed capsule — Wave 4 sub-PR 3 of Quantum Hardening (#921, #919).
@@ -1522,6 +1526,7 @@ Repo entry points and standard project files.
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
 - **tests/frontend/autoload_race.test.mjs** — (mjs asset)
 - **tests/frontend/capabilities.test.mjs** — (mjs asset)
+- **tests/frontend/chat_restart_status_dedupe.test.mjs** — (mjs asset)
 - **tests/frontend/chat_revising_event.test.mjs** — (mjs asset)
 - **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
 - **tests/frontend/effective_session_id.test.mjs** — (mjs asset)
@@ -1887,6 +1892,8 @@ Repo entry points and standard project files.
   - `def test_argparse_no_tests_is_empty_list()`; `def test_argparse_single_test()`; `def test_argparse_multiple_tests_preserve_order()`; `def test_kestrel_cli_registers_verify_install()`; `def test_cmd_all_pass_exits_zero(monkeypatch)`; `def test_cmd_any_fail_exits_one(monkeypatch)`; `def test_cmd_selection_narrows_runs(monkeypatch)`; `def test_cmd_selection_preserves_user_order(monkeypatch)`; `…`
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter (app-server backed) and registry.
   - `class TestOpenAIPlanAdapterClass`; `class TestOpenAIPlanListModels`; `class TestMessageHelpers`; `class TestDynamicToolsSpec`; `class TestTurnInputBuilder`; `class TestUsageProjection`; `class TestResultMarshalling`; `class TestAdapterTextPath`; `…`
+- **tests/unit/test_codex_adapter_failure_rewrite.py** — Pre-response failure-result rewrite at the codex adapter (#1563).
+  - `def test_codex_rejected_string_renders_as_sandbox_blocked()`; `def test_recovery_hint_per_outcome_distinguishes_user_denied()`; `def test_audit_backed_user_denied_renders_with_respect_hint()`; `def test_empty_raw_error_renders_as_unconfirmed_block()`; `def test_success_result_is_NOT_rewritten()`; `def test_failure_result_with_codex_rejection_is_rewritten()`; `def test_failure_result_missing_explicit_error_field_still_rewrites()`; `async def test_adapter_recent_security_decisions_no_agent_yields_empty()`; `…`
 - **tests/unit/test_codex_adapter_turn_failure_honesty.py** — Codex adapter must raise on upstream turn failures (#1438).
   - `async def test_standalone_error_event_with_no_retry_raises()`; `async def test_turn_completed_with_failed_status_raises()`
 - **tests/unit/test_codex_app_server.py** — Tests for the codex app-server JSON-RPC client.
@@ -2053,6 +2060,8 @@ Repo entry points and standard project files.
   - `async def test_clean_ephemeral_exit_calls_purge_and_skips_audit()`; `async def test_leaked_ephemeral_exit_writes_audit_with_breakdown()`; `async def test_normal_to_ephemeral_does_not_purge()`; `async def test_normal_to_isolated_does_not_purge()`; `async def test_ephemeral_to_ephemeral_does_not_purge()`; `async def test_audit_failure_does_not_block_purge_or_transition()`; `async def test_purge_failure_does_not_block_transition()`; `async def test_audit_skipped_when_security_feature_missing()`
 - **tests/unit/test_epistemic_status.py** — Tests for the epistemic status layer (#680).
   - `class TestMemoryMetadataEpistemicFields`; `class TestEpistemicDetection`; `class TestExtractEpistemicFields`; `async def router()`; `class TestSchemaRouterEpistemicProvenance`; `class TestMarkSuperseded`; `class TestRecallSupersededFilter`; `class TestRetrieverCertaintyWeighting`; `…`
+- **tests/unit/test_escalation_classifier.py** — Tests for the escalation classifier (#1540 / #1563).
+  - `def test_audit_row_with_user_denied_decision_yields_user_denied()`; `def test_audit_row_with_web_ui_per_scope_user_choice_yields_user_denied(choice)`; `def test_audit_row_for_different_tool_does_not_attribute_denial()`; `def test_audit_row_for_different_feature_does_not_attribute_denial()`; `def test_codex_rejected_by_user_without_audit_is_sandbox_blocked()`; `def test_sandbox_seccomp_refusal_is_sandbox_blocked()`; `def test_approval_timeout_is_policy_blocked()`; `def test_auto_denied_is_policy_blocked()`; `…`
 - **tests/unit/test_example_model_config_contracts.py** — Contracts for example model config files and catalog source-of-truth shape.
   - `def test_unified_example_llm_block_uses_vendor_route_schema()`; `def test_unified_example_priorities_match_declared_vendors()`; `def test_root_model_catalog_is_manual_overrides_only()`; `def test_package_local_model_catalog_duplicate_is_removed()`
 - **tests/unit/test_execute_named_tool.py** — Unit tests for ``OrchestratorEngineMixin.execute_named_tool``.
@@ -2222,7 +2231,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_multikey.py** — multikey + KeypairFactory tests — Wave 1 sub-PR 2 (#916).
   - `def test_base58btc_empty()`; `def test_base58btc_round_trip(payload)`; `def test_base58btc_random_round_trip()`; `def test_base58btc_leading_zeros_preserved()`; `def test_base58btc_rejects_non_alphabet()`; `def test_base58btc_rejects_capital_o_etc()`; `def test_varint_known_values(value, expected_bytes)`; `def test_varint_negative_rejects()`; `…`
 - **tests/unit/test_narration_check.py** — Wave 5D — deterministic narration check (#1042 layer 3).
-  - `class TestNoViolation`; `class TestViolation`; `class TestLegacySuccessEdgeCases`; `class TestSummarizeForAudit`; `class TestVerdictShape`
+  - `class TestNoViolation`; `class TestViolation`; `class TestLegacySuccessEdgeCases`; `class TestSummarizeForAudit`; `class TestVerdictShape`; `class TestEscalationAttributionNoViolation`; `class TestEscalationAttributionViolation`; `class TestEscalationAttributionEvidence`; `…`
 - **tests/unit/test_nellie_backend_smoke.py** — Nellie backend smoke-proof tests (issue #427, updated for epic #688).
   - `class TestNellieAnthropicPlan`; `class TestNellieOpenAIPlan`; `class TestNellieFailureModes`; `class TestNellieBackendSwitch`
 - **tests/unit/test_observability_inline_dispatch.py** — Regression tests for inline-executed tool dispatch logging (#1458 follow-up).
@@ -2310,9 +2319,11 @@ Repo entry points and standard project files.
 - **tests/unit/test_respond_to_a2a_task.py** — Direct contracts for ``TaskFeature.respond_to_a2a_task``.
   - `async def test_completes_submitted_task_chains_through_working()`; `async def test_completes_working_task_directly()`; `async def test_failed_state_supported()`; `async def test_canceled_state_supported()`; `async def test_invalid_state_rejected()`; `async def test_unknown_state_string_rejected()`; `async def test_task_not_found_returns_error()`; `async def test_already_terminal_task_rejected()`; `…`
 - **tests/unit/test_response_audit.py** — Unit tests for the per-response audit plugin.
-  - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`
+  - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`; `async def test_post_response_hook_flags_user_denial_without_audit()`; `async def test_post_response_hook_allows_audit_backed_user_denial()`; `async def test_post_response_hook_missing_security_feature_does_not_break()`
 - **tests/unit/test_restart_coordinator.py** — Tests for the durable restart coordinator (#1512).
   - `async def test_ensure_table_is_idempotent(tmp_path)`; `async def test_insert_then_list_then_get(tmp_path)`; `async def test_update_status_gated_on_expected_current(tmp_path)`; `async def test_list_requests_filters_by_status_and_agent(tmp_path)`; `async def test_request_restart_creates_pending_row(tmp_path)`; `async def test_request_restart_rejects_unknown_urgency(tmp_path)`; `async def test_request_restart_rejects_unknown_policy(tmp_path)`; `async def test_request_restart_rejects_empty_reason(tmp_path)`; `…`
+- **tests/unit/test_restart_status_events.py** — Tests for the typed restart_status event store (#1562).
+  - `def test_dedupe_signature_is_request_id_colon_state()`; `def test_event_payload_includes_dedupe_signature()`; `def test_event_payload_signature_excludes_volatile_deferral_reason()`; `async def test_record_event_persists_typed_row(tmp_path)`; `async def test_record_event_audit_trail_keeps_all_polls(tmp_path)`; `async def test_list_recent_events_for_history_returns_newest_first(tmp_path)`; `async def test_list_recent_events_since_paging(tmp_path)`; `async def test_list_recent_events_for_agent_context_scopes_by_agent(tmp_path)`; `…`
 - **tests/unit/test_retention_janitor.py** — Unit tests for the retention helpers (#764).
   - `def test_resolve_uses_privacy_override_when_present()`; `def test_resolve_falls_back_to_global_when_no_override()`; `def test_resolve_falls_back_to_compiled_default()`; `def test_resolve_returns_none_for_zero_or_negative_retention()`; `def test_resolve_ignores_garbage_values()`; `def test_resolve_privacy_mode_match_is_case_insensitive()`; `def test_resolve_with_no_privacy_mode_uses_global_default()`; `def test_agent_privacy_mode_handles_enum_and_string()`
 - **tests/unit/test_retirement_service.py** — —
