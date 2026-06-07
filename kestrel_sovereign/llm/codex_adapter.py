@@ -546,6 +546,15 @@ class CodexAdapter(LLMAdapter):
                 _unreg()
             except Exception:  # noqa: BLE001
                 pass
+        # Also detach the audit agent (#1581) so default-decline
+        # records don't keep routing to a stale agent's DB after
+        # rebind.
+        prior_app = self._codex_bridge_for_app
+        if prior_app is not None and hasattr(prior_app, "attach_audit_agent"):
+            try:
+                prior_app.attach_audit_agent(None)
+            except Exception:  # noqa: BLE001
+                pass
         self._codex_bridge_unregisters = []
         self._codex_bridge_for_agent = None
         self._codex_bridge_for_app = None
@@ -586,6 +595,17 @@ class CodexAdapter(LLMAdapter):
             )
         self._codex_bridge_for_agent = agent
         self._codex_bridge_for_app = app
+        # #1581: piggyback the audit-agent attach so default-decline
+        # RPCs (the _DEFAULT_APPROVAL_REPLIES path that the bridge
+        # intentionally doesn't cover) also surface as typed events
+        # in the agent's next-turn operational block.
+        if hasattr(app, "attach_audit_agent"):
+            try:
+                app.attach_audit_agent(agent)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "codex_app_server attach_audit_agent failed: %s", exc,
+                )
 
     async def _recent_security_decisions(self, limit: int = 50) -> list:
         """Pull recent audit rows for the pre-response classifier.
@@ -1146,7 +1166,10 @@ class CodexAdapter(LLMAdapter):
         missing ApprovalQueue, exception → ``decline``.
         """
 
+        request_method = f"item/{kind}/requestApproval"
+
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
+            tool_summary = self._summarize_approval_tool(kind, params or {})
             try:
                 # Gate 1: Kestrel policy (BinaryPolicy / PathPolicy)
                 # must hard-deny before the queue can auto-approve.
@@ -1157,6 +1180,10 @@ class CodexAdapter(LLMAdapter):
                     logger.info(
                         "codex_approval_bridge(%s): policy DENY (%s) — "
                         "declining", kind, policy_decline,
+                    )
+                    await self._record_codex_decline(
+                        agent, request_method, tool_summary,
+                        f"policy_deny:{policy_decline}",
                     )
                     return {"decision": "decline"}
 
@@ -1176,6 +1203,10 @@ class CodexAdapter(LLMAdapter):
                     else None
                 )
                 if queue is None:
+                    await self._record_codex_decline(
+                        agent, request_method, tool_summary,
+                        "no_approval_queue",
+                    )
                     return {"decision": "decline"}
                 # Bound the wait so a turn can't hang forever if no
                 # operator is at the wheel. 120s is below codex's
@@ -1189,15 +1220,100 @@ class CodexAdapter(LLMAdapter):
                     tool_args=params or {},
                     timeout=120.0,
                 )
+                if not approved:
+                    await self._record_codex_decline(
+                        agent, request_method, tool_summary,
+                        "queue_denied",
+                    )
                 return {"decision": "accept" if approved else "decline"}
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "codex_approval_bridge(%s) failed: %s — declining",
                     kind, exc,
                 )
+                await self._record_codex_decline(
+                    agent, request_method, tool_summary,
+                    f"exception:{type(exc).__name__}",
+                )
                 return {"decision": "decline"}
 
         return handler
+
+    @staticmethod
+    def _summarize_approval_tool(kind: str, params: Dict[str, Any]) -> str:
+        """Extract a short human-readable tool descriptor from codex's
+        approval RPC params, for the decline event's ``tool`` field.
+
+        commandExecution → the command string (first match).
+        fileChange → the affected paths joined.
+        Falls back to ``kind`` if nothing else is extractable.
+        """
+        try:
+            if kind == "commandExecution":
+                cmd = params.get("command")
+                if isinstance(cmd, str) and cmd:
+                    return cmd
+                actions = params.get("commandActions") or []
+                for act in actions:
+                    if isinstance(act, dict):
+                        argv = act.get("argv") or act.get("command")
+                        if argv:
+                            if isinstance(argv, list):
+                                return " ".join(str(a) for a in argv)
+                            return str(argv)
+            elif kind == "fileChange":
+                changes = (
+                    params.get("fileChanges")
+                    or params.get("changes")
+                    or params.get("files")
+                    or []
+                )
+                paths = []
+                for ch in changes:
+                    if isinstance(ch, dict):
+                        p = ch.get("path") or ch.get("absolutePath")
+                        if p:
+                            paths.append(str(p))
+                if paths:
+                    return ", ".join(paths)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        return kind
+
+    @staticmethod
+    async def _record_codex_decline(
+        agent: Any, request: str, tool: str, reason: str,
+    ) -> None:
+        """Best-effort decline-event write. Never raises — the codex
+        turn must not break on an audit-store failure."""
+        try:
+            from kestrel_sovereign.features.storage_access import (
+                resolve_feature_database,
+            )
+            db = resolve_feature_database(agent)
+            if db is None:
+                return
+            from kestrel_sovereign.llm.codex_decline_events import (
+                ensure_codex_decline_events_table, record_decline,
+            )
+            await ensure_codex_decline_events_table(db)
+            agent_id = (
+                getattr(agent, "did", None)
+                or getattr(agent, "_agent_name", None)
+                or "anonymous"
+            )
+            await record_decline(
+                db,
+                agent_id=str(agent_id),
+                request=request,
+                tool=tool,
+                reason=reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "codex_decline_events: record failed (%s) — %s",
+                reason, exc,
+            )
 
     @staticmethod
     def _codex_policy_precheck(
