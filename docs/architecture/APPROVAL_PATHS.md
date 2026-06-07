@@ -10,8 +10,6 @@ Closes #1582. Reference for operators and future agents on the three independent
 | **2. Kestrel internal `computer_use` gate** | A direct `cu.shell()` method call from inside a feature (e.g., `talon_file_and_claim`) | Yes — by **both** the global auto-mode short-circuit AND the scoped `[[security.auto_approve.shell]]` allowlist (see flow below) | `auto_approve_audit` (scoped path) + `security_audit_log` (auto-mode path) |
 | **3. Kestrel LLM tool call (`ComputerUseFeature.shell`)** | LLM advertises and calls the `ComputerUseFeature.shell` tool | Yes — `PermissionLevel.AUTO` via auto-mode | `SecurityHook` PRE_TOOL_USE → `security_audit_log` |
 
-> **Note on doc/code sync:** the operator-facing statements about `codex_decline_events` and the operational-state-block decline summary describe shipped behavior **after #1581 (PR #1588) merges into main**. This doc PR is intentionally written for the post-merge state; if you're reading it before #1588 lands, those claims are accurate for that PR's branch but not yet for main.
-
 If a tool call doesn't go through one of these three, no kestrel-side audit will surface it. There is no fourth path today.
 
 ---
