@@ -174,6 +174,30 @@ class PeersFeature(Feature):
         self._api_key = os.environ.get("KESTREL_API_KEY", "")
         self._own_name = self._get_own_name()
 
+        # #1576: every outbound A2A dispatch writes a sender-side audit
+        # row. The receiver-side ``a2a_tasks`` row tells us what the
+        # peer saw; the outbound row tells US what we sent, when, to
+        # whom, via which tool, and (after a later
+        # ``get_peer_task_result`` fetch) what state it settled in.
+        # Without this, the sender has no introspection surface for
+        # "what did I dispatch and to whom?" beyond per-task_id round
+        # trips.
+        from kestrel_sovereign.features.storage_access import (
+            resolve_feature_database,
+        )
+        from kestrel_sovereign.a2a.outbound_store import (
+            ensure_a2a_outbound_tasks_table,
+        )
+        self._db = resolve_feature_database(self.agent)
+        if self._db is not None:
+            try:
+                await ensure_a2a_outbound_tasks_table(self._db)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "PeersFeature: failed to ensure "
+                    "a2a_outbound_tasks table: %s", exc,
+                )
+
         if self._host_url:
             logger.info(f"PeersFeature initialized: host={self._host_url}, self={self._own_name}")
         else:
@@ -360,6 +384,7 @@ class PeersFeature(Feature):
         extra_metadata: Optional[Dict[str, Any]] = None,
         artifacts: Optional[List[Any]] = None,
         references: Optional[List[Any]] = None,
+        dispatch_tool: str = "_post_a2a_task",
     ) -> Tuple[
         Optional[Dict[str, Any]],
         Optional[list],
@@ -406,6 +431,58 @@ class PeersFeature(Feature):
             outbound_metadata["skill"] = skill_id
         if extra_metadata:
             outbound_metadata.update(extra_metadata)
+
+        # #1576: capture the audit-row write so it fires before EVERY
+        # post-task_id return path (success or transport failure). The
+        # helper swallows audit-store errors so dispatch can't be
+        # broken by a DB hiccup.
+        verb = str((extra_metadata or {}).get("a2a_verb") or "task")
+
+        async def _persist_outbound(
+            error: Optional[str] = None,
+            effective_task_id: Optional[str] = None,
+        ) -> None:
+            """Persist the audit row.
+
+            ``effective_task_id`` lets the success path pass the
+            peer-echoed id from the response (which in production
+            equals our local ``task_id`` — kestrel-claw protocol
+            echoes the id back — but may diverge in tests with
+            artificial mocks). Failure paths omit it and the local
+            ``task_id`` is recorded; that's the id the agent would
+            need to reference the attempted dispatch.
+            """
+            db = getattr(self, "_db", None)
+            if db is None:
+                return
+            audit_id = effective_task_id or task_id
+            # Scope the audit row to THIS agent (DID preferred, name
+            # fallback) so a shared-backend Postgres deployment can't
+            # leak rows across agents (codex review #1576 round 3 P1).
+            audit_agent = (
+                getattr(self.agent, "did", None) or self._own_name
+            )
+            try:
+                from kestrel_sovereign.a2a.outbound_store import (
+                    record_outbound_dispatch,
+                )
+                await record_outbound_dispatch(
+                    db,
+                    agent_id=str(audit_agent),
+                    task_id=audit_id,
+                    recipient=recipient,
+                    verb=verb,
+                    session_id=sess_id,
+                    skill_id=skill_id or None,
+                    dispatch_tool=dispatch_tool,
+                    message=message,
+                    error=error,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "outbound_store: record failed for task %s → %s: %s",
+                    audit_id, recipient, exc,
+                )
         # Attach the in-flight signal-driven turn's causation chain so
         # the receiving agent's a2a.task_submitted signal carries the
         # lineage. Without this, A→B→A ping-pong loops bypass the
@@ -455,28 +532,33 @@ class PeersFeature(Feature):
                     ),
                 )
         except httpx.ConnectError:
+            await _persist_outbound(error=f"connect_error:{recipient}")
             return None, None, ToolResult.failed(
                 f"Could not reach agent '{recipient}'",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except httpx.TimeoutException:
+            await _persist_outbound(error=f"timeout:{recipient}")
             return None, None, ToolResult.failed(
                 f"Agent '{recipient}' timed out",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         except Exception as e:
             logger.error(f"A2A send to '{recipient}' failed: {e}")
+            await _persist_outbound(error=str(e))
             return None, None, ToolResult.failed(
                 str(e),
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
 
         if resp.status_code == 404:
+            await _persist_outbound(error=f"http_404:{recipient}")
             return None, None, ToolResult.failed(
                 f"Agent '{recipient}' not found or A2A endpoint missing",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
             )
         if resp.status_code == 503:
+            await _persist_outbound(error=f"http_503:{recipient}")
             return None, None, ToolResult.failed(
                 f"Agent '{recipient}' is offline or TaskManager unavailable",
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
@@ -486,6 +568,7 @@ class PeersFeature(Feature):
             resp.raise_for_status()
             task_data = resp.json()
         except Exception as e:
+            await _persist_outbound(error=str(e))
             return None, None, ToolResult.failed(
                 str(e),
                 data={"sent": False, "recipient": recipient, "task_id": task_id},
@@ -495,6 +578,13 @@ class PeersFeature(Feature):
         # echo only one or the other).
         task_data.setdefault("id", task_id)
         task_data.setdefault("sessionId", sess_id)
+        # Audit success — terminal_state stays NULL until a later
+        # ``get_peer_task_result`` fetch learns the peer's final state.
+        # Use the surfaced (peer-echoed) id so the audit row matches
+        # what the caller sees in ``result.data["task_id"]``.
+        await _persist_outbound(
+            effective_task_id=str(task_data.get("id") or task_id),
+        )
         return task_data, chain, None
 
     @tool(
@@ -529,6 +619,7 @@ class PeersFeature(Feature):
             recipient=recipient, message=message,
             skill_id="", session_id=session_id,
             extra_metadata={"a2a_verb": "message"},
+            dispatch_tool="send_a2a_message",
         )
         if err is not None:
             return err
@@ -617,6 +708,7 @@ class PeersFeature(Feature):
                 "reply_expected": True,
             },
             artifacts=artifacts, references=references,
+            dispatch_tool="send_a2a_question",
         )
         if err is not None:
             return err
@@ -927,6 +1019,36 @@ class PeersFeature(Feature):
 
         artifact_segment_count = sum(len(g) for g in groups.values())
 
+        # #1576: close the loop on the sender-side outbound row. When
+        # the peer reports a terminal state, stamp it on our local
+        # audit row so a later ``list_outbound_a2a_tasks`` shows
+        # ``terminal_state`` populated. Non-terminal interim states
+        # are intentionally NOT stamped — the row stays NULL until a
+        # terminal fetch lands, matching Emma's pinned acceptance
+        # ("terminal/error state when known").
+        _audit_db = getattr(self, "_db", None)
+        if (
+            _audit_db is not None
+            and current_state in terminal_states
+        ):
+            try:
+                from kestrel_sovereign.a2a.outbound_store import (
+                    update_outbound_terminal_state,
+                )
+                await update_outbound_terminal_state(
+                    _audit_db,
+                    agent_id=str(
+                        getattr(self.agent, "did", None) or self._own_name
+                    ),
+                    task_id=task_id,
+                    terminal_state=current_state,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "outbound_store: terminal stamp failed for %s: %s",
+                    task_id, exc,
+                )
+
         return ToolResult.ok(
             confirmation=(
                 f"Fetched peer task {task_id[:8]} from {recipient} "
@@ -951,6 +1073,65 @@ class PeersFeature(Feature):
                 "artifact_bodies": artifact_bodies,
                 "artifact_group_complete": artifact_group_complete,
             },
+        )
+
+    @tool(
+        name="list_outbound_a2a_tasks",
+        description=(
+            "List the A2A tasks you SENT to peer agents — your local "
+            "audit log of outbound dispatches (#1576). Each row carries "
+            "task_id, recipient, verb (message/question/task), "
+            "dispatch_tool, created_at, and terminal_state (populated "
+            "after a get_peer_task_result fetch confirms the peer's "
+            "final state). Use this when you need to enumerate "
+            "'what did I send and to whom?' without per-id round trips."
+        ),
+        category=ToolCategory.COMMUNICATION,
+        command_prefix="!a2a outbound",
+    )
+    async def list_outbound_a2a_tasks(
+        self,
+        limit: int = 50,
+        recipient: str = "",
+    ) -> ToolResult:
+        """Return the most recent outbound A2A dispatches, newest first.
+
+        Args:
+            limit: Maximum rows to return (clamped to [1, 1000]).
+                Default 50.
+            recipient: Optional peer name to filter by; empty returns
+                rows for every recipient.
+        """
+        db = getattr(self, "_db", None)
+        if db is None:
+            return ToolResult.failed(
+                "Outbound audit store unavailable (no DB attached)",
+                data={"rows": [], "count": 0},
+            )
+        try:
+            from kestrel_sovereign.a2a.outbound_store import (
+                list_outbound_tasks,
+            )
+            rows = await list_outbound_tasks(
+                db,
+                agent_id=str(
+                    getattr(self.agent, "did", None) or self._own_name
+                ),
+                limit=limit,
+                recipient=recipient or None,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult.failed(
+                f"Outbound audit query failed: {exc}",
+                data={"rows": [], "count": 0},
+            )
+        public = [r.to_public_dict() for r in rows]
+        return ToolResult.ok(
+            confirmation=(
+                f"Outbound A2A audit: {len(public)} row(s)"
+                + (f" to {recipient}" if recipient else "")
+            ),
+            data={"rows": public, "count": len(public)},
         )
 
     # ------------------------------------------------------------------
@@ -1222,6 +1403,35 @@ class PeersFeature(Feature):
         from kestrel_sovereign.signals.sources.a2a_question_answered import (
             build_signal_for_question_answered,
         )
+
+        # #1576 codex round 2 P1: every terminal-state observation for
+        # a sent question must stamp the outbound audit row. Supervisor
+        # SSE terminal, supervisor deadline expiry, hourly sweep, and
+        # startup replay all funnel through here — so this is the one
+        # place to ensure the audit closes. Without this, questions
+        # would complete via SSE / expire / get swept and the audit
+        # row would still show ``terminal_state = NULL`` even though
+        # the sender knew the state.
+        _audit_db = getattr(self, "_db", None)
+        if _audit_db is not None:
+            try:
+                from kestrel_sovereign.a2a.outbound_store import (
+                    update_outbound_terminal_state,
+                )
+                await update_outbound_terminal_state(
+                    _audit_db,
+                    agent_id=str(
+                        getattr(self.agent, "did", None) or self._own_name
+                    ),
+                    task_id=task_id,
+                    terminal_state=state,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "outbound_store: question-answered terminal stamp "
+                    "failed for task=%s state=%s: %s",
+                    task_id, state, exc,
+                )
 
         dispatcher = getattr(self.agent, "dispatcher", None)
         if dispatcher is None:
@@ -1576,6 +1786,7 @@ class PeersFeature(Feature):
             skill_id=skill_id, session_id=session_id,
             extra_metadata={"a2a_verb": "task"},
             artifacts=artifacts, references=references,
+            dispatch_tool="send_a2a_task",
         )
         if err is not None:
             return err
