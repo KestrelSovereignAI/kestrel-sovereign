@@ -7,6 +7,7 @@ their tests are gone too; these exercise the new app-server projection,
 the per-turn tool-executor bridge, and binary-resolution registry
 wiring.
 """
+from types import SimpleNamespace
 from typing import Any, Dict
 from unittest.mock import patch
 
@@ -189,6 +190,10 @@ class _FakeAppServer:
         self._events = events
         self.requests = []
         self.registered_handlers: Dict[str, Any] = registered or {}
+        # Append-only history of every (method, thread_id) ever
+        # registered — survives unregister() so tests can assert that
+        # a handler WAS registered mid-turn even after cleanup.
+        self.registered_history: list = []
         self.started = False
         self.dynamic_tools = None
 
@@ -207,6 +212,7 @@ class _FakeAppServer:
     def register_server_request_handler(self, method, handler, *, thread_id=None):
         key = (method, thread_id)
         self.registered_handlers[key] = handler
+        self.registered_history.append(key)
         return lambda: self.registered_handlers.pop(key, None)
 
     def open_turn_sink(self, key):
@@ -1007,6 +1013,514 @@ class TestToolExecutorBridge:
         reply = await handler({"threadId": "thr", "tool": "t", "arguments": {}})
         assert reply["success"] is False
         assert "boom" in reply["contentItems"][0]["text"]
+
+
+class TestCodexApprovalBridge:
+    """#1575: bridge codex-native sandbox approval RPCs through
+    Kestrel's ApprovalQueue. The hardcoded decline default silently
+    blocked auto-mode-authorized gh/git/fs writes."""
+
+    def _agent_with_queue(self, *, approves: bool, with_cu: bool = True):
+        """Build a SimpleNamespace agent whose SecurityFeature's
+        approval_queue.request_approval returns the desired verdict.
+
+        ``with_cu=True`` attaches a permissive ComputerUseFeature stub
+        so the policy precheck (which fails-closed on missing CU)
+        doesn't intercept. Pass ``with_cu=False`` to exercise the
+        fail-closed path explicitly.
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        captured = []
+
+        async def request_approval(
+            feature_name, tool_name, tool_args, timeout=None,
+        ):
+            captured.append({
+                "feature_name": feature_name,
+                "tool_name": tool_name,
+                "tool_args": tool_args,
+                "timeout": timeout,
+            })
+            return (approves, "auto" if approves else "user_denied")
+
+        queue = SimpleNamespace(request_approval=request_approval)
+        security = SimpleNamespace(approval_queue=queue)
+        features = {"SecurityFeature": security}
+        if with_cu:
+            features["ComputerUseFeature"] = SimpleNamespace(
+                _binary_policy=BinaryPolicy(allow=["gh", "git", "ls"]),
+                _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+            )
+        agent = SimpleNamespace(features=features, did="did:test:agent")
+        return agent, captured
+
+    @pytest.mark.asyncio
+    async def test_bridged_approval_returns_accept(self):
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        handler = a._make_codex_approval_handler(
+            agent, "commandExecution",
+        )
+        reply = await handler({
+            "threadId": "thr-1",
+            "command": "gh issue create -R O/R --title x",
+            "cwd": "/tmp",
+        })
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1
+        assert captured[0]["feature_name"] == "codex_native"
+        assert captured[0]["tool_name"] == "commandExecution"
+        assert captured[0]["tool_args"]["command"].startswith("gh issue create")
+
+    @pytest.mark.asyncio
+    async def test_bridged_denial_returns_decline(self):
+        """Queue denies → bridge returns decline. Use an allow-listed
+        path so the policy gate passes through to the queue (otherwise
+        the policy gate would short-circuit before the queue verdict
+        was even consulted)."""
+        a = CodexAdapter()
+        agent, _ = self._agent_with_queue(approves=False)
+        handler = a._make_codex_approval_handler(agent, "fileChange")
+        reply = await handler({
+            "fileChanges": [{"path": "/tmp/safe.txt"}],
+            "cwd": "/tmp",
+        })
+        assert reply == {"decision": "decline"}
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_hard_denies_disallowed_binary(self):
+        """Codex review #1575 round 1 P1: BinaryPolicy DENY must fire
+        BEFORE the auto-mode approval queue, so a non-allow-listed
+        binary can't be silently auto-approved by an Auto agent."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        # Build a ComputerUseFeature stub that exposes _binary_policy.
+        cu = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git", "ls"]),
+            _path_policy=None,
+        )
+        agent.features["ComputerUseFeature"] = cu
+
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({
+            "command": "rm -rf /",  # `rm` not in allow list → DENY
+        })
+        assert reply == {"decision": "decline"}
+        # The queue must not have been consulted — the gate hard-stopped.
+        assert captured == [], (
+            "BinaryPolicy DENY must short-circuit before queue auto-approves"
+        )
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_passes_allow_listed_binary_to_queue(self):
+        """Allow-listed binary → policy returns REQUIRE_APPROVAL →
+        the bridge then routes through the queue, where auto-mode
+        approves."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        cu = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["gh"]),
+            _path_policy=None,
+        )
+        agent.features["ComputerUseFeature"] = cu
+
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({
+            "command": "gh issue create -R O/R --title x",
+        })
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, (
+            "queue must be reached when binary is allow-listed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_safe_decline_when_no_security_feature(self):
+        """An agent missing SecurityFeature falls back to safe decline.
+        With no ComputerUseFeature either, the fail-closed policy gate
+        actually short-circuits first — both gates converge on decline."""
+        a = CodexAdapter()
+        agent = SimpleNamespace(features={}, did="did:test:agent")
+        handler = a._make_codex_approval_handler(
+            agent, "commandExecution",
+        )
+        reply = await handler({"command": "ls"})
+        assert reply == {"decision": "decline"}
+
+    @pytest.mark.asyncio
+    async def test_handler_fails_closed_when_no_computer_use_feature(self):
+        """Codex review #1575 round 2 P1: missing ComputerUseFeature
+        means no policy gate, so the bridge must decline rather than
+        pass through to the queue (where auto-mode would auto-approve
+        an unbounded command)."""
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(
+            approves=True, with_cu=False,
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": "rm -rf /"})
+        assert reply == {"decision": "decline"}
+        assert captured == [], (
+            "queue must not be reached when no policy gate exists"
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_safe_decline_when_queue_raises(self):
+        """Any queue exception must collapse to decline; the codex
+        turn must not hang on a kestrel-side error."""
+        a = CodexAdapter()
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("queue down")
+
+        agent = SimpleNamespace(
+            features={"SecurityFeature": SimpleNamespace(
+                approval_queue=SimpleNamespace(request_approval=boom)
+            )},
+            did="did:test:agent",
+        )
+        handler = a._make_codex_approval_handler(
+            agent, "commandExecution",
+        )
+        reply = await handler({"threadId": "thr-1", "command": "ls"})
+        assert reply == {"decision": "decline"}
+
+    @pytest.mark.asyncio
+    async def test_run_turn_registers_bridge_when_agent_attached(self):
+        """When an agent is attached, _run_turn registers the codex
+        approval bridge once at adapter scope (not per-turn). The
+        bridge MUST remain registered after the turn so concurrent
+        and subsequent turns share it (codex review #1575 round 2 P2)."""
+        a = _adapter_with(_TEXT_TURN)
+        agent, _ = self._agent_with_queue(approves=True)
+        a.attach_agent_for_audit(agent)
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="s",
+            tool_executor=exe,
+        )
+        # Registered (history shows it).
+        history_methods = {k[0] for k in a._client.registered_history}
+        assert "item/commandExecution/requestApproval" in history_methods
+        assert "item/fileChange/requestApproval" in history_methods
+        # STILL registered — adapter scope, not per-turn scope. A
+        # later turn must not race against unregistration of an
+        # in-flight bridge.
+        live = {
+            k[0] for k in a._client.registered_handlers
+            if k[0] in (
+                "item/commandExecution/requestApproval",
+                "item/fileChange/requestApproval",
+            )
+        }
+        assert live == {
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+        }, "bridge must live across turn boundaries at adapter scope"
+
+    @pytest.mark.asyncio
+    async def test_run_turn_skips_bridge_when_no_agent_attached(self):
+        """No attached agent → no bridge → the app-server's hardcoded
+        decline default still governs (preserves existing behavior
+        for tests and adapter-direct callers)."""
+        a = _adapter_with(_TEXT_TURN)
+        # No attach_agent_for_audit call.
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="s",
+            tool_executor=exe,
+        )
+        history_methods = {k[0] for k in a._client.registered_history}
+        assert "item/commandExecution/requestApproval" not in history_methods
+        assert "item/fileChange/requestApproval" not in history_methods
+
+    @pytest.mark.asyncio
+    async def test_bridge_idempotent_across_turns(self):
+        """Multiple turns on the same (adapter, agent) pair must
+        register the bridge exactly once. Re-registering per turn
+        would let a later turn's cleanup race-tear-down the bridge
+        an earlier turn was still using (codex review #1575 round
+        2 P2)."""
+        a = _adapter_with(_TEXT_TURN)
+        agent, _ = self._agent_with_queue(approves=True)
+        a.attach_agent_for_audit(agent)
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        for _ in range(3):
+            # Reset _events so each call has a fresh turn script.
+            a._client._events = list(_TEXT_TURN)
+            await a.get_response(
+                client="x", model="auto",
+                messages=[{"role": "user", "content": "hi"}],
+                session_id=f"s-{_}",
+                tool_executor=exe,
+            )
+        # Bridge methods registered exactly once each across 3 turns.
+        cmd_regs = [
+            k for k in a._client.registered_history
+            if k[0] == "item/commandExecution/requestApproval"
+        ]
+        fc_regs = [
+            k for k in a._client.registered_history
+            if k[0] == "item/fileChange/requestApproval"
+        ]
+        assert len(cmd_regs) == 1, cmd_regs
+        assert len(fc_regs) == 1, fc_regs
+
+    @pytest.mark.asyncio
+    async def test_re_attach_to_different_agent_rebinds_bridge(self):
+        """Switching the attached agent must tear down the old
+        bridge and register a fresh one for the new agent so codex
+        RPCs don't keep routing to a stale agent's approval queue."""
+        a = _adapter_with(_TEXT_TURN)
+        agent_a, _ = self._agent_with_queue(approves=True)
+        agent_b, _ = self._agent_with_queue(approves=True)
+        a.attach_agent_for_audit(agent_a)
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="s1",
+            tool_executor=exe,
+        )
+        # Rebind. Existing bridge should be torn down.
+        a.attach_agent_for_audit(agent_b)
+        assert a._codex_bridge_for_agent is None
+
+        # Second turn re-registers for agent_b.
+        a._client._events = list(_TEXT_TURN)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="s2",
+            tool_executor=exe,
+        )
+        assert a._codex_bridge_for_agent is agent_b
+        # History has TWO registrations of commandExecution: once
+        # for agent_a, once for agent_b (the rebind path).
+        cmd_regs = [
+            k for k in a._client.registered_history
+            if k[0] == "item/commandExecution/requestApproval"
+        ]
+        assert len(cmd_regs) == 2, cmd_regs
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_fails_closed_on_empty_command_payload(self):
+        """Codex review #1575 round 3 P1: an approval RPC with no
+        ``command`` / ``commandActions`` evaluable shape must decline
+        rather than pass through to the auto-approving queue."""
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"cwd": "/tmp"})  # no command at all
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_fails_closed_on_empty_filechange_payload(self):
+        """Same round-3 P1 fix for fileChange."""
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        handler = a._make_codex_approval_handler(agent, "fileChange")
+        reply = await handler({"cwd": "/tmp"})  # no fileChanges at all
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_fails_closed_on_malformed_command_action(self):
+        """Codex review #1575 round 5 P1: a commandActions array
+        containing a non-dict OR a dict missing argv/command must
+        decline — even when a sibling entry would pass — so the
+        queue's auto-mode can't bless the whole request via the
+        good sibling."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["gh"]),
+            _path_policy=None,
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+
+        # Non-dict sibling.
+        reply = await handler({
+            "commandActions": [{"argv": ["gh", "issue", "list"]}, "not_a_dict"],
+        })
+        assert reply == {"decision": "decline"}
+
+        # Dict missing argv/command.
+        reply = await handler({
+            "commandActions": [{"argv": ["gh", "x"]}, {"other": "field"}],
+        })
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_fails_closed_on_malformed_filechange(self):
+        """Round-5 P1 fix: an entry missing ``path``/``absolutePath``
+        in a fileChange array must decline rather than silently skip."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=None,
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "fileChange")
+
+        # Dict missing path.
+        reply = await handler({
+            "fileChanges": [{"path": "/tmp/ok.txt"}, {"kind": "delete"}],
+            "cwd": "/tmp",
+        })
+        assert reply == {"decision": "decline"}
+
+        # Non-dict sibling.
+        reply = await handler({
+            "fileChanges": [{"path": "/tmp/ok.txt"}, "not_a_dict"],
+            "cwd": "/tmp",
+        })
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_fails_closed_when_binary_evaluator_raises(self):
+        """Codex review #1575 round 4 P1: a present-but-malformed
+        command (e.g. shlex split fails) must decline. Without this,
+        the outer except would swallow the exception and pass through
+        to auto-approval."""
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+
+        class _BoomBinaryPolicy:
+            def evaluate(self, argv):
+                raise ValueError("unparseable")
+
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=_BoomBinaryPolicy(),
+            _path_policy=None,
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": 'gh issue --"unclosed'})
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_fails_closed_when_path_evaluator_raises(self):
+        """Same round-4 P1 fix for PathPolicy."""
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+
+        class _BoomPathPolicy:
+            def evaluate(self, path, *, write):
+                raise OSError("filesystem down")
+
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=None,
+            _path_policy=_BoomPathPolicy(),
+        )
+        handler = a._make_codex_approval_handler(agent, "fileChange")
+        reply = await handler({
+            "fileChanges": [{"path": "/tmp/x"}],
+            "cwd": "/tmp",
+        })
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_bridge_rebinds_when_app_client_changes(self):
+        """Codex review #1575 round 3 P2: after aclose() and a fresh
+        CodexAppServerClient, same-agent re-use must rebind the
+        bridge against the new client (the old handlers belong to a
+        dead client)."""
+        a = _adapter_with(_TEXT_TURN)
+        agent, _ = self._agent_with_queue(approves=True)
+        a.attach_agent_for_audit(agent)
+
+        async def exe(name, args):
+            return {"success": True, "result": "x"}
+
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="s1",
+            tool_executor=exe,
+        )
+        first_app = a._client
+        assert a._codex_bridge_for_app is first_app
+
+        # Simulate aclose() + fresh client (skipping real aclose
+        # plumbing in the fake server).
+        a._client = _FakeAppServer(list(_TEXT_TURN))
+        assert a._codex_bridge_for_app is first_app  # stale tracker
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}],
+            session_id="s2",
+            tool_executor=exe,
+        )
+        assert a._codex_bridge_for_app is a._client, (
+            "bridge must rebind to the fresh app client, not the dead one"
+        )
+        # New client got the bridge methods registered.
+        history_methods = {k[0] for k in a._client.registered_history}
+        assert "item/commandExecution/requestApproval" in history_methods
+        assert "item/fileChange/requestApproval" in history_methods
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_resolves_cwd_relative_path(self):
+        """Codex review #1575 round 2 P1: a cwd-relative path like
+        ``secrets/key.pem`` must be resolved to its absolute form
+        before PathPolicy evaluation, otherwise an absolute-path
+        deny-list would miss it."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        # Deny anything under /tmp/sensitive.
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=None,
+            _path_policy=PathPolicy(allow=["/tmp"], deny=["/tmp/sensitive"]),
+        )
+
+        handler = a._make_codex_approval_handler(agent, "fileChange")
+        # Relative path that resolves under /tmp/sensitive when cwd
+        # is /tmp/sensitive.
+        reply = await handler({
+            "cwd": "/tmp/sensitive",
+            "fileChanges": [{"path": "secrets.txt"}],
+        })
+        assert reply == {"decision": "decline"}
+        assert captured == [], (
+            "deny match must short-circuit before queue auto-approves"
+        )
 
 
 class TestOpenAIPlanProviderRegistry:

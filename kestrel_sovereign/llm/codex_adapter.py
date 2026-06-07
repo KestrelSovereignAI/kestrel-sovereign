@@ -515,14 +515,77 @@ class CodexAdapter(LLMAdapter):
         # produces user-denial wording from the rewritten typed
         # block.
         self._agent_for_audit: Any = None
+        # Codex approval bridge (#1575) state. Registered ONCE per
+        # (adapter, agent, app_client) — not per turn — so concurrent
+        # turns can't race on registration/unregistration of the
+        # shared (method, None) key. Re-bind to a new agent OR to a
+        # fresh CodexAppServerClient (post-aclose) will unregister +
+        # re-register (codex review #1575 round 3 P2).
+        self._codex_bridge_for_agent: Any = None
+        self._codex_bridge_for_app: Any = None
+        self._codex_bridge_unregisters: List[Callable[[], None]] = []
 
     def attach_agent_for_audit(self, agent: Any) -> None:
         """Bind the running agent so failure-result rewrite can pull
         recent ``SecurityFeature.permission_store.get_audit_log`` rows
         (#1563). Optional — see ``_recent_security_decisions``.
         Idempotent; safe to call before every turn.
+
+        Re-binding to a different agent drops any previously-registered
+        codex approval bridge so the next turn rewires for the new
+        agent (#1575).
         """
+        if self._agent_for_audit is not agent:
+            self._teardown_codex_approval_bridge()
         self._agent_for_audit = agent
+
+    def _teardown_codex_approval_bridge(self) -> None:
+        """Drop bridge handlers registered against a prior (agent, app)."""
+        for _unreg in self._codex_bridge_unregisters:
+            try:
+                _unreg()
+            except Exception:  # noqa: BLE001
+                pass
+        self._codex_bridge_unregisters = []
+        self._codex_bridge_for_agent = None
+        self._codex_bridge_for_app = None
+
+    def _ensure_codex_approval_bridge(
+        self, app: "CodexAppServerClient",
+    ) -> None:
+        """Register the codex sandbox-approval bridge handlers exactly
+        once per (adapter, agent, app_client). Idempotent: subsequent
+        calls for the same triple are no-ops.
+
+        Lives outside the per-turn ``unregisters`` list so two
+        concurrent turns can't race on the same (method, None) key —
+        a later turn's unregister would otherwise tear down the bridge
+        while an earlier turn was still in flight (codex review #1575
+        round 2 P2). Re-keys on agent OR app-client change so a
+        post-``aclose`` reconnect doesn't reuse a dead-handler binding
+        (round 3 P2).
+        """
+        agent = self._agent_for_audit
+        if agent is None:
+            return
+        if (
+            self._codex_bridge_for_agent is agent
+            and self._codex_bridge_for_app is app
+        ):
+            return
+        # Agent or app-client changed → clean reset.
+        self._teardown_codex_approval_bridge()
+        for _kind in ("commandExecution", "fileChange"):
+            _method = f"item/{_kind}/requestApproval"
+            self._codex_bridge_unregisters.append(
+                app.register_server_request_handler(
+                    _method,
+                    self._make_codex_approval_handler(agent, _kind),
+                    thread_id=None,
+                )
+            )
+        self._codex_bridge_for_agent = agent
+        self._codex_bridge_for_app = app
 
     async def _recent_security_decisions(self, limit: int = 50) -> list:
         """Pull recent audit rows for the pre-response classifier.
@@ -1046,6 +1109,259 @@ class CodexAdapter(LLMAdapter):
 
         return handler
 
+    def _make_codex_approval_handler(
+        self, agent: Any, kind: str,
+    ) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
+        """Bridge codex's sandbox-approval RPCs through Kestrel's
+        :class:`ApprovalQueue` (#1575).
+
+        ``kind`` is ``"commandExecution"`` or ``"fileChange"``. The
+        returned handler is registered globally on the app-server
+        (codex's approval params don't carry ``threadId`` the way
+        ``item/tool/call`` does); concurrent same-adapter turns share
+        it, which is correct because they share the attached agent.
+
+        Two gates fire in order:
+
+        1. **Kestrel policy gate.** ``BinaryPolicy`` for commandExecution
+           (binary not allow-listed → hard DENY); ``PathPolicy`` for
+           fileChange (path on deny-list → hard DENY). Without this,
+           auto-mode would auto-approve through the queue and codex
+           could run any binary or write any path. Codex review #1575
+           round 1 P1.
+        2. **ApprovalQueue.** Keyed as ``feature_name="codex_native"``,
+           ``tool_name=kind``. Auto-mode covers it; operator DENY in
+           the permission store hard-stops it; every decision is
+           audited.
+
+        Reply shape mirrors codex's
+        ``CommandExecutionApprovalDecision`` /
+        ``FileChangeApprovalDecision`` enums (verified against the
+        codex binary's serde labels): ``accept`` /
+        ``acceptForSession`` / ``decline`` / ``abort``. ANY approval
+        maps to ``accept`` (single-RPC scope is safe; the queue's
+        permission store handles "always" scope on the Kestrel side).
+
+        Failure modes are all conservative: missing SecurityFeature,
+        missing ApprovalQueue, exception → ``decline``.
+        """
+
+        async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                # Gate 1: Kestrel policy (BinaryPolicy / PathPolicy)
+                # must hard-deny before the queue can auto-approve.
+                policy_decline = self._codex_policy_precheck(
+                    agent, kind, params or {},
+                )
+                if policy_decline is not None:
+                    logger.info(
+                        "codex_approval_bridge(%s): policy DENY (%s) — "
+                        "declining", kind, policy_decline,
+                    )
+                    return {"decision": "decline"}
+
+                # Gate 2: ApprovalQueue routing.
+                features = getattr(agent, "features", {}) or {}
+                if isinstance(features, dict):
+                    security = features.get("SecurityFeature")
+                else:
+                    security = next(
+                        (f for f in features
+                         if type(f).__name__ == "SecurityFeature"),
+                        None,
+                    )
+                queue = (
+                    getattr(security, "approval_queue", None)
+                    if security is not None
+                    else None
+                )
+                if queue is None:
+                    return {"decision": "decline"}
+                # Bound the wait so a turn can't hang forever if no
+                # operator is at the wheel. 120s is below codex's
+                # 300s turn watchdog
+                # (reference_codex_app_server_idle_timeout) — long
+                # enough for a human to decide, short enough that a
+                # runaway prompt times out cleanly.
+                approved, _scope = await queue.request_approval(
+                    feature_name="codex_native",
+                    tool_name=kind,
+                    tool_args=params or {},
+                    timeout=120.0,
+                )
+                return {"decision": "accept" if approved else "decline"}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "codex_approval_bridge(%s) failed: %s — declining",
+                    kind, exc,
+                )
+                return {"decision": "decline"}
+
+        return handler
+
+    @staticmethod
+    def _codex_policy_precheck(
+        agent: Any, kind: str, params: Dict[str, Any],
+    ) -> Optional[str]:
+        """Run BinaryPolicy/PathPolicy against an inbound codex
+        approval request. Returns ``None`` to pass through; a short
+        reason string on DENY.
+
+        Best-effort: any failure to evaluate (missing feature, missing
+        policy attribute, parse error) → ``None`` pass-through, so the
+        ApprovalQueue gate still gets to decide. The policy gate is
+        the *anti-auto-mode-blanket* shield; if the gate itself is
+        unhealthy, the queue remains the floor.
+        """
+        try:
+            from kestrel_sovereign.features.computer_use.policy import (
+                Decision,
+            )
+        except Exception:  # noqa: BLE001 - import path failure → pass-through
+            return None
+        try:
+            cu = None
+            features = getattr(agent, "features", {}) or {}
+            if isinstance(features, dict):
+                cu = features.get("ComputerUseFeature")
+            else:
+                cu = next(
+                    (f for f in features
+                     if type(f).__name__ == "ComputerUseFeature"),
+                    None,
+                )
+            if cu is None:
+                # Fail closed (codex review #1575 round 2 P1): an agent
+                # without ComputerUseFeature has no policy gate to
+                # evaluate, so blanket auto-mode approval would let
+                # codex run any command / write any path. Decline
+                # rather than pass through to the queue.
+                return "no_computer_use_feature"
+            if kind == "commandExecution":
+                policy = getattr(cu, "_binary_policy", None)
+                if policy is None:
+                    return "no_binary_policy"
+                # Codex's params shape evolved: legacy carried a flat
+                # ``command`` string; newer
+                # ``CommandExecutionRequestApprovalParams`` carries
+                # ``commandActions`` (parsed argv variants). Accept
+                # both. Fail closed if NEITHER is present (codex
+                # review #1575 round 3 P1): with no command to
+                # evaluate, the policy gate is effectively absent and
+                # auto-mode would blanket-approve.
+                argv_lists: List[Any] = []
+                actions = params.get("commandActions") or []
+                # Strict per-entry validation (codex review #1575
+                # round 5 P1): any malformed entry in the array fails
+                # closed. Silent-skipping a bad entry while a sibling
+                # passes would let auto-mode approve the whole request.
+                for act in actions or []:
+                    if not isinstance(act, dict):
+                        return f"malformed_command_action:{type(act).__name__}"
+                    argv = act.get("argv") or act.get("command")
+                    if not argv:
+                        return "command_action_missing_argv"
+                    argv_lists.append(argv)
+                cmd = params.get("command")
+                if cmd:
+                    argv_lists.append(cmd)
+                if not argv_lists:
+                    return "no_command_in_params"
+                for argv in argv_lists:
+                    # Per-argv fail-closed (codex review #1575 round
+                    # 4 P1): an unparseable shell string would
+                    # otherwise raise out of BinaryPolicy.evaluate and
+                    # the outer except would swallow → pass through to
+                    # the queue auto-approve. Decline instead.
+                    try:
+                        result = policy.evaluate(argv)
+                    except Exception as eval_exc:  # noqa: BLE001
+                        logger.warning(
+                            "codex_policy_precheck commandExecution: "
+                            "BinaryPolicy.evaluate(%r) raised %s — "
+                            "declining (fail closed)",
+                            argv, eval_exc,
+                        )
+                        return f"binary_eval_failed:{argv!r}"
+                    if getattr(result, "decision", None) is Decision.DENY:
+                        return f"binary:{argv}"
+            elif kind == "fileChange":
+                policy = getattr(cu, "_path_policy", None)
+                if policy is None:
+                    return "no_path_policy"
+                # Newer shape: ``fileChanges`` list with ``path`` per entry.
+                # Legacy/alt: ``changes`` or ``files``.
+                changes = (
+                    params.get("fileChanges")
+                    or params.get("changes")
+                    or params.get("files")
+                    or []
+                )
+                # Resolve cwd-relative paths before evaluating (codex
+                # review #1575 round 2 P1): a deny-list of absolute
+                # paths would miss ``foo/bar.txt`` even when the
+                # resolved absolute is under a deny prefix. Prefer
+                # params.cwd → KESTREL_CODEX_CWD → process cwd.
+                cwd_str = (
+                    params.get("cwd")
+                    or os.environ.get("KESTREL_CODEX_CWD")
+                    or str(Path.cwd())
+                )
+                cwd = Path(cwd_str)
+                # Fail closed if no changes were sent (codex review
+                # #1575 round 3 P1): an empty/malformed payload would
+                # otherwise pass through to the queue and auto-mode
+                # would blanket-approve.
+                if not changes:
+                    return "no_changes_in_params"
+                # Strict per-entry validation (codex review #1575
+                # round 5 P1): a non-dict entry or a dict missing
+                # ``path`` / ``absolutePath`` must decline. Silently
+                # skipping while a sibling passes would let auto-mode
+                # approve the whole request.
+                for change in changes or []:
+                    if not isinstance(change, dict):
+                        return f"malformed_change:{type(change).__name__}"
+                    path_str = change.get("path") or change.get("absolutePath")
+                    if not path_str:
+                        return "change_missing_path"
+                evaluated_any = False
+                for change in changes or []:
+                    path_str = change.get("path") or change.get("absolutePath")
+                    evaluated_any = True
+                    p = Path(path_str).expanduser()
+                    if not p.is_absolute():
+                        p = (cwd / p)
+                    # Lexical absolute — avoids FileNotFoundError on
+                    # resolve(strict=True) for files codex is about to
+                    # CREATE. Symlink-escape protection lives in the
+                    # PathPolicy's allow/deny lists themselves.
+                    try:
+                        p = Path(os.path.normpath(str(p)))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        result = policy.evaluate(p, write=True)
+                    except Exception as eval_exc:  # noqa: BLE001
+                        # Same per-path fail-closed as commandExecution
+                        # (codex review #1575 round 4 P1).
+                        logger.warning(
+                            "codex_policy_precheck fileChange: "
+                            "PathPolicy.evaluate(%s) raised %s — "
+                            "declining (fail closed)",
+                            p, eval_exc,
+                        )
+                        return f"path_eval_failed:{p}"
+                    if getattr(result, "decision", None) is Decision.DENY:
+                        return f"path:{p}"
+                if not evaluated_any:
+                    return "no_evaluable_path_in_params"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "codex_policy_precheck(%s) skipped: %s", kind, exc,
+            )
+        return None
+
     async def _iter_with_overflow_hint(
         self,
         app: Any,
@@ -1228,7 +1544,7 @@ class CodexAdapter(LLMAdapter):
         # chat-history breadcrumbs generically (any adapter that runs
         # tools inline uses this same channel).
         executed_log: List[Dict[str, Any]] = []
-        unregister = None
+        unregisters: List[Callable[[], None]] = []
         if tool_executor is not None and dyn:
             # Only register an item/tool/call handler when tools were
             # actually advertised this turn. A handler on a text-only
@@ -1243,13 +1559,29 @@ class CodexAdapter(LLMAdapter):
             # the dispatcher routes by ``params.threadId``. Without
             # scoping, a second turn's registration would silently
             # overwrite an in-flight turn's handler.
-            unregister = app.register_server_request_handler(
+            unregisters.append(app.register_server_request_handler(
                 "item/tool/call",
                 self._make_tool_call_handler(
                     tool_executor, thread_id, allowed_tools, executed_log,
                 ),
                 thread_id=thread_id,
-            )
+            ))
+
+        # #1575: bridge codex's own sandbox-approval RPCs through
+        # Kestrel's ApprovalQueue when an agent is attached. Without
+        # this, the app-server's native commandExecution/fileChange
+        # approval requests are answered with the hardcoded decline
+        # default in ``_DEFAULT_APPROVAL_REPLIES`` regardless of
+        # auto-mode — silently denying gh / git / fs writes the
+        # Sovereign actually authorized.
+        #
+        # Once-per-adapter registration: codex's approval params don't
+        # reliably carry ``threadId`` (round 1 P1), so the handler is
+        # global, AND registering it per-turn would let a later
+        # turn's unregister tear it down while an earlier turn was
+        # still in flight (round 2 P2). The lifetime is the
+        # (adapter, agent) pair.
+        self._ensure_codex_approval_bridge(app)
 
         sink = app.open_turn_sink(thread_id)
         try:
@@ -1539,8 +1871,11 @@ class CodexAdapter(LLMAdapter):
             raise
         finally:
             app.close_turn_sink(thread_id)
-            if unregister is not None:
-                unregister()
+            for _unreg in unregisters:
+                try:
+                    _unreg()
+                except Exception:  # noqa: BLE001 - cleanup is best-effort
+                    pass
             lock.release()
 
     async def _run_turn_with_retry(
