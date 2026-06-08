@@ -150,12 +150,41 @@ Kestrel ships a lean core. Optional feature packages register `Feature` classes 
 kestrel feature list                   # Show installed + available features
 kestrel feature info <name>            # Detailed info about a feature
 kestrel feature install <name>         # Install a feature package
+kestrel feature upgrade [<name>...]    # Upgrade installed feature/provider packages
+kestrel feature sync                   # Restore the host's declared feature set (see below)
 kestrel feature enable <name>          # Enable an installed feature
 kestrel feature disable <name>         # Disable without uninstalling
 kestrel feature scaffold <name>        # Generate a new feature package skeleton
 ```
 
 The canonical inventory of features lives in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/kestrel_sovereign/data/feature_registry.toml).
+
+#### Keeping features installed across `uv sync` (`kestrel feature sync`)
+
+Feature and provider packages are deliberately **not** declared in `pyproject.toml` (that would invert the open-core dependency direction), so `uv sync` — which makes the venv match declared dependencies exactly — **prunes** them. After a sync or any environment rebuild, an installed feature can silently vanish (e.g. voice endpoints start returning 404). `kestrel feature upgrade` cannot bring it back, because a pruned package leaves no entry-point to discover.
+
+`kestrel feature sync` is the restore counterpart. It reads a host-local manifest, `.kestrel-host-features.toml` (gitignored; template at [`.kestrel-host-features.toml.example`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/.kestrel-host-features.toml.example)), and reinstalls whatever is missing:
+
+```bash
+kestrel feature sync --capture         # Snapshot currently-installed extensions into the manifest
+kestrel feature sync                    # Reinstall the manifest's packages that are missing
+kestrel feature sync --dry-run          # Preview without installing
+kestrel feature sync --manifest PATH    # Use a non-default manifest location
+```
+
+A manifest entry names a package (by registry name or raw dist name) and may pin an editable checkout and extras:
+
+```toml
+[[feature]]
+name = "voice"
+extras = ["local"]                      # also pull the on-device pipeline (Piper / faster-whisper)
+
+[[feature]]
+name = "github"
+editable = "/path/to/kestrel-feature-github"
+```
+
+This never touches `pyproject.toml`, so installing `kestrel-sovereign` itself still pulls zero feature packages. The typical recovery after a prune is `kestrel feature sync` followed by a host/agent restart so the restored entry-points load.
 
 ### Per-Agent Configuration
 
