@@ -1991,10 +1991,15 @@ def cmd_feature_sync(args) -> int:
             action = "install"
         elif editable_want:
             have = _editable_install_path(target)
-            if have and Path(have).resolve() == Path(editable_want).expanduser().resolve():
-                action = "present"
-            else:
+            matched = bool(have) and (
+                Path(have).resolve() == Path(editable_want).expanduser().resolve()
+            )
+            if not matched:
                 action = "reinstall"  # installed, but not editable from the wanted path
+            elif extras:
+                action = "ensure"  # right checkout, but extras can't be probed
+            else:
+                action = "present"
         elif extras:
             # Installed, but we can't tell whether the declared extras' deps
             # are satisfied. Re-run the install (pip/uv is idempotent) so the

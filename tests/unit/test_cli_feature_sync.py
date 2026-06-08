@@ -210,6 +210,21 @@ def test_sync_editable_present_when_path_matches(monkeypatch, fake_registry, tmp
     assert spy.calls == []  # editable already points at the wanted checkout
 
 
+def test_sync_ensures_extras_even_when_editable_path_matches(monkeypatch, fake_registry, tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\neditable = "/src/voice"\nextras = ["local"]\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.2.1"})
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: "/src/voice")  # path matches
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    # right checkout, but extras can't be probed -> idempotent re-install
+    assert spy.calls == [["-e", "/src/voice[local]"]]
+
+
 def test_sync_dry_run_changes_nothing(monkeypatch, fake_registry, tmp_path, capsys):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')
