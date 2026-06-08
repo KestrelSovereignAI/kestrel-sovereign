@@ -1,0 +1,35 @@
+# Host-local feature manifest for `kestrel feature sync`.
+#
+# `uv sync` makes the venv exactly match the project's declared dependencies
+# and prunes anything else. Out-of-tree feature/provider packages
+# (kestrel-feature-voice, kestrel-feature-github, the kestrel-voice-* family,
+# …) are deliberately NOT declared in pyproject.toml — doing so would invert
+# the open-core dependency direction (framework -> feature). So every
+# `uv sync` removes them and the host loses voice/github/etc.
+#
+# This manifest is THIS host's record of which extension packages it should
+# keep installed. Restore them after a prune with:
+#
+#     kestrel feature sync
+#
+# Bootstrap it from your current install instead of hand-editing:
+#
+#     kestrel feature sync --capture
+#
+# Copy this file to `.kestrel-host-features.toml` (gitignored) and edit.
+
+# Install from PyPI/git via the feature registry (name resolves through
+# `kestrel feature list`). A raw dist name like "kestrel-feature-voice" works
+# too.
+[[feature]]
+name = "voice"
+extras = ["local"]   # optional: pulls Piper / faster-whisper for the local pipeline
+
+[[feature]]
+name = "voice_openai"   # OpenAI TTS/STT provider (Realtime path)
+
+# Install editable from a local checkout instead of PyPI — keeps live-editing
+# the feature repo. `editable` and `extras` may be combined.
+[[feature]]
+name = "github"
+editable = "/Volumes/data2/projects/kestrel-feature-github"

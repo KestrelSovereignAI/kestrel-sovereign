@@ -155,6 +155,10 @@ kestrel_sovereign/kestrel.toml
 scripts/talon_daemon.toml
 scripts/launchd/com.kestrel.workload-manager.plist
 
+# Host-local feature manifest for `kestrel feature sync` (contains local
+# checkout paths; use .kestrel-host-features.toml.example as the template)
+.kestrel-host-features.toml
+
 # Control panel env files
 control-panel/.env*
 control-panel/run_*/
