@@ -111,7 +111,10 @@ def test_query_agent_feature_catalog_network_error_returns_none(monkeypatch):
     assert cli._query_agent_feature_catalog("http://x", "") is None
 
 
-@pytest.mark.parametrize("payload", [[], "nope", {"features": None}, {"features": ["x", 1]}])
+@pytest.mark.parametrize(
+    "payload",
+    [[], "nope", {"features": None}, {"features": ["x", 1]}, {"features": [{"package": []}]}],
+)
 def test_query_agent_feature_catalog_malformed_json_never_crashes(monkeypatch, payload):
     import httpx
 

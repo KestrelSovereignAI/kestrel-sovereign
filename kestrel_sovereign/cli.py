@@ -2109,8 +2109,9 @@ def _query_agent_feature_catalog(base_url: str, api_key: str):
         return None
     out = {}
     for f in feats:
-        if isinstance(f, dict) and f.get("package"):
-            out[f["package"]] = f.get("status")
+        pkg = f.get("package") if isinstance(f, dict) else None
+        if isinstance(pkg, str) and pkg:
+            out[pkg] = f.get("status")
     return out
 
 
