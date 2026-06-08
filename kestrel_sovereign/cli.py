@@ -1514,6 +1514,7 @@ def cmd_feature(args) -> int:
         "install": cmd_feature_install,
         "upgrade": cmd_feature_upgrade,
         "sync": cmd_feature_sync,
+        "status": cmd_feature_status,
         "enable": cmd_feature_enable,
         "disable": cmd_feature_disable,
         "info": cmd_feature_info,
@@ -1525,7 +1526,7 @@ def cmd_feature(args) -> int:
     if handler is None:
         print(
             "Usage: kestrel feature "
-            "{list|install|upgrade|sync|enable|disable|info|scaffold|skills}"
+            "{list|install|upgrade|sync|status|enable|disable|info|scaffold|skills}"
         )
         return 1
     return handler(args)
@@ -1934,6 +1935,56 @@ def _capture_host_manifest(path: Path) -> int:
     return len(dists)
 
 
+def _registry_info_for(label: str, registry: dict):
+    """Resolve a manifest entry name to its registry info.
+
+    Handles both registry short names ("voice") and raw dist names
+    ("kestrel-feature-voice", which manifests commonly use). Returns the
+    FeaturePackageInfo or None.
+    """
+    pkg = _resolve_feature_name(label, registry)
+    if pkg:
+        return registry[pkg]
+    for info in registry.values():
+        if info.package == label:
+            return info
+    return None
+
+
+def _resolve_manifest_action(entry: dict, registry: dict):
+    """Resolve a manifest entry to ``(target_package, current_version, action)``.
+
+    ``action`` is exactly what ``kestrel feature sync`` would do:
+    ``install`` (not present), ``reinstall`` (editable path mismatch),
+    ``ensure`` (present but declared extras can't be probed), or ``present``.
+    Shared by ``sync`` and ``status`` so the two never report different drift.
+    """
+    import importlib.metadata as md
+
+    info = _registry_info_for(entry["name"], registry)
+    target = info.package if info else entry["name"]
+    extras = entry["extras"]
+    editable_want = entry["editable"]
+    try:
+        current = md.version(target)
+    except md.PackageNotFoundError:
+        current = None
+
+    if current is None:
+        action = "install"
+    elif editable_want:
+        have = _editable_install_path(target)
+        matched = bool(have) and (
+            Path(have).resolve() == Path(editable_want).expanduser().resolve()
+        )
+        action = "reinstall" if not matched else ("ensure" if extras else "present")
+    elif extras:
+        action = "ensure"
+    else:
+        action = "present"
+    return target, current, action
+
+
 def cmd_feature_sync(args) -> int:
     """Restore the host's declared feature packages (counterpart to upgrade)."""
     from kestrel_sovereign.feature_registry import load_registry
@@ -1965,8 +2016,6 @@ def cmd_feature_sync(args) -> int:
     git_urls = {info.package: info.git for info in registry.values() if info.package}
     dry_run = getattr(args, "dry_run", False)
 
-    import importlib.metadata as md
-
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -1974,39 +2023,9 @@ def cmd_feature_sync(args) -> int:
     rc = 0
     installed = 0
     for entry in entries:
-        # Resolve the manifest name to its pip target. Registry names
-        # ("voice") map to their dist ("kestrel-feature-voice"); anything
-        # unknown is treated as a literal package/dist name.
-        pkg = _resolve_feature_name(entry["name"], registry)
-        target = registry[pkg].package if pkg else entry["name"]
+        target, current, action = _resolve_manifest_action(entry, registry)
         extras = entry["extras"]
         editable_want = entry["editable"]
-
-        try:
-            current = md.version(target)
-        except md.PackageNotFoundError:
-            current = None
-
-        if current is None:
-            action = "install"
-        elif editable_want:
-            have = _editable_install_path(target)
-            matched = bool(have) and (
-                Path(have).resolve() == Path(editable_want).expanduser().resolve()
-            )
-            if not matched:
-                action = "reinstall"  # installed, but not editable from the wanted path
-            elif extras:
-                action = "ensure"  # right checkout, but extras can't be probed
-            else:
-                action = "present"
-        elif extras:
-            # Installed, but we can't tell whether the declared extras' deps
-            # are satisfied. Re-run the install (pip/uv is idempotent) so the
-            # extras are guaranteed present rather than assumed.
-            action = "ensure"
-        else:
-            action = "present"
 
         if action == "present":
             print(f"  {target:<34} {current or '-':<10} present")
@@ -2049,6 +2068,169 @@ def cmd_feature_sync(args) -> int:
         if installed:
             print("  Restart the host/agents to load the synced features.")
     return rc
+
+
+# ---------------------------------------------------------------------------
+# `kestrel feature status` — answer "is my environment set up right, per agent?"
+#
+# Combines two views the operator otherwise has to assemble by hand:
+#   1. Host venv: are the manifest's packages actually installed? (drift vs
+#      `.kestrel-host-features.toml` — the `sync --dry-run` answer)
+#   2. Per running agent: is each feature actually LOADED? An installed package
+#      that an agent hasn't loaded means the host needs a restart (entry-points
+#      are read at startup) or the agent's `features` allowlist excludes it.
+# ---------------------------------------------------------------------------
+
+
+def _query_agent_feature_catalog(base_url: str, api_key: str):
+    """GET ``/api/features`` from a running agent → ``{package: status}``.
+
+    Status is resolved per the routed agent, so ``enabled`` means loaded on
+    *that* agent. Returns None on any network/parse failure (agent treated as
+    unreachable, not as "nothing loaded").
+    """
+    import httpx
+
+    headers = {"X-API-Key": api_key} if api_key else {}
+    try:
+        resp = httpx.get(f"{base_url}/api/features", headers=headers, timeout=5.0)
+    except httpx.RequestError:
+        return None
+    if resp.status_code != 200:
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    feats = data.get("features")
+    if not isinstance(feats, list):
+        return None
+    out = {}
+    for f in feats:
+        pkg = f.get("package") if isinstance(f, dict) else None
+        if isinstance(pkg, str) and pkg:
+            out[pkg] = f.get("status")
+    return out
+
+
+def cmd_feature_status(args) -> int:
+    """Show host install state + per-agent loaded state for manifest features."""
+    from kestrel_sovereign.feature_registry import load_registry
+
+    registry = load_registry()
+    path = _host_manifest_path(args)
+
+    entries = []
+    if path.exists():
+        try:
+            entries = _load_host_manifest(path)
+        except (ValueError, OSError) as exc:
+            print(f"Failed to read manifest {path}: {exc}")
+            return 1
+
+    # Resolve each manifest entry to its install action (shared with `sync`)
+    # plus whether it's a loadable Feature vs a provider. Feature-vs-provider
+    # is decided from the registry by class-name convention (Feature classes
+    # end in "Feature"; providers like OpenAITTSProvider do not) — independent
+    # of install state, so a not-yet-installed feature still gets an agent row.
+    targets = []
+    for entry in entries:
+        info = _registry_info_for(entry["name"], registry)
+        target, current, action = _resolve_manifest_action(entry, registry)
+        is_feature = bool(info) and any(
+            c.endswith("Feature") for c in (info.features or [])
+        )
+        targets.append(
+            {
+                "display": info.name if info else entry["name"],
+                "package": target,
+                "current": current,
+                "action": action,
+                "is_feature": is_feature,
+            }
+        )
+
+    # --- Host install level ---
+    print()
+    if entries:
+        print(f"Host venv (declared in {path.name}):")
+        print(f"  {'PACKAGE':<34} {'INSTALLED':<12} STATE")
+        print(f"  {'-' * 56}")
+        drifted = 0
+        for t in targets:
+            if t["action"] == "present":
+                print(f"  {t['package']:<34} {'✓ ' + t['current']:<12} ok")
+            elif t["action"] == "install":
+                drifted += 1
+                print(f"  {t['package']:<34} {'✗ —':<12} not installed")
+            else:  # reinstall / ensure — installed but not matching the manifest
+                drifted += 1
+                ver = ("✓ " + t["current"]) if t["current"] else "✗ —"
+                print(f"  {t['package']:<34} {ver:<12} needs {t['action']}")
+        if drifted:
+            print(f"\n  → {drifted} package(s) drift from the manifest — run: kestrel feature sync")
+        else:
+            print("\n  → manifest satisfied")
+    else:
+        print(f"No host manifest at {path}. Run `kestrel feature sync --capture` to create one.")
+
+    # --- Per-agent loaded level ---
+    project_dir = _get_project_dir()
+    multi_agent = MultiAgentConfig.load(project_dir / MULTI_AGENT_CONFIG_FILENAME)
+    local_agents = multi_agent.get_local_agents()
+
+    requested = getattr(args, "agent", None)
+    if requested:
+        if requested not in local_agents:
+            print(f"\nAgent '{requested}' not found in {MULTI_AGENT_CONFIG_FILENAME}")
+            return 1
+        agent_names = [requested]
+    else:
+        agent_names = list(local_agents)
+
+    cols = [t for t in targets if t["is_feature"]]
+    print(f"\nLoaded per agent (host :{multi_agent.host.port}):")
+    if not cols:
+        print("  (no loadable feature packages in the manifest to check per agent)")
+        return 0
+
+    print("  " + f"{'AGENT':<12}" + "".join(f"{c['display']:<16}" for c in cols))
+    print("  " + "-" * (12 + 16 * len(cols)))
+
+    drift = False
+    any_online = False
+    for name in agent_names:
+        cfg = local_agents.get(name)
+        endpoint = _detect_running_agent_server(name, cfg, multi_agent) if cfg else None
+        if endpoint is None:
+            print("  " + f"{name:<12}" + f"{'(offline)':<16}")
+            continue
+        base_url, key = endpoint
+        catalog = _query_agent_feature_catalog(base_url, key)
+        if catalog is None:
+            print("  " + f"{name:<12}" + f"{'(unreachable)':<16}")
+            continue
+        any_online = True
+        cells = []
+        for c in cols:
+            status = catalog.get(c["package"])
+            if status == "enabled":
+                cells.append("✓ enabled")
+            elif status in ("installed", "disabled"):
+                cells.append(f"⚠ {status}")
+                drift = True
+            else:
+                cells.append("✗ —")
+        print("  " + f"{name:<12}" + "".join(f"{cell:<16}" for cell in cells))
+
+    if drift:
+        print("\n  ⚠ installed-but-not-loaded → restart the host to load it, or this")
+        print("    agent's `features` allowlist in multi_agent.toml excludes it.")
+    if not any_online:
+        print("\n  No running host found — start it (or check the port) for per-agent state.")
+    return 0
 
 
 def cmd_feature_enable(args) -> int:
@@ -2613,7 +2795,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_p.add_argument("--set-port", type=int, help="Set port")
     config_p.add_argument("--set-name", type=str, help="Set name")
 
-    # kestrel feature {list|install|upgrade|sync|enable|disable|info|scaffold|skills}
+    # kestrel feature {list|install|upgrade|sync|status|enable|disable|info|scaffold|skills}
     feature_p = subparsers.add_parser("feature", help="Manage features")
     feature_sub = feature_p.add_subparsers(dest="feature_command")
 
@@ -2655,6 +2837,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Show what would be installed/restored without changing anything",
+    )
+
+    feat_status = feature_sub.add_parser(
+        "status",
+        help="Show host install state + per-agent loaded state for manifest features",
+    )
+    feat_status.add_argument(
+        "--agent",
+        default=None,
+        help="Only show this agent (default: all local agents)",
+    )
+    feat_status.add_argument(
+        "--manifest",
+        default=None,
+        help=f"Path to the host manifest (default: ./{DEFAULT_HOST_MANIFEST})",
     )
 
     feat_enable = feature_sub.add_parser("enable", help="Enable a disabled feature")
