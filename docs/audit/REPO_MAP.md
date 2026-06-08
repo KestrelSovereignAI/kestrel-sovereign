@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-07
-**Scope:** 1657 tracked files (1072 `.py`, 299 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-08
+**Scope:** 1663 tracked files (1077 `.py`, 300 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -65,6 +65,8 @@ Repo entry points and standard project files.
   - `def is_windows()`; `def run_streaming(cmd)`; `def start_background_process(cmd)`; `def stop_process(proc)`; `def wait_for_health(port)`
 - **kestrel_sovereign/a2a/__init__.py** — A2A (Agent-to-Agent) Protocol Implementation for Kestrel.
 - **kestrel_sovereign/a2a/agent_card.py** — Agent Card Types for A2A Protocol.
+- **kestrel_sovereign/a2a/outbound_store.py** — Sender-side outbound A2A task store (#1576).
+  - `class OutboundTask`; `async def ensure_a2a_outbound_tasks_table(db)`; `async def record_outbound_dispatch(db)`; `async def update_outbound_terminal_state(db)`; `async def list_outbound_tasks(db)`
 - **kestrel_sovereign/a2a/stores/__init__.py** — A2A Datastores - Unified Backend-Agnostic Stores.
 - **kestrel_sovereign/a2a/stores/base.py** — Shared utilities for A2A datastores.
   - `def generate_id()`; `def now_utc()`; `def datetime_to_iso(dt)`; `def iso_to_datetime(iso_str)`; `def json_dumps(obj)`; `def json_loads(s)`
@@ -608,6 +610,8 @@ Repo entry points and standard project files.
   - `def classify_and_render_failure(raw_error)`; `class CodexAdapter`
 - **kestrel_sovereign/llm/codex_app_server.py** — Codex app-server JSON-RPC client.
   - `class CodexAppServerError`; `class CodexAppServerTransportError`; `class CodexAppServerConnectionClosed`; `def resolve_codex_binary()`; `class CodexAppServerClient`
+- **kestrel_sovereign/llm/codex_decline_events.py** — Typed event log for codex sandbox-approval declines (#1581).
+  - `class CodexDeclineEvent`; `async def ensure_codex_decline_events_table(db)`; `async def record_decline(db)`; `async def list_recent_declines_for_agent(db)`
 - **kestrel_sovereign/llm/constitutional_awareness.py** — Constitutional awareness for LLM Service.
   - `class ConstitutionalAwarenessMixin`
 - **kestrel_sovereign/llm/constitutional_profile.py** — Constitutional Profile Service
@@ -1190,6 +1194,7 @@ Repo entry points and standard project files.
 - **docs/SOVEREIGNTY.md** — The Kestrel Sovereignty Stack — This document explains the three architectural pillars that give Kestrel agents their sovereignty properties: **Identity**, **Constitution**, and **Memory**.
 - **docs/TORTOISE_DOCTRINE.md** — The Tortoise Doctrine — > *"Slow is smooth, smooth is fast."*
 - **docs/architecture/AGENT_IDENTITY_CONTRACT.md** — Agent Identity Contract — ## Summary
+- **docs/architecture/APPROVAL_PATHS.md** — Approval paths — Closes #1582.
 - **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — Kestrel Compute Feature - Architecture Design — ## Executive Summary
 - **docs/architecture/CONSTITUTION_INJECTION.md** — SignalDispatcher Constitutional Injection — Architecture Design — > Draft v1.
 - **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C — Unify Auto-Prune With Durable Compression — > Auto-prune is a silent decision.
@@ -1647,6 +1652,8 @@ Repo entry points and standard project files.
   - `async def test_db()`; `def owner()`; `def source()`; `def host()`; `def signed_package(source)`; `def signed_grant(owner, source, host)`; `def stub_package_sig_ok(monkeypatch)`; `async def test_grant_none_preserves_existing_behavior(test_db, signed_package)`; `…`
 - **tests/integration/test_inception.py** — —
   - `async def test_successful_inception(tmp_path)`
+- **tests/integration/test_kestrel_feature_github_create_issue.py** — Integration: create_issue via kestrel-feature-github (#1579).
+  - `def stub_agent()`; `def scrub_github_tokens(monkeypatch)`; `async def test_create_issue_returns_ok_against_stub_github(stub_agent)`; `async def test_create_issue_bypasses_shell_subprocess(stub_agent)`
 - **tests/integration/test_key_management.py** — Integration Tests for API Key Management System.
   - `async def temp_db()`; `def data_key()`; `async def key_storage(temp_db, data_key)`; `class TestServiceKeyStorage`; `class TestKeyResolutionService`; `class TestKeyManagementFeature`; `class TestKnownProviders`; `class TestMasterKeyNotConfigured`
 - **tests/integration/test_lighthouse_rest_e2e.py** — —
@@ -1759,6 +1766,8 @@ Repo entry points and standard project files.
   - `class TestPlaceholderConversion`; `class TestSchemaConversion`; `class TestSQLiteBackend`; `class TestAsyncDatabase`
 - **tests/unit/storage/test_deleted_at_legacy_migration.py** — Regression test for #795: deleted_at migration silently fails on legacy DBs.
   - `async def test_legacy_db_loads_and_migrates_deleted_at(tmp_path)`; `async def test_migration_failure_surfaces(tmp_path, monkeypatch)`
+- **tests/unit/test_a2a_outbound_store.py** — Tests for the sender-side outbound A2A audit store (#1576).
+  - `async def test_ensure_table_idempotent(tmp_path)`; `async def test_record_outbound_dispatch_returns_full_row(tmp_path)`; `async def test_record_with_error_stamps_dispatch_failed_terminal(tmp_path)`; `async def test_message_summary_truncates_at_200_chars(tmp_path)`; `async def test_update_terminal_state_idempotent(tmp_path)`; `async def test_list_outbound_filters_by_recipient(tmp_path)`; `async def test_list_outbound_clamps_limit(tmp_path)`; `async def test_send_a2a_task_writes_outbound_audit_row(tmp_path)`; `…`
 - **tests/unit/test_a2a_question_answered_signal.py** — ``a2a.question_answered`` signal source (#1444 step 4).
   - `class TestRegistration`; `class TestSchema`; `class TestSignalBuilder`; `class TestPackagedTemplate`
 - **tests/unit/test_a2a_question_replay_and_sweep.py** — Startup-replay + hourly expiry sweep for in-flight ``send_a2a_question`` rows (#1444 step 6).
@@ -1902,6 +1911,8 @@ Repo entry points and standard project files.
   - `async def test_request_unguarded_drops_pending_on_cancel()`; `async def test_request_unguarded_preserves_cancellation_for_asyncio_timeout()`; `async def test_request_unguarded_timeout_still_raises_typed_error()`; `async def test_request_unguarded_normal_response_unaffected()`
 - **tests/unit/test_codex_app_server_streamreader_limit.py** — Codex app-server spawn must use a buffer ``limit`` large enough for typical JSON-RPC frames (#1438).
   - `async def test_spawn_passes_large_streamreader_limit(monkeypatch)`; `async def test_read_loop_logs_streamreader_limit_explicitly(monkeypatch, caplog)`
+- **tests/unit/test_codex_decline_events.py** — Tests for the codex sandbox-approval decline event log (#1581).
+  - `async def test_ensure_table_idempotent(tmp_path)`; `async def test_record_and_list_round_trip(tmp_path)`; `async def test_did_scoping_isolates_agents(tmp_path)`; `async def test_tool_field_truncated_at_200_chars(tmp_path)`; `async def test_bridge_policy_deny_records_event(tmp_path)`; `async def test_bridge_queue_denial_records_event(tmp_path)`; `async def test_bridge_no_queue_records_event(tmp_path)`; `async def test_app_server_default_decline_records_event(tmp_path)`; `…`
 - **tests/unit/test_codex_idle_timeout_diagnostics.py** — codex app-server idle-timeout diagnostic surface (#1410).
   - `class TestRecentStderr`; `class TestRecentCodexLog`; `class TestIterTurnEventsIdleTimeoutLogsTailsServerSide`; `class TestOverflowHintBranchesOnPayloadVsCap`
 - **tests/unit/test_codex_retry_on_idle_timeout.py** — One-shot retry on codex idle-timeout under cap (#1411).
@@ -2083,7 +2094,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_feature_registry.py** — Tests for the Feature Registry catalog and loader.
   - `class TestLoadRegistry`; `class TestResolveStatus`; `class TestGetRegistry`; `class TestGetPackageForFeature`; `class TestSkills`
 - **tests/unit/test_feature_startup_promotion.py** — —
-  - `class PlainFeature`; `def test_feature_startup_promotion_defaults_to_disabled()`; `def test_meta_features_opt_into_startup_direct_tools()`; `def test_startup_promotion_uses_feature_descriptor_not_feature_names()`
+  - `class PlainFeature`; `def test_feature_startup_promotion_defaults_to_disabled()`; `def test_meta_features_opt_into_startup_direct_tools()`; `def test_save_and_strategic_memory_opt_into_startup_direct_tools()`; `def test_startup_promotion_stays_under_budget()`; `def test_startup_promotion_uses_feature_descriptor_not_feature_names()`
 - **tests/unit/test_feature_storage_access.py** — —
   - `class PrivacyWrappedStorage`; `def test_resolve_feature_database_prefers_raw_storage()`; `def test_resolve_feature_database_unwraps_privacy_storage_without_touching_property()`; `def test_resolve_feature_database_supports_legacy_unwrapped_storage_names()`; `def test_resolve_feature_database_ignores_magicmock_fabricated_attributes()`; `def test_resolve_feature_database_supports_explicit_magicmock_db()`; `def test_resolve_feature_conversation_store_unwraps_without_touching_property()`
 - **tests/unit/test_feature_subagent_tool_executor.py** — Regression tests for ``Feature.execute_as_subagent`` threading a ``tool_executor`` to the LLM service (#1461 follow-up).
