@@ -1852,19 +1852,39 @@ def _load_host_manifest(path: Path) -> list:
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict) or not entry.get("name"):
             raise ValueError(f"manifest feature #{i + 1} is missing a 'name'")
-        cleaned.append(
-            {
-                "name": str(entry["name"]),
-                "editable": entry.get("editable"),
-                "extras": list(entry.get("extras", []) or []),
-            }
-        )
+        label = entry["name"]
+        editable = entry.get("editable")
+        if editable is not None and not isinstance(editable, str):
+            raise ValueError(f"manifest '{label}': 'editable' must be a string path")
+        extras = entry.get("extras", []) or []
+        # A bare string ("local") would silently iterate into characters
+        # (['l','o','c','a','l']); require an explicit array.
+        if not isinstance(extras, list) or not all(isinstance(x, str) for x in extras):
+            raise ValueError(f"manifest '{label}': 'extras' must be an array of strings")
+        cleaned.append({"name": str(label), "editable": editable, "extras": list(extras)})
     return cleaned
 
 
 def _pip_spec(target: str, extras: list) -> str:
     """Render a pip requirement spec with optional extras (``pkg[a,b]``)."""
     return f"{target}[{','.join(extras)}]" if extras else target
+
+
+def _toml_basic_string(value: str) -> str:
+    """Quote *value* as a valid TOML basic string.
+
+    Escapes backslashes (Windows checkout paths), quotes, and control chars so
+    a captured manifest is always re-parseable without pulling in a TOML
+    writer dependency.
+    """
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
 
 
 def _extension_install_run(pip_args: list):
@@ -1905,9 +1925,9 @@ def _capture_host_manifest(path: Path) -> int:
     ]
     for d in dists:
         lines.append("[[feature]]")
-        lines.append(f'name = "{d["dist"]}"')
+        lines.append(f'name = {_toml_basic_string(d["dist"])}')
         if d["editable_path"]:
-            lines.append(f'editable = "{d["editable_path"]}"')
+            lines.append(f'editable = {_toml_basic_string(d["editable_path"])}')
         lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -1975,6 +1995,11 @@ def cmd_feature_sync(args) -> int:
                 action = "present"
             else:
                 action = "reinstall"  # installed, but not editable from the wanted path
+        elif extras:
+            # Installed, but we can't tell whether the declared extras' deps
+            # are satisfied. Re-run the install (pip/uv is idempotent) so the
+            # extras are guaranteed present rather than assumed.
+            action = "ensure"
         else:
             action = "present"
 
@@ -1994,9 +2019,13 @@ def cmd_feature_sync(args) -> int:
 
         result = _extension_install_run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
-        # `feature install`). Editable installs have no remote fallback.
+        # `feature install`). Editable installs have no remote fallback. Carry
+        # extras across via PEP 508 form (``pkg[extra] @ git+url``) so a git
+        # fallback doesn't silently drop the local-pipeline deps.
         if result.returncode != 0 and not editable_want and git_urls.get(target):
-            result = _extension_install_run([f"git+{git_urls[target]}"])
+            git_ref = f"git+{git_urls[target]}"
+            git_spec = f"{_pip_spec(target, extras)} @ {git_ref}" if extras else git_ref
+            result = _extension_install_run([git_spec])
 
         if result.returncode != 0:
             rc = 1
@@ -2006,7 +2035,8 @@ def cmd_feature_sync(args) -> int:
             continue
 
         installed += 1
-        print(f"  {target:<34} {current or '-':<10} {action}ed")
+        done = {"install": "installed", "reinstall": "reinstalled", "ensure": "ensured"}[action]
+        print(f"  {target:<34} {current or '-':<10} {done}")
 
     print()
     if not dry_run:

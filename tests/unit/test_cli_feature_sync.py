@@ -266,3 +266,70 @@ def test_load_host_manifest_rejects_entry_without_name(tmp_path):
     manifest.write_text('[[feature]]\neditable = "/src/x"\n')
     with pytest.raises(ValueError):
         cli._load_host_manifest(manifest)
+
+
+def test_load_host_manifest_rejects_string_extras(tmp_path):
+    # A bare string must not silently iterate into characters.
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\nextras = "local"\n')
+    with pytest.raises(ValueError):
+        cli._load_host_manifest(manifest)
+
+
+def test_sync_ensures_extras_when_base_already_installed(monkeypatch, fake_registry, tmp_path, capsys):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\nextras = ["local"]\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.2.1"})  # base present, extras unknown
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    # extras can't be probed -> re-run the (idempotent) install to guarantee them
+    assert spy.calls == [["kestrel-feature-voice[local]"]]
+    assert "ensured" in capsys.readouterr().out
+
+
+def test_sync_git_fallback_carries_extras(monkeypatch, fake_registry, tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\nextras = ["local"]\n')
+    _versions(monkeypatch, {})  # missing
+
+    class _FailThenGit:
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, pip_args):
+            self.calls.append(list(pip_args))
+            rc = 0 if "git+" in str(pip_args[0]) else 1
+            return subprocess.CompletedProcess(pip_args, rc, stdout="", stderr="boom")
+
+    spy = _FailThenGit()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls[0] == ["kestrel-feature-voice[local]"]
+    # PEP 508 form keeps extras across the git fallback
+    assert spy.calls[1] == ["kestrel-feature-voice[local] @ git+"
+                            "https://github.com/KestrelSovereignAI/kestrel-feature-voice.git"]
+
+
+def test_toml_basic_string_escapes_backslashes_and_quotes():
+    assert cli._toml_basic_string(r"C:\src\voice") == r'"C:\\src\\voice"'
+    assert cli._toml_basic_string('a"b') == '"a\\"b"'
+
+
+def test_capture_roundtrips_windows_style_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli,
+        "_installed_extension_distributions",
+        lambda: [{"dist": "kestrel-feature-voice", "editable_path": r"C:\src\voice"}],
+    )
+    manifest = tmp_path / "m.toml"
+    cli.cmd_feature_sync(_args(manifest, capture=True))
+    # The captured file must parse back to the exact path (no TOML escape break)
+    entries = cli._load_host_manifest(manifest)
+    assert entries[0]["editable"] == r"C:\src\voice"
