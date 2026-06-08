@@ -1935,6 +1935,56 @@ def _capture_host_manifest(path: Path) -> int:
     return len(dists)
 
 
+def _registry_info_for(label: str, registry: dict):
+    """Resolve a manifest entry name to its registry info.
+
+    Handles both registry short names ("voice") and raw dist names
+    ("kestrel-feature-voice", which manifests commonly use). Returns the
+    FeaturePackageInfo or None.
+    """
+    pkg = _resolve_feature_name(label, registry)
+    if pkg:
+        return registry[pkg]
+    for info in registry.values():
+        if info.package == label:
+            return info
+    return None
+
+
+def _resolve_manifest_action(entry: dict, registry: dict):
+    """Resolve a manifest entry to ``(target_package, current_version, action)``.
+
+    ``action`` is exactly what ``kestrel feature sync`` would do:
+    ``install`` (not present), ``reinstall`` (editable path mismatch),
+    ``ensure`` (present but declared extras can't be probed), or ``present``.
+    Shared by ``sync`` and ``status`` so the two never report different drift.
+    """
+    import importlib.metadata as md
+
+    info = _registry_info_for(entry["name"], registry)
+    target = info.package if info else entry["name"]
+    extras = entry["extras"]
+    editable_want = entry["editable"]
+    try:
+        current = md.version(target)
+    except md.PackageNotFoundError:
+        current = None
+
+    if current is None:
+        action = "install"
+    elif editable_want:
+        have = _editable_install_path(target)
+        matched = bool(have) and (
+            Path(have).resolve() == Path(editable_want).expanduser().resolve()
+        )
+        action = "reinstall" if not matched else ("ensure" if extras else "present")
+    elif extras:
+        action = "ensure"
+    else:
+        action = "present"
+    return target, current, action
+
+
 def cmd_feature_sync(args) -> int:
     """Restore the host's declared feature packages (counterpart to upgrade)."""
     from kestrel_sovereign.feature_registry import load_registry
@@ -1966,8 +2016,6 @@ def cmd_feature_sync(args) -> int:
     git_urls = {info.package: info.git for info in registry.values() if info.package}
     dry_run = getattr(args, "dry_run", False)
 
-    import importlib.metadata as md
-
     print()
     print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
     print(f"  {'-' * 62}")
@@ -1975,39 +2023,9 @@ def cmd_feature_sync(args) -> int:
     rc = 0
     installed = 0
     for entry in entries:
-        # Resolve the manifest name to its pip target. Registry names
-        # ("voice") map to their dist ("kestrel-feature-voice"); anything
-        # unknown is treated as a literal package/dist name.
-        pkg = _resolve_feature_name(entry["name"], registry)
-        target = registry[pkg].package if pkg else entry["name"]
+        target, current, action = _resolve_manifest_action(entry, registry)
         extras = entry["extras"]
         editable_want = entry["editable"]
-
-        try:
-            current = md.version(target)
-        except md.PackageNotFoundError:
-            current = None
-
-        if current is None:
-            action = "install"
-        elif editable_want:
-            have = _editable_install_path(target)
-            matched = bool(have) and (
-                Path(have).resolve() == Path(editable_want).expanduser().resolve()
-            )
-            if not matched:
-                action = "reinstall"  # installed, but not editable from the wanted path
-            elif extras:
-                action = "ensure"  # right checkout, but extras can't be probed
-            else:
-                action = "present"
-        elif extras:
-            # Installed, but we can't tell whether the declared extras' deps
-            # are satisfied. Re-run the install (pip/uv is idempotent) so the
-            # extras are guaranteed present rather than assumed.
-            action = "ensure"
-        else:
-            action = "present"
 
         if action == "present":
             print(f"  {target:<34} {current or '-':<10} present")
@@ -2064,22 +2082,6 @@ def cmd_feature_sync(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _registry_info_for(label: str, registry: dict):
-    """Resolve a manifest entry name to its registry info.
-
-    Handles both registry short names ("voice") and raw dist names
-    ("kestrel-feature-voice", which manifests commonly use). Returns the
-    FeaturePackageInfo or None.
-    """
-    pkg = _resolve_feature_name(label, registry)
-    if pkg:
-        return registry[pkg]
-    for info in registry.values():
-        if info.package == label:
-            return info
-    return None
-
-
 def _query_agent_feature_catalog(base_url: str, api_key: str):
     """GET ``/api/features`` from a running agent → ``{package: status}``.
 
@@ -2097,31 +2099,26 @@ def _query_agent_feature_catalog(base_url: str, api_key: str):
     if resp.status_code != 200:
         return None
     try:
-        feats = resp.json().get("features", [])
+        data = resp.json()
     except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    feats = data.get("features")
+    if not isinstance(feats, list):
         return None
     out = {}
     for f in feats:
-        pkg = f.get("package")
-        if pkg:
-            out[pkg] = f.get("status")
+        if isinstance(f, dict) and f.get("package"):
+            out[f["package"]] = f.get("status")
     return out
 
 
 def cmd_feature_status(args) -> int:
     """Show host install state + per-agent loaded state for manifest features."""
-    from kestrel_sovereign.feature_registry import (
-        load_registry,
-        _get_installed_entrypoint_classes,
-    )
-    import importlib.metadata as md
+    from kestrel_sovereign.feature_registry import load_registry
 
     registry = load_registry()
-    # Class names registered under the `kestrel_sovereign.features` entry-point
-    # group — the precise feature-vs-provider signal. The registry's `features`
-    # field is overloaded (provider packages list their provider classes there
-    # too, e.g. OpenAITTSProvider), so non-empty `features` alone is not enough.
-    feature_classes = _get_installed_entrypoint_classes()
     path = _host_manifest_path(args)
 
     entries = []
@@ -2132,17 +2129,24 @@ def cmd_feature_status(args) -> int:
             print(f"Failed to read manifest {path}: {exc}")
             return 1
 
-    # Resolve each manifest entry to its package + feature classes. Entries
-    # whose registry info exposes a Feature class are loadable per-agent;
-    # provider packages (no class) are install-level only.
+    # Resolve each manifest entry to its install action (shared with `sync`)
+    # plus whether it's a loadable Feature vs a provider. Feature-vs-provider
+    # is decided from the registry by class-name convention (Feature classes
+    # end in "Feature"; providers like OpenAITTSProvider do not) — independent
+    # of install state, so a not-yet-installed feature still gets an agent row.
     targets = []
     for entry in entries:
         info = _registry_info_for(entry["name"], registry)
-        is_feature = bool(info) and any(c in feature_classes for c in info.features)
+        target, current, action = _resolve_manifest_action(entry, registry)
+        is_feature = bool(info) and any(
+            c.endswith("Feature") for c in (info.features or [])
+        )
         targets.append(
             {
                 "display": info.name if info else entry["name"],
-                "package": info.package if info else entry["name"],
+                "package": target,
+                "current": current,
+                "action": action,
                 "is_feature": is_feature,
             }
         )
@@ -2151,16 +2155,23 @@ def cmd_feature_status(args) -> int:
     print()
     if entries:
         print(f"Host venv (declared in {path.name}):")
-        print(f"  {'PACKAGE':<34} INSTALLED")
-        print(f"  {'-' * 48}")
-        missing = 0
+        print(f"  {'PACKAGE':<34} {'INSTALLED':<12} STATE")
+        print(f"  {'-' * 56}")
+        drifted = 0
         for t in targets:
-            try:
-                print(f"  {t['package']:<34} ✓ {md.version(t['package'])}")
-            except md.PackageNotFoundError:
-                missing += 1
-                print(f"  {t['package']:<34} ✗ not installed")
-        print(f"\n  → {'manifest satisfied' if not missing else f'{missing} missing — run: kestrel feature sync'}")
+            if t["action"] == "present":
+                print(f"  {t['package']:<34} {'✓ ' + t['current']:<12} ok")
+            elif t["action"] == "install":
+                drifted += 1
+                print(f"  {t['package']:<34} {'✗ —':<12} not installed")
+            else:  # reinstall / ensure — installed but not matching the manifest
+                drifted += 1
+                ver = ("✓ " + t["current"]) if t["current"] else "✗ —"
+                print(f"  {t['package']:<34} {ver:<12} needs {t['action']}")
+        if drifted:
+            print(f"\n  → {drifted} package(s) drift from the manifest — run: kestrel feature sync")
+        else:
+            print("\n  → manifest satisfied")
     else:
         print(f"No host manifest at {path}. Run `kestrel feature sync --capture` to create one.")
 

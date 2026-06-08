@@ -26,17 +26,16 @@ def fake_registry(monkeypatch):
     registry = {
         "github": _info("github", "kestrel-feature-github", ["GitHubFeature"]),
         "voice": _info("voice", "kestrel-feature-voice", ["VoiceFeature"]),
-        "voice_openai": _info("voice_openai", "kestrel-voice-openai", []),  # provider, no class
+        # Provider: registry lists provider classes under `features`, none of
+        # which end in "Feature" — so it must NOT be treated as a per-agent feature.
+        "voice_openai": _info(
+            "voice_openai", "kestrel-voice-openai",
+            ["OpenAITTSProvider", "OpenAISTTProvider"],
+        ),
     }
     import kestrel_sovereign.feature_registry as fr
 
     monkeypatch.setattr(fr, "load_registry", lambda: registry)
-    # Control which classes count as real features (entry-point group) so the
-    # provider-vs-feature split is deterministic regardless of the test venv.
-    monkeypatch.setattr(
-        fr, "_get_installed_entrypoint_classes",
-        lambda: {"VoiceFeature", "GitHubFeature"},
-    )
     return registry
 
 
@@ -110,6 +109,23 @@ def test_query_agent_feature_catalog_network_error_returns_none(monkeypatch):
 
     monkeypatch.setattr(httpx, "get", boom)
     assert cli._query_agent_feature_catalog("http://x", "") is None
+
+
+@pytest.mark.parametrize("payload", [[], "nope", {"features": None}, {"features": ["x", 1]}])
+def test_query_agent_feature_catalog_malformed_json_never_crashes(monkeypatch, payload):
+    import httpx
+
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return payload
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Resp())
+    # Non-dict / null-features → None; a list with junk entries → {} (no crash).
+    result = cli._query_agent_feature_catalog("http://x", "")
+    assert result is None or result == {}
 
 
 # --- install section -------------------------------------------------------
@@ -190,6 +206,54 @@ def test_status_provider_has_no_per_agent_column(monkeypatch, fake_registry, tmp
     assert rc == 0
     assert "kestrel-voice-openai" in out  # shown in install section
     assert "no loadable feature packages in the manifest" in out  # no per-agent columns
+
+
+def test_status_install_editable_mismatch_flags_drift(monkeypatch, fake_registry, tmp_path, capsys):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname="kestrel-feature-voice"\neditable="/want/voice"\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.2.1"})  # installed...
+    monkeypatch.setattr(cli, "_editable_install_path", lambda d: "/other/voice")  # ...wrong checkout
+    _fake_host(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_detect_running_agent_server", lambda *a: None)
+
+    rc = cli.cmd_feature_status(_args(manifest))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "needs reinstall" in out
+    assert "drift from the manifest" in out
+
+
+def test_status_install_extras_flags_ensure(monkeypatch, fake_registry, tmp_path, capsys):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname="kestrel-feature-voice"\nextras=["local"]\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.2.1"})  # base present, extras unprobed
+    _fake_host(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_detect_running_agent_server", lambda *a: None)
+
+    rc = cli.cmd_feature_status(_args(manifest))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "needs ensure" in out
+
+
+def test_status_uninstalled_feature_still_gets_agent_row(monkeypatch, fake_registry, tmp_path, capsys):
+    # Feature declared + registry-known but NOT installed: must still appear as a
+    # per-agent column (classification is registry-based, not install-based).
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname="kestrel-feature-voice"\n')
+    _versions(monkeypatch, {})  # not installed
+    _fake_host(monkeypatch, tmp_path, agents=("Emma",))
+    monkeypatch.setattr(cli, "_detect_running_agent_server", lambda *a: ("http://h/api/agents/Emma", "k"))
+    monkeypatch.setattr(cli, "_query_agent_feature_catalog", lambda b, k: {})  # agent has none
+
+    rc = cli.cmd_feature_status(_args(manifest))
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "voice" in out          # column present despite not installed
+    assert "✗ —" in out            # Emma doesn't have it loaded
 
 
 def test_status_specific_agent_not_found(monkeypatch, fake_registry, tmp_path, capsys):
