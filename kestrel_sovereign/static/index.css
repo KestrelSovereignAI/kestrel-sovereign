@@ -1112,6 +1112,50 @@ nav {
     border-radius: 8px;
     overflow-x: auto;
     margin: 0.5rem 0;
+    /* Anchor for the absolutely-positioned copy button (#1574). */
+    position: relative;
+}
+
+/* Copy-to-clipboard button on fenced code blocks (#1574). Hover-reveal on
+ * fine pointers; always visible on touch/coarse pointers where there is no
+ * hover. Sits top-right, inside the pre's padding box. */
+.code-copy-btn {
+    position: absolute;
+    top: 0.4rem;
+    right: 0.4rem;
+    padding: 0.15rem 0.5rem;
+    font-family: var(--font-sans, inherit);
+    font-size: 0.72rem;
+    line-height: 1.4;
+    color: var(--code-text, #e2e8f0);
+    background: rgba(125, 125, 140, 0.22);
+    border: 1px solid rgba(125, 125, 140, 0.40);
+    border-radius: 5px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.12s ease, background 0.12s ease;
+    z-index: 1;
+}
+
+.message-content pre:hover .code-copy-btn,
+.code-copy-btn:focus-visible {
+    opacity: 1;
+}
+
+.code-copy-btn:hover {
+    background: rgba(125, 125, 140, 0.38);
+}
+
+.code-copy-btn--ok {
+    color: #4ade80;
+    border-color: rgba(74, 222, 128, 0.5);
+}
+
+/* No hover on touch/coarse pointers — keep the button reachable. */
+@media (hover: none), (pointer: coarse) {
+    .code-copy-btn {
+        opacity: 0.7;
+    }
 }
 
 .message-content code {
