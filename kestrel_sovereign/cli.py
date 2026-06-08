@@ -1513,6 +1513,7 @@ def cmd_feature(args) -> int:
         "list": cmd_feature_list,
         "install": cmd_feature_install,
         "upgrade": cmd_feature_upgrade,
+        "sync": cmd_feature_sync,
         "enable": cmd_feature_enable,
         "disable": cmd_feature_disable,
         "info": cmd_feature_info,
@@ -1522,7 +1523,10 @@ def cmd_feature(args) -> int:
 
     handler = feature_commands.get(args.feature_command)
     if handler is None:
-        print("Usage: kestrel feature {list|install|upgrade|enable|disable|info|scaffold|skills}")
+        print(
+            "Usage: kestrel feature "
+            "{list|install|upgrade|sync|enable|disable|info|scaffold|skills}"
+        )
         return 1
     return handler(args)
 
@@ -1793,6 +1797,222 @@ def cmd_feature_upgrade(args) -> int:
         print(f"  {upgraded} package(s) upgraded.")
         if upgraded:
             print("  Restart the host/agents to load the upgraded code.")
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# `kestrel feature sync` — the restore counterpart to `feature upgrade`.
+#
+# `feature upgrade` discovers packages from their *live* entry-points, which is
+# perfect for upgrading but useless for restoring: once `uv sync` (or any
+# environment rebuild) prunes an out-of-tree feature package, its entry-point
+# is gone and there is nothing left to discover. `feature sync` closes that gap
+# by reading a host-local manifest of the packages this host should keep
+# installed and reinstalling whatever is missing — without ever declaring
+# features in pyproject.toml (which would invert the open-core dependency
+# direction).
+# ---------------------------------------------------------------------------
+
+DEFAULT_HOST_MANIFEST = ".kestrel-host-features.toml"
+
+
+def _host_manifest_path(args) -> Path:
+    """Resolve the host manifest path (``--manifest`` override or default)."""
+    override = getattr(args, "manifest", None)
+    if override:
+        return Path(override).expanduser()
+    return Path.cwd() / DEFAULT_HOST_MANIFEST
+
+
+def _load_host_manifest(path: Path) -> list:
+    """Parse a host manifest into a list of feature entry dicts.
+
+    Schema (TOML)::
+
+        [[feature]]
+        name = "voice"                 # registry name or raw dist/package name
+        editable = "/path/to/checkout" # optional: install -e from here
+        extras = ["local"]             # optional extras
+
+    Raises ``ValueError`` on a malformed entry so the caller can report it.
+    """
+    try:
+        import tomllib  # Python 3.11+
+    except ModuleNotFoundError:  # pragma: no cover - 3.10 and earlier
+        import tomli as tomllib  # type: ignore
+
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+
+    entries = data.get("feature", [])
+    if not isinstance(entries, list):
+        raise ValueError("manifest '[[feature]]' must be an array of tables")
+
+    cleaned = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not entry.get("name"):
+            raise ValueError(f"manifest feature #{i + 1} is missing a 'name'")
+        cleaned.append(
+            {
+                "name": str(entry["name"]),
+                "editable": entry.get("editable"),
+                "extras": list(entry.get("extras", []) or []),
+            }
+        )
+    return cleaned
+
+
+def _pip_spec(target: str, extras: list) -> str:
+    """Render a pip requirement spec with optional extras (``pkg[a,b]``)."""
+    return f"{target}[{','.join(extras)}]" if extras else target
+
+
+def _extension_install_run(pip_args: list):
+    """Install via uv when available, else the interpreter's own pip.
+
+    uv-created virtualenvs frequently ship without ``pip``, so a bare
+    ``python -m pip`` would fail. Prefer ``uv pip install --python <interp>``
+    (pinned to *this* interpreter so a worktree can't retarget the wrong env),
+    and fall back to ``python -m pip install`` only when uv isn't on PATH.
+    """
+    import shutil
+
+    if shutil.which("uv"):
+        cmd = ["uv", "pip", "install", "--python", sys.executable, *pip_args]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", *pip_args]
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _capture_host_manifest(path: Path) -> int:
+    """Snapshot currently-installed extension packages into a manifest.
+
+    Reuses the same live-entry-point discovery as ``feature upgrade`` so the
+    host never hand-authors the file. Editable installs are recorded with
+    their checkout path; extras can't be recovered from metadata, so the user
+    adds those by hand if needed.
+    """
+    dists = _installed_extension_distributions()
+
+    lines = [
+        "# Host-local feature manifest for `kestrel feature sync`.",
+        "# Lists the extension packages THIS host should keep installed so they",
+        "# can be restored after `uv sync` (or any rebuild) prunes them.",
+        "#",
+        "# Regenerate with:  kestrel feature sync --capture",
+        "# Restore with:     kestrel feature sync",
+        "",
+    ]
+    for d in dists:
+        lines.append("[[feature]]")
+        lines.append(f'name = "{d["dist"]}"')
+        if d["editable_path"]:
+            lines.append(f'editable = "{d["editable_path"]}"')
+        lines.append("")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return len(dists)
+
+
+def cmd_feature_sync(args) -> int:
+    """Restore the host's declared feature packages (counterpart to upgrade)."""
+    from kestrel_sovereign.feature_registry import load_registry
+
+    path = _host_manifest_path(args)
+
+    if getattr(args, "capture", False):
+        count = _capture_host_manifest(path)
+        print(f"Captured {count} installed extension package(s) to {path}")
+        return 0
+
+    if not path.exists():
+        print(f"No host manifest at {path}")
+        print("Create one from your current install with:")
+        print("  kestrel feature sync --capture")
+        return 1
+
+    try:
+        entries = _load_host_manifest(path)
+    except (ValueError, OSError) as exc:
+        print(f"Failed to read manifest {path}: {exc}")
+        return 1
+
+    if not entries:
+        print(f"Manifest {path} declares no features. Nothing to sync.")
+        return 0
+
+    registry = load_registry()
+    git_urls = {info.package: info.git for info in registry.values() if info.package}
+    dry_run = getattr(args, "dry_run", False)
+
+    import importlib.metadata as md
+
+    print()
+    print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
+    print(f"  {'-' * 62}")
+
+    rc = 0
+    installed = 0
+    for entry in entries:
+        # Resolve the manifest name to its pip target. Registry names
+        # ("voice") map to their dist ("kestrel-feature-voice"); anything
+        # unknown is treated as a literal package/dist name.
+        pkg = _resolve_feature_name(entry["name"], registry)
+        target = registry[pkg].package if pkg else entry["name"]
+        extras = entry["extras"]
+        editable_want = entry["editable"]
+
+        try:
+            current = md.version(target)
+        except md.PackageNotFoundError:
+            current = None
+
+        if current is None:
+            action = "install"
+        elif editable_want:
+            have = _editable_install_path(target)
+            if have and Path(have).resolve() == Path(editable_want).expanduser().resolve():
+                action = "present"
+            else:
+                action = "reinstall"  # installed, but not editable from the wanted path
+        else:
+            action = "present"
+
+        if action == "present":
+            print(f"  {target:<34} {current or '-':<10} present")
+            continue
+
+        if dry_run:
+            how = f"-e {editable_want}" if editable_want else "pip"
+            print(f"  {target:<34} {current or '-':<10} would {action} ({how})")
+            continue
+
+        if editable_want:
+            pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
+        else:
+            pip_args = [_pip_spec(target, extras)]
+
+        result = _extension_install_run(pip_args)
+        # Registry-backed packages can fall back to their git URL (mirrors
+        # `feature install`). Editable installs have no remote fallback.
+        if result.returncode != 0 and not editable_want and git_urls.get(target):
+            result = _extension_install_run([f"git+{git_urls[target]}"])
+
+        if result.returncode != 0:
+            rc = 1
+            print(f"  {target:<34} {current or '-':<10} FAILED")
+            for line in (result.stderr or "").strip().splitlines()[-3:]:
+                print(f"      {line}")
+            continue
+
+        installed += 1
+        print(f"  {target:<34} {current or '-':<10} {action}ed")
+
+    print()
+    if not dry_run:
+        print(f"  {installed} package(s) installed/restored.")
+        if installed:
+            print("  Restart the host/agents to load the synced features.")
     return rc
 
 
@@ -2358,7 +2578,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_p.add_argument("--set-port", type=int, help="Set port")
     config_p.add_argument("--set-name", type=str, help="Set name")
 
-    # kestrel feature {list|install|enable|disable|info|scaffold|skills}
+    # kestrel feature {list|install|upgrade|sync|enable|disable|info|scaffold|skills}
     feature_p = subparsers.add_parser("feature", help="Manage features")
     feature_sub = feature_p.add_subparsers(dest="feature_command")
 
@@ -2380,6 +2600,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Show what would be upgraded without changing anything",
+    )
+
+    feat_sync = feature_sub.add_parser(
+        "sync",
+        help="Restore the host's declared feature packages (counterpart to upgrade)",
+    )
+    feat_sync.add_argument(
+        "--manifest",
+        default=None,
+        help=f"Path to the host manifest (default: ./{DEFAULT_HOST_MANIFEST})",
+    )
+    feat_sync.add_argument(
+        "--capture",
+        action="store_true",
+        help="Write the manifest from currently-installed extension packages",
+    )
+    feat_sync.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be installed/restored without changing anything",
     )
 
     feat_enable = feature_sub.add_parser("enable", help="Enable a disabled feature")
