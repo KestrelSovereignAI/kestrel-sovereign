@@ -87,6 +87,13 @@ export async function loadCommands(apiModule) {
 //   {
 //     element: HTMLDivElement,         // detached pane container
 //     generation: number,               // bumped on within-agent context change
+//     activeTurnId: number,              // #1573: monotonic per-turn token. Bumped when a
+//                                        //   turn is dispatched; the streaming loop captures
+//                                        //   it and only paints/recreates/tears down the
+//                                        //   pane's stream bubble while it still owns the
+//                                        //   turn. Stops a prior (e.g. interrupted) turn's
+//                                        //   still-unwinding loop from welding its text into
+//                                        //   the next turn's bubble.
 //     streamingMsgDiv: HTMLDivElement|null,
 //     fullContent: string,
 //     thinkingItems: Array,             // UI-only thought bubbles for current stream
@@ -181,6 +188,7 @@ export function getOrCreateChatPane(agentName) {
     pane = {
         element,
         generation: 0,
+        activeTurnId: 0,
         streamingMsgDiv: null,
         fullContent: '',
         thinkingItems: [],

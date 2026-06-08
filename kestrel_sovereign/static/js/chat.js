@@ -1390,6 +1390,38 @@ export async function sendMessage(overrideText, overrideAgent) {
         await stopAgent(dispatchAgent);
     }
 
+    // #1573: claim this turn's ownership of the pane's stream paint
+    // state. `generation` only bumps on a *conversation* change, so two
+    // turns of the SAME conversation (the interrupt case: type a steer
+    // mid-stream, the prior turn aborts while the new one starts) share
+    // `pane.streamingMsgDiv`/`pane.streamBaseline`. The prior turn's
+    // loop is still unwinding when the new turn opens its bubble —
+    // `await stopAgent` aborts the fetch but does NOT await the prior
+    // loop's `finally` — so a trailing paint from the prior turn lands
+    // in the NEW bubble, welding "…org chart.You're right." into one
+    // turn with no boundary. A monotonic per-turn token fixes it: the
+    // streaming loop captures `turnId` and only paints/recreates/tears
+    // down the pane bubble while `pane.activeTurnId === turnId`. Bumping
+    // here orphans any still-live prior loop. (Queue mode returned
+    // above without reaching this, so a queued message never orphans
+    // the turn it's waiting on.)
+    const turnId = ++pane.activeTurnId;
+    const ownsStream = () => pane.activeTurnId === turnId;
+
+    // Seal any bubble a prior turn left behind. An interrupted turn's
+    // abort path nulls bookkeeping in its `finally` but never finalizes
+    // its partial bubble, so it lingers with the live `.streaming`
+    // affordance. Strip it (so the partial pre-interrupt turn reads as a
+    // completed bubble) and detach it from the pane so THIS turn opens
+    // its own fresh bubble below it — a hard turn boundary in the live
+    // stream, mirroring the #1560 restart-status boundary.
+    if (pane.streamingMsgDiv) {
+        const staleContent = pane.streamingMsgDiv.querySelector('.message-content');
+        if (staleContent) staleContent.classList.remove('streaming');
+        pane.streamingMsgDiv = null;
+        pane.streamBaseline = 0;
+    }
+
     // Capture the pane-local generation. This dispatch's DOM writes
     // gate on `pane.generation === dispatchGeneration`. Agent switches
     // do NOT bump generation — only within-agent context changes
@@ -1587,13 +1619,16 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // pane is detached (the user is viewing a
                     // different agent). When they come back, the
                     // streaming text is already there.
-                    if (isPaneFresh()) {
+                    // #1573: also gate on `ownsStream()` — a prior
+                    // turn that was interrupted must not paint (or
+                    // recreate) the new turn's bubble while it unwinds.
+                    if (isPaneFresh() && ownsStream()) {
                         // #1560 stream-boundary: if a restart_status
                         // landed mid-stream, ``handleRestartStatus``
                         // nulled ``pane.streamingMsgDiv``; open a
                         // fresh bubble for the post-status remainder
                         // so the lifecycle stays chronological in the
-                        // DOM.
+                        // DOM. (Same-turn — `ownsStream()` still true.)
                         if (!pane.streamingMsgDiv) {
                             pane.streamingMsgDiv = addMessageStreaming(
                                 'agent', pane.element,
@@ -1608,7 +1643,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                         );
                     }
                 }
-                if (isPaneFresh() && pane.streamingMsgDiv) {
+                if (isPaneFresh() && ownsStream() && pane.streamingMsgDiv) {
                     const slice = fullContent.slice(
                         pane.streamBaseline || 0,
                     );
@@ -1667,15 +1702,33 @@ export async function sendMessage(overrideText, overrideAgent) {
             console.warn(`stream error on ${dispatchAgent} (pane stale):`, e.message);
         }
     } finally {
-        pane.streamingMsgDiv = null;
-        pane.streamBaseline = 0;
-        pane.streamRawContentLength = 0;
-        pane.pendingRevise = false;
-        pane.reviseConsumedRequestId = null;
-        state.waitingAgents.delete(dispatchAgent);
+        // #1573: only tear down the pane's stream state if THIS turn
+        // still owns it. A prior interrupted turn's `finally` runs after
+        // the new turn has already claimed the pane and opened its
+        // bubble; without this guard it would null the new turn's
+        // `streamingMsgDiv` (forcing a spurious extra bubble) and reset
+        // its baseline mid-stream. The new turn's own `finally` does the
+        // real teardown when it finishes.
+        if (ownsStream()) {
+            pane.streamingMsgDiv = null;
+            pane.streamBaseline = 0;
+            pane.streamRawContentLength = 0;
+            pane.pendingRevise = false;
+            pane.reviseConsumedRequestId = null;
+            // Busy state is shared per-agent across turns. Only the turn
+            // that still owns the pane may clear it — otherwise a prior
+            // interrupted turn that runs to completion (the no-abort-
+            // controller case in the #1255 note) would un-mark the ACTIVE
+            // new turn as busy: its spinner vanishes and the next send
+            // skips the interrupt path. The newest dispatch always owns,
+            // so the last turn to settle does the real cleanup.
+            state.waitingAgents.delete(dispatchAgent);
+        }
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the
-        // user is currently looking at, not the dispatch agent.
+        // user is currently looking at, not the dispatch agent. (Reflects
+        // `waitingAgents`, so it's correct whether or not this turn just
+        // cleared the agent — an orphaned prior turn leaves it busy.)
         updateThinkingIndicator();
         // Context status touches a global singleton — gate on visible.
         if (isCurrentVisible()) {
@@ -1683,8 +1736,9 @@ export async function sendMessage(overrideText, overrideAgent) {
         }
         // Toast the user when a non-visible agent finishes responding,
         // so a long-running answer on Agent A surfaces while they're
-        // chatting with Agent B. Skipped on aborts and on stale panes.
-        if (!wasAborted && isPaneFresh() && API.getHostAgent() !== dispatchAgent) {
+        // chatting with Agent B. Skipped on aborts, on stale panes, and
+        // on an orphaned prior turn (it's not the real completion).
+        if (ownsStream() && !wasAborted && isPaneFresh() && API.getHostAgent() !== dispatchAgent) {
             const label = dispatchAgent || 'agent';
             Toast.info(`${label} finished responding`);
         }
@@ -1703,7 +1757,11 @@ export async function sendMessage(overrideText, overrideAgent) {
         // finally's own unwind so the queued sendMessage starts from a
         // clean async context instead of re-entering mid-cleanup —
         // the ordering lesson from #1255's review.
-        if (pane.queuedMessage != null) {
+        // #1573: only the owning turn drains the queue. A queued message
+        // is stashed against the turn currently streaming; an orphaned
+        // prior turn's late `finally` must not fire the message the user
+        // queued against the ACTIVE turn.
+        if (ownsStream() && pane.queuedMessage != null) {
             const queued = pane.queuedMessage;
             pane.queuedMessage = null;
             clearQueuedChip(pane);
