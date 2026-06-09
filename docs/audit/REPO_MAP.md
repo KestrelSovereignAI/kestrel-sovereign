@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-08
-**Scope:** 1663 tracked files (1077 `.py`, 300 `.md`, 286 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-09
+**Scope:** 1668 tracked files (1079 `.py`, 300 `.md`, 289 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -21,6 +21,7 @@ Repo entry points and standard project files.
 - **.env.test.example** — —
 - **.gcloudignore** — —
 - **.gitignore** — —
+- **.kestrel-host-features.toml.example** — —
 - **.windsurfrules** — —
 - **AGENTS.md** — Kestrel Sovereign — Agent Instructions — > **🐢 See [docs/TORTOISE_DOCTRINE.md](docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and coding standards.**
 - **CLAUDE.md** — Claude Code Instructions — This file is a pointer for Claude Code.
@@ -1534,8 +1535,10 @@ Repo entry points and standard project files.
 - **tests/frontend/chat_restart_status_dedupe.test.mjs** — (mjs asset)
 - **tests/frontend/chat_revising_event.test.mjs** — (mjs asset)
 - **tests/frontend/chat_ui_generation.test.mjs** — (mjs asset)
+- **tests/frontend/code_copy_button.test.mjs** — (mjs asset)
 - **tests/frontend/effective_session_id.test.mjs** — (mjs asset)
 - **tests/frontend/initial_pane_migration.test.mjs** — (mjs asset)
+- **tests/frontend/interrupt_turn_boundary.test.mjs** — (mjs asset)
 - **tests/frontend/markdown_link_target.test.mjs** — (mjs asset)
 - **tests/frontend/markdown_streaming_autoclose.test.mjs** — (mjs asset)
 - **tests/frontend/model_selector.test.mjs** — (mjs asset)
@@ -1885,6 +1888,10 @@ Repo entry points and standard project files.
   - `def test_argparse_build_defaults()`; `def test_argparse_build_overrides()`; `def test_argparse_run_defaults()`; `def test_argparse_run_overrides()`; `def test_kestrel_cli_registers_docker_remote()`; `def test_cmd_docker_no_subverb_prints_usage(capsys)`; `def test_cmd_docker_remote_no_subverb_prints_usage(capsys)`; `def test_build_invokes_docker_build_with_defaults(monkeypatch)`; `…`
 - **tests/unit/test_cli_feature.py** — Tests for the Feature CLI commands (kestrel feature list/install/enable/disable/info/scaffold/skills).
   - `class TestFeatureList`; `class TestFeatureInstall`; `class TestFeatureEnableDisable`; `class TestFeatureInfo`; `class TestFeatureScaffold`; `class TestFeatureSkills`; `class TestSkillsSearch`; `class TestResolveFeatureName`; `…`
+- **tests/unit/test_cli_feature_status.py** — Tests for `kestrel feature status` — host install + per-agent loaded view.
+  - `def fake_registry(monkeypatch)`; `def test_registry_info_for_resolves_dist_name_and_short_name(fake_registry)`; `def test_query_agent_feature_catalog_parses_status(monkeypatch)`; `def test_query_agent_feature_catalog_network_error_returns_none(monkeypatch)`; `def test_query_agent_feature_catalog_malformed_json_never_crashes(monkeypatch, payload)`; `def test_status_install_satisfied_and_agents_offline(monkeypatch, fake_registry, tmp_path, capsys)`; `def test_status_install_missing_prompts_sync(monkeypatch, fake_registry, tmp_path, capsys)`; `def test_status_per_agent_enabled_vs_installed_drift(monkeypatch, fake_registry, tmp_path, capsys)`; `…`
+- **tests/unit/test_cli_feature_sync.py** — Tests for `kestrel feature sync` — the restore counterpart to `upgrade`.
+  - `def fake_registry(monkeypatch)`; `def test_pip_spec_renders_extras()`; `def test_extension_install_run_prefers_uv(monkeypatch)`; `def test_extension_install_run_falls_back_to_pip(monkeypatch)`; `def test_capture_writes_manifest_from_installed(monkeypatch, tmp_path)`; `def test_sync_missing_manifest_returns_guidance(tmp_path, capsys)`; `def test_sync_installs_missing_package(monkeypatch, fake_registry, tmp_path, capsys)`; `def test_sync_skips_present_package(monkeypatch, fake_registry, tmp_path, capsys)`; `…`
 - **tests/unit/test_cli_feature_upgrade.py** — Tests for `kestrel feature upgrade`.
   - `def fake_registry(monkeypatch)`; `def test_parse_pip_installed_version_extracts_only_matching_package()`; `def test_editable_install_path_reads_direct_url(monkeypatch)`; `def test_upgrade_dry_run_changes_nothing(monkeypatch, fake_registry, capsys)`; `def test_upgrade_skips_editable_and_pip_upgrades_others(monkeypatch, fake_registry, capsys)`; `def test_upgrade_subset_by_name_only_targets_match(monkeypatch, fake_registry, capsys)`; `def test_upgrade_unmatched_name_is_reported(monkeypatch, fake_registry, capsys)`; `def test_upgrade_falls_back_to_git_on_pip_failure(monkeypatch, fake_registry, capsys)`; `…`
 - **tests/unit/test_cli_first_run.py** — Tests for the first-run setup hook in `kestrel start`.
