@@ -234,7 +234,22 @@ class AsyncStorage:
         if not self._initialized:
             await self.initialize()
         return await self.conversation.get_conversation_history(limit, session_id=session_id)
-    
+
+    async def resolve_session_id(self, provided: Optional[str]) -> Optional[str]:
+        """Resolve the effective session_id for an incoming turn — facade delegator.
+
+        Exists on the facade because ``PrivacyEnforcingStorage`` (and the agent
+        stream/invoke endpoints) call ``storage.resolve_session_id`` rather than
+        ``storage.conversation.resolve_session_id``. Without this wrapper the
+        call hits ``AttributeError`` and is swallowed into a ``None`` fallback
+        (#1599), so every turn derives a *new* implicit session (fragmented
+        history) and the chat pane never learns its durable session id — it
+        then requests ``/conversations/undefined``.
+        """
+        if not self._initialized:
+            await self.initialize()
+        return await self.conversation.resolve_session_id(provided)
+
     async def search_conversation(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Search conversation history."""
         if not self._initialized:
