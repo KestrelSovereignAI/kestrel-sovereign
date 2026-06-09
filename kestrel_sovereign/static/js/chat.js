@@ -424,9 +424,18 @@ function trimPartialStreamSentinel(text) {
 // ============================================================================
 
 let _chatRoot = document;
+const _headerActions = [];
 
 export function setChatRoot(el) {
     _chatRoot = el || document;
+}
+
+export function registerHeaderAction(action) {
+    if (!action || !action.id) return;
+    const i = _headerActions.findIndex((a) => a.id === action.id);
+    if (i >= 0) _headerActions[i] = action;
+    else _headerActions.push(action);
+    renderHeaderActions();
 }
 
 function chatComponentApi() {
@@ -436,6 +445,7 @@ function chatComponentApi() {
         renderAgentContentHtml,
         renderToolActivityHtml,
         setChatRoot,
+        registerHeaderAction,
         mountChatPane,
         wipeAgentChatPane,
         initChat,
@@ -478,6 +488,28 @@ function el(id) {
     return _chatRoot === document
         ? document.getElementById(id)
         : _chatRoot.querySelector('#' + id);
+}
+
+function renderHeaderActions() {
+    let slot = el('chat-header-actions');
+    if (!slot) {
+        if (_headerActions.length === 0) return;
+        const root = (_chatRoot === document ? document : _chatRoot);
+        const header = root.querySelector ? root.querySelector('.chat-header') : null;
+        if (!header) return;
+        slot = document.createElement('div');
+        slot.id = 'chat-header-actions';
+        header.appendChild(slot);
+    }
+    slot.innerHTML = '';
+    for (const action of _headerActions) {
+        const btn = document.createElement('button');
+        btn.className = 'chat-header-action';
+        btn.title = action.title || '';
+        btn.innerHTML = (action.icon || '') + (action.label ? ' ' + action.label : '');
+        btn.addEventListener('click', (event) => action.onClick && action.onClick(event));
+        slot.appendChild(btn);
+    }
 }
 
 let chatContainer = null;
@@ -686,6 +718,7 @@ export function initChat() {
     // SSE notifications and context status are loaded after agent selection:
     // - MultiAgent mode: selectAgent() handles both
     // - Standalone mode: app.js init handles both after loadAgents()
+    renderHeaderActions();
 }
 
 // ============================================================================
