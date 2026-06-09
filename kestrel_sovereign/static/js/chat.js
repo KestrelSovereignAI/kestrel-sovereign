@@ -7,6 +7,7 @@ import API from './api.js';
 import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
 
 let _deps = {
+    api: null,
     markdown: null,
     kicon: null,
     ModelSelector: null,
@@ -24,6 +25,7 @@ export function setChatDeps(partial) {
 function deps() {
     const globalWindow = typeof window !== 'undefined' ? window : {};
     return {
+        api: _deps.api || API,
         markdown: _deps.markdown || globalWindow.SharedMarkdown,
         kicon: _deps.kicon || globalWindow.kicon || globalThis.kicon,
         ModelSelector: _deps.ModelSelector || globalWindow.SharedModelSelector,
@@ -566,7 +568,7 @@ export function initChat() {
     // would just no-op against missing nodes, but the explicit gate makes
     // the intent legible and keeps SharedModelSelector / autocomplete from
     // initializing in a host that doesn't render any of it.
-    if (!API.hasCapability('chat')) return;
+    if (!deps().api.hasCapability('chat')) return;
     chatContainer = el('chat-container');
     messageInput = el('message-input');
     sendButton = el('send-button');
@@ -585,7 +587,7 @@ export function initChat() {
     // conversation. In multi_agent mode, the first selectAgent call swaps
     // this pane out via mountChatPane.
     if (chatContainer) {
-        const initialAgent = API.getHostAgent();
+        const initialAgent = deps().api.getHostAgent();
         const initialPane = deps().getOrCreateChatPane(initialAgent);
         // Move existing children (welcome card, demo banners, etc.)
         // into the pane element and clear the container before mount.
@@ -683,9 +685,9 @@ export function connectNotifications() {
     // prompts on still needs the stream open, otherwise the approval
     // modal never fires.  Open the connection if EITHER consumer is
     // active; only skip when none of them are.
-    const needed = API.hasCapability('chat')
-        || API.hasCapability('permissions')
-        || API.hasCapability('audit');
+    const needed = deps().api.hasCapability('chat')
+        || deps().api.hasCapability('permissions')
+        || deps().api.hasCapability('audit');
     if (!needed) return;
     if (notificationEventSource) {
         notificationEventSource.close();
@@ -696,10 +698,10 @@ export function connectNotifications() {
     // automatically. Embedded hosts using a non-API-key auth scheme (e.g.
     // BearerToken) must authenticate /api/agent/notifications/sse via cookie
     // or their own middleware — the host controls that path.
-    const apiKey = API.getApiKey();
+    const apiKey = deps().api.getApiKey();
 
     try {
-        const ssePath = API.buildAgentUrl('/api/agent/notifications/sse');
+        const ssePath = deps().api.buildAgentUrl('/api/agent/notifications/sse');
         const sseUrl = apiKey ? `${ssePath}?api_key=${encodeURIComponent(apiKey)}` : ssePath;
         notificationEventSource = new EventSource(sseUrl);
 
@@ -734,7 +736,7 @@ export function connectNotifications() {
                 const targetRequestId = data && data.request_id;
                 if (!targetRequestId) return;
                 for (const [agentName, pane] of deps().state.chatPanes) {
-                    const paneRequestId = API.getCurrentStreamRequestId(agentName);
+                    const paneRequestId = deps().api.getCurrentStreamRequestId(agentName);
                     if (paneRequestId !== targetRequestId) continue;
                     // Already consumed (likely by the in-band path
                     // landing first) — don't re-arm.
@@ -1189,7 +1191,7 @@ export function disconnectNotifications() {
  * the waiting set changes OR the selected agent changes.
  */
 export function updateThinkingIndicator() {
-    const current = API.getHostAgent();
+    const current = deps().api.getHostAgent();
     const busy = deps().state.waitingAgents.has(current);
     if (thinkingIndicator) {
         thinkingIndicator.style.display = busy ? 'flex' : 'none';
@@ -1231,14 +1233,14 @@ export function refreshAgentThinkingDot(agentName) {
  * control rendered in the sidebar agent list.
  */
 async function stopRequest() {
-    return stopAgent(API.getHostAgent());
+    return stopAgent(deps().api.getHostAgent());
 }
 
 /**
  * Stop a specific agent's in-flight stream. Aborts client-side via
  * the per-agent AbortController, and tells the server to halt by
  * routing the /stop POST to that agent's endpoint (NOT the currently-
- * selected agent's, which is what the un-overloaded API.stop would do).
+ * selected agent's, which is what the un-overloaded deps().api.stop would do).
  *
  * Exposed so the sidebar agent list can render a per-agent stop
  * affordance — clicking "Stop A" while viewing B must reach A's
@@ -1247,7 +1249,7 @@ async function stopRequest() {
 export async function stopAgent(agentName) {
     // #1257: Stop = stop everything. Clear any queued follow-up
     // SYNCHRONOUSLY, before the abort and before the awaited /stop
-    // POST. This must precede every await: if `API.stop()` is slow,
+    // POST. This must precede every await: if `deps().api.stop()` is slow,
     // the in-flight turn's stream can complete (normally — e.g. no
     // abort controller was registered yet, so `wasAborted` stays
     // false) and reach its `finally` with `pane.queuedMessage` still
@@ -1265,23 +1267,23 @@ export async function stopAgent(agentName) {
         clearQueuedChip(pane);
     }
 
-    const abortController = API.getStreamAbortController(agentName);
+    const abortController = deps().api.getStreamAbortController(agentName);
     if (abortController) {
         try { abortController.abort(); } catch (_) { /* noop */ }
     }
 
-    const requestId = API.getCurrentStreamRequestId(agentName);
+    const requestId = deps().api.getCurrentStreamRequestId(agentName);
     try {
         // Pass agentName explicitly so the stop POST hits this agent's
         // endpoint regardless of which agent is currently selected.
-        await API.stop(requestId, agentName);
+        await deps().api.stop(requestId, agentName);
     } catch (e) {
         console.error(`Error stopping request on ${agentName}:`, e);
     }
 
     deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
-    if (agentName === API.getHostAgent()) {
+    if (agentName === deps().api.getHostAgent()) {
         updateThinkingIndicator();
     }
 }
@@ -1347,7 +1349,7 @@ function clearQueuedChip(pane) {
  */
 export function updateComposerModeToggle() {
     if (!composerModeToggle) return;
-    const current = API.getHostAgent();
+    const current = deps().api.getHostAgent();
     const pane = deps().state.chatPanes.get(current);
     const mode = (pane && pane.composerMode) || 'interrupt';
     composerModeToggle.dataset.mode = mode;
@@ -1359,7 +1361,7 @@ export function updateComposerModeToggle() {
 
 /** Toggle the mounted agent's send-while-busy mode (per-pane). */
 function toggleComposerMode() {
-    const pane = deps().getOrCreateChatPane(API.getHostAgent());
+    const pane = deps().getOrCreateChatPane(deps().api.getHostAgent());
     pane.composerMode = pane.composerMode === 'queue' ? 'interrupt' : 'queue';
     updateComposerModeToggle();
 }
@@ -1391,7 +1393,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // must always land in the agent it was dispatched against.
     const dispatchAgent = overrideAgent !== undefined
         ? overrideAgent
-        : API.getHostAgent();
+        : deps().api.getHostAgent();
     if (!text) return;
 
     const pane = deps().getOrCreateChatPane(dispatchAgent);
@@ -1493,7 +1495,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // used to gate global-singleton updates (model selector, footer).
     const isPaneFresh = () => pane.generation === dispatchGeneration;
     const isCurrentVisible = () =>
-        isPaneFresh() && API.getHostAgent() === dispatchAgent;
+        isPaneFresh() && deps().api.getHostAgent() === dispatchAgent;
 
     let wasAborted = false;
 
@@ -1538,7 +1540,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                 // no visible char after it; consumed when the next
                 // packet's leading visible text is welded onto fullContent.
                 let pendingReviseBoundary = false;
-                for await (const rawChunk of API.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
+                for await (const rawChunk of deps().api.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
                     let processable = merged;
@@ -1583,7 +1585,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                         // Mark this request's revise as consumed so a
                         // delayed SSE arriving after the in-band path is
                         // treated as a no-op.
-                        const rid = API.getCurrentStreamRequestId(dispatchAgent);
+                        const rid = deps().api.getCurrentStreamRequestId(dispatchAgent);
                         if (rid) pane.reviseConsumedRequestId = rid;
                     }
                     // A legacy SSE revising event can still arrive before
@@ -1642,7 +1644,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // pane.sessionId was null — never overwrite an
                     // explicit user-clicked conversation.
                     if (!learnedSessionId && !pane.sessionId) {
-                        const effective = API.getEffectiveSessionId(dispatchAgent);
+                        const effective = deps().api.getEffectiveSessionId(dispatchAgent);
                         if (effective) {
                             pane.sessionId = effective;
                         }
@@ -1701,7 +1703,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // unprefixed invoke() routes via the currently
                     // selected agent and would land on the wrong
                     // backend if the user has switched.
-                    const response = await API.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+                    const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
                     if (response && response.session_id && !pane.sessionId) {
                         pane.sessionId = response.session_id;
                     }
@@ -1716,7 +1718,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                 }
             }
         } else {
-            const response = await API.invokeForAgent(text, null, sessionId, null, dispatchAgent);
+            const response = await deps().api.invokeForAgent(text, null, sessionId, null, dispatchAgent);
             if (response && response.session_id && !pane.sessionId) {
                 pane.sessionId = response.session_id;
             }
@@ -1772,7 +1774,7 @@ export async function sendMessage(overrideText, overrideAgent) {
         // so a long-running answer on Agent A surfaces while they're
         // chatting with Agent B. Skipped on aborts, on stale panes, and
         // on an orphaned prior turn (it's not the real completion).
-        if (ownsStream() && !wasAborted && isPaneFresh() && API.getHostAgent() !== dispatchAgent) {
+        if (ownsStream() && !wasAborted && isPaneFresh() && deps().api.getHostAgent() !== dispatchAgent) {
             const label = dispatchAgent || 'agent';
             deps().toast.info(`${label} finished responding`);
         }
@@ -1833,7 +1835,7 @@ export async function updateContextStatus() {
     // #879: context-status footer is part of the chat surface.  No-op when
     // the host opted out so /api/agent/context-status isn't called on every
     // conversation change.
-    if (!API.hasCapability('chat')) return;
+    if (!deps().api.hasCapability('chat')) return;
     try {
         if (!contextStatusElement) {
             createContextStatusElement();
@@ -1850,7 +1852,7 @@ export async function updateContextStatus() {
             return;
         }
 
-        const status = await API.getContextStatus(sessionId);
+        const status = await deps().api.getContextStatus(sessionId);
         const { message_count, utilization_percent, status: contextState, warnings, route_cap } = status;
 
         // Color based on utilization
@@ -2028,7 +2030,7 @@ window.openContextBreakdownPopup = async function () {
 
     let status;
     try {
-        status = await API.getContextStatus(sessionId, { full: true });
+        status = await deps().api.getContextStatus(sessionId, { full: true });
     } catch (e) {
         // Backend error.detail from a non-OK response is surfaced as
         // ``e.message`` by the API client; that string is **not**
@@ -2509,7 +2511,7 @@ export async function addMessage(role, content, paneElement = null) {
  */
 export async function loadModels() {
     // #879: model selector lives in the chat header — skip when chat is off.
-    if (!API.hasCapability('chat')) return;
+    if (!deps().api.hasCapability('chat')) return;
     // Check if SharedModelSelector is available (loaded via script tag)
     const ModelSelector = deps().ModelSelector;
     if (!ModelSelector) {
@@ -2532,15 +2534,15 @@ export async function loadModels() {
     }
 
     // Create the shared model selector instance
-    // Use API.buildAgentUrl() for proper multi_agent routing and pass auth headers
+    // Use deps().api.buildAgentUrl() for proper multi_agent routing and pass auth headers
     sharedModelSelector = new ModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',
         modelSelectId: 'model-selector',
-        apiEndpoint: API.buildAgentUrl('/api/models'),
-        currentModelEndpoint: API.buildAgentUrl('/api/model/current'),
-        storagePrefix: `kestrel_${API.getHostAgent() || 'default'}`,
-        getAuthHeader: async () => await API.applyAuth({}),
+        apiEndpoint: deps().api.buildAgentUrl('/api/models'),
+        currentModelEndpoint: deps().api.buildAgentUrl('/api/model/current'),
+        storagePrefix: `kestrel_${deps().api.getHostAgent() || 'default'}`,
+        getAuthHeader: async () => await deps().api.applyAuth({}),
         onModelChange: async (vendor, model, isInitialLoad, route) => {
             if (isInitialLoad) return;
 
@@ -2552,7 +2554,7 @@ export async function loadModels() {
             //
             // We capture the host agent at dispatch time and discard the
             // response if the user has switched agents before it lands.
-            const dispatchAgent = API.getHostAgent();
+            const dispatchAgent = deps().api.getHostAgent();
 
             // Persist vendor/route/model in chat state immediately so the UI
             // reflects the user's intent without waiting for the round-trip.
@@ -2563,10 +2565,10 @@ export async function loadModels() {
 
             const body = { vendor, model };
             if (route) body.route = route;
-            const headers = await API.applyAuth({ 'Content-Type': 'application/json' });
+            const headers = await deps().api.applyAuth({ 'Content-Type': 'application/json' });
 
             try {
-                const resp = await fetch(API.buildAgentUrl('/api/model/set'), {
+                const resp = await fetch(deps().api.buildAgentUrl('/api/model/set'), {
                     method: 'POST',
                     headers,
                     body: JSON.stringify(body),
@@ -2575,7 +2577,7 @@ export async function loadModels() {
                     console.warn(`set model failed (${dispatchAgent}): HTTP ${resp.status}`);
                     return;
                 }
-                if (API.getHostAgent() !== dispatchAgent) {
+                if (deps().api.getHostAgent() !== dispatchAgent) {
                     // User switched agents before the server acked. Silently
                     // succeed — the change on dispatchAgent is persisted; don't
                     // overwrite the NEW agent's state.
@@ -2607,9 +2609,9 @@ export async function loadModels() {
     // (the selector stays usable).
     (async () => {
         try {
-            const headers = await API.applyAuth({});
+            const headers = await deps().api.applyAuth({});
             const resp = await fetch(
-                API.buildAgentUrl('/voice/realtime/route'),
+                deps().api.buildAgentUrl('/voice/realtime/route'),
                 { headers },
             );
             if (!resp.ok) return;
@@ -2843,7 +2845,7 @@ window.clearChat = function() {
     // Clear ONLY the visible agent's pane and bump that agent's
     // pane-local generation. Other agents' panes (and their in-flight
     // streams) are untouched.
-    wipeAgentChatPane(API.getHostAgent(), `
+    wipeAgentChatPane(deps().api.getHostAgent(), `
         <div class="message agent-message">
             <div class="message-content">
                 <p>Hello! I am your Kestrel AI agent, bound by the Kestrel Constitution to be your truthful and honorable assistant. How can I help you today?</p>
