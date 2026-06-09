@@ -136,11 +136,34 @@ kestrel health                       # Check prerequisites
 kestrel create MyAgent               # Create a new agent
 kestrel start MyAgent                # Start an agent
 kestrel stop MyAgent                 # Stop an agent
+kestrel restart MyAgent              # Restart (stop then start)
+kestrel update [MyAgent]             # Pull + install + feature sync + restart (see below)
 kestrel status                       # Show all running agents
 kestrel list                         # List available agents
 kestrel shell MyAgent                # CLI chat interface
 kestrel config ./agent_data/MyAgent  # Show agent config
 ```
+
+#### Pulling in upstream changes (`kestrel update`)
+
+Replaces the four-step ritual `git pull && uv pip install -e . && kestrel feature sync && kestrel restart` with one verb:
+
+```bash
+kestrel update                       # pull + install + feature sync + restart all agents
+kestrel update Emma                  # same, but only restart the named agent
+kestrel update --dry-run             # preview the steps without mutating anything
+kestrel update --no-pull --no-install # only feature sync + restart (e.g. after a manual checkout)
+kestrel update --allow-dirty         # pull even with uncommitted changes in the working tree
+kestrel update --no-deps             # pass --no-deps to `uv pip install` for the fast path
+kestrel update --continue-on-error   # restart even if `feature sync` reports an error
+```
+
+Safety:
+
+- `git pull --ff-only` so a non-fast-forward upstream aborts instead of producing a surprise merge.
+- Refuses to pull when the working tree is dirty unless `--allow-dirty` is passed.
+- Any step's failure short-circuits the rest, so a half-applied update never reaches the restart phase.
+- If `kestrel-sovereign` was installed from PyPI (no editable source checkout discoverable from the package's `__file__`), both `pull` AND `install` are silently skipped — `feature sync` and `restart` still run. Upgrade the package itself with `pip install --upgrade kestrel-sovereign` and then re-run `kestrel update` to pick up the new feature manifest and restart agents.
 
 ### Feature management (`kestrel feature`)
 

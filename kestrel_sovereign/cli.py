@@ -38,7 +38,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from kestrel_sovereign import __version__
 from kestrel_sovereign.multi_agent.config import (
@@ -400,6 +400,323 @@ def cmd_restart(args) -> int:
         return rc
     print()
     return cmd_start(args)
+
+
+def _resolve_source_checkout() -> Optional[Path]:
+    """Find the editable source checkout of ``kestrel_sovereign``, if any.
+
+    Returns the directory containing ``pyproject.toml`` + ``.git`` for
+    the running package, or ``None`` when running from a PyPI install
+    (no accessible source tree).
+
+    Distinct from ``_get_project_dir()`` — that returns the runtime
+    data root (honoring ``KESTREL_HOME``), which is the wrong place
+    for ``git pull`` and ``uv pip install -e .`` (codex review round
+    2 P1). On a configured deployment with ``KESTREL_HOME=/data`` set,
+    the data root is NOT a git checkout and has no pyproject; we have
+    to introspect the actual installed package's location instead.
+    """
+    try:
+        import kestrel_sovereign as _ks_pkg
+    except Exception:  # noqa: BLE001
+        return None
+    pkg_file = getattr(_ks_pkg, "__file__", None)
+    if not pkg_file:
+        return None
+    # In an editable install, pkg_dir is e.g.
+    # /Volumes/.../kestrel-sovereign/kestrel_sovereign — and its
+    # parent is the source checkout root.
+    candidate = Path(pkg_file).resolve().parent.parent
+    if not candidate.exists():
+        return None
+    if (
+        (candidate / "pyproject.toml").exists()
+        and (candidate / ".git").exists()
+    ):
+        return candidate
+    return None
+
+
+class _GitFailedError(RuntimeError):
+    """Raised by ``_git_working_tree_dirty`` when the project IS a git
+    checkout but ``git status`` itself failed (missing git binary,
+    dubious-ownership refusal, etc.). Distinct from
+    "not a git checkout" so the caller can surface the real cause
+    instead of silently skipping the pull (codex review round 1 P2)."""
+
+
+def _project_dir_is_git(project_dir: Path) -> bool:
+    """Filesystem-only check: does the project look like a git checkout?
+
+    A separate function from ``_git_working_tree_dirty`` so the caller
+    can distinguish "pip-installed user, no checkout, silently skip the
+    pull" from "real checkout but git itself failed, surface it" —
+    codex review #1 P2.
+    """
+    return (project_dir / ".git").exists()
+
+
+def _git_working_tree_dirty(project_dir: Path) -> bool:
+    """Return True if there are uncommitted changes, False if clean.
+
+    Raises :class:`_GitFailedError` when git itself fails — the caller
+    must NOT continue silently with the rest of the update pipeline
+    because a real checkout with a broken git is a different
+    condition from a pip-installed user with no checkout. Use
+    :func:`_project_dir_is_git` upstream to detect the latter.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        raise _GitFailedError(f"git not available: {exc}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip() or (
+            f"git status exited {result.returncode}"
+        )
+        raise _GitFailedError(detail)
+    return bool(result.stdout.strip())
+
+
+def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
+    """Run ``git pull --ff-only`` in ``project_dir``. Returns
+    ``(returncode, combined_output)``."""
+    try:
+        result = subprocess.run(
+            ["git", "pull", "--ff-only"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 1, f"git not available: {exc}"
+    out = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, out
+
+
+def _run_uv_pip_install_editable(project_dir: Path, no_deps: bool) -> Tuple[int, str]:
+    """Run ``uv pip install -e .`` against the venv that owns this
+    process — NOT just whatever uv resolves on its own.
+
+    Pinning ``--python sys.executable`` mirrors what
+    ``_extension_install_run`` (used by ``feature install/upgrade``)
+    does and prevents a footgun where uv installs into a different
+    environment than the one running ``kestrel``, leaving the
+    subsequent ``kestrel restart`` with the OLD install (codex review
+    round 1 P1).
+    """
+    cmd = ["uv", "pip", "install", "--python", sys.executable]
+    if no_deps:
+        cmd.append("--no-deps")
+    cmd.extend(["-e", "."])
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 1, f"uv not available: {exc}"
+    out = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, out
+
+
+def cmd_update(args) -> int:
+    """One-shot ``git pull`` + ``uv pip install -e .`` +
+    ``kestrel feature sync`` + ``kestrel restart``.
+
+    Each step can be skipped via a ``--no-<step>`` flag, and
+    ``--dry-run`` previews without mutating anything.
+
+    Safety:
+      - A dirty working tree refuses the pull unless ``--allow-dirty``.
+      - ``git pull --ff-only`` so a non-fast-forward upstream aborts
+        cleanly instead of producing a surprise merge commit.
+      - Any failure short-circuits the remaining steps so a
+        half-applied update doesn't get restarted into.
+      - ``--continue-on-error`` lets ``feature sync`` fail without
+        skipping the restart (useful when a single optional feature
+        package is temporarily unreachable).
+    """
+    # _get_project_dir() returns the RUNTIME data root (honors
+    # KESTREL_HOME) which is the wrong place for git pull and
+    # uv pip install -e . — use the actual editable source checkout
+    # the package lives in (codex review round 2 P1). The runtime
+    # data root only matters for the feature-sync manifest lookup.
+    project_dir = _get_project_dir()
+    source_checkout = _resolve_source_checkout()
+    dry_run = bool(getattr(args, "dry_run", False))
+    pull = bool(getattr(args, "pull", True))
+    install = bool(getattr(args, "install", True))
+    features = bool(getattr(args, "features", True))
+    restart = bool(getattr(args, "restart", True))
+    allow_dirty = bool(getattr(args, "allow_dirty", False))
+    no_deps = bool(getattr(args, "no_deps", False))
+    continue_on_error = bool(getattr(args, "continue_on_error", False))
+
+    target = getattr(args, "name", None)
+    target_label = target if target else "all agents"
+
+    print(f"kestrel update → project: {project_dir}")
+    if source_checkout:
+        print(f"  source checkout: {source_checkout}")
+    else:
+        print("  source checkout: (none — PyPI-installed, "
+              "pull/install will be skipped)")
+    print(
+        "  steps: "
+        f"pull={pull} install={install} "
+        f"features={features} restart={restart}"
+    )
+    print(f"  target: {target_label}{' [DRY-RUN]' if dry_run else ''}")
+    print()
+
+    # Step 1: git pull --ff-only against the source checkout (NOT the
+    # data root, which may be a non-git KESTREL_HOME).
+    if pull:
+        if source_checkout is None:
+            print(
+                "• pull: skipped (no editable source checkout — "
+                "kestrel_sovereign is installed from PyPI)"
+            )
+        elif not _project_dir_is_git(source_checkout):
+            # Defensive: _resolve_source_checkout already checked for
+            # .git, but if it disappeared between resolution and now
+            # treat as non-checkout rather than erroring.
+            print("• pull: skipped (source checkout has no .git)")
+        else:
+            try:
+                dirty = _git_working_tree_dirty(source_checkout)
+            except _GitFailedError as exc:
+                print(
+                    f"• pull: FAILED — git status errored ({exc}). "
+                    "Aborting before install/sync/restart.",
+                    file=sys.stderr,
+                )
+                return 1
+            if dirty and not allow_dirty:
+                print(
+                    "• pull: REFUSED — working tree is dirty. "
+                    "Commit/stash first, or pass --allow-dirty.",
+                    file=sys.stderr,
+                )
+                return 2
+            if dry_run:
+                print(
+                    f"• pull: would run `git pull --ff-only` "
+                    f"in {source_checkout}"
+                )
+            else:
+                print(f"• pull: git pull --ff-only ({source_checkout})")
+                rc, out = _run_git_pull(source_checkout)
+                if rc != 0:
+                    print(out.rstrip(), file=sys.stderr)
+                    print(
+                        "• pull: FAILED — aborting before "
+                        "install/sync/restart.",
+                        file=sys.stderr,
+                    )
+                    return rc
+                if out.strip():
+                    for line in out.rstrip().splitlines():
+                        print(f"    {line}")
+    else:
+        print("• pull: skipped (--no-pull)")
+
+    # Step 2: uv pip install -e . against the source checkout.
+    # Can't editable-install from a non-source-checkout location, so
+    # skip with a clear note when running from a PyPI install.
+    if install:
+        if source_checkout is None:
+            print(
+                "• install: skipped (no editable source checkout — "
+                "use `pip install --upgrade kestrel-sovereign` "
+                "to update a PyPI install)"
+            )
+        else:
+            cmd_label = (
+                "uv pip install"
+                + (" --no-deps" if no_deps else "")
+                + " -e ."
+            )
+            if dry_run:
+                print(
+                    f"• install: would run `{cmd_label}` "
+                    f"in {source_checkout}"
+                )
+            else:
+                print(f"• install: {cmd_label} ({source_checkout})")
+                rc, out = _run_uv_pip_install_editable(
+                    source_checkout, no_deps=no_deps,
+                )
+                if rc != 0:
+                    print(out.rstrip(), file=sys.stderr)
+                    print(
+                        "• install: FAILED — aborting before sync/restart.",
+                        file=sys.stderr,
+                    )
+                    return rc
+                tail = [
+                    ln for ln in out.rstrip().splitlines() if ln.strip()
+                ][-3:]
+                for line in tail:
+                    print(f"    {line}")
+    else:
+        print("• install: skipped (--no-install)")
+
+    # Step 3: kestrel feature sync.
+    if features:
+        if dry_run:
+            print("• features: would run `kestrel feature sync`")
+        else:
+            print("• features: kestrel feature sync")
+            sync_args = argparse.Namespace(
+                manifest=getattr(args, "manifest", None),
+                capture=False,
+                dry_run=False,
+            )
+            rc = cmd_feature_sync(sync_args)
+            if rc != 0 and not continue_on_error:
+                print(
+                    "• features: FAILED — aborting before restart. "
+                    "Re-run with --continue-on-error to restart anyway.",
+                    file=sys.stderr,
+                )
+                return rc
+    else:
+        print("• features: skipped (--no-features)")
+
+    # Step 4: kestrel restart.
+    if restart:
+        if dry_run:
+            label = f"would run `kestrel restart {target or ''}`".rstrip()
+            print(f"• restart: {label}")
+        else:
+            print(f"• restart: kestrel restart {target or ''}".rstrip())
+            restart_args = argparse.Namespace(
+                name=target,
+                subprocess=bool(getattr(args, "subprocess", False)),
+                force=bool(getattr(args, "force", False)),
+            )
+            rc = cmd_restart(restart_args)
+            if rc != 0:
+                return rc
+    else:
+        print("• restart: skipped (--no-restart)")
+
+    if dry_run:
+        print("\nkestrel update: dry-run complete; no changes made.")
+    else:
+        print("\nkestrel update: done.")
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -2582,6 +2899,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Force-kill existing processes during the stop phase",
     )
 
+    # kestrel update [agent]
+    update_p = subparsers.add_parser(
+        "update",
+        help=(
+            "One-shot: git pull + uv pip install -e . + "
+            "kestrel feature sync + kestrel restart"
+        ),
+    )
+    update_p.add_argument(
+        "name", nargs="?",
+        help="Agent name (omit for all) — only the restart step honors this",
+    )
+    update_p.add_argument(
+        "--no-pull", dest="pull", action="store_false",
+        help="Skip the `git pull --ff-only` step",
+    )
+    update_p.add_argument(
+        "--no-install", dest="install", action="store_false",
+        help="Skip the `uv pip install -e .` step",
+    )
+    update_p.add_argument(
+        "--no-features", dest="features", action="store_false",
+        help="Skip the `kestrel feature sync` step",
+    )
+    update_p.add_argument(
+        "--no-restart", dest="restart", action="store_false",
+        help="Skip the final `kestrel restart` step",
+    )
+    update_p.add_argument(
+        "--allow-dirty", action="store_true",
+        help="Pull even when the working tree has uncommitted changes",
+    )
+    update_p.add_argument(
+        "--no-deps", action="store_true",
+        help="Pass --no-deps to `uv pip install` (skip dependency resolution)",
+    )
+    update_p.add_argument(
+        "--continue-on-error", action="store_true",
+        help="Continue to the restart step if `feature sync` fails",
+    )
+    update_p.add_argument(
+        "--dry-run", action="store_true",
+        help="Preview the steps that would run; mutate nothing",
+    )
+    update_p.add_argument(
+        "--manifest",
+        help=(
+            "Path to a non-default host-features manifest "
+            "(forwarded to `kestrel feature sync`)"
+        ),
+    )
+    update_p.add_argument(
+        "--subprocess", action="store_true",
+        help="Forwarded to `kestrel restart` (run agents as subprocesses)",
+    )
+    update_p.add_argument(
+        "--force", action="store_true",
+        help="Forwarded to `kestrel restart` (force-kill stale processes)",
+    )
+
     # kestrel status
     subparsers.add_parser("status", help="Show status of host and agents")
 
@@ -2982,6 +3359,7 @@ def main() -> int:
         "start": cmd_start,
         "stop": cmd_stop,
         "restart": cmd_restart,
+        "update": cmd_update,
         "status": cmd_status,
         "logs": cmd_logs,
         "list": cmd_list,
