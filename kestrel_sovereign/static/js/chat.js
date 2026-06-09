@@ -1734,9 +1734,12 @@ export async function sendMessage(overrideText, overrideAgent) {
     // Record this turn's current stream phase on the pane (per-agent, like
     // the busy flag) and repaint the indicator only when this dispatch's
     // agent is the one on screen — switching to Agent B mustn't show A's
-    // phase word.
+    // phase word. Gate on ownsStream() like the streaming DOM writes (#1573):
+    // an interrupted prior turn can still process a late chunk while the new
+    // turn streams; without this guard its setStatusPhase would clobber the
+    // active turn's word on the shared pane.
     const setStatusPhase = (phase) => {
-        if (!phase) return;
+        if (!phase || !ownsStream()) return;
         pane.statusPhase = phase;
         if (isCurrentVisible()) updateThinkingIndicator();
     };
