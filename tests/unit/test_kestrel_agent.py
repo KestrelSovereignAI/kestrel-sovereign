@@ -176,6 +176,27 @@ class TestKestrelAgentInit:
         assert agent._cancelled_requests == set()
         assert agent._current_request_id is None
 
+    def test_init_defaults_bootstrap_service_to_none(self, tmp_path):
+        """bootstrap_service defaults to None before initialize() runs (#1632).
+
+        Regression: a COGNITION signal dispatch (e.g. talon.job_complete)
+        reaches process_input's bootstrap check, which evaluates
+        ``self.bootstrap_service``. Before this fix the attribute only existed
+        after initialize(), so an early/partial dispatch raised
+        ``AttributeError: 'KestrelAgent' object has no attribute
+        'bootstrap_service'`` and the signal was never marked delivered.
+        Accessing the attribute must yield None rather than raising.
+        """
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+
+        # Must not raise AttributeError; the bootstrap-needed guard in
+        # process_input relies on this short-circuiting to False.
+        assert agent.bootstrap_service is None
+        assert bool(agent.bootstrap_service) is False
+
     def test_init_defaults_sync_service_enabled(self, tmp_path):
         """Sync service is enabled by default for production behavior."""
         agent = KestrelAgent(
