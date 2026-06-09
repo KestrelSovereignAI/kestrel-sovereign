@@ -12,6 +12,7 @@ import asyncio
 import json
 import shutil
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -509,6 +510,131 @@ async def test_executor_defers_for_unrelated_active_request(tmp_path):
     assert mock_spawn.call_count == 0
     assert len(result.data["deferred"]) == 1
     assert "busy" in result.data["deferred"][0]["reason"]
+
+
+def _attach_background_task_surface(agent):
+    """Bind KestrelAgent's background-task diagnostics + sweep methods onto
+    a mock agent so the coordinator can name/age/sweep them (#1626)."""
+    from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+    if getattr(agent, "_background_tasks", None) is None:
+        agent._background_tasks = set()
+    agent._background_task_meta = {}
+    for name in (
+        "describe_background_tasks",
+        "prune_stale_background_tasks",
+    ):
+        setattr(agent, name, getattr(KestrelAgent, name).__get__(agent))
+    return agent
+
+
+@pytest.mark.asyncio
+async def test_executor_sweeps_orphaned_background_task_and_executes(tmp_path):
+    """An orphaned/hung background task (alive past the stale window and
+    invisible to list_my_tasks) must NOT deadlock idle_agents_only — the
+    coordinator sweeps it and executes (#1626)."""
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_background_task_surface(agent)
+
+    async def _orphan():
+        await asyncio.sleep(60)
+
+    orphan = asyncio.create_task(_orphan())
+    agent._background_tasks.add(orphan)
+    # Back-date past the stale window so it reads as an orphan.
+    agent._background_task_meta[orphan] = {
+        "name": "github_read_orphan",
+        "started_at": time.monotonic() - 1000,
+    }
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    created = await feat.request_restart(reason="become current with #1621")
+    req_id = created.data["request"]["id"]
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 1
+    assert result.data["executed"][0]["request_id"] == req_id
+    # The orphan was swept out of the busy set.
+    assert orphan not in agent._background_tasks
+    await asyncio.gather(orphan, return_exceptions=True)
+    row = await get_request(backend, req_id)
+    assert row.status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_busy_deferral_reports_background_task_diagnostics(tmp_path):
+    """A genuinely-busy background task surfaces its name/age in the
+    deferral reason plus a structured diagnostics blocker, so the operator
+    sees the real work behind the busy count (#1626)."""
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_background_task_surface(agent)
+
+    async def _busy():
+        await asyncio.sleep(60)
+
+    busy = asyncio.create_task(_busy())
+    agent._background_tasks.add(busy)
+    agent._background_task_meta[busy] = {
+        "name": "selfie_generation",
+        "started_at": time.monotonic() - 5,
+    }
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    await feat.request_restart(reason="r")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    busy.cancel()
+    await asyncio.gather(busy, return_exceptions=True)
+
+    assert mock_spawn.call_count == 0
+    assert len(result.data["deferred"]) == 1
+    entry = result.data["deferred"][0]
+    assert "background task(s) in flight" in entry["reason"]
+    # The exact task name is surfaced — not an opaque count.
+    assert "selfie_generation" in entry["reason"]
+    diag = entry["diagnostics"]
+    assert diag["source"] == "background_tasks"
+    names = [t["name"] for t in diag["tasks"]]
+    assert "selfie_generation" in names
+    assert diag["tasks"][0]["age_seconds"] >= 5
+
+
+@pytest.mark.asyncio
+async def test_busy_deferral_reports_active_request_diagnostics(tmp_path):
+    """A busy active-request block exposes the blocking request ids + ages
+    as structured diagnostics, not just a count (#1626)."""
+    backend = await _backend(tmp_path)
+    agent = _make_agent(backend)
+    _attach_lifecycle(agent)
+
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+    await feat.request_restart(reason="r")
+    agent.register_active_request("fresh-req")
+
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ) as mock_spawn:
+        result = await feat.restart_coordinator()
+
+    assert mock_spawn.call_count == 0
+    entry = result.data["deferred"][0]
+    diag = entry["diagnostics"]
+    assert diag["source"] == "active_requests"
+    assert "fresh-req" in diag["request_ids"]
+    assert "fresh-req" in diag["ages"]
 
 
 @pytest.mark.asyncio

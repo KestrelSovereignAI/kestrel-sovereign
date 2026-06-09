@@ -71,6 +71,15 @@ _OUTPUT_TAIL_CHARS = 2000
 # observed in #1558.
 STALE_ACTIVE_REQUEST_SECONDS = 900
 
+# Background asyncio tasks still alive past this window are treated as
+# orphaned/hung (e.g. a read task whose originating session vanished —
+# the case behind #1626, where 3 background tasks blocked restart while
+# list_my_tasks returned 0). Such a handle never completes on its own
+# and would otherwise deadlock idle_agents_only restarts forever, so it
+# is swept before judging liveness. Same window as the active-request
+# sweep — far longer than any real background task.
+STALE_BACKGROUND_TASK_SECONDS = 900
+
 logger = logging.getLogger(__name__)
 
 
@@ -464,10 +473,17 @@ class RestartCoordinatorFeature(Feature):
             decision = self._evaluate_safety(req)
             if not decision["safe"]:
                 if decision.get("deferable", True):
-                    deferred.append({
+                    deferral = {
                         "request_id": req.id,
                         "reason": decision["reason"],
-                    })
+                    }
+                    # Surface the exact blockers (task/session ids, types,
+                    # ages, source queue) so an operator can see what is
+                    # holding the restart off instead of an opaque count
+                    # (#1626).
+                    if decision.get("blockers") is not None:
+                        deferral["diagnostics"] = decision["blockers"]
+                    deferred.append(deferral)
                     # Surface the deferred attempt + its reason (#1551).
                     await self._emit_status_event(
                         req, state="pending",
@@ -757,6 +773,7 @@ class RestartCoordinatorFeature(Feature):
                     f"agent busy ({idle['reason']}); waiting for "
                     f"timeout to elapse"
                 ),
+                "blockers": idle.get("blockers"),
             }
 
         # idle_agents_only
@@ -764,6 +781,7 @@ class RestartCoordinatorFeature(Feature):
             "safe": False,
             "deferable": True,
             "reason": f"agent busy ({idle['reason']})",
+            "blockers": idle.get("blockers"),
         }
 
     def _agent_appears_idle(
@@ -848,6 +866,7 @@ class RestartCoordinatorFeature(Feature):
                 ]
                 n = len(blockers)
             except TypeError:
+                blockers = []
                 n = 0
             if n:
                 return {
@@ -856,11 +875,23 @@ class RestartCoordinatorFeature(Feature):
                         f"{n} active request id(s)"
                         f"{self._active_request_age_suffix(ignore_request_id)}"
                     ),
+                    "blockers": {
+                        "source": "active_requests",
+                        "request_ids": list(blockers),
+                        "ages": self._active_request_age_map(ignore_request_id),
+                    },
                 }
 
         bg_tasks = getattr(self.agent, "_background_tasks", None)
         if bg_tasks is not None:
             any_surface_seen = True
+            # Sweep orphaned/hung background tasks (e.g. a read task whose
+            # originating session vanished) BEFORE counting — such a
+            # handle never completes and never shows up in list_my_tasks,
+            # yet it blocks idle_agents_only forever (#1626). Mirrors the
+            # stale active-request sweep (#1558).
+            swept = self._sweep_stale_background_tasks()
+            described = self._describe_background_tasks()
             try:
                 alive = [t for t in bg_tasks if not t.done()]
             except (TypeError, AttributeError):
@@ -868,8 +899,19 @@ class RestartCoordinatorFeature(Feature):
             if alive:
                 return {
                     "idle": False,
-                    "reason": f"{len(alive)} background task(s) in flight",
+                    "reason": (
+                        f"{len(alive)} background task(s) in flight"
+                        f"{self._background_task_detail_suffix(described, swept)}"
+                    ),
+                    "blockers": {
+                        "source": "background_tasks",
+                        "tasks": described,
+                        "swept_orphans": swept,
+                    },
                 }
+            # Everything alive was an orphan we just swept — the only
+            # markers were stale, so the agent is genuinely idle now and
+            # the operator should not see a phantom busy block (#1626).
 
         if not any_surface_seen:
             # No introspection available — conservatively defer. The
@@ -908,6 +950,102 @@ class RestartCoordinatorFeature(Feature):
             f"; oldest {int(oldest)}s of "
             f"{STALE_ACTIVE_REQUEST_SECONDS}s stale window"
         )
+
+    def _active_request_age_map(
+        self, ignore_request_id: str = "",
+    ) -> Dict[str, float]:
+        """Return ``{request_id: age_seconds}`` for the blocking requests.
+
+        Diagnostics for #1626 — lets the operator-facing deferral surface
+        the exact request ids and ages contributing to the busy count.
+        The requester's own turn is excluded (it never blocks the restart
+        it filed — #1561).
+        """
+        ages_fn = getattr(self.agent, "active_request_ages", None)
+        if not callable(ages_fn):
+            return {}
+        try:
+            ages = ages_fn()
+        except Exception:
+            return {}
+        return {
+            rid: round(float(age), 1)
+            for rid, age in ages.items()
+            if rid != ignore_request_id
+        }
+
+    def _sweep_stale_background_tasks(self) -> List[Dict[str, Any]]:
+        """Prune orphaned background tasks and return their descriptors.
+
+        Best-effort: the agent may not expose
+        ``prune_stale_background_tasks`` (older runtime, test stub). A
+        swept task is one alive past ``STALE_BACKGROUND_TASK_SECONDS`` —
+        an orphan that would otherwise deadlock idle restarts (#1626).
+        """
+        pruner = getattr(self.agent, "prune_stale_background_tasks", None)
+        if not callable(pruner):
+            return []
+        try:
+            swept = pruner(STALE_BACKGROUND_TASK_SECONDS) or []
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug(
+                "restart_coordinator: background-task sweep failed: %s", e,
+            )
+            return []
+        if swept:
+            logger.info(
+                "restart_coordinator: swept %d orphaned background "
+                "task(s) (older than %ds): %s",
+                len(swept), STALE_BACKGROUND_TASK_SECONDS,
+                [t.get("name") for t in swept],
+            )
+        return list(swept)
+
+    def _describe_background_tasks(self) -> List[Dict[str, Any]]:
+        """Name/age descriptors for the agent's live background tasks.
+
+        Diagnostics for #1626 — gives the operator the exact task names,
+        handles, and ages behind a ``background task(s) in flight`` busy
+        block instead of an opaque count. Degrades to ``[]`` when the
+        agent does not expose ``describe_background_tasks``.
+        """
+        describe = getattr(self.agent, "describe_background_tasks", None)
+        if not callable(describe):
+            return []
+        try:
+            return list(describe() or [])
+        except Exception:  # pragma: no cover - defensive
+            return []
+
+    @staticmethod
+    def _background_task_detail_suffix(
+        described: List[Dict[str, Any]],
+        swept: List[Dict[str, Any]],
+    ) -> str:
+        """Build the operator-facing detail for a background-task block.
+
+        Names the live tasks (with ages) so a real busy block is
+        distinguishable from a phantom one, and notes how many orphaned
+        handles were swept this poll (#1626).
+        """
+        parts: List[str] = []
+        if described:
+            items = []
+            for t in described:
+                age = t.get("age_seconds")
+                if age is None:
+                    items.append(str(t.get("name", "background-task")))
+                else:
+                    items.append(
+                        f"{t.get('name', 'background-task')} {int(age)}s"
+                    )
+            parts.append(": [" + ", ".join(items) + "]")
+        if swept:
+            parts.append(
+                f"; swept {len(swept)} orphaned task(s) older than "
+                f"{STALE_BACKGROUND_TASK_SECONDS}s"
+            )
+        return "".join(parts)
 
     @staticmethod
     def _request_aged_past_timeout(req) -> bool:

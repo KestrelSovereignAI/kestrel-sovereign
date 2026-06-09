@@ -885,6 +885,92 @@ class TestLifecycle:
         assert agent._background_tasks == set()
 
     @pytest.mark.asyncio
+    async def test_describe_background_tasks_reports_name_and_age(self, tmp_path):
+        """describe_background_tasks names + ages each live task (#1626)."""
+        import time as _time
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        started = asyncio.Event()
+
+        async def never_finishes():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = agent._track_background_task(
+            never_finishes(), name="github_read",
+        )
+        await started.wait()
+        # Back-date so the reported age is deterministic and positive.
+        agent._background_task_meta[task]["started_at"] = (
+            _time.monotonic() - 7
+        )
+
+        described = agent.describe_background_tasks()
+        assert len(described) == 1
+        assert described[0]["name"] == "github_read"
+        assert described[0]["age_seconds"] >= 7
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert agent.describe_background_tasks() == []
+
+    @pytest.mark.asyncio
+    async def test_prune_stale_background_tasks_sweeps_orphan(self, tmp_path):
+        """An orphaned background task (alive past the window) is
+        cancelled + dropped so it stops blocking restarts (#1626)."""
+        import time as _time
+
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        started = asyncio.Event()
+
+        async def orphan():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = agent._track_background_task(orphan(), name="orphan_read")
+        await started.wait()
+        # Older than the staleness window the coordinator passes.
+        agent._background_task_meta[task]["started_at"] = (
+            _time.monotonic() - 1000
+        )
+
+        pruned = agent.prune_stale_background_tasks(900)
+        assert len(pruned) == 1
+        assert pruned[0]["name"] == "orphan_read"
+        assert task not in agent._background_tasks
+        await asyncio.gather(task, return_exceptions=True)
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_prune_stale_background_tasks_keeps_fresh(self, tmp_path):
+        """A fresh background task is NOT pruned; an undateable one gets
+        its staleness clock started rather than swept blind (#1626)."""
+        agent = KestrelAgent(
+            did="did:test:123",
+            storage_path=str(tmp_path / "test.db"),
+        )
+        started = asyncio.Event()
+
+        async def fresh():
+            started.set()
+            await asyncio.Event().wait()
+
+        task = agent._track_background_task(fresh(), name="fresh_read")
+        await started.wait()
+
+        assert agent.prune_stale_background_tasks(900) == []
+        assert task in agent._background_tasks
+
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
     async def test_shutdown_cancels_background_tasks_before_storage_close(self, tmp_path):
         """shutdown() cancels agent-owned background tasks before closing storage."""
         agent = KestrelAgent(

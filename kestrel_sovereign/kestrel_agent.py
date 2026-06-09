@@ -354,6 +354,10 @@ class KestrelAgent(
         # Pending task completion notifications (for background tasks)
         self._pending_task_notifications: List[str] = []
         self._background_tasks: set[asyncio.Task] = set()
+        # Per-task metadata (name + monotonic start time) so the restart
+        # coordinator can name/age background tasks and sweep orphaned
+        # handles that never complete (#1626).
+        self._background_task_meta: Dict[asyncio.Task, Dict[str, Any]] = {}
 
         # Cancellation tracking for stop button functionality
         self._current_request_id: Optional[str] = None
@@ -2655,11 +2659,118 @@ Expected Duration: {expected_duration}
         return serialize_chain_for_metadata(chain)
 
     def _track_background_task(self, coro, *, name: str) -> asyncio.Task:
-        """Start agent-owned background work and remove it when complete."""
+        """Start agent-owned background work and remove it when complete.
+
+        Each task is stamped with a monotonic start time and its name so
+        the restart coordinator can report exactly which background tasks
+        are holding a restart off and age out orphaned/hung handles that
+        never complete (#1626).
+        """
         task = asyncio.create_task(coro, name=name)
         self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        if not hasattr(self, "_background_task_meta"):
+            self._background_task_meta = {}
+        self._background_task_meta[task] = {
+            "name": name,
+            "started_at": time.monotonic(),
+        }
+
+        def _cleanup(t: asyncio.Task) -> None:
+            self._background_tasks.discard(t)
+            meta = getattr(self, "_background_task_meta", None)
+            if meta is not None:
+                meta.pop(t, None)
+
+        task.add_done_callback(_cleanup)
         return task
+
+    def describe_background_tasks(self) -> List[Dict[str, Any]]:
+        """Diagnostic snapshot of agent-owned background tasks.
+
+        Returns one descriptor per *alive* (not-done) background task —
+        its tracked name, a stable handle id, and its monotonic age in
+        seconds when known. The restart coordinator surfaces this so an
+        operator can see precisely which background tasks are blocking an
+        ``idle_agents_only`` restart instead of an opaque count (#1626).
+        """
+        tasks = getattr(self, "_background_tasks", None)
+        if not tasks:
+            return []
+        meta = getattr(self, "_background_task_meta", None) or {}
+        now = time.monotonic()
+        out: List[Dict[str, Any]] = []
+        for task in list(tasks):
+            try:
+                if task.done():
+                    continue
+            except Exception:
+                continue
+            info = meta.get(task) or {}
+            started = info.get("started_at")
+            name = info.get("name")
+            if not name and hasattr(task, "get_name"):
+                name = task.get_name()
+            out.append({
+                "name": name or "background-task",
+                "handle": hex(id(task)),
+                "age_seconds": (
+                    max(0.0, now - started) if started is not None else None
+                ),
+            })
+        return out
+
+    def prune_stale_background_tasks(
+        self, max_age_seconds: float,
+    ) -> List[Dict[str, Any]]:
+        """Cancel + drop background tasks older than ``max_age_seconds``.
+
+        A background task still alive long past any plausible runtime is
+        an orphan — e.g. a read task whose originating session vanished —
+        and otherwise blocks ``idle_agents_only`` restarts forever while
+        never appearing in ``list_my_tasks`` (#1626). Mirrors
+        ``prune_stale_active_requests`` (#1558): a task with no recorded
+        start time is stamped ``now`` so the staleness clock starts on
+        first observation rather than pruning an undateable handle blind.
+        Returns the pruned tasks' descriptors.
+        """
+        tasks = getattr(self, "_background_tasks", None)
+        if not tasks:
+            return []
+        if not hasattr(self, "_background_task_meta"):
+            self._background_task_meta = {}
+        meta = self._background_task_meta
+        now = time.monotonic()
+        pruned: List[Dict[str, Any]] = []
+        for task in list(tasks):
+            try:
+                if task.done():
+                    continue
+            except Exception:
+                continue
+            info = meta.get(task)
+            if info is None or info.get("started_at") is None:
+                name = (info or {}).get("name")
+                if not name and hasattr(task, "get_name"):
+                    name = task.get_name()
+                meta[task] = {
+                    "name": name or "background-task",
+                    "started_at": now,
+                }
+                continue
+            age = now - info["started_at"]
+            if age >= max_age_seconds:
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
+                self._background_tasks.discard(task)
+                meta.pop(task, None)
+                pruned.append({
+                    "name": info.get("name") or "background-task",
+                    "handle": hex(id(task)),
+                    "age_seconds": max(0.0, age),
+                })
+        return pruned
 
     async def _shutdown_background_tasks(self) -> None:
         tasks = set(self._background_tasks)
@@ -2672,6 +2783,9 @@ Expected Duration: {expected_duration}
 
         await asyncio.gather(*tasks, return_exceptions=True)
         self._background_tasks.clear()
+        meta = getattr(self, "_background_task_meta", None)
+        if meta is not None:
+            meta.clear()
 
     # Tool registry methods provided by ToolRegistryMixin:
     # - _build_feature_tools, _build_all_tools, _register_explored_feature_tools
