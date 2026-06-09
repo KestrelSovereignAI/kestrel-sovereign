@@ -172,12 +172,14 @@ class TestScheduleAdd:
 
     @pytest.mark.asyncio
     async def test_add_valid_task(self, feature):
+        # memory_consolidate is a registered built-in cron source, so it
+        # passes the #1618 task-name validation.
         result = await feature.schedule_add(
             cron_expression="@daily",
-            task_name="wellness_check",
+            task_name="memory_consolidate",
         )
         assert result.status is ToolResultStatus.OK
-        assert result.data["task_name"] == "wellness_check"
+        assert result.data["task_name"] == "memory_consolidate"
         assert result.data["cron_expression"] == "@daily"
         assert result.data["task_id"] is not None
         assert result.data["next_run_at"] is not None
@@ -189,7 +191,7 @@ class TestScheduleAdd:
     async def test_add_with_args(self, feature):
         result = await feature.schedule_add(
             cron_expression="*/15 * * * *",
-            task_name="memory_consolidation",
+            task_name="memory_consolidate",
             args_json='{"threshold": 100}',
         )
         assert result.status is ToolResultStatus.OK
@@ -230,6 +232,53 @@ class TestScheduleAdd:
             task_name="test_task",
         )
         assert result.status is ToolResultStatus.ERROR
+
+    @pytest.mark.asyncio
+    async def test_add_rejects_unknown_task_name(self, feature):
+        """#1618: an unregistered task name must be rejected at creation
+        time instead of silently entering the schedule and failing every
+        tick with 'Unknown task' (the github_pr_watch incident)."""
+        result = await feature.schedule_add(
+            cron_expression="*/15 * * * *",
+            task_name="totally_made_up_task",
+        )
+        assert result.status is ToolResultStatus.ERROR
+        assert "unknown scheduled task" in result.error.lower()
+        assert "totally_made_up_task" in result.error
+        # The caller gets the list of valid names to fix the typo.
+        assert "totally_made_up_task" not in result.data["valid_task_names"]
+        assert "memory_consolidate" in result.data["valid_task_names"]
+        # And nothing was inserted into the schedule.
+        feature._db.execute.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_add_github_pr_watch_is_valid(self, feature):
+        """#1618: github_pr_watch is now a registered built-in cron task,
+        so scheduling it succeeds (the original bug was that it was not
+        registered)."""
+        result = await feature.schedule_add(
+            cron_expression="*/15 * * * *",
+            task_name="github_pr_watch",
+            args_json='{"repo": "owner/name", "pr": 1614}',
+        )
+        assert result.status is ToolResultStatus.OK
+        assert result.data["task_name"] == "github_pr_watch"
+
+    @pytest.mark.asyncio
+    async def test_add_accepts_loaded_feature_tool(self, feature):
+        """A tool exposed by a loaded feature is a valid scheduled task
+        even though it isn't a built-in cron source."""
+        mock_tool = MagicMock()
+        mock_tool.name = "wellness_check"
+        mock_feature = MagicMock()
+        mock_feature.get_tools = MagicMock(return_value=[mock_tool])
+        feature.agent.features = {"WellnessFeature": mock_feature}
+
+        result = await feature.schedule_add(
+            cron_expression="@daily",
+            task_name="wellness_check",
+        )
+        assert result.status is ToolResultStatus.OK
 
 
 # =========================================================================
@@ -1047,6 +1096,186 @@ class TestRunnerCronReload:
         # last_run_at only. Current code takes the last_run_at-only path.
         if update_calls:
             assert "next_run_at" not in update_calls[0][0][0]
+
+
+# =========================================================================
+# github_pr_watch handler (#1618)
+# =========================================================================
+
+
+_GH_TOKEN = (
+    "kestrel_sovereign.features.strategic_memory."
+    "github_integration.get_github_token"
+)
+_GH_FETCH = "kestrel_sovereign.signals.sources.github_pr_watch.fetch_pr_state"
+
+
+def _pr_payload(**overrides):
+    base = {
+        "state": "open",
+        "merged": False,
+        "comments": 2,
+        "review_comments": 1,
+        "updated_at": "2026-06-09T16:00:00Z",
+        "head": {"sha": "abc123"},
+        "checks_status": "success",
+        "mergeable_state": "clean",
+        "html_url": "https://github.com/owner/name/pull/1614",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestGitHubPRWatchHandler:
+
+    @pytest.mark.asyncio
+    async def test_missing_args_reports_error(self, feature):
+        out = await feature._run_github_pr_watch({"repo": "owner/name"})
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert "requires" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_no_token_blocked_auth(self, feature):
+        with patch(_GH_TOKEN, return_value=None):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["blocked"] == "auth"
+
+    @pytest.mark.asyncio
+    async def test_network_failure_blocked_network(self, feature):
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            PRWatchNetworkError,
+        )
+
+        feature._db.fetchone = AsyncMock(return_value=None)
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH,
+            new=AsyncMock(side_effect=PRWatchNetworkError("timeout")),
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["blocked"] == "network"
+
+    @pytest.mark.asyncio
+    async def test_first_observation_does_not_signal(self, feature):
+        # No persisted fingerprint → first observation → no wake.
+        feature._db.fetchone = AsyncMock(return_value=None)
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH, new=AsyncMock(return_value=_pr_payload())
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["reason"] == "first_observation"
+        feature.agent.dispatcher.enqueue_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_change_does_not_signal(self, feature):
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        norm = normalize_pr_state(_pr_payload())
+        fp = compute_fingerprint(norm)
+        feature._db.fetchone = AsyncMock(return_value=(fp, json.dumps(norm)))
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock()
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH, new=AsyncMock(return_value=_pr_payload())
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["reason"] == "no_change"
+        feature.agent.dispatcher.enqueue_signal.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_new_comment_emits_signal(self, feature):
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        prev = normalize_pr_state(_pr_payload(comments=2))
+        prev_fp = compute_fingerprint(prev)
+        feature._db.fetchone = AsyncMock(
+            return_value=(prev_fp, json.dumps(prev))
+        )
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock(
+            return_value=MagicMock()
+        )
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH, new=AsyncMock(return_value=_pr_payload(comments=3))
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+        data = json.loads(out)
+        assert data["signaled"] is True
+        assert "comments" in data["changed"]
+        feature.agent.dispatcher.enqueue_signal.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pr_arg_fetches_pulls_endpoint(self, feature):
+        feature._db.fetchone = AsyncMock(return_value=None)
+        fetch = AsyncMock(return_value=_pr_payload())
+        with patch(_GH_TOKEN, return_value="tok"), patch(_GH_FETCH, new=fetch):
+            await feature._run_github_pr_watch({"repo": "owner/name", "pr": 1614})
+        assert fetch.call_args.kwargs["kind"] == "pr"
+
+    @pytest.mark.asyncio
+    async def test_issue_arg_fetches_issues_endpoint(self, feature):
+        # An explicit issue number must hit /issues, not /pulls (which would
+        # 404 for an issue and falsely report blocked: network every tick).
+        feature._db.fetchone = AsyncMock(return_value=None)
+        fetch = AsyncMock(return_value={"state": "open", "comments": 0})
+        with patch(_GH_TOKEN, return_value="tok"), patch(_GH_FETCH, new=fetch):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "issue": 1618}
+            )
+        assert fetch.call_args.kwargs["kind"] == "issue"
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["reason"] == "first_observation"
+
+
+def test_fetch_url_selects_endpoint_by_kind():
+    """fetch_pr_state must build /pulls vs /issues from the kind arg."""
+    import asyncio
+    from unittest.mock import patch as _patch
+
+    from kestrel_sovereign.signals.sources import github_pr_watch as gpw
+
+    captured = {}
+
+    class _FakeResp:
+        def read(self):
+            return b'{"state": "open"}'
+
+    def _fake_urlopen(req, timeout=10):
+        captured["url"] = req.full_url
+        return _FakeResp()
+
+    with _patch.object(gpw.urllib.request, "urlopen", _fake_urlopen):
+        asyncio.run(gpw.fetch_pr_state("owner/name", 1614, token="t", kind="pr"))
+        assert captured["url"].endswith("/repos/owner/name/pulls/1614")
+        asyncio.run(gpw.fetch_pr_state("owner/name", 1618, token="t", kind="issue"))
+        assert captured["url"].endswith("/repos/owner/name/issues/1618")
 
 
 # =========================================================================

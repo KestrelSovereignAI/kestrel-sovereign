@@ -97,6 +97,15 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # subprocess to execute the restart. Idle by default; only fires
     # when a row is pending.
     ("restart_coordinator", SignalMode.ACTION, frozenset()),
+    # GitHub PR/issue watcher (#1618). ACTION — no LLM cost on the poll
+    # itself. Fetches the PR's current state, fingerprints the watched
+    # fields, and ENQUEUES one github.pr_activity COGNITION signal only
+    # when a relevant change is detected (state/comment/check/merge).
+    # The COGNITION wake comes from that downstream signal, not from the
+    # watch task itself. Built-in handler:
+    # SchedulerFeature._run_github_pr_watch. Per-watch config (repo, pr,
+    # triggers, notify) travels in the scheduled task's args_json.
+    ("github_pr_watch", SignalMode.ACTION, frozenset()),
 ]
 
 

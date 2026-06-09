@@ -5,14 +5,27 @@ Allows agents to create, manage, and monitor scheduled tasks that run on
 cron expressions. Tasks are persisted in the database and survive restarts.
 A background asyncio runner checks for due tasks every 30 seconds.
 
-Built-in task names (registered by other features):
-    memory_consolidation  -- consolidate short-term memory into episodes
-    wellness_checkpoint   -- run a wellness check
-    audit_anchor          -- anchor the audit trail
+Valid scheduled task names are validated at creation time (#1618):
+``schedule_add`` rejects any name that is neither a built-in cron source
+nor a discoverable feature tool, so a typo / unregistered name (e.g.
+``github_pr_watch`` before it was registered) fails loudly instead of
+silently failing every tick with "Unknown task".
+
+Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
+    backup_snapshot       -- snapshot the agent's data via the sync service
+    signal_dispatch       -- dispatch queued work to Talon
     trash_retention       -- hard-purge soft-deleted conversation rows
                              past their per-agent retention window (#764)
+    training_cycle        -- run a LoRA training cycle (ReflectionFeature)
+    morning_signal        -- produce the daily briefing artifact
+    reflect               -- run a reflection workflow (ReflectionFeature)
+    memory_consolidate    -- consolidate short-term memory into episodes
+    talon_monitor         -- poll Talon jobs, wake on completion (#1510)
+    restart_coordinator   -- execute pending restart requests (#1512)
+    github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
+                             state/comment/check/merge changes (#1618)
 
-Arbitrary feature tool invocations can also be scheduled by name.
+Any loaded feature tool can also be scheduled by its tool name.
 
 Tools:
     !schedule list                          -- list all scheduled tasks
@@ -91,6 +104,7 @@ class SchedulerFeature(Feature):
                 builtin_handlers={
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
+                    "github_pr_watch": self._run_github_pr_watch,
                 },
             )
             for reg in cron_registrations:
@@ -99,6 +113,20 @@ class SchedulerFeature(Feature):
                 # in tests shouldn't blow up).
                 if reg.name not in registry:
                     registry.register(reg)
+
+            # github_pr_watch (#1618) is an ACTION cron task that, on a
+            # relevant change, enqueues a COGNITION github.pr_activity
+            # signal. Register that downstream source here so the wake
+            # has a prompt template and policy. The watcher is built-in
+            # (no GitHub feature required), so the source lives with the
+            # scheduler rather than an external package.
+            from kestrel_sovereign.signals.sources.github_pr_watch import (
+                SOURCE_NAME as _PR_ACTIVITY_SOURCE,
+                build_github_pr_activity_registration,
+            )
+
+            if _PR_ACTIVITY_SOURCE not in registry:
+                registry.register(build_github_pr_activity_registration())
         else:
             logger.warning(
                 "SchedulerFeature: no signal_registry on agent, "
@@ -368,6 +396,42 @@ class SchedulerFeature(Feature):
 
         raise ValueError(f"Unknown task: {task_name}")
 
+    def _scheduler_executable_task_names(self) -> set:
+        """Return the set of task names the scheduler can actually run.
+
+        Used by ``schedule_add`` to reject unknown names at creation time
+        (#1618). A task is executable if it is one of:
+          - a built-in cron source (``CRON_TASKS``), including the
+            built-in-handler tasks like ``backup_snapshot`` and
+            ``github_pr_watch`` that don't go through tool lookup;
+          - a feature tool discoverable by ``_lookup_and_run_tool``
+            (any loaded feature's ``get_tools()``);
+          - one of this scheduler feature's own tools.
+
+        Mirrors the resolution order of the runtime executor so the
+        validation can't drift from what actually runs.
+        """
+        from kestrel_sovereign.signals.sources.scheduler import CRON_TASKS
+
+        names: set = {name for name, _mode, _res in CRON_TASKS}
+
+        features = getattr(self.agent, "features", {}) or {}
+        for feature in features.values():
+            if not hasattr(feature, "get_tools"):
+                continue
+            try:
+                for agent_tool in feature.get_tools():
+                    names.add(agent_tool.name)
+            except Exception:
+                # A misbehaving feature must not block validation of
+                # everything else; skip it.
+                continue
+
+        for agent_tool in self.get_tools():
+            names.add(agent_tool.name)
+
+        return names
+
     async def _handle_backup_snapshot(self, args: dict) -> str:
         """ACTION handler for the `backup_snapshot` cron source. Hits
         the agent's sync service directly — there is no feature tool
@@ -457,6 +521,227 @@ class SchedulerFeature(Feature):
             "retention_days": retention_days,
             "cutoff": cutoff_iso,
             "max_rows": max_rows,
+        })
+
+    # ------------------------------------------------------------------
+    # github_pr_watch (#1618)
+    # ------------------------------------------------------------------
+
+    async def _ensure_pr_watch_table(self) -> None:
+        """Lazily create the per-agent PR-watch fingerprint table."""
+        await self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS github_pr_watch_state (
+                agent_id        TEXT NOT NULL,
+                watch_key       TEXT NOT NULL,
+                fingerprint     TEXT NOT NULL,
+                normalized_json TEXT,
+                updated_at      TEXT,
+                PRIMARY KEY (agent_id, watch_key)
+            )
+            """
+        )
+
+    async def _load_pr_watch_state(self, watch_key: str):
+        """Return ``(fingerprint, normalized_dict)`` for a watch, or
+        ``(None, None)`` if this is the first observation."""
+        await self._ensure_pr_watch_table()
+        row = await self._db.fetchone(
+            "SELECT fingerprint, normalized_json FROM github_pr_watch_state "
+            "WHERE agent_id = ? AND watch_key = ?",
+            (self._agent_id, watch_key),
+        )
+        if not row:
+            return None, None
+        normalized = None
+        if row[1]:
+            try:
+                parsed = json.loads(row[1])
+                normalized = parsed if isinstance(parsed, dict) else None
+            except json.JSONDecodeError:
+                normalized = None
+        return row[0], normalized
+
+    async def _save_pr_watch_state(
+        self, watch_key: str, fingerprint: str, normalized: dict
+    ) -> None:
+        """Upsert the latest observed fingerprint for a watch."""
+        await self._ensure_pr_watch_table()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        await self._db.execute(
+            """
+            INSERT INTO github_pr_watch_state
+                (agent_id, watch_key, fingerprint, normalized_json, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, watch_key) DO UPDATE SET
+                fingerprint = excluded.fingerprint,
+                normalized_json = excluded.normalized_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                self._agent_id,
+                watch_key,
+                fingerprint,
+                json.dumps(normalized, default=str),
+                now_iso,
+            ),
+        )
+
+    async def _run_github_pr_watch(self, args: dict) -> str:
+        """Built-in handler for the ``github_pr_watch`` cron task (#1618).
+
+        Polls a single GitHub PR/issue, fingerprints the watched fields,
+        and enqueues one ``github.pr_activity`` COGNITION signal only when
+        a relevant change is detected. A no-op poll emits nothing.
+
+        Reports ``blocked: auth`` / ``blocked: network`` distinctly from a
+        no-change poll so a bad token or flaky network is never silently
+        read as "nothing happened". The persisted fingerprint is NOT
+        advanced on a blocked poll, so the next successful poll still sees
+        the real delta.
+
+        Args (from the scheduled task's args_json):
+            repo: ``owner/name`` of the repository.
+            pr / issue / number: the PR or issue number to watch.
+            triggers: optional list of change categories that wake the
+                agent (default: state, merge, comments, checks). Pass
+                ``["any"]`` to wake on every fingerprint change.
+            notify: optional target agent DID (defaults to this agent).
+        """
+        from kestrel_sovereign.features.strategic_memory.github_integration import (
+            get_github_token,
+        )
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            PRWatchAuthError,
+            PRWatchNetworkError,
+            build_signal_for_pr_change,
+            evaluate_pr_watch,
+            fetch_pr_state,
+        )
+
+        repo = args.get("repo")
+        # PRs and issues share one numbering space but live behind different
+        # API endpoints, so we track which arg supplied the number. An
+        # explicit 'issue' (without 'pr') fetches /issues/{n}; everything
+        # else fetches /pulls/{n}.
+        if args.get("pr"):
+            number = args.get("pr")
+            kind = "pr"
+        elif args.get("issue"):
+            number = args.get("issue")
+            kind = "issue"
+        else:
+            number = args.get("number")
+            kind = "pr"
+        if not repo or not number:
+            return json.dumps({
+                "signaled": False,
+                "error": (
+                    "github_pr_watch requires 'repo' and one of "
+                    "'pr'/'issue'/'number' in args"
+                ),
+            })
+
+        try:
+            number_int = int(number)
+        except (TypeError, ValueError):
+            return json.dumps({
+                "signaled": False,
+                "error": f"PR/issue number must be an integer, got {number!r}",
+            })
+
+        watch_key = f"{repo}#{number_int}"
+        triggers = args.get("triggers")
+
+        token = get_github_token()
+        if not token:
+            return json.dumps({
+                "signaled": False,
+                "blocked": "auth",
+                "reason": "no GITHUB_TOKEN available",
+                "watch_key": watch_key,
+            })
+
+        try:
+            raw_state = await fetch_pr_state(repo, number_int, token=token, kind=kind)
+        except PRWatchAuthError as e:
+            return json.dumps({
+                "signaled": False,
+                "blocked": "auth",
+                "error": str(e),
+                "watch_key": watch_key,
+            })
+        except PRWatchNetworkError as e:
+            return json.dumps({
+                "signaled": False,
+                "blocked": "network",
+                "error": str(e),
+                "watch_key": watch_key,
+            })
+
+        last_fp, last_normalized = await self._load_pr_watch_state(watch_key)
+        decision = evaluate_pr_watch(
+            raw_state,
+            last_fingerprint=last_fp,
+            last_normalized=last_normalized,
+            triggers=triggers,
+        )
+        # Always advance the persisted fingerprint to the latest observed
+        # state, even on a no-signal change, so the next poll compares
+        # against current reality rather than a stale baseline.
+        await self._save_pr_watch_state(
+            watch_key, decision.fingerprint, decision.normalized,
+        )
+
+        if not decision.should_signal:
+            return json.dumps({
+                "signaled": False,
+                "reason": decision.reason,
+                "watch_key": watch_key,
+                "changed": sorted(decision.changed),
+            })
+
+        target = args.get("notify") or getattr(self.agent, "did", "") or self._agent_id
+        signal = build_signal_for_pr_change(
+            repo=repo,
+            number=number_int,
+            decision=decision,
+            target_agent=str(target),
+            html_url=str(raw_state.get("html_url", "")),
+        )
+
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        if dispatcher is None or not hasattr(dispatcher, "enqueue_signal"):
+            return json.dumps({
+                "signaled": False,
+                "blocked": "no_dispatcher",
+                "reason": "agent has no signal dispatcher",
+                "watch_key": watch_key,
+                "changed": sorted(decision.matched),
+            })
+
+        try:
+            enq = dispatcher.enqueue_signal(signal)
+            if hasattr(enq, "__await__"):
+                await enq
+        except Exception as e:
+            logger.warning(
+                "github_pr_watch: enqueue_signal raised for %s: %s",
+                watch_key, e,
+            )
+            return json.dumps({
+                "signaled": False,
+                "blocked": "dispatch_error",
+                "error": f"{type(e).__name__}: {e}",
+                "watch_key": watch_key,
+                "changed": sorted(decision.matched),
+            })
+
+        return json.dumps({
+            "signaled": True,
+            "reason": decision.reason,
+            "watch_key": watch_key,
+            "changed": sorted(decision.matched),
         })
 
     # ------------------------------------------------------------------
@@ -559,7 +844,10 @@ class SchedulerFeature(Feature):
 
         Args:
             cron_expression: Cron expression (5 fields) or alias like @daily, @hourly
-            task_name: Name of the tool to execute (e.g. wellness_check, audit_anchor)
+            task_name: Name of a registered scheduler-executable task — a
+                built-in cron source (e.g. memory_consolidate, talon_monitor,
+                github_pr_watch) or a loaded feature tool. Unknown names are
+                rejected so they can't silently fail every tick (#1618).
             args_json: JSON-encoded arguments to pass to the tool (default: {})
         """
         if not self._db:
@@ -576,6 +864,25 @@ class SchedulerFeature(Feature):
                 return ToolResult.failed("args_json must be a JSON object")
         except json.JSONDecodeError as e:
             return ToolResult.failed(f"Invalid args_json: {e}")
+
+        # Reject unknown task names at creation time (#1618). A name that
+        # is neither a built-in cron source nor a discoverable feature
+        # tool would silently enter the schedule and then fail with
+        # "Unknown task" on every single tick (the github_pr_watch
+        # incident). Fail loudly here instead, listing the valid names.
+        valid_names = self._scheduler_executable_task_names()
+        if task_name not in valid_names:
+            return ToolResult.failed(
+                f"Unknown scheduled task '{task_name}'. It is not a "
+                f"registered scheduler-executable task, so every cron tick "
+                f"would fail with 'Unknown task'. Valid task names: "
+                f"{', '.join(sorted(valid_names))}.",
+                data={
+                    "success": False,
+                    "task_name": task_name,
+                    "valid_task_names": sorted(valid_names),
+                },
+            )
 
         now = datetime.now(timezone.utc)
         try:
