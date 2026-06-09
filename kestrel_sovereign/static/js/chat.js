@@ -429,6 +429,51 @@ export function setChatRoot(el) {
     _chatRoot = el || document;
 }
 
+function chatComponentApi() {
+    return {
+        setChatDeps,
+        segmentToolActivity,
+        renderAgentContentHtml,
+        renderToolActivityHtml,
+        setChatRoot,
+        mountChatPane,
+        wipeAgentChatPane,
+        initChat,
+        subscribeSSE,
+        connectNotifications,
+        handleSignalCompleted,
+        handleRestartStatus,
+        disconnectNotifications,
+        updateThinkingIndicator,
+        refreshAgentThinkingDot,
+        stopAgent,
+        updateComposerModeToggle,
+        sendMessage,
+        updateContextStatus,
+        addMessageStreaming,
+        updateStreamingMessage,
+        finalizeStreamingMessage,
+        addMessage,
+        loadModels,
+        clearChat,
+    };
+}
+
+// Apply injected deps; return the public chat surface. Does NOT mount/init.
+export function createChatComponent(config = {}) {
+    if (config.deps) setChatDeps(config.deps);
+    if (config.container) setChatRoot(config.container);
+    return chatComponentApi();
+}
+
+// Mount into a container and initialize.
+export function mount(containerEl, config = {}) {
+    if (config.deps) setChatDeps(config.deps);
+    setChatRoot(containerEl || document);
+    initChat();
+    return chatComponentApi();
+}
+
 function el(id) {
     return _chatRoot === document
         ? document.getElementById(id)
@@ -2839,7 +2884,7 @@ function selectHighlightedCommand() {
 /**
  * Clear the chat and start fresh (called via onclick from HTML)
  */
-window.clearChat = function() {
+function clearChat() {
     if (!chatContainer) return;
 
     // Clear ONLY the visible agent's pane and bump that agent's
@@ -2869,4 +2914,6 @@ window.clearChat = function() {
     });
 
     deps().toast.success('Chat cleared');
-};
+}
+
+window.clearChat = clearChat;
