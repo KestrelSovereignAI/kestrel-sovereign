@@ -549,6 +549,33 @@ async def test_send_a2a_rejects_oversized_references_before_dispatch(method_name
 
 
 @pytest.mark.asyncio
+async def test_send_a2a_rejects_nan_in_references_with_typed_error():
+    """Codex round 1 P2: a NaN/Inf float passes default json.dumps but
+    httpx encodes with allow_nan=False and would fail downstream as a
+    generic send error. The validation encoder must match httpx so the
+    typed invalid_a2a_* result fires instead."""
+    feature = _make_a2a_feature()
+    client_factory = MagicMock(
+        return_value=_async_client_with(post_resp=_mock_post_response())
+    )
+    bad_ref = {"ref_type": "memory", "id": "m1", "score": float("nan")}
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        client_factory,
+    ):
+        result = await feature.send_a2a_task(
+            "meridian", "use refs", references=[bad_ref],
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["sent"] is False
+    assert result.data["error_type"] == "invalid_a2a_artifacts"
+    assert result.data["error_code"] == "not_json_serializable"
+    client_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_send_a2a_task_without_artifacts_omits_wire_key():
     """No artifacts/references → the ``artifacts`` key is absent from the
     payload so legacy recipients see an unchanged wire shape (#1525)."""

@@ -197,8 +197,22 @@ def _coerce_outbound_artifacts(
         wire.append(_normalize_outbound_artifact(item, i))
     for i, ref in enumerate(reference_items):
         wire.append(_normalize_outbound_reference(ref, i))
+    # Encode with the SAME settings httpx will use on the wire so the
+    # size check reflects what's actually about to be sent (compact
+    # separators) and rejects payloads httpx will refuse later
+    # (allow_nan=False). Without matching settings the validation
+    # over-estimates by ~30% on dict-heavy payloads and a NaN value
+    # passes here only to die later as a generic send error (codex
+    # round 1 P2).
     try:
-        size = len(json.dumps(wire, ensure_ascii=False).encode("utf-8"))
+        size = len(
+            json.dumps(
+                wire,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        )
     except (TypeError, ValueError) as exc:
         raise OutboundArtifactValidationError(
             "artifacts",
