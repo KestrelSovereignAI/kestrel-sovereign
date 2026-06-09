@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS conversation_history (
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_agent_id ON conversation_history(agent_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_agent_created_at
+    ON conversation_history(agent_id, created_at DESC);
 -- idx_conversation_deleted_at lives in _init_schema (after the
 -- soft-delete migration runs). Legacy DBs predate the column and
 -- would crash here. See #795.

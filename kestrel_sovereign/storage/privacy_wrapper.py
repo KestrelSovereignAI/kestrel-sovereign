@@ -602,6 +602,8 @@ class PrivacyEnforcingStorage:
 
         Returns rows as tuples: (id, role, content, metadata, created_at)
         """
+        bounded_limit = max(1, min(int(limit), 1000))
+
         if self._privacy_config.is_ephemeral():
             logger.debug("query_conversations blocked: ephemeral mode returns no data")
             return []
@@ -624,7 +626,8 @@ class PrivacyEnforcingStorage:
             FROM conversation_history
             WHERE agent_id = ? AND deleted_at IS NULL
             ORDER BY created_at DESC
-        """, (agent_id,))
+            LIMIT ?
+        """, (agent_id, bounded_limit))
 
     async def query_conversation_start(
         self, message_id: str, agent_id: str
