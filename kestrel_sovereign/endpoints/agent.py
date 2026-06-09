@@ -100,7 +100,7 @@ async def invoke_agent(request: Request):
         # anchored on `null`, causing later auto-load + context-status
         # paths to lose continuity. Reviewer flagged at chat.js:520.
         try:
-            effective_session_id = await agent.privacy_agent.resolve_session_id(session_id)
+            effective_session_id = await agent.storage.resolve_session_id(session_id)
         except Exception:
             effective_session_id = session_id  # fall back; never block the request
 
@@ -166,7 +166,7 @@ async def stream_agent_response(request: Request):
         # id on first send (replacing the prior pane.sessionId=null
         # heuristic that left auto-load + context-status fragile).
         try:
-            effective_session_id = await agent.privacy_agent.resolve_session_id(session_id)
+            effective_session_id = await agent.storage.resolve_session_id(session_id)
         except Exception:
             effective_session_id = session_id  # fall back; never block the stream
 
