@@ -49,6 +49,9 @@ from kestrel_sovereign.features.talon.runtime import (
 from kestrel_sovereign.features.talon.verification import (
     CommandExecution,
     TalonVerifier,
+    TestCommandResult,
+    VerificationEvidence,
+    VerificationState,
 )
 
 logger = logging.getLogger(__name__)
@@ -997,6 +1000,7 @@ class TalonCoordinatorFeature(Feature):
         commands: str,
         repo: str = "self",
         cwd: Optional[str] = None,
+        ref: str = "",
         timeout: int = 600,
         note: str = "",
     ) -> ToolResult:
@@ -1011,6 +1015,15 @@ class TalonCoordinatorFeature(Feature):
                 workspace clone to run in when ``cwd`` is not given.
             cwd: Working directory override. Defaults to the repo's
                 workspace clone if present, else the project directory.
+            ref: PR number / branch name / commit SHA to verify. When
+                given, the workspace clone is fetched and checked out to
+                that ref BEFORE any command runs, so a PR is verified
+                against the PR's code and not whatever happened to be
+                checked out (e.g. ``main``). A PR number may be written
+                ``1630``, ``#1630``, or ``pr/1630``. If the fetch/checkout
+                fails, no command runs and the result state is
+                ``tooling_error`` — never a misleading test failure
+                against the un-switched tree (issue #1631).
             timeout: Per-command wall-clock cap in seconds.
             note: Optional reviewer note included in the evidence (e.g.
                 "local tests could not run; CI is the remaining hard gate").
@@ -1019,9 +1032,11 @@ class TalonCoordinatorFeature(Feature):
             ``ToolResult.ok`` when every command passed; ``partial`` when
             any command failed, was blocked, or could not run (the tool
             itself ran fine — the LLM must not claim a clean pass).
-            ``data`` carries the full ``VerificationEvidence`` dict and
-            ``confirmation`` carries the markdown evidence block for
-            review/merge notes.
+            ``data`` carries the full ``VerificationEvidence`` dict plus
+            ``repo``, ``cwd``, ``requested_ref``, ``checked_out_ref`` and
+            ``head_sha`` so a reviewer can tell exactly which ref was
+            verified, and ``confirmation`` carries the markdown evidence
+            block for review/merge notes.
         """
         command_list = [c.strip() for c in str(commands).splitlines() if c.strip()]
         if not command_list:
@@ -1037,6 +1052,50 @@ class TalonCoordinatorFeature(Feature):
                 str(e), data={"success": False, "overall_state": "not_run"}
             )
 
+        requested_ref = (ref or "").strip()
+        if requested_ref:
+            checkout = await self._git_checkout_ref(run_cwd, requested_ref)
+            if not checkout.get("ok"):
+                # Fetch/checkout failed: refuse to run the requested
+                # commands against the un-switched tree. Reporting those
+                # commands as ``tooling_error`` (not ``failed``) is the
+                # whole point of #1631 — a reviewer must be able to tell a
+                # ref-selection failure from a real code failure.
+                reason = checkout.get("error") or (
+                    f"could not check out ref {requested_ref!r}"
+                )
+                summary = (
+                    f"requested ref {requested_ref!r} could not be checked out "
+                    f"in {run_cwd}: {reason}. Commands were NOT run; this is "
+                    "a tooling/ref-selection failure, not a code failure."
+                )
+                evidence = VerificationEvidence(
+                    results=[
+                        TestCommandResult(
+                            command=cmd,
+                            state=VerificationState.TOOLING_ERROR,
+                            allowlisted=False,
+                            summary=summary,
+                        )
+                        for cmd in command_list
+                    ],
+                    note=note,
+                )
+                data = {
+                    "success": True,
+                    "repo": self._resolve_repo(repo),
+                    "cwd": str(run_cwd),
+                    "requested_ref": requested_ref,
+                    "checked_out_ref": None,
+                    "head_sha": None,
+                    **evidence.to_dict(),
+                }
+                return ToolResult.partial(
+                    evidence.to_markdown(),
+                    f"verification overall state: {evidence.overall_state.value}",
+                    data=data,
+                )
+
         verifier = TalonVerifier(
             execute=self._make_verify_executor(run_cwd),
             approve=self._make_verify_approver(repo, run_cwd),
@@ -1049,10 +1108,14 @@ class TalonCoordinatorFeature(Feature):
         evidence = await verifier.verify_commands(
             command_list, timeout=timeout_int, note=note
         )
+        head = self._git_describe_head(run_cwd)
         data = {
             "success": True,
             "repo": self._resolve_repo(repo),
             "cwd": str(run_cwd),
+            "requested_ref": requested_ref or None,
+            "checked_out_ref": head.get("ref"),
+            "head_sha": head.get("head_sha"),
             **evidence.to_dict(),
         }
         confirmation = evidence.to_markdown()
@@ -1181,6 +1244,187 @@ class TalonCoordinatorFeature(Feature):
                 return None
 
         return _approve
+
+    @staticmethod
+    def _parse_verify_ref(ref: str) -> tuple[str, str]:
+        """Classify a verify ref into ``("pr", number)`` or ``("ref", value)``.
+
+        A PR number may be written ``1630``, ``#1630``, or ``pr/1630``
+        (case-insensitive, with ``/``, ``#`` or ``-`` as the separator).
+        Everything else — a branch name or a commit SHA — is returned as a
+        plain ``ref`` and resolved by ``git checkout`` directly.
+        """
+        r = (ref or "").strip()
+        m = re.match(r"^(?:#|pr[/#-]?)(\d+)$", r, re.IGNORECASE)
+        if m:
+            return "pr", m.group(1)
+        if r.isdigit():
+            return "pr", r
+        return "ref", r
+
+    async def _git_checkout_ref(self, workspace: Path, ref: str) -> Dict[str, Any]:
+        """Fetch and check out ``ref`` in the workspace clone.
+
+        ``ref`` forms (see :meth:`_parse_verify_ref`):
+
+          * a PR number — fetched from ``refs/pull/<n>/head`` and checked
+            out detached, so a PR is verified against its own head commit.
+          * a branch name — the remote is fetched, then ``git checkout``
+            switches to (and, if needed, creates a local tracking branch
+            for) it.
+          * a commit SHA — fetched best-effort, then checked out detached.
+
+        Returns ``{"ok": bool, "error": str, "checked_out_ref": str,
+        "head_sha": str}``. A non-``ok`` result means the requested ref
+        could not be materialised; the caller must NOT run verification
+        against the un-switched tree (issue #1631).
+        """
+        if not (workspace / ".git").exists():
+            return {
+                "ok": False,
+                "error": (
+                    f"{workspace} is not a git checkout; cannot select a "
+                    "ref to verify"
+                ),
+            }
+        kind, value = self._parse_verify_ref(ref)
+        if not value:
+            return {"ok": False, "error": "empty ref"}
+
+        if kind == "pr":
+            fetch = await self._git_run(
+                ["fetch", "origin", f"refs/pull/{value}/head"],
+                cwd=workspace,
+                timeout=120,
+            )
+            if not fetch.get("ok"):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"git fetch of PR #{value} failed: "
+                        f"{fetch.get('error') or 'unknown error'}"
+                    ),
+                }
+            checkout = await self._git_run(
+                ["checkout", "--force", "--detach", "FETCH_HEAD"],
+                cwd=workspace,
+                timeout=60,
+            )
+            if not checkout.get("ok"):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"git checkout of PR #{value} failed: "
+                        f"{checkout.get('error') or 'unknown error'}"
+                    ),
+                }
+        else:
+            # Branch or SHA. Fetch the remote so newly-pushed branches
+            # and commits are available locally, then check out the ref.
+            await self._git_run(
+                ["fetch", "--all", "--prune"], cwd=workspace, timeout=120
+            )
+            checkout = await self._git_run(
+                ["checkout", "--force", value], cwd=workspace, timeout=60
+            )
+            if not checkout.get("ok"):
+                # A remote-only branch that git won't auto-track, or a SHA:
+                # fall back to a detached checkout of the remote ref.
+                detached = await self._git_run(
+                    ["checkout", "--force", "--detach", f"origin/{value}"],
+                    cwd=workspace,
+                    timeout=60,
+                )
+                if not detached.get("ok"):
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"git checkout of ref {value!r} failed: "
+                            f"{checkout.get('error') or 'unknown error'}"
+                        ),
+                    }
+
+        head = self._git_describe_head(workspace)
+        return {
+            "ok": True,
+            "checked_out_ref": head.get("ref"),
+            "head_sha": head.get("head_sha"),
+        }
+
+    async def _git_run(
+        self, args: List[str], *, cwd: Path, timeout: int = 120
+    ) -> Dict[str, Any]:
+        """Run a git subcommand in ``cwd`` and capture its outcome.
+
+        Prefers the sanitized, token-bearing subprocess env so fetches
+        from private remotes authenticate; falls back to the plain
+        environment when no GitHub token is configured, so verifying a
+        local branch never requires a token. Returns
+        ``{"ok", "error", "stdout"}``.
+        """
+        try:
+            env = self._build_subprocess_env()
+        except RuntimeError:
+            env = dict(os.environ)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except FileNotFoundError as e:
+            return {"ok": False, "error": f"git not found: {e}"}
+        try:
+            stdout_b, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return {
+                "ok": False,
+                "error": f"git {args[0]} timed out after {timeout}s",
+            }
+        if proc.returncode != 0:
+            return {
+                "ok": False,
+                "error": stderr_b.decode(errors="replace")[-500:]
+                or f"git {args[0]} failed (exit {proc.returncode})",
+            }
+        return {"ok": True, "stdout": stdout_b.decode(errors="replace")}
+
+    @staticmethod
+    def _git_describe_head(workspace: Path) -> Dict[str, Optional[str]]:
+        """Best-effort current ref + full HEAD SHA of a checkout.
+
+        ``ref`` is the symbolic branch name when on a branch, else the
+        short SHA (detached HEAD). ``head_sha`` is the full HEAD commit
+        SHA. Either may be ``None`` if git can't be queried.
+        """
+
+        def _run(args: List[str]) -> Optional[str]:
+            try:
+                proc = subprocess.run(
+                    ["git", *args],
+                    cwd=str(workspace),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                return None
+            if proc.returncode != 0:
+                return None
+            out = proc.stdout.strip()
+            return out or None
+
+        head_sha = _run(["rev-parse", "HEAD"])
+        ref = _run(["rev-parse", "--abbrev-ref", "HEAD"])
+        if ref == "HEAD":  # detached
+            ref = _run(["rev-parse", "--short", "HEAD"])
+        return {"ref": ref, "head_sha": head_sha}
 
     @tool(
         name="talon_workspace_status",
