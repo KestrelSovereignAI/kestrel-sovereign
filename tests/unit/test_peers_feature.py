@@ -548,6 +548,37 @@ async def test_send_a2a_rejects_oversized_references_before_dispatch(method_name
     client_factory.assert_not_called()
 
 
+@pytest.mark.parametrize("tool_method,tool_name", [
+    ("send_a2a_question", "send_a2a_question"),
+    ("send_a2a_task", "send_a2a_task"),
+])
+def test_send_a2a_tool_schema_advertises_arrays_for_artifacts_and_references(
+    tool_method, tool_name,
+):
+    """Codex round 2 P2: the LLM-facing tool schema for the A2A send
+    surfaces MUST advertise ``artifacts`` and ``references`` as
+    arrays-of-objects, not strings. Otherwise the LLM is told to pass
+    a string, which the strict validator (#1624) now rejects, leaving
+    references effectively unusable through the tool path.
+
+    Triggered by the @tool decorator's schema generator mapping
+    ``Union`` (the ``get_origin`` of ``Optional[...]``) to
+    ``"string"`` via its type_map fallback. Annotation kept as
+    ``List[Any]`` (without Optional) so the origin resolves to
+    ``list`` → ``array``.
+    """
+    method = getattr(PeersFeature, tool_method)
+    schema = getattr(method, "_tool_schema", None)
+    assert schema is not None, "method missing @tool schema"
+    params = {p.name: p for p in schema["parameters"]}
+    for field in ("artifacts", "references"):
+        assert field in params, f"{tool_name} schema missing {field} param"
+        assert params[field].type == "array", (
+            f"{tool_name}.{field} schema must advertise 'array', "
+            f"got {params[field].type!r}"
+        )
+
+
 @pytest.mark.asyncio
 async def test_send_a2a_rejects_nan_in_references_with_typed_error():
     """Codex round 1 P2: a NaN/Inf float passes default json.dumps but

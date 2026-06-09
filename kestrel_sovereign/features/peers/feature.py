@@ -757,8 +757,20 @@ class PeersFeature(Feature):
         message: str,
         session_id: str = "",
         timeout_seconds: int = 300,
-        artifacts: Optional[List[Any]] = None,
-        references: Optional[List[Any]] = None,
+        # NOTE on the annotations: dropping ``Optional[...]`` is
+        # deliberate — the @tool decorator's schema generator
+        # (kestrel_sdk.features.base) reads ``get_origin``, which
+        # returns ``Union`` for ``Optional[List[Any]]`` and falls
+        # through to ``"string"`` in its type_map. That makes the
+        # LLM-facing schema advertise these params as strings, so
+        # the LLM passes JSON-encoded blobs that the strict
+        # validator in ``_coerce_outbound_artifacts`` now rejects.
+        # ``List[Any] = None`` works at runtime (Python doesn't
+        # enforce defaults against annotations) and the schema
+        # correctly renders ``array`` of ``object``. Codex round 2
+        # P2 on PR #1628.
+        artifacts: List[Any] = None,
+        references: List[Any] = None,
     ) -> ToolResult:
         """
         Submit an A2A question to a peer agent under the fire-and-resume
@@ -1845,8 +1857,13 @@ class PeersFeature(Feature):
         message: str,
         skill_id: str = "",
         session_id: str = "",
-        artifacts: Optional[List[Any]] = None,
-        references: Optional[List[Any]] = None,
+        # See send_a2a_question for why these are ``List[Any]``
+        # rather than ``Optional[List[Any]]``: kestrel_sdk's @tool
+        # schema generator maps Union (the Optional unwrap) to
+        # ``string``, which is incompatible with the strict
+        # validator. Codex round 2 P2 on PR #1628.
+        artifacts: List[Any] = None,
+        references: List[Any] = None,
     ) -> ToolResult:
         """
         Submit an A2A task to a peer agent and wake their cognition loop.
