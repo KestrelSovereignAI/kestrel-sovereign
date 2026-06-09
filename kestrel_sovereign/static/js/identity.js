@@ -827,6 +827,7 @@ window.selectAgent = async function(agentName) {
     // Show conversations pane
     const conversationsPane = document.getElementById('conversations-pane');
     conversationsPane.style.display = 'flex';
+    prepareConversationsPaneForAgent(agentName);
 
     // Reset cached panel data so they reload for the new agent. Note
     // that `state.currentSessionId` is per-pane now (its getter reads
@@ -874,6 +875,35 @@ window.selectAgent = async function(agentName) {
 // ============================================================================
 
 let activeConversationId = null;
+let conversationListRequestSeq = 0;
+const activeConversationIdsByAgent = new Map();
+
+function currentAgentMatches(expectedAgent) {
+    return expectedAgent === API.getHostAgent();
+}
+
+function hasExpectedAgent(options) {
+    return Object.prototype.hasOwnProperty.call(options || {}, 'expectedAgent');
+}
+
+function conversationAgentKey(agentName) {
+    return agentName === null || agentName === undefined
+        ? '__standalone__'
+        : String(agentName);
+}
+
+function getActiveConversationIdForAgent(agentName) {
+    const pane = state.chatPanes.get(agentName);
+    return pane?.sessionId || activeConversationIdsByAgent.get(agentName) || null;
+}
+
+function prepareConversationsPaneForAgent(agentName) {
+    const container = document.getElementById('conversations-list');
+    if (!container) return;
+    container.dataset.agentKey = conversationAgentKey(agentName);
+    activeConversationId = getActiveConversationIdForAgent(agentName);
+    container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">Loading conversations...</p>';
+}
 
 // Exported for unit test — kept as a pure function so it's trivial to
 // verify without standing up DOM + fetch mocks.  Callers should treat
@@ -925,12 +955,22 @@ export async function loadConversations(_agentName) {
     // would miss the null-keyed pane and ``paneIsCold`` would read
     // false, regressing the standalone auto-load.  Codex round-2 catch.
     const requestAgent = API.getHostAgent();
+    const requestSeq = ++conversationListRequestSeq;
+    const requestAgentKey = conversationAgentKey(requestAgent);
+    prepareConversationsPaneForAgent(requestAgent);
     // Agent routing is handled by API.setHostAgent() — all calls auto-prefix
     try {
         const data = await API.getConversations();
         const conversations = data.conversations || [];
 
         const container = document.getElementById('conversations-list');
+        if (!container
+            || !currentAgentMatches(requestAgent)
+            || requestSeq !== conversationListRequestSeq
+            || container.dataset.agentKey !== requestAgentKey) {
+            return;
+        }
+        activeConversationId = getActiveConversationIdForAgent(requestAgent);
         if (conversations.length === 0) {
             container.innerHTML = '<p style="color: var(--text-secondary); padding: 1rem; text-align: center;">No conversations yet</p>';
             return;
@@ -944,7 +984,13 @@ export async function loadConversations(_agentName) {
             const item = document.createElement('div');
             item.className = `conversation-item ${activeConversationId === conv.session_id ? 'active' : ''}`;
             item.dataset.sessionId = conv.session_id;
-            item.addEventListener('click', () => window.loadConversation(conv.session_id));
+            item.dataset.agentKey = requestAgentKey;
+            item.addEventListener('click', () => {
+                if (item.dataset.agentKey !== conversationAgentKey(API.getHostAgent())) {
+                    return;
+                }
+                window.loadConversation(conv.session_id, { expectedAgent: requestAgent });
+            });
 
             // Display name: user-assigned name wins over the computed
             // preview (issue #716).  Fallback chain keeps the sidebar
@@ -1048,7 +1094,12 @@ export async function loadConversations(_agentName) {
         }
     } catch (e) {
         const container = document.getElementById('conversations-list');
-        container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
+        if (currentAgentMatches(requestAgent)
+            && requestSeq === conversationListRequestSeq
+            && container
+            && container.dataset.agentKey === requestAgentKey) {
+            container.innerHTML = '<p style="color: var(--error); padding: 1rem;">Failed to load conversations</p>';
+        }
     }
 }
 
@@ -1129,21 +1180,25 @@ function beginRenameConversation(previewEl, conv) {
 
 
 window.loadConversation = async function(sessionId, options = {}) {
-    // Stale-auto-load guard: when an auto-load was queued for one agent
-    // and the operator has since selectAgent'd to a different host, the
-    // queued session_id is no longer addressable on the new agent —
-    // running this would issue a 404'ing GET against the new agent's
-    // URL with the prior agent's session_id.  Drop the load.  See #1358.
-    if (options.auto && options.expectedAgent
-        && options.expectedAgent !== API.getHostAgent()) {
+    // Stale-load guard: when a row load was queued for one agent and the
+    // operator has since selectAgent'd to a different host, the queued
+    // session_id is no longer addressable on the new agent — running this
+    // would issue a 404'ing GET against the new agent's URL with the prior
+    // agent's session_id. Drop the load. See #1358 / #1604.
+    if (hasExpectedAgent(options) && !currentAgentMatches(options.expectedAgent)) {
         return;
     }
 
     activeConversationId = sessionId;
+    activeConversationIdsByAgent.set(API.getHostAgent(), sessionId);
 
     // Update selection UI
     document.querySelectorAll('.conversation-item').forEach(item => {
-        item.classList.toggle('active', item.dataset.sessionId === sessionId);
+        item.classList.toggle(
+            'active',
+            item.dataset.agentKey === conversationAgentKey(API.getHostAgent())
+                && item.dataset.sessionId === sessionId,
+        );
     });
 
     // Load conversation messages into chat panel
@@ -1158,8 +1213,7 @@ window.loadConversation = async function(sessionId, options = {}) {
         // switched.  The pre-await guard above catches the case where
         // the switch happened BEFORE the fetch; this one catches a
         // switch DURING.  Codex round-3 catch on #1358.
-        if (options.auto && options.expectedAgent
-            && options.expectedAgent !== API.getHostAgent()) {
+        if (hasExpectedAgent(options) && !currentAgentMatches(options.expectedAgent)) {
             return;
         }
 
@@ -1289,6 +1343,7 @@ window.deleteConversation = async function(sessionId, rowEl) {
         // vanished session.
         if (state.currentSessionId === sessionId) {
             activeConversationId = null;
+            activeConversationIdsByAgent.delete(API.getHostAgent());
             const fresh = await API.newConversation();
             wipeAgentChatPane(API.getHostAgent(), `
                 <div style="text-align: center; padding: 2rem; color: var(--text-secondary);">
@@ -1297,6 +1352,8 @@ window.deleteConversation = async function(sessionId, rowEl) {
                 </div>
             `);
             state.currentSessionId = fresh.session_id;
+            activeConversationId = fresh.session_id;
+            activeConversationIdsByAgent.set(API.getHostAgent(), fresh.session_id);
             if (selectedAgentName) {
                 await loadConversations(selectedAgentName);
             }
@@ -1342,6 +1399,7 @@ window.purgeConversation = async function(sessionId, rowEl) {
 
         if (state.currentSessionId === sessionId) {
             activeConversationId = null;
+            activeConversationIdsByAgent.delete(API.getHostAgent());
             // Wipe ONLY the visible agent's pane and bump that agent's
             // pane-local generation. In-flight streams on other agents
             // are unaffected.

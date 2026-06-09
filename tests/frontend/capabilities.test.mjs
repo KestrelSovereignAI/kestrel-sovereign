@@ -281,6 +281,7 @@ const PANEL_CAPABILITIES_FOR_TEST = {
     spawn: ['spawn'],
     features: ['featureStore'],
     security: ['audit', 'permissions'],
+    approvals: ['permissions'],
 };
 
 function panelIsEnabled(client, panelId) {
