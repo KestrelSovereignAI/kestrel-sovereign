@@ -123,9 +123,19 @@ test('statusPhaseForChunk returns the in-flight verb even with prose before the 
     assert.equal(statusPhaseForChunk(`Here is the plan.\n${start('run_shell')}`), 'running');
 });
 
-test('statusPhaseForChunk drops back to thinking when a tool completes', () => {
-    assert.equal(statusPhaseForChunk(done('web_search')), 'thinking');
-    assert.equal(statusPhaseForChunk(fail('run_shell')), 'thinking');
+test('statusPhaseForChunk drops back to thinking when a tool completes (with its start)', () => {
+    // A completion is only honored alongside a real 🔧 Calling start
+    // (matching the renderer's TOOL_START_PRESENCE rule). With the start
+    // present and nothing after the completion → between-steps "thinking".
+    assert.equal(statusPhaseForChunk(`${start('web_search')}\n${done('web_search')}`), 'thinking');
+    assert.equal(statusPhaseForChunk(`${start('run_shell')}\n${fail('run_shell')}`), 'thinking');
+});
+
+test('statusPhaseForChunk treats lone checkmark/cross prose as writing, not tool activity', () => {
+    // No 🔧 Calling start → "✓ migration complete" / "❌ build failed" are
+    // ordinary answer prose, so the indicator says "Writing…", not "Thinking…".
+    assert.equal(statusPhaseForChunk('✓ migration complete'), 'writing');
+    assert.equal(statusPhaseForChunk('Done. ❌ build failed on CI, retrying'), 'writing');
 });
 
 test('statusPhaseForChunk reads plain answer prose as writing', () => {

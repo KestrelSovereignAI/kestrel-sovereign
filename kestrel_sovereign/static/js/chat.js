@@ -198,7 +198,13 @@ const STATUS_SCAN_WINDOW = 4096;
 // use of it.
 export function statusPhaseForChunk(chunk) {
     const text = String(chunk || '');
-    const markers = text.match(TOOL_MARKER_TOKEN) || [];
+    // Mirror the renderer's rule: a turn is only tool activity when it has a
+    // real `🔧 Calling` start. Without one, lone ✓/❌ lines are ordinary
+    // answer prose ("✓ migration complete", "❌ build failed"), not tool
+    // completions — so they read as `writing`, never `thinking`.
+    const markers = TOOL_START_PRESENCE.test(text)
+        ? (text.match(TOOL_MARKER_TOKEN) || [])
+        : [];
     let phase = null;
     let lastWasStart = false;
     for (const marker of markers) {
