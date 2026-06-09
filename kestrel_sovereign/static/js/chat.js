@@ -133,19 +133,39 @@ const TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
 // to a (themeable, localizable) label.
 
 // Maps a tool name (the `<name>` from a `🔧 Calling <name>...` marker) to
-// the status phase shown while that tool runs. Substring/`test` matching
-// so namespaced or detail-suffixed names ("github.create_issue",
-// "web_search: cats") still resolve. First rule that matches wins, so the
-// more specific patterns lead.
+// the status phase shown while that tool runs. Tuned against the live
+// Kestrel tool inventory (core + feature extensions: fs_*, git_*,
+// recall_*, schedule_*, council_*, health_*, voice, etc.). First rule
+// that matches wins, so ORDER MATTERS — the specific verbs (search,
+// recall, orchestration, voice, run, push) lead, then the broad mutation
+// family, then the broad read family last. Token boundaries are deliberate:
+// bare `web` would mis-flag `webhooks_*`, and bare `ask` would mis-flag
+// `*_task` — both are pinned by the unit tests.
 const TOOL_PHASE_RULES = [
-    [/search|web|browse|lookup|google/i, 'searching'],
-    [/remember|memory|recall|reflect|_fact|fact_|\bfact\b/i, 'remembering'],
-    [/image|vision|\bsee\b|\blook\b|photo|screenshot|camera/i, 'looking'],
-    [/issue|pull|\bpr\b|comment|merge|commit|push|github|\bgit\b/i, 'pushing'],
-    [/ask|consult|delegate|subagent|dispatch|council/i, 'consulting'],
-    [/run|exec|shell|bash|\bcmd\b|command|python|\bsh\b/i, 'running'],
-    [/write|edit|create|save|append|patch|update|\bput\b|\bfile\b/i, 'writing'],
-    [/read|\bget\b|fetch|load|\bcat\b|view|open|list/i, 'reading'],
+    // Search / lookup. Require web_search (not bare "web") so webhooks_* falls through.
+    [/search|web_search|websearch|browse|lookup|google|recursive_query|\bfind\b/i, 'searching'],
+    // Memory / recall.
+    [/recall|remember|memory|episode|state_of_mind|consolidat|_fact|fact_|\bfact\b/i, 'remembering'],
+    // Sub-agent / task orchestration / council. `ask_` (not bare "ask") so "task" is excluded.
+    [/ask_|consult|delegate|subagent|dispatch|council|deploy_agent|_task\b|task_|_child\b|child_|list_peers|terminate_child/i, 'consulting'],
+    // Vision / documents we "look" at.
+    [/image|vision|\bsee\b|\blook\b|photo|screenshot|camera|ccda|visual/i, 'looking'],
+    // Voice out / in.
+    [/\bspeak\b|\btts\b|say_/i, 'speaking'],
+    [/transcribe|\bstt\b|\blisten/i, 'listening'],
+    // Run / execute.
+    [/\brun_|run_script|\bexec\b|execute|shell|bash|\bcmd\b|\bcommand\b|python|\bscript\b/i, 'running'],
+    // Git/forge push-ish (before writing so create_pr/create_issue read as a push, not a write).
+    [/push|commit|create_pr|merge_pr|create_issue|create_branch|comment|github/i, 'pushing'],
+    // Mutations: write / create / save / set / register / update / delete / send / import-export.
+    // NOTE: tokens use bare substrings (not \b) where they must match after an
+    // underscore — `\badd_` would miss `strategy_add_blocker`, `\bsend\b` would
+    // miss `channels_send`. The tool corpus has no false positives for these.
+    [/write|edit|create|save|append|patch|update|register|set_|rename|rotate|enable|disable|mark_|store|add|delete|remove|purge|empty_|restore|send|export|import|approve|deny|deploy|put_/i, 'writing'],
+    // Reads: list / get / status / history / log / diff / view / show / query / stats / check.
+    // Same bare-substring rule for list/check/query so `fs_list`, `health_check`,
+    // and `health_query_resources` resolve (an underscore kills a leading \b).
+    [/read|\bget|fetch|\bload|\bcat\b|view|open|list|status|history|\blog\b|_log\b|diff|show|stats|query|peek|inspect|check|count|verify/i, 'reading'],
 ];
 
 // Resolve a tool name to a status phase, defaulting to the honest generic
@@ -203,6 +223,8 @@ const STATUS_PHASE_LABEL_KEYS = {
     remembering: 'chat_status_remembering',
     looking: 'chat_status_looking',
     consulting: 'chat_status_consulting',
+    speaking: 'chat_status_speaking',
+    listening: 'chat_status_listening',
     working: 'chat_status_working',
     revising: 'chat_status_revising',
 };
@@ -221,6 +243,8 @@ const STATUS_PHASE_FALLBACK = {
     remembering: 'Remembering...',
     looking: 'Looking...',
     consulting: 'Consulting...',
+    speaking: 'Speaking...',
+    listening: 'Listening...',
     working: 'Working...',
     revising: 'Revising...',
 };

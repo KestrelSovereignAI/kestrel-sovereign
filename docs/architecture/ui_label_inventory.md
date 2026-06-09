@@ -336,6 +336,8 @@ The complete `theme`-class key set, with example mappings to the three initial t
 | chat_status_remembering | Remembering... | Roosting... | Remembering... |
 | chat_status_looking | Looking... | Eyeing... | Looking... |
 | chat_status_consulting | Consulting... | Calling... | Consulting... |
+| chat_status_speaking | Speaking... | Crying... | Speaking... |
+| chat_status_listening | Listening... | Heeding... | Listening... |
 | chat_status_working | Working... | Hunting... | Working... |
 | chat_status_revising | Revising... | Mantling... | Revising... |
 | chat_input_placeholder | Ask me anything... | Speak to your bird... | Type a message... |

@@ -74,6 +74,44 @@ test('toolStatusPhase falls back to the honest generic for unknown tools', () =>
     assert.equal(toolStatusPhase(null), 'working');
 });
 
+// Regression pins for two real-inventory bugs the first cut had:
+test('toolStatusPhase does not mistake webhooks_* for web search', () => {
+    // Bare "web" used to flag these as "searching".
+    assert.equal(toolStatusPhase('webhooks_list'), 'reading');
+    assert.equal(toolStatusPhase('webhooks_register'), 'writing');
+    assert.equal(toolStatusPhase('webhooks_remove'), 'writing');
+    assert.equal(toolStatusPhase('search_documents'), 'searching');
+});
+
+test('toolStatusPhase does not mistake *_task for "ask" (consulting)', () => {
+    // Bare "ask" matched the "ask" inside "task"; task orchestration is
+    // now intentionally consulting, but via real tokens.
+    assert.equal(toolStatusPhase('cancel_task'), 'consulting');
+    assert.equal(toolStatusPhase('ask_agent'), 'consulting');
+    assert.equal(toolStatusPhase('deploy_agent'), 'consulting');
+    assert.equal(toolStatusPhase('council_convene'), 'consulting');
+});
+
+test('toolStatusPhase resolves underscore-separated verbs (no leading-\\b miss)', () => {
+    // These all sit after an underscore, which kills a leading \\b.
+    assert.equal(toolStatusPhase('fs_list'), 'reading');
+    assert.equal(toolStatusPhase('schedule_list'), 'reading');
+    assert.equal(toolStatusPhase('health_check'), 'reading');
+    assert.equal(toolStatusPhase('strategy_add_decision'), 'writing');
+    assert.equal(toolStatusPhase('channels_send'), 'writing');
+});
+
+test('toolStatusPhase maps the real read/write/recall/voice families', () => {
+    assert.equal(toolStatusPhase('git_status'), 'reading');
+    assert.equal(toolStatusPhase('list_models'), 'reading');
+    assert.equal(toolStatusPhase('fs_write'), 'writing');
+    assert.equal(toolStatusPhase('set_model'), 'writing');
+    assert.equal(toolStatusPhase('recall_recent'), 'remembering');
+    assert.equal(toolStatusPhase('run_script'), 'running');
+    assert.equal(toolStatusPhase('speak'), 'speaking');
+    assert.equal(toolStatusPhase('transcribe'), 'listening');
+});
+
 test('statusPhaseForChunk reads an in-flight tool start as that tool verb', () => {
     assert.equal(statusPhaseForChunk(start('web_search')), 'searching');
     assert.equal(statusPhaseForChunk(start('read_file')), 'reading');
