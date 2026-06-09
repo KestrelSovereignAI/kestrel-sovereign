@@ -119,6 +119,136 @@ const TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?
 // "❌ build failed" never gets mistaken for a tool card.
 const TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
 
+// ============================================================================
+// Dynamic thinking-status phase (functional words)
+// ============================================================================
+//
+// The thinking indicator used to be a single static "Thinking…". These
+// helpers turn the SAME stream signals the renderer already parses (tool
+// markers, thinking thoughts, revise sentinels, prose) into a one-word
+// description of what the agent is doing right now — "Searching…",
+// "Reading…", "Running…", "Writing…". Functional only: every word is
+// derived from a real signal, so it is never decorative theatre. The
+// words are pure phase keys here; updateThinkingIndicator() resolves each
+// to a (themeable, localizable) label.
+
+// Maps a tool name (the `<name>` from a `🔧 Calling <name>...` marker) to
+// the status phase shown while that tool runs. Substring/`test` matching
+// so namespaced or detail-suffixed names ("github.create_issue",
+// "web_search: cats") still resolve. First rule that matches wins, so the
+// more specific patterns lead.
+const TOOL_PHASE_RULES = [
+    [/search|web|browse|lookup|google/i, 'searching'],
+    [/remember|memory|recall|reflect|_fact|fact_|\bfact\b/i, 'remembering'],
+    [/image|vision|\bsee\b|\blook\b|photo|screenshot|camera/i, 'looking'],
+    [/issue|pull|\bpr\b|comment|merge|commit|push|github|\bgit\b/i, 'pushing'],
+    [/ask|consult|delegate|subagent|dispatch|council/i, 'consulting'],
+    [/run|exec|shell|bash|\bcmd\b|command|python|\bsh\b/i, 'running'],
+    [/write|edit|create|save|append|patch|update|\bput\b|\bfile\b/i, 'writing'],
+    [/read|\bget\b|fetch|load|\bcat\b|view|open|list/i, 'reading'],
+];
+
+// Resolve a tool name to a status phase, defaulting to the honest generic
+// "working" when no rule matches (better than guessing a wrong verb).
+export function toolStatusPhase(name) {
+    const n = String(name || '');
+    for (const [re, phase] of TOOL_PHASE_RULES) {
+        if (re.test(n)) return phase;
+    }
+    return 'working';
+}
+
+// Derive the status phase implied by one stream chunk's visible text.
+// Tool markers win: a `🔧 Calling` start → that tool's verb; a `✓ done`
+// or `❌ failed` → back to the generic `thinking` (the agent is deciding
+// what's next). Plain prose after the last marker means the answer is
+// being composed → `writing`. Returns null when the chunk carries no
+// phase signal (caller keeps the prior phase). Uses only `.match`/
+// `.replace` on TOOL_MARKER_TOKEN — never `.test` — so the shared global
+// regex's lastIndex never leaks into the renderer's own use of it.
+export function statusPhaseForChunk(chunk) {
+    const text = String(chunk || '');
+    const markers = text.match(TOOL_MARKER_TOKEN) || [];
+    let phase = null;
+    let lastWasStart = false;
+    for (const marker of markers) {
+        const parsed = parseToolActivityLine(marker.trim());
+        if (parsed.kind === 'start') {
+            phase = toolStatusPhase(parsed.name);
+            lastWasStart = true;
+        } else if (parsed.kind === 'done' || parsed.kind === 'error') {
+            phase = 'thinking';
+            lastWasStart = false;
+        }
+    }
+    // Visible prose outside the markers → the model is composing its
+    // answer. Don't override an in-flight tool (the prose BEFORE a
+    // `🔧 Calling` is the prior step's output, not new answer text).
+    const prose = text.replace(TOOL_MARKER_TOKEN, '').replace(/-{3,}/g, '').trim();
+    if (prose && !lastWasStart) phase = 'writing';
+    return phase;
+}
+
+// Phase → i18n label key. Resolved through the same theme catalog as the
+// static `chat_thinking` fallback, so the word localizes and themes
+// (falconry says "Scouting…" where plain says "Searching…").
+const STATUS_PHASE_LABEL_KEYS = {
+    thinking: 'chat_thinking',
+    reasoning: 'chat_status_reasoning',
+    searching: 'chat_status_searching',
+    reading: 'chat_status_reading',
+    writing: 'chat_status_writing',
+    running: 'chat_status_running',
+    pushing: 'chat_status_pushing',
+    remembering: 'chat_status_remembering',
+    looking: 'chat_status_looking',
+    consulting: 'chat_status_consulting',
+    working: 'chat_status_working',
+    revising: 'chat_status_revising',
+};
+
+// English fallbacks for when the theme catalog hasn't loaded a key (first
+// paint, fetch failure, or a custom theme that omits it). `chat_thinking`
+// also ships inline in the HTML, so the indicator is never blank.
+const STATUS_PHASE_FALLBACK = {
+    thinking: 'Thinking...',
+    reasoning: 'Reasoning...',
+    searching: 'Searching...',
+    reading: 'Reading...',
+    writing: 'Writing...',
+    running: 'Running...',
+    pushing: 'Pushing...',
+    remembering: 'Remembering...',
+    looking: 'Looking...',
+    consulting: 'Consulting...',
+    working: 'Working...',
+    revising: 'Revising...',
+};
+
+// Paint a phase word into the thinking indicator's text span. Keeps
+// `data-label-key` in sync so a mid-stream theme/locale switch re-hydrates
+// to the CURRENT phase word (via theme.js) instead of snapping back to the
+// static "Thinking…" baseline.
+function applyThinkingStatusWord(phase) {
+    if (!thinkingIndicator) return;
+    const textEl = thinkingIndicator.querySelector('.thinking-text');
+    if (!textEl) return;
+    const key = STATUS_PHASE_LABEL_KEYS[phase] || 'chat_thinking';
+    let word = STATUS_PHASE_FALLBACK[phase] || STATUS_PHASE_FALLBACK.thinking;
+    try {
+        const labels = (typeof window !== 'undefined'
+            && window.KestrelTheme
+            && window.KestrelTheme.getCurrentLabels)
+            ? window.KestrelTheme.getCurrentLabels()
+            : null;
+        if (labels && Object.prototype.hasOwnProperty.call(labels, key)) {
+            word = labels[key];
+        }
+    } catch (_) { /* keep the English fallback */ }
+    textEl.setAttribute('data-label-key', key);
+    textEl.textContent = word;
+}
+
 // The orchestrator emits a bare `---` line as the wire delimiter between
 // the tool-activity block and the synthesized answer. It is protocol,
 // not prose — dropped (only where it appears, leading the prose right
@@ -1240,6 +1370,13 @@ export function updateThinkingIndicator() {
     const busy = deps().state.waitingAgents.has(current);
     if (thinkingIndicator) {
         thinkingIndicator.style.display = busy ? 'flex' : 'none';
+        // Drive the one-word status from the visible agent's current
+        // stream phase (set on the pane by the streaming loop). Falls
+        // back to the generic "Thinking…" when no phase is recorded yet.
+        if (busy) {
+            const pane = deps().state.chatPanes.get(current);
+            applyThinkingStatusWord((pane && pane.statusPhase) || 'thinking');
+        }
     }
     // #1255: composer stays editable while the agent is streaming.
     // Hitting Enter mid-stream is the universal interrupt pattern
@@ -1524,6 +1661,9 @@ export async function sendMessage(overrideText, overrideAgent) {
     // currently-mounted agent.
     if (fromComposer) messageInput.value = '';
     deps().state.waitingAgents.add(dispatchAgent);
+    // Reset the dynamic status word for this turn; the streaming loop
+    // advances it (reasoning → tool verb → writing) as signals arrive.
+    pane.statusPhase = 'thinking';
     updateThinkingIndicator();
     refreshAgentThinkingDot(dispatchAgent);
 
@@ -1541,6 +1681,16 @@ export async function sendMessage(overrideText, overrideAgent) {
     const isPaneFresh = () => pane.generation === dispatchGeneration;
     const isCurrentVisible = () =>
         isPaneFresh() && deps().api.getHostAgent() === dispatchAgent;
+
+    // Record this turn's current stream phase on the pane (per-agent, like
+    // the busy flag) and repaint the indicator only when this dispatch's
+    // agent is the one on screen — switching to Agent B mustn't show A's
+    // phase word.
+    const setStatusPhase = (phase) => {
+        if (!phase) return;
+        pane.statusPhase = phase;
+        if (isCurrentVisible()) updateThinkingIndicator();
+    };
 
     let wasAborted = false;
 
@@ -1609,6 +1759,10 @@ export async function sendMessage(overrideText, overrideAgent) {
                         stripStreamSentinels(processable);
                     if (thoughts.length) {
                         appendThinkingItems(pane.thinkingItems, thoughts);
+                        // Thinking thoughts arrive in their own packets
+                        // (no visible chunk), so reflect "Reasoning…" here
+                        // before the !chunk `continue` below skips the rest.
+                        setStatusPhase('reasoning');
                     }
                     // Case B: a PARTIAL prefix at the tail of post-
                     // strip output — happens when a chunk splits
@@ -1649,9 +1803,14 @@ export async function sendMessage(overrideText, overrideAgent) {
                     if (!chunk) {
                         // No visible text this packet, but a revise
                         // sentinel still arms the boundary for the next
-                        // packet (#1547).
+                        // packet (#1547) — and surfaces "Revising…" now,
+                        // since this `continue` skips the phase update at
+                        // the `fullContent += chunk` site below. Without
+                        // this, a metadata-only revise packet would never
+                        // show the revising word.
                         if (reviseBoundaryPending || leadingReviseBoundary) {
                             pendingReviseBoundary = true;
+                            setStatusPhase('revising');
                         }
                         continue;
                     }
@@ -1667,6 +1826,17 @@ export async function sendMessage(overrideText, overrideAgent) {
                         fullContent += '\n\n';
                     }
                     fullContent += chunk;
+                    // Advance the dynamic status word from this packet's
+                    // visible text: an in-flight tool's verb, or "Writing…"
+                    // once answer prose flows. A revise sentinel with no
+                    // trailing prose surfaces "Revising…". `setStatusPhase`
+                    // is a no-op on null, so a phase-less packet keeps the
+                    // prior word.
+                    let nextPhase = statusPhaseForChunk(chunk);
+                    if (!nextPhase && (reviseBoundaryPending || leadingReviseBoundary)) {
+                        nextPhase = 'revising';
+                    }
+                    setStatusPhase(nextPhase);
                     // #1560 / #1562: expose the RAW cumulative content
                     // length to off-path observers (specifically
                     // ``handleRestartStatus`` deciding the

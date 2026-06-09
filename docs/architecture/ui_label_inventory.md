@@ -327,6 +327,17 @@ The complete `theme`-class key set, with example mappings to the three initial t
 | chat_history_title | History | History | History |
 | chat_welcome_message | (current welcome) | (falconry-voiced rewrite) | (plain rewrite) |
 | chat_thinking | Thinking... | Hunting... | Thinking... |
+| chat_status_reasoning | Reasoning... | Pondering... | Reasoning... |
+| chat_status_searching | Searching... | Scouting... | Searching... |
+| chat_status_reading | Reading... | Spotting... | Reading... |
+| chat_status_writing | Writing... | Scribing... | Writing... |
+| chat_status_running | Running... | Stooping... | Running... |
+| chat_status_pushing | Pushing... | Delivering... | Pushing... |
+| chat_status_remembering | Remembering... | Roosting... | Remembering... |
+| chat_status_looking | Looking... | Eyeing... | Looking... |
+| chat_status_consulting | Consulting... | Calling... | Consulting... |
+| chat_status_working | Working... | Hunting... | Working... |
+| chat_status_revising | Revising... | Mantling... | Revising... |
 | chat_input_placeholder | Ask me anything... | Speak to your bird... | Type a message... |
 | constitution_title | Kestrel Constitution | Kestrel Constitution | Kestrel Constitution |
 | memories_title | Knowledge Graph | The Mews Library | Memories |
