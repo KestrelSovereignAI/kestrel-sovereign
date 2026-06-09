@@ -7,7 +7,11 @@ import httpx
 import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
-from kestrel_sovereign.features.peers.feature import PeersFeature, _discover_host_url
+from kestrel_sovereign.features.peers.feature import (
+    MAX_OUTBOUND_ARTIFACT_BYTES,
+    PeersFeature,
+    _discover_host_url,
+)
 
 
 def test_discover_host_url_from_env(monkeypatch):
@@ -456,6 +460,92 @@ async def test_send_a2a_task_attaches_references_as_data_artifacts():
         "data": {"ref_type": "memory", "id": "m1", "label": "plan"},
     }
     assert arts[1]["parts"][0]["data"] == {"ref_type": "recall", "id": "r2"}
+
+
+@pytest.mark.asyncio
+async def test_send_a2a_question_attaches_references_as_data_artifacts():
+    """send_a2a_question preserves structured references as bounded
+    DataPart artifacts, same as send_a2a_task."""
+    feature = _make_a2a_feature()
+    client = _async_client_with(post_resp=_mock_post_response(task_id="q-ref"))
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        return_value=client,
+    ):
+        result = await feature.send_a2a_question(
+            "meridian",
+            "Use this context?",
+            references={"ref_type": "memory", "id": "m1", "label": "brief"},
+        )
+
+    assert result.status is ToolResultStatus.OK
+    arts = client.post.call_args.kwargs["json"]["artifacts"]
+    assert len(arts) == 1
+    assert arts[0]["name"] == "references"
+    assert arts[0]["index"] == 0
+    assert arts[0]["metadata"] == {"kind": "reference"}
+    assert arts[0]["parts"][0] == {
+        "type": "data",
+        "data": {"ref_type": "memory", "id": "m1", "label": "brief"},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["send_a2a_task", "send_a2a_question"])
+async def test_send_a2a_rejects_string_references_before_dispatch(method_name):
+    """A JSON-serialized string is not a references list. It must fail
+    before dispatch instead of becoming one artifact per character."""
+    feature = _make_a2a_feature()
+    client_factory = MagicMock(
+        return_value=_async_client_with(post_resp=_mock_post_response())
+    )
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        client_factory,
+    ):
+        result = await getattr(feature, method_name)(
+            "meridian",
+            "use refs",
+            references='[{"ref_type":"memory","id":"m1"}]',
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["sent"] is False
+    assert result.data["error_type"] == "invalid_a2a_references"
+    assert result.data["error_code"] == "references_must_be_structured"
+    client_factory.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method_name", ["send_a2a_task", "send_a2a_question"])
+async def test_send_a2a_rejects_oversized_references_before_dispatch(method_name):
+    feature = _make_a2a_feature()
+    client_factory = MagicMock(
+        return_value=_async_client_with(post_resp=_mock_post_response())
+    )
+    huge_ref = {
+        "ref_type": "memory",
+        "id": "m-big",
+        "body": "x" * MAX_OUTBOUND_ARTIFACT_BYTES,
+    }
+
+    with patch(
+        "kestrel_sovereign.features.peers.feature.httpx.AsyncClient",
+        client_factory,
+    ):
+        result = await getattr(feature, method_name)(
+            "meridian",
+            "use refs",
+            references=[huge_ref],
+        )
+
+    assert result.status is ToolResultStatus.ERROR
+    assert result.data["sent"] is False
+    assert result.data["error_type"] == "invalid_a2a_references"
+    assert result.data["error_code"] == "payload_too_large"
+    client_factory.assert_not_called()
 
 
 @pytest.mark.asyncio

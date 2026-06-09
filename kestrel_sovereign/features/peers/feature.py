@@ -79,6 +79,17 @@ def _discover_host_url() -> Optional[str]:
 # from the responder-side ``reply_body`` convention so a recipient can
 # tell sender-attached handoff payload apart from a responder's reply.
 REFERENCES_ARTIFACT_NAME = "references"
+MAX_OUTBOUND_ARTIFACT_ITEMS = 32
+MAX_OUTBOUND_ARTIFACT_BYTES = 64 * 1024
+
+
+class OutboundArtifactValidationError(ValueError):
+    """Typed send-side validation failure for outbound A2A handoff payloads."""
+
+    def __init__(self, field: str, code: str, message: str):
+        super().__init__(message)
+        self.field = field
+        self.code = code
 
 
 def _normalize_outbound_artifact(item: Any, default_index: int) -> Dict[str, Any]:
@@ -86,19 +97,18 @@ def _normalize_outbound_artifact(item: Any, default_index: int) -> Dict[str, Any
     dict (the shape the recipient's ``/tasks/send`` endpoint validates
     into an ``Artifact``).
 
-    Accepts either a bare string (becomes a single text part) or a dict
-    with any of: ``name``, ``description``, ``metadata``, ``index``,
-    ``last_chunk``/``lastChunk``, and a body given as ``parts`` (already
-    wire-shaped), ``text`` (→ TextPart), or ``data`` (→ DataPart for
-    structured payloads). Supporting ``data`` is what lets a handoff
-    carry structured metadata rather than only raw text.
+    Accepts a dict with any of: ``name``, ``description``, ``metadata``,
+    ``index``, ``last_chunk``/``lastChunk``, and a body given as
+    ``parts`` (already wire-shaped), ``text`` (→ TextPart), or ``data``
+    (→ DataPart for structured payloads). Supporting ``data`` is what
+    lets a handoff carry structured metadata rather than only raw text.
     """
     if not isinstance(item, dict):
-        return {
-            "name": "attachment",
-            "parts": [{"type": "text", "text": str(item)}],
-            "index": default_index,
-        }
+        raise OutboundArtifactValidationError(
+            "artifacts",
+            "invalid_artifact_item",
+            "artifacts items must be structured dicts, not strings or scalars",
+        )
 
     parts = item.get("parts")
     if not parts:
@@ -130,7 +140,13 @@ def _normalize_outbound_reference(ref: Any, index: int) -> Dict[str, Any]:
     or recall item id, URI, etc.); we carry it as a ``DataPart`` so the
     recipient gets the structured descriptor intact rather than a
     stringified blob."""
-    data = ref if isinstance(ref, dict) else {"ref": str(ref)}
+    if not isinstance(ref, dict):
+        raise OutboundArtifactValidationError(
+            "references",
+            "invalid_reference_item",
+            "references items must be structured dicts, not strings or scalars",
+        )
+    data = ref
     return {
         "name": REFERENCES_ARTIFACT_NAME,
         "parts": [{"type": "data", "data": data}],
@@ -139,19 +155,64 @@ def _normalize_outbound_reference(ref: Any, index: int) -> Dict[str, Any]:
     }
 
 
+def _coerce_structured_sequence(value: Any, field: str) -> List[Dict[str, Any]]:
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, (str, bytes, bytearray)):
+        raise OutboundArtifactValidationError(
+            field,
+            f"{field}_must_be_structured",
+            f"{field} must be a structured dict or list of dicts; got string",
+        )
+    if not isinstance(value, (list, tuple)):
+        raise OutboundArtifactValidationError(
+            field,
+            f"{field}_must_be_structured",
+            f"{field} must be a structured dict or list of dicts",
+        )
+    return list(value)
+
+
 def _coerce_outbound_artifacts(
-    artifacts: Optional[List[Any]],
-    references: Optional[List[Any]],
+    artifacts: Optional[Any],
+    references: Optional[Any],
 ) -> List[Dict[str, Any]]:
     """Build the outbound ``artifacts`` wire list from sender-supplied
     ``artifacts`` and ``references``. Artifacts keep their own ordering;
     references are appended as a separate ``references`` group with
     monotonic indices so the recipient can reassemble them in order."""
     wire: List[Dict[str, Any]] = []
-    for i, item in enumerate(artifacts or []):
+    artifact_items = _coerce_structured_sequence(artifacts, "artifacts")
+    reference_items = _coerce_structured_sequence(references, "references")
+    if len(artifact_items) + len(reference_items) > MAX_OUTBOUND_ARTIFACT_ITEMS:
+        raise OutboundArtifactValidationError(
+            "artifacts",
+            "too_many_items",
+            "outbound artifacts and references are limited to "
+            f"{MAX_OUTBOUND_ARTIFACT_ITEMS} total items",
+        )
+    for i, item in enumerate(artifact_items):
         wire.append(_normalize_outbound_artifact(item, i))
-    for i, ref in enumerate(references or []):
+    for i, ref in enumerate(reference_items):
         wire.append(_normalize_outbound_reference(ref, i))
+    try:
+        size = len(json.dumps(wire, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise OutboundArtifactValidationError(
+            "artifacts",
+            "not_json_serializable",
+            f"outbound artifacts/references must be JSON-serializable: {exc}",
+        ) from exc
+    if size > MAX_OUTBOUND_ARTIFACT_BYTES:
+        field = "references" if reference_items and not artifact_items else "artifacts"
+        raise OutboundArtifactValidationError(
+            field,
+            "payload_too_large",
+            "outbound artifacts/references exceed "
+            f"{MAX_OUTBOUND_ARTIFACT_BYTES} bytes when serialized",
+        )
     return wire
 
 
@@ -514,7 +575,21 @@ class PeersFeature(Feature):
         # sender attaches at creation time. Only put the key on the wire
         # when there's something to attach so legacy recipients that
         # ignore unknown keys see no change.
-        outbound_artifacts = _coerce_outbound_artifacts(artifacts, references)
+        try:
+            outbound_artifacts = _coerce_outbound_artifacts(
+                artifacts, references,
+            )
+        except OutboundArtifactValidationError as exc:
+            return None, None, ToolResult.failed(
+                f"Invalid A2A {exc.field}: {exc}",
+                data={
+                    "sent": False,
+                    "recipient": recipient,
+                    "error_type": f"invalid_a2a_{exc.field}",
+                    "error_code": exc.code,
+                    "field": exc.field,
+                },
+            )
         if outbound_artifacts:
             payload["artifacts"] = outbound_artifacts
 
