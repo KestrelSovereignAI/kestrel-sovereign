@@ -211,10 +211,19 @@ export function statusPhaseForChunk(chunk) {
             lastWasStart = false;
         }
     }
-    // Visible prose outside the markers → the model is composing its
-    // answer. Don't override an in-flight tool (the prose BEFORE a
-    // `🔧 Calling` is the prior step's output, not new answer text).
-    const prose = text.replace(TOOL_MARKER_TOKEN, '').replace(/-{3,}/g, '').trim();
+    // Only prose AFTER the last marker counts as answer composition. With a
+    // cumulative tail, prose BEFORE/BETWEEN markers is prior-step output, not
+    // new answer text — so inspect only what follows the last marker. A
+    // completion with nothing after it stays `thinking` (the agent is between
+    // tool steps), not `writing`. An in-flight start (lastWasStart) keeps its
+    // verb regardless of any trailing text.
+    let tail = text;
+    if (markers.length) {
+        const last = markers[markers.length - 1];
+        const at = text.lastIndexOf(last);
+        tail = at >= 0 ? text.slice(at + last.length) : '';
+    }
+    const prose = tail.replace(/-{3,}/g, '').trim();
     if (prose && !lastWasStart) phase = 'writing';
     return phase;
 }

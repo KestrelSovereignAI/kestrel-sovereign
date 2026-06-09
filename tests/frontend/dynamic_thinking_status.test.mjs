@@ -160,6 +160,18 @@ test('statusPhaseForChunk keeps the in-flight tool verb past an earlier complete
     assert.equal(statusPhaseForChunk(cumulative), 'running');
 });
 
+test('statusPhaseForChunk stays thinking between tool steps (prior prose does not leak)', () => {
+    // Old prose BEFORE the markers must not count as answer composition —
+    // a completion with nothing after it is "between steps", not writing.
+    const cumulative = `Plan the work.\n${start('web_search')}\n${done('web_search')}`;
+    assert.equal(statusPhaseForChunk(cumulative), 'thinking');
+});
+
+test('statusPhaseForChunk flips to writing only on prose AFTER the last completion', () => {
+    const cumulative = `Plan.\n${done('web_search')}\nThe answer, based on results, is`;
+    assert.equal(statusPhaseForChunk(cumulative), 'writing');
+});
+
 test('statusPhaseForChunk does not corrupt TOOL_MARKER_TOKEN lastIndex across calls', () => {
     // The shared global regex is used via .match/.replace only; two calls
     // in a row must be independent (a stale lastIndex would drop a match).
