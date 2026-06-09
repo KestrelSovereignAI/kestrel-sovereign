@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["conversations"])
 
+SESSION_GAP_OVERSAMPLE = 20
+MAX_CONVERSATION_LIST_ROWS = 1000
+
 
 @router.get("/sessions")
 async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
@@ -53,11 +56,63 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
         # Check if encryption is enabled via the wrapper's safe accessor
         encrypted_at_rest = getattr(storage, 'encryption_enabled', False)
 
-        # Use privacy-aware query method instead of direct storage.db access
-        rows = await storage.query_conversations(agent_id, limit=limit)
+        # Python still groups raw messages into sessions by 30-minute gaps, so
+        # fetch more rows than the requested session count while keeping a hard
+        # SQL-side budget for large histories.
+        row_limit = min(limit * SESSION_GAP_OVERSAMPLE, MAX_CONVERSATION_LIST_ROWS)
+
+        # Use privacy-aware query method instead of direct storage.db access.
+        rows = await storage.query_conversations(agent_id, limit=row_limit)
 
         if not rows:
             return {"conversations": [], "total": 0, "encrypted_at_rest": encrypted_at_rest}
+
+        def _new_session(msg_id, timestamp):
+            return {
+                "session_id": str(msg_id),
+                "started_at": timestamp.isoformat(),
+                "last_message_at": timestamp.isoformat(),
+                "message_count": 0,
+                "user_message_count": 0,
+                "preview": "",
+                "messages": [],
+                "_preview_content": None,
+                "_preview_metadata_json": None,
+            }
+
+        def _decorate_preview(session):
+            preview_content = session.pop("_preview_content", None)
+            metadata_json = session.pop("_preview_metadata_json", None)
+            if preview_content is None:
+                return
+
+            is_encrypted = False
+            decryption_failed = False
+            preview_is_sent_form = False
+            if metadata_json:
+                try:
+                    meta = json.loads(metadata_json)
+                    if meta.get('enc'):
+                        is_encrypted = True
+                        if decrypt:
+                            fernet = get_agent_fernet(agent_id) if agent_id else get_fernet()
+                            if fernet:
+                                try:
+                                    preview_content = decrypt_string(preview_content, meta, fernet)
+                                except Exception as decrypt_err:
+                                    logger.warning(f"Failed to decrypt preview: {decrypt_err}")
+                                    decryption_failed = True
+                    preview_is_sent_form = bool(meta.get('sent_form'))
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse metadata for preview: {e}")
+
+            # Unwrap sent-form so the UI shows raw user text, not the
+            # <retrieved_context>.../<user_input>... wrappers that were stored
+            # for byte-stable history replay.
+            if preview_is_sent_form and not decryption_failed:
+                preview_content = extract_raw_user_content(preview_content)
+            session["preview"] = preview_content[:100] + ("..." if len(preview_content) > 100 else "")
+            session["preview_encrypted"] = is_encrypted and (not decrypt or decryption_failed)
 
         sessions = []
         current_session = None
@@ -95,15 +150,7 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
                     logger.warning(f"Failed to parse metadata for message {msg_id}: {e}")
 
             if current_session is None:
-                current_session = {
-                    "session_id": str(msg_id),
-                    "started_at": timestamp.isoformat(),
-                    "last_message_at": timestamp.isoformat(),
-                    "message_count": 0,
-                    "user_message_count": 0,
-                    "preview": "",
-                    "messages": []
-                }
+                current_session = _new_session(msg_id, timestamp)
 
             last_ts = datetime.fromisoformat(current_session["last_message_at"])
             gap_minutes = (timestamp - last_ts).total_seconds() / 60
@@ -112,15 +159,7 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
             if gap_minutes > SESSION_GAP_MINUTES or is_new_session_marker:
                 if current_session["message_count"] > 0:
                     sessions.append(current_session)
-                current_session = {
-                    "session_id": str(msg_id),
-                    "started_at": timestamp.isoformat(),
-                    "last_message_at": timestamp.isoformat(),
-                    "message_count": 0,
-                    "user_message_count": 0,
-                    "preview": "",
-                    "messages": []
-                }
+                current_session = _new_session(msg_id, timestamp)
                 # Skip counting the session marker itself
                 if is_new_session_marker:
                     continue
@@ -129,40 +168,16 @@ async def list_conversations(request: Request, limit: int = Query(50, ge=1, le=5
             current_session["last_message_at"] = timestamp.isoformat()
             if role == "user":
                 current_session["user_message_count"] += 1
-                if not current_session["preview"]:
-                    preview_content = content
-                    is_encrypted = False
-                    decryption_failed = False
-                    preview_is_sent_form = False
-                    if metadata_json:
-                        try:
-                            meta = json.loads(metadata_json)
-                            if meta.get('enc'):
-                                is_encrypted = True
-                                # Decrypt preview if requested - use per-agent key
-                                if decrypt:
-                                    fernet = get_agent_fernet(agent_id) if agent_id else get_fernet()
-                                    if fernet:
-                                        try:
-                                            preview_content = decrypt_string(content, meta, fernet)
-                                        except Exception as decrypt_err:
-                                            logger.warning(f"Failed to decrypt preview: {decrypt_err}")
-                                            decryption_failed = True
-                            preview_is_sent_form = bool(meta.get('sent_form'))
-                        except json.JSONDecodeError as e:
-                            logger.warning(f"Failed to parse metadata for preview in message {msg_id}: {e}")
-                    # Unwrap sent-form so the UI shows raw user text, not the
-                    # <retrieved_context>.../<user_input>... wrappers that
-                    # were stored for byte-stable history replay.
-                    if preview_is_sent_form and not decryption_failed:
-                        preview_content = extract_raw_user_content(preview_content)
-                    current_session["preview"] = preview_content[:100] + ("..." if len(preview_content) > 100 else "")
-                    current_session["preview_encrypted"] = is_encrypted and (not decrypt or decryption_failed)
+                if current_session["_preview_content"] is None:
+                    current_session["_preview_content"] = content
+                    current_session["_preview_metadata_json"] = metadata_json
 
         if current_session and current_session["message_count"] > 0:
             sessions.append(current_session)
 
         sessions = list(reversed(sessions))[:limit]
+        for session in sessions:
+            _decorate_preview(session)
 
         # Decorate with user-assigned display names (#716).  Single bulk
         # read rather than per-row so long conversation lists stay fast.

@@ -395,7 +395,21 @@ class TestPrivacyAwareQueries:
         rows = await wrapper.query_conversations("agent-1")
         assert len(rows) == 2
         assert rows[0][1] == "user"
-        mock_storage.db.fetchall.assert_called_once()
+        mock_storage.db.fetchall.assert_awaited_once()
+        sql, params = mock_storage.db.fetchall.await_args.args
+        assert "LIMIT ?" in sql
+        assert params == ("agent-1", 50)
+
+    @pytest.mark.asyncio
+    async def test_query_conversations_clamps_sql_limit(self, mock_storage):
+        """NORMAL mode should keep list queries under the raw-row safety cap."""
+        wrapper = PrivacyEnforcingStorage(mock_storage, PrivacyMode.NORMAL)
+
+        await wrapper.query_conversations("agent-1", limit=5000)
+
+        sql, params = mock_storage.db.fetchall.await_args.args
+        assert "LIMIT ?" in sql
+        assert params == ("agent-1", 1000)
 
     @pytest.mark.asyncio
     async def test_query_conversations_ephemeral_returns_empty(self, mock_storage):

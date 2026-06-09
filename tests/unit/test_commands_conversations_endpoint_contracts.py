@@ -1,11 +1,18 @@
 """Focused contract tests for commands and conversations endpoints."""
 
+import time
 import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+
+from kestrel_sovereign.privacy import PrivacyMode
+from kestrel_sovereign.storage.async_storage import AsyncStorage
+from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
 
 
 def _prepare_app(agent):
@@ -142,8 +149,85 @@ def test_conversations_endpoint_groups_rows_and_marks_encrypted_preview():
         assert older_session["preview"] == "ciphertext"
         assert older_session["preview_encrypted"] is True
         assert payload["encrypted_at_rest"] is True
+        storage.query_conversations.assert_awaited_once_with("did:agent", limit=200)
     finally:
         _restore_app(app, original)
+
+
+@pytest.mark.asyncio
+async def test_conversations_endpoint_limits_sql_scan_for_large_history(tmp_path):
+    agent_id = "did:test:large-conversation-list"
+    storage = AsyncStorage(str(tmp_path / "large-history.db"))
+    storage.agent_id = agent_id
+    await storage.initialize()
+    wrapped_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+    start = datetime(2026, 6, 9, 8, 0, 0)
+    rows = []
+    for session_idx in range(2500):
+        session_start = start + timedelta(minutes=session_idx * 40)
+        rows.append((
+            agent_id,
+            "user",
+            f"preview {session_idx}",
+            "{}",
+            session_start,
+        ))
+        rows.append((
+            agent_id,
+            "assistant",
+            f"reply {session_idx}",
+            "{}",
+            session_start + timedelta(minutes=1),
+        ))
+
+    await storage.db.execute_many(
+        """
+        INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+    plan_rows = await storage.db.fetchall(
+        """
+        EXPLAIN QUERY PLAN
+        SELECT id, role, content, metadata, created_at
+        FROM conversation_history
+        WHERE agent_id = ? AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (agent_id, 100),
+    )
+    plan_text = " ".join(str(row) for row in plan_rows).upper()
+    assert "IDX_CONVERSATION_AGENT_CREATED_AT" in plan_text, plan_text
+    assert "USE TEMP B-TREE" not in plan_text, plan_text
+    assert len(await wrapped_storage.query_conversations(agent_id, limit=100)) == 100
+
+    agent = MagicMock(storage=wrapped_storage)
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            transport = httpx.ASGITransport(app=app)
+            started = time.perf_counter()
+            async with httpx.AsyncClient(
+                transport=transport,
+                base_url="http://testserver",
+            ) as client:
+                response = await client.get(
+                    "/api/conversations?limit=5&decrypt=false",
+                    headers=_api_headers(),
+                )
+            elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["total"] == 5
+        assert elapsed < 0.5
+    finally:
+        _restore_app(app, original)
+        await storage.close()
 
 
 def test_get_conversation_filters_session_markers_and_decrypts_messages():
