@@ -10,6 +10,9 @@ let _deps = {
     markdown: null,
     kicon: null,
     ModelSelector: null,
+    toast: null,
+    escapeHtml: null,
+    commands: null,
 };
 
 export function setChatDeps(partial) {
@@ -22,6 +25,9 @@ function deps() {
         markdown: _deps.markdown || globalWindow.SharedMarkdown,
         kicon: _deps.kicon || globalWindow.kicon || globalThis.kicon,
         ModelSelector: _deps.ModelSelector || globalWindow.SharedModelSelector,
+        toast: _deps.toast || Toast,
+        escapeHtml: _deps.escapeHtml || escapeHtml,
+        commands: _deps.commands || AGENT_COMMANDS,
     };
 }
 
@@ -43,7 +49,7 @@ const STREAM_SENTINELS = [
 ];
 
 function renderToolActivityLineHtml(line) {
-    const escaped = escapeHtml(line);
+    const escaped = deps().escapeHtml(line);
     if (line.startsWith('\u{1F527}')) return `<div class="tool-activity tool-start">${escaped}</div>`;
     if (line.startsWith('\u2713')) return `<div class="tool-activity tool-done">${escaped}</div>`;
     if (line.startsWith('\u274C')) return `<div class="tool-activity tool-error">${escaped}</div>`;
@@ -241,8 +247,8 @@ export function renderToolActivityHtml(activityText) {
         return `
         <details class="tool-activity-expandable tool-activity-call">
             <summary class="tool-activity-summary">
-                <span>${escapeHtml(`Tool call: ${group.name}`)}</span>
-                <span class="tool-activity-count">${escapeHtml(meta)}</span>
+                <span>${deps().escapeHtml(`Tool call: ${group.name}`)}</span>
+                <span class="tool-activity-count">${deps().escapeHtml(meta)}</span>
             </summary>
             <div class="tool-activity-list">${activityHtml}</div>
         </details>
@@ -889,7 +895,7 @@ function showTaskNotification(message, type) {
     if (c) c.scrollTop = c.scrollHeight;
 
     // Also show a Toast notification
-    Toast.show(message, type === 'failed' ? 'error' : 'info');
+    deps().toast.show(message, type === 'failed' ? 'error' : 'info');
 }
 
 // Dedupe set for rendered cognition wakes (#1522). EventSource
@@ -944,7 +950,7 @@ export async function handleSignalCompleted(payload) {
     const source = String(payload.source || 'signal');
     const caller = payload.caller ? ` · ${payload.caller}` : '';
     attribution.innerHTML =
-        `${deps().kicon('bird')} <span>Autonomous wake (${escapeHtml(source)}${escapeHtml(caller)})</span>`;
+        `${deps().kicon('bird')} <span>Autonomous wake (${deps().escapeHtml(source)}${deps().escapeHtml(caller)})</span>`;
     div.appendChild(attribution);
 
     const contentDiv = document.createElement('div');
@@ -1115,16 +1121,16 @@ function renderRestartStatusBody(div, payload) {
 
     const detailRows = rows.map(([k, v]) =>
         `<div class="restart-status-row">` +
-        `<span class="restart-status-key">${escapeHtml(k)}</span>` +
-        `<span class="restart-status-val">${escapeHtml(v)}</span></div>`
+        `<span class="restart-status-key">${deps().escapeHtml(k)}</span>` +
+        `<span class="restart-status-val">${deps().escapeHtml(v)}</span></div>`
     ).join('');
 
     div.innerHTML =
         `<div class="restart-status-header">` +
         `${deps().kicon('refresh')} ` +
-        `<span class="restart-status-title">Restart request ${escapeHtml(shortId)}</span>` +
-        `<span class="restart-status-state restart-status-state-${escapeHtml(state)}">` +
-        `${escapeHtml(state)}</span></div>` +
+        `<span class="restart-status-title">Restart request ${deps().escapeHtml(shortId)}</span>` +
+        `<span class="restart-status-state restart-status-state-${deps().escapeHtml(state)}">` +
+        `${deps().escapeHtml(state)}</span></div>` +
         `<div class="restart-status-body">${detailRows}</div>`;
 }
 
@@ -1764,7 +1770,7 @@ export async function sendMessage(overrideText, overrideAgent) {
         // on an orphaned prior turn (it's not the real completion).
         if (ownsStream() && !wasAborted && isPaneFresh() && API.getHostAgent() !== dispatchAgent) {
             const label = dispatchAgent || 'agent';
-            Toast.info(`${label} finished responding`);
+            deps().toast.info(`${label} finished responding`);
         }
         // #1257 queue mode: if a follow-up was queued while this turn
         // streamed, dispatch it now the turn has fully settled. ALWAYS
@@ -2697,7 +2703,7 @@ function showCommandAutocomplete(filter = '') {
     if (!messageInput) return;
 
     const filterLower = filter.toLowerCase();
-    const filteredCommands = AGENT_COMMANDS.filter(c =>
+    const filteredCommands = deps().commands.filter(c =>
         c.cmd.toLowerCase().includes(filterLower) ||
         c.description.toLowerCase().includes(filterLower)
     );
@@ -2780,7 +2786,7 @@ function highlightCommand(index) {
 function selectCommand(cmd) {
     if (!messageInput) return;
 
-    const cmdInfo = AGENT_COMMANDS.find(c => c.cmd === cmd);
+    const cmdInfo = deps().commands.find(c => c.cmd === cmd);
 
     messageInput.value = cmd + ' ';
     messageInput.focus();
@@ -2856,5 +2862,5 @@ window.clearChat = function() {
         // history.js not loaded, that's OK
     });
 
-    Toast.success('Chat cleared');
+    deps().toast.success('Chat cleared');
 };
