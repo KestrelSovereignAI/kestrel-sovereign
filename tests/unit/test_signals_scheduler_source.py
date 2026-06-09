@@ -97,6 +97,7 @@ def test_all_cron_tasks_are_classified():
         "memory_consolidate",
         "talon_monitor",  # #1510
         "restart_coordinator",  # #1512
+        "github_pr_watch",  # #1618
     ])
 
 
@@ -114,6 +115,7 @@ def test_action_vs_artifact_split_matches_design():
         "training_cycle",
         "talon_monitor",  # #1510 — polls jobs, emits signals, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
+        "github_pr_watch",  # #1618 — polls a PR, emits signal on change
     }
     assert by_mode[SignalMode.ARTIFACT] == {
         "morning_signal",

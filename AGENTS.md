@@ -127,6 +127,26 @@ are all signals.
 - **All current sources**: [`kestrel_sovereign/signals/sources/`](kestrel_sovereign/signals/sources/) — grep here to see exactly what wakes the bird
 - **Hooks ≠ signals**: hooks intercept work in flight, signals originate work. The dispatcher module docstring covers the distinction loudly.
 
+### Scheduling recurring work (`schedule_add` task names)
+
+`schedule_add` only accepts a `task_name` the scheduler can actually
+execute, and **rejects unknown names at creation time** (#1618) — a typo
+or unregistered name no longer silently enters the schedule and then
+fails every tick with `Unknown task`. A valid task name is one of:
+
+- a **built-in cron source** in
+  [`signals/sources/scheduler.py`](kestrel_sovereign/signals/sources/scheduler.py)
+  `CRON_TASKS` — e.g. `memory_consolidate`, `talon_monitor`,
+  `restart_coordinator`, `trash_retention`, `github_pr_watch`; or
+- a **tool exposed by a loaded feature** (its `get_tools()` name).
+
+The rejection error lists every currently-valid name, so the live set is
+always discoverable from a failed `schedule_add`. `github_pr_watch`
+(#1618) polls a GitHub PR/issue and emits a `github.pr_activity`
+COGNITION signal only when a watched field changes (state, merge,
+comments, checks) — args travel in the scheduled task's `args_json`
+(`repo`, `pr`/`issue`/`number`, optional `triggers`, `notify`).
+
 ### Working with LLM providers
 1. Config in the `[llm]` section of `kestrel.toml`. Legacy standalone `llm_config.toml` was retired in epic #938 — run `kestrel migrate-llm-config` to fold a legacy file in.
 2. Provider implementations in `kestrel_sovereign/llm/`
