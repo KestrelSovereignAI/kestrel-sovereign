@@ -13,6 +13,8 @@ let _deps = {
     toast: null,
     escapeHtml: null,
     commands: null,
+    state: null,
+    getOrCreateChatPane: null,
 };
 
 export function setChatDeps(partial) {
@@ -28,6 +30,8 @@ function deps() {
         toast: _deps.toast || Toast,
         escapeHtml: _deps.escapeHtml || escapeHtml,
         commands: _deps.commands || AGENT_COMMANDS,
+        state: _deps.state || state,
+        getOrCreateChatPane: _deps.getOrCreateChatPane || getOrCreateChatPane,
     };
 }
 
@@ -460,8 +464,8 @@ function getChatContainer() {
  */
 function resolvePaneElement(paneElement) {
     if (paneElement) return paneElement;
-    if (state.mountedChatAgent === undefined) return null;
-    const pane = state.chatPanes.get(state.mountedChatAgent);
+    if (deps().state.mountedChatAgent === undefined) return null;
+    const pane = deps().state.chatPanes.get(deps().state.mountedChatAgent);
     return pane ? pane.element : null;
 }
 
@@ -474,19 +478,19 @@ function resolvePaneElement(paneElement) {
  * the mermaid pass now that it's live and clear the flag.
  */
 export function mountChatPane(agentName) {
-    const target = getOrCreateChatPane(agentName);
+    const target = deps().getOrCreateChatPane(agentName);
     const container = getChatContainer();
     if (!container) {
         // Pre-init or chat-disabled host — record the intent so the
         // first real mount picks up the right agent. The pane stays
         // detached in the JS heap.
-        state.mountedChatAgent = agentName;
+        deps().state.mountedChatAgent = agentName;
         return target;
     }
 
     // Detach the currently-mounted pane (if any), saving its scroll.
-    if (state.mountedChatAgent !== undefined) {
-        const current = state.chatPanes.get(state.mountedChatAgent);
+    if (deps().state.mountedChatAgent !== undefined) {
+        const current = deps().state.chatPanes.get(deps().state.mountedChatAgent);
         if (current && current.element.parentNode === container) {
             current.scrollPos = container.scrollTop;
             current.element.remove();
@@ -498,7 +502,7 @@ export function mountChatPane(agentName) {
     // into #chat-container without going through a pane).
     container.innerHTML = '';
     container.appendChild(target.element);
-    state.mountedChatAgent = agentName;
+    deps().state.mountedChatAgent = agentName;
 
     // Restore scroll to where the user left this agent's conversation.
     container.scrollTop = target.scrollPos;
@@ -532,7 +536,7 @@ export function mountChatPane(agentName) {
  * chunks painting into B's pane uninterrupted.
  */
 export function wipeAgentChatPane(agentName, html = '') {
-    const pane = getOrCreateChatPane(agentName);
+    const pane = deps().getOrCreateChatPane(agentName);
     pane.generation += 1;
     pane.streamingMsgDiv = null;
     pane.streamBaseline = 0;
@@ -582,14 +586,14 @@ export function initChat() {
     // this pane out via mountChatPane.
     if (chatContainer) {
         const initialAgent = API.getHostAgent();
-        const initialPane = getOrCreateChatPane(initialAgent);
+        const initialPane = deps().getOrCreateChatPane(initialAgent);
         // Move existing children (welcome card, demo banners, etc.)
         // into the pane element and clear the container before mount.
         while (chatContainer.firstChild) {
             initialPane.element.appendChild(chatContainer.firstChild);
         }
         chatContainer.appendChild(initialPane.element);
-        state.mountedChatAgent = initialAgent;
+        deps().state.mountedChatAgent = initialAgent;
     }
 
     // Event listeners
@@ -729,7 +733,7 @@ export function connectNotifications() {
                 const data = JSON.parse(e.data);
                 const targetRequestId = data && data.request_id;
                 if (!targetRequestId) return;
-                for (const [agentName, pane] of state.chatPanes) {
+                for (const [agentName, pane] of deps().state.chatPanes) {
                     const paneRequestId = API.getCurrentStreamRequestId(agentName);
                     if (paneRequestId !== targetRequestId) continue;
                     // Already consumed (likely by the in-band path
@@ -1141,8 +1145,8 @@ function renderRestartStatusBody(div, payload) {
  * but returns the full pane record.
  */
 function resolvePaneObject() {
-    if (state.mountedChatAgent === undefined) return null;
-    return state.chatPanes.get(state.mountedChatAgent) || null;
+    if (deps().state.mountedChatAgent === undefined) return null;
+    return deps().state.chatPanes.get(deps().state.mountedChatAgent) || null;
 }
 
 
@@ -1186,7 +1190,7 @@ export function disconnectNotifications() {
  */
 export function updateThinkingIndicator() {
     const current = API.getHostAgent();
-    const busy = state.waitingAgents.has(current);
+    const busy = deps().state.waitingAgents.has(current);
     if (thinkingIndicator) {
         thinkingIndicator.style.display = busy ? 'flex' : 'none';
     }
@@ -1213,7 +1217,7 @@ export function refreshAgentThinkingDot(agentName) {
     if (typeof document === 'undefined') return;
     const row = document.querySelector(`.agent-item[data-agent-name="${CSS.escape(String(agentName))}"]`);
     if (!row) return;
-    const busy = state.waitingAgents.has(agentName);
+    const busy = deps().state.waitingAgents.has(agentName);
     row.classList.toggle('agent-thinking', busy);
 }
 
@@ -1255,7 +1259,7 @@ export async function stopAgent(agentName) {
     // letting the turn run; that path is in renderQueuedChip.) Use
     // the map directly so we don't conjure a pane for an agent that
     // never had one.
-    const pane = state.chatPanes.get(agentName);
+    const pane = deps().state.chatPanes.get(agentName);
     if (pane) {
         pane.queuedMessage = null;
         clearQueuedChip(pane);
@@ -1275,7 +1279,7 @@ export async function stopAgent(agentName) {
         console.error(`Error stopping request on ${agentName}:`, e);
     }
 
-    state.waitingAgents.delete(agentName);
+    deps().state.waitingAgents.delete(agentName);
     refreshAgentThinkingDot(agentName);
     if (agentName === API.getHostAgent()) {
         updateThinkingIndicator();
@@ -1344,7 +1348,7 @@ function clearQueuedChip(pane) {
 export function updateComposerModeToggle() {
     if (!composerModeToggle) return;
     const current = API.getHostAgent();
-    const pane = state.chatPanes.get(current);
+    const pane = deps().state.chatPanes.get(current);
     const mode = (pane && pane.composerMode) || 'interrupt';
     composerModeToggle.dataset.mode = mode;
     composerModeToggle.textContent = mode === 'queue' ? 'Queue' : 'Interrupt';
@@ -1355,7 +1359,7 @@ export function updateComposerModeToggle() {
 
 /** Toggle the mounted agent's send-while-busy mode (per-pane). */
 function toggleComposerMode() {
-    const pane = getOrCreateChatPane(API.getHostAgent());
+    const pane = deps().getOrCreateChatPane(API.getHostAgent());
     pane.composerMode = pane.composerMode === 'queue' ? 'interrupt' : 'queue';
     updateComposerModeToggle();
 }
@@ -1390,10 +1394,10 @@ export async function sendMessage(overrideText, overrideAgent) {
         : API.getHostAgent();
     if (!text) return;
 
-    const pane = getOrCreateChatPane(dispatchAgent);
+    const pane = deps().getOrCreateChatPane(dispatchAgent);
 
     // Send-while-busy. Behavior depends on the pane's composerMode.
-    if (state.waitingAgents.has(dispatchAgent)) {
+    if (deps().state.waitingAgents.has(dispatchAgent)) {
         if (pane.composerMode === 'queue') {
             // #1257 queue mode: stash the message and surface it as a
             // pending chip. The completing turn's finally dispatches
@@ -1472,7 +1476,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     // whatever the user has since typed for the (possibly different)
     // currently-mounted agent.
     if (fromComposer) messageInput.value = '';
-    state.waitingAgents.add(dispatchAgent);
+    deps().state.waitingAgents.add(dispatchAgent);
     updateThinkingIndicator();
     refreshAgentThinkingDot(dispatchAgent);
 
@@ -1494,7 +1498,7 @@ export async function sendMessage(overrideText, overrideAgent) {
     let wasAborted = false;
 
     try {
-        if (state.useStreaming) {
+        if (deps().state.useStreaming) {
             const msgDiv = addMessageStreaming('agent', pane.element);
             pane.streamingMsgDiv = msgDiv;
             // Cumulative content offset of the CURRENT streaming bubble's
@@ -1691,7 +1695,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                 }
                 if (streamError.message.includes('404') || streamError.message.includes('405')) {
                     console.log('Streaming not available, falling back to standard invoke');
-                    state.useStreaming = false;
+                    deps().state.useStreaming = false;
                     msgDiv.remove();
                     // invokeForAgent pins the URL to dispatchAgent —
                     // unprefixed invoke() routes via the currently
@@ -1752,7 +1756,7 @@ export async function sendMessage(overrideText, overrideAgent) {
             // new turn as busy: its spinner vanishes and the next send
             // skips the interrupt path. The newest dispatch always owns,
             // so the last turn to settle does the real cleanup.
-            state.waitingAgents.delete(dispatchAgent);
+            deps().state.waitingAgents.delete(dispatchAgent);
         }
         refreshAgentThinkingDot(dispatchAgent);
         // Drive the visible thinking indicator from whatever agent the
@@ -1836,7 +1840,7 @@ export async function updateContextStatus() {
         }
         if (!contextStatusElement) return;
 
-        const sessionId = state.currentSessionId || null;
+        const sessionId = deps().state.currentSessionId || null;
 
         // No active conversation → hide the footer outright. The server
         // also returns idle/zeroed values for this case, but hiding
@@ -2008,7 +2012,7 @@ function showContextWarning(warnings, paneElement = null) {
  */
 window.openContextBreakdownPopup = async function () {
     const { Modal } = await import('./ui.js');
-    const sessionId = state.currentSessionId || null;
+    const sessionId = deps().state.currentSessionId || null;
     if (!sessionId) {
         Modal.show({
             title: 'Context breakdown',
@@ -2552,10 +2556,10 @@ export async function loadModels() {
 
             // Persist vendor/route/model in chat state immediately so the UI
             // reflects the user's intent without waiting for the round-trip.
-            state.selectedModel = model;
-            state.selectedProvider = vendor;    // legacy name retained
-            state.selectedVendor = vendor;
-            state.selectedRoute = route || null;
+            deps().state.selectedModel = model;
+            deps().state.selectedProvider = vendor;    // legacy name retained
+            deps().state.selectedVendor = vendor;
+            deps().state.selectedRoute = route || null;
 
             const body = { vendor, model };
             if (route) body.route = route;
@@ -2593,8 +2597,8 @@ export async function loadModels() {
 
     // Update state with initial selection (both provider and model)
     const selection = sharedModelSelector.getSelection();
-    state.selectedModel = selection.model;
-    state.selectedProvider = selection.provider;
+    deps().state.selectedModel = selection.model;
+    deps().state.selectedProvider = selection.provider;
 
     // Discover the voice route's Realtime model and mark it unpickable in the
     // dropdown.  The mic button owns this model (see #1371) — the user can see
@@ -2629,8 +2633,8 @@ function checkForModelChange(content) {
         if (changed) {
             // Update state with both provider and model
             const selection = sharedModelSelector.getSelection();
-            state.selectedModel = selection.model;
-            state.selectedProvider = selection.provider;
+            deps().state.selectedModel = selection.model;
+            deps().state.selectedProvider = selection.provider;
 
             // Visual feedback on model selector
             const modelSelect = el('model-selector');
