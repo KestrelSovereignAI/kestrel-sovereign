@@ -178,14 +178,24 @@ export function toolStatusPhase(name) {
     return 'working';
 }
 
-// Derive the status phase implied by one stream chunk's visible text.
-// Tool markers win: a `🔧 Calling` start → that tool's verb; a `✓ done`
-// or `❌ failed` → back to the generic `thinking` (the agent is deciding
-// what's next). Plain prose after the last marker means the answer is
-// being composed → `writing`. Returns null when the chunk carries no
-// phase signal (caller keeps the prior phase). Uses only `.match`/
-// `.replace` on TOOL_MARKER_TOKEN — never `.test` — so the shared global
-// regex's lastIndex never leaks into the renderer's own use of it.
+// How much of the cumulative stream tail the phase derivation rescans per
+// packet. A tool marker is short and the phase-determining (last) marker
+// is always near the tail — at the very tail during tool execution, since
+// nothing else streams then — so this window captures the current phase in
+// every realistic case while bounding the per-packet rescan to O(window)
+// instead of O(full response).
+const STATUS_SCAN_WINDOW = 4096;
+
+// Derive the status phase implied by a slice of the visible stream (the
+// caller passes the cumulative tail, so a tool marker split across packets
+// still resolves once complete). Tool markers win: a `🔧 Calling` start →
+// that tool's verb; a `✓ done` or `❌ failed` → back to the generic
+// `thinking` (the agent is deciding what's next). Plain prose after the
+// last marker means the answer is being composed → `writing`. Returns null
+// when the text carries no phase signal (caller keeps the prior phase).
+// Uses only `.match`/`.replace` on TOOL_MARKER_TOKEN — never `.test` — so
+// the shared global regex's lastIndex never leaks into the renderer's own
+// use of it.
 export function statusPhaseForChunk(chunk) {
     const text = String(chunk || '');
     const markers = text.match(TOOL_MARKER_TOKEN) || [];
@@ -1850,13 +1860,20 @@ export async function sendMessage(overrideText, overrideAgent) {
                         fullContent += '\n\n';
                     }
                     fullContent += chunk;
-                    // Advance the dynamic status word from this packet's
-                    // visible text: an in-flight tool's verb, or "Writing…"
-                    // once answer prose flows. A revise sentinel with no
-                    // trailing prose surfaces "Revising…". `setStatusPhase`
-                    // is a no-op on null, so a phase-less packet keeps the
-                    // prior word.
-                    let nextPhase = statusPhaseForChunk(chunk);
+                    // Advance the dynamic status word: an in-flight tool's
+                    // verb, or "Writing…" once answer prose flows. A revise
+                    // sentinel with no trailing prose surfaces "Revising…".
+                    // Derive from the CUMULATIVE tail, not just this packet —
+                    // ReadableStream can split a tool marker across packets
+                    // ("🔧 Calling web_" then "search..."), which matches in
+                    // neither half; the cumulative tail always holds the
+                    // completed marker once it arrives, and the tail window
+                    // bounds the per-packet rescan cost. `setStatusPhase` is
+                    // a no-op on null, so a phase-less packet keeps the prior
+                    // word.
+                    let nextPhase = statusPhaseForChunk(
+                        fullContent.slice(-STATUS_SCAN_WINDOW),
+                    );
                     if (!nextPhase && (reviseBoundaryPending || leadingReviseBoundary)) {
                         nextPhase = 'revising';
                     }

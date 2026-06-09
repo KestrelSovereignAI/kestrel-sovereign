@@ -147,6 +147,19 @@ test('statusPhaseForChunk is null for an empty chunk (caller keeps prior phase)'
     assert.equal(statusPhaseForChunk(null), null);
 });
 
+test('statusPhaseForChunk resolves a completed marker embedded in cumulative content', () => {
+    // The loop feeds the cumulative tail, so a marker that arrived split
+    // across packets ("🔧 Calling web_" + "search...") resolves once whole,
+    // even with prior prose and a finished earlier tool ahead of it.
+    const cumulative = `Let me look that up.\n${done('read_file')}\nOk.\n${start('web_search')}`;
+    assert.equal(statusPhaseForChunk(cumulative), 'searching');
+});
+
+test('statusPhaseForChunk keeps the in-flight tool verb past an earlier completed tool', () => {
+    const cumulative = `${start('read_file')}\n${done('read_file')}\n${start('run_shell')}`;
+    assert.equal(statusPhaseForChunk(cumulative), 'running');
+});
+
 test('statusPhaseForChunk does not corrupt TOOL_MARKER_TOKEN lastIndex across calls', () => {
     // The shared global regex is used via .match/.replace only; two calls
     // in a row must be independent (a stale lastIndex would drop a match).
