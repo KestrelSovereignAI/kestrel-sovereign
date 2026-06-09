@@ -625,6 +625,8 @@ function chatComponentApi() {
         renderToolActivityHtml,
         setChatRoot,
         registerHeaderAction,
+        registerPartRenderer,
+        appendMessagePart,
         mountChatPane,
         wipeAgentChatPane,
         initChat,
@@ -2807,6 +2809,57 @@ export async function addMessage(role, content, paneElement = null) {
     if (c && target && target.parentNode === c) {
         c.scrollTop = c.scrollHeight;
     }
+}
+
+// ============================================================================
+// Host extension: custom message-part renderers (#1597 Stage 8)
+// ============================================================================
+
+const _partRenderers = {};
+
+/**
+ * Register a renderer for a custom message-part content type. The renderer
+ * receives the part's `data` and returns either an HTMLElement or an HTML
+ * string. The host owns the markup and its sanitization (e.g. Frinz's selfie
+ * <img>). Additive: the standalone console registers none.
+ */
+export function registerPartRenderer(type, fn) {
+    if (type && typeof fn === 'function') _partRenderers[type] = fn;
+}
+
+/**
+ * Append a host-rendered part as an agent message bubble in the active pane
+ * (or `paneElement` if given). Mirrors addMessage()'s bubble/pane/scroll
+ * machinery, but fills the content from the registered renderer instead of
+ * running markdown — so an image (selfie), citation card, A2A artifact, etc.
+ * renders verbatim. Falls back to escaped text when no renderer is registered.
+ */
+export function appendMessagePart(type, data, paneElement = null) {
+    const target = resolvePaneElement(paneElement);
+    const div = document.createElement('div');
+    div.className = 'message agent-message';
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'message-content';
+
+    const renderer = _partRenderers[type];
+    if (renderer) {
+        const out = renderer(data);
+        if (out instanceof Node) contentDiv.appendChild(out);
+        else contentDiv.innerHTML = String(out == null ? '' : out);
+    } else {
+        // No renderer registered — degrade to safe escaped text.
+        contentDiv.textContent = String(data == null ? '' : data);
+    }
+
+    div.appendChild(contentDiv);
+    if (target) target.appendChild(div);
+
+    const c = getChatContainer();
+    if (c && target && target.parentNode === c) {
+        c.scrollTop = c.scrollHeight;
+    }
+    return div;
 }
 
 // ============================================================================
