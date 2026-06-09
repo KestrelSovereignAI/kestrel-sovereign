@@ -6,14 +6,24 @@
 import API from './api.js';
 import { state, AGENT_COMMANDS, Toast, getOrCreateChatPane, escapeHtml } from './ui.js';
 
-// Shared markdown utilities - loaded via script tag before this module
-const {
-    renderMarkdown,
-    renderStreamingMarkdown,
-    highlightCodeBlocks,
-    renderMermaidDiagrams,
-    finalizeMarkdown
-} = window.SharedMarkdown;
+let _deps = {
+    markdown: null,
+    kicon: null,
+    ModelSelector: null,
+};
+
+export function setChatDeps(partial) {
+    _deps = { ..._deps, ...(partial || {}) };
+}
+
+function deps() {
+    const globalWindow = typeof window !== 'undefined' ? window : {};
+    return {
+        markdown: _deps.markdown || globalWindow.SharedMarkdown,
+        kicon: _deps.kicon || globalWindow.kicon || globalThis.kicon,
+        ModelSelector: _deps.ModelSelector || globalWindow.SharedModelSelector,
+    };
+}
 
 // Wave 5E in-band revising sentinel — pairs with kestrel_sovereign/
 // agent/streaming.py:_build_revise_sentinel. Format:
@@ -184,7 +194,8 @@ function segmentsHaveTools(segments) {
  * selects the partial-tolerant markdown pass for the in-flight bubble.
  */
 export function renderAgentContentHtml(content, { streaming = false } = {}) {
-    const renderProse = streaming ? renderStreamingMarkdown : renderMarkdown;
+    const markdown = deps().markdown;
+    const renderProse = streaming ? markdown.renderStreamingMarkdown : markdown.renderMarkdown;
     const segments = segmentToolActivity(content);
     if (!segmentsHaveTools(segments)) {
         return renderProse(content);
@@ -199,17 +210,18 @@ export function renderAgentContentHtml(content, { streaming = false } = {}) {
 }
 
 async function finalizeAgentContent(contentDiv, content) {
+    const markdown = deps().markdown;
     // No tool activity → the plain finalize path (markdown + highlight +
     // mermaid in one shot). Keeps the common turn on the simplest route.
     if (!segmentsHaveTools(segmentToolActivity(content))) {
-        await finalizeMarkdown(contentDiv, content);
+        await markdown.finalizeMarkdown(contentDiv, content);
         return;
     }
     // With tool runs: one innerHTML write keeps card/prose ordering exact;
     // highlight + mermaid then run once over the whole container.
     contentDiv.innerHTML = renderAgentContentHtml(content);
-    highlightCodeBlocks(contentDiv);
-    await renderMermaidDiagrams(contentDiv);
+    markdown.highlightCodeBlocks(contentDiv);
+    await markdown.renderMermaidDiagrams(contentDiv);
 }
 
 export function renderToolActivityHtml(activityText) {
@@ -490,7 +502,7 @@ export function mountChatPane(agentName) {
     // now that the pane is live.
     if (target.hasUnrenderedMermaid) {
         try {
-            renderMermaidDiagrams(target.element);
+            deps().markdown.renderMermaidDiagrams(target.element);
         } catch (e) {
             console.warn('mermaid render on mount failed:', e);
         }
@@ -932,7 +944,7 @@ export async function handleSignalCompleted(payload) {
     const source = String(payload.source || 'signal');
     const caller = payload.caller ? ` · ${payload.caller}` : '';
     attribution.innerHTML =
-        `${kicon('bird')} <span>Autonomous wake (${escapeHtml(source)}${escapeHtml(caller)})</span>`;
+        `${deps().kicon('bird')} <span>Autonomous wake (${escapeHtml(source)}${escapeHtml(caller)})</span>`;
     div.appendChild(attribution);
 
     const contentDiv = document.createElement('div');
@@ -1109,7 +1121,7 @@ function renderRestartStatusBody(div, payload) {
 
     div.innerHTML =
         `<div class="restart-status-header">` +
-        `${kicon('refresh')} ` +
+        `${deps().kicon('refresh')} ` +
         `<span class="restart-status-title">Restart request ${escapeHtml(shortId)}</span>` +
         `<span class="restart-status-state restart-status-state-${escapeHtml(state)}">` +
         `${escapeHtml(state)}</span></div>` +
@@ -1841,10 +1853,10 @@ export async function updateContextStatus() {
             icon = '●';
         } else if (utilization_percent < 95) {
             color = '#f97316';  // orange
-            icon = kicon('warning');
+            icon = deps().kicon('warning');
         } else {
             color = '#ef4444';  // red
-            icon = kicon('warning');
+            icon = deps().kicon('warning');
         }
 
         // #1503: route per-turn cap labeling. On capped routes (notably
@@ -1960,7 +1972,7 @@ function showContextWarning(warnings, paneElement = null) {
         font-size: 0.875rem;
     `;
     div.innerHTML = `
-        <strong>${kicon('warning')} Context Warning:</strong> ${warnings.join('. ')}
+        <strong>${deps().kicon('warning')} Context Warning:</strong> ${warnings.join('. ')}
         <br><small>Use <code>!compress</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
@@ -2358,7 +2370,7 @@ function renderThinkingBubbles(thinkingItems = []) {
         const content = typeof item === 'string' ? item : (item.content || '');
         const providerText = typeof item === 'object' && item.provider ? ` · ${item.provider}` : '';
         const provider = escapeThinkingLabel(providerText);
-        const rendered = renderStreamingMarkdown(content);
+        const rendered = deps().markdown.renderStreamingMarkdown(content);
         return `<details class="thinking-bubble">
             <summary>Thinking ${idx + 1}${provider}</summary>
             <div class="thinking-bubble-content">${rendered}</div>
@@ -2383,7 +2395,7 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
         // renderAgentContentHtml handles both cases: tool runs become
         // grouped cards in document order, no tools → a single markdown pass.
         contentDiv.innerHTML = `${thinkingHtml}${renderAgentContentHtml(content, { streaming: true })}`;
-        highlightCodeBlocks(contentDiv, true);
+        deps().markdown.highlightCodeBlocks(contentDiv, true);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
         // detached panes update their `scrollPos` lazily on remount.
@@ -2437,7 +2449,7 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     const thinkingItems = pane && pane.thinkingItems ? pane.thinkingItems : [];
     if (thinkingItems.length) {
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
-        highlightCodeBlocks(contentDiv, true);
+        deps().markdown.highlightCodeBlocks(contentDiv, true);
     }
     if (!mounted && pane && /```mermaid/.test(content)) {
         // Mark the pane so mountChatPane re-runs the mermaid pass.
@@ -2489,7 +2501,8 @@ export async function loadModels() {
     // #879: model selector lives in the chat header — skip when chat is off.
     if (!API.hasCapability('chat')) return;
     // Check if SharedModelSelector is available (loaded via script tag)
-    if (!window.SharedModelSelector) {
+    const ModelSelector = deps().ModelSelector;
+    if (!ModelSelector) {
         console.error('SharedModelSelector not loaded. Include /shared/model-selector/index.js');
         return;
     }
@@ -2510,7 +2523,7 @@ export async function loadModels() {
 
     // Create the shared model selector instance
     // Use API.buildAgentUrl() for proper multi_agent routing and pass auth headers
-    sharedModelSelector = new window.SharedModelSelector({
+    sharedModelSelector = new ModelSelector({
         providerSelectId: 'provider-selector',
         routeSelectId: 'route-selector',
         modelSelectId: 'model-selector',
