@@ -399,6 +399,18 @@ function trimPartialStreamSentinel(text) {
 // DOM References
 // ============================================================================
 
+let _chatRoot = document;
+
+export function setChatRoot(el) {
+    _chatRoot = el || document;
+}
+
+function el(id) {
+    return _chatRoot === document
+        ? document.getElementById(id)
+        : _chatRoot.querySelector('#' + id);
+}
+
 let chatContainer = null;
 let messageInput = null;
 let sendButton = null;
@@ -418,7 +430,7 @@ let autocompleteSelectedIndex = -1;
  * ref (e.g. early agent-select firing in parallel with init).
  */
 function getChatContainer() {
-    return chatContainer || document.getElementById('chat-container');
+    return chatContainer || el('chat-container');
 }
 
 /**
@@ -533,12 +545,12 @@ export function initChat() {
     // the intent legible and keeps SharedModelSelector / autocomplete from
     // initializing in a host that doesn't render any of it.
     if (!API.hasCapability('chat')) return;
-    chatContainer = document.getElementById('chat-container');
-    messageInput = document.getElementById('message-input');
-    sendButton = document.getElementById('send-button');
-    modelSelector = document.getElementById('model-selector');
-    thinkingIndicator = document.getElementById('thinking-indicator');
-    composerModeToggle = document.getElementById('composer-mode-toggle');
+    chatContainer = el('chat-container');
+    messageInput = el('message-input');
+    sendButton = el('send-button');
+    modelSelector = el('model-selector');
+    thinkingIndicator = el('thinking-indicator');
+    composerModeToggle = el('composer-mode-toggle');
 
     // Initial-pane migration: HTML ships welcome content baked into
     // #chat-container. Move that content into a pane element so the
@@ -590,7 +602,7 @@ export function initChat() {
     });
 
     // Stop button for cancelling requests
-    const stopButton = document.getElementById('stop-button');
+    const stopButton = el('stop-button');
     stopButton?.addEventListener('click', stopRequest);
 
     // Input events for autocomplete
@@ -1921,7 +1933,7 @@ export async function updateContextStatus() {
  */
 function createContextStatusElement() {
     // The element already exists in HTML (input footer), just return it
-    contextStatusElement = document.getElementById('context-status');
+    contextStatusElement = el('context-status');
     return contextStatusElement;
 }
 
@@ -2488,11 +2500,11 @@ export async function loadModels() {
     // and the user briefly sees the previous agent's vendor/model (the "flash"
     // Jason saw when switching agents).
     for (const id of ['provider-selector', 'route-selector', 'model-selector']) {
-        const el = document.getElementById(id);
-        if (el) {
-            el.innerHTML = '<option value="">Loading…</option>';
-            el.value = '';
-            if (id === 'route-selector') el.style.display = 'none';
+        const element = el(id);
+        if (element) {
+            element.innerHTML = '<option value="">Loading…</option>';
+            element.value = '';
+            if (id === 'route-selector') element.style.display = 'none';
         }
     }
 
@@ -2602,7 +2614,7 @@ function checkForModelChange(content) {
             state.selectedProvider = selection.provider;
 
             // Visual feedback on model selector
-            const modelSelect = document.getElementById('model-selector');
+            const modelSelect = el('model-selector');
             if (modelSelect) {
                 modelSelect.style.transition = 'background-color 0.3s';
                 modelSelect.style.backgroundColor = '#22c55e33';
@@ -2631,7 +2643,7 @@ function handleInput(e) {
 }
 
 function handleKeydown(e) {
-    const dropdown = document.getElementById('command-autocomplete');
+    const dropdown = el('command-autocomplete');
 
     if (dropdown) {
         if (e.key === 'ArrowDown') {
@@ -2736,13 +2748,13 @@ function showCommandAutocomplete(filter = '') {
 }
 
 function hideCommandAutocomplete() {
-    const existing = document.getElementById('command-autocomplete');
+    const existing = el('command-autocomplete');
     if (existing) existing.remove();
     autocompleteSelectedIndex = -1;
 }
 
 function highlightCommand(index) {
-    const dropdown = document.getElementById('command-autocomplete');
+    const dropdown = el('command-autocomplete');
     if (!dropdown) return;
 
     const options = dropdown.querySelectorAll('.command-option');
@@ -2767,7 +2779,7 @@ function selectCommand(cmd) {
 }
 
 function navigateAutocomplete(direction) {
-    const dropdown = document.getElementById('command-autocomplete');
+    const dropdown = el('command-autocomplete');
     if (!dropdown) return false;
 
     const options = dropdown.querySelectorAll('.command-option');
@@ -2784,7 +2796,7 @@ function navigateAutocomplete(direction) {
 }
 
 function selectHighlightedCommand() {
-    const dropdown = document.getElementById('command-autocomplete');
+    const dropdown = el('command-autocomplete');
     if (!dropdown || autocompleteSelectedIndex < 0) return false;
 
     const options = dropdown.querySelectorAll('.command-option');
