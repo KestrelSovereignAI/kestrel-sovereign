@@ -61,6 +61,13 @@ PROMPT_TEMPLATE = (
 # changes the fingerprint. Kept deliberately small — a PR's ``updated_at``
 # bumps on almost any activity, so we track the semantically-meaningful
 # fields explicitly rather than fingerprinting the whole payload.
+#
+# ``checks_status`` is NOT a field GitHub puts on a pull/issue payload — it
+# is a derived summary that :func:`fetch_pr_state` computes from the real
+# Checks (``/commits/{sha}/check-runs``) and Statuses
+# (``/commits/{sha}/status``) APIs via :func:`summarize_checks`. The
+# normalizer reads whatever the fetcher attached, so a raw payload that
+# omits the key normalizes to an empty checks summary rather than raising.
 WATCHED_FIELDS: Tuple[str, ...] = (
     "state",
     "merged",
@@ -127,6 +134,8 @@ def normalize_pr_state(raw: Dict[str, Any]) -> Dict[str, Any]:
         "review_comments": int(raw.get("review_comments", 0) or 0),
         "updated_at": str(raw.get("updated_at", "") or ""),
         "head_sha": head_sha,
+        # Derived by fetch_pr_state via summarize_checks; absent on a raw
+        # GitHub payload, which normalizes to an empty summary.
         "checks_status": str(raw.get("checks_status", "") or ""),
         "mergeable_state": str(raw.get("mergeable_state", "") or ""),
     }
@@ -136,6 +145,60 @@ def compute_fingerprint(normalized: Dict[str, Any]) -> str:
     """Stable SHA-256 over the normalized watched fields."""
     blob = json.dumps(normalized, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def summarize_checks(
+    check_runs: Any = None, combined_status: Any = None
+) -> str:
+    """Reduce real GitHub check-runs + commit statuses to a stable string.
+
+    Standard pull/issue payloads carry no aggregate check field, so the
+    watcher fetches the head commit's checks itself:
+
+      - ``check_runs`` is the JSON from ``/commits/{sha}/check-runs``
+        (``{"check_runs": [{"name", "status", "conclusion"}, ...]}``) or a
+        bare list of those run objects.
+      - ``combined_status`` is the JSON from ``/commits/{sha}/status``
+        (``{"state", "statuses": [{"context", "state"}, ...]}``).
+
+    The summary captures each check's ``status``/``conclusion`` and each
+    legacy status context's ``state``, plus the combined ``state``, so a CI
+    transition — queued → in_progress → completed/success|failure — changes
+    the string (and therefore the fingerprint). It is order-independent
+    (parts are sorted) so the same set of checks always summarizes
+    identically. Returns ``""`` when there are no checks or statuses at all,
+    which is indistinguishable from "no checks key in payload".
+    """
+    parts = []
+
+    combined_state = ""
+    if isinstance(combined_status, dict):
+        combined_state = str(combined_status.get("state", "") or "")
+        for s in combined_status.get("statuses", []) or []:
+            if isinstance(s, dict):
+                ctx = str(s.get("context", "") or "")
+                st = str(s.get("state", "") or "")
+                parts.append(f"status:{ctx}={st}")
+
+    runs: Any
+    if isinstance(check_runs, dict):
+        runs = check_runs.get("check_runs", []) or []
+    elif isinstance(check_runs, list):
+        runs = check_runs
+    else:
+        runs = []
+    for r in runs:
+        if isinstance(r, dict):
+            name = str(r.get("name", "") or "")
+            status = str(r.get("status", "") or "")
+            conclusion = str(r.get("conclusion", "") or "")
+            parts.append(f"check:{name}={status}/{conclusion}")
+
+    if not parts and not combined_state:
+        return ""
+
+    parts.sort()
+    return ";".join([f"combined={combined_state}", *parts])
 
 
 def changed_categories(
@@ -236,25 +299,16 @@ def evaluate_pr_watch(
 # ---------------------------------------------------------------------------
 
 
-async def fetch_pr_state(
-    repo: str, number: int, *, token: str, kind: str = "pr", timeout: int = 10
-) -> Dict[str, Any]:
-    """Fetch a PR's or issue's current state from the GitHub API.
-
-    ``kind="pr"`` queries ``/pulls/{number}`` (the default); ``kind="issue"``
-    queries ``/issues/{number}``. PRs and issues share one numbering space,
-    so an issue number sent to ``/pulls`` would 404 — the endpoint must match
-    the watch type. Issue payloads have no ``head``/``merged``/
-    ``mergeable_state``/``checks_status``; :func:`normalize_pr_state` already
-    tolerates the missing fields.
+async def _github_get(
+    url: str, *, token: str, timeout: int, ref: str
+) -> Any:
+    """GET + JSON-decode one GitHub API URL.
 
     Raises :class:`PRWatchAuthError` on 401/403 and
-    :class:`PRWatchNetworkError` on any other transport/HTTP failure so the
-    caller can report ``blocked: auth`` / ``blocked: network`` distinctly
-    from a no-change poll. Patched out in tests.
+    :class:`PRWatchNetworkError` on any other transport/HTTP/parse failure so
+    the caller can report ``blocked: auth`` / ``blocked: network`` distinctly
+    from a no-change poll. ``ref`` is only used to label errors.
     """
-    endpoint = "issues" if kind == "issue" else "pulls"
-    url = f"https://api.github.com/repos/{repo}/{endpoint}/{number}"
     req = urllib.request.Request(
         url,
         headers={
@@ -271,21 +325,77 @@ async def fetch_pr_state(
         resp = await asyncio.to_thread(_do)
     except urllib.error.HTTPError as e:
         if e.code in (401, 403):
-            raise PRWatchAuthError(f"GitHub returned {e.code} for {repo}#{number}") from e
-        raise PRWatchNetworkError(
-            f"GitHub HTTP {e.code} for {repo}#{number}"
-        ) from e
+            raise PRWatchAuthError(f"GitHub returned {e.code} for {ref}") from e
+        raise PRWatchNetworkError(f"GitHub HTTP {e.code} for {ref}") from e
     except urllib.error.URLError as e:
-        raise PRWatchNetworkError(f"network error for {repo}#{number}: {e}") from e
+        raise PRWatchNetworkError(f"network error for {ref}: {e}") from e
     except Exception as e:  # pragma: no cover - defensive
-        raise PRWatchNetworkError(f"unexpected error for {repo}#{number}: {e}") from e
+        raise PRWatchNetworkError(f"unexpected error for {ref}: {e}") from e
 
     try:
         return json.loads(resp)
     except (ValueError, TypeError) as e:
         raise PRWatchNetworkError(
-            f"could not parse GitHub response for {repo}#{number}: {e}"
+            f"could not parse GitHub response for {ref}: {e}"
         ) from e
+
+
+async def fetch_pr_state(
+    repo: str, number: int, *, token: str, kind: str = "pr", timeout: int = 10
+) -> Dict[str, Any]:
+    """Fetch a PR's or issue's current state from the GitHub API.
+
+    ``kind="pr"`` queries ``/pulls/{number}`` (the default); ``kind="issue"``
+    queries ``/issues/{number}``. PRs and issues share one numbering space,
+    so an issue number sent to ``/pulls`` would 404 — the endpoint must match
+    the watch type. Issue payloads have no ``head``/``merged``/
+    ``mergeable_state``; :func:`normalize_pr_state` already tolerates the
+    missing fields.
+
+    GitHub pull/issue payloads carry **no** aggregate check field, so for a
+    PR this also fetches the head commit's real check runs
+    (``/commits/{sha}/check-runs``) and combined commit status
+    (``/commits/{sha}/status``), reduces them via :func:`summarize_checks`,
+    and attaches the result as ``checks_status``. That makes a CI
+    transition (queued → completed/failure) a real, fingerprint-affecting
+    change rather than depending on a field GitHub never sends. Issues have
+    no head SHA, so their ``checks_status`` stays empty.
+
+    Raises :class:`PRWatchAuthError` on 401/403 and
+    :class:`PRWatchNetworkError` on any other transport/HTTP failure so the
+    caller can report ``blocked: auth`` / ``blocked: network`` distinctly
+    from a no-change poll. A blocked checks fetch blocks the whole poll
+    rather than reporting a false "checks cleared" change.
+    """
+    base = f"https://api.github.com/repos/{repo}"
+    endpoint = "issues" if kind == "issue" else "pulls"
+    ref = f"{repo}#{number}"
+    raw = await _github_get(
+        f"{base}/{endpoint}/{number}", token=token, timeout=timeout, ref=ref
+    )
+    if not isinstance(raw, dict):
+        raise PRWatchNetworkError(
+            f"GitHub returned a non-object payload for {ref}"
+        )
+
+    head = raw.get("head")
+    head_sha = head.get("sha") if isinstance(head, dict) else None
+    if kind != "issue" and head_sha:
+        check_runs = await _github_get(
+            f"{base}/commits/{head_sha}/check-runs",
+            token=token,
+            timeout=timeout,
+            ref=f"{ref} check-runs",
+        )
+        combined_status = await _github_get(
+            f"{base}/commits/{head_sha}/status",
+            token=token,
+            timeout=timeout,
+            ref=f"{ref} status",
+        )
+        raw["checks_status"] = summarize_checks(check_runs, combined_status)
+
+    return raw
 
 
 # ---------------------------------------------------------------------------
