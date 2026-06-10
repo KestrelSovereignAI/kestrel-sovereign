@@ -17,6 +17,7 @@ Pins:
 from __future__ import annotations
 
 import argparse
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -45,6 +46,7 @@ def _ns(**overrides):
         name=None, pull=True, install=True, features=True, restart=True,
         allow_dirty=False, no_deps=False, continue_on_error=False,
         dry_run=False, manifest=None, subprocess=False, force=False,
+        uv_sync=None,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -57,7 +59,7 @@ def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir):
 
     def fake_dirty(_):
         calls.append("dirty_check")
-        return False
+        return False, ""
 
     def fake_pull(_):
         calls.append("pull")
@@ -97,7 +99,7 @@ def test_update_short_circuits_when_pull_fails(stub_project_dir):
     """If git pull fails, install/sync/restart MUST NOT run — otherwise a
     half-applied update could be restarted into."""
     later = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull",
                       lambda _: (1, "merge conflict\n")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -115,7 +117,7 @@ def test_update_short_circuits_when_pull_fails(stub_project_dir):
 def test_update_short_circuits_when_install_fails(stub_project_dir):
     """Install failure aborts before sync + restart."""
     later = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (1, "build failed\n")), \
@@ -133,7 +135,7 @@ def test_dirty_working_tree_refuses_pull(stub_project_dir, capsys):
     """Default behaviour: a dirty working tree aborts before any
     state-changing step. The operator either commits/stashes or passes
     ``--allow-dirty``."""
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: True):
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (True, "    M kestrel_sovereign/cli.py")):
         rc = cli.cmd_update(_ns())
     assert rc == 2
     err = capsys.readouterr().err
@@ -145,7 +147,7 @@ def test_allow_dirty_lets_pull_proceed(stub_project_dir):
     """``--allow-dirty`` bypasses the dirty-tree refusal so the operator
     can update on top of work-in-progress when they know it's safe."""
     pull_calls = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: True), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (True, "    M kestrel_sovereign/cli.py")), \
          patch.object(cli, "_run_git_pull",
                       lambda d: pull_calls.append(d) or (0, "ok")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -161,7 +163,7 @@ def test_allow_dirty_lets_pull_proceed(stub_project_dir):
 def test_dry_run_invokes_no_shell_commands(stub_project_dir, capsys):
     """``--dry-run`` MUST NOT call any of the real-action helpers."""
     forbidden = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull",
                       lambda *_: forbidden.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -190,7 +192,7 @@ def test_no_flag_skips_individual_step(
     """Each ``--no-<step>`` skips precisely its step without affecting the
     others."""
     called = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull",
                       lambda _: called.append("pull") or (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
@@ -210,7 +212,7 @@ def test_continue_on_error_runs_restart_after_sync_failure(stub_project_dir):
     abort the restart — useful when a single optional feature package
     is temporarily unreachable."""
     called = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
@@ -228,7 +230,7 @@ def test_target_agent_flows_to_restart_only(stub_project_dir):
     """A positional ``name`` arg is forwarded to the restart step only;
     the other steps don't accept an agent target."""
     restart_target = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda *a, **kw: (0, "")), \
@@ -245,7 +247,7 @@ def test_no_deps_flag_threads_to_install_helper(stub_project_dir):
     """``--no-deps`` reaches the install helper so dependency resolution
     is skipped when the operator wants the fast path."""
     seen = []
-    with patch.object(cli, "_git_working_tree_dirty", lambda _: False), \
+    with patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
          patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
          patch.object(cli, "_run_uv_pip_install_editable",
                       lambda d, no_deps: seen.append(no_deps) or (0, "")), \
@@ -345,6 +347,276 @@ def test_git_error_in_real_checkout_aborts_update(stub_project_dir, capsys):
     assert later == []
     err = capsys.readouterr().err
     assert "dubious ownership" in err
+
+
+def test_uv_sync_targets_active_venv_when_virtual_env_set(
+    stub_project_dir, monkeypatch,
+):
+    """Codex review round 1 P1: bare ``uv sync`` syncs the project's
+    default ``.venv``, not the venv the operator is in. With
+    ``VIRTUAL_ENV`` exported, ``--active`` MUST be on the command
+    line so the install lands in the running interpreter's env."""
+    captured = {}
+    monkeypatch.setenv("VIRTUAL_ENV", "/fake/venv")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        import types as _types
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        cli._run_uv_sync(stub_project_dir)
+
+    assert captured["cmd"][0:2] == ["uv", "sync"]
+    assert "--active" in captured["cmd"]
+
+
+def test_uv_sync_seeds_virtual_env_when_in_venv_without_shell_activation(
+    stub_project_dir, monkeypatch,
+):
+    """Codex review round 2 P1: a venv-installed ``kestrel`` invoked
+    WITHOUT shell activation (e.g. ``/path/to/.venv/bin/kestrel update``
+    under systemd or cron) has no ``VIRTUAL_ENV`` exported. We must
+    still detect the venv via ``sys.prefix != sys.base_prefix`` and
+    seed ``VIRTUAL_ENV`` for the uv subprocess so ``--active`` picks
+    the right env — otherwise uv would sync the project's ``.venv``
+    and the subsequent restart would run the OLD install."""
+    import sys as _sys
+    captured = {}
+    # Simulate the systemd/cron case: VIRTUAL_ENV cleared, but
+    # sys.prefix != sys.base_prefix (we ARE in a venv).
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    monkeypatch.setattr(_sys, "prefix", "/path/to/active/venv")
+    monkeypatch.setattr(_sys, "base_prefix", "/usr")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        import types as _types
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        cli._run_uv_sync(stub_project_dir)
+
+    assert "--active" in captured["cmd"]
+    # The subprocess MUST see VIRTUAL_ENV pointing at our prefix so
+    # uv's --active resolves to the right env.
+    assert captured["env"]["VIRTUAL_ENV"] == "/path/to/active/venv"
+
+
+def test_uv_sync_overwrites_stale_inherited_virtual_env(
+    stub_project_dir, monkeypatch,
+):
+    """Codex review round 3 P1: a stale or mismatched inherited
+    ``VIRTUAL_ENV`` (e.g. from a parent process that activated a
+    different venv) MUST be overwritten with our actual ``sys.prefix``
+    — otherwise ``uv sync --active`` would target the wrong env."""
+    import sys as _sys
+    captured = {}
+    # Stale VIRTUAL_ENV pointing somewhere other than our actual prefix.
+    monkeypatch.setenv("VIRTUAL_ENV", "/stale/parent/venv")
+    monkeypatch.setattr(_sys, "prefix", "/correct/active/venv")
+    monkeypatch.setattr(_sys, "base_prefix", "/usr")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env")
+        import types as _types
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        cli._run_uv_sync(stub_project_dir)
+
+    assert "--active" in captured["cmd"]
+    # The subprocess MUST see VIRTUAL_ENV pointing at OUR prefix, not
+    # the stale parent value.
+    assert captured["env"]["VIRTUAL_ENV"] == "/correct/active/venv"
+    assert captured["env"]["VIRTUAL_ENV"] != "/stale/parent/venv"
+
+
+def test_uv_sync_omits_active_when_running_outside_any_venv(
+    stub_project_dir, monkeypatch,
+):
+    """System Python (no venv, no VIRTUAL_ENV) → omit ``--active`` and
+    let uv resolve its default. Operators outside a venv shouldn't
+    see uv error on ``--active``."""
+    import sys as _sys
+    captured = {}
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    # Force sys.prefix == sys.base_prefix (system Python, no venv).
+    monkeypatch.setattr(_sys, "prefix", "/usr")
+    monkeypatch.setattr(_sys, "base_prefix", "/usr")
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        import types as _types
+        return _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    with patch("subprocess.run", side_effect=fake_run):
+        cli._run_uv_sync(stub_project_dir)
+
+    assert captured["cmd"] == ["uv", "sync"]
+
+
+def test_dirty_check_excludes_untracked_files(tmp_path):
+    """Stale untracked files (``kestrel.toml.backup-*``, scratch
+    files, etc.) MUST NOT count as dirty — they have nothing to do
+    with whether ``git pull --ff-only`` is safe. Only modified or
+    staged TRACKED files count. Followup: the initial roll-out
+    refused on a tree whose only "dirt" was untracked backup files."""
+    # Seed a real git repo with a tracked file (committed), then add an
+    # untracked file. The dirty check must report clean.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=repo, check=True,
+    )
+    (repo / "tracked.txt").write_text("hello")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"], cwd=repo, check=True,
+    )
+    # Now add an untracked file (mimics kestrel.toml.backup-*).
+    (repo / "kestrel.toml.backup-20260610").write_text("backup")
+
+    dirty, summary = cli._git_working_tree_dirty(repo)
+    assert dirty is False
+    assert summary == ""
+
+
+def test_dirty_check_flags_modified_tracked_file(tmp_path):
+    """A genuinely modified tracked file MUST register as dirty,
+    with the porcelain summary surfacing it for the refusal message."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=repo, check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "test"], cwd=repo, check=True,
+    )
+    (repo / "tracked.txt").write_text("hello")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "init"], cwd=repo, check=True,
+    )
+    (repo / "tracked.txt").write_text("modified")
+
+    dirty, summary = cli._git_working_tree_dirty(repo)
+    assert dirty is True
+    assert "tracked.txt" in summary
+
+
+def test_install_step_uses_uv_sync_when_uv_lock_present(stub_project_dir):
+    """When the source checkout has uv.lock, the install step
+    auto-detects the modern workflow and runs ``uv sync`` (which
+    refreshes deps from the lock AND prunes anything not in it —
+    feature packages get restored on the next step)."""
+    (stub_project_dir / "uv.lock").touch()
+    called = []
+
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty",
+                      lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_sync",
+                      lambda _: called.append("sync") or (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: called.append("pip") or (0, "")), \
+         patch.object(cli, "cmd_feature_sync", lambda args: 0), \
+         patch.object(cli, "cmd_restart", lambda args: 0):
+        rc = cli.cmd_update(_ns())
+
+    assert rc == 0
+    assert called == ["sync"]
+
+
+def test_install_step_falls_back_to_uv_pip_install_without_uv_lock(
+    stub_project_dir,
+):
+    """No uv.lock at the source root → the install step runs the
+    classic ``uv pip install -e .``."""
+    called = []
+    # No uv.lock in stub_project_dir.
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty",
+                      lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_sync",
+                      lambda _: called.append("sync") or (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: called.append("pip") or (0, "")), \
+         patch.object(cli, "cmd_feature_sync", lambda args: 0), \
+         patch.object(cli, "cmd_restart", lambda args: 0):
+        rc = cli.cmd_update(_ns())
+
+    assert rc == 0
+    assert called == ["pip"]
+
+
+def test_uv_sync_flag_forces_uv_sync_even_without_uv_lock(stub_project_dir):
+    """``--uv-sync`` forces ``uv sync`` even when the auto-detect
+    wouldn't have picked it. Useful for operators whose source tree
+    pins the lock outside the default location."""
+    called = []
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty",
+                      lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_sync",
+                      lambda _: called.append("sync") or (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: called.append("pip") or (0, "")), \
+         patch.object(cli, "cmd_feature_sync", lambda args: 0), \
+         patch.object(cli, "cmd_restart", lambda args: 0):
+        rc = cli.cmd_update(_ns(uv_sync=True))
+
+    assert rc == 0
+    assert called == ["sync"]
+
+
+def test_no_uv_sync_flag_forces_pip_install_even_with_uv_lock(
+    stub_project_dir,
+):
+    """``--no-uv-sync`` forces ``uv pip install -e .`` even when
+    uv.lock is present and auto-detect would have picked sync."""
+    (stub_project_dir / "uv.lock").touch()
+    called = []
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty",
+                      lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", lambda _: (0, "")), \
+         patch.object(cli, "_run_uv_sync",
+                      lambda _: called.append("sync") or (0, "")), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: called.append("pip") or (0, "")), \
+         patch.object(cli, "cmd_feature_sync", lambda args: 0), \
+         patch.object(cli, "cmd_restart", lambda args: 0):
+        rc = cli.cmd_update(_ns(uv_sync=False))
+
+    assert rc == 0
+    assert called == ["pip"]
+
+
+def test_dirty_refusal_surfaces_what_is_dirty(stub_project_dir, capsys):
+    """The refusal message MUST show what's dirty so the operator
+    knows what to clean up — not just 'working tree is dirty'."""
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty",
+                      lambda _: (True, "    M kestrel_sovereign/cli.py")):
+        rc = cli.cmd_update(_ns())
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "modified tracked files" in err.lower()
+    assert "kestrel_sovereign/cli.py" in err
 
 
 def test_subparser_registers_and_help_mentions_steps():
