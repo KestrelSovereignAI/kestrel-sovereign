@@ -88,6 +88,31 @@ def _tail(raw: Any) -> str:
     return text
 
 
+# Background-task name prefixes for *infrastructure* work that must never
+# hold off an idle restart (#1626). Two shapes both wedged
+# ``idle_agents_only`` forever by being counted as "busy":
+#   - ``signal_log:`` — fire-and-forget log writes that complete in well
+#     under a second but are minted continuously by heartbeats/scheduler
+#     ticks, so one is almost always alive when the idle check runs.
+#   - ``a2a_question_expiry_sweep`` — an intentionally permanent ``while
+#     True`` maintenance daemon (peers feature) that never completes.
+# Neither is user/signal work; real work (``signal_dispatch:*``) still
+# defers a restart. The name is already stamped on the task at creation —
+# it was just never read here. New long-lived/bookkeeping daemons must be
+# named with a prefix listed here (or excluded from ``_background_tasks``).
+_INFRA_TASK_PREFIXES = ("signal_log:", "a2a_question_expiry_sweep")
+
+
+def _is_infra_background_task(task) -> bool:
+    """True if ``task`` is fire-and-forget infrastructure bookkeeping that
+    must not gate an idle restart (e.g. ``signal_log:*`` writes)."""
+    try:
+        name = task.get_name() or ""
+    except Exception:
+        return False
+    return name.startswith(_INFRA_TASK_PREFIXES)
+
+
 class RestartCoordinatorFeature(Feature):
     """Durable restart-request surface for agents (#1512)."""
 
@@ -862,7 +887,16 @@ class RestartCoordinatorFeature(Feature):
         if bg_tasks is not None:
             any_surface_seen = True
             try:
-                alive = [t for t in bg_tasks if not t.done()]
+                # Exclude fire-and-forget infrastructure bookkeeping
+                # (signal_log: writes). It churns continuously under
+                # heartbeat/scheduler load and would otherwise keep the
+                # agent "busy" forever, never letting an idle restart
+                # through (#1626). Real agent work (e.g. signal_dispatch:)
+                # still counts.
+                alive = [
+                    t for t in bg_tasks
+                    if not t.done() and not _is_infra_background_task(t)
+                ]
             except (TypeError, AttributeError):
                 alive = []
             if alive:
