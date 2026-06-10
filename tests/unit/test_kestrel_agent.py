@@ -1185,3 +1185,37 @@ class TestInitialize:
                         assert "TestFeature" in agent.features
                         assert agent.features["TestFeature"] is mock_feature
                         mock_feature.initialize.assert_called_once()
+
+
+# =============================================================================
+# Tests for injectable PayerPolicy + host db (#1649, multi-tenant embedding)
+# =============================================================================
+
+class TestPayerPolicyInjection:
+    """A host can inject PayerPolicy + host_db instead of reading them off disk."""
+
+    def test_injected_policy_overrides_toml(self):
+        """payer_policy injected → _resolve_payer_policy returns it, no toml."""
+        sentinel = object()
+        agent = KestrelAgent(did="did:test:inject-policy", payer_policy=sentinel)
+        assert agent._resolve_payer_policy() is sentinel
+
+    def test_no_policy_falls_back_to_toml_default(self):
+        """No injection → loads the toml policy (host_env default sans kestrel.toml)."""
+        from kestrel_sdk.payer_policy import PayerPolicy
+
+        agent = KestrelAgent(did="did:test:fallback-policy")
+        assert isinstance(agent._resolve_payer_policy(), PayerPolicy)
+
+    @pytest.mark.asyncio
+    async def test_injected_host_db_overrides_disk(self):
+        """host_db injected → _resolve_host_db returns it, no on-disk lookup."""
+        sentinel = object()
+        agent = KestrelAgent(did="did:test:inject-hostdb", host_db=sentinel)
+        assert await agent._resolve_host_db() is sentinel
+
+    @pytest.mark.asyncio
+    async def test_no_host_db_returns_none_without_host_file(self):
+        """No injection + no on-disk host.db → None (resolver falls back to agent db)."""
+        agent = KestrelAgent(did="did:test:no-hostdb", storage_path=None)
+        assert await agent._resolve_host_db() is None

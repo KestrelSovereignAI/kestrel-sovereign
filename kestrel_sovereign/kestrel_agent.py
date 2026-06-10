@@ -156,6 +156,8 @@ class KestrelAgent(
         db_backend: Optional[str] = None,
         allowed_features: Optional[set] = None,
         sync_enabled: Optional[bool] = None,
+        payer_policy=None,
+        host_db=None,
     ):
         """
         Initializes the agent with memory and reasoning capabilities.
@@ -175,12 +177,28 @@ class KestrelAgent(
                        Mandatory features always load regardless.
             sync_enabled: Enables lifecycle SyncService snapshots. Defaults to
                        KESTREL_SYNC_ENABLED env var, or enabled when unset.
+            payer_policy: Optional ``kestrel_sdk.payer_policy.PayerPolicy`` to
+                       use for credential resolution at init. When provided, it
+                       overrides ``load_policy_from_toml()`` — lets a multi-tenant
+                       host embed agents with a programmatic per-agent policy
+                       instead of an on-disk ``kestrel.toml``.
+            host_db: Optional host-level ``AsyncDatabase`` holding the operator's
+                       HostKeyStorage masters. When provided, it overrides the
+                       on-disk SQLite ``host.db`` lookup (``open_host_db``) — lets
+                       a host on Postgres supply the host db directly (e.g.
+                       ``AsyncDatabase.from_pool(pg_pool)``). The caller owns its
+                       lifecycle; the agent does not close it.
         """
         self.did = did
         self._privacy_mode = privacy_mode
         self.storage_path = storage_path
         self._allowed_features = allowed_features
         self._sync_enabled = _resolve_sync_enabled(sync_enabled)
+        # Optional injected payer-policy + host db for multi-tenant embedding
+        # (#1649). When set, they override the standalone kestrel.toml /
+        # on-disk host.db lookups during credential resolution at init.
+        self._injected_payer_policy = payer_policy
+        self._injected_host_db = host_db
 
         # Per-agent constitution overlay (#898). When ``<agent_dir>/CONSTITUTION.md``
         # exists, its text becomes ``self.constitution_text`` so feature-side
@@ -516,6 +534,30 @@ class KestrelAgent(
         """True when this agent was inceptioned with ``is_test_instance=True``."""
         return getattr(self, "_is_test_instance", False)
 
+    def _resolve_payer_policy(self):
+        """The PayerPolicy for credential resolution at init.
+
+        Prefers an injected policy (multi-tenant embedding, #1649); otherwise
+        loads from the standalone ``kestrel.toml`` ``[payments]`` section.
+        """
+        if self._injected_payer_policy is not None:
+            return self._injected_payer_policy
+        from kestrel_sovereign.services.payer_resolver import load_policy_from_toml
+        return load_policy_from_toml()
+
+    async def _resolve_host_db(self):
+        """The host-level AsyncDatabase holding HostKeyStorage masters.
+
+        Prefers an injected host db (multi-tenant embedding, #1649); otherwise
+        opens the on-disk SQLite ``host.db`` next to this agent's storage.
+        Returns None when neither is available (resolver then falls back to the
+        agent's own db, which has no host_service_keys rows).
+        """
+        if self._injected_host_db is not None:
+            return self._injected_host_db
+        from kestrel_sovereign.services.payer_resolver import open_host_db
+        return await open_host_db(storage_path=self.storage_path)
+
     async def initialize(self) -> None:
         """Async initialization of storage and features."""
         if self._raw_storage is None:
@@ -803,22 +845,19 @@ class KestrelAgent(
                 from kestrel_sdk.payer_policy import ResourceClass
                 from kestrel_sovereign.services.payer_resolver import (
                     FoundationPayerResolver,
-                    load_policy_from_toml,
                 )
                 from kestrel_sovereign.storage.providers.lighthouse_provider import (
                     LighthouseProvider,
                 )
 
-                _policy = load_policy_from_toml()
-                # Open the shared host.db for HostKeyStorage if the
-                # payments wizard has been run. None means no host
-                # master is configured yet — resolver falls back to
-                # the agent's db (same db) which has no host_service_keys
-                # rows, surfacing as 'no host master' for delegated kinds.
-                from kestrel_sovereign.services.payer_resolver import open_host_db
-                _host_db = await open_host_db(
-                    storage_path=self.storage_path,
-                )
+                # Injected policy/host-db (multi-tenant embedding) take
+                # precedence over the standalone kestrel.toml / on-disk host.db.
+                # When no host master is configured, _resolve_host_db returns
+                # None and the resolver falls back to the agent's db (which has
+                # no host_service_keys rows → 'no host master' for delegated
+                # kinds). See #1649.
+                _policy = self._resolve_payer_policy()
+                _host_db = await self._resolve_host_db()
                 _resolver = FoundationPayerResolver(
                     _policy,
                     db=self._raw_storage.db if self._raw_storage else None,
@@ -1015,14 +1054,12 @@ class KestrelAgent(
                 from kestrel_sdk.payer_policy import ResourceClass
                 from kestrel_sovereign.services.payer_resolver import (
                     FoundationPayerResolver,
-                    load_policy_from_toml,
                 )
 
-                _llm_policy = load_policy_from_toml()
-                from kestrel_sovereign.services.payer_resolver import open_host_db
-                _llm_host_db = await open_host_db(
-                    storage_path=self.storage_path,
-                )
+                # Injected policy/host-db (multi-tenant embedding) override the
+                # standalone kestrel.toml / on-disk host.db. See #1649.
+                _llm_policy = self._resolve_payer_policy()
+                _llm_host_db = await self._resolve_host_db()
                 _llm_resolver = FoundationPayerResolver(
                     _llm_policy,
                     db=self._raw_storage.db if self._raw_storage else None,
