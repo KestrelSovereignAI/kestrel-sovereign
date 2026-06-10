@@ -112,11 +112,18 @@ def sqlite_to_postgres(query: str) -> Tuple[str, int]:
             # agent_metadata: (agent_id, key) composite
             # host_service_keys: provider_id (the actual UNIQUE; `id` is a
             #   fresh UUID per insert and would never trigger a replace)
+            # user_master / sponsor_master service keys: the real UNIQUE is
+            #   (master_did, provider_id); `id` is a fresh UUID like host's.
+            # sponsor_beneficiaries: PRIMARY KEY is agent_did (not the first
+            #   column), so re-enroll (repoint) must conflict on agent_did.
             known_pks = {
                 'graph_nodes': ['node_id'],
                 'graph_edges': ['source_id', 'target_id', 'label'],
                 'agent_metadata': ['agent_id', 'key'],
                 'host_service_keys': ['provider_id'],
+                'user_master_service_keys': ['master_did', 'provider_id'],
+                'sponsor_master_service_keys': ['master_did', 'provider_id'],
+                'sponsor_beneficiaries': ['agent_did'],
             }
             pk_columns = known_pks.get(
                 table_name.lower(),
