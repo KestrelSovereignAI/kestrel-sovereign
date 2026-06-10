@@ -1,42 +1,24 @@
 """
-PostgreSQL A2A Stores for Multi-Tenant Deployment.
+PostgreSQL A2A Stores.
 
-DEPRECATION NOTICE (Issue #2):
-    PostgreSQL stores are deprecated in favor of SQLite-first architecture
-    with optional cloud sync. This module remains available for existing
-    multi-tenant deployments but will be removed in a future release.
+These wrap the unified, backend-agnostic A2A stores with a PostgresBackend
+so they run against an existing asyncpg.Pool from app_state.pg_pool without
+opening a second pool.
 
-    Migration path:
-    - Use SQLite stores directly: from kestrel_sovereign.a2a.stores import TaskStore
-    - Use SyncService for cloud backup: from kestrel_sovereign.storage.sync import SyncService
-    - For multi-tenant aggregation, use PostgreSQL as a sync target only
+    from kestrel_sovereign.a2a.stores.postgres import PostgresTaskStore
+    task_store = PostgresTaskStore(app_state.pg_pool)
 
-    See: kestrel_sovereign/storage/sync/
-    See: feedback/2026-01-12_postgres_migration_plan.md
-
-This module provides PostgreSQL-backed A2A stores using the unified
-backend-agnostic store implementations with PostgresBackend.
-
-For new code, use SQLite stores with sync:
-    from kestrel_sovereign.storage.db import SQLiteBackend
-    from kestrel_sovereign.a2a.stores.unified import TaskStore
-    from kestrel_sovereign.storage.sync import SyncService, S3Target
-
-    backend = SQLiteBackend("/path/to/agent.db")
-    await backend.connect()
-    task_store = TaskStore(backend)
-
-    # Optional: sync to cloud
-    sync = SyncService("/path/to/agent.db")
-    sync.add_target(S3Target(bucket="my-bucket"))
-    await sync.start()
-
-The Postgres*Store classes here are thin wrappers for backward compatibility
-with existing code that uses asyncpg.Pool directly.
+Backend choice is independent of deployment tier. SQLite is the zero-config
+default (a portable single-file sovereign agent); PostgreSQL is always
+available as an option and can back a single-user agent just as well as a
+multi-tenant deployment (one shared database, per-agent isolation, server-
+grade concurrency). Multi-tenant SaaS like Frinz uses PostgreSQL because it
+needs a shared pool — not because PostgreSQL is multi-tenant-only. Both
+backends are first-class; pick by operational preference, and use the sync
+layer (kestrel_sovereign.storage.sync) for cloud replication of either.
 """
 
 import logging
-import warnings
 from typing import Any, Optional
 
 import asyncpg
@@ -100,145 +82,91 @@ class PoolBackendAdapter(PostgresBackend):
 
 
 # =============================================================================
-# Backward-Compatible Wrapper Classes
+# PostgreSQL Store Wrappers
 # =============================================================================
-# These classes wrap the unified stores with the pool adapter, providing
-# the same interface as the original Postgres*Store classes.
+# These classes wrap the unified stores with the pool adapter, exposing the
+# same interface against an existing asyncpg.Pool from app_state.pg_pool.
 
 class PostgresTaskStore(UnifiedTaskStore):
-    """PostgreSQL-backed task store for multi-tenant deployment.
-
-    DEPRECATED: Use SQLite stores with SyncService instead.
-    """
+    """PostgreSQL-backed task store for multi-tenant deployment."""
 
     def __init__(self, pool: asyncpg.Pool):
         """
         Initialize with asyncpg connection pool.
 
         Args:
-            pool: asyncpg connection pool from external pg_pool
+            pool: asyncpg connection pool from app_state.pg_pool
         """
-        warnings.warn(
-            "PostgresTaskStore is deprecated. Use TaskStore with SQLiteBackend and SyncService. "
-            "See kestrel_sovereign/storage/sync/ and Issue #2.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         backend = PoolBackendAdapter(pool)
         super().__init__(backend)
 
 
 class PostgresSessionService(UnifiedSessionService):
-    """PostgreSQL-backed session service for multi-tenant deployment.
-
-    DEPRECATED: Use SQLite stores with SyncService instead.
-    """
+    """PostgreSQL-backed session service for multi-tenant deployment."""
 
     def __init__(self, pool: asyncpg.Pool):
         """
         Initialize with asyncpg connection pool.
 
         Args:
-            pool: asyncpg connection pool from external pg_pool
+            pool: asyncpg connection pool from app_state.pg_pool
         """
-        warnings.warn(
-            "PostgresSessionService is deprecated. Use SessionService with SQLiteBackend. "
-            "See kestrel_sovereign/storage/sync/ and Issue #2.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         backend = PoolBackendAdapter(pool)
         super().__init__(backend)
 
 
 class PostgresMemoryService(UnifiedMemoryService):
-    """PostgreSQL-backed memory with full-text search via tsvector/GIN.
-
-    DEPRECATED: Use SQLite stores with SyncService instead.
-    """
+    """PostgreSQL-backed memory with full-text search via tsvector/GIN."""
 
     def __init__(self, pool: asyncpg.Pool):
         """
         Initialize with asyncpg connection pool.
 
         Args:
-            pool: asyncpg connection pool from external pg_pool
+            pool: asyncpg connection pool from app_state.pg_pool
         """
-        warnings.warn(
-            "PostgresMemoryService is deprecated. Use MemoryService with SQLiteBackend. "
-            "See kestrel_sovereign/storage/sync/ and Issue #2.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         backend = PoolBackendAdapter(pool)
         super().__init__(backend)
 
 
 class PostgresObservabilityStore(UnifiedObservabilityStore):
-    """PostgreSQL-backed observability store.
-
-    DEPRECATED: Use SQLite stores with SyncService instead.
-    """
+    """PostgreSQL-backed observability store."""
 
     def __init__(self, pool: asyncpg.Pool):
         """
         Initialize with asyncpg connection pool.
 
         Args:
-            pool: asyncpg connection pool from external pg_pool
+            pool: asyncpg connection pool from app_state.pg_pool
         """
-        warnings.warn(
-            "PostgresObservabilityStore is deprecated. Use ObservabilityStore with SQLiteBackend. "
-            "See kestrel_sovereign/storage/sync/ and Issue #2.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         backend = PoolBackendAdapter(pool)
         super().__init__(backend)
 
 
 class PostgresOrchestrationStore(UnifiedOrchestrationStore):
-    """PostgreSQL-backed orchestration store for multi-agent workflows.
-
-    DEPRECATED: Use SQLite stores with SyncService instead.
-    """
+    """PostgreSQL-backed orchestration store for multi-agent workflows."""
 
     def __init__(self, pool: asyncpg.Pool):
         """
         Initialize with asyncpg connection pool.
 
         Args:
-            pool: asyncpg connection pool from external pg_pool
+            pool: asyncpg connection pool from app_state.pg_pool
         """
-        warnings.warn(
-            "PostgresOrchestrationStore is deprecated. Use OrchestrationStore with SQLiteBackend. "
-            "See kestrel_sovereign/storage/sync/ and Issue #2.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         backend = PoolBackendAdapter(pool)
         super().__init__(backend)
 
 
 class PostgresFeedbackStore(UnifiedFeedbackStore):
-    """PostgreSQL-backed feedback store for agent self-diagnosis.
-
-    DEPRECATED: Use SQLite stores with SyncService instead.
-    """
+    """PostgreSQL-backed feedback store for agent self-diagnosis."""
 
     def __init__(self, pool: asyncpg.Pool):
         """
         Initialize with asyncpg connection pool.
 
         Args:
-            pool: asyncpg connection pool from external pg_pool
+            pool: asyncpg connection pool from app_state.pg_pool
         """
-        warnings.warn(
-            "PostgresFeedbackStore is deprecated. Use FeedbackStore with SQLiteBackend. "
-            "See kestrel_sovereign/storage/sync/ and Issue #2.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         backend = PoolBackendAdapter(pool)
         super().__init__(backend)
 
@@ -248,7 +176,7 @@ class PostgresFeedbackStore(UnifiedFeedbackStore):
 # =============================================================================
 
 __all__ = [
-    # Wrapper classes for backward compatibility
+    # PostgreSQL store wrappers
     "PostgresTaskStore",
     "PostgresSessionService",
     "PostgresMemoryService",
