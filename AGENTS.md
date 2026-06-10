@@ -79,9 +79,12 @@ its current default model.
 Running tests is a **first-class evidence gate**, not just a habit. The
 loop has three gates owned by three layers:
 
-- **Implementation** — Talon runs targeted tests and reports evidence
-  (commands, exit codes, CI status) before PR handoff; it rides back on
-  the `talon.job_complete` signal's `test_evidence` / `ci_status` fields.
+- **Implementation** — Talon runs targeted tests before PR handoff and
+  reports what it ran in the PR. The `talon.job_complete` signal *reserves*
+  `test_evidence` / `ci_status` fields for this, but the coordinator does
+  **not** populate them today (they default to empty and are never
+  assigned) — so don't rely on those fields carrying evidence; the
+  load-bearing gate is the reviewer-side check below.
 - **Review** — the Sovereign reviewer runs independent verification via
   the `talon_verify` tool (allowlisted test commands run without
   prompting; everything else is approval-gated). Result states:
