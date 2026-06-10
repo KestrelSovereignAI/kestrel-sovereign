@@ -431,3 +431,22 @@ def test_lazy_embedding_service_swallows_provider_errors(monkeypatch):
     db.backend_type = "sqlite"
     store = AsyncConversationStore(db=db, agent_id="a")
     assert store._lazy_embedding_service() is None
+
+
+@pytest.mark.asyncio
+async def test_search_history_escapes_like_wildcards_in_session_id():
+    """#1653: a session_id containing LIKE wildcards (%/_) must be escaped so
+    it can't broaden the metadata pre-filter, and the query must carry an
+    ESCAPE clause."""
+    store, db = _make_store()
+    db.fetchall = AsyncMock(return_value=[])
+
+    await store.search_history("hello", session_id="abc%_def")
+
+    sql, params = db.fetchall.call_args[0]
+    assert "ESCAPE '\\'" in sql
+    patterns = [p for p in params if isinstance(p, str) and "session_id" in p]
+    assert patterns
+    # %/_ are backslash-escaped in every metadata pattern.
+    for p in patterns:
+        assert "abc\\%\\_def" in p

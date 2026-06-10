@@ -46,14 +46,28 @@ def _get_embedding_service(llm_service: Optional[Any] = None):
 
 
 def _serialize_embedding(embedding: List[float]) -> bytes:
-    """Serialize embedding to bytes for SQLite storage."""
-    return struct.pack(f'{len(embedding)}f', *embedding)
+    """Serialize embedding to little-endian float32 bytes for SQLite storage.
+
+    Explicit little-endian (``<``) so the bytes round-trip on big-endian
+    hosts and across a cross-architecture migration (mirrors
+    async_conversation_store; #1653).
+    """
+    return struct.pack(f'<{len(embedding)}f', *embedding)
 
 
 def _deserialize_embedding(data: bytes) -> List[float]:
-    """Deserialize embedding from bytes."""
+    """Deserialize embedding from little-endian float32 bytes.
+
+    A length that isn't a multiple of 4 can't be a valid float32 vector —
+    skip it rather than ``// 4``-truncate to noise (#1653).
+    """
+    if len(data) % 4 != 0:
+        logger.warning(
+            "Skipping embedding: %d bytes not a multiple of 4.", len(data),
+        )
+        return []
     count = len(data) // 4  # 4 bytes per float
-    return list(struct.unpack(f'{count}f', data))
+    return list(struct.unpack(f'<{count}f', data))
 
 
 class AsyncRAGStore:

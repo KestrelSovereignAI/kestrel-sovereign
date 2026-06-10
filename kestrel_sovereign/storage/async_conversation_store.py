@@ -1332,17 +1332,26 @@ class AsyncConversationStore:
         # the metadata JSON because session_id is plaintext (not encrypted).
         # Falls back to full scan when no session_id is given.
         if session_id:
-            # Match both `"session_id": "X"` and `"session_id":"X"` formats
+            # Match both `"session_id": "X"` and `"session_id":"X"` formats.
+            # Escape LIKE wildcards in session_id so a `%`/`_` in the id can't
+            # broaden the match; ESCAPE '\' makes the backslash literal (#1653).
+            # Backslash must be escaped first so the wildcards added below
+            # aren't doubled.
+            esc = (
+                session_id.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, rendered_content "
                 "FROM conversation_history "
                 "WHERE agent_id = ? AND deleted_at IS NULL "
-                "AND (metadata LIKE ? OR metadata LIKE ?) "
+                "AND (metadata LIKE ? ESCAPE '\\' OR metadata LIKE ? ESCAPE '\\') "
                 "ORDER BY id DESC LIMIT 5000",
                 (
                     self.agent_id,
-                    f'%"session_id": "{session_id}"%',
-                    f'%"session_id":"{session_id}"%',
+                    f'%"session_id": "{esc}"%',
+                    f'%"session_id":"{esc}"%',
                 ),
             )
         else:
