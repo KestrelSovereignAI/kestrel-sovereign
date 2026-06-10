@@ -5,25 +5,21 @@
 // outside #panel-chat) fails here rather than silently in the browser.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 import { JSDOM } from 'jsdom';
 
-// The chat elements from index.html's #panel-chat (ids the component looks up).
-const PANEL_HTML = `
-<div class="panel active" id="panel-chat">
-  <div class="chat-header"></div>
-  <select id="model-selector"></select>
-  <button id="stop-button"></button>
-  <div id="thinking-indicator"></div>
-  <div class="chat-container" id="chat-container"></div>
-  <span id="context-status"></span>
-  <textarea id="message-input"></textarea>
-  <button id="send-button"></button>
-  <button id="composer-mode-toggle"></button>
-</div>`;
-
-const dom = new JSDOM(`<!DOCTYPE html><body>${PANEL_HTML}</body>`, {
-    url: 'http://localhost/',
-});
+// Load the REAL console markup so the cutover is verified against the actual
+// #panel-chat structure (ids, nesting) the browser uses — not a simplified
+// fixture. jsdom does not run the page's scripts by default, so this only
+// parses the DOM; we drive the component ourselves below.
+const here = dirname(fileURLToPath(import.meta.url));
+const indexHtml = readFileSync(
+    resolve(here, '../../kestrel_sovereign/static/index.html'),
+    'utf8',
+);
+const dom = new JSDOM(indexHtml, { url: 'http://localhost/' });
 globalThis.window = dom.window;
 globalThis.document = dom.window.document;
 globalThis.Node = dom.window.Node;
@@ -55,9 +51,11 @@ test('console mounts into #panel-chat and the embedding hooks resolve in real DO
     });
     assert.equal(typeof api.appendMessagePart, 'function');
 
-    // The chat-container the component scrolls/mounts panes into is the one
-    // inside #panel-chat — proven by real querySelector scoping.
-    assert.ok(document.querySelector('#panel-chat > #chat-container'));
+    // The chat-container the component scrolls/mounts panes into resolves
+    // within #panel-chat (at whatever depth index.html nests it) — proven by
+    // real scoped querySelector against the production markup.
+    assert.ok(panel.querySelector('#chat-container'));
+    assert.equal(document.querySelectorAll('#chat-container').length >= 1, true);
 
     // A header action renders a real <button> into .chat-header inside the panel.
     chat.registerHeaderAction({
