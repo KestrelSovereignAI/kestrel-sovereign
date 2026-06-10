@@ -22,7 +22,11 @@ logger = logging.getLogger(__name__)
 _UNIFIED_CONFIG_MAPPING = {
     "model_catalog.toml": "llm.catalog",
     "model_mandate.toml": "llm.mandate",
-    "constitutional_profiles.toml": "constitution.profiles",
+    # NOTE: constitutional_profiles.toml is intentionally NOT mapped here.
+    # ConstitutionalProfileManager.load() (llm/constitutional_profile.py)
+    # reads it directly via tomllib, never through load_config(), so a
+    # mapping entry was dead. (That manager reimplements the unified-config
+    # fallback instead of reusing this module — a separate consolidation.)
     "council_config.toml": "council",
 }
 

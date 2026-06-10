@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from _council_feature_package import load_council_exports
+from _council_feature_package import load_council_exports, load_council_config
 
 _council = load_council_exports()
 Evidence = _council.Evidence
@@ -64,18 +64,6 @@ def print_token_usage(session) -> float:
     return total_cost
 
 
-def load_council_config() -> CouncilConfig:
-    """Load council configuration from TOML file."""
-    import tomllib
-    config_path = Path(__file__).parent.parent / "council_config.toml"
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"Council config not found: {config_path}")
-
-    with open(config_path, "rb") as f:
-        data = tomllib.load(f)
-
-    return CouncilConfig.from_dict(data.get("council", {}))
 
 
 def build_sqlite_evidence() -> Evidence:
