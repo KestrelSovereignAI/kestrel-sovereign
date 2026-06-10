@@ -203,13 +203,15 @@ class FoundationPayerResolver:
             )
 
         # Side-effect for delegated-master OpenRouter LLM: mint a per-agent
-        # child key against the funding master (host's, or a user's for
-        # USER_MASTER_PROVISIONED) if one doesn't already exist. Idempotent.
-        # The master source is chosen by spec.kind in _fetch_openrouter_master.
+        # child key against the funding master — the host's, a user's
+        # (USER_MASTER_PROVISIONED), or a sponsor's (SPONSOR) — if one doesn't
+        # already exist. Idempotent. The master source is chosen by spec.kind
+        # in _fetch_openrouter_master.
         if (
             spec.kind in (
                 PayerKind.HOST_MASTER_PROVISIONED,
                 PayerKind.USER_MASTER_PROVISIONED,
+                PayerKind.SPONSOR,
             )
             and resource_class is ResourceClass.LLM
             and spec.vendor == "openrouter"
@@ -399,9 +401,9 @@ class FoundationPayerResolver:
         if the agent doesn't already have one. Idempotent.
 
         Called from resolve_for on (LLM, openrouter) for the delegated-master
-        kinds HOST_MASTER_PROVISIONED and USER_MASTER_PROVISIONED. Reads the
-        funding master (host's, or the user's keyed by spec.master_did) via
-        _fetch_openrouter_master, calls
+        kinds HOST_MASTER_PROVISIONED, USER_MASTER_PROVISIONED, and SPONSOR.
+        Reads the funding master (the host's, or a user's / sponsor's keyed by
+        spec.master_did) via _fetch_openrouter_master, calls
         OpenRouterProvisioningService.create_agent_key with the agent's
         DID and the policy's monthly_cap_usd, stores the resulting child
         key in ServiceKeyStorage. Subsequent agent inits and
@@ -465,9 +467,10 @@ class FoundationPayerResolver:
 
         HOST_MASTER_PROVISIONED reads the operator's master from
         ``HostKeyStorage``; USER_MASTER_PROVISIONED reads the funding user's
-        master from ``UserMasterKeyStorage`` (keyed by ``spec.master_did``).
-        Both live in the shared ``host_db``. Raises ``PayerPolicyError`` if the
-        relevant master is not configured.
+        master from ``UserMasterKeyStorage`` and SPONSOR reads the funding
+        sponsor's master from ``SponsorKeyStorage`` (both keyed by
+        ``spec.master_did``). All live in the shared ``host_db``. Raises
+        ``PayerPolicyError`` if the relevant master is not configured.
         """
         from kestrel_sdk.payer_policy import PayerPolicyError
 
@@ -484,6 +487,22 @@ class FoundationPayerResolver:
                     "user master key is configured in UserMasterKeyStorage. The "
                     "user must provision their OpenRouter master key before the "
                     "agent mints a child against it."
+                )
+            return await storage.get_key("openrouter")
+
+        if spec.kind is PayerKind.SPONSOR:
+            from kestrel_sovereign.security.sponsor_key_storage import (
+                SponsorKeyStorage,
+            )
+
+            storage = SponsorKeyStorage(self._host_db, spec.master_did)
+            if not await storage.has_key("openrouter"):
+                raise PayerPolicyError(
+                    "PayerPolicy.llm.kind = SPONSOR for openrouter "
+                    f"(master_did={spec.master_did[:30]}...), but no sponsor "
+                    "master key is configured in SponsorKeyStorage. The sponsor "
+                    "must provision their OpenRouter master key before an agent "
+                    "in their group mints a child against it."
                 )
             return await storage.get_key("openrouter")
 

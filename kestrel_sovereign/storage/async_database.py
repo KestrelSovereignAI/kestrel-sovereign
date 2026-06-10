@@ -286,6 +286,39 @@ CREATE TABLE IF NOT EXISTS user_master_service_keys (
 CREATE INDEX IF NOT EXISTS idx_user_master_keys_did ON user_master_service_keys(master_did);
 CREATE INDEX IF NOT EXISTS idx_user_master_keys_provider ON user_master_service_keys(provider_id);
 
+-- Per-sponsor master credentials for the SPONSOR payer-policy path: a named
+-- third party (e.g. an org) funds agents, and the resolver mints a per-agent
+-- child against the sponsor's master (same shape as user_master_service_keys,
+-- scoped per master_did = the sponsor's DID). See
+-- kestrel_sovereign.security.sponsor_key_storage.SponsorKeyStorage.
+CREATE TABLE IF NOT EXISTS sponsor_master_service_keys (
+    id TEXT PRIMARY KEY,
+    master_did TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    encrypted_key TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(master_did, provider_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sponsor_master_keys_did ON sponsor_master_service_keys(master_did);
+CREATE INDEX IF NOT EXISTS idx_sponsor_master_keys_provider ON sponsor_master_service_keys(provider_id);
+
+-- Sponsor -> beneficiary (agent) roster: which sponsor funds which agent. A
+-- policy builder consults this to set PayerSpec(kind=SPONSOR, master_did=...)
+-- for an enrolled agent. One funding sponsor per agent (per-agent model);
+-- authority/consent for enrollment is a product concern, not enforced here.
+CREATE TABLE IF NOT EXISTS sponsor_beneficiaries (
+    sponsor_did TEXT NOT NULL,
+    agent_did TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    enrolled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (agent_did)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sponsor_beneficiaries_sponsor ON sponsor_beneficiaries(sponsor_did);
+
 CREATE TABLE IF NOT EXISTS service_key_usage (
     id TEXT PRIMARY KEY,
     key_id TEXT NOT NULL,
