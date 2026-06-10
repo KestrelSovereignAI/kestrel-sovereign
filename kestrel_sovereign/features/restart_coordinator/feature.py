@@ -88,14 +88,19 @@ def _tail(raw: Any) -> str:
     return text
 
 
-# Background-task name prefixes for fire-and-forget *infrastructure*
-# bookkeeping that must never hold off an idle restart. These tasks complete
-# in well under a second, but heartbeats and scheduler ticks mint them
-# continuously, so counting them as "busy" wedged ``idle_agents_only``
-# restarts forever — the agent reported "N background task(s) in flight"
-# indefinitely while ``list_my_tasks`` showed nothing (#1626). The name is
-# already stamped on the task at creation; it was just never read here.
-_INFRA_TASK_PREFIXES = ("signal_log:",)
+# Background-task name prefixes for *infrastructure* work that must never
+# hold off an idle restart (#1626). Two shapes both wedged
+# ``idle_agents_only`` forever by being counted as "busy":
+#   - ``signal_log:`` — fire-and-forget log writes that complete in well
+#     under a second but are minted continuously by heartbeats/scheduler
+#     ticks, so one is almost always alive when the idle check runs.
+#   - ``a2a_question_expiry_sweep`` — an intentionally permanent ``while
+#     True`` maintenance daemon (peers feature) that never completes.
+# Neither is user/signal work; real work (``signal_dispatch:*``) still
+# defers a restart. The name is already stamped on the task at creation —
+# it was just never read here. New long-lived/bookkeeping daemons must be
+# named with a prefix listed here (or excluded from ``_background_tasks``).
+_INFRA_TASK_PREFIXES = ("signal_log:", "a2a_question_expiry_sweep")
 
 
 def _is_infra_background_task(task) -> bool:

@@ -1376,19 +1376,22 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
         await asyncio.Event().wait()
 
     log_task = asyncio.create_task(_never(), name="signal_log:heartbeat:abc123")
+    sweep_task = asyncio.create_task(_never(), name="a2a_question_expiry_sweep")
     work_task = asyncio.create_task(_never(), name="signal_dispatch:heartbeat:abc123")
     try:
-        # Only infra bookkeeping in flight -> the agent is idle.
-        feat.agent._background_tasks = {log_task}
+        # Only infra bookkeeping + the permanent peers sweep in flight ->
+        # the agent is idle (neither must wedge an idle restart).
+        feat.agent._background_tasks = {log_task, sweep_task}
         idle = feat._agent_appears_idle()
         assert idle["idle"] is True, idle
 
         # A real signal_dispatch task still defers, and infra tasks don't
         # inflate the reported count.
-        feat.agent._background_tasks = {log_task, work_task}
+        feat.agent._background_tasks = {log_task, sweep_task, work_task}
         busy = feat._agent_appears_idle()
         assert busy["idle"] is False
         assert busy["reason"] == "1 background task(s) in flight"
     finally:
         log_task.cancel()
+        sweep_task.cancel()
         work_task.cancel()
