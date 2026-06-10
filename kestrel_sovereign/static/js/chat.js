@@ -687,7 +687,27 @@ function renderHeaderActions() {
         const btn = document.createElement('button');
         btn.className = 'chat-header-action';
         btn.title = action.title || '';
-        btn.innerHTML = (action.icon || '') + (action.label ? ' ' + action.label : '');
+        // `registerHeaderAction` is the exported embedder API (#1623/#1627),
+        // so label/icon can be third-party supplied. `label` is always text —
+        // escape it. `icon` is an icon slot: pass a DOM Node for rich/SVG icons
+        // (appended safely), or a string treated as embedder-trusted markup for
+        // simple glyphs. Never interpolate an untrusted string as the icon (#1650).
+        // Duck-type the Node check (nodeType) so it's realm-safe (an icon built
+        // in another window/iframe still appends) rather than `instanceof Node`.
+        const iconIsNode = action.icon
+            && typeof action.icon === 'object'
+            && typeof action.icon.nodeType === 'number';
+        const sep = action.icon && action.label ? ' ' : '';
+        if (iconIsNode) {
+            btn.appendChild(action.icon);
+            if (action.label) {
+                btn.appendChild(document.createTextNode(sep + action.label));
+            }
+        } else {
+            btn.innerHTML =
+                (action.icon || '') +
+                (action.label ? sep + escapeHtml(action.label) : '');
+        }
         btn.addEventListener('click', (event) => action.onClick && action.onClick(event));
         slot.appendChild(btn);
     }
@@ -1142,6 +1162,13 @@ function showTaskNotification(message, type) {
     const paneElement = notificationPaneElement();
     if (!paneElement) return;
 
+    // `message` is not local-user authored — it carries A2A peer `sender`
+    // identities and task failure text passed straight through from remote
+    // submitters (see agent/event_manager.describe_background_task). Escape
+    // it once here so neither the pane innerHTML below nor the Toast render
+    // (the only other consumer of this string) can be an XSS sink (#1650).
+    const safeMessage = deps().escapeHtml(message);
+
     const div = document.createElement('div');
     div.className = 'message notification-message';
 
@@ -1176,7 +1203,7 @@ function showTaskNotification(message, type) {
 
     div.innerHTML = `
         <div class="notification-content">
-            ${message}
+            ${safeMessage}
         </div>
     `;
 
@@ -1185,7 +1212,7 @@ function showTaskNotification(message, type) {
     if (c) c.scrollTop = c.scrollHeight;
 
     // Also show a Toast notification
-    deps().toast.show(message, type === 'failed' ? 'error' : 'info');
+    deps().toast.show(safeMessage, type === 'failed' ? 'error' : 'info');
 }
 
 // Dedupe set for rendered cognition wakes (#1522). EventSource
