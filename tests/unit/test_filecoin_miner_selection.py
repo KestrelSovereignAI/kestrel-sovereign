@@ -198,8 +198,9 @@ class TestMinerSelection:
         # Should skip t01000 and select t01001
         assert result == "t01001"
 
-    def test_find_suitable_miner_fallback_on_error(self, adapter):
-        """Should fallback to first miner if scoring fails."""
+    def test_find_suitable_miner_returns_none_when_all_fail_scoring(self, adapter):
+        """#1676: when no miner can be vetted, return None (fail closed) rather
+        than an unvetted fallback — the caller raises 'no suitable miner'."""
         adapter.lotus_client.StateListMiners.return_value = ["t01000", "t01001"]
 
         # Mock all miners fail scoring
@@ -208,11 +209,12 @@ class TestMinerSelection:
 
         result = adapter._find_suitable_miner(size_bytes=1024)
 
-        # Should fallback to first available
-        assert result == "t01000"
+        # No vetted miner -> None, not an unvetted fallback.
+        assert result is None
 
-    def test_find_suitable_miner_handles_balance_check_failure(self, adapter):
-        """Should continue if balance check fails."""
+    def test_find_suitable_miner_excludes_miner_on_balance_check_failure(self, adapter):
+        """#1679: a miner whose balance check fails is treated as unfit and
+        excluded (fail closed), not allowed to fall through as suitable."""
         adapter.lotus_client.StateListMiners.return_value = ["t01000"]
 
         def mock_miner_info(miner):
@@ -227,13 +229,13 @@ class TestMinerSelection:
 
         adapter.lotus_client.StateMinerInfo.side_effect = mock_miner_info
         adapter.lotus_client.StateMinerPower.side_effect = mock_miner_power
-        # Balance check fails
+        # Balance check fails -> the only candidate is excluded -> None.
         adapter.lotus_client.StateMinerAvailableBalance.side_effect = Exception("Balance API error")
 
         result = adapter._find_suitable_miner(size_bytes=1024)
 
-        # Should still select miner despite balance check failure
-        assert result == "t01000"
+        # The unverifiable miner is excluded; no suitable miner remains.
+        assert result is None
 
     def test_find_suitable_miner_score_calculation(self, adapter):
         """Test score calculation gives reasonable values."""
@@ -358,7 +360,8 @@ class TestMinerSelectionEdgeCases:
                 yield adapter
 
     def test_all_miners_filtered_out(self, adapter):
-        """Should fallback when all miners are unsuitable."""
+        """#1676: when every miner is unsuitable, return None (fail closed),
+        not an unvetted fallback."""
         adapter.lotus_client.StateListMiners.return_value = [
             "t01000",
             "t01001",
@@ -377,8 +380,8 @@ class TestMinerSelectionEdgeCases:
 
         result = adapter._find_suitable_miner(size_bytes=1024)
 
-        # Should fallback to first miner
-        assert result == "t01000"
+        # No suitable miner -> None, not a fallback to an unvetted one.
+        assert result is None
 
     def test_single_miner_network(self, adapter):
         """Should work with single miner networks."""
