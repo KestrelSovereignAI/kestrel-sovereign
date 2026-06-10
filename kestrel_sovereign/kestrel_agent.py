@@ -328,6 +328,11 @@ class KestrelAgent(
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
         self.wallet = None  # Set by WalletFeature.initialize()
         self.reflection_hook = None  # Set by ReflectionFeature.post_all_features_loaded()
+        # Bootstrap service is constructed in initialize(); default it here so
+        # any code path that runs before/without full initialization (e.g. a
+        # COGNITION signal dispatch reaching process_input's bootstrap check)
+        # sees None instead of raising AttributeError (#1632).
+        self.bootstrap_service: Optional[BootstrapService] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
