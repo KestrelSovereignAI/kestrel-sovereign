@@ -98,6 +98,24 @@ globalThis.CSS = { escape: (s) => String(s) };
 
 const chatModule = await import('../../kestrel_sovereign/static/js/chat.js');
 const { state } = await import('../../kestrel_sovereign/static/js/ui.js');
+const exampleModule = await import(
+    '../../kestrel_sovereign/static/examples/embed-chat-example.mjs'
+);
+
+function makeChatContainer(hostAgent) {
+    const container = makeNode('section');
+    for (const id of [
+        'chat-container', 'message-input', 'send-button',
+        'model-selector', 'thinking-indicator', 'composer-mode-toggle',
+    ]) {
+        const node = makeNode(id === 'message-input' ? 'textarea' : 'div');
+        node.id = id;
+        container.appendChild(node);
+    }
+    return chatModule.mount(container, {
+        deps: { api: { hasCapability: () => true, getHostAgent: () => hostAgent } },
+    });
+}
 
 test('mount initializes chat in provided container and returns public API', () => {
     const container = makeNode('section');
@@ -138,5 +156,36 @@ test('mount initializes chat in provided container and returns public API', () =
     assert.equal(state.mountedChatAgent, 'factory-agent');
     assert.equal(chatContainer.children.length, 1);
     assert.equal(state.chatPanes.get('factory-agent').element.parentNode, chatContainer);
+});
+
+test('example imagePartRenderer returns an <img> Node with the given src/alt', () => {
+    const img = exampleModule.imagePartRenderer({ src: '/x.png', alt: 'hi' });
+    assert.equal(img.tagName, 'IMG');
+    assert.equal(img.src, '/x.png');
+    assert.equal(img.alt, 'hi');
+});
+
+test('appendMessagePart renders a registered part and isolates a throwing renderer', () => {
+    const api = makeChatContainer('render-agent');
+
+    // Registered renderer: its Node is appended into the message content.
+    api.registerPartRenderer('image', exampleModule.imagePartRenderer);
+    const okDiv = api.appendMessagePart('image', { src: '/y.png', alt: 'a' });
+    const content = okDiv.children[0];
+    assert.equal(content.children[0].tagName, 'IMG');
+    assert.equal(content.children[0].src, '/y.png');
+
+    // A throwing host renderer must not bubble out of appendMessagePart —
+    // it degrades to escaped text (#1644).
+    api.registerPartRenderer('boom', () => { throw new Error('bad renderer'); });
+    let threw = false;
+    let div;
+    try {
+        div = api.appendMessagePart('boom', 'fallback-text');
+    } catch {
+        threw = true;
+    }
+    assert.equal(threw, false);
+    assert.equal(div.children[0].textContent, 'fallback-text');
 });
 

@@ -671,6 +671,15 @@ function el(id) {
         : _chatRoot.querySelector('#' + id);
 }
 
+// The command-autocomplete dropdown is a position:fixed viewport overlay
+// appended to document.body (like a toast), so it lives OUTSIDE the chat
+// root. Look it up document-scoped rather than via the root-scoped el(),
+// otherwise a container-mounted console (#1644) can't find it and the
+// autocomplete silently breaks.
+function autocompleteEl() {
+    return document.getElementById('command-autocomplete');
+}
+
 function renderHeaderActions() {
     let slot = el('chat-header-actions');
     if (!slot) {
@@ -2896,9 +2905,22 @@ export function appendMessagePart(type, data, paneElement = null) {
 
     const renderer = _partRenderers[type];
     if (renderer) {
-        const out = renderer(data);
-        if (out instanceof Node) contentDiv.appendChild(out);
-        else contentDiv.innerHTML = String(out == null ? '' : out);
+        try {
+            const out = renderer(data);
+            // Duck-type the Node check (nodeType) so it's realm-safe — a part
+            // built in another window/iframe still appends — rather than
+            // `instanceof Node` (consistent with registerHeaderAction, #1650).
+            const outIsNode =
+                out && typeof out === 'object' && typeof out.nodeType === 'number';
+            if (outIsNode) contentDiv.appendChild(out);
+            else contentDiv.innerHTML = String(out == null ? '' : out);
+        } catch (err) {
+            // A throwing host part-renderer (third-party embedder code) must
+            // not abort message rendering for the whole conversation (#1644).
+            // Degrade to escaped text and log, so one bad renderer is isolated.
+            console.error(`part renderer for "${type}" threw:`, err);
+            contentDiv.textContent = String(data == null ? '' : data);
+        }
     } else {
         // No renderer registered — degrade to safe escaped text.
         contentDiv.textContent = String(data == null ? '' : data);
@@ -3080,7 +3102,7 @@ function handleInput(e) {
 }
 
 function handleKeydown(e) {
-    const dropdown = el('command-autocomplete');
+    const dropdown = autocompleteEl();
 
     if (dropdown) {
         if (e.key === 'ArrowDown') {
@@ -3185,13 +3207,13 @@ function showCommandAutocomplete(filter = '') {
 }
 
 function hideCommandAutocomplete() {
-    const existing = el('command-autocomplete');
+    const existing = autocompleteEl();
     if (existing) existing.remove();
     autocompleteSelectedIndex = -1;
 }
 
 function highlightCommand(index) {
-    const dropdown = el('command-autocomplete');
+    const dropdown = autocompleteEl();
     if (!dropdown) return;
 
     const options = dropdown.querySelectorAll('.command-option');
@@ -3216,7 +3238,7 @@ function selectCommand(cmd) {
 }
 
 function navigateAutocomplete(direction) {
-    const dropdown = el('command-autocomplete');
+    const dropdown = autocompleteEl();
     if (!dropdown) return false;
 
     const options = dropdown.querySelectorAll('.command-option');
@@ -3233,7 +3255,7 @@ function navigateAutocomplete(direction) {
 }
 
 function selectHighlightedCommand() {
-    const dropdown = el('command-autocomplete');
+    const dropdown = autocompleteEl();
     if (!dropdown || autocompleteSelectedIndex < 0) return false;
 
     const options = dropdown.querySelectorAll('.command-option');
