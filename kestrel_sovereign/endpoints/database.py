@@ -20,16 +20,48 @@ ALLOWED_TABLES = {
 }
 
 
-def _agent_scope_condition(column_names, agent_id):
+def _agent_scope(table_name, column_names, agent_id, backend_type):
     """Return ``(condition, params)`` scoping a query to one agent, else ``(None, [])``.
 
-    Tables that carry an ``agent_id`` column (e.g. ``conversation_history``)
-    are shared across agents in a single database, so the explorer must never
-    surface another agent's rows. Tables without the column get no scope.
+    Cross-agent isolation only matters in a shared-DB deployment (the default
+    is one DB file per agent). We scope each table *exactly as the app itself
+    scopes it*, so the explorer never exposes more than the app does:
+
+      - ``conversation_history``: physical ``agent_id`` column.
+      - ``graph_nodes``: ``agent_id`` lives inside the JSON ``properties``.
+      - ``graph_edges``: an edge belongs to the agent if it touches one of
+        the agent's nodes (mirrors the scoped purge in async_graph_store).
+
+    ``documents`` / ``document_chunks`` / ``fts_documents`` are file-content
+    tables keyed by content hash that the app reads *without* agent scoping,
+    so they are left un-scoped here too. Returns ``(None, [])`` when no agent
+    is known.
     """
-    if agent_id is not None and "agent_id" in set(column_names):
+    if agent_id is None:
+        return None, []
+    if "agent_id" in set(column_names):
         return "agent_id = ?", [agent_id]
+    node_agent = (
+        "(properties::jsonb->>'agent_id')"
+        if backend_type == "postgres"
+        else "json_extract(properties, '$.agent_id')"
+    )
+    if table_name == "graph_nodes":
+        return f"{node_agent} = ?", [agent_id]
+    if table_name == "graph_edges":
+        owned = f"SELECT node_id FROM graph_nodes WHERE {node_agent} = ?"
+        return (
+            f"(source_id IN ({owned}) OR target_id IN ({owned}))",
+            [agent_id, agent_id],
+        )
     return None, []
+
+
+def _privacy_hides_persisted(storage) -> bool:
+    """True when the agent's privacy mode (EPHEMERAL/ISOLATED) means persisted
+    rows are not part of its visible state and must not be surfaced raw."""
+    pconf = getattr(storage, "privacy_config", None)
+    return pconf is not None and (pconf.is_ephemeral() or pconf.uses_temp_storage())
 
 
 async def _list_table_names(db):
@@ -115,22 +147,28 @@ async def list_database_tables(request: Request):
                 logger.warning(f"Failed to get columns for table {table_name}: {e}")
                 columns = []
 
-            # Scope the row count to this agent when the table carries an
-            # agent_id column, so a shared multi-agent DB doesn't report
-            # another agent's row totals through the explorer (#1651).
-            scope_cond, scope_params = _agent_scope_condition(
-                [c["name"] for c in columns], agent_id
+            # Scope the row count to this agent the same way the app scopes
+            # the table, so a shared multi-agent DB doesn't report another
+            # agent's row totals through the explorer (#1651).
+            scope_cond, scope_params = _agent_scope(
+                table_name, [c["name"] for c in columns], agent_id,
+                storage.db.backend_type,
             )
-            where_clause = f"WHERE {scope_cond}" if scope_cond else ""
-            try:
-                count_row = await storage.db.fetchone(
-                    f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
-                    scope_params,
-                )
-                row_count = count_row[0] if count_row else 0
-            except Exception as e:
-                logger.warning(f"Failed to count rows in table {table_name}: {e}")
+            # For agent-scoped tables, EPHEMERAL/ISOLATED modes must not even
+            # reveal that persisted rows exist, so report the count as 0.
+            if scope_cond is not None and _privacy_hides_persisted(storage):
                 row_count = 0
+            else:
+                where_clause = f"WHERE {scope_cond}" if scope_cond else ""
+                try:
+                    count_row = await storage.db.fetchone(
+                        f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
+                        scope_params,
+                    )
+                    row_count = count_row[0] if count_row else 0
+                except Exception as e:
+                    logger.warning(f"Failed to count rows in table {table_name}: {e}")
+                    row_count = 0
 
             tables.append({
                 "name": table_name,
@@ -196,25 +234,25 @@ async def query_database_table(
         column_info = await _get_table_columns(storage.db, table_name)
         columns = [col["name"] for col in column_info]
 
-        scope_cond, scope_params = _agent_scope_condition(columns, agent_id)
+        scope_cond, scope_params = _agent_scope(
+            table_name, columns, agent_id, storage.db.backend_type
+        )
 
         # Privacy gate: the explorer reads the raw persistent DB directly,
         # bypassing the privacy wrapper. For agent-scoped tables, EPHEMERAL
         # and ISOLATED modes promise the persisted rows are not part of the
         # agent's visible state, so don't surface them here either (#1651).
-        if scope_cond is not None:
-            pconf = getattr(storage, "privacy_config", None)
-            if pconf is not None and (pconf.is_ephemeral() or pconf.uses_temp_storage()):
-                return {
-                    "table": table_name,
-                    "columns": columns,
-                    "rows": [],
-                    "total_rows": 0,
-                    "limit": limit,
-                    "offset": offset,
-                    "has_more": False,
-                    "note": "Hidden in EPHEMERAL/ISOLATED privacy mode.",
-                }
+        if scope_cond is not None and _privacy_hides_persisted(storage):
+            return {
+                "table": table_name,
+                "columns": columns,
+                "rows": [],
+                "total_rows": 0,
+                "limit": limit,
+                "offset": offset,
+                "has_more": False,
+                "note": "Hidden in EPHEMERAL/ISOLATED privacy mode.",
+            }
 
         # Compose the WHERE clause: agent scope (when applicable) AND the
         # optional free-text search, sharing one ordered params list.

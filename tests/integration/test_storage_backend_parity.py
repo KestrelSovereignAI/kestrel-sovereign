@@ -1,5 +1,6 @@
 """SQLite/PostgreSQL semantic parity contracts for storage seams."""
 
+import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from uuid import uuid4
@@ -324,3 +325,41 @@ async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend):
     assert result["rows"] == []
     assert result["total_rows"] == 0
     assert "privacy mode" in result.get("note", "").lower()
+
+    # The listing must not reveal the row exists via its count either.
+    listing = await list_database_tables(request)
+    conv = next(t for t in listing["tables"] if t["name"] == "conversation_history")
+    assert conv["row_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_db_explorer_scopes_graph_nodes_by_properties_agent_id(db_backend):
+    """#1651: graph_nodes stores agent ownership in the JSON `properties`
+    (no agent_id column), and the app scopes by it — the explorer must too,
+    or another agent's graph leaks via /api/db/tables/graph_nodes."""
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+    privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+    agent_id = f"did:test:{uuid4()}"
+    other_agent_id = f"did:test:{uuid4()}"
+
+    await storage.db.execute_many(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
+        [
+            (f"n-{uuid4()}", "concept", "mine", json.dumps({"agent_id": agent_id})),
+            (f"n-{uuid4()}", "concept", "also-mine", json.dumps({"agent_id": agent_id})),
+            (f"n-{uuid4()}", "concept", "theirs", json.dumps({"agent_id": other_agent_id})),
+        ],
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, storage=privacy_storage)
+    request = SimpleNamespace(state=SimpleNamespace(agent=agent))
+
+    result = await query_database_table(
+        request, "graph_nodes", limit=50, offset=0, search=None
+    )
+    labels = {r["label"] for r in result["rows"]}
+    assert labels == {"mine", "also-mine"}
+    assert result["total_rows"] == 2
