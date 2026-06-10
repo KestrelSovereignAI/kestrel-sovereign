@@ -424,7 +424,20 @@ class SchedulerFeature(Feature):
                     names.add(agent_tool.name)
             except Exception:
                 # A misbehaving feature must not block validation of
-                # everything else; skip it.
+                # everything else; skip it -- but log it, because a
+                # silent skip drops that feature's task names from the
+                # "every currently-valid name" set that schedule_add's
+                # rejection error promises (AGENTS.md), so an operator
+                # would otherwise see a legitimate name rejected with no
+                # trace of why.
+                logger.warning(
+                    "Feature %r get_tools() raised while collecting "
+                    "scheduler task names; its task names are omitted "
+                    "from the valid set (a schedule_add for them will be "
+                    "rejected as unknown)",
+                    getattr(feature, "name", type(feature).__name__),
+                    exc_info=True,
+                )
                 continue
 
         for agent_tool in self.get_tools():

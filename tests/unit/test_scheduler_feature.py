@@ -10,6 +10,7 @@ Tests:
 """
 
 import json
+import logging
 import pytest
 import pytest_asyncio
 from datetime import datetime, timezone
@@ -279,6 +280,50 @@ class TestScheduleAdd:
             task_name="wellness_check",
         )
         assert result.status is ToolResultStatus.OK
+
+    @pytest.mark.asyncio
+    async def test_feature_get_tools_failure_is_logged_not_swallowed(
+        self, feature, caplog
+    ):
+        """#1640: if a loaded feature's get_tools() raises while the
+        scheduler collects valid task names, the failure must be logged
+        (not silently swallowed) and must not block validation of the
+        other features. A silent skip drops that feature's names from the
+        'every currently-valid name' set schedule_add's rejection error
+        promises, so a legitimate name would be rejected with no trace of
+        why."""
+        bad_feature = MagicMock()
+        bad_feature.name = "BadFeature"
+        bad_feature.get_tools = MagicMock(side_effect=RuntimeError("boom"))
+
+        good_tool = MagicMock()
+        good_tool.name = "wellness_check"
+        good_feature = MagicMock()
+        good_feature.get_tools = MagicMock(return_value=[good_tool])
+
+        feature.agent.features = {
+            "BadFeature": bad_feature,
+            "GoodFeature": good_feature,
+        }
+
+        with caplog.at_level(
+            logging.WARNING,
+            logger="kestrel_sovereign.features.scheduler.feature",
+        ):
+            # The healthy feature's tool is still collected despite the
+            # broken one -- one bad feature can't block the rest.
+            result = await feature.schedule_add(
+                cron_expression="@daily",
+                task_name="wellness_check",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        # The broken feature was reported, not silently swallowed, and the
+        # warning names the offending feature so the omission is traceable.
+        assert any(
+            rec.levelno == logging.WARNING and "BadFeature" in rec.getMessage()
+            for rec in caplog.records
+        ), caplog.text
 
 
 # =========================================================================
