@@ -142,6 +142,10 @@ test('registerHeaderAction appends a DOM Node icon instead of stringifying it', 
     const btn = buttonByTitle(root, 'node-icon-btn');
     assert.ok(btn, 'button rendered');
     assert.equal(btn.children[0], iconNode, 'icon Node appended as a child');
-    // Label rides along as an escaped text node, never as raw markup.
-    assert.ok(!btn.innerHTML.includes('Selfie'), 'label is a text node, not innerHTML markup');
+    // Label rides along as a real text node (nodeType 3), never as innerHTML
+    // markup — so a malicious label can't inject even when an icon Node is used.
+    const textNode = btn.childNodes[1];
+    assert.equal(textNode.nodeType, 3, 'label is appended as a text node');
+    assert.equal(textNode.textContent, ' Selfie', 'label text node carries the raw label as text');
+    assert.equal(btn.innerHTML, '', 'no markup written to button innerHTML in the Node-icon path');
 });
