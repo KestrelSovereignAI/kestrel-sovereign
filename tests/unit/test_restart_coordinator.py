@@ -1362,3 +1362,33 @@ async def test_post_restart_sweep_emits_completed_status_event(tmp_path):
     assert len(events) == 1
     assert events[0]["status"] == "completed"
     assert events[0]["completed_at"]
+
+
+@pytest.mark.asyncio
+async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
+    """#1626: signal_log:* bookkeeping tasks are minted continuously by
+    heartbeats/scheduler ticks; counting them as 'busy' wedged
+    idle_agents_only restarts forever. They must be excluded from the idle
+    check, while real work (signal_dispatch:*) still defers a restart."""
+    feat, _ = await _make_feature(tmp_path)
+
+    async def _never():
+        await asyncio.Event().wait()
+
+    log_task = asyncio.create_task(_never(), name="signal_log:heartbeat:abc123")
+    work_task = asyncio.create_task(_never(), name="signal_dispatch:heartbeat:abc123")
+    try:
+        # Only infra bookkeeping in flight -> the agent is idle.
+        feat.agent._background_tasks = {log_task}
+        idle = feat._agent_appears_idle()
+        assert idle["idle"] is True, idle
+
+        # A real signal_dispatch task still defers, and infra tasks don't
+        # inflate the reported count.
+        feat.agent._background_tasks = {log_task, work_task}
+        busy = feat._agent_appears_idle()
+        assert busy["idle"] is False
+        assert busy["reason"] == "1 background task(s) in flight"
+    finally:
+        log_task.cancel()
+        work_task.cancel()

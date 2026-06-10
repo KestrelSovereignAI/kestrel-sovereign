@@ -88,6 +88,26 @@ def _tail(raw: Any) -> str:
     return text
 
 
+# Background-task name prefixes for fire-and-forget *infrastructure*
+# bookkeeping that must never hold off an idle restart. These tasks complete
+# in well under a second, but heartbeats and scheduler ticks mint them
+# continuously, so counting them as "busy" wedged ``idle_agents_only``
+# restarts forever — the agent reported "N background task(s) in flight"
+# indefinitely while ``list_my_tasks`` showed nothing (#1626). The name is
+# already stamped on the task at creation; it was just never read here.
+_INFRA_TASK_PREFIXES = ("signal_log:",)
+
+
+def _is_infra_background_task(task) -> bool:
+    """True if ``task`` is fire-and-forget infrastructure bookkeeping that
+    must not gate an idle restart (e.g. ``signal_log:*`` writes)."""
+    try:
+        name = task.get_name() or ""
+    except Exception:
+        return False
+    return name.startswith(_INFRA_TASK_PREFIXES)
+
+
 class RestartCoordinatorFeature(Feature):
     """Durable restart-request surface for agents (#1512)."""
 
@@ -862,7 +882,16 @@ class RestartCoordinatorFeature(Feature):
         if bg_tasks is not None:
             any_surface_seen = True
             try:
-                alive = [t for t in bg_tasks if not t.done()]
+                # Exclude fire-and-forget infrastructure bookkeeping
+                # (signal_log: writes). It churns continuously under
+                # heartbeat/scheduler load and would otherwise keep the
+                # agent "busy" forever, never letting an idle restart
+                # through (#1626). Real agent work (e.g. signal_dispatch:)
+                # still counts.
+                alive = [
+                    t for t in bg_tasks
+                    if not t.done() and not _is_infra_background_task(t)
+                ]
             except (TypeError, AttributeError):
                 alive = []
             if alive:
