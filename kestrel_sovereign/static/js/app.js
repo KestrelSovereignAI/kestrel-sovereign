@@ -19,7 +19,7 @@ import {
     loadLocalFiles,
     loadIpfsStatus,
 } from './panels.js';
-import { initChat, loadModels, connectNotifications, updateContextStatus } from './chat.js';
+import { mount as mountChat, loadModels, connectNotifications, updateContextStatus } from './chat.js';
 import { initVoiceUI } from './voice/ui.js';
 import { Security } from './security.js';
 import { initTasks, loadTasks } from './tasks.js';
@@ -61,8 +61,11 @@ async function init() {
     // Initialize navigation
     initNavigation();
 
-    // Initialize chat component
-    initChat();
+    // Initialize chat component by mounting it into the console's chat panel
+    // — the same public entry point (#1597) that external embedders (Frinz)
+    // use, so the console dogfoods the extracted component instead of the old
+    // initChat() path. Falls back to a document root if the panel is absent.
+    mountChat(document.getElementById('panel-chat'));
 
     // Initialize voice UI shell — adds the 🎙️ button, transcript drawer,
     // voice picker. Auto-fallback Realtime → Pipeline based on the
