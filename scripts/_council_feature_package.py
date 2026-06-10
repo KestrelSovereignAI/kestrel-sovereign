@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from importlib import import_module
+from pathlib import Path
 from types import SimpleNamespace
 
 
@@ -39,3 +40,21 @@ def load_council_exports() -> SimpleNamespace:
         print_token_usage_summary=costing.print_token_usage_summary,
         get_storage=storage.get_storage,
     )
+
+
+def load_council_config(config_path: Path | None = None):
+    """Load ``CouncilConfig`` from ``council_config.toml`` at the repo root.
+
+    Shared by the ``convene_*`` scripts, which previously each carried a
+    byte-identical copy of this (one had silently dropped the missing-file
+    check). Single source of truth, with the friendly FileNotFoundError.
+    """
+    import tomllib
+
+    exports = load_council_exports()
+    path = config_path or (Path(__file__).resolve().parent.parent / "council_config.toml")
+    if not path.exists():
+        raise FileNotFoundError(f"Council config not found: {path}")
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    return exports.CouncilConfig.from_dict(data.get("council", {}))
