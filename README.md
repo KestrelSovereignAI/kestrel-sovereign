@@ -146,22 +146,28 @@ kestrel config ./agent_data/MyAgent  # Show agent config
 
 #### Pulling in upstream changes (`kestrel update`)
 
-Replaces the four-step ritual `git pull && uv pip install -e . && kestrel feature sync && kestrel restart` with one verb:
+Replaces the four-step ritual `git pull && uv sync && kestrel feature sync && kestrel restart` with one verb:
 
 ```bash
 kestrel update                       # pull + install + feature sync + restart all agents
 kestrel update Emma                  # same, but only restart the named agent
 kestrel update --dry-run             # preview the steps without mutating anything
 kestrel update --no-pull --no-install # only feature sync + restart (e.g. after a manual checkout)
-kestrel update --allow-dirty         # pull even with uncommitted changes in the working tree
+kestrel update --allow-dirty         # pull even with modified tracked files in the working tree
+kestrel update --uv-sync             # force `uv sync` for the install step
+kestrel update --no-uv-sync          # force `uv pip install -e .` for the install step
 kestrel update --no-deps             # pass --no-deps to `uv pip install` for the fast path
 kestrel update --continue-on-error   # restart even if `feature sync` reports an error
 ```
 
+**Install step auto-detect.** When `uv.lock` exists at the source checkout root, the install step runs `uv sync` — that refreshes deps from the lockfile AND prunes packages not in it. That's why `kestrel feature sync` runs immediately after: it restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` just pruned. Without `uv.lock` present, the step falls back to `uv pip install -e .` which only reinstalls the project package. Force either with `--uv-sync` / `--no-uv-sync`.
+
+**Dirty-tree detection.** Only modified or staged **tracked** files block the pull. Untracked files (`kestrel.toml.backup-*`, scratch files, etc.) don't count — `git pull --ff-only` can't collide with files git doesn't know about. The refusal message surfaces the porcelain summary so you can see exactly what to commit/stash.
+
 Safety:
 
 - `git pull --ff-only` so a non-fast-forward upstream aborts instead of producing a surprise merge.
-- Refuses to pull when the working tree is dirty unless `--allow-dirty` is passed.
+- Refuses to pull when the working tree has modified tracked files unless `--allow-dirty` is passed.
 - Any step's failure short-circuits the rest, so a half-applied update never reaches the restart phase.
 - If `kestrel-sovereign` was installed from PyPI (no editable source checkout discoverable from the package's `__file__`), both `pull` AND `install` are silently skipped — `feature sync` and `restart` still run. Upgrade the package itself with `pip install --upgrade kestrel-sovereign` and then re-run `kestrel update` to pick up the new feature manifest and restart agents.
 

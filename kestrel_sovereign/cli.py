@@ -456,8 +456,22 @@ def _project_dir_is_git(project_dir: Path) -> bool:
     return (project_dir / ".git").exists()
 
 
-def _git_working_tree_dirty(project_dir: Path) -> bool:
-    """Return True if there are uncommitted changes, False if clean.
+def _git_working_tree_dirty(project_dir: Path) -> Tuple[bool, str]:
+    """Return ``(dirty, summary)`` for the TRACKED files in the working
+    tree.
+
+    ``--untracked-files=no`` so untracked files (stale
+    ``kestrel.toml.backup-*`` from ``kestrel setup`` rewrites, ad-hoc
+    scratch files, etc.) don't block a perfectly-safe ``git pull
+    --ff-only``. Only modified, staged, or unmerged TRACKED files
+    count as dirty — those are what an FF pull can collide with.
+    Followup to feat/kestrel-update-command after the initial roll-out
+    refused on a tree whose only "dirt" was untracked backup files.
+
+    ``summary`` is the first few porcelain lines (or the empty
+    string when clean) so the refusal message can surface what's
+    actually wrong instead of forcing the operator to re-run
+    ``git status`` by hand.
 
     Raises :class:`_GitFailedError` when git itself fails — the caller
     must NOT continue silently with the rest of the update pipeline
@@ -467,7 +481,7 @@ def _git_working_tree_dirty(project_dir: Path) -> bool:
     """
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--untracked-files=no"],
             cwd=str(project_dir),
             capture_output=True,
             text=True,
@@ -480,7 +494,17 @@ def _git_working_tree_dirty(project_dir: Path) -> bool:
             f"git status exited {result.returncode}"
         )
         raise _GitFailedError(detail)
-    return bool(result.stdout.strip())
+    porcelain = result.stdout.rstrip()
+    if not porcelain:
+        return False, ""
+    lines = porcelain.splitlines()
+    head = lines[:5]
+    tail = (
+        f"\n    (+{len(lines) - 5} more)"
+        if len(lines) > 5 else ""
+    )
+    summary = "\n".join(f"    {ln}" for ln in head) + tail
+    return True, summary
 
 
 def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
@@ -496,6 +520,58 @@ def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
         )
     except (FileNotFoundError, OSError) as exc:
         return 1, f"git not available: {exc}"
+    out = (result.stdout or "") + (result.stderr or "")
+    return result.returncode, out
+
+
+def _run_uv_sync(project_dir: Path) -> Tuple[int, str]:
+    """Run ``uv sync`` against the source checkout, targeting the
+    venv that owns this process.
+
+    Followup to feat/kestrel-update-command: an editable + uv.lock
+    workflow refreshes deps via ``uv sync``, NOT ``uv pip install -e
+    .`` (which only reinstalls the project package). ``uv sync``
+    also prunes anything not in the lock — including
+    kestrel-feature-* packages installed out-of-tree — which is
+    why ``kestrel feature sync`` runs immediately after to restore
+    them.
+
+    Codex review round 1 P1: bare ``uv sync`` targets the project's
+    default ``.venv``, not the venv the operator is currently in.
+    Codex review round 2 P1: a venv-installed ``kestrel`` invoked
+    WITHOUT shell activation (systemd / cron / direct path) has no
+    ``VIRTUAL_ENV`` exported, so we can't rely on the env var alone.
+    Detect "running inside a venv" via ``sys.prefix !=
+    sys.base_prefix``, then SEED ``VIRTUAL_ENV=sys.prefix`` for the
+    subprocess and pass ``--active`` so uv picks the right env. This
+    mirrors the ``--python sys.executable`` pin on
+    ``_run_uv_pip_install_editable``.
+    """
+    cmd = ["uv", "sync"]
+    env = os.environ.copy()
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        # We're inside a venv per sys.prefix. OVERWRITE VIRTUAL_ENV
+        # (not ``setdefault``) so a stale or mismatched inherited
+        # value can't redirect uv to a different env than the one
+        # owning the kestrel binary. Codex review round 3 P1 caught
+        # the setdefault footgun.
+        env["VIRTUAL_ENV"] = sys.prefix
+        cmd.append("--active")
+    elif env.get("VIRTUAL_ENV"):
+        # Not strictly in a venv per sys.prefix (e.g. system Python)
+        # but the operator has VIRTUAL_ENV set — honor it.
+        cmd.append("--active")
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        return 1, f"uv not available: {exc}"
     out = (result.stdout or "") + (result.stderr or "")
     return result.returncode, out
 
@@ -594,7 +670,7 @@ def cmd_update(args) -> int:
             print("• pull: skipped (source checkout has no .git)")
         else:
             try:
-                dirty = _git_working_tree_dirty(source_checkout)
+                dirty, dirty_summary = _git_working_tree_dirty(source_checkout)
             except _GitFailedError as exc:
                 print(
                     f"• pull: FAILED — git status errored ({exc}). "
@@ -604,10 +680,12 @@ def cmd_update(args) -> int:
                 return 1
             if dirty and not allow_dirty:
                 print(
-                    "• pull: REFUSED — working tree is dirty. "
-                    "Commit/stash first, or pass --allow-dirty.",
+                    "• pull: REFUSED — working tree has modified tracked "
+                    "files. Commit/stash first, or pass --allow-dirty.",
                     file=sys.stderr,
                 )
+                if dirty_summary:
+                    print(dirty_summary, file=sys.stderr)
                 return 2
             if dry_run:
                 print(
@@ -631,9 +709,22 @@ def cmd_update(args) -> int:
     else:
         print("• pull: skipped (--no-pull)")
 
-    # Step 2: uv pip install -e . against the source checkout.
-    # Can't editable-install from a non-source-checkout location, so
-    # skip with a clear note when running from a PyPI install.
+    # Step 2: refresh the install from the source checkout.
+    #
+    # Two flavors depending on the workflow:
+    #   - ``uv sync`` for editable + lockfile setups (the modern
+    #     uv-managed workflow). Refreshes the full env from uv.lock,
+    #     which also PRUNES anything not in the lock — that's why
+    #     ``kestrel feature sync`` runs immediately after, to restore
+    #     out-of-tree feature packages.
+    #   - ``uv pip install -e .`` for the simpler case where only the
+    #     kestrel-sovereign package needs reinstalling.
+    #
+    # Default: auto-detect by checking for ``uv.lock`` at the source
+    # root. ``--uv-sync`` / ``--no-uv-sync`` lets the operator pin
+    # explicitly. PyPI installs (no source checkout) skip the step
+    # entirely — there's no editable env to refresh.
+    explicit_uv_sync = getattr(args, "uv_sync", None)
     if install:
         if source_checkout is None:
             print(
@@ -642,33 +733,72 @@ def cmd_update(args) -> int:
                 "to update a PyPI install)"
             )
         else:
-            cmd_label = (
-                "uv pip install"
-                + (" --no-deps" if no_deps else "")
-                + " -e ."
-            )
-            if dry_run:
-                print(
-                    f"• install: would run `{cmd_label}` "
-                    f"in {source_checkout}"
-                )
+            if explicit_uv_sync is True:
+                use_uv_sync = True
+            elif explicit_uv_sync is False:
+                use_uv_sync = False
             else:
-                print(f"• install: {cmd_label} ({source_checkout})")
-                rc, out = _run_uv_pip_install_editable(
-                    source_checkout, no_deps=no_deps,
-                )
-                if rc != 0:
-                    print(out.rstrip(), file=sys.stderr)
+                # Auto-detect: an editable + uv.lock workflow uses
+                # `uv sync` to refresh deps.
+                use_uv_sync = (source_checkout / "uv.lock").exists()
+
+            if use_uv_sync:
+                cmd_label = "uv sync"
+                if dry_run:
                     print(
-                        "• install: FAILED — aborting before sync/restart.",
-                        file=sys.stderr,
+                        f"• install: would run `{cmd_label}` "
+                        f"(detected uv.lock) in {source_checkout}"
                     )
-                    return rc
-                tail = [
-                    ln for ln in out.rstrip().splitlines() if ln.strip()
-                ][-3:]
-                for line in tail:
-                    print(f"    {line}")
+                else:
+                    print(
+                        f"• install: {cmd_label} "
+                        f"(detected uv.lock) ({source_checkout})"
+                    )
+                    rc, out = _run_uv_sync(source_checkout)
+                    if rc != 0:
+                        print(out.rstrip(), file=sys.stderr)
+                        print(
+                            "• install: FAILED — aborting before "
+                            "sync/restart.",
+                            file=sys.stderr,
+                        )
+                        return rc
+                    tail = [
+                        ln for ln in out.rstrip().splitlines()
+                        if ln.strip()
+                    ][-3:]
+                    for line in tail:
+                        print(f"    {line}")
+            else:
+                cmd_label = (
+                    "uv pip install"
+                    + (" --no-deps" if no_deps else "")
+                    + " -e ."
+                )
+                if dry_run:
+                    print(
+                        f"• install: would run `{cmd_label}` "
+                        f"in {source_checkout}"
+                    )
+                else:
+                    print(f"• install: {cmd_label} ({source_checkout})")
+                    rc, out = _run_uv_pip_install_editable(
+                        source_checkout, no_deps=no_deps,
+                    )
+                    if rc != 0:
+                        print(out.rstrip(), file=sys.stderr)
+                        print(
+                            "• install: FAILED — aborting before "
+                            "sync/restart.",
+                            file=sys.stderr,
+                        )
+                        return rc
+                    tail = [
+                        ln for ln in out.rstrip().splitlines()
+                        if ln.strip()
+                    ][-3:]
+                    for line in tail:
+                        print(f"    {line}")
     else:
         print("• install: skipped (--no-install)")
 
@@ -2933,7 +3063,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_p.add_argument(
         "--no-deps", action="store_true",
-        help="Pass --no-deps to `uv pip install` (skip dependency resolution)",
+        help=(
+            "Pass --no-deps to `uv pip install` "
+            "(ignored when the install step resolves to `uv sync`)"
+        ),
+    )
+    # Tri-state: None = auto-detect by uv.lock presence; True = force
+    # ``uv sync``; False = force ``uv pip install -e .``. argparse's
+    # ``BooleanOptionalAction`` gives both ``--uv-sync`` and
+    # ``--no-uv-sync`` with a default of ``None`` so the auto-detect
+    # branch stays the implicit behaviour.
+    update_p.add_argument(
+        "--uv-sync", action=argparse.BooleanOptionalAction, default=None,
+        help=(
+            "Use `uv sync` (true) or `uv pip install -e .` (false) "
+            "for the install step. Default: auto-detect by uv.lock "
+            "presence."
+        ),
     )
     update_p.add_argument(
         "--continue-on-error", action="store_true",
