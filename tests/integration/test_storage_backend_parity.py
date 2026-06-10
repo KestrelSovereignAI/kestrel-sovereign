@@ -363,3 +363,53 @@ async def test_db_explorer_scopes_graph_nodes_by_properties_agent_id(db_backend)
     labels = {r["label"] for r in result["rows"]}
     assert labels == {"mine", "also-mine"}
     assert result["total_rows"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_db_explorer_scopes_graph_edges_via_node_membership(db_backend):
+    """#1651: graph_edges have no direct owner — an edge belongs to the agent
+    if it touches one of the agent's nodes. Exercises the two-subquery scope
+    and the [agent_id, agent_id] + search params ordering."""
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+    privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+    agent_id = f"did:test:{uuid4()}"
+    other = f"did:test:{uuid4()}"
+    a1, a2 = f"a1-{uuid4()}", f"a2-{uuid4()}"
+    b1, b2 = f"b1-{uuid4()}", f"b2-{uuid4()}"
+
+    await storage.db.execute_many(
+        "INSERT INTO graph_nodes (node_id, node_type, label, properties) VALUES (?, ?, ?, ?)",
+        [
+            (a1, "concept", "a1", json.dumps({"agent_id": agent_id})),
+            (a2, "concept", "a2", json.dumps({"agent_id": agent_id})),
+            (b1, "concept", "b1", json.dumps({"agent_id": other})),
+            (b2, "concept", "b2", json.dumps({"agent_id": other})),
+        ],
+    )
+    await storage.db.execute_many(
+        "INSERT INTO graph_edges (source_id, target_id, label, properties) VALUES (?, ?, ?, ?)",
+        [
+            (a1, a2, "mine_internal", "{}"),    # both endpoints A -> agent's
+            (b1, b2, "theirs_internal", "{}"),  # both endpoints B -> not agent's
+            (a1, b1, "mine_crosslink", "{}"),   # source is A's -> agent's
+        ],
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, storage=privacy_storage)
+    request = SimpleNamespace(state=SimpleNamespace(agent=agent))
+
+    result = await query_database_table(
+        request, "graph_edges", limit=50, offset=0, search=None
+    )
+    assert {r["label"] for r in result["rows"]} == {"mine_internal", "mine_crosslink"}
+    assert result["total_rows"] == 2
+
+    # Scope must AND with search: "theirs_internal" matches the term but is
+    # excluded by node membership — proving scope params precede search params.
+    searched = await query_database_table(
+        request, "graph_edges", limit=50, offset=0, search="internal"
+    )
+    assert {r["label"] for r in searched["rows"]} == {"mine_internal"}
