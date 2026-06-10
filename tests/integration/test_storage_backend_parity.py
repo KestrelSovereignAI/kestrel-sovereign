@@ -6,7 +6,12 @@ from uuid import uuid4
 
 import pytest
 
-from kestrel_sovereign.endpoints.database import _get_table_columns, _list_table_names
+from kestrel_sovereign.endpoints.database import (
+    _get_table_columns,
+    _list_table_names,
+    list_database_tables,
+    query_database_table,
+)
 from kestrel_sovereign.a2a.stores.unified import TaskStore
 from kestrel_sovereign.a2a.types import (
     Artifact,
@@ -238,3 +243,84 @@ async def test_webhook_registration_and_audit_history_are_backend_neutral(db_bac
     assert history.data["events"][0]["webhook_name"] == webhook_name
     assert history.data["events"][0]["authenticated"] is True
     assert history.data["events"][0]["payload_hash"] == "abc123"
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_db_explorer_scopes_rows_to_requesting_agent(db_backend):
+    """#1651: the /api/db/tables explorer must only return the requesting
+    agent's rows for agent-scoped tables, never another agent's data in a
+    shared multi-agent database — and the scope must survive a free-text
+    search."""
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+    privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+    agent_id = f"did:test:{uuid4()}"
+    other_agent_id = f"did:test:{uuid4()}"
+    start = datetime(2026, 4, 16, 12, 0, 0)
+
+    await storage.db.execute_many(
+        """
+        INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [
+            (agent_id, "user", "mine-1", "{}", start),
+            (agent_id, "assistant", "mine-2", "{}", start + timedelta(minutes=1)),
+            (other_agent_id, "user", "NOT-YOURS", "{}", start + timedelta(minutes=2)),
+        ],
+    )
+
+    agent = SimpleNamespace(agent_id=agent_id, storage=privacy_storage)
+    request = SimpleNamespace(state=SimpleNamespace(agent=agent))
+
+    result = await query_database_table(
+        request, "conversation_history", limit=50, offset=0, search=None
+    )
+    contents = {r["content"] for r in result["rows"]}
+    assert contents == {"mine-1", "mine-2"}
+    assert result["total_rows"] == 2
+    assert all(r["agent_id"] == agent_id for r in result["rows"])
+
+    # The agent scope must AND with search — the other agent's "NOT-YOURS"
+    # matches the term but must stay invisible.
+    searched = await query_database_table(
+        request, "conversation_history", limit=50, offset=0, search="YOURS"
+    )
+    assert searched["rows"] == []
+
+    # list_database_tables row counts are scoped too.
+    listing = await list_database_tables(request)
+    conv = next(t for t in listing["tables"] if t["name"] == "conversation_history")
+    assert conv["row_count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.dual_backend
+async def test_db_explorer_hides_agent_rows_in_ephemeral_mode(db_backend):
+    """#1651: for agent-scoped tables, EPHEMERAL/ISOLATED modes must not
+    surface persisted rows through the raw explorer."""
+    storage = AsyncStorage.from_backend(db_backend)
+    await storage.initialize()
+    privacy_storage = PrivacyEnforcingStorage(storage, PrivacyMode.NORMAL)
+
+    agent_id = f"did:test:{uuid4()}"
+    await storage.db.execute_many(
+        """
+        INSERT INTO conversation_history (agent_id, role, content, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        [(agent_id, "user", "secret", "{}", datetime(2026, 4, 16, 12, 0, 0))],
+    )
+
+    privacy_storage.set_privacy_mode(PrivacyMode.EPHEMERAL)
+    agent = SimpleNamespace(agent_id=agent_id, storage=privacy_storage)
+    request = SimpleNamespace(state=SimpleNamespace(agent=agent))
+
+    result = await query_database_table(
+        request, "conversation_history", limit=50, offset=0, search=None
+    )
+    assert result["rows"] == []
+    assert result["total_rows"] == 0
+    assert "privacy mode" in result.get("note", "").lower()

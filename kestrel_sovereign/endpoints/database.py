@@ -20,6 +20,18 @@ ALLOWED_TABLES = {
 }
 
 
+def _agent_scope_condition(column_names, agent_id):
+    """Return ``(condition, params)`` scoping a query to one agent, else ``(None, [])``.
+
+    Tables that carry an ``agent_id`` column (e.g. ``conversation_history``)
+    are shared across agents in a single database, so the explorer must never
+    surface another agent's rows. Tables without the column get no scope.
+    """
+    if agent_id is not None and "agent_id" in set(column_names):
+        return "agent_id = ?", [agent_id]
+    return None, []
+
+
 async def _list_table_names(db):
     """Return table names for the active backend."""
     if db.backend_type == "postgres":
@@ -81,6 +93,7 @@ async def list_database_tables(request: Request):
     try:
         agent = get_agent(request)
         storage = agent.storage
+        agent_id = getattr(agent, "agent_id", None)
 
         # Use async database query
         all_tables = await _list_table_names(storage.db)
@@ -92,20 +105,32 @@ async def list_database_tables(request: Request):
 
             try:
                 safe_name = safe_table_name(table_name)
-                count_row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {safe_name}")
-                row_count = count_row[0] if count_row else 0
             except ValueError:
                 logger.warning(f"Skipping table with invalid name: {table_name!r}")
                 continue
-            except Exception as e:
-                logger.warning(f"Failed to count rows in table {table_name}: {e}")
-                row_count = 0
 
             try:
                 columns = await _get_table_columns(storage.db, table_name)
             except Exception as e:
                 logger.warning(f"Failed to get columns for table {table_name}: {e}")
                 columns = []
+
+            # Scope the row count to this agent when the table carries an
+            # agent_id column, so a shared multi-agent DB doesn't report
+            # another agent's row totals through the explorer (#1651).
+            scope_cond, scope_params = _agent_scope_condition(
+                [c["name"] for c in columns], agent_id
+            )
+            where_clause = f"WHERE {scope_cond}" if scope_cond else ""
+            try:
+                count_row = await storage.db.fetchone(
+                    f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
+                    scope_params,
+                )
+                row_count = count_row[0] if count_row else 0
+            except Exception as e:
+                logger.warning(f"Failed to count rows in table {table_name}: {e}")
+                row_count = 0
 
             tables.append({
                 "name": table_name,
@@ -145,7 +170,13 @@ async def query_database_table(
     offset: int = Query(0, ge=0),
     search: str = None
 ):
-    """Read-only query of a specific table with pagination."""
+    """Read-only query of a specific table with pagination.
+
+    Scoped to the requesting agent: tables with an ``agent_id`` column only
+    return that agent's rows, and for those tables EPHEMERAL/ISOLATED privacy
+    modes return nothing (the persisted rows aren't part of the agent's
+    visible state). See #1651.
+    """
     if table_name not in ALLOWED_TABLES:
         raise HTTPException(
             status_code=403,
@@ -155,6 +186,7 @@ async def query_database_table(
     try:
         agent = get_agent(request)
         storage = agent.storage
+        agent_id = getattr(agent, "agent_id", None)
 
         # Validate table name for safe SQL interpolation (defense-in-depth;
         # ALLOWED_TABLES check above is the primary gate)
@@ -164,31 +196,52 @@ async def query_database_table(
         column_info = await _get_table_columns(storage.db, table_name)
         columns = [col["name"] for col in column_info]
 
+        scope_cond, scope_params = _agent_scope_condition(columns, agent_id)
+
+        # Privacy gate: the explorer reads the raw persistent DB directly,
+        # bypassing the privacy wrapper. For agent-scoped tables, EPHEMERAL
+        # and ISOLATED modes promise the persisted rows are not part of the
+        # agent's visible state, so don't surface them here either (#1651).
+        if scope_cond is not None:
+            pconf = getattr(storage, "privacy_config", None)
+            if pconf is not None and (pconf.is_ephemeral() or pconf.uses_temp_storage()):
+                return {
+                    "table": table_name,
+                    "columns": columns,
+                    "rows": [],
+                    "total_rows": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": False,
+                    "note": "Hidden in EPHEMERAL/ISOLATED privacy mode.",
+                }
+
+        # Compose the WHERE clause: agent scope (when applicable) AND the
+        # optional free-text search, sharing one ordered params list.
+        clauses = []
+        params = []
+        if scope_cond is not None:
+            clauses.append(scope_cond)
+            params.extend(scope_params)
         if search and len(search) >= 2:
-            search_conditions = []
-            for col in columns:
-                search_conditions.append(f"CAST({safe_column_name(col)} AS TEXT) LIKE ?")
-            where_clause = f"WHERE {' OR '.join(search_conditions)}"
-            search_params = [f"%{search}%"] * len(columns)
+            search_conditions = [
+                f"CAST({safe_column_name(col)} AS TEXT) LIKE ?" for col in columns
+            ]
+            clauses.append("(" + " OR ".join(search_conditions) + ")")
+            params.extend([f"%{search}%"] * len(columns))
 
-            count_row = await storage.db.fetchone(
-                f"SELECT COUNT(*) FROM {safe_name} {where_clause}",
-                search_params
-            )
-            total_rows = count_row[0] if count_row else 0
+        where_clause = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-            rows = await storage.db.fetchall(
-                f"SELECT * FROM {safe_name} {where_clause} LIMIT ? OFFSET ?",
-                search_params + [limit, offset]
-            )
-        else:
-            count_row = await storage.db.fetchone(f"SELECT COUNT(*) FROM {safe_name}")
-            total_rows = count_row[0] if count_row else 0
+        count_row = await storage.db.fetchone(
+            f"SELECT COUNT(*) FROM {safe_name} {where_clause}".strip(),
+            params,
+        )
+        total_rows = count_row[0] if count_row else 0
 
-            rows = await storage.db.fetchall(
-                f"SELECT * FROM {safe_name} LIMIT ? OFFSET ?",
-                (limit, offset)
-            )
+        rows = await storage.db.fetchall(
+            f"SELECT * FROM {safe_name} {where_clause} LIMIT ? OFFSET ?".strip(),
+            params + [limit, offset],
+        )
 
         rows = rows or []
 
