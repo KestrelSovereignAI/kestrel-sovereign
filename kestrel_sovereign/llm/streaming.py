@@ -20,6 +20,7 @@ injecting a ``[Provider X unavailable, trying next...]`` note into the
 chat stream where it corrupts the agent's response.
 """
 import logging
+import time
 from typing import Awaitable, Callable, List, Dict, Any, Optional, Union, Type, AsyncIterator
 
 from pydantic import BaseModel
@@ -161,6 +162,49 @@ class StreamingMixin:
         except (TypeError, AttributeError):
             pass
         return set()
+
+    async def _record_streamed_usage(
+        self,
+        response: Any,
+        model: str,
+        provider_name: str,
+        *,
+        duration_ms: int,
+    ) -> None:
+        """Meter a streamed turn from its terminal :class:`LLMResponse`.
+
+        The streaming path never reached ``_track_model_usage`` /
+        ``_log_llm_call`` (the non-streaming chokepoint), so every streamed
+        turn silently bypassed usage tracking and the billing meter. This
+        mirrors the non-streaming recording (service.py) from the terminal
+        response. Best-effort: a recording failure must never break the
+        stream the user is consuming.
+        """
+        if not isinstance(response, LLMResponse):
+            return
+        try:
+            input_tokens = response.input_tokens
+            output_tokens = response.output_tokens
+            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+            await self._track_model_usage(model, provider_name, tokens=total_tokens)
+            await self._log_llm_call(
+                provider=provider_name,
+                model=model,
+                duration_ms=duration_ms,
+                success=True,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=getattr(
+                    response, "cache_creation_input_tokens", None
+                ),
+                cache_read_input_tokens=getattr(
+                    response, "cache_read_input_tokens", None
+                ),
+                tools_used=bool(getattr(response, "tool_calls", None)),
+                metadata={"streamed": True},
+            )
+        except Exception as exc:  # noqa: BLE001 - metering must not break stream
+            logger.warning("Failed to record streamed usage: %s", exc)
 
     async def get_streaming_response(
         self,
@@ -593,20 +637,38 @@ class StreamingMixin:
                     if tool_executor is not None:
                         kwargs["tool_executor"] = tool_executor
 
-                    async for item in adapter.get_streaming_response_with_tools(
-                        client=provider["client"],
-                        model=model,
-                        messages=messages,
-                        tools=tools,
-                        **kwargs
-                    ):
-                        yield item
+                    # Meter the streamed turn from its terminal LLMResponse.
+                    # The `finally` records even if the consumer stops iterating
+                    # after the terminal response arrives. (A true mid-stream
+                    # abort, before the terminal response, still loses usage —
+                    # that needs adapter-level incremental token tracking,
+                    # tracked separately.)
+                    stream_start = time.monotonic()
+                    final_response = None
+                    try:
+                        async for item in adapter.get_streaming_response_with_tools(
+                            client=provider["client"],
+                            model=model,
+                            messages=messages,
+                            tools=tools,
+                            **kwargs
+                        ):
+                            if isinstance(item, LLMResponse):
+                                final_response = item
+                            yield item
+                    finally:
+                        if final_response is not None:
+                            await self._record_streamed_usage(
+                                final_response, model, provider_name,
+                                duration_ms=int((time.monotonic() - stream_start) * 1000),
+                            )
                     logger.info(f"Streaming with tools completed from {provider_name}")
                     return
                 else:
                     # Fallback: use non-streaming for tool detection, then stream text
                     logger.warning(f"{provider_name} doesn't support streaming with tools, using fallback")
                     if tools:
+                        fb_start = time.monotonic()
                         response = await adapter.get_response(
                             client=provider["client"],
                             model=model,
@@ -614,6 +676,12 @@ class StreamingMixin:
                             tools=tools,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
+                        )
+                        # adapter.get_response does not meter (only the service's
+                        # non-streaming path does), so record it here too.
+                        await self._record_streamed_usage(
+                            response, model, provider_name,
+                            duration_ms=int((time.monotonic() - fb_start) * 1000),
                         )
                         if response.has_tool_calls:
                             yield response
