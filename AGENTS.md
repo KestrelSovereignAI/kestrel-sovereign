@@ -105,6 +105,28 @@ GITHUB_HUMAN_REVIEWER=username    # Human for blocked issues (optional)
 
 ## Common Tasks
 
+### Refreshing your dev checkout
+
+After someone else lands a PR you need locally — or after your own PR merges and you want the agents to pick it up — run a single verb:
+
+```bash
+kestrel update                    # git pull + install + feature sync + restart all agents
+kestrel update Emma               # restart only one named agent
+kestrel update --dry-run          # preview; mutate nothing
+```
+
+What it actually does:
+
+1. `git pull --ff-only` in the source checkout (NOT `KESTREL_HOME`). Refuses on modified TRACKED files only — untracked `kestrel.toml.backup-*` etc. are ignored. `--allow-dirty` bypasses.
+2. Install step **auto-detects** by `uv.lock` presence:
+   - With `uv.lock` → `uv sync --active` (refreshes deps from lock + prunes anything not in it).
+   - Without `uv.lock` → `uv pip install --python sys.executable -e .`.
+   - Targets the venv that owns the running `kestrel` binary even under systemd/cron (`VIRTUAL_ENV` force-set from `sys.prefix`).
+3. `kestrel feature sync` restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` pruned.
+4. `kestrel restart` brings agents back so they see the new install.
+
+Any step's failure short-circuits the rest — a half-applied update never reaches the restart phase. Full reference in [`README.md` § Pulling in upstream changes](README.md#pulling-in-upstream-changes-kestrel-update).
+
 ### Adding a new endpoint
 1. Create handler in `endpoints/`
 2. Register in `server.py`

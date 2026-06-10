@@ -146,30 +146,51 @@ kestrel config ./agent_data/MyAgent  # Show agent config
 
 #### Pulling in upstream changes (`kestrel update`)
 
-Replaces the four-step ritual `git pull && uv sync && kestrel feature sync && kestrel restart` with one verb:
+The typical refresh-the-checkout loop is four commands:
+
+```bash
+git pull                               # new code from origin
+uv sync                                # refresh deps from uv.lock (PRUNES kestrel-feature-* packages)
+kestrel feature sync                   # restore the feature packages uv sync just pruned
+kestrel restart                        # bring agents back so they see the new install
+```
+
+`kestrel update` collapses that into one verb:
 
 ```bash
 kestrel update                       # pull + install + feature sync + restart all agents
 kestrel update Emma                  # same, but only restart the named agent
 kestrel update --dry-run             # preview the steps without mutating anything
 kestrel update --no-pull --no-install # only feature sync + restart (e.g. after a manual checkout)
-kestrel update --allow-dirty         # pull even with modified tracked files in the working tree
+kestrel update --allow-dirty         # pull even with modified TRACKED files in the working tree
 kestrel update --uv-sync             # force `uv sync` for the install step
 kestrel update --no-uv-sync          # force `uv pip install -e .` for the install step
 kestrel update --no-deps             # pass --no-deps to `uv pip install` for the fast path
 kestrel update --continue-on-error   # restart even if `feature sync` reports an error
 ```
 
-**Install step auto-detect.** When `uv.lock` exists at the source checkout root, the install step runs `uv sync` — that refreshes deps from the lockfile AND prunes packages not in it. That's why `kestrel feature sync` runs immediately after: it restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` just pruned. Without `uv.lock` present, the step falls back to `uv pip install -e .` which only reinstalls the project package. Force either with `--uv-sync` / `--no-uv-sync`.
+**Install step auto-detect.** When `uv.lock` exists at the source checkout root, the install step runs `uv sync --active` against the venv that owns the running `kestrel` binary (detected via `sys.prefix != sys.base_prefix`, so systemd / cron / direct-path invocations work too). That refreshes deps from the lockfile AND prunes packages not in it — which is precisely why `kestrel feature sync` runs immediately after, to restore any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` just pruned. Without `uv.lock` present, the step falls back to `uv pip install --python sys.executable -e .` which only reinstalls the project package. Force either branch with `--uv-sync` / `--no-uv-sync`.
 
-**Dirty-tree detection.** Only modified or staged **tracked** files block the pull. Untracked files (`kestrel.toml.backup-*`, scratch files, etc.) don't count — `git pull --ff-only` can't collide with files git doesn't know about. The refusal message surfaces the porcelain summary so you can see exactly what to commit/stash.
+**Dirty-tree detection.** Only modified or staged **tracked** files block the pull. Untracked files (`kestrel.toml.backup-*` written by `kestrel setup`, scratch files, etc.) don't count — `git pull --ff-only` can't collide with files git doesn't know about. The refusal message surfaces the porcelain summary so you can see exactly what to commit/stash.
 
-Safety:
+**Safety:**
 
 - `git pull --ff-only` so a non-fast-forward upstream aborts instead of producing a surprise merge.
-- Refuses to pull when the working tree has modified tracked files unless `--allow-dirty` is passed.
+- Refuses to pull when the working tree has modified TRACKED files unless `--allow-dirty` is passed.
 - Any step's failure short-circuits the rest, so a half-applied update never reaches the restart phase.
-- If `kestrel-sovereign` was installed from PyPI (no editable source checkout discoverable from the package's `__file__`), both `pull` AND `install` are silently skipped — `feature sync` and `restart` still run. Upgrade the package itself with `pip install --upgrade kestrel-sovereign` and then re-run `kestrel update` to pick up the new feature manifest and restart agents.
+- Source checkout and runtime data root (`KESTREL_HOME`) are resolved separately. The pull/install run against the source checkout (discovered by introspecting `kestrel_sovereign.__file__` — must have both `pyproject.toml` and `.git`). The runtime data root is used only for `feature sync`'s manifest lookup.
+
+**Pip-installed users** (no editable source checkout — `pip install kestrel-sovereign` against PyPI) — both pull AND install are silently skipped; `feature sync` and `restart` still run. Upgrade the package itself with `pip install --upgrade kestrel-sovereign` first, then run `kestrel update` to pick up new features + restart.
+
+**Bootstrap when your installed `kestrel update` is older than the fix you want.** If your CLI predates a `kestrel update` change you're trying to pull in, the old version may refuse on a dirty tree (early behaviour treated untracked files as dirty) or run the wrong install command. One-time bootstrap:
+
+```bash
+git pull && kestrel update          # explicit pull first, then the new code runs
+# or
+kestrel update --allow-dirty         # bypass the old refusal a single time
+```
+
+After the new code lands in your checkout, `kestrel update` alone handles subsequent refreshes.
 
 ### Feature management (`kestrel feature`)
 

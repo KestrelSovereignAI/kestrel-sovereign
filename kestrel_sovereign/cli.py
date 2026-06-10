@@ -3047,7 +3047,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_p.add_argument(
         "--no-install", dest="install", action="store_false",
-        help="Skip the `uv pip install -e .` step",
+        help=(
+            "Skip the install step "
+            "(`uv sync` or `uv pip install -e .` — auto-detected)"
+        ),
     )
     update_p.add_argument(
         "--no-features", dest="features", action="store_false",
@@ -3059,7 +3062,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_p.add_argument(
         "--allow-dirty", action="store_true",
-        help="Pull even when the working tree has uncommitted changes",
+        help=(
+            "Pull even when the working tree has modified TRACKED files. "
+            "Untracked files (e.g. kestrel.toml.backup-*) never block."
+        ),
     )
     update_p.add_argument(
         "--no-deps", action="store_true",
