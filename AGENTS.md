@@ -17,9 +17,9 @@ Kestrel Sovereign is a Constitutional AI Agent Framework with cryptographic iden
 ## Key Directories
 
 - `kestrel_sovereign/` - Main package
-- `endpoints/` - FastAPI route handlers
+- `kestrel_sovereign/endpoints/` - FastAPI route handlers (the repo-root `endpoints/` is a backward-compat shim — don't add handlers there)
 - `tests/` - Test suite (pytest)
-- `docker/` - Docker configurations (10 Dockerfile variants)
+- `docker/` - Docker configurations (13 Dockerfile variants under `docker/`; the repo also has root-level and devcontainer Dockerfiles)
 - `scripts/` - Utility scripts (Cloud Run build/deploy is now the `kestrel deploy` CLI; see `docs/deployment/README.md`)
 
 ## Running Tests
@@ -49,7 +49,7 @@ Run tests in order: Unit → Integration → E2E. Fix failures before moving up.
 
 ## Kestrel Talon (GitHub Issue Processor)
 
-Autonomous GitHub issue processing is handled by the standalone [`kestrel-talon`](https://github.com/KestrelSovereignAI/kestrel-talon) package. Installed as a dependency.
+Autonomous GitHub issue processing is handled by the standalone [`kestrel-talon`](https://github.com/KestrelSovereignAI/kestrel-talon) package. It is installed **independently** (out-of-tree) and is deliberately *not* a dependency of kestrel-sovereign — listing it would invert the open-core dependency direction (framework → feature instead of feature → framework; see the comment in `pyproject.toml`). Install it separately to use the `kestrel-talon` CLI shown below.
 
 ### Quick Start
 
@@ -95,6 +95,15 @@ the deployment primitive. Full runbook:
 [`docs/architecture/testing/TEST_EVIDENCE_GATES.md`](docs/architecture/testing/TEST_EVIDENCE_GATES.md).
 Verification layer: `kestrel_sovereign/features/talon/verification.py`.
 
+### Closing issues from a PR
+
+GitHub only auto-closes an issue when a closing keyword appears
+**immediately before each issue reference**. In a comma list the keyword
+binds to the *first* reference only — `Closes #12 (A), #13 (B)` closes
+**#12 and leaves #13 open**. Always repeat the keyword per issue:
+`Closes #12. Closes #13.` (A comma list silently stranded #1577/#1580 as
+open after they shipped in #1585.)
+
 ### Environment Variables
 
 ```bash
@@ -128,9 +137,12 @@ What it actually does:
 Any step's failure short-circuits the rest — a half-applied update never reaches the restart phase. Full reference in [`README.md` § Pulling in upstream changes](README.md#pulling-in-upstream-changes-kestrel-update).
 
 ### Adding a new endpoint
-1. Create handler in `endpoints/`
-2. Register in `server.py`
-3. Add tests in `tests/`
+1. Create the handler module in `kestrel_sovereign/endpoints/` (e.g. `mything.py`) exposing `router = APIRouter()`.
+2. Export it from `kestrel_sovereign/endpoints/__init__.py` (add `from .mything import router as mything_router` and append it to `__all__`).
+3. Wire it in `kestrel_sovereign/server.py`: add it to the `from kestrel_sovereign.endpoints import (...)` block and add `app.include_router(mything_router)`.
+4. Add tests in `tests/`.
+
+> The repo-root `endpoints/` and `server.py` are backward-compat shims — do **not** add code there; the canonical modules live under `kestrel_sovereign/`. Feature-contributed routers mount dynamically through the feature system rather than this manual path.
 
 ### Modifying agent behavior
 1. Check `kestrel_sovereign/agent.py`

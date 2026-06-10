@@ -620,12 +620,6 @@ class ModelDiscoveryMixin:
 
         return [m for m in models if m.is_featured and not m.is_hidden]
 
-    def set_default_model(self, model_id: str):
-        """Set the default model for this LLM service."""
-        if hasattr(self, 'default_model'):
-            self.default_model = model_id
-            logger.info(f"Default model set to: {model_id}")
-
     def clear_model_cache(self):
         """Clear the shared model cache to force rediscovery."""
         get_shared_model_cache().clear()
