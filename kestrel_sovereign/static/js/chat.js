@@ -729,6 +729,23 @@ function resolvePaneElement(paneElement) {
     return pane ? pane.element : null;
 }
 
+// Aux SSE renders (task notifications, A2A wakes, restart status) belong to the
+// agent the notification stream is bound to (notificationAgent) — NOT whatever
+// pane is mounted now. Pinning to the mounted pane leaked another agent's
+// wake/notification into the visible pane when the user switched agents
+// mid-turn. Fall back to the mounted pane when no stream agent is set
+// (single-agent hosts / pre-connect).
+function notificationPaneObject() {
+    if (notificationAgent != null) {
+        return deps().getOrCreateChatPane(notificationAgent) || resolvePaneObject();
+    }
+    return resolvePaneObject();
+}
+function notificationPaneElement() {
+    const pane = notificationPaneObject();
+    return pane ? pane.element : resolvePaneElement();
+}
+
 /**
  * Mount the named agent's pane into #chat-container, swapping out
  * whichever pane (if any) is currently mounted. Does NOT bump any
@@ -908,6 +925,11 @@ export function initChat() {
 
 let notificationEventSource = null;
 let notificationReconnectTimeout = null;
+// The agent the notification SSE stream is bound to, captured at connect time.
+// Aux renders (task notifications, A2A wakes, restart status) pin to THIS
+// agent's pane, not whatever is mounted now — otherwise switching agents
+// mid-turn leaks another agent's wake/notification into the visible pane.
+let notificationAgent = null;
 
 // Subscribers registered via subscribeSSE. Kept in module state (not attached
 // directly to notificationEventSource) so subscriptions survive reconnects —
@@ -962,6 +984,9 @@ export function connectNotifications() {
     try {
         const ssePath = deps().api.buildAgentUrl('/api/agent/notifications/sse');
         const sseUrl = apiKey ? `${ssePath}?api_key=${encodeURIComponent(apiKey)}` : ssePath;
+        // Pin aux renders to the agent this stream is for (captured here,
+        // not read at handler time — getHostAgent() changes on agent switch).
+        notificationAgent = deps().api.getHostAgent();
         notificationEventSource = new EventSource(sseUrl);
 
         notificationEventSource.addEventListener('connected', (e) => {
@@ -1114,7 +1139,7 @@ function showTaskNotification(message, type) {
     // Reset reconnect attempts on successful notification
     reconnectAttempts = 0;
 
-    const paneElement = resolvePaneElement();
+    const paneElement = notificationPaneElement();
     if (!paneElement) return;
 
     const div = document.createElement('div');
@@ -1204,7 +1229,7 @@ export async function handleSignalCompleted(payload) {
         renderedWakeSignalIds.add(sigId);
     }
 
-    const target = resolvePaneElement();
+    const target = notificationPaneElement();
     if (!target) return;
 
     const div = document.createElement('div');
@@ -1261,7 +1286,7 @@ export function handleRestartStatus(payload) {
     // Resolve both the pane element (where the bubble lands) and the
     // pane object (so we can detect an active assistant stream and
     // interrupt it cleanly — #1560 stream-boundary).
-    const paneObj = resolvePaneObject();
+    const paneObj = notificationPaneObject();
     const target = paneObj ? paneObj.element : resolvePaneElement();
     if (!target) return;
 
