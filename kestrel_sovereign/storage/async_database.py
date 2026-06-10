@@ -307,8 +307,9 @@ CREATE INDEX IF NOT EXISTS idx_sponsor_master_keys_provider ON sponsor_master_se
 
 -- Sponsor -> beneficiary (agent) roster: which sponsor funds which agent. A
 -- policy builder consults this to set PayerSpec(kind=SPONSOR, master_did=...)
--- for an enrolled agent. One funding sponsor per agent (per-agent model);
--- authority/consent for enrollment is a product concern, not enforced here.
+-- for an enrolled agent. One funding sponsor per agent (per-agent model).
+-- Authority/consent for enrollment is a product concern, not enforced here.
+-- (Schema comments must not contain a semicolon: _init_schema splits on it.)
 CREATE TABLE IF NOT EXISTS sponsor_beneficiaries (
     sponsor_did TEXT NOT NULL,
     agent_did TEXT NOT NULL,
