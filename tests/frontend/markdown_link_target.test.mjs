@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { JSDOM } from 'jsdom';
+import createDOMPurify from 'dompurify';
 
 // parse.js installs a custom marked renderer so every external link rendered
 // in chat carries target="_blank" rel="noopener noreferrer". The two
@@ -40,11 +42,17 @@ function loadParseModule() {
         },
     };
 
+    // parse.js now fails closed (escapes) without DOMPurify, so the sandbox
+    // supplies a real one — this exercises the production pipeline (link
+    // renderer + sanitizer) end to end. target survives via ADD_ATTR:['target']
+    // and rel is enforced by the afterSanitizeAttributes hook.
+    const { window } = new JSDOM('');
+    const DOMPurify = createDOMPurify(window);
     const factory = new Function(
-        'marked',
+        'marked', 'DOMPurify',
         `${parseSrc}\nreturn { renderMarkdown, renderStreamingMarkdown };`,
     );
-    return factory(marked);
+    return factory(marked, DOMPurify);
 }
 
 test('external markdown links get target="_blank" rel="noopener noreferrer"', () => {

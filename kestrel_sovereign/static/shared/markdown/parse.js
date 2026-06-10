@@ -14,6 +14,91 @@ function _escapeAttr(value) {
     }[ch]));
 }
 
+// ---------------------------------------------------------------------------
+// HTML sanitization (DOMPurify, hardened).
+//
+// The markdown stream is NOT trusted authorship: it carries web_search
+// results, tool output, and echoed user content, and frinz is multi-tenant.
+// So every HTML string produced by marked is run through DOMPurify before it
+// reaches innerHTML. Sanitizing the *string* here (not the live DOM) is the
+// right boundary: hljs spans and mermaid SVG are injected into the DOM AFTER
+// this step (highlightCodeBlocks / renderMermaidDiagrams), so they are never
+// stripped by the sanitizer.
+//
+// Hardening beyond DOMPurify's safe defaults (which already block <script>,
+// inline event handlers, and javascript: URLs):
+//   - allowDataImages:false  — drop data: image sources (exfil/HTML-smuggling)
+//   - force rel="noopener noreferrer" on every target="_blank" anchor, so the
+//     guarantee holds even for links DOMPurify keeps but our marked renderer
+//     didn't emit (e.g. raw <a> in the source).
+// ---------------------------------------------------------------------------
+const _SANITIZE_CONFIG = {
+    // Markdown only ever produces HTML — restrict to the HTML profile so the
+    // SVG and MathML namespaces are dropped entirely. That closes the whole
+    // class of SVG data-URI / script vectors (e.g. <svg><image href="data:…">)
+    // rather than chasing each sub-element. Mermaid renders its SVG into the
+    // DOM AFTER this step (renderMermaidDiagrams), so it is never sanitized
+    // here and is unaffected.
+    USE_PROFILES: { html: true },
+    // marked emits class="language-xxx" (hljs + mermaid detection rely on it);
+    // target is needed for external-link new-tab behavior.
+    ADD_ATTR: ['target'],
+    ALLOW_DATA_ATTR: false,
+    // Keep the contents of a removed tag (e.g. strip a stray <foo> but keep its
+    // text) rather than dropping the whole subtree.
+    KEEP_CONTENT: true,
+};
+
+let _purifyHooksInstalled = false;
+function _installPurifyHooks() {
+    if (_purifyHooksInstalled) return;
+    if (typeof DOMPurify === 'undefined' || typeof DOMPurify.addHook !== 'function') return;
+    DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+        const tag = node.tagName ? node.tagName.toLowerCase() : '';
+        // Block data: image sources (allowDataImages:false).
+        if (tag === 'img' || tag === 'source') {
+            const src = node.getAttribute('src') || '';
+            if (/^data:/i.test(src.trim())) node.removeAttribute('src');
+            const srcset = node.getAttribute('srcset') || '';
+            if (/data:/i.test(srcset)) node.removeAttribute('srcset');
+        }
+        // Any anchor opening a new tab must be reverse-tabnabbing safe. The
+        // _blank browsing-context keyword is case-insensitive, so normalize
+        // before comparing (target="_BLANK" must not slip through).
+        if (tag === 'a') {
+            const target = (node.getAttribute('target') || '').trim().toLowerCase();
+            if (target === '_blank') node.setAttribute('rel', 'noopener noreferrer');
+        }
+    });
+    _purifyHooksInstalled = true;
+}
+
+let _sanitizerWarned = false;
+/**
+ * Sanitize a rendered-HTML string before it is assigned to innerHTML.
+ *
+ * Fails CLOSED when DOMPurify is absent (CDN blocked, CSP, offline deploy, or
+ * the node test sandbox): rather than passing raw marked output to innerHTML —
+ * an XSS hole in exactly the failure mode where the sanitizer is missing — the
+ * HTML is escaped to inert text. A degraded-but-safe render beats executing
+ * `<img onerror=…>`. A one-time warning makes the missing sanitizer visible.
+ * @param {string} html - HTML produced by marked
+ * @returns {string} Sanitized HTML (or escaped text when no sanitizer is available)
+ */
+function sanitizeHtml(html) {
+    if (typeof DOMPurify === 'undefined' || typeof DOMPurify.sanitize !== 'function') {
+        if (!_sanitizerWarned) {
+            _sanitizerWarned = true;
+            if (typeof console !== 'undefined' && console.warn) {
+                console.warn('[SharedMarkdown] DOMPurify not loaded — failing closed, markdown shown as escaped text');
+            }
+        }
+        return _escapeAttr(html);
+    }
+    _installPurifyHooks();
+    return DOMPurify.sanitize(html, _SANITIZE_CONFIG);
+}
+
 // Configure marked once, on first load, to render external links with
 // target="_blank" rel="noopener noreferrer". In-page (#anchor) links keep
 // default behavior so internal jump links still work in the same view.
@@ -83,15 +168,15 @@ function renderMarkdown(text) {
 
     if (typeof marked !== 'undefined') {
         _installMarkedLinkRenderer();
-        return marked.parse(normalized, {
+        return sanitizeHtml(marked.parse(normalized, {
             breaks: true,
             gfm: true,
             headerIds: false,
             mangle: false
-        });
+        }));
     }
 
-    return normalized.replace(/\n/g, '<br>');
+    return sanitizeHtml(normalized.replace(/\n/g, '<br>'));
 }
 
 /**
@@ -102,7 +187,7 @@ function renderMarkdown(text) {
  */
 function renderStreamingMarkdown(content) {
     if (typeof marked === 'undefined') {
-        return normalizeNewlines(content).replace(/\n/g, '<br>');
+        return sanitizeHtml(normalizeNewlines(content).replace(/\n/g, '<br>'));
     }
 
     _installMarkedLinkRenderer();
@@ -143,13 +228,13 @@ function renderStreamingMarkdown(content) {
         // the stream ended. The catch-fallback below already preserves
         // line breaks via `\n` → `<br>`, so the no-`breaks` `try` path
         // was the inconsistent branch.
-        return marked.parse(processedContent, {
+        return sanitizeHtml(marked.parse(processedContent, {
             breaks: true,
             gfm: true,
             headerIds: false,
             mangle: false,
-        });
+        }));
     } catch (e) {
-        return content.replace(/\n/g, '<br>');
+        return sanitizeHtml(content.replace(/\n/g, '<br>'));
     }
 }
