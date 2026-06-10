@@ -313,20 +313,10 @@ app.add_middleware(
 
 
 # CORS middleware — added after auth so it runs outermost (before auth).
-# Uses same defaults as server.py. Override via KESTREL_CORS_ORIGINS env var.
-_DEFAULT_CORS_ORIGINS = [
-    "http://localhost:8080",
-    "http://127.0.0.1:8080",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:8888",
-    "http://127.0.0.1:8888",
-    "https://kestrelsovereignai.github.io",
-]
-_cors_env = os.environ.get("KESTREL_CORS_ORIGINS", "")
-CORS_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()] if _cors_env else _DEFAULT_CORS_ORIGINS
+# Shared origin builder (same defaults as server.py); rejects a wildcard
+# because credentialed CORS is on. See kestrel_sovereign.config.
+from kestrel_sovereign.config import build_cors_origins
+CORS_ORIGINS = build_cors_origins()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,

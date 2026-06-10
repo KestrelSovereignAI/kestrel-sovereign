@@ -362,9 +362,15 @@ class FilecoinAdapter:
                         has_balance = int(available_balance) > 0
                         if not has_balance:
                             continue
-                    except Exception:
-                        # If we can't check balance, assume it's OK
-                        pass
+                    except Exception as e:
+                        # Fail closed: if we can't verify the miner has funds,
+                        # treat it as unfit and skip it rather than letting an
+                        # unverified miner fall through as suitable. Log so the
+                        # exclusion is diagnosable.
+                        logging.warning(
+                            "Skipping miner %s: balance check failed (%s)", miner, e,
+                        )
+                        continue
 
                     # Calculate a score for this miner
                     # Higher score = better miner
@@ -402,11 +408,14 @@ class FilecoinAdapter:
                     continue
 
             if not suitable_miners:
-                logging.warning("No suitable miners found after filtering")
-                # Fallback: return first miner from list
-                if miners:
-                    logging.info(f"Falling back to first available miner: {miners[0]}")
-                    return miners[0]
+                # Fail closed: returning an unvetted fallback miner defeats the
+                # whole suitability filter. The caller treats None as "no
+                # suitable miner" and raises a clear error, so return None
+                # rather than a miner we couldn't verify (#1676).
+                logging.warning(
+                    "No suitable miner found after filtering — returning None "
+                    "(no unvetted fallback)."
+                )
                 return None
 
             # Sort by score (highest first)
@@ -423,15 +432,10 @@ class FilecoinAdapter:
             return best_miner['address']
 
         except Exception as e:
+            # Fail closed: on any error selecting a miner, return None so the
+            # caller surfaces "no suitable miner" rather than silently using an
+            # unvetted first-available miner (#1676).
             logging.error(f"Error finding miners: {e}")
-            # Graceful fallback: try to get first miner
-            try:
-                miners = self.lotus_client.StateListMiners()
-                if miners:
-                    logging.info(f"Falling back to first miner due to error: {miners[0]}")
-                    return miners[0]
-            except Exception:
-                pass
             return None
     
     def _store_local_cache(self, content_hash: str, content: bytes, metadata: Optional[Dict] = None):

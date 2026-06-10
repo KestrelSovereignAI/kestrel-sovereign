@@ -11,6 +11,48 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+# Default CORS origins for the console/API. Override via the comma-separated
+# KESTREL_CORS_ORIGINS env var. Shared by server.py and host.py so the
+# allowlist and the wildcard guard live in exactly one place.
+_DEFAULT_CORS_ORIGINS = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8888",
+    "http://127.0.0.1:8888",
+    "https://kestrelsovereignai.github.io",
+]
+
+
+def build_cors_origins() -> list:
+    """Resolve the CORS ``allow_origins`` list from ``KESTREL_CORS_ORIGINS``.
+
+    Rejects a wildcard at startup: the app always sends credentialed CORS
+    (``allow_credentials=True``), and browsers forbid a wildcard origin on
+    credentialed requests. So ``KESTREL_CORS_ORIGINS="*"`` does not "open"
+    CORS — it silently breaks credentialed cross-origin requests while making
+    the operator believe access was granted. Fail closed with an actionable
+    message instead of mis-securing quietly.
+    """
+    raw = os.environ.get("KESTREL_CORS_ORIGINS", "")
+    origins = (
+        [o.strip() for o in raw.split(",") if o.strip()]
+        if raw
+        else list(_DEFAULT_CORS_ORIGINS)
+    )
+    if "*" in origins:
+        raise RuntimeError(
+            'KESTREL_CORS_ORIGINS="*" cannot be combined with credentialed CORS '
+            "(the app sends allow_credentials=True). Browsers reject a wildcard "
+            "origin on credentialed requests. Set an explicit comma-separated "
+            "origin allowlist instead."
+        )
+    return origins
+
 # Mapping of legacy standalone config files to their unified kestrel.toml
 # section paths. Callers using load_config(file_name) get the unified path
 # transparently when kestrel.toml is present.

@@ -38,7 +38,14 @@ async def get_commands(request: Request) -> Dict[str, Any]:
     # Add feature commands from loaded features
     try:
         agent = get_agent(request)
-    except Exception:
+    except Exception as e:
+        # No resolvable agent — return just the built-ins, but log it: a
+        # silent drop of every feature command looks identical to "this agent
+        # has no feature commands", which masks a real wiring/auth problem.
+        logger.warning(
+            "Command discovery: could not resolve agent, returning built-ins only: %s",
+            e,
+        )
         return {
             "commands": commands,
             "count": len(commands),
