@@ -1333,12 +1333,18 @@ class AsyncConversationStore:
         # Falls back to full scan when no session_id is given.
         if session_id:
             # Match both `"session_id": "X"` and `"session_id":"X"` formats.
-            # Escape LIKE wildcards in session_id so a `%`/`_` in the id can't
-            # broaden the match; ESCAPE '\' makes the backslash literal (#1653).
-            # Backslash must be escaped first so the wildcards added below
-            # aren't doubled.
+            # The stored metadata is JSON, so the value appears JSON-escaped
+            # (e.g. a literal backslash is stored as `\\`); match against that
+            # exact form via json.dumps, then escape LIKE wildcards so a
+            # `%`/`_`/`\` in the id can't broaden the match. ESCAPE '\' makes
+            # the backslash the LIKE escape char (#1653). Order matters:
+            # JSON-escape first, then LIKE-escape (backslash first so the
+            # wildcards added after aren't doubled). For an ordinary UUID
+            # session id both passes are no-ops, so the common case is
+            # unchanged.
+            json_frag = json.dumps(session_id)[1:-1]
             esc = (
-                session_id.replace("\\", "\\\\")
+                json_frag.replace("\\", "\\\\")
                 .replace("%", "\\%")
                 .replace("_", "\\_")
             )

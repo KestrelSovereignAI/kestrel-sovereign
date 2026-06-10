@@ -450,3 +450,22 @@ async def test_search_history_escapes_like_wildcards_in_session_id():
     # %/_ are backslash-escaped in every metadata pattern.
     for p in patterns:
         assert "abc\\%\\_def" in p
+
+
+@pytest.mark.asyncio
+async def test_search_history_matches_json_escaped_backslash_in_session_id():
+    """#1653: a literal backslash in session_id is stored JSON-escaped (\\\\),
+    so the pattern must JSON-escape then LIKE-escape it — matching the stored
+    form rather than a single literal backslash."""
+    store, db = _make_store()
+    db.fetchall = AsyncMock(return_value=[])
+
+    await store.search_history("hi", session_id="a\\b")  # the id is a<backslash>b
+
+    _, params = db.fetchall.call_args[0]
+    patterns = [p for p in params if isinstance(p, str) and "session_id" in p]
+    assert patterns
+    # Stored JSON text is `a\\b`; with ESCAPE '\' the pattern fragment must be
+    # `a\\\\b` (each stored backslash LIKE-escaped) to match it.
+    for p in patterns:
+        assert "a\\\\\\\\b" in p
