@@ -267,6 +267,25 @@ CREATE TABLE IF NOT EXISTS host_service_keys (
 
 CREATE INDEX IF NOT EXISTS idx_host_service_keys_provider ON host_service_keys(provider_id);
 
+-- Per-user master credentials for the USER_MASTER_PROVISIONED payer-policy
+-- path: a named user's master account funds an agent, and the resolver mints
+-- a per-agent child against it (same shape as host_service_keys, but scoped
+-- per master_did = the funding user's DID). See
+-- kestrel_sovereign.security.user_master_key_storage.UserMasterKeyStorage.
+CREATE TABLE IF NOT EXISTS user_master_service_keys (
+    id TEXT PRIMARY KEY,
+    master_did TEXT NOT NULL,
+    provider_id TEXT NOT NULL,
+    encrypted_key TEXT NOT NULL,
+    key_hash TEXT NOT NULL,
+    is_active INTEGER DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(master_did, provider_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_master_keys_did ON user_master_service_keys(master_did);
+CREATE INDEX IF NOT EXISTS idx_user_master_keys_provider ON user_master_service_keys(provider_id);
+
 CREATE TABLE IF NOT EXISTS service_key_usage (
     id TEXT PRIMARY KEY,
     key_id TEXT NOT NULL,
