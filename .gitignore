@@ -151,6 +151,7 @@ kestrel_sovereign/runpod_config.toml
 vastai_config.toml
 kestrel_sovereign/vastai_config.toml
 kestrel.toml
+kestrel.toml.backup-*
 kestrel_sovereign/kestrel.toml
 scripts/talon_daemon.toml
 scripts/launchd/com.kestrel.workload-manager.plist

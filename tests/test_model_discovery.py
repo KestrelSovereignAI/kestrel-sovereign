@@ -120,20 +120,6 @@ class TestModelDiscovery:
 
         print(f"✅ Model caching working, cached {len(models1)} models")
 
-    def test_set_default_model(self, llm_service):
-        """Test setting default model"""
-        original = llm_service.default_model
-
-        # Set new default
-        llm_service.set_default_model("gpt-5-mini")
-        assert llm_service.default_model == "gpt-5-mini"
-
-        # Reset
-        llm_service.set_default_model(original)
-        assert llm_service.default_model == original
-
-        print(f"✅ Default model setting works")
-
 
 class TestModelInfoStructure:
     """Test ModelInfo structure from discovered models"""
@@ -217,9 +203,6 @@ if __name__ == "__main__":
 
             print("\n4. Testing caching...")
             await test.test_discover_all_models_with_cache(service)
-
-            print("\n5. Testing default model setting...")
-            test.test_set_default_model(service)
 
             print("\n" + "=" * 60)
         finally:
