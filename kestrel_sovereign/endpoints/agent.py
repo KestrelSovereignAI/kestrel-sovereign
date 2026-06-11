@@ -6,6 +6,7 @@ from typing import Optional
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 
@@ -1094,6 +1095,24 @@ async def list_tasks(
         raise HTTPException(status_code=500, detail="Error listing tasks.")
 
 
+def _a2a_did_resolver(agent):
+    """Return the DID resolver used to verify A2A sender signatures (#1673).
+
+    Resolution is injectable so the verification *policy* stays in the
+    envelope-signing module while the *topology* is the host's choice: a
+    resolver attached as ``agent.a2a_did_resolver`` maps a peer DID to its DID
+    document. The intended default is local same-host resolution (read peer
+    agents' on-disk DID documents — no network), with federated ``did:web`` as
+    an optional fetcher; neither is ever required. Until a host wires one,
+    ``None`` means signatures can't be resolved, so a signed envelope is
+    treated as unsigned unless ``KESTREL_A2A_REQUIRE_SIGNED`` is set — the
+    remaining infrastructure (a same-host DID registry of peer documents) is
+    tracked as follow-up; this endpoint activates verification with no change
+    once that resolver is attached.
+    """
+    return getattr(agent, "a2a_did_resolver", None)
+
+
 @router.post("/tasks/send")
 @limiter.limit("120/minute")
 async def send_task(request: Request):
@@ -1132,20 +1151,22 @@ async def send_task(request: Request):
     only the local agent's own code could call create_task — which made
     inter-agent A2A submission impossible to surface from a tool.
 
-    TODO (v2, separate epic): cryptographic sender verification. Today
-    we accept ``metadata["sender"]`` as a plain string claim — v1 trust
-    model is same-host shared-API-key boundary, where all callers are
-    inside the kestrel multi_agent host. For federation / cross-
-    environment agents (different orgs, different trust tiers), this
-    endpoint needs:
-      * Signed envelope: ``{sender_did, signature, body, timestamp}``
-        validated against the sender's DID public key.
-      * Reuse the SLH-DSA infrastructure from #921 (quantum hardening
-        already provisioned the keypair format + verification path).
-      * Identity-injection middleware: after verification, the cognition
-        turn fires with a system-context note ("Message from agent X,
-        verified DID Y") so the LLM applies the right governance tier.
-    See follow-up epic for the full peer-attribution layer.
+    Cryptographic sender verification (#1673): if the envelope carries a
+    ``metadata["signature"]`` block, it is verified against the sender's
+    resolved DID document via ``verify_inbound_envelope`` (hybrid Ed25519 +
+    ML-DSA-65, replay-windowed, DID-bound). A present-but-invalid signature is
+    always rejected; an unsigned envelope is allowed by default (the same-host
+    shared-API-key boundary still applies) unless ``KESTREL_A2A_REQUIRE_SIGNED``
+    is set. The verdict is recorded as ``metadata["sender_verified"]`` for
+    downstream governance tiering.
+
+    Remaining for full cross-host federation: the DID *resolver*
+    (``agent.a2a_did_resolver``) — a same-host registry of peer agents' DID
+    documents (local-first; federated ``did:web`` optional) — and sign-on-send,
+    which needs the sending agent's runtime keypair. Until the resolver is
+    attached, signed envelopes from unresolvable senders are treated as
+    unsigned. The richer identity-injection middleware (a system-context note
+    "verified message from agent X") builds on ``sender_verified``.
     """
     agent = get_agent(request)
     body = await _parse_json_body(request)
@@ -1221,6 +1242,44 @@ async def send_task(request: Request):
             status_code=400,
             detail="TaskSendParams.id and TaskSendParams.sessionId are required",
         )
+
+    # Cryptographic sender verification (#1673). If the envelope carries a
+    # ``metadata["signature"]`` block, verify it against the sender's resolved
+    # DID document — a present-but-invalid signature is ALWAYS rejected (an
+    # attack signal, never downgraded). Unsigned envelopes are allowed by
+    # default: the same-host shared-API-key boundary (this endpoint sits behind
+    # the host API-key middleware) still applies. Set
+    # ``KESTREL_A2A_REQUIRE_SIGNED=1`` to require a verified signature.
+    from kestrel_sovereign.a2a.envelope_signing import (
+        canonical_message,
+        verify_inbound_envelope,
+    )
+
+    require_signed = os.environ.get("KESTREL_A2A_REQUIRE_SIGNED", "").lower() in (
+        "1", "true", "yes",
+    )
+    # Structure-preserving message form (a JSON array of part texts, not a
+    # lossy join) and the AUTHORITATIVE top-level sessionId — both bound into
+    # the signature so neither the multipart structure nor the session can be
+    # swapped after signing.
+    signed_message_text = canonical_message([p.text for p in parts])
+    sender_verdict = await verify_inbound_envelope(
+        params.metadata,
+        task_id=params.id,
+        message=signed_message_text,
+        session_id=params.sessionId,
+        resolver=_a2a_did_resolver(agent),
+        require_signed=require_signed,
+    )
+    if not sender_verdict.ok:
+        raise HTTPException(
+            status_code=403,
+            detail=f"A2A sender verification failed: {sender_verdict.reason}",
+        )
+    # Record the outcome so downstream governance can apply the right trust
+    # tier (a cryptographically-verified peer vs. an unverified same-host
+    # claim). This is the seed of the identity-injection layer (#1673).
+    params.metadata["sender_verified"] = sender_verdict.verified
 
     # ``agent_name`` here is the local (recipient) agent's identifier —
     # the same value `create_task` logs as ``agent_name`` for the
