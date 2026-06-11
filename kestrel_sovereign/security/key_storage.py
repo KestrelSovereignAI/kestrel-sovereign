@@ -328,7 +328,10 @@ class SecureKeyStorage:
         key_path = self._get_key_path(key_id)
         with open(key_path, 'w', encoding='utf-8') as f:
             f.write(bundle.to_json())
-        
+        # Owner-only perms: even AES-256-GCM ciphertext + salt/KDF params
+        # should not be world/group-readable on a shared filesystem.
+        os.chmod(key_path, 0o600)
+
         logger.info(f"Saved encrypted private key: {key_path}")
         return key_path
     
@@ -397,6 +400,9 @@ class SecureKeyStorage:
         key_path = self._get_secret_bytes_path(key_id)
         with open(key_path, 'w', encoding='utf-8') as f:
             f.write(bundle.to_json())
+        # Owner-only perms (mirrors save_private_key): PQ secret-key ciphertext
+        # must not be world/group-readable on a shared filesystem.
+        os.chmod(key_path, 0o600)
         logger.info(f"Saved encrypted secret bytes: {key_path}")
         return key_path
 
