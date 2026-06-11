@@ -115,6 +115,13 @@ def _make_feature(
     dispatcher_enqueue = AsyncMock()
     agent.dispatcher = MagicMock()
     agent.dispatcher.enqueue_signal = dispatcher_enqueue
+    agent.tracked_background = []
+
+    def _track_bg(coro, *, name=""):
+        agent.tracked_background.append((coro, name))
+        coro.close()
+        return MagicMock()
+    agent._track_background_task = _track_bg
     feature.agent = agent
 
     if monkeypatch is not None:
@@ -254,6 +261,55 @@ class TestSupervisorHappyPath:
             "What is the capital of Italy?"
         )
         assert sent_signal.target_agent == "did:test:sender"
+
+    @pytest.mark.asyncio
+    async def test_terminal_enqueue_failure_restores_waiting_with_reply_payload(
+        self, monkeypatch,
+    ):
+        terminal_frame = json.dumps({
+            "id": "t-retry-answer",
+            "status": {
+                "state": "completed",
+                "message": {
+                    "parts": [{"type": "text", "text": "Preserve me"}],
+                },
+            },
+            "final": True,
+        })
+        feature, agent, enqueue, _ = _make_feature(
+            sse_responses=[
+                _FakeStreamResponse([
+                    "event: status",
+                    f"data: {terminal_frame}",
+                    "",
+                ])
+            ],
+            monkeypatch=monkeypatch,
+        )
+        agent.pending_a2a_questions.mark_waiting_for_retry = AsyncMock(
+            return_value=True,
+        )
+        enqueue.side_effect = RuntimeError("dispatcher down")
+
+        await feature._supervise_a2a_question(
+            task_id="t-retry-answer",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-retry-answer",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(minutes=5),
+            causation_chain=None,
+        )
+
+        agent.pending_a2a_questions.mark_resolved.assert_awaited_once_with(
+            "t-retry-answer",
+        )
+        agent.pending_a2a_questions.mark_waiting_for_retry.assert_awaited_once_with(
+            "t-retry-answer",
+            state="completed",
+            reply_text="Preserve me",
+        )
+        assert agent.tracked_background
+        assert "a2a_question_answered_retry" in agent.tracked_background[0][1]
 
     @pytest.mark.asyncio
     async def test_pre_terminal_then_terminal_only_fires_once(
@@ -452,6 +508,8 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
         agent.pending_a2a_questions.mark_waiting_for_retry.assert_awaited_once_with(
             "t-deadline-retry",
+            state="expired",
+            reply_text="",
         )
 
     @pytest.mark.asyncio

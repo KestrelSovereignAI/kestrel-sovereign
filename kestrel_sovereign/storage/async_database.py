@@ -425,6 +425,8 @@ CREATE TABLE IF NOT EXISTS pending_a2a_questions (
     status TEXT NOT NULL DEFAULT 'WAITING' CHECK (
         status IN ('WAITING', 'RESOLVED', 'EXPIRED')
     ),
+    retry_state TEXT,
+    retry_reply_text TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     resolved_at TIMESTAMP,
     PRIMARY KEY (agent_id, task_id)
@@ -592,6 +594,16 @@ class AsyncDatabase:
         # them on first read.
         await self._migrate_add_column(
             "conversation_history", "rendered_content", "TEXT DEFAULT NULL"
+        )
+        # #1710 follow-up: if a pending A2A question observes a terminal
+        # answer but fails to enqueue the local resumption signal, keep the
+        # terminal payload on the WAITING row so replay/sweeps can retry the
+        # actual answer rather than degrade it to an empty expiry.
+        await self._migrate_add_column(
+            "pending_a2a_questions", "retry_state", "TEXT DEFAULT NULL"
+        )
+        await self._migrate_add_column(
+            "pending_a2a_questions", "retry_reply_text", "TEXT DEFAULT NULL"
         )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(

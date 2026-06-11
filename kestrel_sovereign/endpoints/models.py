@@ -41,6 +41,10 @@ def _get_service_key_db(agent):
     return db
 
 
+def _service_key_storage_hidden(agent) -> bool:
+    return hides_persisted_user_content(agent)
+
+
 def _get_service_key_db_or_none(agent):
     if hides_persisted_user_content(agent):
         return None
@@ -570,7 +574,11 @@ async def get_keys(request: Request):
     """Get configured API keys (no secrets exposed)."""
     try:
         agent = get_agent(request)
-        db = _get_service_key_db(agent)
+        if _service_key_storage_hidden(agent):
+            raise HTTPException(status_code=403, detail=_key_storage_privacy_detail())
+        db = _get_service_key_db_or_none(agent)
+        if db is None:
+            return {"keys": [], "count": 0}
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
@@ -751,7 +759,11 @@ async def get_key_usage(request: Request, provider: str, days: int = Query(30, g
     """Get usage history for a specific API key."""
     try:
         agent = get_agent(request)
-        db = _get_service_key_db(agent)
+        if _service_key_storage_hidden(agent):
+            raise HTTPException(status_code=403, detail=_key_storage_privacy_detail())
+        db = _get_service_key_db_or_none(agent)
+        if db is None:
+            return {"usage": [], "count": 0, "provider": provider, "days": days}
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 

@@ -44,6 +44,8 @@ class PendingA2AQuestion:
     status: str  # WAITING | RESOLVED | EXPIRED
     created_at: str
     resolved_at: Optional[str]
+    retry_state: Optional[str] = None
+    retry_reply_text: Optional[str] = None
 
 
 class PendingA2AQuestionStore:
@@ -119,7 +121,8 @@ class PendingA2AQuestionStore:
             """
             SELECT task_id, recipient, original_question,
                    origin_turn_id, origin_session_id, deadline,
-                   status, created_at, resolved_at
+                   status, created_at, resolved_at,
+                   retry_state, retry_reply_text
             FROM pending_a2a_questions
             WHERE agent_id = ? AND task_id = ?
             """,
@@ -138,6 +141,8 @@ class PendingA2AQuestionStore:
             status=r[6],
             created_at=str(r[7]),
             resolved_at=str(r[8]) if r[8] else None,
+            retry_state=str(r[9]) if r[9] else None,
+            retry_reply_text=str(r[10]) if r[10] else None,
         )
 
     async def mark_resolved(self, task_id: str) -> bool:
@@ -159,7 +164,10 @@ class PendingA2AQuestionStore:
         rowcount = await self._db.execute(
             """
             UPDATE pending_a2a_questions
-            SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP
+            SET status = 'RESOLVED',
+                resolved_at = CURRENT_TIMESTAMP,
+                retry_state = NULL,
+                retry_reply_text = NULL
             WHERE agent_id = ? AND task_id = ? AND status = 'WAITING'
             """,
             (self._agent_id, task_id),
@@ -188,7 +196,8 @@ class PendingA2AQuestionStore:
             """
             SELECT task_id, recipient, original_question,
                    origin_turn_id, origin_session_id, deadline,
-                   status, created_at, resolved_at
+                   status, created_at, resolved_at,
+                   retry_state, retry_reply_text
             FROM pending_a2a_questions
             WHERE agent_id = ? AND status = 'WAITING' AND deadline < ?
             """,
@@ -205,28 +214,42 @@ class PendingA2AQuestionStore:
         rowcount = await self._db.execute(
             """
             UPDATE pending_a2a_questions
-            SET status = 'EXPIRED', resolved_at = CURRENT_TIMESTAMP
+            SET status = 'EXPIRED',
+                resolved_at = CURRENT_TIMESTAMP,
+                retry_state = NULL,
+                retry_reply_text = NULL
             WHERE agent_id = ? AND task_id = ? AND status = 'WAITING'
             """,
             (self._agent_id, task_id),
         )
         return rowcount > 0
 
-    async def mark_waiting_for_retry(self, task_id: str) -> bool:
+    async def mark_waiting_for_retry(
+        self,
+        task_id: str,
+        *,
+        state: Optional[str] = None,
+        reply_text: Optional[str] = None,
+    ) -> bool:
         """Restore a terminal row to WAITING after a dispatch failure.
 
         Callers that mark a question RESOLVED/EXPIRED before enqueueing the
         resumption signal must use this when enqueue fails. Otherwise the
-        terminal row disappears from startup replay/hourly sweep and the
-        asker is never woken.
+        terminal row disappears from startup replay/hourly sweep and the asker
+        is never woken. When the terminal payload is known, preserve it so a
+        later replay can wake the asker with the real answer instead of an
+        empty expiry.
         """
         rowcount = await self._db.execute(
             """
             UPDATE pending_a2a_questions
-            SET status = 'WAITING', resolved_at = NULL
+            SET status = 'WAITING',
+                resolved_at = NULL,
+                retry_state = ?,
+                retry_reply_text = ?
             WHERE agent_id = ? AND task_id = ? AND status IN ('RESOLVED', 'EXPIRED')
             """,
-            (self._agent_id, task_id),
+            (state, reply_text, self._agent_id, task_id),
         )
         return rowcount > 0
 
@@ -235,7 +258,8 @@ class PendingA2AQuestionStore:
             """
             SELECT task_id, recipient, original_question,
                    origin_turn_id, origin_session_id, deadline,
-                   status, created_at, resolved_at
+                   status, created_at, resolved_at,
+                   retry_state, retry_reply_text
             FROM pending_a2a_questions
             WHERE agent_id = ? AND status = ?
             """,
@@ -255,4 +279,6 @@ class PendingA2AQuestionStore:
             status=r[6],
             created_at=str(r[7]),
             resolved_at=str(r[8]) if r[8] else None,
+            retry_state=str(r[9]) if len(r) > 9 and r[9] else None,
+            retry_reply_text=str(r[10]) if len(r) > 10 and r[10] else None,
         )

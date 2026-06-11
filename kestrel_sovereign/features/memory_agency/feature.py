@@ -127,6 +127,12 @@ class MemoryAgencyFeature(Feature):
         self._db = resolve_feature_database(self.agent)
         return self._db
 
+    async def _ensure_override_db(self) -> Any:
+        db = self._resolve_override_db()
+        if db is not None:
+            await self._ensure_memory_pins_table()
+        return db
+
     async def _active_pin_count(self) -> int:
         """Return the number of currently active (non-released) pins."""
         db = await self._ensure_persistent_db()
@@ -500,7 +506,7 @@ class MemoryAgencyFeature(Feature):
         Returns:
             Number of pins overridden.
         """
-        db = self._resolve_override_db()
+        db = await self._ensure_override_db()
         if db is None:
             return 0
 
@@ -558,7 +564,7 @@ class MemoryAgencyFeature(Feature):
         Used by :meth:`sovereign_override_pins` to ensure the metadata flag
         is consistent with the pin record removal.
         """
-        db = db or self._resolve_override_db()
+        db = db or await self._ensure_override_db()
         if db is None:
             return
 
