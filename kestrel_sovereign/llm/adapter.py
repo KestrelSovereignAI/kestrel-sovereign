@@ -253,6 +253,15 @@ class LLMAdapter(_SDKLLMAdapter):
     their dependency surface minimal.
     """
 
+    #: Whether this adapter reports token usage *incrementally* during a
+    #: stream (not only in the terminal ``LLMResponse``). When True, the
+    #: service streaming path passes a ``usage_sink`` dict that the adapter
+    #: populates as usage events arrive, so a mid-stream abort/timeout can
+    #: still flush partial usage to the meter (#1684). Default False: most
+    #: providers only surface usage on the final chunk, where the terminal
+    #: ``LLMResponse`` already carries it.
+    supports_partial_usage_flush: bool = False
+
     def create_messages(
         self,
         user_prompt: Optional[str] = None,

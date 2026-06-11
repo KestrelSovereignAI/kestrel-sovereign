@@ -254,6 +254,11 @@ class AnthropicAdapter(LLMAdapter):
     The system prompt is passed separately, not in messages.
     """
 
+    # Anthropic surfaces input_tokens at message_start and output_tokens at
+    # message_delta — both before the terminal LLMResponse — so a mid-stream
+    # abort can still flush partial usage via the service's usage_sink (#1684).
+    supports_partial_usage_flush: bool = True
+
     def provider_capabilities(self) -> ProviderCapabilities:
         kwargs = {
             "supports_tools": True,
@@ -888,7 +893,7 @@ class AnthropicAdapter(LLMAdapter):
 
         Yields:
             str: Text content chunks as they arrive
-            LLMResponse: Final response with tool_calls (only at end if tools were called)
+            LLMResponse: Terminal response at end-of-stream carrying token usage (and tool_calls when present)
 
         Example:
             async for item in adapter.get_streaming_response_with_tools(...):
@@ -899,6 +904,10 @@ class AnthropicAdapter(LLMAdapter):
                         for tc in item.tool_calls:
                             result = execute_tool(tc)
         """
+        # Optional mutable dict the service passes so a mid-stream abort can
+        # still flush partial usage (#1684). Popped before building api_params
+        # so it is never forwarded to the Anthropic SDK.
+        usage_sink = kwargs.pop("usage_sink", None)
         try:
             filtered_messages, combined_system = self._convert_messages_to_anthropic(
                 messages,
@@ -959,11 +968,18 @@ class AnthropicAdapter(LLMAdapter):
                     if event_type == 'message_start':
                         if hasattr(event, 'message') and hasattr(event.message, 'usage'):
                             input_tokens = getattr(event.message.usage, 'input_tokens', None)
+                            if usage_sink is not None and input_tokens is not None:
+                                # Flush input usage immediately — Anthropic bills
+                                # input the moment the request is accepted, so an
+                                # abort after this must still record it (#1684).
+                                usage_sink["input_tokens"] = input_tokens
 
                     # Message delta - contains output token count at end
                     elif event_type == 'message_delta':
                         if hasattr(event, 'usage'):
                             output_tokens = getattr(event.usage, 'output_tokens', None)
+                            if usage_sink is not None and output_tokens is not None:
+                                usage_sink["output_tokens"] = output_tokens
 
                     # Content block start - marks beginning of text or tool_use block
                     elif event_type == 'content_block_start':

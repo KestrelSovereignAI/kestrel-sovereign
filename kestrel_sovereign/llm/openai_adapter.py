@@ -414,7 +414,7 @@ class OpenAIAdapter(LLMAdapter):
 
         Yields:
             str: Text content chunks as they arrive
-            LLMResponse: Final response with tool_calls (only at end if tools were called)
+            LLMResponse: Terminal response at end-of-stream carrying token usage (and tool_calls when present)
 
         Example:
             async for item in adapter.get_streaming_response_with_tools(...):
@@ -569,7 +569,8 @@ class OpenAIAdapter(LLMAdapter):
                     text_content += item
                 yield item
 
-            # If we have tool calls, yield a final LLMResponse with assembled tool calls
+            # Assemble any tool calls collected during the stream.
+            parsed_tool_calls = None
             if tool_calls_accumulator:
                 parsed_tool_calls = []
                 for idx in sorted(tool_calls_accumulator.keys()):
@@ -587,15 +588,24 @@ class OpenAIAdapter(LLMAdapter):
                         name=tc_data["name"],
                         arguments=args
                     ))
+                parsed_tool_calls = parsed_tool_calls or None
 
-                yield LLMResponse(
-                    content=text_content if text_content else None,
-                    tool_calls=parsed_tool_calls,
-                    raw={"reasoning_content": reasoning_content} if reasoning_content else None,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    total_tokens=total_tokens,
-                )
+            # Always emit a terminal LLMResponse carrying token usage, even for
+            # text-only turns. Previously this was nested under `if
+            # tool_calls_accumulator`, so text-only streams — the common case —
+            # dropped their usage entirely, a silent billing undercount. The
+            # service layer meters streamed turns from this terminal response;
+            # consumers read it only for tool_calls / usage (visible content was
+            # already streamed as chunks). Mirrors the anthropic adapter fix
+            # (#1686/#1684). OpenRouter inherits this via super() delegation.
+            yield LLMResponse(
+                content=text_content if text_content else None,
+                tool_calls=parsed_tool_calls,
+                raw={"reasoning_content": reasoning_content} if reasoning_content else None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
 
         except openai.RateLimitError as e:
             logger.error(f"OpenAI rate limit exceeded during streaming with tools: {e}")

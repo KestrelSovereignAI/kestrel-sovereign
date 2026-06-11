@@ -442,7 +442,7 @@ class VertexAIAdapter(LLMAdapter):
             logger.error(f"Vertex AI API error: {e}")
             raise
 
-    async def get_streaming_response(
+    async def _stream_with_usage(
         self,
         client: Any,
         model: str,
@@ -450,20 +450,15 @@ class VertexAIAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[str]:
-        """
-        Get streaming response from Vertex AI.
+    ) -> AsyncIterator[Union[str, LLMResponse]]:
+        """Stream text chunks then emit one terminal LLMResponse with usage.
 
-        Args:
-            client: The genai.Client instance
-            model: Model name
-            messages: Chat messages
-            tools: Optional tools
-            response_format: Optional Pydantic model for structured output
-            **kwargs: Additional parameters
-
-        Yields:
-            Text chunks as they arrive
+        Shared by :meth:`get_streaming_response` (which filters the terminal
+        response out to preserve its text-only contract) and the no-tools
+        branch of :meth:`get_streaming_response_with_tools` (which forwards it
+        so the service layer can meter streamed turns — #1684). Vertex sends
+        ``usage_metadata`` cumulatively across the stream; the latest non-empty
+        value carries the final counts.
         """
         try:
             # Use provided client or internal client
@@ -500,19 +495,70 @@ class VertexAIAdapter(LLMAdapter):
                 contents=filtered_messages,
                 config=config if config else None,
             )
+            text_content = ""
+            usage_meta = None
             async for chunk in stream:
+                if getattr(chunk, "usage_metadata", None):
+                    usage_meta = chunk.usage_metadata
                 if hasattr(chunk, 'text') and chunk.text:
+                    text_content += chunk.text
                     yield chunk.text
                 elif hasattr(chunk, 'candidates') and chunk.candidates:
                     for candidate in chunk.candidates:
                         if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
                             for part in candidate.content.parts:
                                 if hasattr(part, 'text') and part.text:
+                                    text_content += part.text
                                     yield part.text
+
+            input_tokens = output_tokens = total_tokens = None
+            if usage_meta is not None:
+                input_tokens = getattr(usage_meta, 'prompt_token_count', None)
+                output_tokens = getattr(usage_meta, 'candidates_token_count', None)
+                total_tokens = getattr(usage_meta, 'total_token_count', None)
+                if total_tokens is None and input_tokens is not None and output_tokens is not None:
+                    total_tokens = input_tokens + output_tokens
+            yield LLMResponse(
+                content=text_content if text_content else None,
+                tool_calls=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
 
         except Exception as e:
             logger.error(f"Vertex AI streaming error: {e}")
             raise
+
+    async def get_streaming_response(
+        self,
+        client: Any,
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        **kwargs
+    ) -> AsyncIterator[str]:
+        """
+        Get streaming response from Vertex AI (text-only contract).
+
+        Delegates to :meth:`_stream_with_usage` and drops the terminal
+        usage-bearing :class:`LLMResponse` so existing callers keep their
+        ``AsyncIterator[str]`` contract.
+
+        Yields:
+            Text chunks as they arrive
+        """
+        async for item in self._stream_with_usage(
+            client=client,
+            model=model,
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+            **kwargs
+        ):
+            if isinstance(item, str):
+                yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -544,7 +590,7 @@ class VertexAIAdapter(LLMAdapter):
 
         Yields:
             str: Text content chunks as they arrive
-            LLMResponse: Final response with tool_calls (only if tools were called)
+            LLMResponse: Terminal response at end-of-stream carrying token usage (and tool_calls when present)
         """
         try:
             logger.info(f"Starting Vertex AI stream with tools for model: {model}")
@@ -566,20 +612,26 @@ class VertexAIAdapter(LLMAdapter):
                     yield response
                     return
 
-                # No tool calls - yield the text content and we're done
+                # No tool calls - yield the text content, then a terminal
+                # LLMResponse carrying usage so the service layer meters this
+                # turn (#1684). `response` already holds token counts from the
+                # non-streaming probe; the terminal response is read only for
+                # usage (content was already streamed above).
                 if response.content:
                     yield response.content
+                yield response
                 return
 
-            # No tools - use regular streaming
-            async for chunk in self.get_streaming_response(
+            # No tools - stream text and forward the terminal usage response so
+            # the service layer meters text-only streamed turns (#1684).
+            async for item in self._stream_with_usage(
                 client=client,
                 model=model,
                 messages=messages,
                 response_format=response_format,
                 **kwargs
             ):
-                yield chunk
+                yield item
 
         except Exception as e:
             logger.error(f"Vertex AI streaming with tools failed: {e}")
