@@ -18,7 +18,6 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from kestrel_sovereign import cli
 # Non-patched constant — import directly. (``MultiAgentConfig`` itself is
 # referenced as ``cli.MultiAgentConfig`` because the test suite patches it.)
 from kestrel_sovereign.multi_agent.config import MULTI_AGENT_CONFIG_FILENAME
@@ -1086,3 +1085,12 @@ def add_feature_subparser(subparsers) -> None:
 
     feat_skills = feature_sub.add_parser("skills", help="List skills in a feature")
     feat_skills.add_argument("name", help="Feature or package name")
+
+
+# Imported at module bottom (not top) to break the cli <-> cli_features import
+# cycle: cli.py re-exports the public handlers above, so when this module is
+# imported first it must finish defining them before `cli` (which imports
+# them back) loads. Every `cli.<name>` reference above resolves at call time,
+# so binding `cli` here at end-of-module is safe.
+from kestrel_sovereign import cli  # noqa: E402
+
