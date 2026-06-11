@@ -197,6 +197,85 @@ class TestSQLiteBackend:
         assert count == 0
     
     @pytest.mark.asyncio
+    async def test_concurrent_autocommit_writes_all_persist(self, backend):
+        """#1675: concurrent autocommit writers on the shared connection must
+        each be an atomic write unit — no lost writes."""
+        import asyncio
+
+        await backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+
+        async def write(i):
+            await backend.execute("INSERT INTO t (id, v) VALUES (?, ?)", (i, f"v{i}"))
+
+        await asyncio.gather(*(write(i) for i in range(25)))
+        count = await backend.fetch_val("SELECT COUNT(*) FROM t")
+        assert count == 25
+
+    @pytest.mark.asyncio
+    async def test_concurrent_writer_waits_for_open_transaction(self, backend):
+        """#1675: a transaction is one atomic write unit — a concurrent
+        autocommit writer must wait for it to finish, not interleave into its
+        connection-scoped transaction (which a sibling rollback could discard)."""
+        import asyncio
+
+        await backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        in_txn = asyncio.Event()
+        release = asyncio.Event()
+
+        async def txn_task():
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t (id, v) VALUES (1, 'a')")
+                in_txn.set()
+                await release.wait()  # hold the transaction open
+
+        async def writer_task():
+            await in_txn.wait()
+            await backend.execute("INSERT INTO t (id, v) VALUES (2, 'b')")
+
+        t1 = asyncio.create_task(txn_task())
+        t2 = asyncio.create_task(writer_task())
+
+        await in_txn.wait()
+        await asyncio.sleep(0.05)  # give the writer a chance to (wrongly) proceed
+        # The writer is blocked on the write lock: only the transaction's own
+        # uncommitted row is visible on this connection.
+        mid = await backend.fetch_all("SELECT id FROM t ORDER BY id")
+        assert mid == [(1,)]
+
+        release.set()
+        await asyncio.gather(t1, t2)
+        final = await backend.fetch_all("SELECT id FROM t ORDER BY id")
+        assert final == [(1,), (2,)]
+
+    @pytest.mark.asyncio
+    async def test_canceled_transaction_rolls_back_and_frees_lock(self, backend):
+        """#1675: a transaction canceled mid-flight (CancelledError, a
+        BaseException) must roll back and release the write lock — not leak an
+        open transaction the next writer would inherit and commit."""
+        import asyncio
+
+        await backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        started = asyncio.Event()
+
+        async def txn_task():
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t (id) VALUES (1)")
+                started.set()
+                await asyncio.sleep(10)  # cancelled here, before commit
+
+        t = asyncio.create_task(txn_task())
+        await started.wait()
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+
+        # The canceled transaction's write was rolled back.
+        assert await backend.fetch_all("SELECT id FROM t") == []
+        # The lock was released, so a fresh writer proceeds.
+        await backend.execute("INSERT INTO t (id) VALUES (2)")
+        assert await backend.fetch_all("SELECT id FROM t") == [(2,)]
+
+    @pytest.mark.asyncio
     async def test_table_not_exists(self, backend):
         exists = await backend.table_exists("nonexistent")
         assert exists is False

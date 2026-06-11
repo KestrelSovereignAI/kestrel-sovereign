@@ -4,6 +4,7 @@ SQLite Database Backend
 Implementation of DatabaseBackend using aiosqlite.
 """
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -45,6 +46,16 @@ class SQLiteBackend(DatabaseBackend):
         self.db_path = db_path
         self._connection: Optional[aiosqlite.Connection] = None
         self._in_transaction = False
+        # Serializes write *units* on the single shared connection. aiosqlite
+        # serializes individual operations, but NOT the execute->commit/rollback
+        # pair: without this, two concurrent autocommit writers share one
+        # connection-scoped transaction, so one writer's failed rollback() can
+        # discard the other's uncommitted write (#1675). The lock makes each
+        # autocommit statement and each explicit transaction an atomic write
+        # unit. Re-entrant for the task that owns an open transaction (its own
+        # statements must not deadlock on the lock it already holds).
+        self._write_lock = asyncio.Lock()
+        self._txn_owner: Optional["asyncio.Task"] = None
     
     @property
     def backend_type(self) -> str:
@@ -100,36 +111,66 @@ class SQLiteBackend(DatabaseBackend):
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._connection
     
+    @asynccontextmanager
+    async def _write_guard(self) -> AsyncIterator[None]:
+        """Hold the connection write lock for one atomic write unit.
+
+        Re-entrant only for the task that owns an open transaction: that task's
+        own statements run under the lock it already holds (no deadlock), while
+        every other writer — autocommit or a different task — must acquire the
+        lock and therefore waits until the in-flight write unit completes.
+        """
+        if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
+            yield
+            return
+        async with self._write_lock:
+            yield
+
     async def execute(self, query: str, params: Params = ()) -> int:
         """Execute a write query."""
         record_write_query(query)
         conn = self._ensure_connected()
-        try:
-            cursor = await conn.execute(query, params)
-            if not self._in_transaction:
-                await conn.commit()
-            return cursor.rowcount
-        except Exception as e:
-            if not self._in_transaction:
-                await conn.rollback()
-            raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-    
+        async with self._write_guard():
+            try:
+                cursor = await conn.execute(query, params)
+                if not self._in_transaction:
+                    await conn.commit()
+                return cursor.rowcount
+            except Exception as e:
+                if not self._in_transaction:
+                    await conn.rollback()
+                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+            except BaseException:
+                # Cancellation (CancelledError is BaseException, not Exception):
+                # roll back the partial statement so the next writer to acquire
+                # the lock doesn't inherit — and commit — a canceled write, then
+                # propagate unchanged.
+                if not self._in_transaction:
+                    await conn.rollback()
+                raise
+
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
         if not params_list:
             return 0
         record_write_query(query)
         conn = self._ensure_connected()
-        try:
-            cursor = await conn.executemany(query, params_list)
-            if not self._in_transaction:
-                await conn.commit()
-            return cursor.rowcount
-        except Exception as e:
-            if not self._in_transaction:
-                await conn.rollback()
-            raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-    
+        async with self._write_guard():
+            try:
+                cursor = await conn.executemany(query, params_list)
+                if not self._in_transaction:
+                    await conn.commit()
+                return cursor.rowcount
+            except Exception as e:
+                if not self._in_transaction:
+                    await conn.rollback()
+                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+            except BaseException:
+                # See execute(): roll back a canceled partial write.
+                if not self._in_transaction:
+                    await conn.rollback()
+                raise
+
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
         record_write_query(query)
@@ -165,33 +206,55 @@ class SQLiteBackend(DatabaseBackend):
         """Execute a multi-statement SQL script."""
         record_write_script(script)
         conn = self._ensure_connected()
-        try:
-            await conn.executescript(script)
-            await conn.commit()
-        except Exception as e:
-            await conn.rollback()
-            raise QueryError(f"Script execution failed: {e}") from e
-    
+        async with self._write_guard():
+            try:
+                await conn.executescript(script)
+                if not self._in_transaction:
+                    await conn.commit()
+            except Exception as e:
+                if not self._in_transaction:
+                    await conn.rollback()
+                raise QueryError(f"Script execution failed: {e}") from e
+            except BaseException:
+                # See execute(): roll back a canceled partial script.
+                if not self._in_transaction:
+                    await conn.rollback()
+                raise
+
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
         """Transaction context manager."""
         conn = self._ensure_connected()
-        
-        if self._in_transaction:
-            # Nested transaction - just yield (SQLite doesn't support savepoints well)
+
+        if self._in_transaction and self._txn_owner is asyncio.current_task():
+            # Nested transaction in the SAME task — just yield (SQLite doesn't
+            # support savepoints well). A *different* task starting a
+            # transaction falls through and waits on the write lock below.
             yield
             return
-        
-        self._in_transaction = True
-        try:
-            await conn.execute("BEGIN")
-            yield
-            await conn.commit()
-        except Exception as e:
-            await conn.rollback()
-            raise TransactionError(f"Transaction failed: {e}") from e
-        finally:
-            self._in_transaction = False
+
+        # Hold the write lock for the whole BEGIN..COMMIT/ROLLBACK span so the
+        # transaction is one atomic write unit against concurrent writers
+        # sharing this connection (#1675).
+        async with self._write_lock:
+            self._in_transaction = True
+            self._txn_owner = asyncio.current_task()
+            try:
+                await conn.execute("BEGIN")
+                yield
+                await conn.commit()
+            except Exception as e:
+                await conn.rollback()
+                raise TransactionError(f"Transaction failed: {e}") from e
+            except BaseException:
+                # Cancellation mid-transaction: roll back so a partial
+                # transaction isn't left open for the next writer (which would
+                # otherwise commit it), then propagate unchanged.
+                await conn.rollback()
+                raise
+            finally:
+                self._in_transaction = False
+                self._txn_owner = None
     
     async def table_exists(self, table_name: str) -> bool:
         """Check if a table exists."""
