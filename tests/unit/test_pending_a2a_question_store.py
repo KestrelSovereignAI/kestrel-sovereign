@@ -100,6 +100,24 @@ async def test_mark_resolved_returns_false_for_unknown_task(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mark_waiting_for_retry_restores_terminal_row(tmp_path):
+    store = await _make_store(tmp_path)
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=10)
+    await store.insert(
+        task_id="task-retry", recipient="Meridian",
+        original_question="x", origin_turn_id=None, origin_session_id=None,
+        deadline=deadline,
+    )
+
+    assert await store.mark_resolved("task-retry") is True
+    assert await store.mark_waiting_for_retry("task-retry") is True
+
+    row = await store.get("task-retry")
+    assert row.status == "WAITING"
+    assert row.resolved_at is None
+
+
+@pytest.mark.asyncio
 async def test_list_waiting_excludes_terminal_rows(tmp_path):
     store = await _make_store(tmp_path)
     deadline = datetime.now(timezone.utc) + timedelta(minutes=10)

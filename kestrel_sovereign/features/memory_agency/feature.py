@@ -27,7 +27,10 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
@@ -63,14 +66,31 @@ class MemoryAgencyFeature(Feature):
     async def initialize(self):
         """Initialize the memory agency feature and create the memory_pins table."""
         self.storage = self.agent.storage
-        self._db = resolve_feature_database(self.agent)
-        if self._db is None:
-            raise RuntimeError("MemoryAgencyFeature requires database storage")
         self.agent_id = self.agent.did
 
         # Pin quota -- configurable per-instance, defaults to module constant
         self.pin_quota = PIN_QUOTA_DEFAULT
 
+        self._db = None
+        if hides_persisted_user_content(self.agent):
+            logger.info(
+                "MemoryAgencyFeature: persistent memory pin storage "
+                "unavailable in current privacy mode"
+            )
+            return
+
+        self._db = resolve_feature_database(self.agent)
+        if self._db is None:
+            raise RuntimeError("MemoryAgencyFeature requires database storage")
+
+        await self._ensure_memory_pins_table()
+
+        logger.info(
+            "MemoryAgencyFeature initialized for agent: %s...",
+            self.agent_id[:30] if self.agent_id else "(none)",
+        )
+
+    async def _ensure_memory_pins_table(self) -> None:
         # Create the memory_pins tracking table
         await self._db.execute(
             """CREATE TABLE IF NOT EXISTS memory_pins (
@@ -83,19 +103,37 @@ class MemoryAgencyFeature(Feature):
             )"""
         )
 
-        logger.info(
-            "MemoryAgencyFeature initialized for agent: %s...",
-            self.agent_id[:30] if self.agent_id else "(none)",
-        )
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
+    async def _ensure_persistent_db(self) -> Any:
+        if self._persistent_memory_hidden():
+            return None
+        if self._db is None:
+            self._db = resolve_feature_database(self.agent)
+            if self._db is not None:
+                await self._ensure_memory_pins_table()
+        return self._db
+
+    def _resolve_override_db(self) -> Any:
+        """Resolve raw DB for sovereign deletion/compliance cleanup.
+
+        Override paths remove or relax persistence constraints. They must work
+        even when the current privacy mode hides persisted user content.
+        """
+        if self._db is not None:
+            return self._db
+        self._db = resolve_feature_database(self.agent)
+        return self._db
+
     async def _active_pin_count(self) -> int:
         """Return the number of currently active (non-released) pins."""
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return 0
         return (
-            await self._db.fetchval(
+            await db.fetchval(
                 "SELECT COUNT(*) FROM memory_pins WHERE released_at IS NULL",
             )
             or 0
@@ -103,8 +141,11 @@ class MemoryAgencyFeature(Feature):
 
     async def _pin_ratio(self) -> float:
         """Return the ratio of pinned memories to total memories."""
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return 0.0
         total = (
-            await self._db.fetchval(
+            await db.fetchval(
                 "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
                 (self.agent_id,),
             )
@@ -129,6 +170,18 @@ class MemoryAgencyFeature(Feature):
             except (json.JSONDecodeError, TypeError):
                 return {}
         return {}
+
+    def _persistent_memory_hidden(self) -> bool:
+        return hides_persisted_user_content(self.agent)
+
+    def _privacy_unavailable_result(self) -> ToolResult:
+        return ToolResult.failed(
+            "Memory pinning is unavailable in the current privacy mode",
+            data={"privacy_mode_blocks_persistent_storage": True},
+        )
+
+    def _storage_unavailable_result(self) -> ToolResult:
+        return ToolResult.failed("Memory pinning requires database storage")
 
     # ------------------------------------------------------------------
     # Tools
@@ -158,7 +211,13 @@ class MemoryAgencyFeature(Feature):
                 f"message_id must be an integer, got {message_id!r}"
             )
 
-        db = self._db
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return (
+                self._privacy_unavailable_result()
+                if self._persistent_memory_hidden()
+                else self._storage_unavailable_result()
+            )
 
         # Quota enforcement (idempotent re-pin doesn't count).
         try:
@@ -298,7 +357,13 @@ class MemoryAgencyFeature(Feature):
                 f"message_id must be an integer, got {message_id!r}"
             )
 
-        db = self._db
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return (
+                self._privacy_unavailable_result()
+                if self._persistent_memory_hidden()
+                else self._storage_unavailable_result()
+            )
 
         try:
             row = await db.fetchone(
@@ -371,7 +436,13 @@ class MemoryAgencyFeature(Feature):
     )
     async def memory_pinned(self) -> ToolResult:
         """List all active (non-released) pinned memories."""
-        db = self._db
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return (
+                self._privacy_unavailable_result()
+                if self._persistent_memory_hidden()
+                else self._storage_unavailable_result()
+            )
 
         try:
             rows = await db.fetchall(
@@ -429,7 +500,9 @@ class MemoryAgencyFeature(Feature):
         Returns:
             Number of pins overridden.
         """
-        db = self._db
+        db = self._resolve_override_db()
+        if db is None:
+            return 0
 
         if message_ids:
             placeholders = ",".join("?" for _ in message_ids)
@@ -440,7 +513,7 @@ class MemoryAgencyFeature(Feature):
             )
             # Clear decay_protected flag on each message
             for mid in message_ids:
-                await self._clear_decay_protected(mid, agent_id)
+                await self._clear_decay_protected(mid, agent_id, db=db)
 
             logger.info(
                 "Sovereign override: cleared %d pin(s) for agent %s (reason=%s)",
@@ -472,14 +545,22 @@ class MemoryAgencyFeature(Feature):
             )
             return count
 
-    async def _clear_decay_protected(self, message_id: int, agent_id: str) -> None:
+    async def _clear_decay_protected(
+        self,
+        message_id: int,
+        agent_id: str,
+        *,
+        db: Any | None = None,
+    ) -> None:
         """
         Clear the ``decay_protected`` flag from a single message's metadata.
 
         Used by :meth:`sovereign_override_pins` to ensure the metadata flag
         is consistent with the pin record removal.
         """
-        db = self._db
+        db = db or self._resolve_override_db()
+        if db is None:
+            return
 
         row = await db.fetchone(
             "SELECT metadata FROM conversation_history WHERE id = ? AND agent_id = ?",
@@ -509,7 +590,13 @@ class MemoryAgencyFeature(Feature):
     )
     async def memory_pin_stats(self) -> ToolResult:
         """Return statistics about memory pinning activity."""
-        db = self._db
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return (
+                self._privacy_unavailable_result()
+                if self._persistent_memory_hidden()
+                else self._storage_unavailable_result()
+            )
 
         try:
             total_messages = await db.fetchval(
@@ -719,7 +806,13 @@ class MemoryAgencyFeature(Feature):
     )
     async def memory_admin_unpin_all(self) -> ToolResult:
         """Remove every active pin for the current agent."""
-        db = self._db
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return (
+                self._privacy_unavailable_result()
+                if self._persistent_memory_hidden()
+                else self._storage_unavailable_result()
+            )
         now = datetime.now(timezone.utc).isoformat()
 
         try:
@@ -817,7 +910,13 @@ class MemoryAgencyFeature(Feature):
         if count_val < 1:
             return ToolResult.failed("count must be >= 1")
 
-        db = self._db
+        db = await self._ensure_persistent_db()
+        if db is None:
+            return (
+                self._privacy_unavailable_result()
+                if self._persistent_memory_hidden()
+                else self._storage_unavailable_result()
+            )
         now = datetime.now(timezone.utc).isoformat()
 
         try:

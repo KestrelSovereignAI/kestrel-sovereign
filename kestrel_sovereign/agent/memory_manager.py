@@ -7,9 +7,14 @@ Extracted from ContextManager to improve modularity and maintainability.
 
 import html
 import logging
+from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import uuid
 
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 from kestrel_sovereign.security.input_guardrails import extract_raw_user_content
 
 if TYPE_CHECKING:
@@ -595,6 +600,12 @@ class MemoryManager:
         """
         import json
 
+        if hides_persisted_user_content(self.storage):
+            return {
+                "success": False,
+                "error": "Stash saving is unavailable in the current privacy mode",
+            }
+
         conv_store = self._get_conversation_store()
         if not conv_store:
             return {"success": False, "error": "Conversation store not available"}
@@ -643,7 +654,7 @@ class MemoryManager:
                 SavedItemsStore, SavedItemType, SourceType
             )
 
-            db = getattr(self.storage, 'db', None)
+            db = resolve_feature_database(SimpleNamespace(storage=self.storage))
             if not db:
                 return {"success": False, "error": "Database not available"}
 

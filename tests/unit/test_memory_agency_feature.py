@@ -46,7 +46,7 @@ class FakeDB:
 
         if sql_lower.startswith("update conversation_history"):
             # UPDATE conversation_history SET metadata = ? WHERE id = ?
-            meta_json, msg_id = params
+            meta_json, msg_id, *_ = params
             if msg_id in self.messages:
                 self.messages[msg_id]["metadata"] = meta_json
             return 1
@@ -73,6 +73,49 @@ class FakeDB:
 
         return 0
 
+    async def execute_commit(self, sql, params=()):
+        """Handle committed writes used by sovereign override cleanup."""
+        sql_lower = sql.strip().lower()
+
+        if sql_lower.startswith("delete from memory_pins"):
+            if "message_id in" in sql_lower:
+                agent_id, *message_ids = list(params)
+                before = len(self.pins)
+                self.pins = {
+                    pin_id: pin
+                    for pin_id, pin in self.pins.items()
+                    if not (
+                        pin["agent_id"] == agent_id
+                        and pin["message_id"] in message_ids
+                    )
+                }
+                return before - len(self.pins)
+
+            agent_id = params[0]
+            before = len(self.pins)
+            self.pins = {
+                pin_id: pin
+                for pin_id, pin in self.pins.items()
+                if not (
+                    pin["agent_id"] == agent_id
+                    and pin["released_at"] is None
+                )
+            }
+            return before - len(self.pins)
+
+        if sql_lower.startswith("update conversation_history"):
+            agent_id = params[0]
+            for msg in self.messages.values():
+                if msg["agent_id"] != agent_id:
+                    continue
+                metadata = json.loads(msg["metadata"])
+                if metadata.get("decay_protected"):
+                    metadata["decay_protected"] = False
+                    msg["metadata"] = json.dumps(metadata)
+            return 1
+
+        return await self.execute(sql, params)
+
     async def fetchone(self, sql, params=()):
         """Handle SELECT queries returning a single row."""
         sql_lower = sql.strip().lower()
@@ -85,6 +128,8 @@ class FakeDB:
             # Return columns based on SELECT clause
             if "content, metadata" in sql_lower and "id," in sql_lower:
                 return (msg["id"], msg["content"], msg["metadata"])
+            if sql_lower.startswith("select metadata"):
+                return (msg["metadata"],)
             if "metadata" in sql_lower:
                 return (msg["id"], msg["metadata"])
             return (msg["id"], msg["content"], msg["metadata"])
@@ -225,6 +270,51 @@ async def test_initialize_uses_raw_storage_without_touching_wrapper_db():
     await feature.initialize()
 
     assert feature._db is db
+
+
+@pytest.mark.asyncio
+async def test_memory_pin_refuses_privacy_hidden_mode_without_db_access():
+    """Runtime privacy changes must block persistent pin writes."""
+    from kestrel_sdk.tools.result import ToolResultStatus
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    db = FakeDB()
+    msg_id = db.add_message("Do not pin while hidden")
+    feature = _make_feature(db)
+    feature.agent.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+
+    result = await feature.memory_pin(message_id=msg_id, reason="private")
+
+    assert result.status is ToolResultStatus.ERROR
+    assert "privacy mode" in result.error
+    assert db.pins == {}
+    assert json.loads(db.messages[msg_id]["metadata"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_sovereign_override_still_clears_pins_in_privacy_hidden_mode():
+    """Privacy mode must not let pins resist sovereign cleanup."""
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    db = FakeDB()
+    msg_id = db.add_message("Pinned before privacy switch")
+    feature = _make_feature(db)
+
+    pin_result = await feature.memory_pin(message_id=msg_id, reason="cleanup")
+    assert pin_result.data["pinned"] is True
+    assert db.pins
+
+    feature.agent.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+
+    removed = await feature.sovereign_override_pins(
+        "test-agent",
+        message_ids=[msg_id],
+        reason="privacy_mode_change",
+    )
+
+    assert removed == 1
+    assert db.pins == {}
+    assert json.loads(db.messages[msg_id]["metadata"])["decay_protected"] is False
 
 
 @pytest.mark.asyncio

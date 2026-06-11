@@ -1438,7 +1438,7 @@ class PeersFeature(Feature):
                     # Someone else (hourly sweep that beat us by a tick)
                     # got there first — drop our duplicate signal.
                     return
-            await self._fire_question_answered_signal(
+            fired = await self._fire_question_answered_signal(
                 task_id=task_id,
                 recipient=recipient,
                 original_question=original_question,
@@ -1447,6 +1447,8 @@ class PeersFeature(Feature):
                 reply_text="",
                 causation_chain=causation_chain,
             )
+            if not fired and store is not None and was_waiting:
+                await self._restore_pending_question_waiting(task_id)
             return
 
         # Terminal: mark resolved + fire local signal. Resolve-first so
@@ -1474,7 +1476,7 @@ class PeersFeature(Feature):
                 )
                 return
 
-        await self._fire_question_answered_signal(
+        fired = await self._fire_question_answered_signal(
             task_id=task_id,
             recipient=recipient,
             original_question=original_question,
@@ -1483,6 +1485,8 @@ class PeersFeature(Feature):
             reply_text=reply_text,
             causation_chain=causation_chain,
         )
+        if not fired and store is not None and was_waiting:
+            await self._restore_pending_question_waiting(task_id)
 
     async def _fire_question_answered_signal(
         self,
@@ -1494,7 +1498,7 @@ class PeersFeature(Feature):
         state: str,
         reply_text: str,
         causation_chain: Optional[list],
-    ) -> None:
+    ) -> bool:
         """Build and enqueue the local ``a2a.question_answered`` signal.
 
         Factored out so the supervisor AND the future startup-replay /
@@ -1541,7 +1545,7 @@ class PeersFeature(Feature):
                 "agent has no dispatcher.",
                 task_id,
             )
-            return
+            return False
 
         try:
             target_agent = getattr(self.agent, "did", None) or self._own_name
@@ -1556,12 +1560,35 @@ class PeersFeature(Feature):
                 causation_chain=causation_chain,
             )
             await dispatcher.enqueue_signal(signal)
+            return True
         except Exception as e:
             logger.error(
                 "Failed to enqueue a2a.question_answered for task=%s "
                 "recipient=%s: %s",
                 task_id, recipient, e,
                 exc_info=True,
+            )
+            return False
+
+    async def _restore_pending_question_waiting(self, task_id: str) -> None:
+        """Return a pending question to WAITING so replay can retry wakeup."""
+        store = getattr(self.agent, "pending_a2a_questions", None)
+        if store is None or not hasattr(store, "mark_waiting_for_retry"):
+            return
+        try:
+            restored = await store.mark_waiting_for_retry(task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Failed to restore pending_a2a_question task=%s to WAITING "
+                "after signal enqueue failure: %s",
+                task_id, exc, exc_info=True,
+            )
+            return
+        if restored:
+            logger.warning(
+                "Restored pending_a2a_question task=%s to WAITING after "
+                "a2a.question_answered signal enqueue failure.",
+                task_id,
             )
 
     async def _iter_sse_events(self, response):
@@ -1813,7 +1840,7 @@ class PeersFeature(Feature):
         was_waiting = await store.mark_expired(row.task_id)
         if not was_waiting:
             return
-        await self._fire_question_answered_signal(
+        fired = await self._fire_question_answered_signal(
             task_id=row.task_id,
             recipient=row.recipient,
             original_question=row.original_question,
@@ -1822,6 +1849,8 @@ class PeersFeature(Feature):
             reply_text="",
             causation_chain=None,
         )
+        if not fired:
+            await self._restore_pending_question_waiting(row.task_id)
 
     @tool(
         name="send_a2a_task",

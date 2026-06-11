@@ -20,7 +20,10 @@ from typing import Any, Dict, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 from kestrel_sovereign.kestrel_config.constants import APPROVAL_TIMEOUT_DEFAULT
 from kestrel_sovereign.security.service_key_storage import (
     ServiceKeyStorage,
@@ -56,8 +59,6 @@ class KeyManagementFeature(Feature):
         self._storage: Optional[ServiceKeyStorage] = None
         self._agent_did: Optional[str] = None
 
-        db = resolve_feature_database(self.agent)
-
         # Get agent DID - REQUIRED for key storage
         self._agent_did = self.agent.did
 
@@ -65,17 +66,43 @@ class KeyManagementFeature(Feature):
             logger.error("KeyManagementFeature: No agent DID available - key storage disabled")
             return
 
+        if hides_persisted_user_content(self.agent):
+            logger.info(
+                "KeyManagementFeature: persistent key storage unavailable "
+                "in current privacy mode"
+            )
+            return
+
+        self._ensure_storage()
+
+    def _ensure_storage(self) -> bool:
+        if self._storage is not None:
+            return True
+        if not self._agent_did:
+            return False
+        db = resolve_feature_database(self.agent)
         # Initialize storage (requires KESTREL_DATA_KEY)
         if db:
             try:
                 self._storage = ServiceKeyStorage(db, self._agent_did)
                 logger.info(f"KeyManagementFeature initialized for agent {self._agent_did[:30]}...")
+                return True
             except MasterKeyNotConfiguredError as e:
                 logger.warning(f"KeyManagementFeature: Secure storage not available: {e}")
             except ValueError as e:
                 logger.error(f"KeyManagementFeature: Invalid configuration: {e}")
         else:
             logger.warning("KeyManagementFeature: Database not available")
+        return False
+
+    def _persistent_key_storage_hidden(self) -> bool:
+        return hides_persisted_user_content(self.agent)
+
+    def _privacy_unavailable_result(self) -> ToolResult:
+        return ToolResult.failed(
+            "Service key storage is unavailable in the current privacy mode",
+            data={"privacy_mode_blocks_persistent_storage": True},
+        )
 
     # =========================================================================
     # Key Management Tools
@@ -104,7 +131,10 @@ class KeyManagementFeature(Feature):
             api_key: The API key to store (will be encrypted)
             quota_limit: Optional usage limit
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return self._privacy_unavailable_result()
+
+        if not self._ensure_storage():
             return ToolResult.failed(
                 "Key storage not available - check KESTREL_DATA_KEY and agent DID",
             )
@@ -155,7 +185,10 @@ class KeyManagementFeature(Feature):
         - Quota usage
         - Active status
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return self._privacy_unavailable_result()
+
+        if not self._ensure_storage():
             return ToolResult.failed(
                 "Key storage not available - check KESTREL_DATA_KEY and agent DID",
             )
@@ -207,7 +240,10 @@ class KeyManagementFeature(Feature):
             provider: Service provider
             days: Number of days to look back (default: 30)
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return self._privacy_unavailable_result()
+
+        if not self._ensure_storage():
             return ToolResult.failed(
                 "Key storage not available - check KESTREL_DATA_KEY and agent DID",
             )
@@ -277,7 +313,10 @@ class KeyManagementFeature(Feature):
         Args:
             provider: Service provider to remove key for
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return self._privacy_unavailable_result()
+
+        if not self._ensure_storage():
             return ToolResult.failed(
                 "Key storage not available - check KESTREL_DATA_KEY and agent DID",
             )
@@ -319,7 +358,10 @@ class KeyManagementFeature(Feature):
         Args:
             provider: Service provider to delete key for
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return self._privacy_unavailable_result()
+
+        if not self._ensure_storage():
             return ToolResult.failed(
                 "Key storage not available - check KESTREL_DATA_KEY and agent DID",
             )
@@ -364,7 +406,10 @@ class KeyManagementFeature(Feature):
             provider: Service provider
             new_api_key: The new API key
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return self._privacy_unavailable_result()
+
+        if not self._ensure_storage():
             return ToolResult.failed(
                 "Key storage not available - check KESTREL_DATA_KEY and agent DID",
             )
@@ -485,7 +530,10 @@ class KeyManagementFeature(Feature):
         Returns:
             Decrypted API key or None if not configured
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return None
+
+        if not self._ensure_storage():
             return None
 
         try:
@@ -506,7 +554,10 @@ class KeyManagementFeature(Feature):
         Returns:
             True if key exists and is active
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return False
+
+        if not self._ensure_storage():
             return False
 
         try:
@@ -534,7 +585,10 @@ class KeyManagementFeature(Feature):
         Returns:
             True if operation allowed, False if quota exceeded
         """
-        if not self._storage:
+        if self._persistent_key_storage_hidden():
+            return True
+
+        if not self._ensure_storage():
             return True  # No storage = no quota enforcement
 
         provider = provider.lower()
