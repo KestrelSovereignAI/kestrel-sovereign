@@ -188,7 +188,7 @@ class ContextStats:
     queries for duplicate detection and token attribution by source.
 
     Designed to be attached to the agent instance and reset on session change
-    or context compression.
+    or context compaction.
     """
 
     def __init__(self):
@@ -204,7 +204,7 @@ class ContextStats:
             self.reset()
 
     def reset(self):
-        """Clear all accumulated stats. Call on session change or compression."""
+        """Clear all accumulated stats. Call on session change or compaction."""
         # List of recorded tool calls in dispatch order
         self._calls: List[Dict[str, Any]] = []
         # Set of normalized signatures for duplicate detection

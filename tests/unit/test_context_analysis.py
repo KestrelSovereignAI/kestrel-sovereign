@@ -7,7 +7,7 @@ Covers:
 - get_analysis() returns correct structure and values
 - Integration with ToolContextManager.get_status() (nested analysis key)
 - Integration with ContextManager.get_status() pass-through
-- Reset on compression
+- Reset on compaction
 """
 
 import os
@@ -293,11 +293,11 @@ class TestContextStatsIntegrationWithContextManager:
         assert call_kwargs.kwargs.get("context_stats") is stats
 
 
-class TestContextStatsResetOnCompression:
-    """Test that context stats reset when compression happens."""
+class TestContextStatsResetOnCompaction:
+    """Test that context stats reset when compaction happens."""
 
     @pytest.mark.asyncio
-    async def test_feature_compress_resets_stats(self):
+    async def test_feature_compact_resets_stats(self):
         from kestrel_sovereign.features.context.feature import ContextFeature
 
         # Build a mock agent with context_stats
@@ -309,9 +309,9 @@ class TestContextStatsResetOnCompression:
         feature = ContextFeature.__new__(ContextFeature)
         feature.agent = mock_agent
         feature.context_manager = AsyncMock()
-        feature.context_manager.compress_session = AsyncMock(return_value={
+        feature.context_manager.compact_session = AsyncMock(return_value={
             "success": True,
-            "messages_compressed": 5,
+            "messages_compacted": 5,
             "messages_preserved": 10,
             "tokens_saved": 500,
             "tokens_before": 1500,
@@ -319,15 +319,15 @@ class TestContextStatsResetOnCompression:
         })
         feature.llm_service = MagicMock()
 
-        # Before compression, stats has data
+        # Before compaction, stats has data
         assert stats.get_analysis()["total_tool_calls"] == 1
 
-        # Compress
-        result = await feature.compress_context(keep_recent=10)
+        # Compact
+        result = await feature.compact_context(keep_recent=10)
 
         from kestrel_sdk.tools.result import ToolResultStatus
         assert result.status is ToolResultStatus.OK
-        # After compression, stats should be reset
+        # After compaction, stats should be reset
         assert stats.get_analysis()["total_tool_calls"] == 0
 
 

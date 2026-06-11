@@ -1179,7 +1179,7 @@ class KestrelAgent(
             )
 
             # Context stats accumulator for duplicate detection / token attribution.
-            # Resets on session change or compression.
+            # Resets on session change or compaction.
             self.context_stats = ContextStats()
 
             # Initialize bootstrap service for first-time agent wake-up

@@ -15,8 +15,8 @@
 | MemoryMetadata | `storage/memory_models.py` | Data model for message metadata | Shared data contract |
 | MemoryEpisode | `storage/memory_models.py` | Data model for consolidated episodes | Shared data contract |
 | TemporalPattern | `storage/memory_models.py` | Data model for detected patterns | Shared data contract |
-| ConversationManager | `agent/conversation_manager.py` | History retrieval, filtering, compression, marking | Conversation operations |
-| MemoryManager | `agent/memory_manager.py` | Stash operations, episode triggers, hierarchical compression | Context parking |
+| ConversationManager | `agent/conversation_manager.py` | History retrieval, filtering, compaction, marking | Conversation operations |
+| MemoryManager | `agent/memory_manager.py` | Stash operations, episode triggers, hierarchical compaction | Context parking |
 | ContextManager | `agent/context_manager.py` | Orchestrator dispatching to ConversationManager + MemoryManager | Top-level orchestrator |
 | ContextBuilder | `agent/context_builder.py` | Assembles context window for LLM | Context assembly |
 

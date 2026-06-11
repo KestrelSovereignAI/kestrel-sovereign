@@ -1201,7 +1201,7 @@ Repo entry points and standard project files.
 - **docs/architecture/APPROVAL_PATHS.md** — Approval paths — Closes #1582.
 - **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — Kestrel Compute Feature - Architecture Design — ## Executive Summary
 - **docs/architecture/CONSTITUTION_INJECTION.md** — SignalDispatcher Constitutional Injection — Architecture Design — > Draft v1.
-- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C — Unify Auto-Prune With Durable Compression — > Auto-prune is a silent decision.
+- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C — Unify Auto-Prune With Durable Compaction — > Auto-prune is a silent decision.
 - **docs/architecture/CONTEXT_SYSTEM_DESIGN.md** — Kestrel Context System — Assessment & Redesign — > A context window is not a buffer you fill until it overflows.
 - **docs/architecture/DYNAMIC_TOOL_LOADING.md** — Dynamic Tool Loading — **Status:** Implemented **Author:** Design review **Date:** 2026-02-16 **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`, `kestrel_sovereign/prompts/syste…
 - **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
@@ -1609,8 +1609,8 @@ Repo entry points and standard project files.
   - `async def test_cache_prompt_reaches_wire_for_llama_cpp()`; `async def test_cache_prompt_absent_from_wire_for_other_vendors(vendor)`; `async def test_real_llama_server_accepts_cache_prompt()`
 - **tests/integration/test_codex_real.py** — Integration tests: CodexAdapter against the real ``codex app-server``.
   - `async def test_single_turn_text_real()`; `async def test_session_reuses_thread_real()`; `async def test_streaming_text_real()`; `async def test_tool_call_round_trip_real()`
-- **tests/integration/test_compress_e2e.py** — E2E Tests for Session Compression Functionality.
-  - `async def agent_with_messages(temp_dir)`; `async def agent_with_few_messages(temp_dir)`; `class TestCompressCommand`; `class TestCompressionCheckNeeded`; `class TestCompressionSession`; `class TestContextManagerNoLLM`
+- **tests/integration/test_compact_e2e.py** — E2E Tests for Session Compaction Functionality.
+  - `async def agent_with_messages(temp_dir)`; `async def agent_with_few_messages(temp_dir)`; `class TestCompactCommand`; `class TestCompactionCheckNeeded`; `class TestCompactionSession`; `class TestContextManagerNoLLM`
 - **tests/integration/test_compute_security_integration.py** — Integration tests for Compute + Security feature interaction.
   - `class MockAgent`; `def temp_db()`; `def mock_agent(temp_db)`; `async def compute_feature(mock_agent)`; `async def security_feature(mock_agent)`; `class TestHookRegistration`; `class TestScriptLifecycle`; `class TestSecurityAnalysis`; `…`
 - **tests/integration/test_computer_use_integration.py** — Real integration tests for ComputerUseFeature.
@@ -1973,7 +1973,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_constitutional_profile.py** — Unit tests for Constitutional Profile Service.
   - `def profile_service()`; `def test_load_profiles(profile_service)`; `def test_get_profile_anthropic(profile_service)`; `def test_get_profile_openai(profile_service)`; `def test_get_profile_ollama(profile_service)`; `def test_get_profile_unknown_provider(profile_service)`; `def test_get_profile_for_model(profile_service)`; `def test_get_state_of_mind(profile_service)`; `…`
 - **tests/unit/test_context_analysis.py** — Tests for context analysis: duplicate detection and token attribution by source.
-  - `class TestContextStatsBasic`; `class TestContextStatsNormalization`; `class TestContextStatsIntegrationWithToolContextManager`; `class TestContextStatsIntegrationWithContextManager`; `class TestContextStatsResetOnCompression`; `class TestContextFeatureLateBoundContextManager`; `class TestDispatchToolCallRecording`; `class TestContextStatsSessionReset`
+  - `class TestContextStatsBasic`; `class TestContextStatsNormalization`; `class TestContextStatsIntegrationWithToolContextManager`; `class TestContextStatsIntegrationWithContextManager`; `class TestContextStatsResetOnCompaction`; `class TestContextFeatureLateBoundContextManager`; `class TestDispatchToolCallRecording`; `class TestContextStatsSessionReset`
 - **tests/unit/test_context_breakdown_measurement.py** — Tests for ``ContextBuilder.measure_context_breakdown`` and friends.
   - `def mock_storage()`; `def builder(mock_storage)`; `def sample_episodes()`; `def short_history()`; `class TestCountToolSchemaTokens`; `class TestEpisodeGetFormatSplit`; `class TestMeasureContextBreakdown`; `class TestDriftGuard`; `…`
 - **tests/unit/test_context_builder.py** — Tests for the ContextBuilder module.
@@ -1983,7 +1983,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_context_dynamic_user_context.py** — Tests for the dynamic_user_context field on ContextResult (issue #703).
   - `async def test_system_prompt_stable_when_memory_and_rag_differ()`; `async def test_dynamic_user_context_wraps_memories_and_rag()`; `async def test_dynamic_user_context_empty_when_no_retrieval()`; `async def test_dynamic_user_context_memories_only_when_rag_empty()`; `async def test_dynamic_user_context_rag_only_when_memories_empty()`; `async def test_system_prompt_does_not_contain_memory_or_rag_markers()`; `async def test_reflection_guidance_stays_in_system_not_dynamic()`; `async def test_ephemeral_mode_dynamic_is_empty()`; `…`
 - **tests/unit/test_context_management.py** — Tests for the Context Management System.
-  - `class TestTokenCounter`; `class TestTokenBudget`; `class TestAdaptiveTokenBudget`; `class TestBM25Index`; `class TestTokenAllocation`; `class TestContextManagerIntegration`; `class TestSessionCompression`; `class TestAgentContextControl`; `…`
+  - `class TestTokenCounter`; `class TestTokenBudget`; `class TestAdaptiveTokenBudget`; `class TestBM25Index`; `class TestTokenAllocation`; `class TestContextManagerIntegration`; `class TestSessionCompaction`; `class TestAgentContextControl`; `…`
 - **tests/unit/test_context_manager_bootstrap_injection.py** — Regression test: system prompts sent via ContextManager actually contain the agent's bootstrap identity (SOUL.md).
   - `def test_context_manager_uses_injected_context_builder()`; `def test_context_manager_falls_back_when_no_injection()`; `async def test_system_prompt_contains_soul_content_when_injected()`; `def test_kestrel_agent_injects_its_own_context_builder()`
 - **tests/unit/test_continuation_store.py** — Unit tests for the continuation cursor store (#808 / #806).

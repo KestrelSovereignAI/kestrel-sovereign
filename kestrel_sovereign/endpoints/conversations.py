@@ -817,7 +817,7 @@ async def get_conversation_transcript(request: Request, session_id: str, decrypt
                 # Add metadata annotations if present
                 annotations = []
                 if meta:
-                    if meta.get('type') in ('compression', 'context_summary'):
+                    if meta.get('type') in ('compaction', 'context_summary'):
                         annotations.append(f"Type: {meta.get('type')}")
                     if meta.get('original_message_ids'):
                         orig_ids = meta.get('original_message_ids')

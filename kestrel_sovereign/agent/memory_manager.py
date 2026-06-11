@@ -28,7 +28,7 @@ class MemoryManager:
     1. Retrieve emotionally-weighted memories
     2. Episode creation and management
     3. Stash operations (context parking)
-    4. Hierarchical compression of messages
+    4. Hierarchical compaction of messages
     5. Memory-based context enrichment
     """
 
@@ -767,10 +767,10 @@ class MemoryManager:
         }
 
     # =========================================================================
-    # RLM-Inspired Hierarchical Compression
+    # RLM-Inspired Hierarchical Compaction
     # =========================================================================
 
-    async def hierarchical_compress(
+    async def hierarchical_compact(
         self,
         llm_service,
         counter,
@@ -779,13 +779,13 @@ class MemoryManager:
         max_depth: int = 3
     ) -> Dict[str, Any]:
         """
-        Hierarchical compression using RLM-style recursive summarization.
+        Hierarchical compaction using RLM-style recursive summarization.
 
-        Instead of flat linear compression, this:
+        Instead of flat linear compaction, this:
         1. Splits messages into chunks
         2. Recursively summarizes each chunk
         3. Merges summaries into higher-level summaries
-        4. Preserves more structure than flat compression
+        4. Preserves more structure than flat compaction
 
         This is inspired by the RLM paper's approach to handling long context
         through recursive sub-queries.
@@ -798,7 +798,7 @@ class MemoryManager:
             max_depth: Maximum recursion depth
 
         Returns:
-            Result dict with compression stats
+            Result dict with compaction stats
         """
         # Get conversation history
         history = []
@@ -811,39 +811,39 @@ class MemoryManager:
         if message_count <= preserve_recent + 3:
             return {
                 "success": False,
-                "reason": "Not enough messages to compress",
+                "reason": "Not enough messages to compact",
                 "message_count": message_count
             }
 
-        # Split into messages to compress vs preserve
-        to_compress = history[:-preserve_recent] if preserve_recent > 0 else history
+        # Split into messages to compact vs preserve
+        to_compact = history[:-preserve_recent] if preserve_recent > 0 else history
         to_preserve = history[-preserve_recent:] if preserve_recent > 0 else []
 
-        if len(to_compress) < 4:
+        if len(to_compact) < 4:
             return {
                 "success": False,
-                "reason": "Not enough older messages for hierarchical compression",
-                "message_count": len(to_compress)
+                "reason": "Not enough older messages for hierarchical compaction",
+                "message_count": len(to_compact)
             }
 
         # Count tokens before
         tokens_before = sum(
             counter.count(m.get("content", ""))
-            for m in to_compress
+            for m in to_compact
         )
 
         # Build text chunks
-        chunks = self._build_message_chunks(to_compress, chunk_size)
+        chunks = self._build_message_chunks(to_compact, chunk_size)
 
         if len(chunks) < 2:
-            # Fall back to regular compression - not implemented here, would need ConversationManager
+            # Fall back to regular compaction - not implemented here, would need ConversationManager
             return {
                 "success": False,
-                "reason": "Not enough chunks for hierarchical compression",
+                "reason": "Not enough chunks for hierarchical compaction",
                 "chunks_count": len(chunks)
             }
 
-        logger.info(f"Hierarchical compression: {len(to_compress)} messages → {len(chunks)} chunks")
+        logger.info(f"Hierarchical compaction: {len(to_compact)} messages → {len(chunks)} chunks")
 
         try:
             # Recursive summarization
@@ -857,18 +857,18 @@ class MemoryManager:
             tokens_after = counter.count(final_summary)
             tokens_saved = tokens_before - tokens_after
 
-            # Store compression result
+            # Store compaction result
             from datetime import datetime, timezone
-            compression_marker = {
+            compaction_marker = {
                 "role": "system",
-                "content": f"[HIERARCHICAL COMPRESSION - {len(to_compress)} messages, {len(chunks)} chunks]\n\n{final_summary}",
+                "content": f"[HIERARCHICAL COMPACTION - {len(to_compact)} messages, {len(chunks)} chunks]\n\n{final_summary}",
                 "metadata": {
-                    "type": "hierarchical_compression",
-                    "messages_compressed": len(to_compress),
+                    "type": "hierarchical_compaction",
+                    "messages_compacted": len(to_compact),
                     "chunks_processed": len(chunks),
                     "tokens_before": tokens_before,
                     "tokens_after": tokens_after,
-                    "compressed_at": datetime.now(timezone.utc).isoformat()
+                    "compacted_at": datetime.now(timezone.utc).isoformat()
                 }
             }
 
@@ -876,18 +876,18 @@ class MemoryManager:
             if conv_store:
                 await conv_store.add_conversation(
                     role="system",
-                    content=compression_marker["content"],
-                    metadata=compression_marker["metadata"]
+                    content=compaction_marker["content"],
+                    metadata=compaction_marker["metadata"]
                 )
 
             logger.info(
-                f"Hierarchical compression complete: {len(to_compress)} messages → summary, "
+                f"Hierarchical compaction complete: {len(to_compact)} messages → summary, "
                 f"saved {tokens_saved} tokens ({tokens_before} → {tokens_after})"
             )
 
             return {
                 "success": True,
-                "messages_compressed": len(to_compress),
+                "messages_compacted": len(to_compact),
                 "messages_preserved": len(to_preserve),
                 "chunks_processed": len(chunks),
                 "tokens_before": tokens_before,
@@ -897,13 +897,13 @@ class MemoryManager:
             }
 
         except (ConnectionError, TimeoutError) as e:
-            logger.error(f"Network error during hierarchical compression: {e}", exc_info=True)
+            logger.error(f"Network error during hierarchical compaction: {e}", exc_info=True)
             return {"success": False, "error": f"Network error: {str(e)}"}
         except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Data error during hierarchical compression: {e}", exc_info=True)
+            logger.error(f"Data error during hierarchical compaction: {e}", exc_info=True)
             return {"success": False, "error": f"Data error: {str(e)}"}
         except Exception as e:
-            logger.error(f"Hierarchical compression failed: {e}", exc_info=True)
+            logger.error(f"Hierarchical compaction failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     def _build_message_chunks(

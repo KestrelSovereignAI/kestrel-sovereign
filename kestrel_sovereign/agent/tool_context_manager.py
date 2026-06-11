@@ -126,7 +126,7 @@ class ToolContextManager:
             "total_used": history_tokens,
             "utilization_percent": round(total_utilization, 1),
             "history_utilization_percent": round(history_utilization, 1),
-            "compression_recommended": history_utilization >= 70.0,
+            "compaction_recommended": history_utilization >= 70.0,
             "allocations": {
                 "system": {
                     "budget": budget.system,

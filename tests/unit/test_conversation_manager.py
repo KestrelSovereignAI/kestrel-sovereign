@@ -1,7 +1,7 @@
 """
 Unit tests for ConversationManager.
 
-Tests conversation state management, history retrieval, compression,
+Tests conversation state management, history retrieval, compaction,
 and message operations with mocked AsyncStorage.
 """
 
@@ -48,7 +48,7 @@ class MockConversationStore:
         return result[-limit:]
 
     async def get_full_history(self) -> List[Dict]:
-        """Return all messages (unfiltered, for compression)."""
+        """Return all messages (unfiltered, for compaction)."""
         return self.messages.copy()
 
     async def get_full_history_with_ids(self) -> List[Dict]:
@@ -260,9 +260,9 @@ async def test_get_conversation_history_no_method(mock_storage):
 
 
 @pytest.mark.asyncio
-async def test_compress_session_success(conversation_manager, mock_storage, mock_llm, mock_counter, sample_messages):
-    """Test successful session compression."""
-    # Setup - need more messages for compression to trigger (preserve_recent + 5 threshold)
+async def test_compact_session_success(conversation_manager, mock_storage, mock_llm, mock_counter, sample_messages):
+    """Test successful session compaction."""
+    # Setup - need more messages for compaction to trigger (preserve_recent + 5 threshold)
     # Add more messages to sample_messages
     extended_messages = sample_messages.copy()
     for i in range(6, 16):  # Add 10 more messages
@@ -276,11 +276,11 @@ async def test_compress_session_success(conversation_manager, mock_storage, mock
 
     mock_storage.conversation.messages = extended_messages
 
-    # Mock the database fetchone for getting compression marker ID
+    # Mock the database fetchone for getting compaction marker ID
     mock_storage.conversation.db.fetchone = AsyncMock(return_value=(16,))
 
     # Execute
-    result = await conversation_manager.compress_session(
+    result = await conversation_manager.compact_session(
         llm_service=mock_llm,
         counter=mock_counter,
         preserve_recent=2,
@@ -289,7 +289,7 @@ async def test_compress_session_success(conversation_manager, mock_storage, mock
 
     # Assert
     assert result["success"] is True
-    assert result["messages_compressed"] == 13  # First 13 messages compressed (15 total - 2 preserved)
+    assert result["messages_compacted"] == 13  # First 13 messages compacted (15 total - 2 preserved)
     assert result["messages_preserved"] == 2  # Last 2 preserved
     assert "tokens_before" in result
     assert "tokens_after" in result
@@ -301,12 +301,12 @@ async def test_compress_session_success(conversation_manager, mock_storage, mock
 
     # Verify original messages were marked as excluded
     excluded = await mock_storage.conversation.get_excluded_messages()
-    assert len(excluded) == 13  # The 13 compressed messages
+    assert len(excluded) == 13  # The 13 compacted messages
 
 
 @pytest.mark.asyncio
-async def test_compress_session_not_enough_messages(conversation_manager, mock_llm, mock_counter):
-    """Test compression fails when not enough messages."""
+async def test_compact_session_not_enough_messages(conversation_manager, mock_llm, mock_counter):
+    """Test compaction fails when not enough messages."""
     # Setup - only 2 messages
     conversation_manager.storage.conversation.messages = [
         {"id": 1, "role": "user", "content": "Hi", "metadata": {}},
@@ -314,7 +314,7 @@ async def test_compress_session_not_enough_messages(conversation_manager, mock_l
     ]
 
     # Execute
-    result = await conversation_manager.compress_session(
+    result = await conversation_manager.compact_session(
         llm_service=mock_llm,
         counter=mock_counter,
         preserve_recent=10
@@ -326,8 +326,8 @@ async def test_compress_session_not_enough_messages(conversation_manager, mock_l
 
 
 @pytest.mark.asyncio
-async def test_compress_session_force(conversation_manager, mock_storage, mock_llm, mock_counter):
-    """Test forced compression even with few messages."""
+async def test_compact_session_force(conversation_manager, mock_storage, mock_llm, mock_counter):
+    """Test forced compaction even with few messages."""
     # Setup - just enough messages when forced
     mock_storage.conversation.messages = [
         {"id": 1, "role": "user", "content": "Message one", "metadata": {}},
@@ -338,7 +338,7 @@ async def test_compress_session_force(conversation_manager, mock_storage, mock_l
     mock_storage.conversation.db.fetchone = AsyncMock(return_value=(5,))
 
     # Execute with force=True
-    result = await conversation_manager.compress_session(
+    result = await conversation_manager.compact_session(
         llm_service=mock_llm,
         counter=mock_counter,
         preserve_recent=1,
@@ -347,12 +347,12 @@ async def test_compress_session_force(conversation_manager, mock_storage, mock_l
 
     # Assert
     assert result["success"] is True
-    assert result["messages_compressed"] == 3
+    assert result["messages_compacted"] == 3
 
 
 @pytest.mark.asyncio
-async def test_compress_session_llm_error(conversation_manager, mock_storage, mock_counter, sample_messages):
-    """Test compression handles LLM errors gracefully."""
+async def test_compact_session_llm_error(conversation_manager, mock_storage, mock_counter, sample_messages):
+    """Test compaction handles LLM errors gracefully."""
     # Setup - need enough messages to pass the threshold
     extended_messages = sample_messages.copy()
     for i in range(6, 16):
@@ -370,7 +370,7 @@ async def test_compress_session_llm_error(conversation_manager, mock_storage, mo
     mock_llm.generate = AsyncMock(side_effect=Exception("LLM API error"))
 
     # Execute
-    result = await conversation_manager.compress_session(
+    result = await conversation_manager.compact_session(
         llm_service=mock_llm,
         counter=mock_counter,
         preserve_recent=2
@@ -378,12 +378,12 @@ async def test_compress_session_llm_error(conversation_manager, mock_storage, mo
 
     # Assert
     assert result["success"] is False
-    assert "Compression failed" in result["reason"]
+    assert "Compaction failed" in result["reason"]
 
 
 @pytest.mark.asyncio
-async def test_check_compression_needed_over_threshold(conversation_manager, mock_storage, mock_counter, sample_messages):
-    """Test compression check when utilization is over threshold."""
+async def test_check_compaction_needed_over_threshold(conversation_manager, mock_storage, mock_counter, sample_messages):
+    """Test compaction check when utilization is over threshold."""
     # Setup
     mock_storage.conversation.messages = sample_messages.copy()
 
@@ -392,21 +392,21 @@ async def test_check_compression_needed_over_threshold(conversation_manager, moc
         mock_create_budget.return_value = MockTokenBudget(total_budget=10)  # Very small budget
 
         # Execute
-        result = await conversation_manager.check_compression_needed(
+        result = await conversation_manager.check_compaction_needed(
             counter=mock_counter,
             model="test-model",
             utilization_threshold=50.0
         )
 
     # Assert
-    assert result["compression_recommended"] is True
+    assert result["compaction_recommended"] is True
     assert result["utilization_percent"] > 50.0
     assert result["message_count"] == 5
 
 
 @pytest.mark.asyncio
-async def test_check_compression_needed_under_threshold(conversation_manager, mock_storage, mock_counter, sample_messages):
-    """Test compression check when utilization is under threshold."""
+async def test_check_compaction_needed_under_threshold(conversation_manager, mock_storage, mock_counter, sample_messages):
+    """Test compaction check when utilization is under threshold."""
     # Setup
     mock_storage.conversation.messages = sample_messages.copy()
 
@@ -415,14 +415,14 @@ async def test_check_compression_needed_under_threshold(conversation_manager, mo
         mock_create_budget.return_value = MockTokenBudget(total_budget=10000)  # Large budget
 
         # Execute
-        result = await conversation_manager.check_compression_needed(
+        result = await conversation_manager.check_compaction_needed(
             counter=mock_counter,
             model="test-model",
             utilization_threshold=70.0
         )
 
     # Assert
-    assert result["compression_recommended"] is False
+    assert result["compaction_recommended"] is False
     assert result["utilization_percent"] < 70.0
 
 

@@ -1,4 +1,4 @@
-# Context C — Unify Auto-Prune With Durable Compression
+# Context C — Unify Auto-Prune With Durable Compaction
 
 > Auto-prune is a silent decision. A fact in turn 47 — a constraint,
 > a decision, a number — was true to the model on turn 47 and gone
@@ -36,7 +36,7 @@
    - [State machine for a salvaged span](#state-machine-for-a-salvaged-span)
    - [Async summarization](#async-summarization)
    - [Interaction with episodes](#interaction-with-episodes)
-   - [Interaction with `!compress`](#interaction-with-compress)
+   - [Interaction with `!compact`](#interaction-with-compact)
    - [`restore_excluded` contract](#restore_excluded-contract)
 5. [UI surfacing (D's badge slots get real signals)](#ui-surfacing)
 6. [Performance budget](#performance-budget)
@@ -52,18 +52,18 @@
 
 Three uncoordinated mechanisms shape the context window today — auto-prune
 (transient + silent), additive episodes (emotionally gated), and manual
-`!compress` (durable fold). Only `!compress` produces a durable
+`!compact` (durable fold). Only `!compact` produces a durable
 restorable artifact; only auto-prune actually runs on every turn that
 needs it. The non-emotional but factually important content in old turns
 falls into the gap between them: episodes don't capture it (they require
 emotional salience), auto-prune drops it silently from the model view,
-and `!compress` is manual. The system has had the right machinery to
-salvage these turns since the original `compress_session` shipped — it
+and `!compact` is manual. The system has had the right machinery to
+salvage these turns since the original `compact_session` shipped — it
 just isn't wired into the prune path.
 
 **Tortoise framing.** Symptom: facts present in old turns are silently
 absent from the model on later turns. Disease: the prune path emits no
-durable artifact; episodes are gated on emotion; only manual `!compress`
+durable artifact; episodes are gated on emotion; only manual `!compact`
 folds. C unifies the three mechanisms onto one durable-salvage substrate.
 
 Emma's 2026-05-20 review made C **release-blocking** for any claim that
@@ -102,16 +102,16 @@ In both cases the per-row metadata stays untouched: no
 The `restore_excluded` tool ([`features/context/feature.py:537-593`](kestrel_sovereign/features/context/feature.py))
 finds nothing to restore — because nothing was marked.
 
-### What `compress_session` already does (the machinery we will reuse)
+### What `compact_session` already does (the machinery we will reuse)
 
-`ConversationManager.compress_session`
+`ConversationManager.compact_session`
 ([`conversation_manager.py:79-243`](kestrel_sovereign/agent/conversation_manager.py))
 already implements the durable-fold pattern:
 
 - LLM-summarises the older messages.
-- Writes a system row with `metadata.type = "compression"`,
+- Writes a system row with `metadata.type = "compaction"`,
   `original_message_ids`, `message_range: {first, last}`,
-  `tokens_before/after`, `compressed_at`.
+  `tokens_before/after`, `compacted_at`.
 - Marks originals with
   `{excluded_from_context: True, excluded_at, excluded_reason,
   summarized_into: <marker_id>}` via `update_messages_metadata`.
@@ -119,9 +119,9 @@ already implements the durable-fold pattern:
 `restore_excluded` flips `excluded_from_context` back to `False`. The
 contract is non-destructive, reversible, agent-reachable.
 
-The C design **does not invent a new compression mechanism**. It
+The C design **does not invent a new compaction mechanism**. It
 extracts the "what to do when bytes leave the model view"
-invariant from `compress_session` and applies it to the prune path
+invariant from `compact_session` and applies it to the prune path
 with one additional layer (sync salvage record) so the LLM call does
 not block on a summarization round trip.
 
@@ -186,7 +186,7 @@ Two consequences worth surfacing:
   latency is unchanged modulo a single small DB write.
 
 Emma's hardening invariant from her ack: **the UI never implies
-"compression saved this" when only a pointer-only-salvage exists.** D
+"compaction saved this" when only a pointer-only-salvage exists.** D
 already enforces this via the `silently-pruned path still active`
 auto-detect; once C ships, the auto-detect can read salvage_state
 per-span and surface accurate labels.
@@ -198,7 +198,7 @@ per-span and surface accurate labels.
 ### Sync salvage record
 
 A new metadata `type` on the existing `conversation_history` table —
-reusing the same shape `compress_session` uses, with one added
+reusing the same shape `compact_session` uses, with one added
 discriminator:
 
 ```python
@@ -206,11 +206,11 @@ salvage_marker = {
     "role": "system",
     "content": "",                       # filled in by async summary; empty for pointer-only
     "metadata": {
-        "type": "salvage",               # vs "compression" for manual !compress
+        "type": "salvage",               # vs "compaction" for manual !compact
         "salvage_state": "pointer-only", # "pending-summary" | "durable-folded" | "failed-fold"
         "salvage_reason": "auto-prune-pretrim" |
                           "auto-prune-postbudget" |
-                          "manual-compress" |    # !compress takes this path too post-C
+                          "manual-compact" |    # !compact takes this path too post-C
                           "session-end-fold",    # future hook
         "original_message_ids": [...],
         "message_range": {"first": <id>, "last": <id>},
@@ -246,7 +246,7 @@ Originals get the existing exclusion metadata:
   surface it for free.
 - `format_conversation_history` already skips `excluded_from_context`
   rows, so once a span is marked, it is gone from the next turn's
-  model view by the same path that handles `compress_session`
+  model view by the same path that handles `compact_session`
   outputs today.
 
 **Why not a separate `salvages` table:**
@@ -255,9 +255,9 @@ Originals get the existing exclusion metadata:
   point to a different table breaks `restore_excluded`'s lookup.
 
 The added discriminator (`metadata.type == "salvage"` vs
-`"compression"`) is what lets the popup distinguish the two — and lets
+`"compaction"`) is what lets the popup distinguish the two — and lets
 the async worker pick salvages to summarise without looking at manual
-compression markers.
+compaction markers.
 
 ### State machine for a salvaged span
 
@@ -293,7 +293,7 @@ compression markers.
 `restore_excluded(salvage_marker_id)` works in **every** state. It
 sets `excluded_from_context: False` on the originals and effectively
 demotes the salvage marker (the existing implementation already
-unwinds compression markers; the same code path applies). The salvage
+unwinds compaction markers; the same code path applies). The salvage
 marker row stays for audit.
 
 ### Async summarization
@@ -304,7 +304,7 @@ Rides on `SignalDispatcher`:
   payload={salvage_marker_id, session_id, model_at_salvage})` via
   `enqueue_signal` ([`signals/dispatcher.py:363`](kestrel_sovereign/signals/dispatcher.py)).
 - Handler: load originals via `original_message_ids`, run the same
-  summarization prompt `compress_session` uses
+  summarization prompt `compact_session` uses
   ([`conversation_manager.py:142-154`](kestrel_sovereign/agent/conversation_manager.py)),
   write the summary text to `salvage_marker.content`, flip
   `salvage_state` to `durable-folded`, increment `summary_attempts`,
@@ -324,7 +324,7 @@ worker is correct.
 
 **Model selection.** Summary uses the same model the salvage happened
 under (`model_at_salvage`). The summary prompt is the existing
-`compress_session` prompt verbatim — known-good, reviewed.
+`compact_session` prompt verbatim — known-good, reviewed.
 
 ### Interaction with episodes
 
@@ -359,15 +359,15 @@ episodes" row in D's popup keeps showing episode counts; the
 `durable-folded` badges show salvage state. Two orthogonal axes,
 both attributable to specific spans.
 
-### Interaction with `!compress`
+### Interaction with `!compact`
 
-`!compress` becomes a **tuning knob, not a safety mechanism.** Post-C,
-the prune path always salvages, so manual compression is no longer
+`!compact` becomes a **tuning knob, not a safety mechanism.** Post-C,
+the prune path always salvages, so manual compaction is no longer
 required to avoid silent loss. The command still works and still
 provides:
 
 - **Force**: salvage spans the auto-prune would not have touched yet
-  (e.g. user wants to compress at 50% utilization to keep the prefix
+  (e.g. user wants to compact at 50% utilization to keep the prefix
   smaller for cache stability).
 - **Keep-N**: same semantics as today — fold everything except the
   recent N turns.
@@ -375,11 +375,11 @@ provides:
   summary text immediately (the only case the LLM round-trip is on
   the operator-blocking path; explicit).
 
-Implementation: `compress_session` is refactored to call the same
+Implementation: `compact_session` is refactored to call the same
 salvage primitive as the prune path, with `salvage_state` flipping
 straight to `pending-summary` (sync mode) or queued
 (async mode, default). The metadata discriminator stays
-`"compression"` so the UI can still distinguish operator-driven
+`"compaction"` so the UI can still distinguish operator-driven
 folds from prune-driven folds when useful.
 
 ### `restore_excluded` contract
@@ -418,8 +418,8 @@ gate from epic #1307 keys off this flag, not off ticket closure — so
 a partially-deployed C never silently claims correctness it does not
 have.
 
-The popup's "Save older turns into a durable note (!compress)"
-button label changes to **"Compress now (synchronous)"** since the
+The popup's "Save older turns into a durable note (!compact)"
+button label changes to **"Compact now (synchronous)"** since the
 default async salvage already runs — the button is for operators
 who want the summary text immediately rather than after the worker
 catches up.
@@ -446,7 +446,7 @@ path. Budget for one prune event:
 
 - 1× INSERT into `conversation_history` (the salvage marker).
 - 1× UPDATE on `conversation_history` rows by id-list (mark
-  originals excluded). Already batched in `compress_session`
+  originals excluded). Already batched in `compact_session`
   ([`conversation_manager.py:225-228`](kestrel_sovereign/agent/conversation_manager.py)).
 - 1× enqueue into the SignalDispatcher's queue.
 
@@ -624,9 +624,9 @@ C implementation (separate sub-ticket) is accepted when:
 - [ ] Async summarization rides on `SignalDispatcher.enqueue_signal`,
   with retry policy and per-attempt error recording.
 - [ ] `restore_excluded` operates on salvage markers identically to
-  compression markers (no behavior change for the operator).
-- [ ] `compress_session` refactored to share the salvage primitive;
-  manual `!compress` retains `force`/`keep-N` semantics; default
+  compaction markers (no behavior change for the operator).
+- [ ] `compact_session` refactored to share the salvage primitive;
+  manual `!compact` retains `force`/`keep-N` semantics; default
   becomes async (`pending-summary`) with an explicit
   `--sync`/`--bypass-async` flag for the operator-blocking case.
 - [ ] `MemoryConsolidator` skips spans where all rows already have
@@ -641,7 +641,7 @@ C implementation (separate sub-ticket) is accepted when:
   monitoring patch of the LLM service); async summary updates the
   record; failure exhaustion → `failed-fold`; concurrent prune +
   restore is idempotent; `restore_excluded` on salvage markers
-  matches compression-marker behavior; no episode + salvage
+  matches compaction-marker behavior; no episode + salvage
   double-summarization of the same span.
 
 The popup's `silently-pruned path still active` auto-detect flag
@@ -660,7 +660,7 @@ two refinements folded into the sections above.
 | # | Question | Resolution |
 |---|---|---|
 | (a) | Pre-C backfill | **Option 1 — no backfill.** Pre-C boundary surfaced in the popup so operators can see where salvage history begins. Folded into [UI surfacing](#ui-surfacing). |
-| (b) | `!compress` default mode post-C | **Async by default, `--sync` opt-in.** Help text + popup tooltip updated to reflect the default change. Folded into [Interaction with `!compress`](#interaction-with-compress). |
+| (b) | `!compact` default mode post-C | **Async by default, `--sync` opt-in.** Help text + popup tooltip updated to reflect the default change. Folded into [Interaction with `!compact`](#interaction-with-compact). |
 | (c) | Failed-fold UX | **Label-only, no auto-nudge.** Hover links to `!context restore` docs. Operator agency. |
 | (d) | Episode-vs-salvage overlap | **Episode-as-input.** Plus an idempotency rule: when the linked salvage is still `pointer-only` / `pending-summary`, the consolidator defers or skips that span until it settles. Folded into [Interaction with episodes](#interaction-with-episodes). |
 | (e) | Sub-ticket scope | **One ticket end-to-end, feature-flagged.** The release-gate flag (`silently_pruned_path_active`) flips to `False` only when the full path is live — closure of the impl ticket alone is insufficient. Folded into [UI surfacing](#ui-surfacing). |
@@ -691,7 +691,7 @@ this PR.
 - `kestrel_sovereign/agent/context_manager.py:632-687` — the two
   silent-prune sites C replaces (pre-trim + post-budget auto-prune).
 - `kestrel_sovereign/agent/conversation_manager.py:79-243` —
-  `compress_session`, the existing durable-fold machinery C extends.
+  `compact_session`, the existing durable-fold machinery C extends.
 - `kestrel_sovereign/storage/async_conversation_store.py:1102` —
   `excluded_from_context` filter the LLM path reads through.
 - `kestrel_sovereign/features/context/feature.py:537-593` —
@@ -707,5 +707,5 @@ this PR.
 - `kestrel_sovereign/endpoints/agent.py:get_context_status` — where
   `silently_pruned_path_active` flips off the day C ships.
 - Related: [`CONTEXT_SYSTEM_DESIGN.md`](CONTEXT_SYSTEM_DESIGN.md)
-  ("Review record" + "C — Unify auto-prune with durable compression"
+  ("Review record" + "C — Unify auto-prune with durable compaction"
   sections — the parent design Emma acked).

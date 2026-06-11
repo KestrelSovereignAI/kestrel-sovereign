@@ -692,6 +692,22 @@ class AsyncDatabase:
                 "once the underlying cause is fixed.", e, exc_info=True,
             )
 
+        # compress → compact terminology rename: rewrite persisted
+        # session-compaction metadata strings (marker ``type`` values,
+        # ``salvage_reason``, key renames) so readers never need
+        # dual-string compat. Idempotent + transactional; non-fatal
+        # because untouched legacy rows only degrade transcript
+        # annotations and consolidator marker-state checks, not boot.
+        try:
+            from .sqla.migrations import migrate_compaction_terminology
+            await migrate_compaction_terminology(self)
+        except Exception as e:
+            logger.error(
+                "compaction-terminology migration failed: %s. Legacy "
+                "'compression' metadata rows remain until next boot.",
+                e, exc_info=True,
+            )
+
         logger.debug(f"Database schema initialized ({self.backend_type})")
 
     async def _migrate_add_column(

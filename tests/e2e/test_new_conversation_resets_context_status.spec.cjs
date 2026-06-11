@@ -44,7 +44,7 @@ test('context-status footer resets to 0 messages after startNewConversation', as
     // selectAgent leaves ``state.currentSessionId = null`` and
     // ``updateContextStatus`` hides the indicator in that case, rather
     // than showing the agent's cross-session aggregate ("472 msgs ·
-    // 100% Compress" on an empty pane).  So we wait for the element to
+    // 100% Compact" on an empty pane).  So we wait for the element to
     // be ATTACHED but NOT for it to contain a count.
     await page.waitForSelector('#context-status', { state: 'attached', timeout: 15000 });
 

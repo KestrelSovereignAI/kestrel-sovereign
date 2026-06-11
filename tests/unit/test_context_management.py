@@ -432,8 +432,8 @@ class TestContextManagerIntegration:
         assert status["total_budget"] == 19456
 
 
-class TestSessionCompression:
-    """Tests for session compression feature."""
+class TestSessionCompaction:
+    """Tests for session compaction feature."""
 
     @pytest.fixture
     def mock_storage(self):
@@ -444,17 +444,17 @@ class TestSessionCompression:
 
     @pytest.fixture
     def mock_llm_service(self):
-        """Create a mock LLM service for compression."""
+        """Create a mock LLM service for compaction."""
         llm_service = MagicMock()
         llm_service.generate = AsyncMock(return_value="Summary of the conversation: key points discussed.")
         return llm_service
 
     @pytest.mark.asyncio
-    async def test_compress_session_not_enough_messages(self, mock_storage, mock_llm_service):
-        """Test compression fails when not enough messages."""
+    async def test_compact_session_not_enough_messages(self, mock_storage, mock_llm_service):
+        """Test compaction fails when not enough messages."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
-        # Only 5 messages - not enough to compress
+        # Only 5 messages - not enough to compact
         mock_storage.conversation.get_full_history = AsyncMock(return_value=[
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
@@ -464,37 +464,37 @@ class TestSessionCompression:
         ])
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.compress_session(llm_service=mock_llm_service)
+        result = await manager.compact_session(llm_service=mock_llm_service)
 
         assert result["success"] is False
         assert "Not enough messages" in result["reason"]
 
     @pytest.mark.asyncio
-    async def test_compress_session_success(self, mock_storage, mock_llm_service):
-        """Test successful session compression."""
+    async def test_compact_session_success(self, mock_storage, mock_llm_service):
+        """Test successful session compaction."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
-        # 20 messages - enough to compress
+        # 20 messages - enough to compact
         messages = []
         for i in range(20):
             role = "user" if i % 2 == 0 else "assistant"
             messages.append({"role": role, "content": f"Message {i} with some content"})
 
         mock_storage.conversation.get_full_history = AsyncMock(return_value=messages)
-        mock_storage.compress_conversation_history = AsyncMock()
+        mock_storage.compact_conversation_history = AsyncMock()
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.compress_session(llm_service=mock_llm_service, preserve_recent=5)
+        result = await manager.compact_session(llm_service=mock_llm_service, preserve_recent=5)
 
         assert result["success"] is True
-        assert result["messages_compressed"] == 15  # 20 - 5 preserved
+        assert result["messages_compacted"] == 15  # 20 - 5 preserved
         assert result["messages_preserved"] == 5
         assert result["tokens_saved"] > 0
         assert "summary_preview" in result
 
     @pytest.mark.asyncio
-    async def test_compress_session_force(self, mock_storage, mock_llm_service):
-        """Test force compression even with few messages."""
+    async def test_compact_session_force(self, mock_storage, mock_llm_service):
+        """Test force compaction even with few messages."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         # 12 messages - would normally skip, but force=True
@@ -502,10 +502,10 @@ class TestSessionCompression:
                     for i in range(12)]
 
         mock_storage.conversation.get_full_history = AsyncMock(return_value=messages)
-        mock_storage.compress_conversation_history = AsyncMock()
+        mock_storage.compact_conversation_history = AsyncMock()
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.compress_session(
+        result = await manager.compact_session(
             llm_service=mock_llm_service,
             preserve_recent=10,
             force=True
@@ -513,18 +513,18 @@ class TestSessionCompression:
 
         # With force=True, should fail due to not enough older messages (12 - 10 = 2, need at least 3)
         # Let's increase preserve_recent to a more realistic number
-        result = await manager.compress_session(
+        result = await manager.compact_session(
             llm_service=mock_llm_service,
             preserve_recent=5,
             force=True
         )
 
         assert result["success"] is True
-        assert result["messages_compressed"] == 7
+        assert result["messages_compacted"] == 7
 
     @pytest.mark.asyncio
-    async def test_compress_session_llm_failure(self, mock_storage):
-        """Test compression handles LLM failure gracefully."""
+    async def test_compact_session_llm_failure(self, mock_storage):
+        """Test compaction handles LLM failure gracefully."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"Msg {i}"}
@@ -536,36 +536,36 @@ class TestSessionCompression:
         failing_llm.generate = AsyncMock(side_effect=Exception("LLM unavailable"))
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.compress_session(llm_service=failing_llm)
+        result = await manager.compact_session(llm_service=failing_llm)
 
         assert result["success"] is False
         assert "LLM unavailable" in result["reason"]
 
     @pytest.mark.asyncio
-    async def test_compress_session_preserve_all(self, mock_storage, mock_llm_service):
-        """Test compression with preserve_recent=0 (compress all)."""
+    async def test_compact_session_preserve_all(self, mock_storage, mock_llm_service):
+        """Test compaction with preserve_recent=0 (compact all)."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"Msg {i}"}
                     for i in range(15)]
 
         mock_storage.conversation.get_full_history = AsyncMock(return_value=messages)
-        mock_storage.compress_conversation_history = AsyncMock()
+        mock_storage.compact_conversation_history = AsyncMock()
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.compress_session(
+        result = await manager.compact_session(
             llm_service=mock_llm_service,
             preserve_recent=0,
             force=True
         )
 
         assert result["success"] is True
-        assert result["messages_compressed"] == 15
+        assert result["messages_compacted"] == 15
         assert result["messages_preserved"] == 0
 
     @pytest.mark.asyncio
-    async def test_check_compression_needed_below_threshold(self, mock_storage):
-        """Test check_compression_needed when utilization is below threshold."""
+    async def test_check_compaction_needed_below_threshold(self, mock_storage):
+        """Test check_compaction_needed when utilization is below threshold."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         # Few short messages - low utilization
@@ -573,15 +573,15 @@ class TestSessionCompression:
         mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.check_compression_needed(utilization_threshold=70.0)
+        result = await manager.check_compaction_needed(utilization_threshold=70.0)
 
-        assert result["compression_recommended"] is False
+        assert result["compaction_recommended"] is False
         assert result["utilization_percent"] < 70.0
         assert result["message_count"] == 2
 
     @pytest.mark.asyncio
-    async def test_check_compression_needed_above_threshold(self, mock_storage):
-        """Test check_compression_needed when utilization is above threshold."""
+    async def test_check_compaction_needed_above_threshold(self, mock_storage):
+        """Test check_compaction_needed when utilization is above threshold."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         # Many long messages to simulate high utilization
@@ -594,15 +594,15 @@ class TestSessionCompression:
         mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.check_compression_needed(utilization_threshold=70.0)
+        result = await manager.check_compaction_needed(utilization_threshold=70.0)
 
-        assert result["compression_recommended"] is True
+        assert result["compaction_recommended"] is True
         assert result["utilization_percent"] >= 70.0
         assert result["message_count"] == 50
 
     @pytest.mark.asyncio
-    async def test_check_compression_needed_custom_threshold(self, mock_storage):
-        """Test check_compression_needed with custom threshold."""
+    async def test_check_compaction_needed_custom_threshold(self, mock_storage):
+        """Test check_compaction_needed with custom threshold."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         # Moderate amount of content
@@ -612,20 +612,20 @@ class TestSessionCompression:
         manager = ContextManager(storage=mock_storage, model="gpt-4")
 
         # Very low threshold should trigger
-        result = await manager.check_compression_needed(utilization_threshold=5.0)
+        result = await manager.check_compaction_needed(utilization_threshold=5.0)
         assert result["threshold"] == 5.0
 
     @pytest.mark.asyncio
-    async def test_check_compression_empty_history(self, mock_storage):
-        """Test check_compression_needed with empty history."""
+    async def test_check_compaction_empty_history(self, mock_storage):
+        """Test check_compaction_needed with empty history."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         mock_storage.conversation.get_full_history = AsyncMock(return_value=[])
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
-        result = await manager.check_compression_needed()
+        result = await manager.check_compaction_needed()
 
-        assert result["compression_recommended"] is False
+        assert result["compaction_recommended"] is False
         assert result["utilization_percent"] == 0.0
         assert result["message_count"] == 0
         assert result["total_tokens"] == 0
@@ -1405,12 +1405,12 @@ class TestRLMInspiredFeatures:
         assert "No stashes found" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_hierarchical_compress_builds_tree_summaries(self, mock_storage_with_conv, mock_llm_service):
-        """Test hierarchical compression creates tree-structured summaries."""
+    async def test_hierarchical_compact_builds_tree_summaries(self, mock_storage_with_conv, mock_llm_service):
+        """Test hierarchical compaction creates tree-structured summaries."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         storage, conv_store = mock_storage_with_conv
-        # Create enough messages for hierarchical compression
+        # Create enough messages for hierarchical compaction
         messages = [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"Message {i} with content " * 50}
             for i in range(30)
@@ -1419,7 +1419,7 @@ class TestRLMInspiredFeatures:
         conv_store.add_conversation = AsyncMock()
 
         manager = ContextManager(storage=storage, model="gpt-4", agent_id="test")
-        result = await manager.hierarchical_compress(
+        result = await manager.hierarchical_compact(
             llm_service=mock_llm_service,
             chunk_size=2000,
             preserve_recent=5,
@@ -1427,13 +1427,13 @@ class TestRLMInspiredFeatures:
         )
 
         assert result["success"] is True
-        assert result["messages_compressed"] == 25  # 30 - 5 preserved
+        assert result["messages_compacted"] == 25  # 30 - 5 preserved
         assert result["chunks_processed"] > 1  # Multiple chunks
         assert "tokens_saved" in result
 
     @pytest.mark.asyncio
-    async def test_hierarchical_compress_not_enough_messages(self, mock_storage_with_conv, mock_llm_service):
-        """Test hierarchical compression fails with too few messages."""
+    async def test_hierarchical_compact_not_enough_messages(self, mock_storage_with_conv, mock_llm_service):
+        """Test hierarchical compaction fails with too few messages."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
         storage, conv_store = mock_storage_with_conv
@@ -1443,7 +1443,7 @@ class TestRLMInspiredFeatures:
         ])
 
         manager = ContextManager(storage=storage, model="gpt-4", agent_id="test")
-        result = await manager.hierarchical_compress(
+        result = await manager.hierarchical_compact(
             llm_service=mock_llm_service,
             preserve_recent=5
         )
@@ -1541,21 +1541,21 @@ class TestContextFeature:
         mock_agent.context_manager.stash_peek.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_hierarchical_compress_tool(self, mock_agent):
-        """Test hierarchical_compress tool."""
+    async def test_hierarchical_compact_tool(self, mock_agent):
+        """Test hierarchical_compact tool."""
         from kestrel_sovereign.features.context import ContextFeature
         from kestrel_sdk.tools.result import ToolResultStatus
 
-        mock_agent.context_manager.hierarchical_compress = AsyncMock(return_value={
+        mock_agent.context_manager.hierarchical_compact = AsyncMock(return_value={
             "success": True,
-            "messages_compressed": 20,
+            "messages_compacted": 20,
             "chunks_processed": 5,
             "tokens_saved": 1500
         })
 
         feature = ContextFeature(mock_agent)
         await feature.initialize()
-        result = await feature.hierarchical_compress(
+        result = await feature.hierarchical_compact(
             chunk_size=4000,
             keep_recent=5,
             max_depth=3
