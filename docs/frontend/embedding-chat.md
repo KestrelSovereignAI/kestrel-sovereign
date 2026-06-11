@@ -33,6 +33,41 @@ const api = createChatComponent({ deps, container: containerEl });
 > to `document.body` and positioned `fixed`, so they are not scoped to the
 > mount container.
 
+## Markdown rendering & required scripts
+
+Assistant messages render through the shared markdown module
+(`kestrel_sovereign/static/shared/markdown/`). An embedder that serves these
+files itself (e.g. Frinz via a `/kestrel-ui/` mount) must load them — and their
+libraries — in this order, **before** `chat.js` runs:
+
+```html
+<!-- libraries -->
+<script src=".../marked@11/marked.min.js"></script>
+<!-- DOMPurify MUST precede parse.js (see below) -->
+<script src=".../dompurify@3/dist/purify.min.js"></script>
+<script src=".../highlight.js@11/highlight.min.js"></script>
+
+<!-- shared module, in order -->
+<script src="shared/markdown/parse.js"></script>
+<script src="shared/markdown/highlight.js"></script>
+<script src="shared/markdown/mermaid.js"></script>
+<script src="shared/markdown/katex.js"></script>
+<script src="shared/markdown/index.js"></script>
+```
+
+- **Sanitization (required).** All rendered markdown is run through DOMPurify
+  (hardened: HTML-profile only, `data:` images blocked, `rel=noopener` forced
+  on `target=_blank`). If DOMPurify is **not** loaded before `parse.js`, the
+  renderer **fails closed** — markdown is shown as escaped text, not raw HTML,
+  with a one-time console warning. Always load DOMPurify.
+- **Mermaid** diagrams (` ```mermaid `) and **KaTeX** math (`$$…$$`, `\[…\]`,
+  `\(…\)` — no bare `$…$`) are **lazy-loaded** on first use by their shared
+  modules; you don't load mermaid/KaTeX yourself. If a host omits `katex.js`,
+  `index.js` degrades to no-math (no error). Math runs only on finalized
+  messages; both render as a post-sanitize DOM pass and are never re-sanitized.
+- Tool activity renders from typed in-band stream sentinels into collapsible
+  cards — no host wiring needed.
+
 ## Hooks
 
 ### `registerPartRenderer(type, fn)`
