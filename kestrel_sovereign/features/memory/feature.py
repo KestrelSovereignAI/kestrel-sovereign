@@ -712,8 +712,25 @@ class MemoryFeature(Feature):
         if not memory_system:
             return ToolResult.failed("MemorySystem not available on agent")
 
+        from contextlib import AsyncExitStack
+        from kestrel_sdk.signals import ResourceLock
+
+        # Serialize against the scheduled cron consolidation, which holds
+        # ResourceLock.MEMORY via the dispatcher. Without this, a manual
+        # `!memory consolidate` racing the cron tick reads the same empty
+        # covered-message-id set and both runs emit duplicate episodes for the
+        # same span (round-3 finding). No-op when no dispatcher lock manager is
+        # wired (standalone / tests).
+        dispatcher = getattr(self.agent, "dispatcher", None)
+        lock_manager = getattr(dispatcher, "_locks", None) if dispatcher is not None else None
+
         try:
-            result = await memory_system.consolidate()
+            async with AsyncExitStack() as stack:
+                if lock_manager is not None:
+                    await stack.enter_async_context(
+                        lock_manager.acquire([ResourceLock.MEMORY])
+                    )
+                result = await memory_system.consolidate()
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))

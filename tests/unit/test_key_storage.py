@@ -65,6 +65,22 @@ class TestSecureKeyStorageInit:
 class TestKeyEncryption:
     """Tests for key encryption and decryption."""
 
+    def test_saved_key_files_are_owner_only(self, storage, test_private_key):
+        """#round3: encrypted key files must be chmod 0600 — even AES-256-GCM
+        ciphertext + salt/KDF params shouldn't be world/group-readable on a
+        shared filesystem."""
+        import stat
+
+        key_path = storage.save_private_key(test_private_key, "perm_test_priv")
+        assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600, oct(
+            os.stat(key_path).st_mode
+        )
+
+        sec_path = storage.save_secret_bytes(b"\x01\x02\x03\x04", "perm_test_secret")
+        assert stat.S_IMODE(os.stat(sec_path).st_mode) == 0o600, oct(
+            os.stat(sec_path).st_mode
+        )
+
     def test_save_and_load_private_key(self, storage, test_private_key):
         """Should save and load a private key correctly."""
         key_id = "test_key_001"
