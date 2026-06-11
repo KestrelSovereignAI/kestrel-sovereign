@@ -373,6 +373,80 @@ class AsyncStorage:
             self.agent_id, since_iso=since_iso
         )
 
+    async def purge_episodes_older_than(
+        self,
+        cutoff_iso: str,
+        *,
+        max_rows: int = 10_000,
+        reason: str = "retention-janitor",
+    ) -> int:
+        """Cognition-retention primitive — hard-delete old memory episodes (#1674).
+
+        Deletes ``memory_episodes`` rows for THIS agent whose ``created_at`` is
+        older than ``cutoff_iso``, oldest first, capped at ``max_rows``. Each
+        episode is mirrored into the knowledge graph as a node whose
+        ``node_id`` IS the episode id (see ``memory_consolidator``), so the
+        paired graph node — and, via ``delete_node``, its edges — is removed
+        too, leaving no orphans.
+
+        The graph node is deleted BEFORE the episode row, and an episode row is
+        removed ONLY if its node delete succeeded — so a node-delete failure (or
+        a mid-sweep crash) can never leave an orphan graph node pointing at a
+        deleted episode. The worst case is an episode whose row+node both
+        survive and are retried next run.
+
+        Returns the number of episodes removed. ``reason`` is informational
+        (parity with ``purge_trash_older_than``; episodes carry no audit row).
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # Guard the cap: SQLite reads LIMIT -1 (any max_rows <= 0) as unbounded,
+        # which would silently bypass the per-sweep cap. Matches
+        # purge_trash_older_than. A zero/negative cap means "purge nothing".
+        if max_rows <= 0:
+            return 0
+
+        rows = await self.db.fetchall(
+            """
+            SELECT id FROM memory_episodes
+            WHERE agent_id = ? AND created_at < ?
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (self.agent_id, cutoff_iso, max_rows),
+        )
+        episode_ids = [r[0] for r in rows]
+        if not episode_ids:
+            return 0
+
+        # Drop the paired KG node (+ its edges) first — see docstring. Only
+        # episodes whose node delete SUCCEEDS are then removed from the table:
+        # deleting a row whose node delete failed would leave exactly the
+        # orphan node the ordering is meant to prevent. A skipped episode keeps
+        # both its row and node and is retried on the next sweep.
+        deletable_ids = []
+        for episode_id in episode_ids:
+            try:
+                await self.graph.delete_node(episode_id)
+            except Exception as e:  # noqa: BLE001 - one bad node must not abort the sweep
+                logger.warning(
+                    "[retention] skipping episode %s — graph node delete failed: %s",
+                    episode_id, e,
+                )
+                continue
+            deletable_ids.append(episode_id)
+
+        if not deletable_ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in deletable_ids)
+        await self.db.execute(
+            f"DELETE FROM memory_episodes WHERE id IN ({placeholders})",
+            tuple(deletable_ids),
+        )
+        return len(deletable_ids)
+
     async def set_conversation_name(
         self, session_id: str, name: Optional[str]
     ) -> Optional[str]:

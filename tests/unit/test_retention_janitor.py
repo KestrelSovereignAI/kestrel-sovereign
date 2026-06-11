@@ -114,3 +114,36 @@ def test_agent_privacy_mode_handles_enum_and_string():
     # Missing
     a = SimpleNamespace()
     assert agent_privacy_mode(a) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_cognition_retention_days (#1674) — opt-in, no compiled default
+# ---------------------------------------------------------------------------
+
+from kestrel_sovereign.storage.retention import resolve_cognition_retention_days
+
+
+def test_cognition_resolve_returns_none_when_key_absent():
+    """Opt-in: an unset window keeps episodes forever (skip)."""
+    assert resolve_cognition_retention_days(config={}, key="episodes_days") is None
+
+
+def test_cognition_resolve_reads_configured_window():
+    assert resolve_cognition_retention_days(
+        config={"episodes_days": 180}, key="episodes_days",
+    ) == 180
+
+
+def test_cognition_resolve_none_for_non_positive():
+    assert resolve_cognition_retention_days(
+        config={"episodes_days": 0}, key="episodes_days",
+    ) is None
+    assert resolve_cognition_retention_days(
+        config={"episodes_days": -5}, key="episodes_days",
+    ) is None
+
+
+def test_cognition_resolve_none_for_non_int():
+    assert resolve_cognition_retention_days(
+        config={"episodes_days": "soon"}, key="episodes_days",
+    ) is None

@@ -908,6 +908,25 @@ class PrivacyEnforcingStorage:
             cutoff_iso, max_rows=max_rows, reason=reason,
         )
 
+    async def purge_episodes_older_than(
+        self,
+        cutoff_iso: str,
+        *,
+        max_rows: int = 10_000,
+        reason: str = "retention-janitor",
+    ) -> int:
+        """Cognition-retention primitive — wrapper delegator (#1674).
+
+        Exposed on the wrapper because the cron handler reads
+        ``agent.storage.purge_episodes_older_than`` and ``agent.storage`` is
+        the wrapper, not the raw facade (same reason as
+        ``purge_trash_older_than``). No extra privacy gating: the sweep only
+        removes episodes already older than the operator-configured window.
+        """
+        return await self._storage.purge_episodes_older_than(
+            cutoff_iso, max_rows=max_rows, reason=reason,
+        )
+
     async def delete_conversation_session(
         self, session_id: str, agent_id: str
     ) -> int:

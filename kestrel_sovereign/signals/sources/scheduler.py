@@ -70,6 +70,11 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # is the closest existing lock; refining the lock taxonomy is a
     # follow-up.
     ("trash_retention", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
+    # Bounds memory_episodes (+ paired KG nodes) past the configured window.
+    # Touches the same memory/graph storage as consolidation, so it takes the
+    # MEMORY lock to serialize against memory_consolidate (#1674). ACTION — no
+    # follow-up cognition.
+    ("cognition_retention", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
     # Long-running LLM ops that modify model/training state. ACTION
     # because it doesn't return cognition for the bird to act on.
     ("training_cycle", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
