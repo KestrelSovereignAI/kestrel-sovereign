@@ -1276,6 +1276,63 @@ class TestGitHubPRWatchHandler:
         feature.agent.dispatcher.enqueue_signal.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_dispatch_error_does_not_advance_watch_state(self, feature):
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        prev = normalize_pr_state(_pr_payload(comments=2))
+        prev_fp = compute_fingerprint(prev)
+        feature._load_pr_watch_state = AsyncMock(
+            return_value=(prev_fp, prev)
+        )
+        feature._save_pr_watch_state = AsyncMock()
+        feature.agent.dispatcher = MagicMock()
+        feature.agent.dispatcher.enqueue_signal = AsyncMock(
+            side_effect=RuntimeError("queue unavailable")
+        )
+
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH, new=AsyncMock(return_value=_pr_payload(comments=3))
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["blocked"] == "dispatch_error"
+        feature._save_pr_watch_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_dispatcher_does_not_advance_watch_state(self, feature):
+        from kestrel_sovereign.signals.sources.github_pr_watch import (
+            compute_fingerprint,
+            normalize_pr_state,
+        )
+
+        prev = normalize_pr_state(_pr_payload(comments=2))
+        prev_fp = compute_fingerprint(prev)
+        feature._load_pr_watch_state = AsyncMock(
+            return_value=(prev_fp, prev)
+        )
+        feature._save_pr_watch_state = AsyncMock()
+        feature.agent.dispatcher = None
+
+        with patch(_GH_TOKEN, return_value="tok"), patch(
+            _GH_FETCH, new=AsyncMock(return_value=_pr_payload(comments=3))
+        ):
+            out = await feature._run_github_pr_watch(
+                {"repo": "owner/name", "pr": 1614}
+            )
+
+        data = json.loads(out)
+        assert data["signaled"] is False
+        assert data["blocked"] == "no_dispatcher"
+        feature._save_pr_watch_state.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_pr_arg_fetches_pulls_endpoint(self, feature):
         feature._db.fetchone = AsyncMock(return_value=None)
         fetch = AsyncMock(return_value=_pr_payload())

@@ -176,6 +176,35 @@ def test_saved_items_listing_filters_and_schema_contracts():
         _restore_app(app, original)
 
 
+def test_saved_items_endpoint_refuses_privacy_hidden_modes():
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    db = MagicMock()
+    storage = MagicMock(db=db, agent_id="did:agent")
+    agent = MagicMock(storage=storage, agent_id="did:agent")
+    agent.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch("kestrel_sovereign.storage.saved_items_store.SavedItemsStore") as store_cls:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    response = client.post(
+                        "/api/saved-items",
+                        headers=_api_headers(),
+                        json={
+                            "item_type": "stash",
+                            "name": "Do not persist",
+                            "content": "EPHEMERAL_SECRET",
+                        },
+                    )
+        assert response.status_code == 403
+        assert "privacy mode" in response.json()["detail"]
+        store_cls.assert_not_called()
+    finally:
+        _restore_app(app, original)
+
+
 def test_saved_items_item_crud_search_and_pin_contracts():
     agent = MagicMock(storage=MagicMock(db=MagicMock(), agent_id="did:agent"), agent_id="did:agent")
     existing = MagicMock(ipfs_cid=None)

@@ -10,6 +10,10 @@ import logging
 
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.endpoints.agent_helpers import get_agent
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,15 +71,19 @@ class SearchRequest(BaseModel):
 def _get_saved_items_store(request: Request):
     """Get SavedItemsStore from agent storage."""
     agent = get_agent(request)
-    storage = agent.storage
+    if hides_persisted_user_content(agent):
+        raise HTTPException(
+            status_code=403,
+            detail="Saved items are unavailable in the current privacy mode.",
+        )
 
-    # Get the database
-    db = getattr(storage, 'db', None)
+    db = resolve_feature_database(agent)
     if not db:
         raise HTTPException(status_code=503, detail="Database not available.")
 
     # Create SavedItemsStore
     from kestrel_sovereign.storage.saved_items_store import SavedItemsStore
+    storage = getattr(agent, "storage", None)
     agent_id = getattr(storage, 'agent_id', '') or getattr(agent, 'agent_id', '')
     return SavedItemsStore(db, agent_id, llm_service=getattr(agent, "llm_service", None))
 

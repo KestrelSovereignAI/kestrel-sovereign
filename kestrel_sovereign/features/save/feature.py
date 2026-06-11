@@ -18,7 +18,10 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.features.storage_access import resolve_feature_database
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 from kestrel_sovereign.storage.saved_items_store import (
     SavedItemsStore, SavedItemType, SourceType
 )
@@ -55,18 +58,34 @@ class SaveFeature(Feature):
     async def initialize(self):
         """Initialize the save feature with required references."""
         self.storage = getattr(self.agent, 'storage', None)
-        self._db = resolve_feature_database(self.agent)
+        persisted_content_hidden = self._persistent_content_hidden()
+        self._db = (
+            None
+            if persisted_content_hidden
+            else resolve_feature_database(self.agent)
+        )
         self.context_manager = getattr(self.agent, 'context_manager', None)
         self.agent_id = self.agent.did
         self._saved_items_store = None
 
         if not self.storage:
             logger.warning("SaveFeature initialized without storage - tools may not work")
+        if persisted_content_hidden:
+            logger.info(
+                "SaveFeature persistent tools disabled by current privacy mode"
+            )
 
         logger.info("SaveFeature initialized")
 
+    def _persistent_content_hidden(self) -> bool:
+        return hides_persisted_user_content(self.agent)
+
     def _get_store(self) -> Optional[SavedItemsStore]:
         """Get or create the saved items store."""
+        if self._persistent_content_hidden():
+            return None
+        if self._db is None:
+            self._db = resolve_feature_database(self.agent)
         if self._saved_items_store is None and self._db:
             self._saved_items_store = SavedItemsStore(
                 self._db,
@@ -74,6 +93,11 @@ class SaveFeature(Feature):
                 llm_service=getattr(self.agent, "llm_service", None),
             )
         return self._saved_items_store
+
+    def _privacy_unavailable_result(self) -> ToolResult:
+        return ToolResult.failed(
+            "Saved items are unavailable in the current privacy mode"
+        )
 
     @staticmethod
     def _parse_tags(raw: str) -> List[str]:
@@ -130,6 +154,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         if not self.context_manager:
@@ -233,6 +259,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         if not self.context_manager:
@@ -373,6 +401,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         try:
@@ -426,6 +456,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         try:
@@ -487,6 +519,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         try:
@@ -535,6 +569,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         try:
@@ -569,6 +605,8 @@ class SaveFeature(Feature):
         """
         store = self._get_store()
         if not store:
+            if self._persistent_content_hidden():
+                return self._privacy_unavailable_result()
             return ToolResult.failed("Storage not available")
 
         try:
