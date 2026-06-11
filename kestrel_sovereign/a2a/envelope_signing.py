@@ -102,6 +102,31 @@ def canonical_signing_bytes(
     ).encode("utf-8")
 
 
+def kids_from_verification_methods(
+    verification_methods: "list[Mapping[str, Any]]",
+) -> "tuple[str, str]":
+    """Derive ``(classical_kid, pq_kid)`` from a DID document's VM list.
+
+    The verifier matches a signature entry's ``kid`` to a VM ``id`` fragment, so
+    the signer must use kids that match its *published* verification methods.
+    VMs are classical-first, PQ-second (``build_verification_methods`` ordering),
+    so we take the fragment (after ``#``) of VM[0] and VM[1]. Falls back to the
+    ``sign_hybrid`` defaults (``key-1`` / ``key-2``) when a VM is missing — those
+    are exactly the kids the inception/rotation ceremonies assign.
+    """
+    def _frag(vm: Any, default: str) -> str:
+        if isinstance(vm, Mapping):
+            vm_id = vm.get("id") or ""
+            if "#" in vm_id:
+                return vm_id.rsplit("#", 1)[-1]
+        return default
+
+    vms = list(verification_methods or [])
+    classical = _frag(vms[0] if len(vms) > 0 else None, "key-1")
+    pq = _frag(vms[1] if len(vms) > 1 else None, "key-2")
+    return classical, pq
+
+
 def sign_envelope(
     keypair: HybridKeypair,
     *,
@@ -110,6 +135,8 @@ def sign_envelope(
     message: str,
     timestamp: str,
     session_id: Optional[str] = None,
+    classical_kid: str = "key-1",
+    pq_kid: str = "key-2",
 ) -> dict:
     """Produce the signature block to attach to an outbound envelope.
 
@@ -121,7 +148,9 @@ def sign_envelope(
 
     ``sender`` should be the signer's DID (matching the DID document the
     receiver will resolve). ``timestamp`` is an ISO-8601 UTC string the
-    receiver checks for freshness.
+    receiver checks for freshness. ``classical_kid`` / ``pq_kid`` must match the
+    signer's published verification-method ids — derive them with
+    :func:`kids_from_verification_methods` when signing as a real identity.
     """
     data = canonical_signing_bytes(
         sender=sender,
@@ -137,7 +166,7 @@ def sign_envelope(
         # bytes. It is part of the signed payload, so tampering it changes the
         # bytes and fails verification (and the freshness check bounds replay).
         "timestamp": timestamp,
-        "signatures": sign_hybrid(data, keypair),
+        "signatures": sign_hybrid(data, keypair, classical_kid=classical_kid, pq_kid=pq_kid),
     }
 
 

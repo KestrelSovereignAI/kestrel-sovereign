@@ -298,6 +298,59 @@ class PeersFeature(Feature):
             headers["X-API-Key"] = self._api_key
         return headers
 
+    def _maybe_sign_outbound(
+        self,
+        payload: Dict[str, Any],
+        *,
+        task_id: str,
+        sess_id: str,
+        message: str,
+    ) -> None:
+        """Sign the outbound A2A envelope if this agent has a hybrid identity (#1706).
+
+        Sets ``metadata["sender"]`` to the signing DID — the *verified*
+        identifier — and attaches ``metadata["signature"]`` (hybrid Ed25519 +
+        ML-DSA-65 over the canonical view: sender, task_id, session_id, message,
+        timestamp). The kids are derived from the agent's published verification
+        methods so the recipient's verifier can match them. Non-hybrid
+        (pre-ceremony) agents send unsigned — the recipient allows that under
+        the same-host boundary (back-compat). Best-effort: a signing failure
+        falls back to sending unsigned rather than breaking dispatch.
+        """
+        identity = getattr(self.agent, "identity", None)
+        if identity is None or not getattr(identity, "is_hybrid", False):
+            return
+        keypair = getattr(identity, "hybrid_keypair", None)
+        signing_did = getattr(identity, "signing_did", None)
+        vms = getattr(identity, "new_verification_methods", None)
+        if not keypair or not signing_did or not vms:
+            return
+        try:
+            from datetime import datetime, timezone
+            from kestrel_sovereign.a2a.envelope_signing import (
+                canonical_message,
+                kids_from_verification_methods,
+                sign_envelope,
+            )
+
+            classical_kid, pq_kid = kids_from_verification_methods(vms)
+            block = sign_envelope(
+                keypair,
+                sender=signing_did,
+                task_id=task_id,
+                message=canonical_message([message]),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                session_id=sess_id,
+                classical_kid=classical_kid,
+                pq_kid=pq_kid,
+            )
+            md = payload.setdefault("metadata", {})
+            # The signed DID is the verified identifier the recipient binds to.
+            md["sender"] = signing_did
+            md["signature"] = block
+        except Exception as exc:  # noqa: BLE001 - never break dispatch on signing
+            logger.warning("A2A sign-on-send failed; sending unsigned: %s", exc)
+
     @tool(
         name="list_peers",
         description="List all available peer agents in the multi_agent.",
@@ -606,6 +659,13 @@ class PeersFeature(Feature):
             )
         if outbound_artifacts:
             payload["artifacts"] = outbound_artifacts
+
+        # Cryptographic sender authentication (#1706): if this agent has a
+        # hybrid identity, sign the envelope so the recipient can verify it
+        # (#1673). Non-hybrid agents send unsigned — back-compat.
+        self._maybe_sign_outbound(
+            payload, task_id=task_id, sess_id=sess_id, message=message,
+        )
 
         try:
             async with httpx.AsyncClient() as client:
