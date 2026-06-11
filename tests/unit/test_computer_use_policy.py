@@ -47,24 +47,38 @@ def test_binary_policy_denied():
     assert pol.evaluate(["rm", "-rf", "/"]).decision is Decision.DENY
 
 
-def test_binary_policy_allowed_requires_approval():
+def test_binary_policy_allow_listed_short_circuits_to_allow():
+    # #1694: allow-listed binaries are pre-approved (Decision.ALLOW)
+    # so the queue is bypassed, matching auto_approve_read for paths.
     pol = BinaryPolicy(allow=["git"], deny=[])
-    assert pol.evaluate(["git", "status"]).decision is Decision.REQUIRE_APPROVAL
+    result = pol.evaluate(["git", "status"])
+    assert result.decision is Decision.ALLOW
+    assert result.rule == "allow:git"
 
 
-def test_binary_policy_unknown_denied():
+def test_binary_policy_unknown_requires_approval():
+    # #1694: no_match no longer hard-denies; it routes through the
+    # ApprovalQueue so the operator can vouch for an unusual binary.
     pol = BinaryPolicy(allow=["git"], deny=[])
-    assert pol.evaluate(["nmap", "-sS"]).decision is Decision.DENY
+    result = pol.evaluate(["touch", "/tmp/x"])
+    assert result.decision is Decision.REQUIRE_APPROVAL
+    assert result.rule == "no_match:touch"
+
+
+def test_binary_policy_deny_wins_over_allow():
+    # An entry on both lists must still hard-deny (deny-wins).
+    pol = BinaryPolicy(allow=["sudo"], deny=["sudo"])
+    assert pol.evaluate(["sudo", "-i"]).decision is Decision.DENY
 
 
 def test_binary_policy_basename_match():
     pol = BinaryPolicy(allow=["git"], deny=[])
-    assert pol.evaluate(["/usr/bin/git", "status"]).decision is Decision.REQUIRE_APPROVAL
+    assert pol.evaluate(["/usr/bin/git", "status"]).decision is Decision.ALLOW
 
 
 def test_binary_policy_string_input():
     pol = BinaryPolicy(allow=["git"], deny=[])
-    assert pol.evaluate("git status").decision is Decision.REQUIRE_APPROVAL
+    assert pol.evaluate("git status").decision is Decision.ALLOW
 
 
 def test_binary_policy_empty_argv():

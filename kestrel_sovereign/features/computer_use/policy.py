@@ -7,9 +7,16 @@ The feature uses two independent policies:
 - :class:`BinaryPolicy` — same shape for the executable that a shell
   command resolves to (``argv[0]``).
 
-Both policies share deny-wins semantics: any deny match short-circuits to
-``deny`` regardless of the allow list. Glob patterns are honored via
-``fnmatch`` (delegated to :func:`path_safety.match_allow_list`).
+Both policies share three-state, deny-wins semantics (#1694):
+
+- ``DENY`` — deny-list match. Hard refuse; never raises a prompt.
+- ``ALLOW`` — allow-list match (binaries; reads inside the path
+  allow-list when ``auto_approve_read`` is on). Bypass the queue.
+- ``REQUIRE_APPROVAL`` — no allow-list match, or an allow-list write
+  for paths. Route through the ApprovalQueue.
+
+Glob patterns are honored via ``fnmatch`` (delegated to
+:func:`path_safety.match_allow_list`).
 """
 
 from __future__ import annotations
@@ -94,6 +101,20 @@ class BinaryPolicy:
     def evaluate(self, argv: list[str] | str) -> PolicyResult:
         """Evaluate ``argv[0]`` against the allow/deny lists.
 
+        Three-state semantics (#1694), mirroring :class:`PathPolicy`:
+
+        - Deny match → ``DENY`` (hard refuse; never raises a prompt).
+        - Allow match → ``ALLOW`` (pre-approved; bypass the queue).
+        - No match → ``REQUIRE_APPROVAL`` (raise a prompt — operator
+          can vouch for an unusual binary).
+
+        The previous shape mapped no-match to ``DENY``, which collapsed
+        branches 1 and 3 to the same outcome and made the deny-list a
+        no-op for binaries not on the allow-list. The new shape gives
+        the deny-list the distinct meaning "never, even with operator
+        approval" and routes everything unfamiliar through the
+        ApprovalQueue.
+
         Strings are tokenized with ``shlex``. Match is on the basename of
         ``argv[0]`` so callers can list ``git`` rather than ``/usr/bin/git``.
         """
@@ -108,8 +129,8 @@ class BinaryPolicy:
         if binary in self.deny:
             return PolicyResult(Decision.DENY, f"deny:{binary}")
         if binary in self.allow:
-            return PolicyResult(Decision.REQUIRE_APPROVAL, f"allow:{binary}")
-        return PolicyResult(Decision.DENY, f"no_match:{binary}")
+            return PolicyResult(Decision.ALLOW, f"allow:{binary}")
+        return PolicyResult(Decision.REQUIRE_APPROVAL, f"no_match:{binary}")
 
 
 def split_command(cmd: str | Iterable[str]) -> list[str]:

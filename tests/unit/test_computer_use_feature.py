@@ -223,7 +223,14 @@ async def test_shell_denied_binary(workspace: Path):
 
 
 @pytest.mark.asyncio
-async def test_shell_allowed_runs(workspace: Path):
+async def test_shell_allow_listed_binary_bypasses_queue(workspace: Path):
+    """#1694: allow-listed (auto-approved) binaries run without
+    queueing. Mirrors auto_approve_read for PathPolicy.
+
+    Also pins the legacy ``allowed_binaries`` config key (still accepted
+    as a one-release deprecation synonym for ``auto_approved_binaries``;
+    see [features.computer_use] in kestrel.toml).
+    """
     queue = FakeApprovalQueue(decision=(True, "once"))
     agent = FakeAgent(
         privacy=PrivacyConfig(computer_access=True),
@@ -236,7 +243,34 @@ async def test_shell_allowed_runs(workspace: Path):
     assert envelope.status is ToolResultStatus.OK
     assert envelope.data["returncode"] == 0
     assert "hi" in envelope.data["stdout"]
-    assert len(queue.calls) == 1
+    assert queue.calls == [], (
+        "allow-listed binary must bypass the ApprovalQueue (#1694)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_shell_unlisted_binary_routes_through_queue(workspace: Path):
+    """#1694: an unlisted binary (not on allow OR deny list) now
+    returns REQUIRE_APPROVAL and reaches the ApprovalQueue, where the
+    operator (or auto-mode) decides. Previously the policy gate would
+    hard-deny before the queue was even consulted."""
+    queue = FakeApprovalQueue(decision=(True, "once"))
+    agent = FakeAgent(
+        privacy=PrivacyConfig(computer_access=True),
+        grants={"shell_execution_sandboxed", "shell_execution_host"},
+        queue=queue,
+    )
+    feature = await _make_feature(workspace, agent=agent)
+    await feature.initialize()
+    # ``true`` is neither allow- nor deny-listed in the fixture (only
+    # ``echo`` is allow, ``rm`` is deny). Under the new contract it
+    # routes through the queue, the queue says yes, the shell runs.
+    envelope = await feature.shell(command="true", timeout=5)
+    assert envelope.status is ToolResultStatus.OK
+    assert envelope.data["returncode"] == 0
+    assert len(queue.calls) == 1, (
+        "unlisted binary must reach the ApprovalQueue (#1694)"
+    )
 
 
 @pytest.mark.asyncio

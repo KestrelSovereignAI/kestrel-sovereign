@@ -59,12 +59,13 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
-# ``gh`` is allow-listed so it reaches the approval queue rather than
-# being hard-denied by binary policy before the scoped auto-approve seam
-# can govern it (epic #1290 D4: talon_file_and_claim → gh issue create).
-# Allow-listed != auto-run: BinaryPolicy still returns REQUIRE_APPROVAL,
-# so a human (or an explicit, scoped auto-approve rule) remains the gate.
-_DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
+# Allow-listed binaries are pre-approved: BinaryPolicy.evaluate returns
+# Decision.ALLOW and the queue is bypassed (#1694, mirrors
+# auto_approve_read for PathPolicy). Anything not on either list returns
+# REQUIRE_APPROVAL and routes through the ApprovalQueue so the operator
+# (or scoped auto-approve) decides. The deny-list is the only path that
+# refuses without a prompt.
+_DEFAULT_AUTO_APPROVED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
 _DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
@@ -152,8 +153,34 @@ class ComputerUseFeature(Feature):
             deny=denied,
             auto_approve_read=bool(self._cfg.get("auto_approve_read", True)),
         )
+        # `auto_approved_binaries` is the canonical key (#1694). The
+        # `allowed_binaries` spelling is accepted as a one-release
+        # deprecation synonym: if `auto_approved_binaries` is set it
+        # wins outright; if only `allowed_binaries` is set we honor it
+        # and log a one-time WARNING; if both are set the canonical key
+        # wins and we WARN that the legacy one is being ignored.
+        cfg_auto = self._cfg.get("auto_approved_binaries")
+        cfg_legacy = self._cfg.get("allowed_binaries")
+        if cfg_auto is not None:
+            auto_bins = list(cfg_auto)
+            if cfg_legacy is not None:
+                logger.warning(
+                    "ComputerUseFeature: both `auto_approved_binaries` and "
+                    "legacy `allowed_binaries` set in [features.computer_use]; "
+                    "ignoring `allowed_binaries`. Remove it from kestrel.toml."
+                )
+        elif cfg_legacy is not None:
+            logger.warning(
+                "ComputerUseFeature: `allowed_binaries` is a deprecated "
+                "alias for `auto_approved_binaries`. Rename it in "
+                "kestrel.toml. The legacy spelling will be removed in a "
+                "future release."
+            )
+            auto_bins = list(cfg_legacy)
+        else:
+            auto_bins = list(_DEFAULT_AUTO_APPROVED_BINS)
         self._binary_policy = BinaryPolicy(
-            allow=list(self._cfg.get("allowed_binaries", _DEFAULT_ALLOWED_BINS)),
+            allow=auto_bins,
             deny=list(self._cfg.get("denied_binaries", _DEFAULT_DENIED_BINS)),
         )
 
@@ -176,10 +203,12 @@ class ComputerUseFeature(Feature):
             return
 
         logger.info(
-            "ComputerUseFeature initialized: backend=%s, allowed=%d, allowed_bins=%d",
+            "ComputerUseFeature initialized: backend=%s, allowed=%d, "
+            "auto_approved_bins=%d, denied_bins=%d",
             self._backend.name,
             len(allowed),
             len(self._binary_policy.allow),
+            len(self._binary_policy.deny),
         )
 
     async def shutdown(self) -> None:
@@ -381,7 +410,13 @@ class ComputerUseFeature(Feature):
                 await self._audit_denied(tool_name, payload, allowed_by + ["denied:policy"])
                 return _GateOutcome(False, allowed_by, f"policy:{decision.rule}")
             allowed_by.append("policy")
-            require_approval = True
+            # #1694: honor BinaryPolicy's three-state result instead of
+            # hardcoding require_approval=True. Allow-listed binaries
+            # (Decision.ALLOW) are pre-approved and bypass the queue —
+            # the same contract PathPolicy uses for allow-listed reads
+            # under auto_approve_read. Anything not on the allow-list
+            # returns REQUIRE_APPROVAL and routes through the queue.
+            require_approval = decision.decision is Decision.REQUIRE_APPROVAL
         else:
             require_approval = False
 

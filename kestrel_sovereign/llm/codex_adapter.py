@@ -1171,21 +1171,43 @@ class CodexAdapter(LLMAdapter):
         async def handler(params: Dict[str, Any]) -> Dict[str, Any]:
             tool_summary = self._summarize_approval_tool(kind, params or {})
             try:
-                # Gate 1: Kestrel policy (BinaryPolicy / PathPolicy)
-                # must hard-deny before the queue can auto-approve.
-                policy_decline = self._codex_policy_precheck(
+                from kestrel_sovereign.features.computer_use.policy import (
+                    Decision,
+                )
+                # Gate 1: Kestrel policy. Three outcomes (#1694):
+                #   DENY              → record + decline (no queue)
+                #   ALLOW             → record + accept (no queue)
+                #   REQUIRE_APPROVAL  → fall through to queue (Gate 2)
+                policy_dec, policy_reason = self._codex_policy_precheck(
                     agent, kind, params or {},
                 )
-                if policy_decline is not None:
+                if policy_dec is Decision.DENY:
                     logger.info(
                         "codex_approval_bridge(%s): policy DENY (%s) — "
-                        "declining", kind, policy_decline,
+                        "declining", kind, policy_reason,
                     )
                     await self._record_codex_decline(
                         agent, request_method, tool_summary,
-                        f"policy_deny:{policy_decline}",
+                        f"policy_deny:{policy_reason}",
                     )
                     return {"decision": "decline"}
+                if policy_dec is Decision.ALLOW:
+                    logger.info(
+                        "codex_approval_bridge(%s): policy ALLOW (%s) — "
+                        "auto-accepting (pre-approved binary)",
+                        kind, policy_reason,
+                    )
+                    # Record the auto-approve event so the operational
+                    # state block + audit surface show that codex
+                    # asked, kestrel pre-approved, and the queue was
+                    # bypassed. ``policy_allow`` reason distinguishes
+                    # it from a queue-approved or a default-decline.
+                    await self._record_codex_decline(
+                        agent, request_method, tool_summary,
+                        f"policy_allow:{policy_reason}",
+                        status="auto_approved",
+                    )
+                    return {"decision": "accept"}
 
                 # Gate 2: ApprovalQueue routing.
                 features = getattr(agent, "features", {}) or {}
@@ -1282,10 +1304,21 @@ class CodexAdapter(LLMAdapter):
 
     @staticmethod
     async def _record_codex_decline(
-        agent: Any, request: str, tool: str, reason: str,
+        agent: Any,
+        request: str,
+        tool: str,
+        reason: str,
+        *,
+        status: str = "declined",
     ) -> None:
-        """Best-effort decline-event write. Never raises — the codex
-        turn must not break on an audit-store failure."""
+        """Best-effort event write. Never raises — the codex turn must
+        not break on an audit-store failure.
+
+        ``status`` defaults to ``"declined"`` (the original use). The
+        bridge passes ``"auto_approved"`` when policy ALLOW short-
+        circuits a queue request (#1694), so the operational-state
+        block can distinguish "policy pre-approved" from "queue
+        approved" from "declined"."""
         try:
             from kestrel_sovereign.features.storage_access import (
                 resolve_feature_database,
@@ -1308,6 +1341,7 @@ class CodexAdapter(LLMAdapter):
                 request=request,
                 tool=tool,
                 reason=reason,
+                status=status,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug(
@@ -1318,23 +1352,32 @@ class CodexAdapter(LLMAdapter):
     @staticmethod
     def _codex_policy_precheck(
         agent: Any, kind: str, params: Dict[str, Any],
-    ) -> Optional[str]:
+    ) -> Tuple["Decision", str]:
         """Run BinaryPolicy/PathPolicy against an inbound codex
-        approval request. Returns ``None`` to pass through; a short
-        reason string on DENY.
+        approval request.
 
-        Best-effort: any failure to evaluate (missing feature, missing
-        policy attribute, parse error) → ``None`` pass-through, so the
-        ApprovalQueue gate still gets to decide. The policy gate is
-        the *anti-auto-mode-blanket* shield; if the gate itself is
-        unhealthy, the queue remains the floor.
+        Returns ``(Decision, reason)``:
+
+        - ``(DENY, reason)`` — safety/policy refuse. Bridge declines
+          without queueing.
+        - ``(ALLOW, reason)`` — allow-listed binary (#1694). Bridge
+          short-circuits to ``accept`` without queueing — the operator
+          has pre-approved this binary via ``auto_approved_binaries``.
+        - ``(REQUIRE_APPROVAL, reason)`` — no allow-list match, no
+          policy deny. Bridge falls through to the ApprovalQueue.
+
+        Fail-closed: any failure to evaluate (missing feature, missing
+        policy attribute, malformed payload, parse error) returns
+        ``(DENY, "<reason>")`` rather than passing through. The policy
+        gate is the *anti-auto-mode-blanket* shield; if the gate itself
+        is unhealthy, the safe default is decline.
         """
         try:
             from kestrel_sovereign.features.computer_use.policy import (
                 Decision,
             )
-        except Exception:  # noqa: BLE001 - import path failure → pass-through
-            return None
+        except Exception:  # noqa: BLE001 - import path failure → fail closed
+            return (Decision.DENY, "policy_module_import_failed")  # type: ignore[name-defined]
         try:
             cu = None
             features = getattr(agent, "features", {}) or {}
@@ -1352,11 +1395,11 @@ class CodexAdapter(LLMAdapter):
                 # evaluate, so blanket auto-mode approval would let
                 # codex run any command / write any path. Decline
                 # rather than pass through to the queue.
-                return "no_computer_use_feature"
+                return (Decision.DENY, "no_computer_use_feature")
             if kind == "commandExecution":
                 policy = getattr(cu, "_binary_policy", None)
                 if policy is None:
-                    return "no_binary_policy"
+                    return (Decision.DENY, "no_binary_policy")
                 # Codex's params shape evolved: legacy carried a flat
                 # ``command`` string; newer
                 # ``CommandExecutionRequestApprovalParams`` carries
@@ -1373,16 +1416,27 @@ class CodexAdapter(LLMAdapter):
                 # passes would let auto-mode approve the whole request.
                 for act in actions or []:
                     if not isinstance(act, dict):
-                        return f"malformed_command_action:{type(act).__name__}"
+                        return (
+                            Decision.DENY,
+                            f"malformed_command_action:{type(act).__name__}",
+                        )
                     argv = act.get("argv") or act.get("command")
                     if not argv:
-                        return "command_action_missing_argv"
+                        return (Decision.DENY, "command_action_missing_argv")
                     argv_lists.append(argv)
                 cmd = params.get("command")
                 if cmd:
                     argv_lists.append(cmd)
                 if not argv_lists:
-                    return "no_command_in_params"
+                    return (Decision.DENY, "no_command_in_params")
+                # Evaluate every argv entry. Aggregate to the strictest
+                # outcome across the batch (#1694):
+                #   - ANY DENY → DENY (deny-wins)
+                #   - else ANY REQUIRE_APPROVAL → REQUIRE_APPROVAL
+                #     (mixed batches go through the queue)
+                #   - else all ALLOW → ALLOW (auto-approve)
+                aggregate = Decision.ALLOW
+                aggregate_reason = "allow"
                 for argv in argv_lists:
                     # Per-argv fail-closed (codex review #1575 round
                     # 4 P1): an unparseable shell string would
@@ -1398,13 +1452,23 @@ class CodexAdapter(LLMAdapter):
                             "declining (fail closed)",
                             argv, eval_exc,
                         )
-                        return f"binary_eval_failed:{argv!r}"
-                    if getattr(result, "decision", None) is Decision.DENY:
-                        return f"binary:{argv}"
+                        return (
+                            Decision.DENY, f"binary_eval_failed:{argv!r}",
+                        )
+                    rdec = getattr(result, "decision", None)
+                    rrule = getattr(result, "rule", "") or ""
+                    if rdec is Decision.DENY:
+                        return (Decision.DENY, f"binary:{rrule or argv}")
+                    if rdec is Decision.REQUIRE_APPROVAL:
+                        aggregate = Decision.REQUIRE_APPROVAL
+                        aggregate_reason = rrule or f"no_match:{argv}"
+                    # ALLOW: leave aggregate as-is (only downgrades to
+                    # REQUIRE_APPROVAL if a later entry isn't allow-listed).
+                return (aggregate, aggregate_reason)
             elif kind == "fileChange":
                 policy = getattr(cu, "_path_policy", None)
                 if policy is None:
-                    return "no_path_policy"
+                    return (Decision.DENY, "no_path_policy")
                 # Newer shape: ``fileChanges`` list with ``path`` per entry.
                 # Legacy/alt: ``changes`` or ``files``.
                 changes = (
@@ -1429,7 +1493,7 @@ class CodexAdapter(LLMAdapter):
                 # otherwise pass through to the queue and auto-mode
                 # would blanket-approve.
                 if not changes:
-                    return "no_changes_in_params"
+                    return (Decision.DENY, "no_changes_in_params")
                 # Strict per-entry validation (codex review #1575
                 # round 5 P1): a non-dict entry or a dict missing
                 # ``path`` / ``absolutePath`` must decline. Silently
@@ -1437,10 +1501,13 @@ class CodexAdapter(LLMAdapter):
                 # approve the whole request.
                 for change in changes or []:
                     if not isinstance(change, dict):
-                        return f"malformed_change:{type(change).__name__}"
+                        return (
+                            Decision.DENY,
+                            f"malformed_change:{type(change).__name__}",
+                        )
                     path_str = change.get("path") or change.get("absolutePath")
                     if not path_str:
-                        return "change_missing_path"
+                        return (Decision.DENY, "change_missing_path")
                 evaluated_any = False
                 for change in changes or []:
                     path_str = change.get("path") or change.get("absolutePath")
@@ -1467,16 +1534,25 @@ class CodexAdapter(LLMAdapter):
                             "declining (fail closed)",
                             p, eval_exc,
                         )
-                        return f"path_eval_failed:{p}"
+                        return (Decision.DENY, f"path_eval_failed:{p}")
                     if getattr(result, "decision", None) is Decision.DENY:
-                        return f"path:{p}"
+                        return (Decision.DENY, f"path:{p}")
                 if not evaluated_any:
-                    return "no_evaluable_path_in_params"
+                    return (Decision.DENY, "no_evaluable_path_in_params")
+                # Path writes that passed deny but are not on the
+                # allow-list (or are allow-listed writes) all carry
+                # REQUIRE_APPROVAL today — PathPolicy is intentionally
+                # not changing in #1694, so we fall through to the
+                # ApprovalQueue (no fileChange auto-approve short-circuit).
+                return (Decision.REQUIRE_APPROVAL, "fileChange_passed_policy")
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "codex_policy_precheck(%s) skipped: %s", kind, exc,
+            logger.warning(
+                "codex_policy_precheck(%s) failed unexpectedly: %s — "
+                "declining (fail closed)", kind, exc,
             )
-        return None
+            return (Decision.DENY, f"precheck_exception:{type(exc).__name__}")
+        # Unknown kind — be conservative.
+        return (Decision.DENY, f"unknown_kind:{kind}")
 
     async def _iter_with_overflow_hint(
         self,

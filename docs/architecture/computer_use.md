@@ -40,9 +40,15 @@ The backend is selected once at feature init and cannot be swapped at runtime.
 | `!fs-list <path>` | `filesystem_read` | Auto-approve inside allow-list; human approval outside |
 | `!fs-write <path>` | `filesystem_write` | Always human approval; payload includes a unified-diff preview |
 | `!fs-edit <path> <old> <new>` | `filesystem_write` | Always human approval; replaces the Nth occurrence of `old_text` with `new_text`; payload includes a unified-diff preview |
-| `!shell <cmd>` | `shell_execution_sandboxed` (docker) or `shell_execution_host` (local) | Always human approval; binary deny-list hard-rejects before approval |
+| `!shell <cmd>` | `shell_execution_sandboxed` (docker) or `shell_execution_host` (local) | Auto-approved binaries run without a prompt; unlisted binaries route through the queue (human or scoped auto-approve); deny-listed binaries hard-reject |
 
-A path or binary that matches the deny-list is rejected before the approval queue ever sees it; the approver cannot accidentally widen the deny-list.
+A path or binary that matches the deny-list is rejected before the approval queue ever sees it; the approver cannot accidentally widen the deny-list. The binary policy has three states (#1694):
+
+- **Deny-list match** → hard `DENY`. No queue prompt.
+- **Allow-list (a.k.a. `auto_approved_binaries`) match** → `ALLOW`. Pre-approved; queue is bypassed.
+- **Neither** → `REQUIRE_APPROVAL`. Routes through the ApprovalQueue so the operator (or a scoped auto-approve rule) decides.
+
+Path writes still go through approval regardless of allow-list match — write paths are wider blast radius and never short-circuit.
 
 ## Configuration
 
@@ -53,11 +59,17 @@ backend = "docker"                    # docker | local
 allowed_paths = ["~/projects", "~/Documents"]
 deny_paths = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
 max_read_bytes = 5_000_000
-allowed_binaries = ["git", "ls", "cat", "rg", "uv", "node", "python"]
+# Canonical key (#1694). Binaries on this list run without a queue
+# prompt — the operator has pre-approved them. Everything not on
+# `auto_approved_binaries` and not on `denied_binaries` routes through
+# the ApprovalQueue.
+auto_approved_binaries = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
 denied_binaries = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 auto_approve_read = true              # only inside allowed_paths
 audit_log_path = ".kestrel/computer_use_audit.jsonl"
 ```
+
+`allowed_binaries` is accepted as a one-release deprecation synonym for `auto_approved_binaries`. If both are set the canonical key wins and a warning is logged; if only the legacy key is set it still works and a deprecation warning is logged. Rename it when you next edit your kestrel.toml.
 
 The toml is looked up in this order: (1) the agent's `storage_path` directory, (2) `<storage_path>/..`, (3) walking up from the source file to the repo root. Per-agent kestrel.toml under `agent_data/<name>/` is the typical home.
 
