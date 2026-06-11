@@ -1038,7 +1038,8 @@ class AnthropicAdapter(LLMAdapter):
                     text_content += item
                 yield item
 
-            # If we have tool calls, yield a final LLMResponse with assembled tool calls
+            # Assemble any tool calls collected during the stream.
+            parsed_tool_calls = None
             if tool_calls_accumulator:
                 parsed_tool_calls = []
                 for idx in sorted(tool_calls_accumulator.keys()):
@@ -1067,25 +1068,35 @@ class AnthropicAdapter(LLMAdapter):
                         name=tc_data["name"],
                         arguments=args
                     ))
+                # A structured-output-only turn assembles no real tool calls.
+                parsed_tool_calls = parsed_tool_calls or None
 
-                # Calculate total tokens
-                total_tokens = None
-                if input_tokens is not None and output_tokens is not None:
-                    total_tokens = input_tokens + output_tokens
+            # Calculate total tokens
+            total_tokens = None
+            if input_tokens is not None and output_tokens is not None:
+                total_tokens = input_tokens + output_tokens
 
-                # Only yield LLMResponse if we have actual tool calls (not structured output)
-                if parsed_tool_calls:
-                    yield LLMResponse(
-                        content=text_content if text_content else None,
-                        tool_calls=parsed_tool_calls,
-                        raw=None,
-                        input_tokens=input_tokens,
-                        output_tokens=output_tokens,
-                        total_tokens=total_tokens,
-                    )
-                elif text_content and structured_output_tool_name:
-                    # Structured output - yield the JSON as final text
-                    yield text_content
+            # Structured output: surface the assembled JSON as final text
+            # (text was streamed as a tool-arg JSON, not content chunks).
+            if structured_output_tool_name and text_content and not parsed_tool_calls:
+                yield text_content
+
+            # Always emit a terminal LLMResponse carrying token usage, even for
+            # text-only / structured turns. The service layer meters streamed
+            # turns from this terminal response; previously it was emitted ONLY
+            # when tool calls were present (nested under `if
+            # tool_calls_accumulator`), so text-only streams — the common case —
+            # dropped their token usage entirely, a silent billing undercount.
+            # Consumers read this only for tool_calls / usage; visible content
+            # was already streamed as chunks.
+            yield LLMResponse(
+                content=text_content if text_content else None,
+                tool_calls=parsed_tool_calls,
+                raw=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
 
         except Exception as e:
             logger.error(f"Anthropic streaming with tools failed: {e}", exc_info=True)
