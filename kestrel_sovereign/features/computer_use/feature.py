@@ -53,18 +53,35 @@ from .backends import (
     SandboxBackend,
 )
 from .path_safety import PathSafetyError, resolve_realpath
-from .policy import BinaryPolicy, Decision, PathPolicy, PolicyResult, split_command
+from .policy import (
+    BinaryPolicy,
+    Decision,
+    PathPolicy,
+    PolicyResult,
+    command_contains_unquoted_shell_control,
+    split_command,
+)
 
 logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
-# ``gh`` is allow-listed so it reaches the approval queue rather than
-# being hard-denied by binary policy before the scoped auto-approve seam
-# can govern it (epic #1290 D4: talon_file_and_claim → gh issue create).
-# Allow-listed != auto-run: BinaryPolicy still returns REQUIRE_APPROVAL,
-# so a human (or an explicit, scoped auto-approve rule) remains the gate.
-_DEFAULT_ALLOWED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
+# Auto-approved binaries skip the ApprovalQueue (#1694). The default
+# list is deliberately narrow: only inert read-only tools where the
+# argv shape can't be turned into arbitrary host work via flags or
+# args. Interpreters (``python``, ``node``), package managers (``uv``,
+# ``gh``) and other rich CLIs are NOT auto-approved by default — they
+# still route through the queue so the operator (or a scoped
+# auto-approve rule in security.permission_store) decides. Operators
+# who want to broaden the default add binaries to
+# ``[features.computer_use].auto_approved_binaries`` in kestrel.toml.
+#
+# The bridge handler additionally downgrades ALLOW to REQUIRE_APPROVAL
+# when the raw command string contains shell metacharacters
+# (``;``, ``&&``, ``||``, ``|``, backticks, ``$(...)``, redirects,
+# newlines) so an allow-listed first token can never bless a piggy-
+# backed compound command.
+_DEFAULT_AUTO_APPROVED_BINS = ["ls", "cat", "rg"]
 _DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
@@ -152,8 +169,34 @@ class ComputerUseFeature(Feature):
             deny=denied,
             auto_approve_read=bool(self._cfg.get("auto_approve_read", True)),
         )
+        # `auto_approved_binaries` is the canonical key (#1694). The
+        # `allowed_binaries` spelling is accepted as a one-release
+        # deprecation synonym: if `auto_approved_binaries` is set it
+        # wins outright; if only `allowed_binaries` is set we honor it
+        # and log a one-time WARNING; if both are set the canonical key
+        # wins and we WARN that the legacy one is being ignored.
+        cfg_auto = self._cfg.get("auto_approved_binaries")
+        cfg_legacy = self._cfg.get("allowed_binaries")
+        if cfg_auto is not None:
+            auto_bins = list(cfg_auto)
+            if cfg_legacy is not None:
+                logger.warning(
+                    "ComputerUseFeature: both `auto_approved_binaries` and "
+                    "legacy `allowed_binaries` set in [features.computer_use]; "
+                    "ignoring `allowed_binaries`. Remove it from kestrel.toml."
+                )
+        elif cfg_legacy is not None:
+            logger.warning(
+                "ComputerUseFeature: `allowed_binaries` is a deprecated "
+                "alias for `auto_approved_binaries`. Rename it in "
+                "kestrel.toml. The legacy spelling will be removed in a "
+                "future release."
+            )
+            auto_bins = list(cfg_legacy)
+        else:
+            auto_bins = list(_DEFAULT_AUTO_APPROVED_BINS)
         self._binary_policy = BinaryPolicy(
-            allow=list(self._cfg.get("allowed_binaries", _DEFAULT_ALLOWED_BINS)),
+            allow=auto_bins,
             deny=list(self._cfg.get("denied_binaries", _DEFAULT_DENIED_BINS)),
         )
 
@@ -176,10 +219,12 @@ class ComputerUseFeature(Feature):
             return
 
         logger.info(
-            "ComputerUseFeature initialized: backend=%s, allowed=%d, allowed_bins=%d",
+            "ComputerUseFeature initialized: backend=%s, allowed=%d, "
+            "auto_approved_bins=%d, denied_bins=%d",
             self._backend.name,
             len(allowed),
             len(self._binary_policy.allow),
+            len(self._binary_policy.deny),
         )
 
     async def shutdown(self) -> None:
@@ -381,7 +426,19 @@ class ComputerUseFeature(Feature):
                 await self._audit_denied(tool_name, payload, allowed_by + ["denied:policy"])
                 return _GateOutcome(False, allowed_by, f"policy:{decision.rule}")
             allowed_by.append("policy")
-            require_approval = True
+            # #1694: honor BinaryPolicy's three-state result instead of
+            # hardcoding require_approval=True. Allow-listed binaries
+            # (Decision.ALLOW) are pre-approved and bypass the queue —
+            # the same contract PathPolicy uses for allow-listed reads
+            # under auto_approve_read. Anything not on the allow-list
+            # returns REQUIRE_APPROVAL and routes through the queue.
+            # #1694 codex review P1: the compound-command guard now
+            # lives inside ``BinaryPolicy.evaluate`` itself, so when
+            # ``shell`` passes the raw command string the policy
+            # already downgrades ALLOW → REQUIRE_APPROVAL on unquoted
+            # shell control chars and the rule reads
+            # ``compound_command:allow:<bin>``.
+            require_approval = decision.decision is Decision.REQUIRE_APPROVAL
         else:
             require_approval = False
 
@@ -817,12 +874,29 @@ class ComputerUseFeature(Feature):
 
     @tool(
         name="shell",
-        description="Run a shell command (always approval-gated).",
+        description=(
+            "Run a shell command. Deny-listed binaries hard-refuse; "
+            "auto-approved binaries run without a prompt; everything "
+            "else routes through the ApprovalQueue."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
     async def shell(self, command: str, timeout: int | str = 60) -> ToolResult:
-        """Run a shell command after policy + approval.
+        """Run a shell command after policy + (conditional) approval.
+
+        Approval semantics (#1694):
+
+        - Deny-listed binary → hard refuse before queueing.
+        - Auto-approved binary (allow-list match) → runs without a
+          prompt. Same contract as ``auto_approve_read`` for paths.
+        - Anything else → routes through ApprovalQueue (operator or
+          scoped auto-approve rule decides).
+
+        The compound-command guard (raw string with unquoted ``;``,
+        ``&&``, backticks, ``$(...)``, redirects, newline) downgrades
+        ALLOW to REQUIRE_APPROVAL so an allow-listed first token can't
+        bless a piggy-backed second command.
 
         Args:
             command: The shell command to run; tokenized with shlex.
@@ -873,7 +947,11 @@ class ComputerUseFeature(Feature):
                 "backend": self._backend.name if self._backend else "uninitialized",
                 "timeout": timeout,
             },
-            argv=argv,
+            # Pass the RAW command (not the pre-tokenized argv) so
+            # ``BinaryPolicy.evaluate`` can apply its compound-command
+            # guard (#1694 codex review P1). Argv-list inputs are
+            # trusted; raw strings get the metacharacter check.
+            argv=command,
         )
         if not outcome:
             return ToolResult.failed(error=outcome.denied_reason)

@@ -117,7 +117,12 @@ async def test_tool_field_truncated_at_200_chars(tmp_path):
 @pytest.mark.asyncio
 async def test_bridge_policy_deny_records_event(tmp_path):
     """Policy-gate DENY in the codex_adapter bridge must write a
-    typed decline event tagged with the policy reason."""
+    typed decline event tagged with the policy reason.
+
+    Under #1694, hard-decline requires the binary be on the deny-list
+    (unlisted binaries route through the queue, not hard-decline). Use
+    ``rm`` with ``deny=['rm']`` to exercise the policy DENY path.
+    """
     from kestrel_sovereign.features.computer_use.policy import (
         BinaryPolicy,
     )
@@ -130,13 +135,13 @@ async def test_bridge_policy_deny_records_event(tmp_path):
             )
         ),
         "ComputerUseFeature": SimpleNamespace(
-            _binary_policy=BinaryPolicy(allow=["gh"]),
+            _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
             _path_policy=None,
         ),
     }
     adapter = CodexAdapter()
     handler = adapter._make_codex_approval_handler(agent, "commandExecution")
-    reply = await handler({"command": "rm -rf /"})  # rm not allow-listed
+    reply = await handler({"command": "rm -rf /"})  # deny-listed
     assert reply == {"decision": "decline"}
 
     rows = await list_recent_declines_for_agent(db, agent_id="did:test:emma")
@@ -146,8 +151,48 @@ async def test_bridge_policy_deny_records_event(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_bridge_policy_allow_records_auto_approve(tmp_path):
+    """#1694: an allow-listed binary short-circuits the queue and the
+    bridge records the auto-approve as a typed event with
+    status=auto_approved purely for after-the-fact audit. The
+    operational-state block intentionally filters these out (its job
+    is "what blocked a turn"); the row lives in the
+    codex_decline_events table for review."""
+    from kestrel_sovereign.features.computer_use.policy import (
+        BinaryPolicy,
+    )
+    db = await _backend(tmp_path)
+    agent = _agent_with_db(db)
+    queue_called = AsyncMock(return_value=(True, "auto"))
+    agent.features = {
+        "SecurityFeature": SimpleNamespace(
+            approval_queue=SimpleNamespace(request_approval=queue_called),
+        ),
+        "ComputerUseFeature": SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
+            _path_policy=None,
+        ),
+    }
+    adapter = CodexAdapter()
+    handler = adapter._make_codex_approval_handler(agent, "commandExecution")
+    reply = await handler({"command": "gh issue create -R O/R --title x"})
+    assert reply == {"decision": "accept"}
+    queue_called.assert_not_called()
+
+    rows = await list_recent_declines_for_agent(db, agent_id="did:test:emma")
+    assert len(rows) == 1
+    assert rows[0].status == "auto_approved"
+    assert rows[0].reason.startswith("policy_allow:")
+
+
+@pytest.mark.asyncio
 async def test_bridge_queue_denial_records_event(tmp_path):
-    """Approval queue saying 'denied' must surface as queue_denied."""
+    """Approval queue saying 'denied' must surface as queue_denied.
+
+    Under #1694, the queue is only reached for binaries the policy
+    routes to REQUIRE_APPROVAL — i.e. unlisted ones. Use ``touch``
+    with no allow/deny so the policy falls through to the queue.
+    """
     from kestrel_sovereign.features.computer_use.policy import (
         BinaryPolicy,
     )
@@ -160,13 +205,13 @@ async def test_bridge_queue_denial_records_event(tmp_path):
             )
         ),
         "ComputerUseFeature": SimpleNamespace(
-            _binary_policy=BinaryPolicy(allow=["gh"]),
+            _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
             _path_policy=None,
         ),
     }
     adapter = CodexAdapter()
     handler = adapter._make_codex_approval_handler(agent, "commandExecution")
-    reply = await handler({"command": "gh issue create -R O/R --title x"})
+    reply = await handler({"command": "touch /tmp/x"})
     assert reply == {"decision": "decline"}
 
     rows = await list_recent_declines_for_agent(db, agent_id="did:test:emma")
@@ -176,27 +221,24 @@ async def test_bridge_queue_denial_records_event(tmp_path):
 
 @pytest.mark.asyncio
 async def test_bridge_no_queue_records_event(tmp_path):
-    """Missing SecurityFeature → no_approval_queue reason."""
+    """Missing SecurityFeature → no_approval_queue reason.
+
+    Under #1694, the queue is only consulted for REQUIRE_APPROVAL
+    binaries, so the test must use an unlisted binary so the policy
+    falls through to the queue check (which is then absent).
+    """
+    from kestrel_sovereign.features.computer_use.policy import BinaryPolicy
     db = await _backend(tmp_path)
     agent = _agent_with_db(db)
     agent.features = {
-        # CU present (so policy gate passes) but no SecurityFeature.
         "ComputerUseFeature": SimpleNamespace(
-            _binary_policy=None,  # no policy → passes through (round 2 still declines on no_binary_policy)
+            _binary_policy=BinaryPolicy(allow=["gh"], deny=["rm"]),
             _path_policy=None,
         ),
     }
-    # Actually with no _binary_policy the gate returns "no_binary_policy"
-    # — that's a policy_deny variant. Use a permissive policy instead.
-    from kestrel_sovereign.features.computer_use.policy import BinaryPolicy
-    agent.features["ComputerUseFeature"] = SimpleNamespace(
-        _binary_policy=BinaryPolicy(allow=["gh"]),
-        _path_policy=None,
-    )
-
     adapter = CodexAdapter()
     handler = adapter._make_codex_approval_handler(agent, "commandExecution")
-    reply = await handler({"command": "gh issue create -R O/R --title x"})
+    reply = await handler({"command": "touch /tmp/x"})  # unlisted → queue
     assert reply == {"decision": "decline"}
 
     rows = await list_recent_declines_for_agent(db, agent_id="did:test:emma")

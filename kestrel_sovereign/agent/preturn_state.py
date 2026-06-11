@@ -346,19 +346,24 @@ async def _codex_decline_section(agent: Any) -> Optional[str]:
             "operational_state: codex_decline read failed: %s", exc,
         )
         return None
-    if not rows:
+    # #1694: the same store also records auto-approves via the
+    # codex_native bridge (status="auto_approved"). Those are
+    # transparency events, not blockers; the operational state block
+    # surfaces what BLOCKED a turn so filter them out here.
+    declined_rows = [r for r in rows if r.status == "declined"]
+    if not declined_rows:
         return None
     by_reason: dict[str, int] = {}
-    for ev in rows:
+    for ev in declined_rows:
         key = ev.reason.split(":", 1)[0]
         by_reason[key] = by_reason.get(key, 0) + 1
     counts = ", ".join(
         f"{n} {r}" for r, n in sorted(by_reason.items())
     )
-    latest = rows[0]
+    latest = declined_rows[0]
     latest_tool = latest.tool[:80]
     return (
-        f"Codex declines (recent {len(rows)}): {counts}; "
+        f"Codex declines (recent {len(declined_rows)}): {counts}; "
         f"latest: {latest.request} → {latest_tool!r}"
     )
 

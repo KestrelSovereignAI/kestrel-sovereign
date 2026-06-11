@@ -1073,7 +1073,10 @@ class TestCodexApprovalBridge:
         return agent, captured
 
     @pytest.mark.asyncio
-    async def test_bridged_approval_returns_accept(self):
+    async def test_allow_listed_binary_auto_accepts_without_queue(self):
+        """#1694: allow-listed binary → policy returns Decision.ALLOW →
+        bridge short-circuits to ``accept`` without queueing. Mirrors
+        ``auto_approve_read`` for PathPolicy."""
         a = CodexAdapter()
         agent, captured = self._agent_with_queue(approves=True)
         handler = a._make_codex_approval_handler(
@@ -1085,10 +1088,39 @@ class TestCodexApprovalBridge:
             "cwd": "/tmp",
         })
         assert reply == {"decision": "accept"}
-        assert len(captured) == 1
-        assert captured[0]["feature_name"] == "codex_native"
-        assert captured[0]["tool_name"] == "commandExecution"
-        assert captured[0]["tool_args"]["command"].startswith("gh issue create")
+        assert captured == [], (
+            "allow-listed binary must bypass the ApprovalQueue (#1694)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unlisted_binary_routes_through_queue(self):
+        """#1694: a binary that is neither allow- nor deny-listed
+        returns Decision.REQUIRE_APPROVAL → bridge reaches the
+        ApprovalQueue. Queue approval → accept; queue denial → decline."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        # Approving queue: queue is reached and says yes.
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": "touch /tmp/x"})
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, "unlisted binary must reach the queue"
+
+        # Denying queue: same binary, queue says no.
+        agent2, captured2 = self._agent_with_queue(approves=False)
+        agent2.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler2 = a._make_codex_approval_handler(agent2, "commandExecution")
+        reply2 = await handler2({"command": "touch /tmp/x"})
+        assert reply2 == {"decision": "decline"}
 
     @pytest.mark.asyncio
     async def test_bridged_denial_returns_decline(self):
@@ -1106,55 +1138,81 @@ class TestCodexApprovalBridge:
         assert reply == {"decision": "decline"}
 
     @pytest.mark.asyncio
-    async def test_policy_gate_hard_denies_disallowed_binary(self):
+    async def test_compound_command_downgrades_allow_to_queue(self):
+        """#1694 codex review P1: a flat ``command`` whose first
+        token is allow-listed but whose body contains an unquoted
+        shell control char must NOT auto-approve. The bridge
+        downgrades to REQUIRE_APPROVAL and routes through the queue
+        so the operator (and any scoped-auto-approve rule) sees the
+        full compound, not just the allow-listed head."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": "git status; rm -rf /tmp/x"})
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, (
+            "compound command must reach the queue, not auto-accept"
+        )
+
+    @pytest.mark.asyncio
+    async def test_compound_command_with_denied_token_hard_denies(self):
+        """If the policy DENIES any argv in the batch via parsed
+        ``commandActions``, the compound guard is irrelevant — DENY
+        still wins."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({
+            "commandActions": [
+                {"argv": ["git", "status"]},
+                {"argv": ["rm", "-rf", "/tmp/x"]},
+            ],
+        })
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
+    async def test_policy_gate_hard_denies_deny_listed_binary(self):
         """Codex review #1575 round 1 P1: BinaryPolicy DENY must fire
-        BEFORE the auto-mode approval queue, so a non-allow-listed
-        binary can't be silently auto-approved by an Auto agent."""
+        BEFORE the queue, so a deny-listed binary can't be approved.
+
+        Under #1694, a binary must be on the deny-list to hard-decline
+        without queueing — unlisted binaries now route through the
+        queue. This test exercises the deny path specifically.
+        """
         from kestrel_sovereign.features.computer_use.policy import (
             BinaryPolicy,
         )
         a = CodexAdapter()
         agent, captured = self._agent_with_queue(approves=True)
-        # Build a ComputerUseFeature stub that exposes _binary_policy.
         cu = SimpleNamespace(
-            _binary_policy=BinaryPolicy(allow=["git", "ls"]),
+            _binary_policy=BinaryPolicy(allow=["git", "ls"], deny=["rm"]),
             _path_policy=None,
         )
         agent.features["ComputerUseFeature"] = cu
 
         handler = a._make_codex_approval_handler(agent, "commandExecution")
         reply = await handler({
-            "command": "rm -rf /",  # `rm` not in allow list → DENY
+            "command": "rm -rf /",  # `rm` on deny list → DENY
         })
         assert reply == {"decision": "decline"}
         # The queue must not have been consulted — the gate hard-stopped.
         assert captured == [], (
             "BinaryPolicy DENY must short-circuit before queue auto-approves"
-        )
-
-    @pytest.mark.asyncio
-    async def test_policy_gate_passes_allow_listed_binary_to_queue(self):
-        """Allow-listed binary → policy returns REQUIRE_APPROVAL →
-        the bridge then routes through the queue, where auto-mode
-        approves."""
-        from kestrel_sovereign.features.computer_use.policy import (
-            BinaryPolicy,
-        )
-        a = CodexAdapter()
-        agent, captured = self._agent_with_queue(approves=True)
-        cu = SimpleNamespace(
-            _binary_policy=BinaryPolicy(allow=["gh"]),
-            _path_policy=None,
-        )
-        agent.features["ComputerUseFeature"] = cu
-
-        handler = a._make_codex_approval_handler(agent, "commandExecution")
-        reply = await handler({
-            "command": "gh issue create -R O/R --title x",
-        })
-        assert reply == {"decision": "accept"}
-        assert len(captured) == 1, (
-            "queue must be reached when binary is allow-listed"
         )
 
     @pytest.mark.asyncio
@@ -1190,22 +1248,39 @@ class TestCodexApprovalBridge:
     @pytest.mark.asyncio
     async def test_handler_safe_decline_when_queue_raises(self):
         """Any queue exception must collapse to decline; the codex
-        turn must not hang on a kestrel-side error."""
+        turn must not hang on a kestrel-side error.
+
+        Use a binary that triggers REQUIRE_APPROVAL so the bridge
+        actually reaches the queue. Allow-listed (ALLOW) would
+        short-circuit before the queue; deny-listed (DENY) would
+        decline before the queue; only no_match routes through.
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy,
+        )
         a = CodexAdapter()
 
         async def boom(*args, **kwargs):
             raise RuntimeError("queue down")
 
         agent = SimpleNamespace(
-            features={"SecurityFeature": SimpleNamespace(
-                approval_queue=SimpleNamespace(request_approval=boom)
-            )},
+            features={
+                "SecurityFeature": SimpleNamespace(
+                    approval_queue=SimpleNamespace(request_approval=boom)
+                ),
+                "ComputerUseFeature": SimpleNamespace(
+                    _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+                    _path_policy=None,
+                ),
+            },
             did="did:test:agent",
         )
         handler = a._make_codex_approval_handler(
             agent, "commandExecution",
         )
-        reply = await handler({"threadId": "thr-1", "command": "ls"})
+        # ``touch`` is no_match → REQUIRE_APPROVAL → reaches the
+        # exploding queue → exception → safe decline.
+        reply = await handler({"threadId": "thr-1", "command": "touch /tmp/x"})
         assert reply == {"decision": "decline"}
 
     @pytest.mark.asyncio
