@@ -6,7 +6,7 @@ This gives the agent tools to:
 - See current context utilization
 - Summarize specific conversation sections
 - Mark content as protected or droppable
-- Proactively trigger compression
+- Proactively trigger compaction
 - Exclude irrelevant content (soft removal)
 - Restore excluded content
 - Stash context for context-switching (like git stash)
@@ -86,7 +86,7 @@ def _wrap_manager_result(
 ) -> ToolResult:
     """Translate a context_manager method's dict return into a ToolResult.
 
-    The manager's ``mark_messages`` / ``compress_session`` / ``stash_*``
+    The manager's ``mark_messages`` / ``compact_session`` / ``stash_*``
     helpers all return dicts with an inconsistent honesty shape:
 
       - some include ``success: True`` and the data
@@ -147,14 +147,14 @@ class ContextFeature(Feature):
     - Checking context window utilization
     - Summarizing specific conversation sections
     - Marking content priority (protected/droppable)
-    - Triggering compression
+    - Triggering compaction
     - Excluding/restoring content
     - Stashing context for context-switching (stash/pop/apply/list/drop)
     """
 
     @property
     def tool_description(self) -> str:
-        return "Manage context window - check status, summarize sections, mark content priority, compress, exclude/restore content"
+        return "Manage context window - check status, summarize sections, mark content priority, compact, exclude/restore content"
 
     async def initialize(self):
         """Initialize the context feature.
@@ -301,7 +301,7 @@ class ContextFeature(Feature):
 
     @tool(
         name="summarize_section",
-        description="Summarize a specific section of conversation history to save context space. Use this to compress verbose exchanges while preserving key information.",
+        description="Summarize a specific section of conversation history to save context space. Use this to compact verbose exchanges while preserving key information.",
         category=ToolCategory.MEMORY,
         command_prefix="!context summarize"
     )
@@ -437,24 +437,24 @@ class ContextFeature(Feature):
         )
 
     @tool(
-        name="compress_context",
-        description="Compress context by summarizing older messages. Use when context utilization is high and you need space for new information.",
+        name="compact_context",
+        description="Compact context by summarizing older messages. Use when context utilization is high and you need space for new information.",
         category=ToolCategory.MEMORY,
-        command_prefix="!context compress"
+        command_prefix="!context compact"
     )
-    async def compress_context(
+    async def compact_context(
         self,
         keep_recent: int = 10,
         force: bool = False,
         dry_run: bool = False,
     ) -> ToolResult:
         """
-        Compress context window by summarizing older messages.
+        Compact context window by summarizing older messages.
 
         Args:
             keep_recent: Number of recent messages to preserve verbatim (default 10)
-            force: Compress even if utilization is below threshold (default False)
-            dry_run: Show what would be compressed without doing it (default False)
+            force: Compact even if utilization is below threshold (default False)
+            dry_run: Show what would be compacted without doing it (default False)
         """
         for name, val in (("force", force), ("dry_run", dry_run)):
             if not isinstance(val, bool):
@@ -477,56 +477,56 @@ class ContextFeature(Feature):
 
         if dry_run:
             try:
-                status = await self.context_manager.check_compression_needed()
+                status = await self.context_manager.check_compaction_needed()
             except (AttributeError, TypeError, ValueError) as e:
-                logger.error(f"compress_context dry-run failed: {e}")
+                logger.error(f"compact_context dry-run failed: {e}")
                 return ToolResult.failed(str(e))
             except Exception as e:
-                logger.error(f"compress_context dry-run failed: {e}", exc_info=True)
+                logger.error(f"compact_context dry-run failed: {e}", exc_info=True)
                 return ToolResult.failed(str(e))
 
             return ToolResult.ok(
                 confirmation=(
-                    f"Dry run: would compress "
+                    f"Dry run: would compact "
                     f"{max(0, status['message_count'] - keep_val)} message(s), "
                     f"preserve {min(keep_val, status['message_count'])}"
                 ),
                 data={
                     "dry_run": True,
-                    "compression_recommended": status.get("compression_recommended"),
+                    "compaction_recommended": status.get("compaction_recommended"),
                     "utilization_percent": status.get("utilization_percent"),
                     "message_count": status.get("message_count"),
-                    "would_compress": max(0, status["message_count"] - keep_val),
+                    "would_compact": max(0, status["message_count"] - keep_val),
                     "would_preserve": min(keep_val, status["message_count"]),
                 },
             )
 
         if not self.llm_service:
-            return ToolResult.failed("LLM service not available for compression")
+            return ToolResult.failed("LLM service not available for compaction")
 
         try:
-            result = await self.context_manager.compress_session(
+            result = await self.context_manager.compact_session(
                 llm_service=self.llm_service,
                 preserve_recent=keep_val,
                 force=force,
             )
 
-            # Reset context stats after compression — accumulated
-            # duplicate/attribution data is stale post-compression.
+            # Reset context stats after compaction — accumulated
+            # duplicate/attribution data is stale post-compaction.
             context_stats = getattr(self.agent, 'context_stats', None)
             if context_stats is not None:
                 context_stats.reset()
         except (AttributeError, TypeError, ValueError) as e:
-            logger.error(f"compress_context failed: {e}")
+            logger.error(f"compact_context failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
-            logger.error(f"compress_context failed: {e}", exc_info=True)
+            logger.error(f"compact_context failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
         return _wrap_manager_result(
             result,
-            ok_confirmation=f"Compressed context, preserved last {keep_val}",
-            failure_prefix="compress_session",
+            ok_confirmation=f"Compacted context, preserved last {keep_val}",
+            failure_prefix="compact_session",
         )
 
     @tool(
@@ -942,23 +942,23 @@ class ContextFeature(Feature):
         )
 
     # =========================================================================
-    # RLM-Inspired Advanced Compression
+    # RLM-Inspired Advanced Compaction
     # =========================================================================
 
     @tool(
-        name="hierarchical_compress",
-        description="Compress context using hierarchical tree-structured summarization (RLM-inspired). Better preserves structure than linear compression.",
+        name="hierarchical_compact",
+        description="Compact context using hierarchical tree-structured summarization (RLM-inspired). Better preserves structure than linear compaction.",
         category=ToolCategory.MEMORY,
-        command_prefix="!context compress hierarchical"
+        command_prefix="!context compact hierarchical"
     )
-    async def hierarchical_compress(
+    async def hierarchical_compact(
         self,
         chunk_size: int = 4000,
         keep_recent: int = 5,
         max_depth: int = 3,
     ) -> ToolResult:
         """
-        Hierarchical compression using recursive summarization.
+        Hierarchical compaction using recursive summarization.
 
         Args:
             chunk_size: Target characters per chunk (default: 4000)
@@ -968,7 +968,7 @@ class ContextFeature(Feature):
         if not self.context_manager:
             return ToolResult.failed("Context manager not available")
         if not self.llm_service:
-            return ToolResult.failed("LLM service not available for compression")
+            return ToolResult.failed("LLM service not available for compaction")
 
         try:
             chunk_val = int(chunk_size)
@@ -984,31 +984,31 @@ class ContextFeature(Feature):
             )
 
         try:
-            result = await self.context_manager.hierarchical_compress(
+            result = await self.context_manager.hierarchical_compact(
                 llm_service=self.llm_service,
                 chunk_size=chunk_val,
                 preserve_recent=keep_val,
                 max_depth=depth_val,
             )
         except (AttributeError, TypeError, ValueError) as e:
-            logger.error(f"hierarchical_compress failed: {e}")
+            logger.error(f"hierarchical_compact failed: {e}")
             return ToolResult.failed(str(e))
         except Exception as e:
-            logger.error(f"hierarchical_compress failed: {e}", exc_info=True)
+            logger.error(f"hierarchical_compact failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
         return _wrap_manager_result(
             result,
             ok_confirmation=(
-                f"Hierarchical compress complete (chunk_size={chunk_val}, "
+                f"Hierarchical compact complete (chunk_size={chunk_val}, "
                 f"keep_recent={keep_val}, max_depth={depth_val})"
             ),
-            failure_prefix="hierarchical_compress",
+            failure_prefix="hierarchical_compact",
         )
 
     @tool(
         name="recursive_query",
-        description="Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compressed originals, or excluded messages without using main model quota.",
+        description="Query a subset of context using a cheaper model (RLM-inspired sub-LM call). Use for exploring large context sections, compacted originals, or excluded messages without using main model quota.",
         category=ToolCategory.MEMORY,
         command_prefix="!context query"
     )
@@ -1022,7 +1022,7 @@ class ContextFeature(Feature):
         Query context subset using recursive sub-LM call.
 
         Args:
-            context_source: Source - "stash:name", "excluded", "compressed:ID", "summary:ID", "last_N"
+            context_source: Source - "stash:name", "excluded", "compacted:ID", "summary:ID", "last_N"
             query: Question to ask about the context
             use_cheap_model: Use cheaper model for query (default: True)
         """
@@ -1061,7 +1061,7 @@ class ContextFeature(Feature):
                     for m in excluded
                 ])[:10000]
 
-            elif context_source.startswith("compressed:") or context_source.startswith("summary:"):
+            elif context_source.startswith("compacted:") or context_source.startswith("summary:"):
                 try:
                     marker_id = context_source.split(":", 1)[1]
                     conv_store = self.context_manager._get_conversation_store()
@@ -1115,7 +1115,7 @@ class ContextFeature(Feature):
             else:
                 return ToolResult.failed(
                     f"Invalid source: {context_source}. "
-                    "Use 'stash:name', 'excluded', 'compressed:ID', 'summary:ID', or 'last_N'"
+                    "Use 'stash:name', 'excluded', 'compacted:ID', 'summary:ID', or 'last_N'"
                 )
 
             if not context_text:

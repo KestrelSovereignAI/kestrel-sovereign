@@ -15,7 +15,7 @@ likely to regress silently if skipped"*):
 
 Plus the design-doc checklist: sync-write-fails-closed, back-compat
 with the feature flag off, ``restore_excluded`` works on salvage
-markers, ``compress_session`` retains its semantics through the
+markers, ``compact_session`` retains its semantics through the
 shared primitive.
 """
 
@@ -563,7 +563,7 @@ class TestConsolidatorWhileSalvagePending:
         Codex round 1 #5: it must look at the linked marker's actual
         ``salvage_state``, not just the presence of
         ``summarized_into`` — otherwise it regresses
-        ``compress_session``'s already-durable folds (those set
+        ``compact_session``'s already-durable folds (those set
         ``summarized_into`` too)."""
         from kestrel_sovereign.storage.memory_consolidator import (
             MemoryConsolidator,
@@ -576,7 +576,7 @@ class TestConsolidatorWhileSalvagePending:
                     100: {"type": "salvage", "salvage_state": SalvageState.POINTER_ONLY},
                     200: {"type": "salvage", "salvage_state": SalvageState.PENDING_SUMMARY},
                     300: {"type": "salvage", "salvage_state": SalvageState.DURABLE_FOLDED},
-                    400: {"type": "compression"},  # legacy !compress marker
+                    400: {"type": "compaction"},  # compact_session marker (no salvage_state)
                 }
 
             async def fetchone(self, sql, params=()):
@@ -601,7 +601,7 @@ class TestConsolidatorWhileSalvagePending:
         ]
         assert await consolidator._all_messages_have_pending_salvage(all_pointer) is True
         assert await consolidator._all_messages_have_pending_salvage(all_pending) is True
-        # Codex round 1 #5: durable + legacy compression must NOT be
+        # Codex round 1 #5: durable + legacy compaction must NOT be
         # treated as pending. The consolidator must run for those
         # spans (or use the summary as input, per Emma's preference).
         assert await consolidator._all_messages_have_pending_salvage(all_durable) is False

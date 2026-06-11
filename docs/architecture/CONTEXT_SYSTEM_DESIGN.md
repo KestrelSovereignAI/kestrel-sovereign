@@ -26,7 +26,7 @@
 4. [Redesign](#redesign)
    - [A — Measurement source of truth](#a--measurement-source-of-truth)
    - [B — Elastic token budget](#b--elastic-token-budget)
-   - [C — Unify auto-prune with durable compression](#c--unify-auto-prune-with-durable-compression)
+   - [C — Unify auto-prune with durable compaction](#c--unify-auto-prune-with-durable-compaction)
    - [D — Legible context: clickable breakdown popup](#d--legible-context-clickable-breakdown-popup)
 5. [Non-goals](#non-goals)
 6. [Review questions for Emma](#review-questions-for-emma)
@@ -37,14 +37,14 @@
 ## Why
 
 A user looked at the chat footer pill — `● 34 msgs · 74%` with a
-**Compress** button — and asked a reasonable question: *what does
-"compress" even mean when context is already dynamically managed, and
+**Compact** button — and asked a reasonable question: *what does
+"compact" even mean when context is already dynamically managed, and
 isn't old history already condensed into summary nodes?*
 
 The honest answer required reading three subsystems, because **the
 context model is implicit** — it is not expressed in any single
 component, surfaced in any UI, or reconciled across the mechanisms that
-shape it. That is the disease. The pill, the Compress button, and the
+shape it. That is the disease. The pill, the Compact button, and the
 `%` are symptoms of it.
 
 Tortoise Doctrine framing: the symptom is "users (and agents) cannot
@@ -96,12 +96,12 @@ conversation is therefore *not* generally "condensed into summary
 nodes" — only the emotionally salient fraction, and only as extra
 system-prompt context.
 
-### 3. `!compress` — manual, LLM-driven, the only durable fold
+### 3. `!compact` — manual, LLM-driven, the only durable fold
 
-`ConversationManager.compress_session()`
+`ConversationManager.compact_session()`
 (`kestrel_sovereign/agent/conversation_manager.py:79-243`) takes all but
 the recent N messages, sends them to the LLM for one summary, writes a
-`[COMPRESSED CONTEXT - N messages summarized]` system marker into the
+`[COMPACTED CONTEXT - N messages summarized]` system marker into the
 conversation, and marks the originals
 `excluded_from_context: true` with `summarized_into` pointing at the
 marker id (lines 195-228).
@@ -116,7 +116,7 @@ returns it (line 1046). The marker carries `original_message_ids` +
 `message_range`; each original carries `summarized_into`. A
 `restore_excluded` tool / `!context restore` exists
 (`kestrel_sovereign/features/context/feature.py:536-540`). So
-compression is **fold, not delete** — durable, reversible,
+compaction is **fold, not delete** — durable, reversible,
 agent-reachable.
 
 ### Sessions are soft, not hard
@@ -159,7 +159,7 @@ source of truth are missing**. Four concrete defects follow from that:
 
 1. **Three mechanisms, no reconciliation.** Transient prune (silent,
    lossy *to the model*), additive episodes (gated on emotion, system
-   slice), durable `!compress` (manual fold). Nothing composes them; no
+   slice), durable `!compact` (manual fold). Nothing composes them; no
    component knows the net state.
 
 2. **The silent-prune gap is a correctness hole, not just UX.**
@@ -167,8 +167,8 @@ source of truth are missing**. Four concrete defects follow from that:
    durable artifact**. Episodes only capture emotionally significant
    clusters. So a non-emotional but important fact in an old turn — a
    decision, a number, a constraint — is silently gone from the model's
-   view unless a human happens to hit `!compress` in time. The machinery
-   to fix this already exists (`compress_session`'s
+   view unless a human happens to hit `!compact` in time. The machinery
+   to fix this already exists (`compact_session`'s
    summarize→exclude→link); it simply is not wired into the prune path.
 
 3. **Static budget throttles history for no reason.** The
@@ -179,9 +179,9 @@ source of truth are missing**. Four concrete defects follow from that:
    reason the pill reads high so easily — not "out of room," but "the
    budget will not let history use the room."
 
-4. **The Compress affordance is mis-framed.** It fires at history-slice
+4. **The Compact affordance is mis-framed.** It fires at history-slice
    ≥70% implying overflow risk; auto-prune means overflow is impossible.
-   The real value of `!compress` is the opposite: *salvage old turns
+   The real value of `!compact` is the opposite: *salvage old turns
    into a durable summary before the silent prune drops them.* The
    label and trigger should say what it does.
 
@@ -230,7 +230,7 @@ the code path; `**` heuristic deleted.
 ### B — Elastic token budget
 
 **Problem:** static `15/40/20/10/15` reserves budget for empty sections
-and throttles other sections → premature prune / premature "Compress"
+and throttles other sections → premature prune / premature "Compact"
 pressure.
 
 **Change (per Emma's reallocation policy):** budget is computed
@@ -280,7 +280,7 @@ condition explicitly.
   per the no-cop-outs rule, tests assert the documented elastic
   behavior).
 
-### C — Unify auto-prune with durable compression
+### C — Unify auto-prune with durable compaction
 
 > **Next correctness track.** Design-first, immediately after A/B/D
 > lands. **Release-blocking for any claim that context correctness is
@@ -309,12 +309,12 @@ salvage record into the normal
 
 If async summarization fails or has not yet run, the UI surfaces a
 **pending fold** or **failed fold** in the breakdown popup — never
-"compression saved this" when only silent-prune happened (D honesty
+"compaction saved this" when only silent-prune happened (D honesty
 invariant).
 
 **Consequences to specify in C's own design doc:**
 
-- manual `!compress` becomes a *tuning knob* (force / keep-N / earlier),
+- manual `!compact` becomes a *tuning knob* (force / keep-N / earlier),
   not a safety requirement;
 - async/deferred/batched summarization strategy (queue, worker, retry,
   back-pressure) — bounded by the sync salvage record so no fact is ever
@@ -373,11 +373,11 @@ number *correct*, not compatible.
   note · soft-session note ("this slice is session X; the agent also
   carries cross-session episodic + semantic memory") · which section
   borrowed slack from where this turn (B's transparency requirement).
-- The **Compress** affordance is relabeled/retooltip'd to state what it
+- The **Compact** affordance is relabeled/retooltip'd to state what it
   actually does ("summarize older turns into a durable, restorable note
   before pruning drops them"), not implied overflow.
 
-**UI honesty invariant (Emma):** **no UI element may imply "compression
+**UI honesty invariant (Emma):** **no UI element may imply "compaction
 saved this" when only the silent-prune path executed and no durable fold
 exists.** Out-of-window spans are labeled out-of-window, not folded.
 
@@ -399,7 +399,7 @@ implementation.
 clickable; popup renders the canonical taxonomy above incl. tool tokens
 and the pending-fold / out-of-window states; warning labels appear where
 counts are estimated, missing, pending, or failed; no surface implies
-durable compression where only silent prune happened; idle/no-session
+durable compaction where only silent prune happened; idle/no-session
 shows the #713-safe shape; frontend + endpoint tests cover idle +
 populated session + the warning-label states.
 
@@ -411,7 +411,7 @@ populated session + the warning-label states.
   D only makes it legible.
 - Hard per-conversation isolation (ChatGPT-style) — explicitly rejected;
   Kestrel is an agent with continuous memory, not a threaded chatbot.
-- Removing `!compress` — C may demote it to a tuning knob, but the
+- Removing `!compact` — C may demote it to a tuning knob, but the
   durable-fold + `restore_excluded` contract stays.
 - Any change to episode emotional-significance gating (separate concern,
   see `MEMORY_SYSTEM.md`).
@@ -428,7 +428,7 @@ refinements folded into the sections above:
    correctness track, not a nice-to-have follow-up.* C is design-first,
    immediately next, and release-blocking for any claim that context
    correctness is fixed. → folded into [Redesign intro](#redesign) and
-   [C](#c--unify-auto-prune-with-durable-compression).
+   [C](#c--unify-auto-prune-with-durable-compaction).
 2. **B reallocation policy.** Idle budget flows to *any* over-demanded
    eligible section by turn-intent priority (not only history). System
    floor is the **measured token cost of mandatory governance content
@@ -439,12 +439,12 @@ refinements folded into the sections above:
    durable capture is not. Invariant: *no model-visible pruning without
    a synchronous durable artifact or lossless pointer; the summary may
    be async, the salvage record must be sync.* → folded into
-   [C](#c--unify-auto-prune-with-durable-compression).
+   [C](#c--unify-auto-prune-with-durable-compaction).
 4. **D popup taxonomy.** Refined to separate source / visibility-state /
    budget-behavior, with explicit warning labels (`not counted`,
    `estimated`, `pending fold`, `failed fold`,
    `silently-pruned path still active`) and the UI-honesty invariant
-   that no surface may imply "compression saved this" when only
+   that no surface may imply "compaction saved this" when only
    silent-prune happened. → folded into [D](#d--legible-context-clickable-breakdown-popup).
 
 **Ack received (Emma, 2026-05-20):** confirmed reading head `ac26c324`
@@ -475,7 +475,7 @@ In the same ack, Emma added two hardening invariants — explicitly
 - `kestrel_sovereign/agent/context_manager.py:513-524` — silent
   auto-prune (C)
 - `kestrel_sovereign/agent/conversation_manager.py:79-243` —
-  `compress_session`, the durable-fold machinery C reuses
+  `compact_session`, the durable-fold machinery C reuses
 - `kestrel_sovereign/storage/async_conversation_store.py:1046,1102` —
   `include_excluded` read path
 - `kestrel_sovereign/storage/memory_consolidator.py:47-206` — episodes

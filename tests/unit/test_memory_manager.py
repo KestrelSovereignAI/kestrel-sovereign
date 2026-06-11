@@ -5,7 +5,7 @@ Tests the memory manager's orchestration of:
 - Stash operations (git-like stash/pop/apply/list/drop/save/peek)
 - Memory retrieval with emotional context
 - Episode creation and management
-- Hierarchical compression
+- Hierarchical compaction
 """
 import pytest
 from datetime import datetime, timezone
@@ -784,17 +784,17 @@ class TestEpisodeManagement:
         consolidator.create_session_episode.assert_called_once_with(force=True)
 
 
-class TestHierarchicalCompression:
-    """Tests for hierarchical_compress() operation."""
+class TestHierarchicalCompaction:
+    """Tests for hierarchical_compact() operation."""
 
     @pytest.mark.asyncio
-    async def test_hierarchical_compress_success(self):
-        """Should compress messages hierarchically."""
+    async def test_hierarchical_compact_success(self):
+        """Should compact messages hierarchically."""
         storage = MagicMock()
         conv_store = AsyncMock()
         storage.conversation = conv_store
 
-        # Mock 20 messages to compress (with longer content to create multiple chunks)
+        # Mock 20 messages to compact (with longer content to create multiple chunks)
         history = [
             {"role": "user", "content": f"Message {i}: " + "x" * 500}
             for i in range(20)
@@ -804,14 +804,14 @@ class TestHierarchicalCompression:
 
         # Mock LLM service
         llm_service = AsyncMock()
-        llm_service.generate.return_value = "Compressed summary of the conversation"
+        llm_service.generate.return_value = "Compacted summary of the conversation"
 
         # Mock token counter
         counter = MagicMock()
         counter.count.side_effect = lambda x: len(x) // 4  # Simple token estimate
 
         mm = MemoryManager(storage)
-        result = await mm.hierarchical_compress(
+        result = await mm.hierarchical_compact(
             llm_service=llm_service,
             counter=counter,
             chunk_size=1000,
@@ -820,15 +820,15 @@ class TestHierarchicalCompression:
         )
 
         assert result["success"] is True
-        assert result["messages_compressed"] == 15  # 20 - 5 preserved
+        assert result["messages_compacted"] == 15  # 20 - 5 preserved
         assert result["messages_preserved"] == 5
         assert result["tokens_saved"] > 0
         assert "summary_preview" in result
         llm_service.generate.assert_called()
 
     @pytest.mark.asyncio
-    async def test_hierarchical_compress_not_enough_messages(self):
-        """Should return error if not enough messages to compress."""
+    async def test_hierarchical_compact_not_enough_messages(self):
+        """Should return error if not enough messages to compact."""
         storage = MagicMock()
         conv_store = AsyncMock()
         storage.conversation = conv_store
@@ -841,7 +841,7 @@ class TestHierarchicalCompression:
         counter = MagicMock()
 
         mm = MemoryManager(storage)
-        result = await mm.hierarchical_compress(
+        result = await mm.hierarchical_compact(
             llm_service=llm_service,
             counter=counter,
             preserve_recent=5
@@ -851,7 +851,7 @@ class TestHierarchicalCompression:
         assert "Not enough messages" in result["reason"]
 
     @pytest.mark.asyncio
-    async def test_hierarchical_compress_chunks_messages(self):
+    async def test_hierarchical_compact_chunks_messages(self):
         """Should split messages into chunks."""
         storage = MagicMock()
         messages = [

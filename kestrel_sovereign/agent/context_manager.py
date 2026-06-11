@@ -1132,15 +1132,15 @@ class ContextManager:
         )
 
     # Delegate to ConversationManager
-    async def compress_session(self, llm_service, preserve_recent: int = 10, force: bool = False) -> Dict[str, Any]:
+    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
-        return await self.conversation_manager.compress_session(
+        return await self.conversation_manager.compact_session(
             llm_service, self.counter, preserve_recent, force
         )
 
-    async def check_compression_needed(self, utilization_threshold: float = 70.0) -> Dict[str, Any]:
+    async def check_compaction_needed(self, utilization_threshold: float = 70.0) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
-        return await self.conversation_manager.check_compression_needed(
+        return await self.conversation_manager.check_compaction_needed(
             self.counter, self.model, utilization_threshold
         )
 
@@ -1203,9 +1203,9 @@ class ContextManager:
         """Delegate to MemoryManager."""
         return await self.memory_manager.stash_peek(stash_id, max_chars)
 
-    async def hierarchical_compress(self, llm_service, chunk_size: int = 4000, preserve_recent: int = 5, max_depth: int = 3) -> Dict[str, Any]:
+    async def hierarchical_compact(self, llm_service, chunk_size: int = 4000, preserve_recent: int = 5, max_depth: int = 3) -> Dict[str, Any]:
         """Delegate to MemoryManager."""
-        return await self.memory_manager.hierarchical_compress(
+        return await self.memory_manager.hierarchical_compact(
             llm_service, self.counter, chunk_size, preserve_recent, max_depth
         )
 

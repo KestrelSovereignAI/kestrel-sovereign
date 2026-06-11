@@ -94,7 +94,7 @@ class SalvageReason:
 
     AUTO_PRUNE_PRETRIM = "auto-prune-pretrim"
     AUTO_PRUNE_POSTBUDGET = "auto-prune-postbudget"
-    MANUAL_COMPRESS = "manual-compress"
+    MANUAL_COMPACT = "manual-compact"
 
 
 class SalvageState:
@@ -350,7 +350,7 @@ async def salvage_messages(
 # ---------------------------------------------------------------------------
 
 
-# The LLM summarisation prompt is exactly the one ``compress_session``
+# The LLM summarisation prompt is exactly the one ``compact_session``
 # uses today (``conversation_manager.py:142-154``). C's design keeps
 # the prompt identical so the summary content stays consistent
 # regardless of who triggered the fold (prune-driven vs operator-

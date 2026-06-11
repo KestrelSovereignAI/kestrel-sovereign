@@ -135,8 +135,8 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
         assert payload["response_reserve"] == 1024
         assert payload["total_budget"] == 2976
         assert payload["status"] == "critical"
-        assert payload["compression_recommended"] is True
-        assert "compression strongly recommended" in payload["warnings"][0]
+        assert payload["compaction_recommended"] is True
+        assert "compaction strongly recommended" in payload["warnings"][0]
         # New for #1310: full breakdown block surfaced for the popup.
         assert "breakdown" in payload
         assert payload["breakdown"]["total_measured"] == 2900
@@ -520,7 +520,7 @@ def test_context_status_returns_idle_shape_when_no_session_id():
     through to ``storage.get_conversation_history(session_id=None)``, which
     returns the agent's aggregate history across ALL sessions.  That made
     the chat-footer indicator show the cross-session total (e.g. "472 msgs
-    · 100% Compress") on a fresh empty chat pane where no conversation was
+    · 100% Compact") on a fresh empty chat pane where no conversation was
     active.  The fixed endpoint returns an idle/zeroed shape and never
     reads storage in this case.
     """
@@ -553,7 +553,7 @@ def test_context_status_returns_idle_shape_when_no_session_id():
         assert payload["message_count"] == 0
         assert payload["total_tokens"] == 0
         assert payload["utilization_percent"] == 0.0
-        assert payload["compression_recommended"] is False
+        assert payload["compaction_recommended"] is False
         assert payload["status"] == "idle"
         assert payload["warnings"] == []
         # Model / limits should still reflect the agent's configuration so

@@ -645,7 +645,7 @@ async def get_context_status(
         # session_id=None into get_conversation_history leaked the agent's
         # cross-session aggregate count and falsely rolled utilization to
         # 100%, which surfaced in the chat footer as "472 msgs · 100%
-        # Compress" on an empty pane.  See #713.  "Context window status"
+        # Compact" on an empty pane.  See #713.  "Context window status"
         # is only meaningful for an active conversation; with none, there's
         # nothing to report.
         if not session_id:
@@ -657,7 +657,7 @@ async def get_context_status(
                 "response_reserve": RESPONSE_RESERVE,
                 "total_budget": context_limit - RESPONSE_RESERVE,
                 "utilization_percent": 0.0,
-                "compression_recommended": False,
+                "compaction_recommended": False,
                 "status": "idle",
                 "warnings": [],
                 "breakdown": None,
@@ -812,13 +812,13 @@ async def get_context_status(
             status_str = "warning"
             warnings.append(
                 f"Context window {utilization_percent:.0f}% full - "
-                "consider !compress to save older turns into a durable summary"
+                "consider !compact to save older turns into a durable summary"
             )
         else:
             status_str = "critical"
             warnings.append(
                 f"Context window {utilization_percent:.0f}% full - "
-                "compression strongly recommended"
+                "compaction strongly recommended"
             )
 
         # 7. Auto-detect the legacy silent-prune path (Emma's
@@ -939,7 +939,7 @@ async def get_context_status(
             "response_reserve": breakdown["response_reserve"],
             "total_budget": total_budget,
             "utilization_percent": utilization_percent,
-            "compression_recommended": utilization_percent >= 70,
+            "compaction_recommended": utilization_percent >= 70,
             "status": status_str,
             "warnings": warnings,
             # Layered breakdown the popup renders. Sections include

@@ -25,6 +25,7 @@ review — an in-place ``ALTER COLUMN TYPE`` would have broken
 
 from __future__ import annotations
 
+import json
 import logging
 import struct
 from typing import TYPE_CHECKING
@@ -707,3 +708,92 @@ async def _migrate_sqlite_greenfield(db: "AsyncDatabase", *, table: str) -> None
         "%s greenfield SQLite migration complete: added embedding_vec BLOB. "
         "No backfill (greenfield column).", table,
     )
+
+
+# =============================================================================
+# compress → compact terminology rename (session-context shrinking)
+# =============================================================================
+
+
+async def migrate_compaction_terminology(db: "AsyncDatabase") -> None:
+    """One-time data rewrite for the compress → compact terminology
+    rename: session-context shrinking is "compaction" (the industry
+    term), and the persisted metadata strings move with the code so
+    readers never need dual-string compat.
+
+    Rewrites ``conversation_history.metadata`` (plaintext JSON TEXT on
+    both dialects — only ``content`` is encrypted at rest, see #1401):
+
+    - ``type: "compression"`` → ``"compaction"``
+    - ``type: "hierarchical_compression"`` → ``"hierarchical_compaction"``
+    - key ``messages_compressed`` → ``messages_compacted``
+    - key ``compressed_at`` → ``compacted_at``
+    - ``salvage_reason: "manual-compress"`` → ``"manual-compact"``
+    - ``excluded_reason: "Replaced by compression"`` → ``"Replaced by compaction"``
+
+    Legacy ``[COMPRESSED CONTEXT …]`` / ``[HIERARCHICAL COMPRESSION …]``
+    ``content`` markers are deliberately left alone: content may be
+    encrypted at rest, and no code path parses the marker text — it is
+    display prose inside the message body.
+
+    Idempotent by construction: rewritten rows no longer match the
+    LIKE filter, so re-running is a no-op. The migration runs on every
+    boot (no completion sentinel exists), so the filter is kept tight:
+    ``compression"`` matches all three quoted JSON values
+    (``"compression"``, ``"hierarchical_compression"``, ``"Replaced by
+    compression"``) and ``manual-compress`` matches the salvage reason
+    — without fetching ordinary rows whose metadata merely mentions the
+    word compress. The key renames (``messages_compressed``,
+    ``compressed_at``) only occur on marker rows already matched by the
+    type filter. Dialect-neutral: plain ``?`` placeholders, no DDL.
+    """
+    rows = await db.fetchall(
+        "SELECT id, metadata FROM conversation_history "
+        "WHERE metadata LIKE '%compression\"%' "
+        "   OR metadata LIKE '%manual-compress%'",
+        (),
+    )
+    if not rows:
+        return
+
+    rewritten = 0
+    async with db.transaction():
+        for row_id, raw in rows:
+            if not raw:
+                continue
+            try:
+                meta = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+
+            new_meta = dict(meta)
+            marker_type = new_meta.get("type")
+            if marker_type == "compression":
+                new_meta["type"] = "compaction"
+            elif marker_type == "hierarchical_compression":
+                new_meta["type"] = "hierarchical_compaction"
+            if "messages_compressed" in new_meta:
+                new_meta["messages_compacted"] = new_meta.pop("messages_compressed")
+            if "compressed_at" in new_meta:
+                new_meta["compacted_at"] = new_meta.pop("compressed_at")
+            if new_meta.get("salvage_reason") == "manual-compress":
+                new_meta["salvage_reason"] = "manual-compact"
+            if new_meta.get("excluded_reason") == "Replaced by compression":
+                new_meta["excluded_reason"] = "Replaced by compaction"
+
+            if new_meta == meta:
+                continue
+            await db.execute(
+                "UPDATE conversation_history SET metadata = ? WHERE id = ?",
+                (json.dumps(new_meta), row_id),
+            )
+            rewritten += 1
+
+    if rewritten:
+        logger.info(
+            "compaction-terminology migration: rewrote %d "
+            "conversation_history metadata row(s) (compression → "
+            "compaction).", rewritten,
+        )

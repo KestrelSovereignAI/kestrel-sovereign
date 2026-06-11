@@ -142,7 +142,7 @@ These features use `self.agent.storage.db` to create tables, sharing the same SQ
 | Feature | Usage | Writes back? |
 |---------|-------|-------------|
 | consent | `self.agent.llm_service.generate()` -- generates consent reflection | No |
-| context | Uses `self.llm_service` (cached from agent) for summarization/compression | No |
+| context | Uses `self.llm_service` (cached from agent) for summarization/compaction | No |
 | gcp_compute | `self.llm_service.switch_backend()` -- **mutates** LLM routing | **YES** |
 | model | `self.llm_service.set_model_preference()` -- **mutates** model config | **YES** |
 | reflection | Uses `llm_service` for interaction analysis | No |

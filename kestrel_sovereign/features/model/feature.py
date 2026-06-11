@@ -311,7 +311,7 @@ class ModelAgent(Feature):
                         f"(overflow {overflow:,} tok, {utilization:.1f}%). "
                         f"The new model's context window ({est['context_limit']:,}) "
                         "is too small for this conversation. Try a model with a "
-                        "larger context, or run `!compress` to reduce history."
+                        "larger context, or run `!compact` to reduce history."
                     )
                     return ToolResult.failed(
                         overflow_message,

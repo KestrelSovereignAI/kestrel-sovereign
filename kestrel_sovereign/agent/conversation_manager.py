@@ -24,7 +24,7 @@ class ConversationManager:
     2. Format conversation messages for context
     3. Handle message selection and filtering
     4. Manage message metadata (protect, exclude, restore)
-    5. Compression and summarization of conversation history
+    5. Compaction and summarization of conversation history
     """
 
     def __init__(
@@ -48,7 +48,7 @@ class ConversationManager:
         """Get conversation history from storage.
 
         Uses session-aware, limited retrieval that filters out excluded messages
-        (compressed, summarized, etc.).
+        (compacted, summarized, etc.).
 
         Args:
             session_id: Optional session ID to filter by specific session.
@@ -76,7 +76,7 @@ class ConversationManager:
             logger.error(f"Failed to get conversation history: {e}", exc_info=True)
             return []
 
-    async def compress_session(
+    async def compact_session(
         self,
         llm_service,
         counter,
@@ -84,9 +84,9 @@ class ConversationManager:
         force: bool = False
     ) -> Dict[str, Any]:
         """
-        Compress the current session by summarizing older messages.
+        Compact the current session by summarizing older messages.
 
-        This is an in-session compression that:
+        This is an in-session compaction that:
         1. Takes all messages except the most recent N
         2. Uses the LLM to create a summary
         3. Replaces older messages with the summary
@@ -96,12 +96,12 @@ class ConversationManager:
             llm_service: LLM service for generating summary
             counter: TokenCounter for token counting
             preserve_recent: Number of recent messages to keep verbatim
-            force: Compress even if utilization is low
+            force: Compact even if utilization is low
 
         Returns:
-            Dict with compression results (messages_compressed, tokens_saved, etc.)
+            Dict with compaction results (messages_compacted, tokens_saved, etc.)
         """
-        # Compression needs full unfiltered history to see what to compress
+        # Compaction needs full unfiltered history to see what to compact
         conv_store = self._get_conversation_store()
         if conv_store:
             history = await conv_store.get_full_history()
@@ -109,35 +109,35 @@ class ConversationManager:
             history = await self.get_conversation_history()
         message_count = len(history)
 
-        # Check if compression is needed
+        # Check if compaction is needed
         if not force and message_count <= preserve_recent + 5:
             return {
                 "success": False,
-                "reason": "Not enough messages to compress",
+                "reason": "Not enough messages to compact",
                 "message_count": message_count
             }
 
-        # Messages to compress (older) vs preserve (recent)
-        messages_to_compress = history[:-preserve_recent] if preserve_recent > 0 else history
+        # Messages to compact (older) vs preserve (recent)
+        messages_to_compact = history[:-preserve_recent] if preserve_recent > 0 else history
         messages_to_preserve = history[-preserve_recent:] if preserve_recent > 0 else []
 
-        if len(messages_to_compress) < 3:
+        if len(messages_to_compact) < 3:
             return {
                 "success": False,
-                "reason": "Not enough older messages to compress",
+                "reason": "Not enough older messages to compact",
                 "message_count": message_count
             }
 
-        # Count tokens in messages to compress
+        # Count tokens in messages to compact
         tokens_before = sum(
             counter.count(m.get("content", ""))
-            for m in messages_to_compress
+            for m in messages_to_compact
         )
 
         # Build summary prompt
         conversation_text = "\n".join([
             f"{m.get('role', 'user').upper()}: {m.get('content', '')}"
-            for m in messages_to_compress
+            for m in messages_to_compact
         ])
 
         summary_prompt = f"""Summarize this conversation segment concisely, preserving:
@@ -168,22 +168,22 @@ SUMMARY:"""
             tokens_saved = tokens_before - tokens_after
 
             # Collect original message IDs for transcript reference
-            original_message_ids = [m.get("id") for m in messages_to_compress if m.get("id")]
+            original_message_ids = [m.get("id") for m in messages_to_compact if m.get("id")]
             first_id = original_message_ids[0] if original_message_ids else None
             last_id = original_message_ids[-1] if original_message_ids else None
 
-            # Store the compression in the database
-            # Create a summary message that replaces the compressed portion
+            # Store the compaction in the database
+            # Create a summary message that replaces the compacted portion
             # Note: Transcript reference is in metadata only, not in content (LLM context)
-            compression_marker = {
+            compaction_marker = {
                 "role": "system",
-                "content": f"[COMPRESSED CONTEXT - {len(messages_to_compress)} messages summarized]\n\n{summary_text}",
+                "content": f"[COMPACTED CONTEXT - {len(messages_to_compact)} messages summarized]\n\n{summary_text}",
                 "metadata": {
-                    "type": "compression",
-                    "messages_compressed": len(messages_to_compress),
+                    "type": "compaction",
+                    "messages_compacted": len(messages_to_compact),
                     "tokens_before": tokens_before,
                     "tokens_after": tokens_after,
-                    "compressed_at": datetime.now(timezone.utc).isoformat(),
+                    "compacted_at": datetime.now(timezone.utc).isoformat(),
                     "original_message_ids": original_message_ids,
                     "message_range": {
                         "first": first_id,
@@ -192,35 +192,35 @@ SUMMARY:"""
                 }
             }
 
-            # Store the compression result
-            # Add the compression marker to conversation
+            # Store the compaction result
+            # Add the compaction marker to conversation
             conv_store = self._get_conversation_store()
             if conv_store:
                 await conv_store.add_conversation(
                     role="system",
-                    content=compression_marker["content"],
-                    metadata=compression_marker["metadata"]
+                    content=compaction_marker["content"],
+                    metadata=compaction_marker["metadata"]
                 )
 
-                # Get the ID of the compression marker we just created
+                # Get the ID of the compaction marker we just created
                 # We need this to populate summarized_into on original messages
                 # Query for just the last ID instead of full history (performance fix)
-                compression_marker_id = None
+                compaction_marker_id = None
                 if hasattr(conv_store, 'db'):
                     row = await conv_store.db.fetchone(
                         "SELECT id FROM conversation_history WHERE agent_id = ? ORDER BY id DESC LIMIT 1",
                         (conv_store.agent_id,)
                     )
-                    compression_marker_id = row[0] if row else None
+                    compaction_marker_id = row[0] if row else None
 
-                # Mark original messages as excluded and link to compression marker
-                if compression_marker_id and original_message_ids:
+                # Mark original messages as excluded and link to compaction marker
+                if compaction_marker_id and original_message_ids:
                     now = datetime.now(timezone.utc).isoformat()
                     exclusion_metadata = {
                         "excluded_from_context": True,
                         "excluded_at": now,
-                        "excluded_reason": "Replaced by compression",
-                        "summarized_into": str(compression_marker_id)
+                        "excluded_reason": "Replaced by compaction",
+                        "summarized_into": str(compaction_marker_id)
                     }
                     await conv_store.update_messages_metadata(
                         original_message_ids,
@@ -228,13 +228,13 @@ SUMMARY:"""
                     )
 
             logger.info(
-                f"Session compressed: {len(messages_to_compress)} messages → summary, "
+                f"Session compacted: {len(messages_to_compact)} messages → summary, "
                 f"saved {tokens_saved} tokens ({tokens_before} → {tokens_after})"
             )
 
             return {
                 "success": True,
-                "messages_compressed": len(messages_to_compress),
+                "messages_compacted": len(messages_to_compact),
                 "messages_preserved": len(messages_to_preserve),
                 "tokens_before": tokens_before,
                 "tokens_after": tokens_after,
@@ -243,35 +243,35 @@ SUMMARY:"""
             }
 
         except (ConnectionError, TimeoutError) as e:
-            logger.error(f"Network error during session compression: {e}", exc_info=True)
+            logger.error(f"Network error during session compaction: {e}", exc_info=True)
             return {
                 "success": False,
-                "reason": f"Network error during compression: {str(e)}",
+                "reason": f"Network error during compaction: {str(e)}",
                 "message_count": message_count
             }
         except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Data error during session compression: {e}", exc_info=True)
+            logger.error(f"Data error during session compaction: {e}", exc_info=True)
             return {
                 "success": False,
-                "reason": f"Data error during compression: {str(e)}",
+                "reason": f"Data error during compaction: {str(e)}",
                 "message_count": message_count
             }
         except Exception as e:
-            logger.error(f"Session compression failed: {e}", exc_info=True)
+            logger.error(f"Session compaction failed: {e}", exc_info=True)
             return {
                 "success": False,
-                "reason": f"Compression failed: {str(e)}",
+                "reason": f"Compaction failed: {str(e)}",
                 "message_count": message_count
             }
 
-    async def check_compression_needed(self, counter, model: str, utilization_threshold: float = 70.0, history: Optional[list] = None) -> Dict[str, Any]:
+    async def check_compaction_needed(self, counter, model: str, utilization_threshold: float = 70.0, history: Optional[list] = None) -> Dict[str, Any]:
         """
-        Check if session compression is recommended.
+        Check if session compaction is recommended.
 
         Args:
             counter: TokenCounter for token counting
             model: Model name for budget calculation
-            utilization_threshold: Percentage at which compression is recommended
+            utilization_threshold: Percentage at which compaction is recommended
             history: Pre-fetched session-filtered history (same as LLM sees).
                      If None, fetches limited history to approximate LLM path.
 
@@ -294,7 +294,7 @@ SUMMARY:"""
         history_utilization = (total_tokens / budget.history * 100) if budget.history > 0 else 0
 
         return {
-            "compression_recommended": history_utilization >= utilization_threshold,
+            "compaction_recommended": history_utilization >= utilization_threshold,
             "utilization_percent": round(history_utilization, 1),
             "message_count": message_count,
             "total_tokens": total_tokens,

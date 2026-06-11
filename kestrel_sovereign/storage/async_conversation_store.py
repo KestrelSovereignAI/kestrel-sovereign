@@ -1035,7 +1035,7 @@ class AsyncConversationStore:
             row_id = row[0]
             meta = json.loads(row[3]) if row[3] else None
 
-            # Skip messages excluded from context (compressed, summarized, etc.)
+            # Skip messages excluded from context (compacted, summarized, etc.)
             if meta and meta.get("excluded_from_context"):
                 continue
 

@@ -202,7 +202,7 @@ See `/feedback/chat_session_management.md` for the completed scout that triggere
 - `tiktoken` installed but never imported
 - Fake token counting using word count × 1.3
 - Character-based limits (50K chars) unrelated to actual tokens
-- No compression, no UI gauge, no `!compact` command
+- No compaction, no UI gauge, no `!compact` command
 
 ---
 

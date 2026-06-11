@@ -337,15 +337,15 @@ class MemoryConsolidator:
         Codex round 1 #5 caught a regression in the earlier sync
         version of this helper: it returned True for any cluster
         where every row had ``summarized_into`` set — but legacy
-        ``compress_session`` markers ALSO set that field and are
+        ``compact_session`` markers ALSO set that field and are
         already ``durable-folded``. The consolidator would have
         skipped clusters whose narrative the salvage summariser is
         not about to write, with no recovery path. We now load each
         marker and check its actual ``salvage_state``.
 
         ``durable-folded`` and ``failed-fold`` (and the legacy
-        ``compress_session`` markers, which carry ``type ==
-        "compression"`` and no ``salvage_state``) are treated as
+        ``compact_session`` markers, which carry ``type ==
+        "compaction"`` and no ``salvage_state``) are treated as
         settled — the consolidator may run its emotional-cluster
         logic for those spans, using the summary marker as input on
         Emma's "episode-as-input" preference (deferred to a follow-up
@@ -376,7 +376,7 @@ class MemoryConsolidator:
 
     async def _load_marker_state(self, marker_id: int) -> Optional[str]:
         """Return the linked marker's ``salvage_state``, or None when
-        the row is missing or is a legacy ``compression`` marker that
+        the row is missing or is a legacy ``compaction`` marker that
         has no salvage_state field (treated as ``durable-folded`` for
         the pending-check above)."""
         try:
@@ -396,9 +396,13 @@ class MemoryConsolidator:
             meta = json.loads(raw)
         except (TypeError, ValueError):
             return None
-        # Legacy compression markers don't have ``salvage_state``; they
-        # are durable-folded by construction.
-        if meta.get("type") == "compression":
+        # Pre-salvage ``compact_session`` markers don't have
+        # ``salvage_state``; they are durable-folded by construction.
+        # (Pre-rename rows carried ``type == "compression"`` — the
+        # startup migration rewrites them to "compaction" before this
+        # reader runs; an unmigrated row degrades to None, which the
+        # pending-check treats the same as durable-folded.)
+        if meta.get("type") == "compaction":
             return _SALVAGE_STATE_DURABLE_FOLDED
         return meta.get("salvage_state")
 

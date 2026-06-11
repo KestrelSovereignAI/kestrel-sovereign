@@ -2215,7 +2215,7 @@ let contextStatusElement = null;
  * fresh chat pane before the user starts or selects a conversation) the
  * indicator is hidden rather than showing stale/aggregate data.  See #713 —
  * previously this case leaked the agent's global cross-session message
- * count into the footer and offered a Compress button based on that
+ * count into the footer and offered a Compact button based on that
  * aggregate, which made no sense.
  */
 export async function updateContextStatus() {
@@ -2290,15 +2290,15 @@ export async function updateContextStatus() {
 
         contextStatusElement.style.color = color;
 
-        // Show compress button when utilization is 70%+
-        const showCompress = utilization_percent >= 70;
-        const compressButton = showCompress
-            // The Compress button lives inside the clickable pill
+        // Show compact button when utilization is 70%+
+        const showCompact = utilization_percent >= 70;
+        const compactButton = showCompact
+            // The Compact button lives inside the clickable pill
             // span, so its click would bubble up to the pill's
             // ``openContextBreakdownPopup`` handler. Stop propagation
-            // so clicking Compress only sends !compress (codex round
+            // so clicking Compact only sends !compact (codex round
             // 1 P2 caught this regression).
-            ? `<button onclick="event.stopPropagation(); window.compressContext()" style="
+            ? `<button onclick="event.stopPropagation(); window.compactContext()" style="
                     margin-left: 0.5rem;
                     padding: 0.125rem 0.375rem;
                     font-size: 0.625rem;
@@ -2308,7 +2308,7 @@ export async function updateContextStatus() {
                     border-radius: 3px;
                     cursor: pointer;
                     opacity: 0.9;
-                " title="Compress older messages to free up context space">Compress</button>`
+                " title="Compact older messages to free up context space">Compact</button>`
             : '';
 
         // Pill is clickable — opens the breakdown popup (#1310) which
@@ -2325,7 +2325,7 @@ export async function updateContextStatus() {
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
                   title="Click for per-section context breakdown · ${message_count} messages · ${utilization_percent.toFixed(1)}% of window used${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
-                ${icon} ${message_count} msgs · ${utilization_percent.toFixed(0)}%${routeCapBadge}${compressButton}
+                ${icon} ${message_count} msgs · ${utilization_percent.toFixed(0)}%${routeCapBadge}${compactButton}
             </span>
         `;
 
@@ -2372,7 +2372,7 @@ function showContextWarning(warnings, paneElement = null) {
     `;
     div.innerHTML = `
         <strong>${deps().kicon('warning')} Context Warning:</strong> ${warnings.join('. ')}
-        <br><small>Use <code>!compress</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
+        <br><small>Use <code>!compact</code> to summarize older messages, or start fresh with <code>!new-session</code></small>
     `;
     target.appendChild(div);
     const c = getChatContainer();
@@ -2394,7 +2394,7 @@ function showContextWarning(warnings, paneElement = null) {
  *   Retrieval / RAG — chunks + "estimated" badge, "skipped" when poll
  *   Reserve / Overhead — dynamic_context_overhead + response_reserve
  *
- * UI honesty invariant (Emma): never imply "compression saved this"
+ * UI honesty invariant (Emma): never imply "compaction saved this"
  * when only the silent-prune path executed. While #1311 is unshipped,
  * the popup unconditionally surfaces "silently-pruned path still
  * active" — the auto-detect invariant from the design doc.
@@ -2434,13 +2434,13 @@ window.openContextBreakdownPopup = async function () {
         title: 'Context breakdown',
         content: renderContextBreakdown(status),
         buttons: [
-            ...((status.compression_recommended)
+            ...((status.compaction_recommended)
                 ? [{
-                    label: 'Save older turns into a durable note (!compress)',
+                    label: 'Save older turns into a durable note (!compact)',
                     type: 'primary',
                     onClick: () => {
                         Modal.hide();
-                        window.compressContext();
+                        window.compactContext();
                     },
                 }]
                 : []),
@@ -2714,15 +2714,15 @@ function renderContextBreakdown(status) {
 }
 
 /**
- * Compress context by sending !compress command.
- * Called from the compress button in the context status indicator.
+ * Compact context by sending !compact command.
+ * Called from the compact button in the context status indicator.
  */
-window.compressContext = async function() {
+window.compactContext = async function() {
     if (!messageInput) return;
 
-    // Send the compress command
+    // Send the compact command
     const originalValue = messageInput.value;
-    messageInput.value = '!compress';
+    messageInput.value = '!compact';
     await sendMessage();
 
     // Restore original input if user was typing something

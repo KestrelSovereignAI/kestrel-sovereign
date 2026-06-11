@@ -43,7 +43,7 @@ BUILTIN_COMMAND_SPECS = [
     {"cmd": "!promote-backup", "handler": "_cmd_promote_backup", "description": "Save isolated session and backup", "args": "[--tier ...]", "category": "Backup"},
     {"cmd": "!sleep", "handler": "_cmd_sleep", "description": "Consolidate memories and export sovereignty snapshot", "args": "[--tier ...]", "category": "Memory"},
     {"cmd": "!consolidate", "handler": "_cmd_consolidate", "description": "Consolidate memories only", "category": "Memory"},
-    {"cmd": "!compress", "handler": "_cmd_compress", "description": "Compress session context", "args": "[--keep N]", "category": "Memory"},
+    {"cmd": "!compact", "handler": "_cmd_compact", "description": "Compact session context", "args": "[--keep N]", "category": "Memory"},
 
     # Agent/runtime
     {"cmd": "!create-agent", "handler": "_cmd_create_agent", "description": "Create trusted agent", "args": "<name>", "category": "Agent"},
@@ -361,7 +361,7 @@ class CommandHandler:
             "  !privacy-discard     - Discard isolated session",
             "",
             "Memory:",
-            "  !compress [--keep N] - Compress session (summarize older messages, keep N recent)",
+            "  !compact [--keep N]  - Compact session (summarize older messages, keep N recent)",
             "  !sleep [--tier ...]  - Consolidate memories + export to sovereignty storage",
             "  !consolidate         - Consolidate memories only (create episodes, archive)",
             "",
@@ -506,18 +506,18 @@ class CommandHandler:
         """
         return await self.agent._command_sleep(user_input + " --consolidate-only")
 
-    async def _cmd_compress(self, user_input: str) -> str:
+    async def _cmd_compact(self, user_input: str) -> str:
         """
-        Handle !compress command - in-session context compression.
+        Handle !compact command - in-session context compaction.
 
         Summarizes older messages to free up context window space
         while preserving recent messages verbatim.
 
         Usage:
-            !compress             - Compress with default settings (keep 10 recent)
-            !compress --keep 20   - Keep 20 most recent messages
-            !compress --force     - Force compression even if not needed
-            !compress --check     - Check if compression is recommended
+            !compact             - Compact with default settings (keep 10 recent)
+            !compact --keep 20   - Keep 20 most recent messages
+            !compact --force     - Force compaction even if not needed
+            !compact --check     - Check if compaction is recommended
         """
         import re
 
@@ -538,8 +538,8 @@ class CommandHandler:
 
         # Check-only mode
         if check_only:
-            result = await self.agent.context_manager.check_compression_needed()
-            status = "✅ Recommended" if result["compression_recommended"] else "ℹ️ Not needed"
+            result = await self.agent.context_manager.check_compaction_needed()
+            status = "✅ Recommended" if result["compaction_recommended"] else "ℹ️ Not needed"
             return (
                 f"{status}\n"
                 f"  Utilization: {result['utilization_percent']:.1f}% (threshold: {result['threshold']}%)\n"
@@ -549,30 +549,30 @@ class CommandHandler:
 
         # Check if llm_service exists
         if not hasattr(self.agent, 'llm_service') or not self.agent.llm_service:
-            return "❌ LLM service not available for compression"
+            return "❌ LLM service not available for compaction"
 
-        # Perform compression
-        result = await self.agent.context_manager.compress_session(
+        # Perform compaction
+        result = await self.agent.context_manager.compact_session(
             llm_service=self.agent.llm_service,
             preserve_recent=preserve_recent,
             force=force
         )
 
         if result["success"]:
-            # Reset context stats after compression (accumulated data is stale)
+            # Reset context stats after compaction (accumulated data is stale)
             context_stats = getattr(self.agent, 'context_stats', None)
             if context_stats is not None:
                 context_stats.reset()
 
             return (
-                f"✅ Session compressed\n"
-                f"  Messages compressed: {result['messages_compressed']}\n"
+                f"✅ Session compacted\n"
+                f"  Messages compacted: {result['messages_compacted']}\n"
                 f"  Messages preserved: {result['messages_preserved']}\n"
                 f"  Tokens saved: {result['tokens_saved']:,} ({result['tokens_before']:,} → {result['tokens_after']:,})\n"
                 f"  Summary preview: {result['summary_preview']}"
             )
         else:
-            return f"ℹ️ {result.get('reason', 'Compression not performed')}"
+            return f"ℹ️ {result.get('reason', 'Compaction not performed')}"
 
     # Sovereignty commands now handled by SovereigntyFeature via tool registry
     # !export-sovereignty, !import-sovereignty, !sovereignty-status, etc.
