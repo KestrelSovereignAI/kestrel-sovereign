@@ -287,7 +287,11 @@ class TestUnavailableProviderFails:
 
         assert len(providers) == 1
         assert providers[0]["name"] == "openai:api"
-        assert target == "gpt-5-mini"
+        # #1685: the fallback's model is now pinned onto its own provider dict
+        # (so multi-fallback configs with differing models all route), and the
+        # global target is cleared for per-provider concrete-model resolution.
+        assert providers[0]["model"] == "gpt-5-mini"
+        assert target is None
 
 
 class TestEmptyProviderListRaisesClearly:
