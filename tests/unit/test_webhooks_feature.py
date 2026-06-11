@@ -689,12 +689,34 @@ class TestWebhooksRegister:
         return feat
 
     @pytest.mark.asyncio
-    async def test_register_none_auth(self, feature):
+    async def test_register_none_auth_warns(self, feature):
+        """#1677: an unacknowledged auth_type=none registration still succeeds
+        but returns PARTIAL with a loud unauthenticated-endpoint warning."""
         from kestrel_sdk.tools.result import ToolResultStatus
         envelope = await feature.webhooks_register(name="open-hook", auth_type="none")
-        assert envelope.status is ToolResultStatus.OK
+        assert envelope.status is ToolResultStatus.PARTIAL
         assert envelope.data["name"] == "open-hook"
         assert envelope.data["endpoint"] == "/webhooks/open-hook"
+        assert envelope.data["unauthenticated"] is True
+        # The warning names the risk and the remediation.
+        blob = (envelope.error or "") + " " + (envelope.confirmation or "")
+        assert "UNAUTHENTICATED" in blob
+        assert "hmac_sha256" in blob
+        # The endpoint really was registered (warn, not refuse).
+        listing = await feature.webhooks_list()
+        assert any(w["name"] == "open-hook" for w in listing.data["webhooks"])
+
+    @pytest.mark.asyncio
+    async def test_register_none_auth_acknowledged_is_ok(self, feature):
+        """allow_unauthenticated=True downgrades the warning to a clean OK,
+        but the open endpoint is still flagged in data for audits."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        envelope = await feature.webhooks_register(
+            name="open-hook", auth_type="none", allow_unauthenticated=True
+        )
+        assert envelope.status is ToolResultStatus.OK
+        assert envelope.data["name"] == "open-hook"
+        assert envelope.data["unauthenticated"] is True
 
     @pytest.mark.asyncio
     async def test_register_bearer_auth(self, feature):
@@ -779,7 +801,7 @@ class TestWebhooksRegister:
     async def test_register_with_custom_rate_limit(self, feature):
         from kestrel_sdk.tools.result import ToolResultStatus
         envelope = await feature.webhooks_register(
-            name="rate-hook", auth_type="none", rate_limit=10
+            name="rate-hook", auth_type="none", rate_limit=10, allow_unauthenticated=True
         )
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["rate_limit"] == 10
@@ -788,7 +810,7 @@ class TestWebhooksRegister:
     async def test_register_with_event_type(self, feature):
         from kestrel_sdk.tools.result import ToolResultStatus
         envelope = await feature.webhooks_register(
-            name="event-hook", auth_type="none", event_type="push"
+            name="event-hook", auth_type="none", event_type="push", allow_unauthenticated=True
         )
         assert envelope.status is ToolResultStatus.OK
         assert envelope.data["event_type"] == "push"
@@ -797,7 +819,7 @@ class TestWebhooksRegister:
     async def test_register_hyphens_and_underscores_in_name(self, feature):
         from kestrel_sdk.tools.result import ToolResultStatus
         envelope = await feature.webhooks_register(
-            name="my-webhook_v2", auth_type="none"
+            name="my-webhook_v2", auth_type="none", allow_unauthenticated=True
         )
         assert envelope.status is ToolResultStatus.OK
 
