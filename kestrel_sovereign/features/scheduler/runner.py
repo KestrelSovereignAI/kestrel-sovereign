@@ -34,6 +34,16 @@ POLL_INTERVAL = 30
 # to the next one. 0 disables the rail (legacy fire-everything behaviour).
 DEFAULT_MISFIRE_GRACE_SECONDS = 600
 
+# Max number of due tasks executed concurrently per tick (#1675). The serial
+# loop meant one dispatch slower than POLL_INTERVAL (30s) delayed every later
+# due task, so a single long cognition turn could push other tasks past the
+# misfire grace and skip them. A modest cap overlaps the slow task *handlers*
+# while keeping LLM-call / memory pressure bounded; the quick DB writes are
+# serialized by aiosqlite's single connection regardless. Each due task touches
+# only its own scheduled_tasks row + a unique-id log append, so there is no
+# row-level read-modify-write race between concurrent tasks.
+DEFAULT_MAX_CONCURRENT_TASKS = 4
+
 
 @dataclass
 class ScheduledTask:
@@ -92,6 +102,7 @@ class SchedulerRunner:
         executor: TaskExecutor,
         poll_interval: int = POLL_INTERVAL,
         misfire_grace_seconds: int = DEFAULT_MISFIRE_GRACE_SECONDS,
+        max_concurrent_tasks: int = DEFAULT_MAX_CONCURRENT_TASKS,
     ):
         """
         Args:
@@ -102,12 +113,16 @@ class SchedulerRunner:
             misfire_grace_seconds: A due task more than this many seconds late
                 is skipped-and-re-anchored instead of executed (host-suspend
                 resilience, #1545). 0 disables the rail.
+            max_concurrent_tasks: Upper bound on due tasks executed
+                concurrently within a single tick (#1675). 1 restores the
+                legacy strictly-serial behaviour.
         """
         self._db = db
         self._agent_id = agent_id
         self._executor = executor
         self._poll_interval = poll_interval
         self._misfire_grace_seconds = max(0, int(misfire_grace_seconds))
+        self._max_concurrent_tasks = max(1, int(max_concurrent_tasks))
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
@@ -165,8 +180,8 @@ class SchedulerRunner:
             """,
             (self._agent_id, now_iso),
         )
-        for row in rows:
-            task = ScheduledTask(
+        tasks = [
+            ScheduledTask(
                 id=row[0],
                 agent_id=row[1],
                 task_name=row[2],
@@ -177,17 +192,40 @@ class SchedulerRunner:
                 next_run_at=row[7],
                 created_at=row[8],
             )
-            # Misfire grace (#1545): a task far past its scheduled time was
-            # almost certainly slept through (host suspend) or starved.
-            # Firing it late — and firing every overdue task at once in the
-            # first post-wake tick — is rarely what the operator wants for
-            # "run around time T" cron work. Skip-and-re-anchor to the next
-            # occurrence instead. Within grace, behave exactly as before.
-            late = self._seconds_late(task.next_run_at, now)
-            if self._misfire_grace_seconds and late > self._misfire_grace_seconds:
-                await self._skip_misfire(task, now, late)
-            else:
-                await self._execute_task(task)
+            for row in rows
+        ]
+        if not tasks:
+            return
+
+        # Bounded-concurrent execution (#1675). The serial loop meant one
+        # dispatch slower than the poll interval delayed every later due task,
+        # which could push them past the misfire grace and skip them. Run up to
+        # max_concurrent_tasks at once instead. `now` is frozen at tick start so
+        # the misfire decision is consistent across the batch. Each task touches
+        # only its own scheduled_tasks row (+ a unique-id log append), so there
+        # is no row-level read-modify-write race; aiosqlite serializes the
+        # writes on its single connection.
+        sem = asyncio.Semaphore(self._max_concurrent_tasks)
+
+        async def _run_one(task: ScheduledTask) -> None:
+            async with sem:
+                # Misfire grace (#1545): a task far past its scheduled time was
+                # almost certainly slept through (host suspend) or starved.
+                # Skip-and-re-anchor to the next occurrence instead of firing a
+                # post-wake burst. Within grace, behave exactly as before.
+                late = self._seconds_late(task.next_run_at, now)
+                if self._misfire_grace_seconds and late > self._misfire_grace_seconds:
+                    await self._skip_misfire(task, now, late)
+                else:
+                    await self._execute_task(task)
+
+        # _execute_task / _skip_misfire already swallow their own errors per
+        # task; return_exceptions=True is a backstop so one unexpected failure
+        # can't cancel sibling tasks mid-tick.
+        await asyncio.gather(
+            *(_run_one(task) for task in tasks),
+            return_exceptions=True,
+        )
 
     @staticmethod
     def _seconds_late(next_run_at_iso: Optional[str], now: datetime) -> float:

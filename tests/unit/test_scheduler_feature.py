@@ -525,6 +525,94 @@ class TestSchedulerRunner:
         executor.assert_called_once_with("wellness_check", {})
 
     @pytest.mark.asyncio
+    async def test_tick_runs_due_tasks_concurrently_bounded(self):
+        """#1675: due tasks run concurrently, capped at max_concurrent_tasks."""
+        import asyncio
+
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            (f"task-{i}", "test-agent", "t", "@hourly", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00")
+            for i in range(6)
+        ])
+
+        live = 0
+        peak = 0
+        ran = []
+
+        async def executor(name, args):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.02)  # force overlap
+            ran.append(name)
+            live -= 1
+            return "ok"
+
+        runner = SchedulerRunner(db, "test-agent", executor, max_concurrent_tasks=2)
+        await runner._tick()
+
+        assert len(ran) == 6          # every due task executed
+        assert peak == 2              # never exceeded the cap
+        assert peak > 1               # genuinely concurrent (not serial)
+
+    @pytest.mark.asyncio
+    async def test_tick_serial_when_cap_is_one(self):
+        """max_concurrent_tasks=1 restores strictly-serial execution."""
+        import asyncio
+
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            (f"task-{i}", "test-agent", "t", "@hourly", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00")
+            for i in range(4)
+        ])
+
+        live = 0
+        peak = 0
+
+        async def executor(name, args):
+            nonlocal live, peak
+            live += 1
+            peak = max(peak, live)
+            await asyncio.sleep(0.01)
+            live -= 1
+            return "ok"
+
+        runner = SchedulerRunner(db, "test-agent", executor, max_concurrent_tasks=1)
+        await runner._tick()
+
+        assert peak == 1              # strictly serial
+
+    @pytest.mark.asyncio
+    async def test_tick_one_failure_does_not_block_siblings(self):
+        """A task raising must not cancel its concurrent siblings in the tick."""
+        db = _make_mock_db()
+        now_iso = datetime.now(timezone.utc).isoformat()
+        db.fetchall = AsyncMock(return_value=[
+            (f"task-{i}", "test-agent", "t", "@hourly", "{}",
+             1, None, now_iso, "2026-03-04T00:00:00")
+            for i in range(3)
+        ])
+
+        ran = []
+
+        async def executor(name, args):
+            if name == "t" and len(ran) == 0:
+                ran.append("boom")
+                raise RuntimeError("kaboom")
+            ran.append(name)
+            return "ok"
+
+        runner = SchedulerRunner(db, "test-agent", executor, max_concurrent_tasks=3)
+        await runner._tick()
+
+        # All three were attempted despite the first raising.
+        assert len(ran) == 3
+
+    @pytest.mark.asyncio
     async def test_tick_records_execution(self):
         db = _make_mock_db()
         now_iso = datetime.now(timezone.utc).isoformat()

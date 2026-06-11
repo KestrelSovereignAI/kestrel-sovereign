@@ -141,9 +141,32 @@ class SchedulerFeature(Feature):
             agent_id=self._agent_id,
             executor=self._dispatch_scheduled_task,
             misfire_grace_seconds=self._load_misfire_grace_seconds(),
+            max_concurrent_tasks=self._load_max_concurrent_tasks(),
         )
         await self._runner.start()
         logger.info("SchedulerFeature initialized")
+
+    @staticmethod
+    def _load_max_concurrent_tasks() -> int:
+        """Read ``[scheduler] max_concurrent_tasks`` from kestrel.toml.
+
+        Defaults to ``DEFAULT_MAX_CONCURRENT_TASKS`` (#1675). Operators set 1
+        to restore the legacy strictly-serial tick behaviour."""
+        from kestrel_sovereign.config import load_section
+        from kestrel_sovereign.features.scheduler.runner import (
+            DEFAULT_MAX_CONCURRENT_TASKS,
+        )
+
+        cfg = load_section("scheduler") or {}
+        raw = cfg.get("max_concurrent_tasks", DEFAULT_MAX_CONCURRENT_TASKS)
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid scheduler.max_concurrent_tasks=%r, using %d",
+                raw, DEFAULT_MAX_CONCURRENT_TASKS,
+            )
+            return DEFAULT_MAX_CONCURRENT_TASKS
 
     @staticmethod
     def _load_misfire_grace_seconds() -> int:
