@@ -341,12 +341,10 @@ class TestThreadStartParams:
 
 
 class TestToolActivityMarkers:
-    """The chat-UI parses 🔧/✓/❌ marker lines from the streamed text to
-    render the expandable tool-activity cards (chat.js
-    ``isToolActivityStartLine``). For the orchestrator-dispatched path
-    the orchestrator emits these markers; for codex's inline tool loop
-    the adapter must emit them itself or the chat surface goes opaque
-    — which is exactly what Nellie reported."""
+    """The chat-UI renders tool-activity cards from typed in-band TOOL
+    sentinels (#1659, `\\x1eKESTREL:TOOL:{json}\\x1e`) — the codex inline
+    tool loop must emit them itself or the chat surface goes opaque (what
+    Nellie reported). Replaces the legacy 🔧/✓/❌ emoji markers."""
 
     @pytest.mark.asyncio
     async def test_native_shell_emits_start_and_complete_markers(self):
@@ -377,8 +375,13 @@ class TestToolActivityMarkers:
             )
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
-        assert "\U0001f527 Calling shell: git status --short --branch" in stream
-        assert "✓ shell complete" in stream
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+        _clean, parts = _parse_stream_sentinels(stream)
+        phases = [(p["phase"], p["name"]) for p in parts]
+        assert ("start", "shell") in phases
+        assert ("done", "shell") in phases
+        start = next(p for p in parts if p["phase"] == "start")
+        assert start["detail"] == "git status --short --branch"
 
     @pytest.mark.asyncio
     async def test_failed_shell_emits_failure_marker(self):
@@ -400,7 +403,9 @@ class TestToolActivityMarkers:
             )
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
-        assert "❌ shell failed" in stream
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+        _clean, parts = _parse_stream_sentinels(stream)
+        assert ("error", "shell") in [(p["phase"], p["name"]) for p in parts]
 
     @pytest.mark.asyncio
     async def test_markers_do_not_leak_into_llmresponse_content(self):
@@ -428,6 +433,8 @@ class TestToolActivityMarkers:
         assert r.content == "Hi"
         assert "\U0001f527" not in (r.content or "")
         assert "✓" not in (r.content or "")
+        # Typed sentinels must not leak into content either.
+        assert "\x1eKESTREL:TOOL" not in (r.content or "")
 
     @pytest.mark.asyncio
     async def test_markers_dedupe_when_started_and_completed_repeat(self):
@@ -456,8 +463,12 @@ class TestToolActivityMarkers:
             )
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
-        assert stream.count("\U0001f527 Calling shell") == 1
-        assert stream.count("✓ shell complete") == 1
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+        _clean, parts = _parse_stream_sentinels(stream)
+        starts = [p for p in parts if p["phase"] == "start" and p["name"] == "shell"]
+        dones = [p for p in parts if p["phase"] == "done" and p["name"] == "shell"]
+        assert len(starts) == 1
+        assert len(dones) == 1
 
     @pytest.mark.asyncio
     async def test_idless_items_dont_collapse_into_one_dedupe_slot(self):
@@ -493,9 +504,11 @@ class TestToolActivityMarkers:
             )
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
-        # Both calls must appear — start + complete each.
-        assert stream.count("\U0001f527 Calling shell") == 2
-        assert stream.count("✓ shell complete") == 2
+        # Both calls must appear — start + done each.
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+        _clean, parts = _parse_stream_sentinels(stream)
+        assert len([p for p in parts if p["phase"] == "start"]) == 2
+        assert len([p for p in parts if p["phase"] == "done"]) == 2
 
     @pytest.mark.asyncio
     async def test_dynamic_tool_emits_marker_and_preserves_executed_log(self):
@@ -534,8 +547,11 @@ class TestToolActivityMarkers:
             )
         ]
         stream = "".join(c for c in chunks if isinstance(c, str))
-        assert "\U0001f527 Calling memory_search" in stream
-        assert "✓ memory_search complete" in stream
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+        _clean, parts = _parse_stream_sentinels(stream)
+        phases = [(p["phase"], p["name"]) for p in parts]
+        assert ("start", "memory_search") in phases
+        assert ("done", "memory_search") in phases
         # LLMResponse should still carry executed_tool_calls so the
         # orchestrator path can fold it into chat history (PR #1331).
         final = [c for c in chunks if isinstance(c, LLMResponse)][-1]

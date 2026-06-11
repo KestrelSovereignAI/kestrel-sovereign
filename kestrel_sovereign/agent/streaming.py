@@ -41,6 +41,188 @@ REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
 REVISE_SENTINEL_SUFFIX = "\x1e"
 THINKING_SENTINEL_PREFIX = "\x1eKESTREL:THINK:"
 THINKING_SENTINEL_SUFFIX = "\x1e"
+# #1659: tool activity is the last signal class still emitted as
+# regex-scraped emoji text. It now rides the same in-band sentinel
+# channel as REVISE/THINK. Payload:
+#   {"phase":"start"|"done"|"error","name":str,"index":int|None,
+#    "ms":int|None,"detail":str|None}
+# Like REVISE/THINK it is NEVER persisted in the assistant text — the
+# structured ``tool_events`` metadata (now position-stamped) is the
+# single source of truth for rendering tool cards, live and on reload.
+TOOL_SENTINEL_PREFIX = "\x1eKESTREL:TOOL:"
+TOOL_SENTINEL_SUFFIX = "\x1e"
+
+# All three sentinel classes share the \x1e suffix and are mutually
+# exclusive in the stream; this tuple drives every strip/extract loop.
+_ALL_SENTINEL_PREFIXES = (
+    REVISE_SENTINEL_PREFIX,
+    THINKING_SENTINEL_PREFIX,
+    TOOL_SENTINEL_PREFIX,
+)
+_SENTINEL_SUFFIX = REVISE_SENTINEL_SUFFIX  # "\x1e" — identical for all
+
+
+def _build_tool_sentinel(
+    phase: str,
+    name: str,
+    index: Optional[int] = None,
+    ms: Optional[int] = None,
+    detail: Optional[str] = None,
+) -> str:
+    """Construct an in-band tool-activity sentinel.
+
+    ``phase`` is "start" | "done" | "error". ``detail`` carries the
+    shell-command preview (start) or error text (error); ``ms`` the
+    dispatch duration (done).
+    """
+    payload = json.dumps({
+        "phase": phase,
+        "name": name,
+        "index": index,
+        "ms": ms,
+        "detail": detail,
+    }, separators=(",", ":"))
+    return f"{TOOL_SENTINEL_PREFIX}{payload}{TOOL_SENTINEL_SUFFIX}"
+
+
+def is_only_sentinels(text: str) -> bool:
+    """True when ``text`` is one or more complete sentinels and nothing
+    else (no visible prose). Used to keep a tool/think sentinel chunk
+    from materializing a pending revise paragraph boundary — sentinels
+    are wire bytes, not the visible text the weld waits for.
+    """
+    clean, _ = _parse_stream_sentinels(text)
+    return text != "" and clean == ""
+
+
+def _parse_stream_sentinels(text: str, base_offset: int = 0):
+    """Strip all in-band sentinels from ``text`` and extract structured
+    tool parts, in a single pass.
+
+    Returns ``(clean_text, tool_parts)`` where ``tool_parts`` is a list
+    of the TOOL sentinel payloads, each augmented with ``pos`` — the
+    character offset into ``clean_text`` (plus ``base_offset``) at which
+    the tool sentinel sat. ``pos`` is what lets the renderer place a tool
+    card back at the right point between prose segments, live and on
+    reload, without the marker living in the prose.
+
+    REVISE sentinels weld a ``\\n\\n`` paragraph boundary at their point
+    (mirroring the chat client's ``stripStreamSentinels`` — #1547); THINK
+    and TOOL sentinels are stripped without welding (they are not prose
+    boundaries). Operates on a complete string, so the cross-packet edge
+    cases the client handles don't arise here.
+    """
+    if not any(p in text for p in _ALL_SENTINEL_PREFIXES):
+        return text, []
+    result = ""
+    tool_parts: list = []
+    i = 0
+    n = len(text)
+    weld_pending = False  # a removed revise sentinel awaits its next visible char
+    while i < n:
+        nxt_idx = -1
+        nxt_prefix = ""
+        for p in _ALL_SENTINEL_PREFIXES:
+            idx = text.find(p, i)
+            if idx >= 0 and (nxt_idx < 0 or idx < nxt_idx):
+                nxt_idx, nxt_prefix = idx, p
+        seg_end = nxt_idx if nxt_idx >= 0 else n
+        seg = text[i:seg_end]
+        if seg:
+            if weld_pending and seg.strip():
+                if result and not result[-1].isspace() and not seg[0].isspace():
+                    result += "\n\n"
+                weld_pending = False
+            result += seg
+        if nxt_idx < 0:
+            break
+        close = text.find(_SENTINEL_SUFFIX, nxt_idx + len(nxt_prefix))
+        if close < 0:
+            # Unterminated sentinel at the tail — drop the remainder,
+            # matching the client's partial-buffer behavior.
+            break
+        if nxt_prefix == TOOL_SENTINEL_PREFIX:
+            payload = text[nxt_idx + len(nxt_prefix):close]
+            try:
+                evt = json.loads(payload)
+                if isinstance(evt, dict):
+                    evt["pos"] = base_offset + len(result)
+                    tool_parts.append(evt)
+            except (ValueError, TypeError):
+                pass
+        elif nxt_prefix == REVISE_SENTINEL_PREFIX:
+            weld_pending = True
+        i = close + len(_SENTINEL_SUFFIX)
+    return result, tool_parts
+
+
+def _tool_parts_to_events(parts: list) -> list:
+    """Convert parsed TOOL sentinel parts (phase/name/ms/detail/pos) into the
+    persisted ``tool_events`` metadata shape (type/tool/ms/error/pos). Used on
+    paths where the sentinels are the ONLY structured signal (e.g. codex-native
+    tools that don't populate executed_tool_calls) so reload can reconstruct
+    the cards instead of losing them after the sentinels are stripped.
+    """
+    events: list = []
+    for p in parts or []:
+        if not isinstance(p, dict):
+            continue
+        phase = p.get("phase")
+        name = p.get("name", "")
+        pos = p.get("pos")
+        if phase == "start":
+            events.append({"type": "start", "tool": name, "pos": pos})
+        elif phase == "done":
+            ev = {"type": "complete", "tool": name, "pos": pos}
+            if p.get("ms") is not None:
+                ev["ms"] = p["ms"]
+            events.append(ev)
+        elif phase == "error":
+            events.append({
+                "type": "error", "tool": name,
+                "error": p.get("detail") or "", "pos": pos,
+            })
+    return events
+
+
+_TOOL_EVENT_PHASE = {"start": "start", "complete": "done", "error": "error"}
+
+
+def _stamp_tool_event_positions(tool_events: list, parts: list) -> list:
+    """Assign each ``tool_events`` entry a ``pos`` (clean-text offset) by
+    matching it to the TOOL sentinel part that produced it.
+
+    The by-ref ``tool_events`` (built server-side) and the in-band sentinel
+    ``parts`` (which carry the positions) can arrive in different orders — the
+    orchestrator emits all start sentinels up front, then the batch appends
+    start/complete interleaved — so we match each event to the next unconsumed
+    part with the same (phase, name) rather than relying on positional order.
+    A startless terminal event (e.g. a follow-up-timeout ``error`` for ``llm``)
+    therefore keeps its OWN position instead of inheriting the prior tool's.
+    Events with no matching part fall back to the most recent stamped pos.
+    Mutates + returns the list.
+    """
+    consumed = [False] * len(parts)
+    last_pos = 0
+    for ev in tool_events:
+        if not isinstance(ev, dict):
+            continue
+        want_phase = _TOOL_EVENT_PHASE.get(ev.get("type"))
+        name = ev.get("tool", "")
+        matched = None
+        for i, p in enumerate(parts):
+            if consumed[i]:
+                continue
+            if p.get("phase") == want_phase and p.get("name", "") == name:
+                matched = i
+                break
+        if matched is not None:
+            consumed[matched] = True
+            pos = parts[matched].get("pos")
+            if isinstance(pos, int):
+                last_pos = pos
+        ev["pos"] = last_pos
+    return tool_events
 
 
 def _build_revise_sentinel(marker: ToolCallStarted) -> str:
@@ -79,7 +261,7 @@ def strip_revise_sentinels(chunk: str) -> str:
     In practice the server emits the sentinel as a single Python
     yield, so single-chunk delivery is the overwhelming common case.
     """
-    prefixes = (REVISE_SENTINEL_PREFIX, THINKING_SENTINEL_PREFIX)
+    prefixes = _ALL_SENTINEL_PREFIXES
     if not any(prefix in chunk for prefix in prefixes):
         return chunk
     out = []
@@ -132,40 +314,13 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
     post-tool half was already recorded as a ``\\n\\n`` in
     ``full_response`` at the first ``ToolCallStarted`` marker, mirroring
     the client's weld at the first revise sentinel.
+
+    Thin wrapper over :func:`_parse_stream_sentinels` (#1659) — callers
+    that only want the cleaned text keep this name; the tool-part
+    extraction is ignored here.
     """
-    prefixes = (REVISE_SENTINEL_PREFIX, THINKING_SENTINEL_PREFIX)
-    if not any(p in text for p in prefixes):
-        return text
-    result = ""
-    i = 0
-    n = len(text)
-    weld_pending = False  # a removed revise sentinel awaits its next visible char
-    while i < n:
-        nxt_idx = -1
-        nxt_prefix = ""
-        for p in prefixes:
-            idx = text.find(p, i)
-            if idx >= 0 and (nxt_idx < 0 or idx < nxt_idx):
-                nxt_idx, nxt_prefix = idx, p
-        seg_end = nxt_idx if nxt_idx >= 0 else n
-        seg = text[i:seg_end]
-        if seg:
-            if weld_pending and seg.strip():
-                if result and not result[-1].isspace() and not seg[0].isspace():
-                    result += "\n\n"
-                weld_pending = False
-            result += seg
-        if nxt_idx < 0:
-            break
-        close = text.find(REVISE_SENTINEL_SUFFIX, nxt_idx + len(nxt_prefix))
-        if close < 0:
-            # Unterminated sentinel at the tail — drop the remainder,
-            # matching the client's partial-buffer behavior.
-            break
-        if nxt_prefix == REVISE_SENTINEL_PREFIX:
-            weld_pending = True
-        i = close + len(REVISE_SENTINEL_SUFFIX)
-    return result
+    clean, _tool_parts = _parse_stream_sentinels(text)
+    return clean
 
 
 class StreamingMixin:
@@ -453,7 +608,15 @@ class StreamingMixin:
                 # only when real post-marker text lands, and only when it
                 # would otherwise weld two non-whitespace chars. Mirrors
                 # the client weld so the persisted turn equals the render.
-                if pending_visible_boundary and item.strip():
+                # #1659: a tool sentinel is wire bytes, not the visible
+                # text the weld waits for — never let it materialize (or
+                # clear) the boundary, and don't weld a \n\n in front of
+                # it (it'd survive the persist-time sentinel strip).
+                if (
+                    pending_visible_boundary
+                    and item.strip()
+                    and not is_only_sentinels(item)
+                ):
                     acc = "".join(full_response)
                     if acc and not acc[-1].isspace() and not item[:1].isspace():
                         full_response.append("\n\n")
@@ -529,7 +692,9 @@ class StreamingMixin:
         # prose the LLM already yielded so the user can see what the
         # agent had been about to do.
         if has_tool_calls and request_id and self.is_request_cancelled(request_id):
-            cancelled_text = "".join(full_response)
+            # #1659: strip any codex inline tool sentinels from the
+            # partial pre-tool text before persisting.
+            cancelled_text, _ = _parse_stream_sentinels("".join(full_response))
             await self._persist_assistant_turn_safely(
                 cancelled_text, metadata=None, session_id=session_id,
                 request_id=request_id,
@@ -588,12 +753,15 @@ class StreamingMixin:
             # to any pre-tool explanation, and the agent couldn't see the
             # reasoning it had just shown the user. Surfaced by Meridian's
             # "I don't see my own quantum response" transcript.
-            pre_tool_text = "".join(full_response)
-            # #1547: strip + weld the post-tool half exactly as the chat
-            # client does, so embedded follow-up revise sentinels neither
-            # leak wire bytes into the assistant row nor glue the prose
-            # around them.
-            post_tool_text = _strip_and_weld_revise_sentinels(
+            # #1547/#1659: strip + weld in-band sentinels from BOTH halves
+            # and recover each tool sentinel's clean-text position. The pre
+            # half can carry codex inline tool sentinels (emitted on the LLM
+            # stream itself); the post half carries the orchestrator's
+            # per-batch start sentinels plus any follow-up revise sentinels.
+            pre_tool_text, pre_parts = _parse_stream_sentinels(
+                "".join(full_response)
+            )
+            post_tool_text, post_parts = _parse_stream_sentinels(
                 "".join(tool_response_chunks)
             )
             # Materialize the pre/post seam boundary armed by the first
@@ -609,10 +777,21 @@ class StreamingMixin:
                 and not pre_tool_text[-1].isspace()
                 and not post_tool_text[:1].isspace()
             ):
-                tool_final_text = pre_tool_text + "\n\n" + post_tool_text
+                seam = "\n\n"
             else:
-                tool_final_text = pre_tool_text + post_tool_text
+                seam = ""
+            tool_final_text = pre_tool_text + seam + post_tool_text
             pending_visible_boundary = False
+            # Position-stamp tool_events so the renderer can place each card
+            # back between the right prose segments (live + on reload). Pre
+            # positions already index the final text (pre half is at the
+            # front); post positions shift past the clean pre half + seam.
+            post_base = len(pre_tool_text) + len(seam)
+            combined_parts = (
+                list(pre_parts)
+                + [{**p, "pos": post_base + p["pos"]} for p in post_parts]
+            )
+            _stamp_tool_event_positions(tool_events, combined_parts)
             # Narration check (#1042 layer 3): the hook receives the
             # pre-tool prose snapshot taken at the first ToolCallStarted
             # marker boundary, plus the tool calls + result envelopes.
@@ -621,7 +800,7 @@ class StreamingMixin:
             # full_response — that's still the text the user saw before
             # the tool ran.
             pre_tool_for_audit = (
-                pre_tool_prose_snapshot
+                _parse_stream_sentinels(pre_tool_prose_snapshot)[0]
                 if pre_tool_prose_snapshot is not None
                 else pre_tool_text
             )
@@ -743,14 +922,24 @@ class StreamingMixin:
                     error_class=err_class,
                     error_message=err_msg,
                 )
-            final_text = "".join(full_response)
+            # #1659: the codex tool sentinels rode the LLM stream itself, so
+            # they're embedded in full_response. Strip them out of the
+            # persisted text and recover their positions to stamp onto the
+            # synthesized events (inline_executed order == start-sentinel
+            # order on the wire).
+            final_text, inline_parts = _parse_stream_sentinels(
+                "".join(full_response)
+            )
+            _stamp_tool_event_positions(synth_tool_events, inline_parts)
             tool_calls_payload = [
                 {"id": e["id"], "name": e["name"], "arguments": e["arguments"]}
                 for e in inline_executed
             ]
             final_text = await self._fire_post_response_hook(
                 final_text, session_id,
-                pre_tool_prose=pre_tool_prose_snapshot or "",
+                pre_tool_prose=_parse_stream_sentinels(
+                    pre_tool_prose_snapshot or ""
+                )[0],
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
@@ -775,13 +964,20 @@ class StreamingMixin:
             # prose / tool_calls / tool_results all stay None: a hook
             # writing the narration check should treat ``tool_results
             # is None`` as "this turn didn't call any tools, no
-            # narration to verify".
-            final_text = "".join(full_response)
+            # narration to verify". (#1659: strip in-band sentinels from the
+            # persisted text.) Codex-native tools (commandExecution, fileChange,
+            # webSearch) that don't populate executed_tool_calls land here with
+            # their TOOL sentinels embedded — build tool_events from them so the
+            # cards survive reload rather than vanishing once stripped.
+            final_text, tool_parts = _parse_stream_sentinels("".join(full_response))
             final_text = await self._fire_post_response_hook(
                 final_text, session_id,
             )
+            _no_tool_events = _tool_parts_to_events(tool_parts)
             await self._persist_assistant_turn_safely(
-                final_text, metadata=None, session_id=session_id,
+                final_text,
+                metadata=({"tool_events": _no_tool_events} if _no_tool_events else None),
+                session_id=session_id,
                 request_id=request_id,
             )
             final_assistant_text = final_text

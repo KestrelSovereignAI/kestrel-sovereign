@@ -33,7 +33,10 @@ from kestrel_sdk.llm import ToolCallStarted
 # applies uniformly to first-level AND multi-iteration tool calls
 # (codex P1 on PR #1346: follow-up pre-tool prose was streamed without
 # the honesty-layer clear).
-from kestrel_sovereign.agent.streaming import _build_revise_sentinel
+from kestrel_sovereign.agent.streaming import (
+    _build_revise_sentinel,
+    _build_tool_sentinel,
+)
 from kestrel_sovereign.security.input_guardrails import validate_tool_arguments
 from kestrel_sovereign.telemetry import optional_span
 
@@ -1209,6 +1212,16 @@ class OrchestratorEngineMixin:
         if not is_valid:
             logging.warning(f"{log_prefix} Tool validation failed: {validation_error}")
             result = {"success": False, "error": f"Tool validation failed: {validation_error}"}
+            # #1659: a start sentinel was already emitted for this call, so it
+            # must terminate — record start+error tool_events here (this path
+            # returns before the normal start append) so the card renders as an
+            # error on reload, and the post-batch sentinel emit resolves it live.
+            if streaming and tool_events is not None:
+                tool_events.append({'type': 'start', 'tool': tool_name})
+                tool_events.append({
+                    'type': 'error', 'tool': tool_name,
+                    'error': f'Tool validation failed: {validation_error}',
+                })
             from kestrel_sovereign.features.base import _serialize_tool_result
             from kestrel_sovereign.security.narration_check import (
                 summarize_tool_result_for_audit,
@@ -2132,18 +2145,39 @@ class OrchestratorEngineMixin:
             if _cancelled():
                 return
 
-            # Stream tool names for user visibility
-            for tc in response.tool_calls:
-                yield f"\U0001f527 Calling {tc.name}...\n"
+            # Stream tool starts for user visibility as typed in-band
+            # sentinels (#1659) — the chat client renders the card; the
+            # persisted ``tool_events`` metadata (position-stamped from
+            # these) is the source of truth on reload. Replaces the old
+            # "🔧 Calling X..." emoji text.
+            for tc_index, tc in enumerate(response.tool_calls):
+                yield _build_tool_sentinel("start", tc.name, index=tc_index)
 
             features_by_tool_name = self._visible_features_by_tool_name()
             known_tools = self._visible_known_tool_names()
+            events_before = len(tool_events) if tool_events is not None else 0
             await self._execute_tool_batch(
                 response.tool_calls, features_by_tool_name, known_tools,
                 messages, iteration, user_message,
                 tool_events=tool_events, tool_results=tool_results, streaming=True,
                 session_id=session_id,
             )
+            # #1659: _execute_tool_batch isn't a generator, so it records the
+            # batch's outcome into tool_events (complete/error) but can't yield
+            # the terminal sentinels itself. Emit them here from the events it
+            # just appended so the live cards resolve out of "running" — and so
+            # error/validation-failure paths (which only append to tool_events)
+            # surface as error cards live, not just on reload.
+            if tool_events is not None:
+                for ev in tool_events[events_before:]:
+                    if ev.get('type') == 'complete':
+                        yield _build_tool_sentinel(
+                            'done', ev.get('tool', ''), ms=ev.get('ms'),
+                        )
+                    elif ev.get('type') == 'error':
+                        yield _build_tool_sentinel(
+                            'error', ev.get('tool', ''), detail=ev.get('error'),
+                        )
 
             if _cancelled():
                 # Tool batch finished cleanly; skip synthesis. The user
@@ -2245,19 +2279,23 @@ class OrchestratorEngineMixin:
                 return
 
             if timed_out:
-                # ❌ marker BEFORE any separator: chat.js's
-                # ``splitToolActivity`` groups everything before the
-                # first ``\n---\n`` as tool activity, so the failure
-                # renders in the tool-card error state instead of as
-                # response prose (codex P2 on PR #1346).
+                # #1659: render the follow-up timeout as an error tool card,
+                # not response prose — record the structured event (so it
+                # persists for reload) AND emit the error sentinel (so the live
+                # card shows it). Replaces the legacy "❌ llm call failed" text
+                # that the old segmenter grouped as tool activity.
                 logging.warning(
                     "[ORCHESTRATOR-STREAM] follow-up LLM call timed out after %ss",
                     ORCHESTRATOR_TURN_TIMEOUT_SECS,
                 )
-                yield (
-                    f"❌ llm call failed: timeout after "
-                    f"{int(ORCHESTRATOR_TURN_TIMEOUT_SECS)}s\n"
+                _timeout_detail = (
+                    f"timeout after {int(ORCHESTRATOR_TURN_TIMEOUT_SECS)}s"
                 )
+                if tool_events is not None:
+                    tool_events.append({
+                        'type': 'error', 'tool': 'llm', 'error': _timeout_detail,
+                    })
+                yield _build_tool_sentinel('error', 'llm', detail=_timeout_detail)
                 return
 
             if response is None:

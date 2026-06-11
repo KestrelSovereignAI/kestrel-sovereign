@@ -8,10 +8,55 @@ import { state, Toast, escapeHtml } from './ui.js';
 import {
     updateContextStatus,
     wipeAgentChatPane,
-    renderToolActivityHtml,
-    segmentToolActivity,
     renderAgentContentHtml,
 } from './chat.js';
+
+// #1659: tool cards on reload come from the structured, position-stamped
+// ``tool_events`` metadata; new rows persist clean prose. Rows persisted
+// BEFORE the cutover instead carry emoji marker tokens inline (and their
+// tool_events, if any, lack ``pos``). For those we parse the markers back
+// into structured events WITH positions, so the cards render where the tools
+// actually occurred — not all bunched at the top.
+//
+// Self-terminating marker TOKENS (not line-anchored): the old stream could
+// glue a marker onto adjacent prose without a newline ("I'll check🔧 Calling
+// lookup..."). Mirrors the deleted chat.js TOOL_MARKER_TOKEN.
+const LEGACY_TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n\u{1F527}✓❌]*)?/gu;
+// Gate legacy handling on a 🔧 Calling START being present — exactly the old
+// TOOL_START_PRESENCE rule. Without it, ordinary replies like "✓ Migration
+// complete" would be mistaken for tool markers.
+const LEGACY_TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
+
+// Parse a pre-cutover assistant message's inline emoji markers into
+// { clean, events }: the prose with ONLY the markers removed, and the tool
+// events with their positions into that prose. Nothing else is mutated, so
+// the positions stay exact — the shared renderer (buildToolSegmentsByPos)
+// already strips the `---` wire delimiter and leading blanks PER SEGMENT, so
+// doing it here too would shift every later card's position (codex review).
+function legacyToolEventsFromText(content) {
+    const src = String(content || '');
+    const re = new RegExp(LEGACY_TOOL_MARKER_TOKEN.source, 'gu');
+    const events = [];
+    let clean = '';
+    let last = 0;
+    let m;
+    while ((m = re.exec(src)) !== null) {
+        clean += src.slice(last, m.index);
+        const marker = m[0];
+        const pos = clean.length;
+        let mm;
+        if ((mm = marker.match(/^\u{1F527}\s+Calling\s+(\S[^\n]*?)(?::[^\n]*)?\.\.\.$/u))) {
+            events.push({ phase: 'start', name: mm[1].trim(), pos });
+        } else if ((mm = marker.match(/^✓\s+(\S[^\n]*?)\s+(?:complete|done)\b/u))) {
+            events.push({ phase: 'done', name: mm[1].trim(), pos });
+        } else if ((mm = marker.match(/^❌\s+(\S[^\n]*?)\s+failed\b/u))) {
+            events.push({ phase: 'error', name: mm[1].trim(), pos });
+        }
+        last = re.lastIndex;
+    }
+    clean += src.slice(last);
+    return { clean, events };
+}
 
 // ============================================================================
 // Chat History Browser
@@ -268,21 +313,27 @@ window.loadConversation = async function(sessionId) {
             let bodyHtml = null;
             const content = msg.content;
             if (msg.role === 'assistant' && !isEncrypted) {
-                if (segmentToolActivity(content).some((seg) => seg.kind === 'tools')) {
-                    // Inline tool markers present (the common persisted shape):
-                    // render cards + prose in document order, the same as the
-                    // live bubble.
-                    bodyHtml = renderAgentContentHtml(content);
-                } else if (msg.metadata?.tool_events?.length > 0) {
-                    // No inline markers, but a structured tool-event record \u2014
-                    // surface it as a card block above the prose.
-                    const toolActivityText = msg.metadata.tool_events.map(ev => {
-                        if (ev.type === 'start') return `\u{1F527} Calling ${ev.tool}...`;
-                        if (ev.type === 'complete') return `\u2713 ${ev.tool} complete (${ev.ms}ms)`;
-                        if (ev.type === 'error') return `\u274C ${ev.tool} failed: ${ev.error || ''}`;
-                        return '';
-                    }).filter(Boolean).join('\n');
-                    toolHtml = renderToolActivityHtml(toolActivityText);
+                const toolEvents = msg.metadata?.tool_events;
+                const hasPos = !!toolEvents
+                    && toolEvents.some((e) => typeof e.pos === 'number');
+                if (hasPos) {
+                    // New (post-cutover) row: position-stamped tool_events are
+                    // authoritative and the prose is clean. Cards + prose in
+                    // document order, identical to the live bubble.
+                    bodyHtml = renderAgentContentHtml(content, { toolEvents });
+                } else if (LEGACY_TOOL_START_PRESENCE.test(content)) {
+                    // Pre-cutover row: derive cards AND their positions from the
+                    // inline emoji markers so they render where the tools ran,
+                    // not bunched at the top.
+                    const legacy = legacyToolEventsFromText(content);
+                    bodyHtml = renderAgentContentHtml(
+                        legacy.clean, { toolEvents: legacy.events },
+                    );
+                } else if (toolEvents && toolEvents.length) {
+                    // Old metadata with neither pos nor inline markers \u2014 no
+                    // placement survives; render cards at the top rather than
+                    // dropping them.
+                    bodyHtml = renderAgentContentHtml(content, { toolEvents });
                 }
             }
             addMessageToChat(

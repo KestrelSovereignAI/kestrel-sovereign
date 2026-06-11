@@ -46,13 +46,6 @@ const { toolStatusPhase, statusPhaseForChunk } = await import(
     '../../kestrel_sovereign/static/js/chat.js'
 );
 
-// 🔧 Calling <name>... start marker.
-const start = (name) => `\u{1F527} Calling ${name}...`;
-// ✓ <name> complete done marker.
-const done = (name) => `✓ ${name} complete`;
-// ❌ <name> failed error marker.
-const fail = (name) => `❌ ${name} failed: boom`;
-
 test('toolStatusPhase maps common tool names to functional verbs', () => {
     assert.equal(toolStatusPhase('web_search'), 'searching');
     assert.equal(toolStatusPhase('read_file'), 'reading');
@@ -112,42 +105,17 @@ test('toolStatusPhase maps the real read/write/recall/voice families', () => {
     assert.equal(toolStatusPhase('transcribe'), 'listening');
 });
 
-test('statusPhaseForChunk reads an in-flight tool start as that tool verb', () => {
-    assert.equal(statusPhaseForChunk(start('web_search')), 'searching');
-    assert.equal(statusPhaseForChunk(start('read_file')), 'reading');
-});
+// #1659: statusPhaseForChunk is now prose-only. Tool activity is structured
+// (typed TOOL sentinels), so markers never appear in the visible stream — the
+// in-flight tool's verb is set by the streaming loop via toolStatusPhase on
+// the start sentinel, not by scanning text here.
 
-test('statusPhaseForChunk returns the in-flight verb even with prose before the start', () => {
-    // The prose BEFORE a 🔧 Calling marker is the prior step's output, so
-    // an open tool call still wins — don't flip to "Writing…".
-    assert.equal(statusPhaseForChunk(`Here is the plan.\n${start('run_shell')}`), 'running');
-});
-
-test('statusPhaseForChunk drops back to thinking when a tool completes (with its start)', () => {
-    // A completion is only honored alongside a real 🔧 Calling start
-    // (matching the renderer's TOOL_START_PRESENCE rule). With the start
-    // present and nothing after the completion → between-steps "thinking".
-    assert.equal(statusPhaseForChunk(`${start('web_search')}\n${done('web_search')}`), 'thinking');
-    assert.equal(statusPhaseForChunk(`${start('run_shell')}\n${fail('run_shell')}`), 'thinking');
-});
-
-test('statusPhaseForChunk treats lone checkmark/cross prose as writing, not tool activity', () => {
-    // No 🔧 Calling start → "✓ migration complete" / "❌ build failed" are
-    // ordinary answer prose, so the indicator says "Writing…", not "Thinking…".
-    assert.equal(statusPhaseForChunk('✓ migration complete'), 'writing');
-    assert.equal(statusPhaseForChunk('Done. ❌ build failed on CI, retrying'), 'writing');
-});
-
-test('statusPhaseForChunk reads plain answer prose as writing', () => {
+test('statusPhaseForChunk maps answer prose to writing', () => {
     assert.equal(statusPhaseForChunk('The answer is 42 because'), 'writing');
+    assert.equal(statusPhaseForChunk('Based on the results, here is'), 'writing');
 });
 
-test('statusPhaseForChunk treats post-completion prose as writing', () => {
-    // Tool finished, then the model resumes composing → "Writing…".
-    assert.equal(statusPhaseForChunk(`${done('web_search')}\nBased on the results,`), 'writing');
-});
-
-test('statusPhaseForChunk ignores the bare --- wire delimiter as a phase signal', () => {
+test('statusPhaseForChunk ignores the bare --- wire delimiter and whitespace', () => {
     assert.equal(statusPhaseForChunk('---'), null);
     assert.equal(statusPhaseForChunk('\n  \n'), null);
 });
@@ -157,35 +125,9 @@ test('statusPhaseForChunk is null for an empty chunk (caller keeps prior phase)'
     assert.equal(statusPhaseForChunk(null), null);
 });
 
-test('statusPhaseForChunk resolves a completed marker embedded in cumulative content', () => {
-    // The loop feeds the cumulative tail, so a marker that arrived split
-    // across packets ("🔧 Calling web_" + "search...") resolves once whole,
-    // even with prior prose and a finished earlier tool ahead of it.
-    const cumulative = `Let me look that up.\n${done('read_file')}\nOk.\n${start('web_search')}`;
-    assert.equal(statusPhaseForChunk(cumulative), 'searching');
-});
-
-test('statusPhaseForChunk keeps the in-flight tool verb past an earlier completed tool', () => {
-    const cumulative = `${start('read_file')}\n${done('read_file')}\n${start('run_shell')}`;
-    assert.equal(statusPhaseForChunk(cumulative), 'running');
-});
-
-test('statusPhaseForChunk stays thinking between tool steps (prior prose does not leak)', () => {
-    // Old prose BEFORE the markers must not count as answer composition —
-    // a completion with nothing after it is "between steps", not writing.
-    const cumulative = `Plan the work.\n${start('web_search')}\n${done('web_search')}`;
-    assert.equal(statusPhaseForChunk(cumulative), 'thinking');
-});
-
-test('statusPhaseForChunk flips to writing only on prose AFTER the last completion', () => {
-    const cumulative = `Plan.\n${done('web_search')}\nThe answer, based on results, is`;
-    assert.equal(statusPhaseForChunk(cumulative), 'writing');
-});
-
-test('statusPhaseForChunk does not corrupt TOOL_MARKER_TOKEN lastIndex across calls', () => {
-    // The shared global regex is used via .match/.replace only; two calls
-    // in a row must be independent (a stale lastIndex would drop a match).
-    const chunk = start('web_search');
-    assert.equal(statusPhaseForChunk(chunk), 'searching');
-    assert.equal(statusPhaseForChunk(chunk), 'searching');
+test('statusPhaseForChunk no longer derives tool verbs from text (#1659)', () => {
+    // A leftover glyph in the visible stream reads as ordinary prose now; the
+    // tool verb comes from toolStatusPhase on the typed start sentinel.
+    assert.equal(statusPhaseForChunk('\u{1F527} Calling web_search...'), 'writing');
+    assert.equal(toolStatusPhase('web_search'), 'searching');
 });
