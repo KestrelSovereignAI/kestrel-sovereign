@@ -1701,11 +1701,30 @@ No other text or formatting.
             errors = {}
             for provider in available_providers:
                 logger.info(f"Auditing with provider: {provider['name']}")
-                effective_model = target_model or provider["model"]
                 if target_model and not self._model_available_for_route(provider, target_model):
+                    # Record the skip so that if EVERY route rejects the
+                    # mandated model, the loop fails closed (risk=3) instead of
+                    # falling through to the benign "no providers" risk=1.
+                    errors[provider["name"]] = (
+                        f"target model {target_model} not available for route"
+                    )
                     logger.debug(
                         "Audit: skipping %s (target model %s not in vendor catalog)",
                         provider["name"], target_model,
+                    )
+                    continue
+                # Resolve the "auto" sentinel to a concrete model (#1408): the
+                # main generation/streaming paths funnel through this so they
+                # never leak "auto" to the wire; the audit path must too, or an
+                # agent on the default model="auto" config fails every audit
+                # call (e.g. ollama 404 "model 'auto' not found").
+                try:
+                    effective_model = self._resolve_concrete_model(target_model, provider)
+                except ModelNotAvailableForRoute as exc:
+                    errors[provider["name"]] = str(exc)
+                    logger.debug(
+                        "Audit: skipping %s (cannot resolve concrete model: %s)",
+                        provider["name"], exc,
                     )
                     continue
                 messages = messages_for(
