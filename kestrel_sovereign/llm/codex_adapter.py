@@ -753,6 +753,28 @@ class CodexAdapter(LLMAdapter):
             # multi-turn sessions retain the full prior context server-side.
             params: Dict[str, Any] = {
                 "sandbox": "read-only",
+                # #1707: tell codex to escalate sandbox failures via the
+                # ``item/commandExecution/requestApproval`` RPC instead
+                # of silently returning the OS-level error. Without
+                # this, the entire #1575+#1581+#1702 bridge stack is
+                # dormant for sandbox writes — codex never asks
+                # Kestrel to approve, so unlisted writes (``touch``,
+                # ``mkdir``, etc.) surface as ``Operation not
+                # permitted`` and the operator never sees a prompt.
+                #
+                # Codex policy choices (kebab-case wire format,
+                # verified against the binary):
+                #   - ``unless-trusted``  → escalate every shell call
+                #   - ``on-failure``      → escalate on sandbox-denied
+                #   - ``on-request``      → only when the model asks
+                #   - ``never``           → never escalate
+                # ``on-failure`` is the operator-in-the-loop sweet
+                # spot: the sandbox handles inert reads, the bridge
+                # handles the rest. ``unless-trusted`` would spam the
+                # operator with prompts for ``ls``/``cat``;
+                # ``on-request`` requires model-mediated elevation
+                # tokens and is brittle.
+                "approval_policy": "on-failure",
                 "cwd": cwd,
                 "experimentalRawEvents": True,
                 "persistExtendedHistory": True,

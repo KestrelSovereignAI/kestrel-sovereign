@@ -339,6 +339,45 @@ class TestThreadStartParams:
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
         assert ts["cwd"] == "/agents/nellie/workspace"
 
+    @pytest.mark.asyncio
+    async def test_thread_start_carries_on_failure_approval_policy(self):
+        """#1707: ``thread/start`` MUST set ``approval_policy`` to
+        ``"on-failure"`` so codex escalates sandbox-denied writes via
+        ``item/commandExecution/requestApproval`` instead of returning
+        the raw OS-level error. Without this, the entire #1575+#1702
+        bridge stack is dormant — codex never sends the RPC, the queue
+        never fires, the operator never sees a prompt, and the agent
+        sees ``Operation not permitted`` as the terminal outcome.
+
+        Wire format is kebab-case (verified against the codex binary:
+        ``approval_policy = "never"`` in the binary's own error
+        messages)."""
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        assert ts.get("approval_policy") == "on-failure", (
+            f"thread/start must set approval_policy=on-failure (got "
+            f"{ts.get('approval_policy')!r}). Without it, codex never "
+            f"escalates sandbox-blocked writes to Kestrel's approval bridge."
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_start_keeps_read_only_sandbox(self):
+        """#1707 companion: the ``approval_policy`` change must not
+        accidentally widen the sandbox. We still want ``read-only`` —
+        inert reads stay sandboxed, and the bridge handles escalations
+        for the rest."""
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        assert ts.get("sandbox") == "read-only"
+
 
 class TestToolActivityMarkers:
     """The chat-UI renders tool-activity cards from typed in-band TOOL
