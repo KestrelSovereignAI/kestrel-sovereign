@@ -328,7 +328,7 @@ class OllamaAdapter(LLMAdapter):
             logger.error(f"Ollama adapter failed: {e}", exc_info=True)
             raise
 
-    async def get_streaming_response(
+    async def _stream_with_usage(
         self,
         client: "ollama.AsyncClient",
         model: str,
@@ -336,23 +336,14 @@ class OllamaAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         **kwargs
-    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
-        """
-        Gets a streaming response from Ollama.
+    ) -> AsyncIterator[Union[str, ThinkingDelta, LLMResponse]]:
+        """Stream text/thinking chunks then emit one terminal LLMResponse.
 
-        Note: Tool calling during streaming is not well-supported by Ollama.
-        For tool calls, use the non-streaming get_response method.
-
-        Args:
-            client: Ollama async client
-            model: Model name
-            messages: Chat messages
-            tools: Optional tools (not well-supported in streaming)
-            response_format: Optional Pydantic model for structured output
-            **kwargs: Additional parameters
-
-        Yields:
-            Text chunks as they arrive. For structured output, yields JSON chunks.
+        Shared by :meth:`get_streaming_response` (which filters the terminal
+        response out to preserve its text/thinking contract) and the no-tools
+        branch of :meth:`get_streaming_response_with_tools` (which forwards it
+        so the service layer can meter streamed turns — #1684). Ollama reports
+        ``prompt_eval_count`` / ``eval_count`` on the final (``done``) chunk.
         """
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
@@ -385,8 +376,23 @@ class OllamaAdapter(LLMAdapter):
 
             chunk_count = 0
             response_accum = ""
+            text_content = ""
+            input_tokens = None
+            output_tokens = None
             splitter = ThinkingContentSplitter(provider="ollama")
             async for chunk in stream:
+                # Usage arrives on the final (done) chunk; keep the latest.
+                if isinstance(chunk, dict):
+                    it = chunk.get('prompt_eval_count')
+                    ot = chunk.get('eval_count')
+                else:
+                    it = getattr(chunk, 'prompt_eval_count', None)
+                    ot = getattr(chunk, 'eval_count', None)
+                if it is not None:
+                    input_tokens = it
+                if ot is not None:
+                    output_tokens = ot
+
                 thinking, content = _extract_message_fields(chunk)
 
                 if thinking and response_format is None:
@@ -394,6 +400,7 @@ class OllamaAdapter(LLMAdapter):
 
                 if content:
                     chunk_count += 1
+                    text_content += content
                     if response_format is not None:
                         # Accumulate for final validation
                         response_accum += content
@@ -419,12 +426,56 @@ class OllamaAdapter(LLMAdapter):
                 except Exception as e:
                     logger.error(f"Unexpected error during Ollama streaming structured output validation: {e}", exc_info=True)
 
+            total_tokens = None
+            if input_tokens is not None and output_tokens is not None:
+                total_tokens = input_tokens + output_tokens
+            yield LLMResponse(
+                content=text_content if text_content else None,
+                tool_calls=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+            )
+
         except ollama.ResponseError as e:
             logger.error(f"Ollama streaming API error: {e}")
             raise
         except Exception as e:
             logger.error(f"Ollama streaming failed: {e}", exc_info=True)
             raise
+
+    async def get_streaming_response(
+        self,
+        client: "ollama.AsyncClient",
+        model: str,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Type[BaseModel]] = None,
+        **kwargs
+    ) -> AsyncIterator[Union[str, ThinkingDelta]]:
+        """
+        Gets a streaming response from Ollama (text/thinking contract).
+
+        Note: Tool calling during streaming is not well-supported by Ollama.
+        For tool calls, use the non-streaming get_response method.
+
+        Delegates to :meth:`_stream_with_usage` and drops the terminal
+        usage-bearing :class:`LLMResponse` so existing callers keep their
+        ``AsyncIterator[Union[str, ThinkingDelta]]`` contract.
+
+        Yields:
+            Text chunks as they arrive. For structured output, yields JSON chunks.
+        """
+        async for item in self._stream_with_usage(
+            client=client,
+            model=model,
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+            **kwargs
+        ):
+            if not isinstance(item, LLMResponse):
+                yield item
 
     async def get_streaming_response_with_tools(
         self,
@@ -457,7 +508,7 @@ class OllamaAdapter(LLMAdapter):
 
         Yields:
             str: Text content chunks as they arrive
-            LLMResponse: Final response with tool_calls (only if tools were called)
+            LLMResponse: Terminal response at end-of-stream carrying token usage (and tool_calls when present)
         """
         if not OLLAMA_AVAILABLE:
             raise RuntimeError("Ollama is not available in this environment")
@@ -495,24 +546,29 @@ class OllamaAdapter(LLMAdapter):
                     should_split_thinking = "<think" in response.content.lower()
                     if not should_split_thinking:
                         yield response.content
-                        return
-                    thinking, clean = split_thinking_from_content(response.content)
-                    if thinking:
-                        yield ThinkingDelta(thinking, provider="ollama")
-                    response.content = clean
-                    if response.content:
-                        yield response.content
+                    else:
+                        thinking, clean = split_thinking_from_content(response.content)
+                        if thinking:
+                            yield ThinkingDelta(thinking, provider="ollama")
+                        response.content = clean
+                        if response.content:
+                            yield response.content
+                # Terminal LLMResponse carrying usage so the service layer meters
+                # this turn (#1684); content was already streamed above. `response`
+                # holds the token counts from the non-streaming probe.
+                yield response
                 return
 
-            # No tools - use regular streaming
-            async for chunk in self.get_streaming_response(
+            # No tools - stream text and forward the terminal usage response so
+            # the service layer meters text-only streamed turns (#1684).
+            async for item in self._stream_with_usage(
                 client=client,
                 model=model,
                 messages=messages,
                 response_format=response_format,
                 **kwargs
             ):
-                yield chunk
+                yield item
 
         except ollama.ResponseError as e:
             logger.error(f"Ollama streaming with tools API error: {e}")

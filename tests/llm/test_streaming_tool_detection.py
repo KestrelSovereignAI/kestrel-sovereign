@@ -106,10 +106,16 @@ class TestOpenAIStreamingToolDetectionUnit:
         ):
             results.append(item)
 
-        # Should yield only text chunks, no LLMResponse at end (no tools called)
-        assert len(results) == 4
-        assert all(isinstance(r, str) for r in results)
-        assert "".join(results) == "Hello world!"
+        # #1684: a text-only stream now ALSO emits a terminal LLMResponse
+        # carrying token usage (previously dropped — a silent billing
+        # undercount), so the service layer can meter the turn.
+        text_chunks = [r for r in results if isinstance(r, str)]
+        finals = [r for r in results if isinstance(r, LLMResponse)]
+        assert "".join(text_chunks) == "Hello world!"
+        assert len(finals) == 1
+        assert not finals[0].tool_calls  # text-only: no tool calls
+        assert finals[0].input_tokens == 10
+        assert finals[0].output_tokens == 5
 
     @pytest.mark.asyncio
     async def test_single_tool_call_detection(self):
@@ -609,20 +615,32 @@ class TestOllamaStreamingToolDetectionUnit:
             ):
                 results.append(item)
 
-            # Should yield text content
-            assert len(results) == 1
-            assert results[0] == "The weather is sunny."
+            # #1684: the text-only fallback now also emits the terminal
+            # LLMResponse (carrying usage) after the streamed content so the
+            # service layer can meter the turn.
+            text = [r for r in results if isinstance(r, str)]
+            finals = [r for r in results if isinstance(r, LLMResponse)]
+            assert "".join(text) == "The weather is sunny."
+            assert len(finals) == 1
+            assert finals[0].input_tokens == 8 and finals[0].output_tokens == 6
 
     @pytest.mark.asyncio
     async def test_no_tools_uses_streaming(self):
         """Test Ollama uses regular streaming when no tools provided."""
         adapter = OllamaAdapter()
 
-        async def mock_streaming():
-            for chunk in ["Hello", " world"]:
-                yield chunk
+        # #1684: the no-tools branch routes through _stream_with_usage (which
+        # yields chunks + a terminal usage-bearing LLMResponse) so streamed
+        # turns are metered. get_streaming_response keeps its text-only contract
+        # by filtering that terminal out, but the tool-detection entry point
+        # forwards it.
+        async def mock_stream_with_usage(**kwargs):
+            yield "Hello"
+            yield " world"
+            yield LLMResponse(content="Hello world", tool_calls=None,
+                              input_tokens=3, output_tokens=2, total_tokens=5)
 
-        with patch.object(adapter, 'get_streaming_response', return_value=mock_streaming()) as mock_stream:
+        with patch.object(adapter, '_stream_with_usage', return_value=mock_stream_with_usage()):
             mock_client = MagicMock()
             results = []
             async for item in adapter.get_streaming_response_with_tools(
@@ -633,8 +651,11 @@ class TestOllamaStreamingToolDetectionUnit:
             ):
                 results.append(item)
 
-            assert len(results) == 2
-            assert "".join(results) == "Hello world"
+            text = [r for r in results if isinstance(r, str)]
+            finals = [r for r in results if isinstance(r, LLMResponse)]
+            assert "".join(text) == "Hello world"
+            assert len(finals) == 1
+            assert finals[0].input_tokens == 3
 
 
 # =============================================================================

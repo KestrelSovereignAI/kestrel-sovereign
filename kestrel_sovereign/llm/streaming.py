@@ -170,6 +170,7 @@ class StreamingMixin:
         provider_name: str,
         *,
         duration_ms: int,
+        partial: bool = False,
     ) -> None:
         """Meter a streamed turn from its terminal :class:`LLMResponse`.
 
@@ -179,6 +180,10 @@ class StreamingMixin:
         mirrors the non-streaming recording (service.py) from the terminal
         response. Best-effort: a recording failure must never break the
         stream the user is consuming.
+
+        ``partial=True`` flags a mid-stream-abort flush (no terminal response
+        arrived). Tokens were still consumed/billed by the provider, so the
+        usage is recorded; the metadata flag lets telemetry tell it apart.
         """
         if not isinstance(response, LLMResponse):
             return
@@ -187,6 +192,9 @@ class StreamingMixin:
             output_tokens = response.output_tokens
             total_tokens = (input_tokens or 0) + (output_tokens or 0)
             await self._track_model_usage(model, provider_name, tokens=total_tokens)
+            metadata = {"streamed": True}
+            if partial:
+                metadata["partial_abort"] = True
             await self._log_llm_call(
                 provider=provider_name,
                 model=model,
@@ -201,7 +209,7 @@ class StreamingMixin:
                     response, "cache_read_input_tokens", None
                 ),
                 tools_used=bool(getattr(response, "tool_calls", None)),
-                metadata={"streamed": True},
+                metadata=metadata,
             )
         except Exception as exc:  # noqa: BLE001 - metering must not break stream
             logger.warning("Failed to record streamed usage: %s", exc)
@@ -639,10 +647,16 @@ class StreamingMixin:
 
                     # Meter the streamed turn from its terminal LLMResponse.
                     # The `finally` records even if the consumer stops iterating
-                    # after the terminal response arrives. (A true mid-stream
-                    # abort, before the terminal response, still loses usage —
-                    # that needs adapter-level incremental token tracking,
-                    # tracked separately.)
+                    # after the terminal response arrives. For adapters that
+                    # report usage incrementally (Anthropic), pass a usage_sink
+                    # so a true mid-stream abort — before the terminal response
+                    # — can still flush the partial usage the provider billed
+                    # (#1684). Adapters that only surface usage at stream end
+                    # leave the sink empty, so the abort path records nothing
+                    # (there is nothing to record).
+                    usage_sink: Dict[str, Any] = {}
+                    if getattr(adapter, "supports_partial_usage_flush", False):
+                        kwargs["usage_sink"] = usage_sink
                     stream_start = time.monotonic()
                     final_response = None
                     try:
@@ -657,10 +671,27 @@ class StreamingMixin:
                                 final_response = item
                             yield item
                     finally:
+                        duration_ms = int((time.monotonic() - stream_start) * 1000)
                         if final_response is not None:
+                            # Normal end-of-stream: terminal response carries the
+                            # authoritative usage (and supersedes the sink).
                             await self._record_streamed_usage(
                                 final_response, model, provider_name,
-                                duration_ms=int((time.monotonic() - stream_start) * 1000),
+                                duration_ms=duration_ms,
+                            )
+                        elif usage_sink:
+                            # Aborted before the terminal response — flush what
+                            # the adapter captured incrementally.
+                            await self._record_streamed_usage(
+                                LLMResponse(
+                                    content=None,
+                                    tool_calls=None,
+                                    input_tokens=usage_sink.get("input_tokens"),
+                                    output_tokens=usage_sink.get("output_tokens"),
+                                ),
+                                model, provider_name,
+                                duration_ms=duration_ms,
+                                partial=True,
                             )
                     logger.info(f"Streaming with tools completed from {provider_name}")
                     return
