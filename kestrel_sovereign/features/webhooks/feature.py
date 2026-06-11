@@ -20,7 +20,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.features.storage_access import resolve_feature_database
@@ -346,6 +346,7 @@ class WebhookFeature(Feature):
         event_type: str = "",
         auth_config_json: str = "{}",
         rate_limit: int = 60,
+        allow_unauthenticated: bool = False,
     ) -> ToolResult:
         """Register a new webhook endpoint.
 
@@ -355,13 +356,21 @@ class WebhookFeature(Feature):
             event_type: Optional event type label for categorisation
             auth_config_json: JSON config for auth (e.g. {"token":"secret"} for bearer_token)
             rate_limit: Maximum requests per minute (default: 60, 0 = unlimited)
+            allow_unauthenticated: Acknowledge an intentionally open
+                (``auth_type="none"``) endpoint. The host bypasses its
+                API-key auth for ``/webhooks/*``, so an unauthenticated
+                webhook is reachable by anyone who can hit the URL. Without
+                this flag, registering with ``auth_type="none"`` still
+                succeeds but returns PARTIAL with a loud security warning;
+                pass ``True`` to downgrade that to a clean OK for a
+                deliberately open, trusted-network endpoint (#1677).
 
         Returns:
-            ToolResult.ok on a clean register; PARTIAL when the
-            in-memory register succeeded but the DB persistence row
-            failed (the webhook will work right now but won't survive
-            a restart); ERROR for any validation or duplicate-name
-            failure.
+            ToolResult.ok on a clean register; PARTIAL when the in-memory
+            register succeeded but (a) the endpoint is unauthenticated and
+            not explicitly acknowledged, and/or (b) the DB persistence row
+            failed (the webhook works now but won't survive a restart);
+            ERROR for any validation or duplicate-name failure.
         """
         # Validate auth_type
         try:
@@ -439,6 +448,7 @@ class WebhookFeature(Feature):
             name, auth_type, rate_limit,
         )
 
+        is_unauthenticated = auth_type_enum == WebhookAuthType.NONE
         data = {
             "webhook_id": webhook_id,
             "name": name,
@@ -448,21 +458,34 @@ class WebhookFeature(Feature):
             "endpoint": f"/webhooks/{name}",
             "created_at": now,
             "persisted": (self._db is not None and not persist_failed),
+            # Always recorded (even when acknowledged) so audits can find
+            # every open endpoint, not just the un-acknowledged ones.
+            "unauthenticated": is_unauthenticated,
         }
         confirmation = (
             f"Registered webhook '{name}' (auth={auth_type}, "
             f"rate_limit={max(0, rate_limit)}/min, endpoint=/webhooks/{name})."
         )
-        if persist_failed:
-            return ToolResult.partial(
-                confirmation,
-                (
-                    "in-memory registration succeeded but the DB INSERT for "
-                    "webhook_config failed — this webhook will accept "
-                    "requests now but will NOT survive a restart."
-                ),
-                data=data,
+
+        # Collect any conditions that warrant a PARTIAL (vs a clean OK).
+        warnings: List[str] = []
+        if is_unauthenticated and not allow_unauthenticated:
+            warnings.append(
+                f"UNAUTHENTICATED endpoint: anyone who can reach "
+                f"/webhooks/{name} can trigger it — the host bypasses its "
+                f"API-key auth for /webhooks/*, and auth_type='none' accepts "
+                f"every request. Set auth_type='hmac_sha256' (recommended) to "
+                f"require a signed secret, or pass allow_unauthenticated=True "
+                f"to acknowledge an intentionally open, trusted-network endpoint."
             )
+        if persist_failed:
+            warnings.append(
+                "in-memory registration succeeded but the DB INSERT for "
+                "webhook_config failed — this webhook will accept "
+                "requests now but will NOT survive a restart."
+            )
+        if warnings:
+            return ToolResult.partial(confirmation, " ".join(warnings), data=data)
         return ToolResult.ok(confirmation, data=data)
 
     @tool(

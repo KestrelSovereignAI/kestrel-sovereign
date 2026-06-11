@@ -224,6 +224,7 @@ async def test_webhook_registration_and_audit_history_are_backend_neutral(db_bac
         auth_type="none",
         event_type="sync",
         rate_limit=0,
+        allow_unauthenticated=True,  # #1677: acknowledge the open endpoint
     )
     assert registered.status is ToolResultStatus.OK
 
