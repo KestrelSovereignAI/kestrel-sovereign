@@ -745,11 +745,14 @@ async def test_orchestrator_loop_timeout_surfaces_failed_marker(monkeypatch):
         chunks.append(chunk)
 
     text = "".join(c for c in chunks if isinstance(c, str))
-    # User sees the failure marker — chat UI groups this under the
-    # tool card as the error state.
-    assert "❌" in text and "timeout" in text, (
-        f"expected '❌ llm call failed: timeout' in stream, got: {text!r}"
-    )
+    # #1659: the follow-up timeout surfaces as a typed error tool sentinel
+    # (rendered as a tool-card error), not emoji prose.
+    from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+    _clean, parts = _parse_stream_sentinels(text)
+    assert any(
+        p["phase"] == "error" and "timeout" in (p.get("detail") or "")
+        for p in parts
+    ), f"expected an error tool sentinel with timeout, got: {text!r}"
     # Tool still ran exactly once — only the FOLLOW-UP timed out.
     assert mock_feature.execute_as_subagent.await_count == 1
 
@@ -840,14 +843,18 @@ async def test_orchestrator_loop_timeout_marker_precedes_separator():
 
         text = "".join(c for c in chunks if isinstance(c, str))
         # No separator should have been emitted (no text chunk arrived
-        # before the timeout). The ❌ marker is in the tool-activity
-        # block where chat.js will style it as a tool-card error.
+        # before the timeout) — the timeout error rides a typed sentinel,
+        # so there is no stray `---` rendered as prose.
         assert "\n---\n" not in text, (
-            f"separator must NOT precede timeout marker (chat.js would "
-            f"then render timeout as response prose, not tool-card error). "
-            f"Got: {text!r}"
+            f"separator must NOT precede timeout marker. Got: {text!r}"
         )
-        assert "❌" in text and "timeout" in text
+        # #1659: typed error sentinel instead of the ❌ emoji marker.
+        from kestrel_sovereign.agent.streaming import _parse_stream_sentinels
+        _clean, parts = _parse_stream_sentinels(text)
+        assert any(
+            p["phase"] == "error" and "timeout" in (p.get("detail") or "")
+            for p in parts
+        ), f"expected an error tool sentinel with timeout, got: {text!r}"
     finally:
         oe.ORCHESTRATOR_TURN_TIMEOUT_SECS = oe_original_timeout
 

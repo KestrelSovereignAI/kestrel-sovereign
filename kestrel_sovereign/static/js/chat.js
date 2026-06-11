@@ -49,9 +49,15 @@ const REVISE_SENTINEL_PREFIX = '\x1eKESTREL:REVISE:';
 const REVISE_SENTINEL_SUFFIX = '\x1e';
 const THINKING_SENTINEL_PREFIX = '\x1eKESTREL:THINK:';
 const THINKING_SENTINEL_SUFFIX = '\x1e';
+// #1659: typed tool-activity sentinel — pairs with streaming.py
+// _build_tool_sentinel. Payload {phase,name,index,ms,detail}. Stripped from
+// visible prose like the others; the structured payload drives tool cards.
+const TOOL_SENTINEL_PREFIX = '\x1eKESTREL:TOOL:';
+const TOOL_SENTINEL_SUFFIX = '\x1e';
 const STREAM_SENTINELS = [
     { kind: 'revise', prefix: REVISE_SENTINEL_PREFIX, suffix: REVISE_SENTINEL_SUFFIX },
     { kind: 'thinking', prefix: THINKING_SENTINEL_PREFIX, suffix: THINKING_SENTINEL_SUFFIX },
+    { kind: 'tool', prefix: TOOL_SENTINEL_PREFIX, suffix: TOOL_SENTINEL_SUFFIX },
 ];
 
 function renderToolActivityLineHtml(line) {
@@ -62,62 +68,141 @@ function renderToolActivityLineHtml(line) {
     return `<div class="tool-activity">${escaped}</div>`;
 }
 
-function parseToolActivityLine(line) {
-    const text = String(line || '').trim();
-    const startMatch = text.match(/^\u{1F527}\s*(?:Calling\s+)?(.+?)(?:\.\.\.)?$/u);
-    const doneMatch = text.match(/^\u2713\s*(.+?)\s+(complete|done)(?:\s+\((.+)\))?$/u);
-    const errorMatch = text.match(/^\u274C\s*(.+?)\s+failed(?::\s*(.*))?$/u);
-    if (startMatch) return { kind: 'start', name: startMatch[1], line: text };
-    if (doneMatch) return { kind: 'done', name: doneMatch[1], detail: doneMatch[3] || '', line: text };
-    if (errorMatch) return { kind: 'error', name: errorMatch[1], detail: errorMatch[2] || '', line: text };
-    return { kind: 'note', name: '', line: text };
-}
+// #1659: tool activity is now structured data (typed TOOL sentinels live,
+// position-stamped ``tool_events`` metadata on reload) \u2014 never regex-scraped
+// emoji text. These helpers normalize both shapes and group them into cards.
 
-function groupToolActivity(lines) {
-    const groups = [];
-    for (const line of lines) {
-        const parsed = parseToolActivityLine(line);
-        if (parsed.kind === 'start') {
-            groups.push({ name: parsed.name, status: 'running', detail: '', lines: [line] });
-            continue;
-        }
-
-        const target = [...groups].reverse().find((group) => group.name === parsed.name && group.status === 'running');
-        if (target && (parsed.kind === 'done' || parsed.kind === 'error')) {
-            target.status = parsed.kind === 'done' ? 'complete' : 'error';
-            target.detail = parsed.detail;
-            target.lines.push(line);
-            continue;
-        }
-
-        groups.push({
-            name: parsed.name || line,
-            status: parsed.kind === 'error' ? 'error' : parsed.kind === 'done' ? 'complete' : 'note',
-            detail: parsed.detail || '',
-            lines: [line],
+// Accept either the live sentinel shape ({phase,name,ms,detail,pos}) or the
+// persisted metadata shape ({type,tool,ms,error,pos}); emit one normal form.
+export function normalizeToolEvents(list) {
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const e of list) {
+        if (!e || typeof e !== 'object') continue;
+        const raw = e.phase || e.type;
+        const phase = raw === 'complete' ? 'done' : raw;
+        if (phase !== 'start' && phase !== 'done' && phase !== 'error') continue;
+        out.push({
+            phase,
+            name: e.name || e.tool || '',
+            ms: (typeof e.ms === 'number' ? e.ms : null),
+            detail: e.detail || e.error || '',
+            pos: (typeof e.pos === 'number' ? e.pos : null),
         });
     }
-    return groups;
+    return out;
 }
 
-// Tool-activity markers are recognized STRUCTURALLY as bounded tokens.
-// Each token self-terminates (at "...", the complete/done keyword, or the
-// failed clause), so prose welded onto EITHER side splits out cleanly:
-//   START: 🔧 Calling <name>[: detail]...
-//   DONE:  ✓ <name> complete|done [(detail)]
-//   ERROR: ❌ <name> failed[: detail]
-// The error detail excludes the marker code points (🔧 ✓ ❌) so a
-// detail glued to a following marker — "❌ x failed: timeout🔧 Calling
-// y..." — terminates at that marker instead of swallowing it (codex
-// review). Start ("...") and done (keyword/paren) are already self-bounded.
-const TOOL_MARKER_TOKEN = /\u{1F527}\s+Calling\s+\S[^\n]*?\.\.\.|✓\s+\S[^\n]*?\s+(?:complete|done)\b(?:\s+\([^\n)]*\))?|❌\s+\S[^\n]*?\s+failed\b(?::[^\n\u{1F527}✓❌]*)?/gu;
+// Re-base tool-event positions onto a streamed slice (#1560 baseline): drop
+// events before the baseline and shift the rest so ``pos`` indexes the slice.
+function sliceToolEvents(events, baseline) {
+    if (!Array.isArray(events) || !events.length) return events || [];
+    if (!baseline) return events;
+    return events
+        .filter((e) => (typeof e.pos === 'number' ? e.pos : 0) >= baseline)
+        .map((e) => ({ ...e, pos: (typeof e.pos === 'number' ? e.pos : 0) - baseline }));
+}
 
-// A turn is only treated as tool activity when it contains at least one
-// 🔧 Calling start marker. Done/error markers (✓/❌) are recognized only
-// in that company — so a fast-item turn's done-only markers still card,
-// but ordinary prose that happens to read "✓ migration complete" or
-// "❌ build failed" never gets mistaken for a tool card.
-const TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
+// The tool events to render into a pane's CURRENT streaming bubble: skip the
+// ones already shown in a pre-restart bubble (index baseline) and re-base the
+// rest onto the content slice (#1560 / #1659).
+function paneStreamToolEvents(pane) {
+    const idx = pane.toolEventsBaseline || 0;
+    const baseline = pane.streamBaseline || 0;
+    return sliceToolEvents((pane.toolEvents || []).slice(idx), baseline);
+}
+
+// Group ordered normalized events into one card per tool lifecycle. A 'start'
+// opens a running card; the next 'done'/'error' for the same name closes the
+// most recent running one. ``pos`` (the start's clean-text offset) places the
+// card between prose segments.
+function groupToolCards(events) {
+    const cards = [];
+    for (const ev of events) {
+        if (ev.phase === 'start') {
+            cards.push({ name: ev.name, status: 'running', detail: ev.detail || '', pos: ev.pos, events: [ev] });
+            continue;
+        }
+        const target = [...cards].reverse().find((c) => c.name === ev.name && c.status === 'running');
+        if (target) {
+            target.status = ev.phase === 'done' ? 'complete' : 'error';
+            // Card summary detail: the duration on success, the error on
+            // failure (mirrors the pre-#1659 card meta).
+            const closing = ev.phase === 'done'
+                ? (ev.ms != null ? `${ev.ms}ms` : '')
+                : (ev.detail || '');
+            if (closing) target.detail = closing;
+            if (target.pos == null) target.pos = ev.pos;
+            target.events.push(ev);
+        } else {
+            cards.push({
+                name: ev.name,
+                status: ev.phase === 'done' ? 'complete' : 'error',
+                detail: ev.detail || '',
+                pos: ev.pos,
+                events: [ev],
+            });
+        }
+    }
+    for (const c of cards) if (c.pos == null) c.pos = 0;
+    return cards;
+}
+
+// Display string for a single structured event \u2014 used only to render the
+// card body (the glyph is display, not wire/data). renderToolActivityLineHtml
+// styles by the leading glyph.
+function toolEventDisplayLine(ev) {
+    if (ev.phase === 'start') {
+        return `\u{1F527} Calling ${ev.name}${ev.detail ? `: ${ev.detail}` : ''}...`;
+    }
+    if (ev.phase === 'done') {
+        return `\u2713 ${ev.name} complete${ev.ms != null ? ` (${ev.ms}ms)` : ''}`;
+    }
+    if (ev.phase === 'error') {
+        return `\u274C ${ev.name} failed${ev.detail ? `: ${ev.detail}` : ''}`;
+    }
+    return ev.name || '';
+}
+
+// Split clean prose into ordered prose/tools segments by each card's position.
+// Cards sharing a position render as one batch (a multi-tool iteration).
+function buildToolSegmentsByPos(content, cards) {
+    const text = String(content || '');
+    const len = text.length;
+    const sorted = [...cards].sort((a, b) => (a.pos || 0) - (b.pos || 0));
+    const segments = [];
+    let cursor = 0;
+    let i = 0;
+    const clamp = (p) => Math.max(0, Math.min(len, p == null ? len : p));
+    // Prose that opens right after a tools batch leads with the orchestrator's
+    // `\n---\n` wire delimiter (still emitted for multi-iteration turns). It is
+    // protocol, not content — drop it (and surrounding blank lines) without
+    // touching real content indentation, exactly as the old segmenter did.
+    const pushProse = (raw) => {
+        let t = raw;
+        const prevTools = segments.length && segments[segments.length - 1].kind === 'tools';
+        if (prevTools) {
+            t = t.replace(/^(?:[ \t]*\r?\n)*[ \t]*---[ \t]*(?:\r?\n|$)/, '');
+            t = t.replace(/^(?:[ \t]*\r?\n)+/, '');
+        }
+        if (t.trim()) segments.push({ kind: 'prose', text: t });
+    };
+    while (i < sorted.length) {
+        const pos = clamp(sorted[i].pos);
+        if (pos > cursor) {
+            pushProse(text.slice(cursor, pos));
+            cursor = pos;
+        }
+        const batch = [];
+        while (i < sorted.length && clamp(sorted[i].pos) === pos) {
+            batch.push(sorted[i]);
+            i += 1;
+        }
+        segments.push({ kind: 'tools', cards: batch });
+    }
+    if (cursor < len) pushProse(text.slice(cursor));
+    return segments;
+}
 
 // ============================================================================
 // Dynamic thinking-status phase (functional words)
@@ -186,52 +271,16 @@ export function toolStatusPhase(name) {
 // instead of O(full response).
 const STATUS_SCAN_WINDOW = 4096;
 
-// Derive the status phase implied by a slice of the visible stream (the
-// caller passes the cumulative tail, so a tool marker split across packets
-// still resolves once complete). Tool markers win: a `🔧 Calling` start →
-// that tool's verb; a `✓ done` or `❌ failed` → back to the generic
-// `thinking` (the agent is deciding what's next). Plain prose after the
-// last marker means the answer is being composed → `writing`. Returns null
-// when the text carries no phase signal (caller keeps the prior phase).
-// Uses only `.match`/`.replace` on TOOL_MARKER_TOKEN — never `.test` — so
-// the shared global regex's lastIndex never leaks into the renderer's own
-// use of it.
+// Derive the prose-composition phase from a slice of the visible stream.
+// #1659: tool verbs no longer come from text scanning — the streaming loop
+// sets a tool's verb directly from its typed TOOL start sentinel (via
+// ``toolStatusPhase``). This now answers a narrower question: is the agent
+// composing answer prose? Non-whitespace visible text (ignoring the legacy
+// `---` wire delimiter) → ``writing``; otherwise null so the caller keeps
+// the prior phase (e.g. the in-flight tool's verb between sentinels).
 export function statusPhaseForChunk(chunk) {
-    const text = String(chunk || '');
-    // Mirror the renderer's rule: a turn is only tool activity when it has a
-    // real `🔧 Calling` start. Without one, lone ✓/❌ lines are ordinary
-    // answer prose ("✓ migration complete", "❌ build failed"), not tool
-    // completions — so they read as `writing`, never `thinking`.
-    const markers = TOOL_START_PRESENCE.test(text)
-        ? (text.match(TOOL_MARKER_TOKEN) || [])
-        : [];
-    let phase = null;
-    let lastWasStart = false;
-    for (const marker of markers) {
-        const parsed = parseToolActivityLine(marker.trim());
-        if (parsed.kind === 'start') {
-            phase = toolStatusPhase(parsed.name);
-            lastWasStart = true;
-        } else if (parsed.kind === 'done' || parsed.kind === 'error') {
-            phase = 'thinking';
-            lastWasStart = false;
-        }
-    }
-    // Only prose AFTER the last marker counts as answer composition. With a
-    // cumulative tail, prose BEFORE/BETWEEN markers is prior-step output, not
-    // new answer text — so inspect only what follows the last marker. A
-    // completion with nothing after it stays `thinking` (the agent is between
-    // tool steps), not `writing`. An in-flight start (lastWasStart) keeps its
-    // verb regardless of any trailing text.
-    let tail = text;
-    if (markers.length) {
-        const last = markers[markers.length - 1];
-        const at = text.lastIndexOf(last);
-        tail = at >= 0 ? text.slice(at + last.length) : '';
-    }
-    const prose = tail.replace(/-{3,}/g, '').trim();
-    if (prose && !lastWasStart) phase = 'writing';
-    return phase;
+    const prose = String(chunk || '').replace(/-{3,}/g, '').trim();
+    return prose ? 'writing' : null;
 }
 
 // Phase → i18n label key. Resolved through the same theme catalog as the
@@ -298,149 +347,73 @@ function applyThinkingStatusWord(phase) {
     textEl.textContent = word;
 }
 
-// The orchestrator emits a bare `---` line as the wire delimiter between
-// the tool-activity block and the synthesized answer. It is protocol,
-// not prose — dropped (only where it appears, leading the prose right
-// after a tools block) so it never renders as a stray <hr> while genuine
-// markdown rules elsewhere survive.
-
-/**
- * Segment a (possibly partial) assistant message into an ordered list of
- * ``{ kind: 'prose' | 'tools', text }`` blocks. Adjacent tool markers
- * (separated only by whitespace) coalesce into one tools block — one
- * card group — while real prose between them stays prose, so a
- * multi-iteration turn renders as cards/prose/cards/prose in document
- * order instead of one leading card group followed by inline marker text.
- */
-export function segmentToolActivity(content) {
-    const text = String(content || '');
-    // No start marker → no tool activity at all; the whole message is
-    // prose (and any literal `---` is a real markdown rule, left alone).
-    if (!TOOL_START_PRESENCE.test(text)) {
-        return text.trim() ? [{ kind: 'prose', text }] : [];
-    }
-
-    const segments = [];
-    const appendProse = (raw) => {
-        // Whitespace-only gaps merely separate tokens — they must not
-        // break a run of adjacent markers into two card groups.
-        if (!raw || !raw.trim()) return;
-        const last = segments[segments.length - 1];
-        if (last && last.kind === 'prose') last.text += raw;
-        else segments.push({ kind: 'prose', text: raw });
-    };
-    const appendTool = (marker) => {
-        const last = segments[segments.length - 1];
-        if (last && last.kind === 'tools') last.text += `\n${marker}`;
-        else segments.push({ kind: 'tools', text: marker });
-    };
-
-    const re = new RegExp(TOOL_MARKER_TOKEN);
-    let idx = 0;
-    let m;
-    while ((m = re.exec(text)) !== null) {
-        // Prose that opens AFTER a marker (idx > 0): its leading spaces/
-        // tabs on the same line are the server's inline separator
-        // ("✓ x complete The next..."), not content — drop them. We strip
-        // only same-line whitespace (no `\n`), so indentation that begins
-        // on a NEW line (a 4-space markdown code block) is preserved.
-        let before = text.slice(idx, m.index);
-        if (idx > 0) before = before.replace(/^[ \t]+/, '');
-        appendProse(before);
-        appendTool(m[0]);
-        idx = re.lastIndex;
-        if (m.index === re.lastIndex) re.lastIndex++; // tokens are non-empty; pure safety
-    }
-    let tail = text.slice(idx);
-    if (idx > 0) tail = tail.replace(/^[ \t]+/, '');
-    appendProse(tail);
-
-    // Clean prose blocks WITHOUT touching content indentation (codex
-    // review): drop the wire `---` delimiter the orchestrator emits at the
-    // head of the prose right after a tools block, then trim surrounding
-    // blank lines and trailing whitespace. A leading 4-space code block
-    // (indentation that follows a newline) survives.
-    for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i];
-        if (seg.kind !== 'prose') continue;
-        let t = seg.text;
-        if (i > 0 && segments[i - 1].kind === 'tools') {
-            t = t.replace(/^(?:[ \t]*\r?\n)*[ \t]*---[ \t]*(?:\r?\n|$)/, '');
-        }
-        t = t.replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\s+$/, '');
-        seg.text = t;
-    }
-    return segments.filter((seg) => seg.kind === 'tools' || seg.text);
-}
-
-function segmentsHaveTools(segments) {
-    return segments.some((seg) => seg.kind === 'tools');
-}
-
-/**
- * Render a full assistant message to an HTML string: tool runs become
- * grouped cards, prose becomes markdown, in document order. The single
- * shared renderer for the streaming bubble, the finalized bubble, and
- * the history-reload path, so all three agree on layout. ``streaming``
- * selects the partial-tolerant markdown pass for the in-flight bubble.
- */
-export function renderAgentContentHtml(content, { streaming = false } = {}) {
-    const markdown = deps().markdown;
-    const renderProse = streaming ? markdown.renderStreamingMarkdown : markdown.renderMarkdown;
-    const segments = segmentToolActivity(content);
-    if (!segmentsHaveTools(segments)) {
-        return renderProse(content);
-    }
-    return segments
-        .map((seg, i) => {
-            if (seg.kind === 'tools') return renderToolActivityHtml(seg.text);
-            const cls = i === 0 ? 'response-content response-prelude' : 'response-content';
-            return `<div class="${cls}">${renderProse(seg.text)}</div>`;
-        })
-        .join('');
-}
-
-async function finalizeAgentContent(contentDiv, content) {
-    const markdown = deps().markdown;
-    // No tool activity → the plain finalize path (markdown + highlight +
-    // mermaid in one shot). Keeps the common turn on the simplest route.
-    if (!segmentsHaveTools(segmentToolActivity(content))) {
-        await markdown.finalizeMarkdown(contentDiv, content);
-        return;
-    }
-    // With tool runs: one innerHTML write keeps card/prose ordering exact;
-    // highlight + mermaid then run once over the whole container.
-    contentDiv.innerHTML = renderAgentContentHtml(content);
-    markdown.highlightCodeBlocks(contentDiv);
-    await markdown.renderMermaidDiagrams(contentDiv);
-}
-
-export function renderToolActivityHtml(activityText) {
-    const lines = String(activityText || '')
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean);
-    if (lines.length === 0) return '';
-
-    const groups = groupToolActivity(lines);
-    const callsHtml = groups.map((group) => {
-        const eventCount = group.lines.length === 1 ? '1 event' : `${group.lines.length} events`;
-        const detail = group.detail ? ` · ${group.detail}` : '';
-        const meta = `${group.status}${detail} · ${eventCount}`;
-        const activityHtml = group.lines.map(renderToolActivityLineHtml).join('');
-
+// Render a group of structured tool cards (one per tool lifecycle) into the
+// same ``.tool-activity-container`` markup the emoji path produced — the CSS
+// is unchanged; only the data source moved from regex-scraped text to typed
+// events (#1659).
+export function renderToolCardsHtml(cards) {
+    if (!cards || !cards.length) return '';
+    const callsHtml = cards.map((card) => {
+        const n = card.events.length;
+        const eventCount = n === 1 ? '1 event' : `${n} events`;
+        const detail = card.detail ? ` · ${card.detail}` : '';
+        const meta = `${card.status}${detail} · ${eventCount}`;
+        const activityHtml = card.events
+            .map(toolEventDisplayLine)
+            .map(renderToolActivityLineHtml)
+            .join('');
         return `
         <details class="tool-activity-expandable tool-activity-call">
             <summary class="tool-activity-summary">
-                <span>${deps().escapeHtml(`Tool call: ${group.name}`)}</span>
+                <span>${deps().escapeHtml(`Tool call: ${card.name}`)}</span>
                 <span class="tool-activity-count">${deps().escapeHtml(meta)}</span>
             </summary>
             <div class="tool-activity-list">${activityHtml}</div>
         </details>
     `;
     }).join('');
-
     return `<div class="tool-activity-container">${callsHtml}</div>`;
+}
+
+/**
+ * Render a full assistant message to an HTML string: tool runs become grouped
+ * cards placed by position, prose becomes markdown, in document order. The
+ * single shared renderer for the streaming bubble, the finalized bubble, and
+ * the history-reload path, so all three agree on layout. ``streaming`` selects
+ * the partial-tolerant markdown pass; ``toolEvents`` is the structured tool
+ * activity (live sentinel parts, or persisted ``tool_events`` metadata).
+ */
+export function renderAgentContentHtml(content, { streaming = false, toolEvents = null } = {}) {
+    const markdown = deps().markdown;
+    const renderProse = streaming ? markdown.renderStreamingMarkdown : markdown.renderMarkdown;
+    const events = normalizeToolEvents(toolEvents);
+    if (!events.length) {
+        return renderProse(content);
+    }
+    const cards = groupToolCards(events);
+    const segments = buildToolSegmentsByPos(content, cards);
+    return segments
+        .map((seg, i) => {
+            if (seg.kind === 'tools') return renderToolCardsHtml(seg.cards);
+            const cls = i === 0 ? 'response-content response-prelude' : 'response-content';
+            return `<div class="${cls}">${renderProse(seg.text)}</div>`;
+        })
+        .join('');
+}
+
+async function finalizeAgentContent(contentDiv, content, toolEvents = null) {
+    const markdown = deps().markdown;
+    // No tool activity → the plain finalize path (markdown + highlight +
+    // mermaid in one shot). Keeps the common turn on the simplest route.
+    if (!normalizeToolEvents(toolEvents).length) {
+        await markdown.finalizeMarkdown(contentDiv, content);
+        return;
+    }
+    // With tool runs: one innerHTML write keeps card/prose ordering exact;
+    // highlight + mermaid then run once over the whole container.
+    contentDiv.innerHTML = renderAgentContentHtml(content, { toolEvents });
+    markdown.highlightCodeBlocks(contentDiv);
+    await markdown.renderMermaidDiagrams(contentDiv);
 }
 
 /**
@@ -471,6 +444,7 @@ function stripStreamSentinels(chunk) {
     let textBefore = '';
     let sawSentinel = false;
     const thoughts = [];
+    const tools = [];
     let pos = 0;
     // #1547: a revise sentinel marks the boundary between the agent's
     // pre-revision prose and its post-revision (post-tool) synthesis.
@@ -530,6 +504,17 @@ function stripStreamSentinels(chunk) {
             // means the boundary spans the packet edge — the loop welds
             // this packet's leading prose against the prior fullContent.
             if (!sawVisible) leadingReviseBoundary = true;
+        } else if (found.kind === 'tool') {
+            try {
+                const payload = JSON.parse(payloadText);
+                if (payload && payload.phase) {
+                    // pos = offset into THIS packet's clean text; the loop
+                    // adds the cumulative content length to make it absolute.
+                    tools.push({ ...payload, pos: textBefore.length });
+                }
+            } catch (_) {
+                // Malformed UI metadata should not corrupt visible text.
+            }
         } else {
             try {
                 const payload = JSON.parse(payloadText);
@@ -546,6 +531,7 @@ function stripStreamSentinels(chunk) {
         textAfter: '',
         sawSentinel,
         thoughts,
+        tools,
         reviseBoundaryPending,
         leadingReviseBoundary,
     };
@@ -620,9 +606,9 @@ export function registerHeaderAction(action) {
 function chatComponentApi() {
     return {
         setChatDeps,
-        segmentToolActivity,
+        normalizeToolEvents,
         renderAgentContentHtml,
-        renderToolActivityHtml,
+        renderToolCardsHtml,
         setChatRoot,
         registerHeaderAction,
         registerPartRenderer,
@@ -1388,6 +1374,13 @@ export function handleRestartStatus(payload) {
                 // the next chunk write.
                 paneObj.streamBaseline = rawLen;
             }
+            // #1659: the tool cards already rendered in the bubble we just
+            // sealed/removed belong to it — snapshot the count so the
+            // post-boundary bubble only renders tool events that arrive AFTER
+            // here. Index-based (not pos-based) so a tool-only packet, which
+            // doesn't advance the content length, can't collide with the
+            // baseline and re-render an already-shown card.
+            paneObj.toolEventsBaseline = (paneObj.toolEvents || []).length;
             paneObj.streamingMsgDiv = null;
         } catch (err) {
             console.warn(
@@ -1859,6 +1852,8 @@ export async function sendMessage(overrideText, overrideAgent) {
             // the ``fullContent += chunk`` site below.
             pane.streamRawContentLength = 0;
             pane.thinkingItems = [];
+            pane.toolEvents = [];
+            pane.toolEventsBaseline = 0;
             let fullContent = '';
 
             try {
@@ -1903,7 +1898,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // Strip any complete sentinels in processable.
                     // Revise markers and thinking markers are wire
                     // metadata; visible prose stays in the accumulator.
-                    let { textBefore, textAfter, sawSentinel, thoughts, reviseBoundaryPending, leadingReviseBoundary } =
+                    let { textBefore, textAfter, sawSentinel, thoughts, tools, reviseBoundaryPending, leadingReviseBoundary } =
                         stripStreamSentinels(processable);
                     if (thoughts.length) {
                         appendThinkingItems(pane.thinkingItems, thoughts);
@@ -1948,20 +1943,23 @@ export async function sendMessage(overrideText, overrideAgent) {
                         pendingReviseBoundary = true;
                     }
                     const chunk = sawSentinel ? textBefore + textAfter : textBefore;
-                    if (!chunk) {
-                        // No visible text this packet, but a revise
-                        // sentinel still arms the boundary for the next
-                        // packet (#1547) — and surfaces "Revising…" now,
-                        // since this `continue` skips the phase update at
-                        // the `fullContent += chunk` site below. Without
-                        // this, a metadata-only revise packet would never
-                        // show the revising word.
+                    const haveTools = tools && tools.length;
+                    if (!chunk && !haveTools) {
+                        // Metadata-only packet (revise/think, no visible text
+                        // and no tool event): a revise sentinel still arms the
+                        // boundary for the next packet (#1547) and surfaces
+                        // "Revising…" now, since this `continue` skips the
+                        // phase update at the `fullContent += chunk` site below.
                         if (reviseBoundaryPending || leadingReviseBoundary) {
                             pendingReviseBoundary = true;
                             setStatusPhase('revising');
                         }
                         continue;
                     }
+                    // #1659: a tool-only packet (no visible prose) falls
+                    // THROUGH so its card is recorded once and painted now —
+                    // the orchestrator emits long-running tool starts as their
+                    // own sentinel-only yields, so they must not look idle.
                     // #1547: weld the packet-edge revise boundary — a
                     // prior packet ended on a revise sentinel (carried in
                     // `pendingReviseBoundary`), or this packet opened with
@@ -1973,7 +1971,16 @@ export async function sendMessage(overrideText, overrideAgent) {
                         && fullContent && !/\s$/.test(fullContent)) {
                         fullContent += '\n\n';
                     }
+                    // #1659: tool sentinels in this packet sit after the
+                    // (welded) prose already accumulated — record absolute
+                    // positions so the renderer places each card correctly.
+                    const chunkBase = fullContent.length;
                     fullContent += chunk;
+                    if (tools && tools.length) {
+                        for (const t of tools) {
+                            pane.toolEvents.push({ ...t, pos: chunkBase + (t.pos || 0) });
+                        }
+                    }
                     // Advance the dynamic status word: an in-flight tool's
                     // verb, or "Writing…" once answer prose flows. A revise
                     // sentinel with no trailing prose surfaces "Revising…".
@@ -1992,6 +1999,12 @@ export async function sendMessage(overrideText, overrideAgent) {
                         nextPhase = 'revising';
                     }
                     setStatusPhase(nextPhase);
+                    // #1659: a tool that started this packet sets its verb
+                    // (overriding "Writing…") — the freshest signal wins.
+                    if (tools && tools.length) {
+                        const lastStart = [...tools].reverse().find((t) => t.phase === 'start');
+                        if (lastStart) setStatusPhase(toolStatusPhase(lastStart.name));
+                    }
                     // #1560 / #1562: expose the RAW cumulative content
                     // length to off-path observers (specifically
                     // ``handleRestartStatus`` deciding the
@@ -2001,10 +2014,15 @@ export async function sendMessage(overrideText, overrideAgent) {
                     // thinking bubbles, corrupting the post-status
                     // slice (codex P1 round 1).
                     pane.streamRawContentLength = fullContent.length;
-                    // The carried/leading boundary is now resolved; the
-                    // only boundary still pending is one this packet ended
-                    // on (a trailing sentinel with no visible char after).
-                    pendingReviseBoundary = reviseBoundaryPending;
+                    // The carried/leading boundary is resolved once VISIBLE
+                    // prose welds against it. A tool-only packet (chunk === '')
+                    // falls through here without welding, so it must NOT clear
+                    // a carried boundary (#1659) — otherwise pre-tool prose →
+                    // revise → tool-start → answer glues the answer on. Keep it
+                    // pending; OR-in any trailing boundary this packet ended on.
+                    pendingReviseBoundary = chunk
+                        ? reviseBoundaryPending
+                        : (pendingReviseBoundary || reviseBoundaryPending);
                     // The server resolves the effective session_id and
                     // returns it as the X-Session-Id response header,
                     // which streamInvoke captures before yielding the
@@ -2040,19 +2058,18 @@ export async function sendMessage(overrideText, overrideAgent) {
                                 'agent', pane.element,
                             );
                         }
-                        const slice = fullContent.slice(
-                            pane.streamBaseline || 0,
-                        );
+                        const baseline = pane.streamBaseline || 0;
+                        const slice = fullContent.slice(baseline);
                         updateStreamingMessage(
                             pane.streamingMsgDiv, slice,
                             pane.element, pane.thinkingItems,
+                            paneStreamToolEvents(pane),
                         );
                     }
                 }
                 if (isPaneFresh() && ownsStream() && pane.streamingMsgDiv) {
-                    const slice = fullContent.slice(
-                        pane.streamBaseline || 0,
-                    );
+                    const baseline = pane.streamBaseline || 0;
+                    const slice = fullContent.slice(baseline);
                     await finalizeStreamingMessage(
                         pane.streamingMsgDiv, slice, pane,
                     );
@@ -2770,13 +2787,13 @@ function escapeThinkingLabel(text) {
     }[ch]));
 }
 
-export function updateStreamingMessage(msgDiv, content, paneElement = null, thinkingItems = []) {
+export function updateStreamingMessage(msgDiv, content, paneElement = null, thinkingItems = [], toolEvents = null) {
     const contentDiv = msgDiv.querySelector('.message-content');
     if (contentDiv) {
         const thinkingHtml = renderThinkingBubbles(thinkingItems);
         // renderAgentContentHtml handles both cases: tool runs become
         // grouped cards in document order, no tools → a single markdown pass.
-        contentDiv.innerHTML = `${thinkingHtml}${renderAgentContentHtml(content, { streaming: true })}`;
+        contentDiv.innerHTML = `${thinkingHtml}${renderAgentContentHtml(content, { streaming: true, toolEvents })}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
 
         // Scroll-sync only when this msgDiv is in the live viewport;
@@ -2827,7 +2844,11 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     const c = getChatContainer();
     const mounted = !!(c && paneEl && paneEl.parentNode === c);
 
-    await finalizeAgentContent(contentDiv, content);
+    // #1659: tool cards come from the pane's accumulated structured events,
+    // sliced to the same stream-baseline as ``content`` (#1560) and skipping
+    // any already shown in a pre-restart bubble.
+    const toolEvents = pane ? paneStreamToolEvents(pane) : null;
+    await finalizeAgentContent(contentDiv, content, toolEvents);
     const thinkingItems = pane && pane.thinkingItems ? pane.thinkingItems : [];
     if (thinkingItems.length) {
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;

@@ -1806,10 +1806,14 @@ class CodexAdapter(LLMAdapter):
                             _format_command_summary(item.get("command"))
                             if itype == "commandExecution" else None
                         )
-                        line = (
-                            f"\U0001f527 Calling {label}: {detail}...\n"
-                            if detail else f"\U0001f527 Calling {label}...\n"
+                        # #1659: typed in-band tool sentinel instead of the
+                        # "🔧 Calling X..." emoji text. Same wire channel as
+                        # REVISE/THINK; the chat client renders the card from
+                        # this and the persisted tool_events metadata.
+                        from kestrel_sovereign.agent.streaming import (
+                            _build_tool_sentinel,
                         )
+                        line = _build_tool_sentinel("start", label, detail=detail)
                         # NOT appended to ``text_parts`` — those rebuild
                         # ``LLMResponse.content`` as a clean string when
                         # the app-server doesn't deliver an agentMessage
@@ -1851,10 +1855,15 @@ class CodexAdapter(LLMAdapter):
                                 isinstance(status, str)
                                 and status.lower() in ("failed", "error", "blocked")
                             ) or bool(item.get("error"))
-                            line = (
-                                f"❌ {label} failed\n"
-                                if failed
-                                else f"✓ {label} complete\n"
+                            # #1659: typed done/error sentinel (was ✓/❌ text).
+                            from kestrel_sovereign.agent.streaming import (
+                                _build_tool_sentinel,
+                            )
+                            err = item.get("error")
+                            line = _build_tool_sentinel(
+                                "error" if failed else "done",
+                                label,
+                                detail=(str(err)[:200] if (failed and err) else None),
                             )
                             # See start-marker note: NOT appended to
                             # ``text_parts``; markers stay on the wire,
