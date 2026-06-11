@@ -334,6 +334,7 @@ class StreamingMixin:
         session_id: str = None,
         caller=None,
         request_id: Optional[str] = None,
+        attachments: Optional[list] = None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -383,7 +384,7 @@ class StreamingMixin:
                 async with self._turn_lifecycle():
                     async for chunk in self._process_input_streaming_traced_locked(
                         user_input, model_override, session_id, _otel_span,
-                        request_id=request_id,
+                        request_id=request_id, attachments=attachments,
                     ):
                         yield chunk
         except Exception as exc:
@@ -395,7 +396,7 @@ class StreamingMixin:
 
     async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span,
-        request_id: Optional[str] = None,
+        request_id: Optional[str] = None, attachments: Optional[list] = None,
     ):
         """Inner streaming logic wrapped in an OTEL span.
 
@@ -494,9 +495,15 @@ class StreamingMixin:
         # verbatim so Anthropic's cache_control marker at messages[-2]
         # still compounds across turns, while every other consumer
         # (search, audit, UI, memory ingestion) sees clean user speech.
+        # #1662: persist attachment refs on the user turn so the composer's
+        # images/docs survive reload (and a later turn can resolve them). The
+        # bytes live in the encrypted file store; only the refs ride here.
+        _user_meta = {"sent_form": True}
+        if attachments:
+            _user_meta["attachments"] = attachments
         await self.privacy_agent.add_conversation(
             "user", wrapped_user,
-            metadata={"sent_form": True},
+            metadata=_user_meta,
             session_id=session_id,
             rendered_content=prompt,
         )

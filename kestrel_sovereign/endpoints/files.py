@@ -31,18 +31,20 @@ async def serve_file(content_hash: str, request: Request):
         agent = get_agent(request)
         storage = agent.storage
 
-        if not storage or not hasattr(storage, 'files'):
+        if not storage or not hasattr(storage, 'retrieve_file'):
             raise HTTPException(status_code=503, detail="Storage not available.")
 
-        file_store = storage.files
-
-        # Retrieve the file content
-        content = await file_store.retrieve_file(content_hash)
+        # Retrieve through the privacy wrapper so ISOLATED-mode files buffered
+        # in the session store (#1662 attachments) are served too — going
+        # straight to storage.files would 404 for exactly those.
+        content = await storage.retrieve_file(content_hash)
         if not content:
             raise HTTPException(status_code=404, detail="File not found")
 
-        # Get metadata for MIME type
-        metadata = await file_store.get_file_metadata(content_hash)
+        # Metadata (MIME) lives on the persistent store; session-buffered files
+        # have none, so fall back to a safe default.
+        file_store = getattr(storage, 'files', None)
+        metadata = await file_store.get_file_metadata(content_hash) if file_store else None
         mime_type = "application/octet-stream"
         if metadata:
             mime_type = metadata.get("mime_type", "image/jpeg")

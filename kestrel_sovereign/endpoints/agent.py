@@ -1,6 +1,6 @@
 """Agent invoke and streaming endpoints."""
 from collections import defaultdict
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from typing import Optional
 import asyncio
@@ -118,6 +118,115 @@ async def invoke_agent(request: Request):
         raise HTTPException(status_code=500, detail="An internal error occurred.")
 
 
+# Chat attachments (#1662). Images can be sent to the model as vision input
+# (eager) or read on demand (lazy); documents are read on demand. Stored
+# content-addressed + encrypted via the agent file store; the privacy wrapper
+# enforces the mode (EPHEMERAL rejects, ISOLATED buffers) so an attachment
+# inherits the message's privacy automatically.
+_ATTACHMENT_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+_ATTACHMENT_DOC_TYPES = {"application/pdf", "text/plain", "text/markdown"}
+_ATTACHMENT_TYPES = _ATTACHMENT_IMAGE_TYPES | _ATTACHMENT_DOC_TYPES
+_ATTACHMENT_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+# SHA-256 hex (the file store's content hash) — the only id we accept back.
+_ATTACHMENT_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _sanitize_attachments(raw) -> list:
+    """Coerce client-supplied attachment refs to a safe, fixed shape before
+    they touch persisted metadata. Drops anything malformed; bounds the count.
+    """
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for item in raw[:10]:  # a turn won't reference more than a handful
+        if not isinstance(item, dict):
+            continue
+        h = item.get("hash")
+        if not isinstance(h, str) or not _ATTACHMENT_HASH_RE.match(h):
+            continue
+        kind = item.get("kind")
+        if kind not in ("image", "document"):
+            kind = "document"
+        mime = item.get("mime")
+        out.append({
+            "hash": h,
+            "kind": kind,
+            "mime": mime if (isinstance(mime, str) and mime in _ATTACHMENT_TYPES) else None,
+            "name": (str(item.get("name") or "attachment"))[:255],
+        })
+    return out
+
+
+@router.post("/attachments")
+@limiter.limit("30/minute")
+async def upload_attachment(request: Request, file: UploadFile = File(...)):
+    """Upload a chat attachment (image or document); returns a reference the
+    composer attaches to the next message."""
+    agent = get_agent(request)
+    # agent.storage is the PrivacyEnforcingStorage facade — its store_file
+    # checks write permission (EPHEMERAL -> PrivacyViolationError) and session-
+    # buffers in ISOLATED. Going through storage.files would bypass all that.
+    storage = getattr(agent, "storage", None)
+    if not storage or not hasattr(storage, "store_file"):
+        raise HTTPException(status_code=503, detail="File storage not available.")
+
+    ctype = (file.content_type or "").split(";")[0].strip().lower()
+    if ctype not in _ATTACHMENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported attachment type '{ctype}'. Allowed: images "
+                "(jpeg/png/webp/gif) and documents (pdf/text/markdown)."
+            ),
+        )
+    # Read at most cap+1 bytes so an oversized upload (allowed content-type)
+    # can't force materializing an arbitrarily large body in memory.
+    data = await file.read(_ATTACHMENT_MAX_SIZE + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(data) > _ATTACHMENT_MAX_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large. Maximum {_ATTACHMENT_MAX_SIZE // (1024 * 1024)} MB.",
+        )
+
+    name = (file.filename or "attachment")[:255]
+    kind = "image" if ctype in _ATTACHMENT_IMAGE_TYPES else "document"
+    try:
+        content_hash = await storage.store_file(
+            data,
+            name,
+            metadata={
+                "type": "attachment",
+                "kind": kind,
+                "mime_type": ctype,
+                "agent_id": getattr(agent, "agent_id", ""),
+            },
+        )
+    except ValueError as e:
+        # store_file raises ValueError when the content exceeds the store cap.
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        # PrivacyEnforcingStorage rejects writes in EPHEMERAL mode.
+        if type(e).__name__ == "PrivacyViolationError":
+            raise HTTPException(
+                status_code=403,
+                detail="Attachments are disabled in this privacy mode.",
+            )
+        logger.error(f"Attachment store failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to store attachment.")
+
+    return {
+        "success": True,
+        "hash": content_hash,
+        "mime": ctype,
+        "name": name,
+        "kind": kind,
+        "size": len(data),
+        "url": f"/api/files/{content_hash}",
+    }
+
+
 @router.post("/stream")
 @limiter.limit("60/minute")
 async def stream_agent_response(request: Request):
@@ -135,6 +244,10 @@ async def stream_agent_response(request: Request):
         provider_override = data.get("provider")
         session_id = data.get("session_id")
         audit_before_streaming = data.get("audit_before_streaming", False)
+        # #1662: attachment references the composer uploaded for this turn.
+        # Sanitize to the known shape — never trust client JSON verbatim into
+        # persisted metadata.
+        attachments = _sanitize_attachments(data.get("attachments"))
 
         if user_input is None:
             raise HTTPException(status_code=400, detail="Input not provided.")
@@ -180,6 +293,7 @@ async def stream_agent_response(request: Request):
                     audit_before_streaming=audit_before_streaming,
                     caller=caller,
                     request_id=request_id,
+                    attachments=attachments,
                 ):
                     # Check if request was cancelled
                     if agent.is_request_cancelled(request_id):
