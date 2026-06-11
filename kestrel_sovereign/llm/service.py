@@ -730,10 +730,26 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                                 fb_vendor,
                             )
                             if match_list:
-                                fallback_providers.append(match_list[0])
+                                chosen = match_list[0]
+                                fb_model = fb.get("model")
+                                if fb_model:
+                                    # Pin THIS fallback's model onto its own
+                                    # provider (copy — never mutate the shared
+                                    # provider dict). Previously a single global
+                                    # target_model from fallbacks[0] was applied
+                                    # to every fallback, so any fallback whose
+                                    # model differed was rejected by
+                                    # _model_available_for_route and became
+                                    # unreachable (#1685).
+                                    chosen = {**chosen, "model": fb_model}
+                                fallback_providers.append(chosen)
                     if fallback_providers:
                         providers_to_use = fallback_providers
-                        target_model = self._mandate_fallbacks[0].get("model") or target_model
+                        # Each fallback provider now carries its own model, so
+                        # clear the global target_model: the downstream loop
+                        # resolves the concrete model per provider via
+                        # _resolve_concrete_model(None, provider).
+                        target_model = None
                 else:
                     raise LLMProviderUnavailableError(
                         selector,
