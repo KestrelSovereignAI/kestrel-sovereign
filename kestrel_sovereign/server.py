@@ -294,6 +294,21 @@ async def lifespan(app: FastAPI):
             app.state.agent = None  # No single default agent
             logger.info(f"Multi-agent mode: {loaded} agent(s) loaded")
 
+            # A2A sender verification (#1705): the host holds every agent, so it
+            # builds the same-host DID registry and injects the resolver into
+            # each agent (consumed by /tasks/send verification, #1673). Local
+            # same-host resolution by default; federated did:web opt-in via
+            # KESTREL_A2A_FEDERATED_DID.
+            try:
+                from kestrel_sovereign.a2a.did_registry import install_a2a_did_resolver
+
+                federated = os.environ.get("KESTREL_A2A_FEDERATED_DID", "").lower() in (
+                    "1", "true", "yes",
+                )
+                install_a2a_did_resolver(manager, federated_fallback=federated)
+            except Exception as exc:  # noqa: BLE001 - never block startup on this
+                logger.warning("Could not install A2A DID resolver: %s", exc)
+
             # Lifecycle hardening (#377): surface per-agent init failures
             # — without this, a multi-agent host whose providers all failed
             # would report healthy startup while every agent was mute.
