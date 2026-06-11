@@ -15,6 +15,10 @@ from kestrel_sovereign.sql_utils import safe_column_name
 from kestrel_sovereign.rate_limit import limiter
 from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
 from kestrel_sovereign.endpoints.agent_helpers import get_agent, get_caller
+from kestrel_sovereign.features.storage_access import (
+    hides_persisted_user_content,
+    resolve_feature_database,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +26,25 @@ router = APIRouter(tags=["models"])
 
 # Validation: agent names must be alphanumeric + hyphens/underscores, 1-64 chars
 _AGENT_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
+
+
+def _key_storage_privacy_detail() -> str:
+    return "Service key storage is unavailable in the current privacy mode."
+
+
+def _get_service_key_db(agent):
+    if hides_persisted_user_content(agent):
+        raise HTTPException(status_code=403, detail=_key_storage_privacy_detail())
+    db = resolve_feature_database(agent)
+    if db is None:
+        raise HTTPException(status_code=503, detail="Storage not available")
+    return db
+
+
+def _get_service_key_db_or_none(agent):
+    if hides_persisted_user_content(agent):
+        return None
+    return resolve_feature_database(agent)
 
 
 class CreateAgentRequest(BaseModel):
@@ -547,14 +570,11 @@ async def get_keys(request: Request):
     """Get configured API keys (no secrets exposed)."""
     try:
         agent = get_agent(request)
-        storage = agent.storage
-
-        if not storage or not hasattr(storage, 'db'):
-            return {"keys": [], "count": 0}
+        db = _get_service_key_db(agent)
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
-        key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+        key_storage = ServiceKeyStorage(db, agent.agent_id)
         keys = await key_storage.list_keys()
 
         keys_data = []
@@ -572,6 +592,8 @@ async def get_keys(request: Request):
             "keys": keys_data,
             "count": len(keys_data),
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting keys: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving keys.")
@@ -592,14 +614,11 @@ async def add_key(request: Request):
             raise HTTPException(status_code=400, detail="API key is required")
 
         agent = get_agent(request)
-        storage = agent.storage
-
-        if not storage or not hasattr(storage, 'db'):
-            raise HTTPException(status_code=503, detail="Storage not available")
+        db = _get_service_key_db(agent)
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
-        key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+        key_storage = ServiceKeyStorage(db, agent.agent_id)
 
         # Check if key already exists for this provider
         existing_keys = await key_storage.list_keys()
@@ -635,14 +654,11 @@ async def delete_key(request: Request, provider: str):
     """Delete an API key for a provider."""
     try:
         agent = get_agent(request)
-        storage = agent.storage
-
-        if not storage or not hasattr(storage, 'db'):
-            raise HTTPException(status_code=503, detail="Storage not available")
+        db = _get_service_key_db(agent)
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
-        key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+        key_storage = ServiceKeyStorage(db, agent.agent_id)
 
         # Find and delete the key
         existing_keys = await key_storage.list_keys()
@@ -656,7 +672,7 @@ async def delete_key(request: Request, provider: str):
             raise HTTPException(status_code=404, detail=f"No key found for provider '{provider}'")
 
         # Delete the key (soft delete by deactivating, or hard delete)
-        await storage.db.execute(
+        await db.execute(
             "DELETE FROM agent_service_keys WHERE id = ?",
             (key_to_delete.id,)
         )
@@ -682,14 +698,11 @@ async def update_key(request: Request, provider: str):
         is_active = body.get("is_active")
 
         agent = get_agent(request)
-        storage = agent.storage
-
-        if not storage or not hasattr(storage, 'db'):
-            raise HTTPException(status_code=503, detail="Storage not available")
+        db = _get_service_key_db(agent)
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
-        key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+        key_storage = ServiceKeyStorage(db, agent.agent_id)
 
         # Find the key
         existing_keys = await key_storage.list_keys()
@@ -716,7 +729,7 @@ async def update_key(request: Request, provider: str):
             raise HTTPException(status_code=400, detail="No updates provided")
 
         params.append(key_to_update.id)
-        await storage.db.execute(
+        await db.execute(
             f"UPDATE agent_service_keys SET {', '.join(updates)} WHERE id = ?",
             tuple(params)
         )
@@ -738,14 +751,11 @@ async def get_key_usage(request: Request, provider: str, days: int = Query(30, g
     """Get usage history for a specific API key."""
     try:
         agent = get_agent(request)
-        storage = agent.storage
-
-        if not storage or not hasattr(storage, 'db'):
-            return {"usage": [], "count": 0, "provider": provider}
+        db = _get_service_key_db(agent)
 
         from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
 
-        key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+        key_storage = ServiceKeyStorage(db, agent.agent_id)
         usage_records = await key_storage.get_usage(provider, days=days)
 
         usage_data = []
@@ -764,6 +774,8 @@ async def get_key_usage(request: Request, provider: str, days: int = Query(30, g
             "count": len(usage_data),
             "days": days,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error getting key usage: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Error retrieving key usage.")
@@ -788,10 +800,9 @@ def _get_postgres_pool(agent):
     require one.  Callers use this to decide between "real" three-tier
     behavior and the empty/disabled shape.
     """
-    storage = getattr(agent, "storage", None)
-    if not storage or not hasattr(storage, "db"):
+    db = _get_service_key_db_or_none(agent)
+    if db is None:
         return None
-    db = storage.db
     backend = getattr(db, "backend", None)
     if backend is None or getattr(db, "backend_type", None) != "postgres":
         return None
@@ -816,11 +827,11 @@ async def get_available_key_sources(
     sources = {"agent": False, "user": False, "platform": False}
     platform_margin = None
 
-    storage = getattr(agent, "storage", None)
-    if storage and hasattr(storage, "db"):
+    db = _get_service_key_db_or_none(agent)
+    if db is not None:
         try:
             from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
-            key_storage = ServiceKeyStorage(storage.db, agent.agent_id)
+            key_storage = ServiceKeyStorage(db, agent.agent_id)
             sources["agent"] = await key_storage.has_key(provider_id=provider_id)
         except Exception as e:
             logger.debug(f"Agent key source check failed for {provider_id}: {e}")

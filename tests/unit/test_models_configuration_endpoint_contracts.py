@@ -206,6 +206,33 @@ def test_keys_endpoints_use_storage_contract_without_exposing_secrets():
         _restore_app(app, original)
 
 
+def test_keys_endpoints_refuse_privacy_hidden_persistent_storage():
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    storage = MagicMock(db=MagicMock())
+    agent = MagicMock(storage=storage, agent_id="did:agent")
+    agent.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch("kestrel_sovereign.security.service_key_storage.ServiceKeyStorage") as storage_cls:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    list_response = client.get("/api/keys", headers=_api_headers())
+                    create_response = client.post(
+                        "/api/keys",
+                        headers=_api_headers(),
+                        json={"provider": "openai", "api_key": "sk-nope"},
+                    )
+
+        assert list_response.status_code == 403
+        assert create_response.status_code == 403
+        assert "privacy mode" in list_response.json()["detail"]
+        storage_cls.assert_not_called()
+    finally:
+        _restore_app(app, original)
+
+
 def test_key_update_delete_and_usage_endpoints_preserve_provider_contracts():
     key = SimpleNamespace(
         id="key-1",

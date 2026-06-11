@@ -416,6 +416,28 @@ class TestSaveFeaturePrivacy:
         assert "privacy mode" in result.error
         store_cls.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_stash_save_refuses_privacy_hidden_mode_before_store_creation(self):
+        from kestrel_sovereign.agent.memory_manager import MemoryManager
+        from kestrel_sovereign.privacy import PrivacyConfig
+
+        storage = MagicMock()
+        storage.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+        storage.conversation = MagicMock()
+        storage.conversation.list_stashes = AsyncMock(
+            return_value=[{"stash_id": "stash-1", "name": "Hidden"}]
+        )
+
+        manager = MemoryManager(storage=storage, agent_id="did:test:stash")
+
+        with patch("kestrel_sovereign.storage.saved_items_store.SavedItemsStore") as store_cls:
+            result = await manager.stash_save()
+
+        assert result["success"] is False
+        assert "privacy mode" in result["error"]
+        storage.conversation.list_stashes.assert_not_awaited()
+        store_cls.assert_not_called()
+
 
 class TestEmbeddingSerialization:
     """Tests for embedding serialization."""

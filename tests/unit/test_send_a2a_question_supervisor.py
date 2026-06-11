@@ -415,6 +415,46 @@ class TestSupervisorDeadlineAccurateExpiry:
         )
 
     @pytest.mark.asyncio
+    async def test_deadline_enqueue_failure_restores_waiting_for_retry(self, monkeypatch):
+        working_frame = json.dumps({
+            "id": "t-deadline-retry",
+            "status": {"state": "working"},
+        })
+        feature, agent, enqueue, _ = _make_feature(
+            sse_responses=[
+                _FakeStreamResponse([
+                    "event: status",
+                    f"data: {working_frame}",
+                    "",
+                ])
+            ],
+            monkeypatch=monkeypatch,
+        )
+        agent.pending_a2a_questions.mark_expired = AsyncMock(return_value=True)
+        agent.pending_a2a_questions.mark_waiting_for_retry = AsyncMock(return_value=True)
+        enqueue.side_effect = RuntimeError("dispatcher down")
+
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        await feature._supervise_a2a_question(
+            task_id="t-deadline-retry",
+            recipient="Meridian",
+            original_question="?",
+            sess_id="s-deadline",
+            deadline_utc=datetime.now(timezone.utc) + timedelta(milliseconds=10),
+            causation_chain=None,
+        )
+
+        agent.pending_a2a_questions.mark_expired.assert_awaited_once_with(
+            "t-deadline-retry",
+        )
+        agent.pending_a2a_questions.mark_waiting_for_retry.assert_awaited_once_with(
+            "t-deadline-retry",
+        )
+
+    @pytest.mark.asyncio
     async def test_deadline_exit_drops_signal_when_already_terminal(
         self, monkeypatch,
     ):

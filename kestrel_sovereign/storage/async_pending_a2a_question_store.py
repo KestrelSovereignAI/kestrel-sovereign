@@ -212,6 +212,24 @@ class PendingA2AQuestionStore:
         )
         return rowcount > 0
 
+    async def mark_waiting_for_retry(self, task_id: str) -> bool:
+        """Restore a terminal row to WAITING after a dispatch failure.
+
+        Callers that mark a question RESOLVED/EXPIRED before enqueueing the
+        resumption signal must use this when enqueue fails. Otherwise the
+        terminal row disappears from startup replay/hourly sweep and the
+        asker is never woken.
+        """
+        rowcount = await self._db.execute(
+            """
+            UPDATE pending_a2a_questions
+            SET status = 'WAITING', resolved_at = NULL
+            WHERE agent_id = ? AND task_id = ? AND status IN ('RESOLVED', 'EXPIRED')
+            """,
+            (self._agent_id, task_id),
+        )
+        return rowcount > 0
+
     async def _list_by_status(self, status: str) -> List[PendingA2AQuestion]:
         rows = await self._db.fetchall(
             """
