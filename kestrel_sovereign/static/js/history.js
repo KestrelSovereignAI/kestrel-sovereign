@@ -33,6 +33,23 @@ const LEGACY_TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
 // the positions stay exact — the shared renderer (buildToolSegmentsByPos)
 // already strips the `---` wire delimiter and leading blanks PER SEGMENT, so
 // doing it here too would shift every later card's position (codex review).
+// Render assistant prose for history reload through the shared renderer
+// (protects math spans + sanitizes), falling back to marked / escaped text.
+function renderAssistantHtml(text) {
+    const SM = window.SharedMarkdown;
+    if (SM && SM.renderMarkdown) return SM.renderMarkdown(text);
+    if (window.marked) return marked.parse(text);
+    return escapeHtml(String(text || ''));
+}
+
+// Run the KaTeX math post-pass on a reloaded element (fire-and-forget; renders
+// when the lazy lib resolves). #1661 — without this, math reloads as raw
+// "$$…$$" / "\(…\)" delimiters after a refresh.
+function mathPass(el) {
+    const SM = window.SharedMarkdown;
+    if (el && SM && SM.renderMath) SM.renderMath(el);
+}
+
 function legacyToolEventsFromText(content) {
     const src = String(content || '');
     const re = new RegExp(LEGACY_TOOL_MARKER_TOKEN.source, 'gu');
@@ -521,7 +538,8 @@ function addMessageToChat(
         const preludeDiv = document.createElement('div');
         preludeDiv.className = 'message-content response-prelude';
         if (role === 'assistant' && window.marked) {
-            preludeDiv.innerHTML = marked.parse(preludeContent);
+            preludeDiv.innerHTML = renderAssistantHtml(preludeContent);
+            mathPass(preludeDiv);
         } else {
             preludeDiv.textContent = preludeContent;
         }
@@ -580,10 +598,13 @@ function addMessageToChat(
         contentDiv.className = 'message-content';
         if (bodyHtml !== null) {
             // Pre-rendered cards + prose (assistant turns with tool activity),
-            // already in document order — see renderAgentContentHtml.
+            // already in document order — see renderAgentContentHtml (which
+            // protected any math spans through the shared renderer).
             contentDiv.innerHTML = bodyHtml;
+            mathPass(contentDiv);
         } else if (role === 'assistant' && window.marked) {
-            contentDiv.innerHTML = marked.parse(content);
+            contentDiv.innerHTML = renderAssistantHtml(content);
+            mathPass(contentDiv);
         } else {
             contentDiv.textContent = content;
         }

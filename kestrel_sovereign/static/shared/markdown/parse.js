@@ -155,6 +155,34 @@ function normalizeNewlines(text) {
     return text.replace(/\n{3,}/g, '\n\n');
 }
 
+// Math-span protection (#1661 KaTeX). marked would escape `\(`/`\[` to `(`/`[`
+// (so the KaTeX post-pass never sees those delimiters) and could split a
+// `$$…$$` block across markdown constructs. So we lift math spans OUT before
+// marked, leave an inert private-use placeholder, then restore them AFTER —
+// HTML-escaped, so the special chars inside math (`<`, `&`, …) are safe through
+// innerHTML while KaTeX still reads the real characters from textContent.
+// Display ($$, \[) before inline (\() so the longer delimiters win. No bare
+// `$…$`: chat prose has too much currency / shell-var noise.
+const _MATH_SPAN_RE = /\$\$[\s\S]*?\$\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)/g;
+const _MATH_PLACEHOLDER = '\uE000'; // BMP private-use char; passes through marked as inert text
+
+function _protectMath(text) {
+    const spans = [];
+    const out = text.replace(_MATH_SPAN_RE, (m) => {
+        spans.push(m);
+        return `${_MATH_PLACEHOLDER}${spans.length - 1}${_MATH_PLACEHOLDER}`;
+    });
+    return { out, spans };
+}
+
+function _restoreMath(html, spans) {
+    if (!spans.length) return html;
+    return html.replace(
+        new RegExp(`${_MATH_PLACEHOLDER}(\\d+)${_MATH_PLACEHOLDER}`, 'g'),
+        (_m, i) => _escapeAttr(spans[Number(i)] || ''),
+    );
+}
+
 /**
  * Render markdown text to HTML
  * @param {string} text - Raw text that may contain markdown
@@ -168,12 +196,17 @@ function renderMarkdown(text) {
 
     if (typeof marked !== 'undefined') {
         _installMarkedLinkRenderer();
-        return sanitizeHtml(marked.parse(normalized, {
+        const { out, spans } = _protectMath(normalized);
+        const parsed = marked.parse(out, {
             breaks: true,
             gfm: true,
             headerIds: false,
             mangle: false
-        }));
+        });
+        // Restore (HTML-escaped) math BEFORE sanitize — the escaped delimiters
+        // are inert text to DOMPurify; KaTeX's post-pass reads the real chars
+        // from textContent and renders them.
+        return sanitizeHtml(_restoreMath(parsed, spans));
     }
 
     return sanitizeHtml(normalized.replace(/\n/g, '<br>'));

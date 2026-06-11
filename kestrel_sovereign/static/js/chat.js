@@ -410,10 +410,11 @@ async function finalizeAgentContent(contentDiv, content, toolEvents = null) {
         return;
     }
     // With tool runs: one innerHTML write keeps card/prose ordering exact;
-    // highlight + mermaid then run once over the whole container.
+    // highlight + mermaid + math then run once over the whole container.
     contentDiv.innerHTML = renderAgentContentHtml(content, { toolEvents });
     markdown.highlightCodeBlocks(contentDiv);
     await markdown.renderMermaidDiagrams(contentDiv);
+    if (markdown.renderMath) await markdown.renderMath(contentDiv);
 }
 
 /**
