@@ -1138,6 +1138,54 @@ class TestCodexApprovalBridge:
         assert reply == {"decision": "decline"}
 
     @pytest.mark.asyncio
+    async def test_compound_command_downgrades_allow_to_queue(self):
+        """#1694 codex review P1: a flat ``command`` whose first
+        token is allow-listed but whose body contains an unquoted
+        shell control char must NOT auto-approve. The bridge
+        downgrades to REQUIRE_APPROVAL and routes through the queue
+        so the operator (and any scoped-auto-approve rule) sees the
+        full compound, not just the allow-listed head."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({"command": "git status; rm -rf /tmp/x"})
+        assert reply == {"decision": "accept"}
+        assert len(captured) == 1, (
+            "compound command must reach the queue, not auto-accept"
+        )
+
+    @pytest.mark.asyncio
+    async def test_compound_command_with_denied_token_hard_denies(self):
+        """If the policy DENIES any argv in the batch via parsed
+        ``commandActions``, the compound guard is irrelevant — DENY
+        still wins."""
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(allow=["git"], deny=["rm"]),
+            _path_policy=PathPolicy(allow=["/tmp"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({
+            "commandActions": [
+                {"argv": ["git", "status"]},
+                {"argv": ["rm", "-rf", "/tmp/x"]},
+            ],
+        })
+        assert reply == {"decision": "decline"}
+        assert captured == []
+
+    @pytest.mark.asyncio
     async def test_policy_gate_hard_denies_deny_listed_binary(self):
         """Codex review #1575 round 1 P1: BinaryPolicy DENY must fire
         BEFORE the queue, so a deny-listed binary can't be approved.

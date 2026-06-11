@@ -53,19 +53,35 @@ from .backends import (
     SandboxBackend,
 )
 from .path_safety import PathSafetyError, resolve_realpath
-from .policy import BinaryPolicy, Decision, PathPolicy, PolicyResult, split_command
+from .policy import (
+    BinaryPolicy,
+    Decision,
+    PathPolicy,
+    PolicyResult,
+    command_contains_unquoted_shell_control,
+    split_command,
+)
 
 logger = logging.getLogger(__name__)
 
 
 _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
-# Allow-listed binaries are pre-approved: BinaryPolicy.evaluate returns
-# Decision.ALLOW and the queue is bypassed (#1694, mirrors
-# auto_approve_read for PathPolicy). Anything not on either list returns
-# REQUIRE_APPROVAL and routes through the ApprovalQueue so the operator
-# (or scoped auto-approve) decides. The deny-list is the only path that
-# refuses without a prompt.
-_DEFAULT_AUTO_APPROVED_BINS = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
+# Auto-approved binaries skip the ApprovalQueue (#1694). The default
+# list is deliberately narrow: only inert read-only tools where the
+# argv shape can't be turned into arbitrary host work via flags or
+# args. Interpreters (``python``, ``node``), package managers (``uv``,
+# ``gh``) and other rich CLIs are NOT auto-approved by default — they
+# still route through the queue so the operator (or a scoped
+# auto-approve rule in security.permission_store) decides. Operators
+# who want to broaden the default add binaries to
+# ``[features.computer_use].auto_approved_binaries`` in kestrel.toml.
+#
+# The bridge handler additionally downgrades ALLOW to REQUIRE_APPROVAL
+# when the raw command string contains shell metacharacters
+# (``;``, ``&&``, ``||``, ``|``, backticks, ``$(...)``, redirects,
+# newlines) so an allow-listed first token can never bless a piggy-
+# backed compound command.
+_DEFAULT_AUTO_APPROVED_BINS = ["ls", "cat", "rg"]
 _DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
@@ -416,6 +432,12 @@ class ComputerUseFeature(Feature):
             # the same contract PathPolicy uses for allow-listed reads
             # under auto_approve_read. Anything not on the allow-list
             # returns REQUIRE_APPROVAL and routes through the queue.
+            # #1694 codex review P1: the compound-command guard now
+            # lives inside ``BinaryPolicy.evaluate`` itself, so when
+            # ``shell`` passes the raw command string the policy
+            # already downgrades ALLOW → REQUIRE_APPROVAL on unquoted
+            # shell control chars and the rule reads
+            # ``compound_command:allow:<bin>``.
             require_approval = decision.decision is Decision.REQUIRE_APPROVAL
         else:
             require_approval = False
@@ -908,7 +930,11 @@ class ComputerUseFeature(Feature):
                 "backend": self._backend.name if self._backend else "uninitialized",
                 "timeout": timeout,
             },
-            argv=argv,
+            # Pass the RAW command (not the pre-tokenized argv) so
+            # ``BinaryPolicy.evaluate`` can apply its compound-command
+            # guard (#1694 codex review P1). Argv-list inputs are
+            # trusted; raw strings get the metacharacter check.
+            argv=command,
         )
         if not outcome:
             return ToolResult.failed(error=outcome.denied_reason)

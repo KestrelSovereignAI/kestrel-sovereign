@@ -154,8 +154,10 @@ async def test_bridge_policy_deny_records_event(tmp_path):
 async def test_bridge_policy_allow_records_auto_approve(tmp_path):
     """#1694: an allow-listed binary short-circuits the queue and the
     bridge records the auto-approve as a typed event with
-    status=auto_approved so the operational-state block can show it
-    distinctly from queue-approved or declined."""
+    status=auto_approved purely for after-the-fact audit. The
+    operational-state block intentionally filters these out (its job
+    is "what blocked a turn"); the row lives in the
+    codex_decline_events table for review."""
     from kestrel_sovereign.features.computer_use.policy import (
         BinaryPolicy,
     )

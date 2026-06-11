@@ -1316,9 +1316,12 @@ class CodexAdapter(LLMAdapter):
 
         ``status`` defaults to ``"declined"`` (the original use). The
         bridge passes ``"auto_approved"`` when policy ALLOW short-
-        circuits a queue request (#1694), so the operational-state
-        block can distinguish "policy pre-approved" from "queue
-        approved" from "declined"."""
+        circuits a queue request (#1694). The operational-state block
+        intentionally filters to ``status="declined"`` only — its job
+        is to surface what BLOCKED a turn, not what we did for the
+        agent. The auto-approved rows live in this typed event log
+        purely for after-the-fact audit (DID-scoped) and don't show
+        up in the next-turn operational summary."""
         try:
             from kestrel_sovereign.features.storage_access import (
                 resolve_feature_database,
@@ -1435,6 +1438,12 @@ class CodexAdapter(LLMAdapter):
                 #   - else ANY REQUIRE_APPROVAL → REQUIRE_APPROVAL
                 #     (mixed batches go through the queue)
                 #   - else all ALLOW → ALLOW (auto-approve)
+                # The compound-command guard lives inside
+                # ``BinaryPolicy.evaluate`` itself (codex review P1):
+                # passing a raw flat ``command`` string downgrades
+                # ALLOW → REQUIRE_APPROVAL when the body contains an
+                # unquoted shell control char. Parsed
+                # ``commandActions[].argv`` entries are trusted.
                 aggregate = Decision.ALLOW
                 aggregate_reason = "allow"
                 for argv in argv_lists:
