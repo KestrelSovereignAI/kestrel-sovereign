@@ -23,6 +23,7 @@ class FakeDB:
         self.messages = {}  # id -> (id, content, metadata_json)
         self.pins = {}      # id -> dict with pin fields
         self._next_id = 1
+        self.create_table_calls = 0
 
     def add_message(self, content, metadata=None, agent_id="test-agent"):
         """Add a fake message and return its ID."""
@@ -42,6 +43,7 @@ class FakeDB:
         sql_lower = sql.strip().lower()
 
         if sql_lower.startswith("create table"):
+            self.create_table_calls += 1
             return 0
 
         if sql_lower.startswith("update conversation_history"):
@@ -315,6 +317,34 @@ async def test_sovereign_override_still_clears_pins_in_privacy_hidden_mode():
     assert removed == 1
     assert db.pins == {}
     assert json.loads(db.messages[msg_id]["metadata"])["decay_protected"] is False
+
+
+@pytest.mark.asyncio
+async def test_sovereign_override_ensures_pin_table_after_privacy_first_init():
+    """Cleanup must not assume memory_pins was created before hidden mode."""
+    from kestrel_sovereign.features.memory_agency.feature import MemoryAgencyFeature
+    from kestrel_sovereign.privacy import PrivacyConfig
+
+    db = FakeDB()
+    raw_storage = MagicMock(db=db)
+    agent = MagicMock()
+    agent.did = "test-agent"
+    agent.storage = PrivacyWrappedStorage(raw_storage)
+    agent._raw_storage = raw_storage
+    agent.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+    feature = MemoryAgencyFeature(agent)
+
+    await feature.initialize()
+    assert feature._db is None
+    assert db.create_table_calls == 0
+
+    removed = await feature.sovereign_override_pins(
+        "test-agent",
+        reason="privacy_first_cleanup",
+    )
+
+    assert removed == 0
+    assert db.create_table_calls == 1
 
 
 @pytest.mark.asyncio

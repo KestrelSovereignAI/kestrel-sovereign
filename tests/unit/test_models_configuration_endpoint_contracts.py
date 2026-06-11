@@ -233,6 +233,54 @@ def test_keys_endpoints_refuse_privacy_hidden_persistent_storage():
         _restore_app(app, original)
 
 
+def test_key_read_endpoints_keep_empty_shape_when_storage_absent():
+    storage = SimpleNamespace()
+    agent = MagicMock(storage=storage, agent_id="did:agent")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch("kestrel_sovereign.security.service_key_storage.ServiceKeyStorage") as storage_cls:
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    keys_response = client.get("/api/keys", headers=_api_headers())
+                    usage_response = client.get(
+                        "/api/keys/openai/usage",
+                        headers=_api_headers(),
+                    )
+
+        assert keys_response.status_code == 200
+        assert keys_response.json() == {"keys": [], "count": 0}
+        assert usage_response.status_code == 200
+        assert usage_response.json() == {
+            "provider": "openai",
+            "usage": [],
+            "count": 0,
+            "days": 30,
+        }
+        storage_cls.assert_not_called()
+    finally:
+        _restore_app(app, original)
+
+
+def test_key_write_endpoint_still_errors_when_storage_absent():
+    storage = SimpleNamespace()
+    agent = MagicMock(storage=storage, agent_id="did:agent")
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                delete_response = client.delete(
+                    "/api/keys/openai",
+                    headers=_api_headers(),
+                )
+
+        assert delete_response.status_code == 503
+        assert delete_response.json()["detail"] == "Storage not available"
+    finally:
+        _restore_app(app, original)
+
+
 def test_key_update_delete_and_usage_endpoints_preserve_provider_contracts():
     key = SimpleNamespace(
         id="key-1",

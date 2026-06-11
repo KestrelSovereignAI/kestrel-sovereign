@@ -1508,7 +1508,15 @@ class PeersFeature(Feature):
                 causation_chain=causation_chain,
             )
             if not fired and store is not None and was_waiting:
-                await self._restore_pending_question_waiting(task_id)
+                await self._restore_pending_question_waiting(
+                    task_id,
+                    state="expired",
+                    reply_text="",
+                    recipient=recipient,
+                    original_question=original_question,
+                    sess_id=sess_id,
+                    causation_chain=causation_chain,
+                )
             return
 
         # Terminal: mark resolved + fire local signal. Resolve-first so
@@ -1546,7 +1554,15 @@ class PeersFeature(Feature):
             causation_chain=causation_chain,
         )
         if not fired and store is not None and was_waiting:
-            await self._restore_pending_question_waiting(task_id)
+            await self._restore_pending_question_waiting(
+                task_id,
+                state=state,
+                reply_text=reply_text,
+                recipient=recipient,
+                original_question=original_question,
+                sess_id=sess_id,
+                causation_chain=causation_chain,
+            )
 
     async def _fire_question_answered_signal(
         self,
@@ -1630,13 +1646,28 @@ class PeersFeature(Feature):
             )
             return False
 
-    async def _restore_pending_question_waiting(self, task_id: str) -> None:
+    async def _restore_pending_question_waiting(
+        self,
+        task_id: str,
+        *,
+        state: Optional[str] = None,
+        reply_text: Optional[str] = None,
+        recipient: Optional[str] = None,
+        original_question: Optional[str] = None,
+        sess_id: Optional[str] = None,
+        causation_chain: Optional[list] = None,
+        schedule_retry: bool = True,
+    ) -> None:
         """Return a pending question to WAITING so replay can retry wakeup."""
         store = getattr(self.agent, "pending_a2a_questions", None)
         if store is None or not hasattr(store, "mark_waiting_for_retry"):
             return
         try:
-            restored = await store.mark_waiting_for_retry(task_id)
+            restored = await store.mark_waiting_for_retry(
+                task_id,
+                state=state,
+                reply_text=reply_text,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(
                 "Failed to restore pending_a2a_question task=%s to WAITING "
@@ -1649,6 +1680,113 @@ class PeersFeature(Feature):
                 "Restored pending_a2a_question task=%s to WAITING after "
                 "a2a.question_answered signal enqueue failure.",
                 task_id,
+            )
+            if (
+                schedule_retry
+                and state
+                and recipient is not None
+                and original_question is not None
+            ):
+                self._schedule_question_answered_retry(
+                    task_id=task_id,
+                    recipient=recipient,
+                    original_question=original_question,
+                    sess_id=sess_id or "",
+                    state=state,
+                    reply_text=reply_text or "",
+                    causation_chain=causation_chain,
+                )
+
+    def _schedule_question_answered_retry(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        original_question: str,
+        sess_id: str,
+        state: str,
+        reply_text: str,
+        causation_chain: Optional[list],
+    ) -> None:
+        """Schedule near-term retries for a restored terminal wake payload."""
+        import asyncio
+
+        coro = self._retry_restored_question_answered_signal(
+            task_id=task_id,
+            recipient=recipient,
+            original_question=original_question,
+            sess_id=sess_id,
+            state=state,
+            reply_text=reply_text,
+            causation_chain=causation_chain,
+        )
+        tracker = getattr(self.agent, "_track_background_task", None)
+        if callable(tracker):
+            tracker(coro, name=f"a2a_question_answered_retry:{recipient}:{task_id}")
+        else:
+            task = asyncio.create_task(coro)
+            tasks = getattr(self, "_question_answered_retry_tasks", None)
+            if tasks is None:
+                tasks = set()
+                self._question_answered_retry_tasks = tasks
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+
+    async def _retry_restored_question_answered_signal(
+        self,
+        *,
+        task_id: str,
+        recipient: str,
+        original_question: str,
+        sess_id: str,
+        state: str,
+        reply_text: str,
+        causation_chain: Optional[list],
+    ) -> None:
+        """Retry a restored terminal payload before waiting for restart/sweep."""
+        import asyncio
+
+        for delay_seconds in (1, 5, 15):
+            await asyncio.sleep(delay_seconds)
+            store = getattr(self.agent, "pending_a2a_questions", None)
+            if store is None:
+                return
+            try:
+                if state == "expired":
+                    was_waiting = await store.mark_expired(task_id)
+                else:
+                    was_waiting = await store.mark_resolved(task_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to claim restored pending_a2a_question task=%s "
+                    "for retry: %s",
+                    task_id, exc, exc_info=True,
+                )
+                continue
+            if not was_waiting:
+                return
+
+            fired = await self._fire_question_answered_signal(
+                task_id=task_id,
+                recipient=recipient,
+                original_question=original_question,
+                sess_id=sess_id,
+                state=state,
+                reply_text=reply_text,
+                causation_chain=causation_chain,
+            )
+            if fired:
+                return
+
+            await self._restore_pending_question_waiting(
+                task_id,
+                state=state,
+                reply_text=reply_text,
+                recipient=recipient,
+                original_question=original_question,
+                sess_id=sess_id,
+                causation_chain=causation_chain,
+                schedule_retry=False,
             )
 
     async def _iter_sse_events(self, response):
@@ -1810,6 +1948,10 @@ class PeersFeature(Feature):
         replayed = 0
         expired = 0
         for row in waiting:
+            if getattr(row, "retry_state", None):
+                await self._handle_retry_payload_row(store, row)
+                replayed += 1
+                continue
             try:
                 deadline = datetime.fromisoformat(row.deadline)
             except (TypeError, ValueError):
@@ -1897,6 +2039,10 @@ class PeersFeature(Feature):
         ``state='expired'`` signal. Idempotent: if the row was
         already terminal (raced the supervisor), drop silently
         instead of double-firing."""
+        if getattr(row, "retry_state", None):
+            await self._handle_retry_payload_row(store, row)
+            return
+
         was_waiting = await store.mark_expired(row.task_id)
         if not was_waiting:
             return
@@ -1910,7 +2056,48 @@ class PeersFeature(Feature):
             causation_chain=None,
         )
         if not fired:
-            await self._restore_pending_question_waiting(row.task_id)
+            await self._restore_pending_question_waiting(
+                row.task_id,
+                state="expired",
+                reply_text="",
+                recipient=row.recipient,
+                original_question=row.original_question,
+                sess_id=row.origin_session_id or "",
+                causation_chain=None,
+            )
+
+    async def _handle_retry_payload_row(self, store, row) -> None:
+        """Re-fire a previously observed terminal answer after enqueue failure."""
+        retry_state = getattr(row, "retry_state", None)
+        if not retry_state:
+            return
+
+        if retry_state == "expired":
+            was_waiting = await store.mark_expired(row.task_id)
+        else:
+            was_waiting = await store.mark_resolved(row.task_id)
+        if not was_waiting:
+            return
+
+        fired = await self._fire_question_answered_signal(
+            task_id=row.task_id,
+            recipient=row.recipient,
+            original_question=row.original_question,
+            sess_id=row.origin_session_id or "",
+            state=retry_state,
+            reply_text=getattr(row, "retry_reply_text", None) or "",
+            causation_chain=None,
+        )
+        if not fired:
+            await self._restore_pending_question_waiting(
+                row.task_id,
+                state=retry_state,
+                reply_text=getattr(row, "retry_reply_text", None) or "",
+                recipient=row.recipient,
+                original_question=row.original_question,
+                sess_id=row.origin_session_id or "",
+                causation_chain=None,
+            )
 
     @tool(
         name="send_a2a_task",

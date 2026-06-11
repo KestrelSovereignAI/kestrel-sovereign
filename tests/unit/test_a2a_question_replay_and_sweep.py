@@ -138,6 +138,41 @@ class TestStartupReplay:
         assert "a2a_question_expiry_sweep" in spawn_names
 
     @pytest.mark.asyncio
+    async def test_retry_payload_row_refires_captured_answer(self):
+        feature, agent, tracked = _make_feature_for_replay()
+        future = datetime.now(timezone.utc) + timedelta(minutes=10)
+        row = PendingA2AQuestion(
+            task_id="task-retry-answer",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=future.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="completed",
+            retry_reply_text="Captured reply",
+        )
+
+        store = MagicMock()
+        store.list_waiting = AsyncMock(return_value=[row])
+        store.mark_resolved = AsyncMock(return_value=True)
+        store.mark_expired = AsyncMock(return_value=True)
+        agent.pending_a2a_questions = store
+
+        await feature.post_all_features_loaded(agent)
+
+        store.mark_resolved.assert_awaited_once_with("task-retry-answer")
+        store.mark_expired.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_awaited_once()
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert sig.payload["state"] == "completed"
+        assert sig.payload["reply_text"] == "Captured reply"
+        spawn_names = [n for _, n in tracked]
+        assert not any("task-retry-answer" in n for n in spawn_names)
+
+    @pytest.mark.asyncio
     async def test_past_deadline_row_fires_expired_signal(self):
         feature, agent, tracked = _make_feature_for_replay()
         past = datetime.now(timezone.utc) - timedelta(hours=2)
@@ -332,3 +367,163 @@ class TestHandleExpiredRow:
 
         store.mark_expired.assert_awaited_once_with("already-resolved")
         agent.dispatcher.enqueue_signal.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_retry_payload_past_deadline_preserves_captured_answer(self):
+        feature, agent, _ = _make_feature_for_replay()
+        store = MagicMock()
+        store.mark_resolved = AsyncMock(return_value=True)
+        store.mark_expired = AsyncMock(return_value=True)
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        row = PendingA2AQuestion(
+            task_id="retry-past-deadline",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=past.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="completed",
+            retry_reply_text="Late but real",
+        )
+
+        await feature._handle_expired_row(store, row)
+
+        store.mark_resolved.assert_awaited_once_with("retry-past-deadline")
+        store.mark_expired.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_awaited_once()
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert sig.payload["state"] == "completed"
+        assert sig.payload["reply_text"] == "Late but real"
+
+    @pytest.mark.asyncio
+    async def test_expired_retry_payload_uses_expired_terminal_transition(self):
+        feature, agent, _ = _make_feature_for_replay()
+        store = MagicMock()
+        store.mark_resolved = AsyncMock(return_value=True)
+        store.mark_expired = AsyncMock(return_value=True)
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        row = PendingA2AQuestion(
+            task_id="retry-expired",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=past.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="expired",
+            retry_reply_text="",
+        )
+
+        await feature._handle_expired_row(store, row)
+
+        store.mark_expired.assert_awaited_once_with("retry-expired")
+        store.mark_resolved.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_awaited_once()
+        sig = agent.dispatcher.enqueue_signal.await_args.args[0]
+        assert sig.payload["state"] == "expired"
+        assert sig.payload["reply_text"] == ""
+
+    @pytest.mark.asyncio
+    async def test_retry_payload_enqueue_failure_restores_payload_again(self):
+        feature, agent, _ = _make_feature_for_replay()
+        agent.dispatcher.enqueue_signal.side_effect = RuntimeError("still down")
+        store = MagicMock()
+        store.mark_resolved = AsyncMock(return_value=True)
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        agent.pending_a2a_questions = store
+        past = datetime.now(timezone.utc) - timedelta(hours=2)
+        row = PendingA2AQuestion(
+            task_id="retry-still-down",
+            recipient="Meridian",
+            original_question="q",
+            origin_turn_id=None,
+            origin_session_id="sess-1",
+            deadline=past.isoformat(),
+            status="WAITING",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            resolved_at=None,
+            retry_state="completed",
+            retry_reply_text="Keep carrying this",
+        )
+
+        await feature._handle_expired_row(store, row)
+
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "retry-still-down",
+            state="completed",
+            reply_text="Keep carrying this",
+        )
+
+    @pytest.mark.asyncio
+    async def test_near_term_retry_refires_restored_payload(self, monkeypatch):
+        feature, agent, _ = _make_feature_for_replay()
+        store = MagicMock()
+        store.mark_resolved = AsyncMock(side_effect=[True, True])
+        store.mark_waiting_for_retry = AsyncMock(return_value=True)
+        agent.pending_a2a_questions = store
+        agent.dispatcher.enqueue_signal.side_effect = [
+            RuntimeError("dispatcher blip"),
+            None,
+        ]
+
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        await feature._retry_restored_question_answered_signal(
+            task_id="retry-soon",
+            recipient="Meridian",
+            original_question="q",
+            sess_id="sess-1",
+            state="completed",
+            reply_text="Recovered answer",
+            causation_chain=None,
+        )
+
+        assert store.mark_resolved.await_count == 2
+        store.mark_waiting_for_retry.assert_awaited_once_with(
+            "retry-soon",
+            state="completed",
+            reply_text="Recovered answer",
+        )
+        assert agent.dispatcher.enqueue_signal.await_count == 2
+        assert (
+            agent.dispatcher.enqueue_signal.await_args_list[1]
+            .args[0].payload["reply_text"] == "Recovered answer"
+        )
+
+    @pytest.mark.asyncio
+    async def test_near_term_expired_retry_uses_mark_expired(self, monkeypatch):
+        feature, agent, _ = _make_feature_for_replay()
+        store = MagicMock()
+        store.mark_expired = AsyncMock(return_value=True)
+        store.mark_resolved = AsyncMock(return_value=True)
+        agent.pending_a2a_questions = store
+
+        async def _instant_sleep(_secs):
+            return None
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+        await feature._retry_restored_question_answered_signal(
+            task_id="retry-expired-soon",
+            recipient="Meridian",
+            original_question="q",
+            sess_id="sess-1",
+            state="expired",
+            reply_text="",
+            causation_chain=None,
+        )
+
+        store.mark_expired.assert_awaited_once_with("retry-expired-soon")
+        store.mark_resolved.assert_not_awaited()
+        agent.dispatcher.enqueue_signal.assert_awaited_once()
+        assert (
+            agent.dispatcher.enqueue_signal.await_args.args[0]
+            .payload["state"] == "expired"
+        )

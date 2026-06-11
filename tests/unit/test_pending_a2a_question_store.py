@@ -118,6 +118,29 @@ async def test_mark_waiting_for_retry_restores_terminal_row(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_mark_waiting_for_retry_preserves_terminal_payload(tmp_path):
+    store = await _make_store(tmp_path)
+    deadline = datetime.now(timezone.utc) + timedelta(minutes=10)
+    await store.insert(
+        task_id="task-retry-payload", recipient="Meridian",
+        original_question="x", origin_turn_id=None, origin_session_id=None,
+        deadline=deadline,
+    )
+
+    assert await store.mark_resolved("task-retry-payload") is True
+    assert await store.mark_waiting_for_retry(
+        "task-retry-payload",
+        state="completed",
+        reply_text="real answer",
+    ) is True
+
+    row = await store.get("task-retry-payload")
+    assert row.status == "WAITING"
+    assert row.retry_state == "completed"
+    assert row.retry_reply_text == "real answer"
+
+
+@pytest.mark.asyncio
 async def test_list_waiting_excludes_terminal_rows(tmp_path):
     store = await _make_store(tmp_path)
     deadline = datetime.now(timezone.utc) + timedelta(minutes=10)
