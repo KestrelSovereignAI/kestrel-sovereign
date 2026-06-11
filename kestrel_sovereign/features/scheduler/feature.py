@@ -699,14 +699,14 @@ class SchedulerFeature(Feature):
             last_normalized=last_normalized,
             triggers=triggers,
         )
-        # Always advance the persisted fingerprint to the latest observed
-        # state, even on a no-signal change, so the next poll compares
-        # against current reality rather than a stale baseline.
-        await self._save_pr_watch_state(
-            watch_key, decision.fingerprint, decision.normalized,
-        )
-
         if not decision.should_signal:
+            # Advance the baseline for first observations and filtered/no-op
+            # changes. Signal-worthy changes advance only after enqueue
+            # succeeds, otherwise a transient dispatcher failure would mark
+            # the event handled and permanently drop the wake.
+            await self._save_pr_watch_state(
+                watch_key, decision.fingerprint, decision.normalized,
+            )
             return json.dumps({
                 "signaled": False,
                 "reason": decision.reason,
@@ -749,6 +749,10 @@ class SchedulerFeature(Feature):
                 "watch_key": watch_key,
                 "changed": sorted(decision.matched),
             })
+
+        await self._save_pr_watch_state(
+            watch_key, decision.fingerprint, decision.normalized,
+        )
 
         return json.dumps({
             "signaled": True,

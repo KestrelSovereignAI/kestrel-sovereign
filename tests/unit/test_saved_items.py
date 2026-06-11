@@ -388,6 +388,35 @@ class TestContentHash:
         assert len(hash1) == 64  # SHA256 hex is 64 chars
 
 
+class TestSaveFeaturePrivacy:
+    """Tests for SaveFeature privacy-mode behavior."""
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_mode_does_not_construct_persistent_store(self):
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.save.feature import SaveFeature
+        from kestrel_sovereign.privacy import PrivacyConfig
+
+        agent = MagicMock()
+        agent.did = "did:test:save"
+        agent.storage = MagicMock(db=MagicMock())
+        agent.privacy_config = PrivacyConfig(storage="none", llm_location="local")
+        agent.context_manager = None
+
+        feature = SaveFeature(agent)
+        await feature.initialize()
+
+        with patch("kestrel_sovereign.features.save.feature.SavedItemsStore") as store_cls:
+            result = await feature.save_item(
+                name="Do not persist",
+                content="EPHEMERAL_SECRET",
+            )
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "privacy mode" in result.error
+        store_cls.assert_not_called()
+
+
 class TestEmbeddingSerialization:
     """Tests for embedding serialization."""
 
