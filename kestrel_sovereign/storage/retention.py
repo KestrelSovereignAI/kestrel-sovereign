@@ -114,6 +114,63 @@ def resolve_retention_days(
     return days
 
 
+# --------------------------------------------------------------------------
+# Cognition retention (#1674) — bounds the unbounded cognition tables that
+# the trash rail never touched. memory_episodes is the in-core table (also
+# mirrored into KG nodes, so the janitor must drop the paired node too);
+# reflection_* lives in the kestrel-feature-reflection package and is swept
+# by that feature's own cron (core must not import features).
+# --------------------------------------------------------------------------
+
+# Daily at 04:30 — runs just after the 04:00 memory_consolidate so a freshly
+# written episode is never a sweep candidate on its own creation day.
+DEFAULT_COGNITION_RETENTION_CRON = "30 4 * * *"
+
+
+def load_cognition_config() -> Dict[str, Any]:
+    """Read the merged ``[retention.cognition]`` table from ``kestrel.toml``.
+
+    Returns ``{}`` when the section is absent — which the resolver treats as
+    "retention disabled" (opt-in). Episodes are the agent's autobiographical
+    long-term memory, so the rail never deletes them unless an operator sets
+    an explicit window.
+    """
+    try:
+        from kestrel_sovereign.config import load_section
+        retention = load_section("retention") or {}
+        cognition = retention.get("cognition")
+        return cognition if isinstance(cognition, dict) else {}
+    except Exception as e:
+        logger.debug("[retention] cognition config load failed (using defaults): %s", e)
+        return {}
+
+
+def resolve_cognition_retention_days(
+    *,
+    config: Dict[str, Any],
+    key: str,
+) -> Optional[int]:
+    """Resolve a cognition retention window (in days) from ``config[key]``.
+
+    Returns ``None`` to signal "skip" when the key is absent, non-integer, or
+    non-positive. There is no compiled-in default and no privacy-override
+    table: cognition retention is **opt-in**, so omitting the key keeps the
+    data forever rather than silently aging out an agent's memory.
+    """
+    if key not in config:
+        return None
+    try:
+        days = int(config[key])
+    except (TypeError, ValueError):
+        logger.warning(
+            "[retention] cognition.%s is not an int: %r", key, config[key],
+        )
+        return None
+    if days <= 0:
+        return None
+    return days
+
+
 def agent_privacy_mode(agent: Any) -> Optional[str]:
     """Resolve the agent's current privacy mode as a lowercase string.
 

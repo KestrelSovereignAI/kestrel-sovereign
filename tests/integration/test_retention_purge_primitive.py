@@ -244,3 +244,159 @@ async def test_privacy_wrapper_purge_trash_works_in_ephemeral_mode(tmp_path):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).replace(tzinfo=None).isoformat(sep=" ")
         purged = await wrapper.purge_trash_older_than(cutoff)
         assert purged == 1
+
+
+# ---------------------------------------------------------------------------
+# Cognition retention — purge_episodes_older_than (#1674)
+# ---------------------------------------------------------------------------
+
+from kestrel_sovereign.storage.async_graph_store import GraphNode
+
+
+async def _add_episode(storage, episode_id: str, created_at: datetime, *, agent_id=AGENT_ID):
+    """Insert a memory_episodes row + its paired KG node (node_id == episode id),
+    matching what memory_consolidator writes."""
+    # Match the consolidator: datetime.now(tz=utc).isoformat() -> "...T...+00:00".
+    iso = created_at.isoformat()
+    await storage.db.execute(
+        """INSERT INTO memory_episodes
+           (id, agent_id, title, summary, created_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (episode_id, agent_id, f"title-{episode_id}", "summary", iso),
+    )
+    await storage.add_node(GraphNode(
+        node_id=episode_id,
+        node_type="episode",
+        label=f"title-{episode_id}",
+        properties={"source": "consolidator"},
+    ))
+
+
+@pytest.mark.asyncio
+async def test_purge_episodes_removes_aged_rows_and_paired_nodes(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        await _add_episode(storage, "old-1", now - timedelta(days=200))
+        await _add_episode(storage, "old-2", now - timedelta(days=400))
+        await _add_episode(storage, "recent", now - timedelta(days=10))
+        # An edge touching an old episode node must be scrubbed (no orphan).
+        await storage.graph.add_edge("old-1", "recent", "followed_by", {})
+
+        cutoff = (now - timedelta(days=180)).isoformat()
+        purged = await storage.purge_episodes_older_than(cutoff)
+
+        assert purged == 2
+        # Old episodes gone from the table; recent survives.
+        remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
+        assert {r[0] for r in remaining} == {"recent"}
+        # Paired KG nodes gone too; recent node survives.
+        assert await storage.get_node("old-1") is None
+        assert await storage.get_node("old-2") is None
+        assert await storage.get_node("recent") is not None
+        # The edge touching the purged node was scrubbed (no orphan edge).
+        assert await storage.graph.get_edges("recent") == []
+
+
+@pytest.mark.asyncio
+async def test_purge_episodes_respects_window_and_cap(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            await _add_episode(storage, f"old-{i}", now - timedelta(days=300))
+        await _add_episode(storage, "within-window", now - timedelta(days=30))
+
+        cutoff = (now - timedelta(days=180)).isoformat()
+        # Cap at 2 — only the two oldest of the 5 aged rows are removed this sweep.
+        purged = await storage.purge_episodes_older_than(cutoff, max_rows=2)
+        assert purged == 2
+        remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
+        assert len(remaining) == 4  # 5 old - 2 purged + 1 within-window
+
+        # within-window is never a candidate regardless of cap.
+        ids = {r[0] for r in remaining}
+        assert "within-window" in ids
+
+
+@pytest.mark.asyncio
+async def test_purge_episodes_scopes_to_agent(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        await _add_episode(storage, "mine-old", now - timedelta(days=300))
+        await _add_episode(storage, "other-old", now - timedelta(days=300),
+                           agent_id=OTHER_AGENT_ID)
+
+        cutoff = (now - timedelta(days=180)).isoformat()
+        purged = await storage.purge_episodes_older_than(cutoff)
+
+        assert purged == 1  # only this agent's episode
+        remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
+        assert {r[0] for r in remaining} == {"other-old"}
+
+
+@pytest.mark.asyncio
+async def test_purge_episodes_timestamp_format_matches_consolidator(tmp_path):
+    """Regression (#1674): created_at is stored as isoformat() with a 'T' and
+    a '+00:00' offset; the cutoff MUST use the same format. A space-separated
+    cutoff would sort wrong against the 'T' and miss a same-day-earlier row."""
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        cutoff_dt = now - timedelta(days=180)
+        # 1 hour OLDER than the cutoff, on the same calendar day.
+        await _add_episode(storage, "same-day-older", cutoff_dt - timedelta(hours=1))
+
+        purged = await storage.purge_episodes_older_than(cutoff_dt.isoformat())
+
+        assert purged == 1
+        assert await storage.db.fetchall("SELECT id FROM memory_episodes") == []
+
+
+@pytest.mark.asyncio
+async def test_purge_episodes_keeps_row_when_node_delete_fails(tmp_path):
+    """Regression (#1674): if a paired KG node delete fails, the episode row
+    must NOT be deleted — otherwise we create the orphan node the ordering is
+    meant to prevent. The episode is retried on the next sweep."""
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        await _add_episode(storage, "good", now - timedelta(days=300))
+        await _add_episode(storage, "bad", now - timedelta(days=300))
+
+        real_delete = storage.graph.delete_node
+
+        async def flaky(node_id):
+            if node_id == "bad":
+                raise RuntimeError("graph store unavailable")
+            return await real_delete(node_id)
+
+        storage.graph.delete_node = flaky
+
+        purged = await storage.purge_episodes_older_than(
+            (now - timedelta(days=180)).isoformat()
+        )
+
+        assert purged == 1  # only "good" removed
+        remaining = {r[0] for r in await storage.db.fetchall("SELECT id FROM memory_episodes")}
+        assert remaining == {"bad"}  # row kept — its node could not be deleted
+        # "bad" node is still present (not orphaned).
+        assert await storage.get_node("bad") is not None
+
+
+@pytest.mark.asyncio
+async def test_purge_episodes_non_positive_cap_purges_nothing(tmp_path):
+    """Regression (#1674): max_rows<=0 must purge nothing, not fall through to
+    SQLite's unbounded LIMIT -1 (which would bypass the per-sweep cap)."""
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        await _add_episode(storage, "old", now - timedelta(days=300))
+        cutoff = (now - timedelta(days=180)).isoformat()
+
+        assert await storage.purge_episodes_older_than(cutoff, max_rows=0) == 0
+        assert await storage.purge_episodes_older_than(cutoff, max_rows=-1) == 0
+        # The episode (and its node) survive.
+        assert len(await storage.db.fetchall("SELECT id FROM memory_episodes")) == 1
+        assert await storage.get_node("old") is not None

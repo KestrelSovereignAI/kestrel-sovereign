@@ -92,6 +92,7 @@ def test_all_cron_tasks_are_classified():
         "morning_signal",
         "signal_dispatch",
         "trash_retention",
+        "cognition_retention",  # #1674
         "training_cycle",
         "reflect",
         "memory_consolidate",
@@ -112,6 +113,7 @@ def test_action_vs_artifact_split_matches_design():
         "backup_snapshot",
         "signal_dispatch",
         "trash_retention",
+        "cognition_retention",  # #1674 — purges episodes + KG nodes, no LLM
         "training_cycle",
         "talon_monitor",  # #1510 — polls jobs, emits signals, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
@@ -147,6 +149,7 @@ def test_state_mutating_tasks_declare_memory():
     """
     by_name = {name: resources for name, _, resources in CRON_TASKS}
     assert ResourceLock.MEMORY in by_name["trash_retention"]
+    assert ResourceLock.MEMORY in by_name["cognition_retention"]
     assert ResourceLock.MEMORY in by_name["training_cycle"]
     assert ResourceLock.MEMORY in by_name["memory_consolidate"]
     assert ResourceLock.MEMORY in by_name["reflect"]
