@@ -505,15 +505,22 @@ async def test_audit_log_records_full_chain(workspace: Path, security_feature: S
     async with _ApprovalResponder(security_feature, decision=True):
         await feature.fs_read(path=str(workspace / "ok.txt"))  # auto-approved
         await feature.fs_write(path=str(workspace / "n1.txt"), content="a")  # human approval
-        await feature.shell(command="echo done", timeout=5)  # human approval
+        # #1694: ``echo``, ``true``, ``false`` are all on the
+        # fixture's allow-list, so they auto-approve and bypass the
+        # queue (same contract as auto_approve_read for paths). Use
+        # ``whoami`` which is on neither list so it actually exercises
+        # the REQUIRE_APPROVAL → queue path.
+        await feature.shell(command="whoami", timeout=5)  # queue routed
 
     audit = _read_audit(workspace / "audit.jsonl")
     assert len(audit) == 3
     assert [r["tool"] for r in audit] == ["fs-read", "fs-write", "shell"]
     # Read auto-approves -> chain has privacy/constitution/path_safety/policy
     assert audit[0]["allowed_by"] == ["privacy", "constitution", "path_safety", "policy"]
-    # Writes/shell go all the way through the queue
+    # Write still goes all the way through the queue (PathPolicy
+    # writes are always REQUIRE_APPROVAL).
     assert any(s.startswith("approval:") for s in audit[1]["allowed_by"])
+    # Shell with unlisted ``true`` routes through the queue too.
     assert any(s.startswith("approval:") for s in audit[2]["allowed_by"])
 
 

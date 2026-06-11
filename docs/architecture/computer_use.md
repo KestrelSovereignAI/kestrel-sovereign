@@ -63,7 +63,14 @@ max_read_bytes = 5_000_000
 # prompt — the operator has pre-approved them. Everything not on
 # `auto_approved_binaries` and not on `denied_binaries` routes through
 # the ApprovalQueue.
-auto_approved_binaries = ["git", "ls", "cat", "rg", "uv", "node", "python", "gh"]
+#
+# Default is deliberately narrow: only inert read-only tools where the
+# argv shape can't be turned into arbitrary host work. Interpreters
+# (`python`, `node`) and rich CLIs (`uv`, `gh`, `git`) are NOT
+# auto-approved by default — they reach the queue so the operator (or
+# a scoped auto-approve rule) decides. Operators add to this list to
+# broaden the no-prompt set; never blindly copy the broad list below.
+auto_approved_binaries = ["ls", "cat", "rg"]
 denied_binaries = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
 auto_approve_read = true              # only inside allowed_paths
 audit_log_path = ".kestrel/computer_use_audit.jsonl"

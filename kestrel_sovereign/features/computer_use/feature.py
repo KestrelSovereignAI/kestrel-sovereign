@@ -874,12 +874,29 @@ class ComputerUseFeature(Feature):
 
     @tool(
         name="shell",
-        description="Run a shell command (always approval-gated).",
+        description=(
+            "Run a shell command. Deny-listed binaries hard-refuse; "
+            "auto-approved binaries run without a prompt; everything "
+            "else routes through the ApprovalQueue."
+        ),
         category=ToolCategory.SYSTEM,
         command_prefix="!shell",
     )
     async def shell(self, command: str, timeout: int | str = 60) -> ToolResult:
-        """Run a shell command after policy + approval.
+        """Run a shell command after policy + (conditional) approval.
+
+        Approval semantics (#1694):
+
+        - Deny-listed binary → hard refuse before queueing.
+        - Auto-approved binary (allow-list match) → runs without a
+          prompt. Same contract as ``auto_approve_read`` for paths.
+        - Anything else → routes through ApprovalQueue (operator or
+          scoped auto-approve rule decides).
+
+        The compound-command guard (raw string with unquoted ``;``,
+        ``&&``, backticks, ``$(...)``, redirects, newline) downgrades
+        ALLOW to REQUIRE_APPROVAL so an allow-listed first token can't
+        bless a piggy-backed second command.
 
         Args:
             command: The shell command to run; tokenized with shlex.
