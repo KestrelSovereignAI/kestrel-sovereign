@@ -7,9 +7,22 @@ than every attachment being shoved into the model's context. Pasted images
 take the *eager* path instead (sent as vision the same turn — see the LLM
 streaming layer); this feature is the lazy counterpart.
 
-Security: an agent may only read a hash that actually appears as an attachment
-in its OWN conversation history (session-scoped), so the content-addressed
-store can't be turned into a read-anything oracle by a hallucinated hash.
+Security model (boundaries, in order of strength):
+
+1. The file store is PER-AGENT (each agent reads only its own DB), and the
+   caller is the authenticated owner — so there is no cross-agent / cross-tenant
+   read. The owner can already read any of their agent's files directly.
+2. The hash must resolve to bytes in that store (a forged/non-existent hash
+   fails at ``retrieve_file``).
+3. The hash must be referenced as an attachment in the agent's AUTHORITATIVE
+   active-turn session (membership), which scopes a read to documents attached
+   in this thread.
+
+Residual (tracked follow-up): a caller's request body controls the turn's
+``attachments`` refs, so a forged ref to one of the agent's OWN existing files
+(e.g. its avatar) could be referenced. Closing this needs a reliable
+upload-receipt — store metadata is NOT reliable (ISOLATED mode doesn't persist
+it; content-dedup keeps stale metadata), so it's deferred rather than faked.
 """
 import io
 import logging
@@ -134,10 +147,12 @@ class AttachmentsFeature(Feature):
         # agent reads only its own DB) plus the authenticated owner; membership
         # then scopes a read to documents actually attached in this thread.
         #
-        # The tool-call ``session_id`` arg is model-controlled and usually
-        # omitted, so the authoritative scope is the session the agent recorded
-        # for the active turn; the arg only narrows further if supplied.
-        effective_session = session_id or getattr(self.agent, "_active_session_id", None)
+        # The agent's recorded active-turn session is AUTHORITATIVE; a
+        # model-supplied ``session_id`` arg must not be able to widen scope to
+        # another thread, so the active session wins whenever it's known and the
+        # arg only applies in its absence (e.g. standalone single-conversation).
+        active = getattr(self.agent, "_active_session_id", None)
+        effective_session = active if active is not None else session_id
         try:
             history = await self.storage.get_conversation_history(
                 limit=200, session_id=effective_session
