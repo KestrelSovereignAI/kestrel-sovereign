@@ -263,6 +263,15 @@ const _LIST_ITEM_RE = /^[ \t]*([-*+]|\d+[.)])\s/;
 // A reference-style link/image definition line: `[label]: url`.
 const _REF_DEF_RE = /^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*\S/m;
 
+// True when `text` ends inside an OPEN display-math region ($$…$$ or \[…\])
+// — used so a blank line inside multi-line display math isn't read as a block
+// boundary (which would split the math across stable/tail).
+function _hasOpenMath(text) {
+    if (((text.match(/\$\$/g) || []).length) % 2 !== 0) return true;
+    if (((text.match(/\\\[/g) || []).length) > ((text.match(/\\\]/g) || []).length)) return true;
+    return false;
+}
+
 // Walk the fence state of `text` line by line, invoking `onLine(openMarkerOrNull,
 // lineIndex, line)` after each line's fence transition is applied. Returns the
 // final open fence marker STRING (e.g. "```", "````", "~~~"), or null. Per
@@ -347,6 +356,9 @@ function _splitStreamingTail(text) {
     _walkFences(text, (openFence, i) => {
         if (openFence !== null) return;  // inside a fenced block — never split
         if (lines[i].trim() !== '') return;
+        // Inside an open display-math region ($$…$$ or \[…\] crossing the
+        // blank)? Keep it whole in the tail so the balanced span is protected.
+        if (_hasOpenMath(lines.slice(0, i).join('\n'))) return;
         // Suppress this blank as a boundary ONLY for a genuine loose-list gap —
         // i.e. the block BEFORE the blank is list-ish AND the content AFTER it
         // is too (a new item or an indented continuation). A paragraph→list

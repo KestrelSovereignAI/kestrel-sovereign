@@ -97,6 +97,13 @@ test('a non-list block after a loose list still finalizes', () => {
     assert.equal(tail, 'paragraph');
 });
 
+test('a blank line inside open display math does not split the block', () => {
+    const { _splitStreamingTail } = load();
+    const { stable, tail } = _splitStreamingTail('$$\na\n\nb\n$$');
+    assert.equal(stable, '');
+    assert.match(tail, /\$\$\na\n\nb\n\$\$/);  // the whole math span stays together
+});
+
 test('a ``` fence containing a ~~~ line stays open (marker-aware)', () => {
     const { _splitStreamingTail, _completeStreamingInline } = load();
     const { tail } = _splitStreamingTail('```\n~~~\n\nstill code');
