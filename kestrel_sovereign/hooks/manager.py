@@ -20,6 +20,34 @@ from kestrel_sdk.hooks.base import (
 logger = logging.getLogger(__name__)
 
 
+def _hook_is_enforcing(hook) -> bool:
+    """Whether a hook must FAIL CLOSED (deny) if it errors/times out.
+
+    A deny-capable / blocking hook silently converted to "allow" on failure is
+    the fail-open bug (#1723). A hook is enforcing if it opts in via
+    ``fail_closed=True`` or if it blocks on human approval
+    (``awaits_user_input``) — a crashed approval means we never got approval, so
+    the safe resolution is deny. Plain advisory hooks (warnings, telemetry)
+    are NOT enforcing and are skipped on failure as before.
+    """
+    return bool(
+        getattr(hook, "fail_closed", False)
+        or getattr(hook, "awaits_user_input", False)
+    )
+
+
+def _deny_for_failed_hook(hook, reason, accumulated_warnings, max_warning_severity):
+    """Build a DENY HookOutput for an enforcing hook that failed (fail closed)."""
+    out = HookOutput.deny(
+        f"Enforcing hook '{getattr(hook, 'name', '?')}' failed ({reason}); "
+        f"denying by fail-closed policy."
+    )
+    if accumulated_warnings:
+        out.warning_message = " | ".join(accumulated_warnings)
+        out.warning_severity = max_warning_severity
+    return out
+
+
 class HooksManager:
     """
     Central manager for hook registration and execution.
@@ -252,12 +280,36 @@ class HooksManager:
                     input.tool_input = output.updated_input
 
             except asyncio.TimeoutError:
+                # FAIL CLOSED for enforcing hooks: a deny-capable hook that times
+                # out must not silently become "allowed" — that turns a block
+                # into a pass (#1723). Advisory hooks are still skipped.
+                if _hook_is_enforcing(hook):
+                    logger.error(
+                        f"Enforcing hook '{hook.name}' timed out after "
+                        f"{hook.timeout}s — failing closed (deny)."
+                    )
+                    return _deny_for_failed_hook(
+                        hook, f"timed out after {hook.timeout}s",
+                        accumulated_warnings, max_warning_severity,
+                    )
                 logger.warning(
                     f"Hook '{hook.name}' timed out after {hook.timeout}s, skipping"
                 )
                 continue
 
             except Exception as e:
+                # FAIL CLOSED for enforcing hooks: a crashed deny-capable hook
+                # (e.g. an approval hook whose queue backend raised) must deny,
+                # not allow (#1723). Advisory hooks are still skipped.
+                if _hook_is_enforcing(hook):
+                    logger.error(
+                        f"Enforcing hook '{hook.name}' raised ({e}) — failing closed (deny).",
+                        exc_info=True,
+                    )
+                    return _deny_for_failed_hook(
+                        hook, f"raised {type(e).__name__}: {e}",
+                        accumulated_warnings, max_warning_severity,
+                    )
                 logger.error(f"Hook '{hook.name}' failed with error: {e}", exc_info=True)
                 continue
 

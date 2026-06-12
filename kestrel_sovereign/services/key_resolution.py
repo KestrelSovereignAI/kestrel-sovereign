@@ -215,9 +215,21 @@ class KeyResolutionService:
             True if allowed, False if quota exceeded or check failed after retries
         """
         import asyncio
+        import os
 
         if not self._storage:
-            return True  # No storage = no quota enforcement
+            # No storage = quota not configured. This is a legitimate default
+            # (quota enforcement is opt-in), so allow — denying here would block
+            # every operation for any agent without a quota store. A deployment
+            # that MANDATES quota sets KESTREL_QUOTA_ENFORCE=1, which makes a
+            # missing store fail CLOSED instead of silently unlimited (#1723).
+            if os.environ.get("KESTREL_QUOTA_ENFORCE", "").lower() in ("1", "true", "yes"):
+                logger.error(
+                    "KESTREL_QUOTA_ENFORCE=1 but no quota storage is configured "
+                    "for %s — denying (fail closed).", provider,
+                )
+                return False
+            return True
 
         provider = provider.lower()
 

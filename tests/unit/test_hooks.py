@@ -444,6 +444,71 @@ class TestHooksManager:
         assert allow_hook.call_count == 1
 
     @pytest.mark.asyncio
+    async def test_enforcing_hook_exception_fails_closed(self):
+        """#1723: a deny-capable (fail_closed) hook that RAISES must resolve to
+        DENY, not allow — a crashed enforcing hook can't silently pass."""
+        manager = HooksManager()
+
+        class EnforcingFailingHook(Hook):
+            def __init__(self):
+                super().__init__(name="enforcing_fail", events=[HookEvent.PRE_TOOL_USE], priority=10)
+                self.fail_closed = True
+
+            async def execute(self, input):
+                raise ValueError("backend exploded")
+
+        manager.register(EnforcingFailingHook())
+        manager.register(AllowAllHook(priority=200))
+        input = HookInput(session_id="t", hook_event_name="PreToolUse", tool_name="x")
+        output = await manager.execute_hooks(HookEvent.PRE_TOOL_USE, input)
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_enforcing_hook_timeout_fails_closed(self):
+        """#1723: an enforcing hook that TIMES OUT must resolve to DENY."""
+        manager = HooksManager()
+
+        class EnforcingTimeoutHook(Hook):
+            def __init__(self):
+                super().__init__(
+                    name="enforcing_timeout", events=[HookEvent.PRE_TOOL_USE],
+                    priority=10, timeout=0.05,
+                )
+                self.fail_closed = True
+
+            async def execute(self, input):
+                await asyncio.sleep(5.0)
+                return HookOutput.allow()
+
+        manager.register(EnforcingTimeoutHook())
+        input = HookInput(session_id="t", hook_event_name="PreToolUse", tool_name="x")
+        output = await manager.execute_hooks(HookEvent.PRE_TOOL_USE, input)
+        assert output.continue_execution is False
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_awaits_user_input_hook_exception_fails_closed(self):
+        """#1723: an approval hook (awaits_user_input) whose queue raises must
+        DENY — we never got approval, so the safe resolution is deny."""
+        manager = HooksManager()
+
+        class CrashingApprovalHook(Hook):
+            def __init__(self):
+                super().__init__(
+                    name="approval", events=[HookEvent.PRE_TOOL_USE],
+                    priority=10, awaits_user_input=True,
+                )
+
+            async def execute(self, input):
+                raise RuntimeError("approval queue down")
+
+        manager.register(CrashingApprovalHook())
+        input = HookInput(session_id="t", hook_event_name="PreToolUse", tool_name="x")
+        output = await manager.execute_hooks(HookEvent.PRE_TOOL_USE, input)
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
     async def test_execute_hooks_parallel(self):
         manager = HooksManager()
         hook1 = AllowAllHook(name="hook1")
