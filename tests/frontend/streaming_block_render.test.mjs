@@ -57,6 +57,29 @@ test('a blank line INSIDE a closed fence does not split the block', () => {
     assert.equal(tail, 'after');
 });
 
+test('a loose list (blank line between items) is NOT split into two lists', () => {
+    const { _splitStreamingTail } = load();
+    const { stable, tail } = _splitStreamingTail('- first\n\n- second');
+    // The whole loose list stays together (in the tail) — not finalized as a
+    // standalone <ul> before the second item arrives.
+    assert.equal(stable, '');
+    assert.match(tail, /- first\n\n- second/);
+});
+
+test('a non-list block after a loose list still finalizes', () => {
+    const { _splitStreamingTail } = load();
+    const { stable, tail } = _splitStreamingTail('- a\n\n- b\n\nparagraph');
+    assert.match(stable, /- a\n\n- b/);   // the loose list memoizes together
+    assert.equal(tail, 'paragraph');
+});
+
+test('a ``` fence containing a ~~~ line stays open (marker-aware)', () => {
+    const { _splitStreamingTail, _completeStreamingInline } = load();
+    const { tail } = _splitStreamingTail('```\n~~~\n\nstill code');
+    assert.match(tail, /```\n~~~\n\nstill code/);  // blank inside the fence didn't split
+    assert.equal(_completeStreamingInline('```\n~~~\ncode'), '```\n~~~\ncode\n```');
+});
+
 // --- tail-scoped complete-all -----------------------------------------------
 
 test('completes unclosed bold, inline code, link, and math', () => {
@@ -71,6 +94,11 @@ test('completes unclosed bold, inline code, link, and math', () => {
 test('closes an open fenced code block (and leaves inline alone inside it)', () => {
     const { _completeStreamingInline } = load();
     assert.equal(_completeStreamingInline('```js\nconst x = 1;'), '```js\nconst x = 1;\n```');
+});
+
+test('closes a TILDE fence with a tilde marker, not backticks', () => {
+    const { _completeStreamingInline } = load();
+    assert.equal(_completeStreamingInline('~~~\ncode'), '~~~\ncode\n~~~');
 });
 
 test('does NOT complete ambiguous single-* or bare $ (the #1547 trap)', () => {

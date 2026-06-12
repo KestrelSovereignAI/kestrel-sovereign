@@ -251,20 +251,51 @@ function _renderStreamStable(stable) {
     return html;
 }
 
+const _FENCE_RE = /^[ \t]*(```+|~~~+)/;
+const _LIST_ITEM_RE = /^[ \t]*([-*+]|\d+[.)])\s/;
+
+// Return the marker char ('`' or '~') of a still-OPEN fence in `text`, else
+// null. A fence only closes with the SAME marker character it opened with, so a
+// ``` block containing a `~~~` line stays open (CommonMark).
+function _openFenceMarker(text) {
+    let marker = null;
+    for (const line of text.split('\n')) {
+        const m = line.match(_FENCE_RE);
+        if (!m) continue;
+        const c = m[1][0];
+        if (marker === null) marker = c;
+        else if (marker === c) marker = null;
+        // a different marker while inside a fence is literal code — ignore
+    }
+    return marker;
+}
+
 // Fence-aware split into {stable, tail}. The boundary is the last blank line
-// that is NOT inside a fenced code block; an open (unclosed) fence keeps its
-// whole region in the tail. Blank-line-separated top-level blocks are
-// independent in markdown, so rendering stable and tail separately is safe.
+// that is NOT inside a fenced code block AND not a loose-list gap; an open
+// (unclosed) fence keeps its whole region in the tail. Blank-line-separated
+// top-level blocks are independent in markdown, so rendering stable and tail
+// separately is safe — EXCEPT a blank line between list items (a loose list is
+// one list), so we never finalize across a blank line whose next content is a
+// list item.
 function _splitStreamingTail(text) {
     const lines = text.split('\n');
-    let inFence = false;
+    let fenceMarker = null;
     let tailStartLine = 0;
     for (let i = 0; i < lines.length; i++) {
-        if (/^\s*(```|~~~)/.test(lines[i])) {
-            inFence = !inFence;
+        const m = lines[i].match(_FENCE_RE);
+        if (m) {
+            const c = m[1][0];
+            if (fenceMarker === null) fenceMarker = c;
+            else if (fenceMarker === c) fenceMarker = null;
             continue;
         }
-        if (!inFence && lines[i].trim() === '') {
+        if (fenceMarker === null && lines[i].trim() === '') {
+            // Peek the next non-blank line: if it's a list item this blank may
+            // be a loose-list gap, so keep the prefix in the tail (don't split
+            // a multi-item list into separate lists mid-stream).
+            let j = i + 1;
+            while (j < lines.length && lines[j].trim() === '') j++;
+            if (j < lines.length && _LIST_ITEM_RE.test(lines[j])) continue;
             tailStartLine = i + 1;
         }
     }
@@ -281,10 +312,11 @@ function _splitStreamingTail(text) {
 // their real closer streams in.
 function _completeStreamingInline(tail) {
     let t = tail;
-    // Open fenced code block → close it; leave everything inside untouched.
-    const fences = (t.match(/^[ \t]*(```|~~~)/gm) || []).length;
-    if (fences % 2 !== 0) {
-        return t + '\n```';
+    // Open fenced code block → close it with the SAME marker that opened it;
+    // leave everything inside untouched.
+    const openMarker = _openFenceMarker(t);
+    if (openMarker) {
+        return t + (openMarker === '~' ? '\n~~~' : '\n```');
     }
     // Inline code: odd backtick count (fences are balanced here) → close.
     if (((t.match(/`/g) || []).length) % 2 !== 0) t += '`';
