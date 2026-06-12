@@ -446,6 +446,12 @@ class MemorySystem:
         1. Creates narrative episodes from conversation clusters
         2. Detects temporal patterns
         3. Archives fully decayed memories
+        4. Forgets (deletes) episodes decayed past the delete threshold (#1674)
+
+        This is the SINGLE consolidation chokepoint — both the nightly ``sleep``
+        cycle and the manual ``!memory consolidate`` tool route through here, so
+        forgetting lives in one place rather than scattered across per-memory
+        crons. The forgetting deletion tier is opt-in/off and best-effort.
 
         Returns:
             Report dict with counts of each operation
@@ -454,7 +460,42 @@ class MemorySystem:
             logger.warning("Memory consolidator not initialized")
             return {"error": "Consolidator not initialized"}
 
-        return await self.consolidator.run_consolidation()
+        report = dict(await self.consolidator.run_consolidation() or {})
+        # Only ride a SUCCESSFUL pass: run_consolidation reports many internal
+        # failures as {"error": ...} instead of raising, and destructive
+        # forgetting must never follow a failed/partial consolidation.
+        report["episodes_deleted"] = (
+            0 if "error" in report else await self._forget_decayed_episodes()
+        )
+        return report
+
+    async def _forget_decayed_episodes(self) -> int:
+        """Deletion tier of the forgetting curve (#1674).
+
+        Deletes episodes whose importance- and access-scaled decay strength has
+        fallen below ``[forgetting].delete_threshold`` and that are past
+        ``[forgetting].delete_grace_days``. Opt-in: a no-op unless
+        ``[forgetting].enabled``. Best-effort — a failure here must not fail the
+        consolidation it rides on (episodes are retried next pass). Returns the
+        number of episodes forgotten.
+        """
+        from kestrel_sovereign.storage.retention import load_forgetting_config
+
+        config = load_forgetting_config()
+        if not config["enabled"]:
+            return 0
+        storage = self.storage
+        if storage is None or not hasattr(storage, "purge_decayed_episodes"):
+            return 0
+        try:
+            return await storage.purge_decayed_episodes(
+                delete_threshold=config["delete_threshold"],
+                grace_days=config["grace_days"],
+                reason="forgetting",
+            )
+        except Exception as e:  # noqa: BLE001 - forgetting must not fail consolidation
+            logger.warning("forgetting: episode deletion tier failed: %s", e)
+            return 0
 
     async def get_episodes(
         self,

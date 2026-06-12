@@ -204,6 +204,103 @@ class TestRetiredCronCleanup:
         # An already-present live default is not duplicated.
         assert "backup_snapshot" not in readded
 
+    @pytest.mark.asyncio
+    async def test_post_load_removes_autoseeded_consolidate_reflect_keeps_custom(self):
+        """#1674 P3: the nightly `sleep` cycle supersedes the auto-seeded
+        memory_consolidate + reflect crons. post_all_features_loaded removes
+        rows that EXACTLY match the old auto-seed (name+cron+args) but leaves a
+        user-customized schedule intact, and seeds `sleep` when MemoryFeature
+        is present."""
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_mock_agent()
+        agent.features = {"MemoryFeature"}
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                # Auto-seeded defaults (exact match) → removed.
+                {"task_name": "memory_consolidate", "id": "mc-auto",
+                 "cron_expression": "0 4 * * *", "args": {}},
+                {"task_name": "reflect", "id": "rf-auto",
+                 "cron_expression": "0 */4 * * *",
+                 "args": {"scope": "all", "depth": "normal"}},
+                # User-customized memory_consolidate (different cron) → kept.
+                {"task_name": "memory_consolidate", "id": "mc-custom",
+                 "cron_expression": "30 2 * * *", "args": {}},
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
+        f.schedule_add = AsyncMock(return_value=ToolResult.ok(
+            confirmation="added", data={"next_run_at": None}))
+
+        await f.post_all_features_loaded(agent)
+
+        removed_ids = {c.args[0] for c in f.schedule_remove.await_args_list}
+        assert "mc-auto" in removed_ids and "rf-auto" in removed_ids
+        assert "mc-custom" not in removed_ids  # user schedule preserved
+        seeded = [c.kwargs.get("task_name") for c in f.schedule_add.await_args_list]
+        assert "sleep" in seeded                # the one memory-maintenance cron
+        assert "memory_consolidate" not in seeded
+        assert "reflect" not in seeded
+
+
+class TestSleepCronHandler:
+    @pytest.mark.asyncio
+    async def test_handle_sleep_calls_agent_sleep_skip_export(self):
+        """The sleep cron handler runs the agent's sleep cycle with
+        skip_export=True (backups own DR) and surfaces the report."""
+        from types import SimpleNamespace
+
+        class _Report:
+            def to_dict(self):
+                return {"success": True, "consolidation": {"episodes_deleted": 2}}
+
+        agent = _make_mock_agent()
+        agent.sleep = AsyncMock(return_value=_Report())
+        agent.storage = MagicMock()
+        # No messages at all → genuinely idle → reflection gated off. The gate
+        # queries conversation MAX(created_at) first; None → idle (early return).
+        agent.storage.db = MagicMock()
+        agent.storage.db.fetchval = AsyncMock(side_effect=[None])
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        out = await f._handle_sleep({})
+
+        agent.sleep.assert_awaited_once()
+        kwargs = agent.sleep.await_args.kwargs
+        assert kwargs["skip_export"] is True
+        assert kwargs["skip_reflection"] is True  # idle → reflection skipped
+        assert '"success": true' in out
+
+    @pytest.mark.asyncio
+    async def test_handle_sleep_reflects_when_active(self):
+        agent = _make_mock_agent()
+
+        class _Report:
+            def to_dict(self):
+                return {"success": True}
+
+        agent.sleep = AsyncMock(return_value=_Report())
+        agent.storage = MagicMock()
+        agent.storage.db = MagicMock()
+        # Gate queries conversation MAX first, then episode MAX. Newest message
+        # (Jun 12, space-format) is newer than the last episode (Jun 1, ISO/tz)
+        # → active even across the two on-disk timestamp formats.
+        agent.storage.db.fetchval = AsyncMock(
+            side_effect=["2026-06-12 10:00:00", "2026-06-01T00:00:00+00:00"])
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        await f._handle_sleep({})
+        assert agent.sleep.await_args.kwargs["skip_reflection"] is False
+
 
 # =========================================================================
 # schedule_add
