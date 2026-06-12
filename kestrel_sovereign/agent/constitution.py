@@ -559,7 +559,26 @@ class ConstitutionMixin:
 
         ``is_valid=False`` drives the integrity audit into safe mode.
         """
-        overlay_sha = getattr(self, "_constitution_overlay_sha", None)
+        # Re-read the overlay from disk EVERY call (not the __init__-cached hash)
+        # so the periodic audit detects live mutation/removal while the agent is
+        # running (#1722). Refresh the cached text + sha so the capability gate
+        # also sees current content.
+        overlay_path = getattr(self, "_constitution_overlay_path", None)
+        overlay_sha = None
+        if overlay_path is not None and overlay_path.exists():
+            try:
+                overlay_bytes = overlay_path.read_bytes()
+                overlay_sha = hashlib.sha256(overlay_bytes).hexdigest()
+                self.constitution_text = overlay_bytes.decode("utf-8")
+            except OSError as e:
+                logging.warning("Could not re-read constitution overlay %s: %s", overlay_path, e)
+                overlay_sha = None
+                self.constitution_text = None
+        else:
+            # File absent now (never existed, or removed at runtime).
+            if getattr(self, "constitution_text", None) is not None and overlay_path is not None:
+                self.constitution_text = None
+        self._constitution_overlay_sha = overlay_sha
 
         anchor = None
         try:

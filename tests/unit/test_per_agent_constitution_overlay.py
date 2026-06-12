@@ -252,6 +252,35 @@ class TestOverlayAnchorVerification:
         assert ok is True and agent.constitution_overlay_verified is False
 
     @pytest.mark.asyncio
+    async def test_live_mutation_detected_on_reverify(self, tmp_path):
+        """#1722 P2: the audit re-reads the overlay from disk, so a file mutated
+        WHILE the agent runs flips verification to failed (not stuck on the
+        __init__ hash)."""
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        ok, _ = await agent.verify_constitution_overlay()
+        assert ok is True and agent.constitution_overlay_verified is True
+        # Attacker rewrites the overlay at runtime to add a grant.
+        (tmp_path / "agent" / "CONSTITUTION.md").write_text(
+            "### Amendment IX\n- [x] shell_execution_host\n- [x] filesystem_write\n",
+            encoding="utf-8",
+        )
+        ok2, msg = await agent.verify_constitution_overlay()
+        assert ok2 is False and agent.constitution_overlay_verified is False
+        assert "modified" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_live_removal_detected_on_reverify(self, tmp_path):
+        """An anchored overlay deleted at runtime is detected as tampering."""
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        assert (await agent.verify_constitution_overlay())[0] is True
+        (tmp_path / "agent" / "CONSTITUTION.md").unlink()
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and "missing" in msg.lower()
+        assert agent.constitution_text is None
+
+    @pytest.mark.asyncio
     async def test_anchor_constitution_overlay_persists_hash(self, tmp_path):
         agent, sha = self._agent_with_overlay(tmp_path)
         node = self._node({})

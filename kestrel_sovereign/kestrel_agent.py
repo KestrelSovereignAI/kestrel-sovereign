@@ -970,6 +970,22 @@ class KestrelAgent(
             else:
                 self._agent_name = "Unnamed Agent"
 
+            # Verify the per-agent constitution overlay against its anchor BEFORE
+            # feature discovery (#1722). ComputerUseFeature.initialize() reads
+            # _granted_capabilities() to build its backend; if the overlay were
+            # verified later, a legitimate anchored overlay's grants would be
+            # ignored at feature-init time and the backend would never build.
+            # For a brand-new agent the identity node doesn't exist yet → no
+            # anchor → an overlay (if present) stays unverified until anchored,
+            # which is the correct fail-closed default.
+            try:
+                ok, msg = await self.verify_constitution_overlay()
+                if not ok:
+                    logging.warning("Constitution overlay not trusted: %s", msg)
+            except Exception as e:  # noqa: BLE001 - never block init on this
+                logging.warning("Constitution overlay verification errored: %s", e)
+                self.constitution_overlay_verified = False
+
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
             # Per-agent feature profiles filter via allowed_features
@@ -1023,19 +1039,6 @@ class KestrelAgent(
                 )
                 await self.storage.add_node(agent_node)
                 logging.info("Agent node created")
-
-            # Verify the per-agent constitution overlay against its anchor so the
-            # capability gate knows whether to honor its Amendment IX grants
-            # (#1722). An unanchored/tampered overlay leaves
-            # ``constitution_overlay_verified`` False (grants ignored); the
-            # periodic audit additionally fails closed on it.
-            try:
-                ok, msg = await self.verify_constitution_overlay()
-                if not ok:
-                    logging.warning("Constitution overlay not trusted: %s", msg)
-            except Exception as e:  # noqa: BLE001 - never block init on this
-                logging.warning("Constitution overlay verification errored: %s", e)
-                self.constitution_overlay_verified = False
 
             # Load prompts from external files (fallback to embedded defaults)
             self.prompt_template = _load_prompt_file(
