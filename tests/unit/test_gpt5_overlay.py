@@ -88,3 +88,55 @@ class TestPrependGpt5Overlay:
         c = prepend_gpt5_overlay(base, "gpt-5.5-pro")
         assert c.startswith(GPT5_BEHAVIOR_CONTRACT)
         assert a.startswith(GPT5_BEHAVIOR_CONTRACT)
+
+
+class TestSandboxRetryDiscipline:
+    """#1718: codex 0.138 merged approval_policy on-failure semantics into
+    on-request — agents must explicitly request elevation rather than
+    relying on auto-escalation. The overlay tells GPT-5 agents (which is
+    every codex-backed agent in our setup) to retry once with explicit
+    escalation instead of surfacing the raw sandbox error.
+
+    Lives in <tool_discipline> so it composes naturally with the rest of
+    the tool-use guidance and inherits the byte-stable prefix-cache
+    invariant. Anthropic-backed agents do not see this overlay and do
+    not need it — their shell path goes through ``_run_gates`` directly
+    (no codex sandbox layer).
+    """
+
+    @pytest.mark.parametrize(
+        "phrase",
+        [
+            "Operation not permitted",
+            "rejected by user",
+            "sandbox refusal",
+            "retry once",
+            "host approval queue",
+        ],
+    )
+    def test_contract_carries_sandbox_retry_clause(self, phrase):
+        assert phrase in GPT5_BEHAVIOR_CONTRACT, (
+            f"GPT5 contract must mention {phrase!r} so sandbox-blocked "
+            f"writes can be retried with an explicit elevation request"
+        )
+
+    def test_sandbox_retry_clause_inside_tool_discipline(self):
+        # The clause is part of <tool_discipline>, not a floating
+        # paragraph — keeps the contract structurally clean.
+        td_start = GPT5_BEHAVIOR_CONTRACT.index("<tool_discipline>")
+        td_end = GPT5_BEHAVIOR_CONTRACT.index("</tool_discipline>")
+        td_block = GPT5_BEHAVIOR_CONTRACT[td_start:td_end]
+        assert "Operation not permitted" in td_block
+        assert "host approval queue" in td_block
+
+    def test_sandbox_retry_clause_not_in_other_blocks(self):
+        # Spot-check: the clause must not have been duplicated into
+        # <execution_policy> / <output_contract> by a future edit.
+        for tag in ("<execution_policy>", "<output_contract>", "<completion_contract>"):
+            start = GPT5_BEHAVIOR_CONTRACT.index(tag)
+            end = GPT5_BEHAVIOR_CONTRACT.index(tag.replace("<", "</"))
+            block = GPT5_BEHAVIOR_CONTRACT[start:end]
+            assert "Operation not permitted" not in block, (
+                f"sandbox-retry clause must live in <tool_discipline>, "
+                f"not duplicated into {tag}"
+            )
