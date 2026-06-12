@@ -775,21 +775,40 @@ class MemoryConsolidator:
         if not query:
             return []
 
-        # Always run BOTH and merge (vector-first), so un-embedded episodes
-        # stay recallable by keyword. _knn returns None when the vector path
-        # can't run at all (no provider / non-SQLite / error) — treat as empty.
+        # Always run BOTH and merge, so un-embedded episodes stay recallable by
+        # keyword. _knn returns None when the vector path can't run at all (no
+        # provider / non-SQLite / error) — treat as empty.
         vec_ids = await self._knn_episode_ids(query, limit) or []
-        kw_ids = await self._keyword_episode_ids(query, limit)
+        # Exclude vector hits in SQL so keyword returns up to `limit` NEW matches
+        # (legacy / un-embedded rows), not ones the vector path already covered.
+        kw_only = await self._keyword_episode_ids(
+            query, limit, exclude_ids=vec_ids
+        )
 
+        # Interleave (vector-first) rather than concatenate: a pure
+        # vector-then-keyword merge lets `limit` embedded hits fill every slot
+        # and starve an exact keyword match from a legacy NULL-embedding
+        # episode — which then also never gets its access-heat protection. Round-
+        # robin guarantees keyword-only hits get slots while the top relevance
+        # hit still ranks first.
         ordered: List[str] = []
         seen: set = set()
-        for eid in (*vec_ids, *kw_ids):
-            if eid in seen:
-                continue
-            seen.add(eid)
-            ordered.append(eid)
-            if len(ordered) >= limit:
-                break
+        vi = ki = 0
+        while len(ordered) < limit and (vi < len(vec_ids) or ki < len(kw_only)):
+            if vi < len(vec_ids):
+                eid = vec_ids[vi]
+                vi += 1
+                if eid not in seen:
+                    seen.add(eid)
+                    ordered.append(eid)
+                if len(ordered) >= limit:
+                    break
+            if ki < len(kw_only):
+                eid = kw_only[ki]
+                ki += 1
+                if eid not in seen:
+                    seen.add(eid)
+                    ordered.append(eid)
 
         episodes = await self._episodes_by_ids(ordered)
         await self._increment_episode_access([ep.id for ep in episodes])
@@ -849,17 +868,33 @@ class MemoryConsolidator:
             return None
         return [episode_id for episode_id, _score in top_k]
 
-    async def _keyword_episode_ids(self, query: str, limit: int) -> List[str]:
-        """Keyword LIKE recall over title+summary — the fallback when no
-        embeddings are available. Ranks by recency among matches."""
+    async def _keyword_episode_ids(
+        self, query: str, limit: int, exclude_ids: Optional[List[str]] = None
+    ) -> List[str]:
+        """Keyword LIKE recall over title+summary, ranked by recency.
+
+        ``exclude_ids`` (the vector hits) are filtered out IN SQL so the LIMIT
+        returns up to ``limit`` genuinely-NEW matches — otherwise a query that
+        the vector path already satisfied would consume the whole LIMIT with
+        rows already surfaced, starving keyword-only legacy episodes."""
         like = f"%{query}%"
+        exclude_ids = exclude_ids or []
+        exclude_clause = ""
+        params: list = [self.agent_id, like, like]
+        if exclude_ids:
+            exclude_clause = (
+                " AND id NOT IN (" + ",".join("?" for _ in exclude_ids) + ")"
+            )
+            params.extend(exclude_ids)
+        params.append(limit)
         try:
             rows = await self._db.fetchall(
-                """SELECT id FROM memory_episodes
-                   WHERE agent_id = ? AND (title LIKE ? OR summary LIKE ?)
-                   ORDER BY created_at DESC
-                   LIMIT ?""",
-                (self.agent_id, like, like, limit),
+                f"""SELECT id FROM memory_episodes
+                    WHERE agent_id = ? AND (title LIKE ? OR summary LIKE ?)
+                    {exclude_clause}
+                    ORDER BY created_at DESC
+                    LIMIT ?""",
+                tuple(params),
             )
         except Exception as e:  # noqa: BLE001
             logger.debug("episode keyword recall failed: %s", e)

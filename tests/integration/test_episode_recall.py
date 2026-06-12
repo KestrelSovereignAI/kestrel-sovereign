@@ -115,6 +115,26 @@ async def test_recall_merges_vector_and_keyword(db):
     assert len(ids) == len(set(ids))  # deduped
 
 
+async def test_recall_keyword_not_starved_when_vector_fills_limit(db):
+    """Regression: even when semantic kNN returns `limit` embedded hits, an
+    exact keyword match from a legacy NULL-embedding episode must still surface
+    (and get access-heat). Interleave guarantees it a slot."""
+    c = MemoryConsolidator(db, "agent-p2", llm_service=None)
+    for i in range(3):
+        await _insert_episode(db, f"emb{i}", "Embedded sailing", "semantic")
+    await _insert_episode(db, "legacy", "Legacy sailing", "keyword only")
+
+    async def fake_knn(query, limit):
+        return ["emb0", "emb1", "emb2"]  # vector fills the whole limit=3
+
+    c._knn_episode_ids = fake_knn  # type: ignore[assignment]
+
+    found = await c.search_episodes("sailing", limit=3)
+    ids = [e.id for e in found]
+    assert "legacy" in ids, f"keyword-only legacy episode starved: {ids}"
+    assert ids[0] == "emb0"  # top vector hit still first
+
+
 async def test_recall_scoped_to_agent(db):
     c = MemoryConsolidator(db, "agent-p2", llm_service=None)
     await _insert_episode(db, "mine", "Sailing trip", "Sailing.", agent_id="agent-p2")
