@@ -237,10 +237,13 @@ class TestSQLiteBackend:
 
         await in_txn.wait()
         await asyncio.sleep(0.05)  # give the writer a chance to (wrongly) proceed
-        # The writer is blocked on the write lock: only the transaction's own
-        # uncommitted row is visible on this connection.
+        # The writer is blocked on the write lock (still). This read is from a
+        # NON-owner task, which now reads the separate read connection and sees
+        # the COMMITTED snapshot — neither the transaction's uncommitted row (1)
+        # nor the blocked writer's row (2). That's read-committed isolation
+        # (#1726); previously this connection-shared read saw the dirty row (1).
         mid = await backend.fetch_all("SELECT id FROM t ORDER BY id")
-        assert mid == [(1,)]
+        assert mid == []
 
         release.set()
         await asyncio.gather(t1, t2)

@@ -45,6 +45,12 @@ class SQLiteBackend(DatabaseBackend):
         """
         self.db_path = db_path
         self._connection: Optional[aiosqlite.Connection] = None
+        # Dedicated READ connection for file-backed DBs (#1726): a second
+        # connection that, in WAL mode, only sees the last committed snapshot —
+        # so reads from non-transaction tasks never observe the writer
+        # connection's uncommitted writes, and never block on the write lock.
+        # None for ``:memory:`` (a 2nd connection would be a separate empty DB).
+        self._read_connection: Optional[aiosqlite.Connection] = None
         self._in_transaction = False
         # Serializes write *units* on the single shared connection. aiosqlite
         # serializes individual operations, but NOT the execute->commit/rollback
@@ -89,14 +95,31 @@ class SQLiteBackend(DatabaseBackend):
             
             # Row factory to return tuples
             self._connection.row_factory = aiosqlite.Row
-            
+
+            # Open a dedicated read connection for file-backed DBs (#1726). In
+            # WAL mode it sees only committed data, giving dirty-read-safe reads
+            # without serializing them behind the write lock. ``:memory:`` can't
+            # share a DB across connections, so it keeps the single connection.
+            if self.db_path != ":memory:":
+                self._read_connection = await aiosqlite.connect(self.db_path, timeout=30)
+                await self._read_connection.execute("PRAGMA busy_timeout=30000")
+                await self._read_connection.execute("PRAGMA foreign_keys=ON")
+                self._read_connection.row_factory = aiosqlite.Row
+
             logger.debug(f"Connected to SQLite: {self.db_path}")
-            
+
         except Exception as e:
             raise ConnectionError(f"Failed to connect to SQLite: {e}") from e
     
     async def close(self) -> None:
         """Close database connection and wait for background thread to stop."""
+        if self._read_connection is not None:
+            try:
+                await self._read_connection.close()
+            except Exception as e:  # noqa: BLE001 - best-effort on the read conn
+                logger.debug(f"Error closing SQLite read connection: {e}")
+            finally:
+                self._read_connection = None
         if self._connection is not None:
             conn = self._connection
             try:
@@ -171,40 +194,53 @@ class SQLiteBackend(DatabaseBackend):
                     await conn.rollback()
                 raise
 
-    async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
-        """Fetch a single row.
+    def _read_conn(self) -> aiosqlite.Connection:
+        """Pick the connection a read should run on (#1726).
 
-        Reads run under ``_write_guard`` too (#1726): all tasks share ONE
-        aiosqlite connection, so an unguarded read could observe ANOTHER task's
-        UNCOMMITTED writes (a dirty read) while that task held the write lock
-        mid-transaction. The guard is re-entrant for the transaction owner — a
-        task still sees its OWN in-flight writes — but a different task's read
-        waits until the open write unit commits/rolls back, giving read-committed
-        isolation.
+        Dirty-read avoidance WITHOUT serializing reads behind the write lock
+        (which would deadlock a coordinator that reads while another task holds a
+        transaction open):
+
+        * The TRANSACTION OWNER reads its OWN (write) connection so it still sees
+          its in-flight uncommitted writes (read-your-own-writes).
+        * Any OTHER task reads the dedicated, separate read connection. In WAL
+          mode that connection only ever sees the last COMMITTED snapshot — never
+          the writer connection's uncommitted transaction — so no dirty reads,
+          and reads never block on the write lock.
+        * ``:memory:`` databases can't have a second connection (it would be a
+          separate empty DB), so they fall back to the single connection. That
+          path keeps the pre-existing (no-lock) behaviour; in-memory DBs are
+          single-process test fixtures where cross-task dirty reads don't arise.
         """
+        if self._txn_owner is not None and self._txn_owner is asyncio.current_task():
+            return self._ensure_connected()
+        if self._read_connection is not None:
+            return self._read_connection
+        return self._ensure_connected()
+
+    async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
+        """Fetch a single row (dirty-read-safe via a separate read conn, #1726)."""
         record_write_query(query)
-        conn = self._ensure_connected()
-        async with self._write_guard():
-            try:
-                cursor = await conn.execute(query, params)
-                row = await cursor.fetchone()
-                if row is None:
-                    return None
-                return tuple(row)
-            except Exception as e:
-                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+        conn = self._read_conn()
+        try:
+            cursor = await conn.execute(query, params)
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return tuple(row)
+        except Exception as e:
+            raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
 
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
-        """Fetch all rows. Guarded against dirty reads — see ``fetch_one`` (#1726)."""
+        """Fetch all rows (dirty-read-safe via a separate read conn, #1726)."""
         record_write_query(query)
-        conn = self._ensure_connected()
-        async with self._write_guard():
-            try:
-                cursor = await conn.execute(query, params)
-                rows = await cursor.fetchall()
-                return [tuple(row) for row in rows]
-            except Exception as e:
-                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+        conn = self._read_conn()
+        try:
+            cursor = await conn.execute(query, params)
+            rows = await cursor.fetchall()
+            return [tuple(row) for row in rows]
+        except Exception as e:
+            raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""

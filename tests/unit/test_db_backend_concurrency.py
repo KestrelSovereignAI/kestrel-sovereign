@@ -20,11 +20,13 @@ from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_sqlite_read_does_not_see_uncommitted_writes(tmp_path):
+    """A non-owner read during another task's open transaction sees the COMMITTED
+    snapshot (no dirty read) and does NOT block (separate read connection)."""
     backend = SQLiteBackend(str(tmp_path / "c.db"))
     await backend.connect()
     try:
         await backend.execute("CREATE TABLE t (v INTEGER)")
-        await backend.execute("INSERT INTO t (v) VALUES (1)")
+        await backend.execute("INSERT INTO t (v) VALUES (1)")  # committed: 1 row
 
         reader_saw = {}
         reader_started = asyncio.Event()
@@ -32,33 +34,25 @@ async def test_sqlite_read_does_not_see_uncommitted_writes(tmp_path):
 
         async def writer():
             async with backend.transaction():
-                await backend.execute("INSERT INTO t (v) VALUES (2)")
-                # Signal that an uncommitted write exists, then hold the txn open
-                # until the reader has attempted its read.
+                await backend.execute("INSERT INTO t (v) VALUES (2)")  # UNcommitted
                 reader_started.set()
                 await release_writer.wait()
-            # transaction commits here
+            # commits here
 
         async def reader():
             await reader_started.wait()
-            # This read is from a DIFFERENT task while the writer's txn is open.
-            # It must block until the writer commits (write guard), then see 2
-            # rows — NEVER a dirty read of the uncommitted row mid-transaction.
-            async def _do_read():
-                return await backend.fetch_val("SELECT COUNT(*) FROM t")
-            read_task = asyncio.create_task(_do_read())
-            # Give the read a chance to run; it should be blocked on the lock.
-            await asyncio.sleep(0.05)
-            reader_saw["blocked"] = not read_task.done()
+            # Read from a DIFFERENT task while the writer's txn is open: must see
+            # the committed snapshot (1), NOT the uncommitted 2nd row, and return
+            # promptly (no blocking on the write lock).
+            reader_saw["during"] = await asyncio.wait_for(
+                backend.fetch_val("SELECT COUNT(*) FROM t"), timeout=2.0
+            )
             release_writer.set()
-            reader_saw["count"] = await read_task
 
         await asyncio.gather(writer(), reader())
 
-        # The reader blocked during the open transaction (no dirty read) and saw
-        # the committed state (2 rows) afterward.
-        assert reader_saw["blocked"] is True
-        assert reader_saw["count"] == 2
+        assert reader_saw["during"] == 1  # no dirty read of the uncommitted row
+        assert await backend.fetch_val("SELECT COUNT(*) FROM t") == 2  # committed after
     finally:
         await backend.close()
 
