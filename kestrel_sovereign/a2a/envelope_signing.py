@@ -84,16 +84,25 @@ def canonical_message(part_texts: "list[str]") -> str:
     return json.dumps(list(part_texts), ensure_ascii=False, separators=(",", ":"))
 
 
-def _canonical_chain(chain: Any) -> "list[str]":
-    """Normalise a causation chain to a list of strings for binding.
+def _canonical_chain(chain: Any) -> Any:
+    """Normalise a causation chain to a STRUCTURE-PRESERVING form for binding.
 
-    The chain lives in ``metadata["causation_chain"]`` as a serialized list;
-    both signer and verifier project it identically so the loop-detection
-    lineage can't be rewritten on an otherwise-valid envelope.
+    The chain lives in ``metadata["causation_chain"]`` as a serialized list of
+    frame dicts; both signer and verifier project it identically so the
+    loop-detection lineage can't be rewritten on an otherwise-valid envelope.
+
+    Structure must be preserved (NOT ``str()``-flattened): a flattened
+    projection lets an attacker swap each frame dict for its exact string repr —
+    the bound bytes would match and the signature verify, but ``_deserialize_chain``
+    later drops the non-dict entries, erasing the lineage. A JSON round-trip
+    keeps dict/list shape distinct from a string while staying serialisable.
     """
     if not isinstance(chain, (list, tuple)):
         return []
-    return [str(x) for x in chain]
+    try:
+        return json.loads(json.dumps(list(chain), default=str))
+    except (TypeError, ValueError):
+        return [str(x) for x in chain]
 
 
 def _canonical_artifacts(artifacts: Any) -> Any:
@@ -337,13 +346,20 @@ def verify_envelope(
 
 
 class ReplayGuard:
-    """Bounded, thread-safe seen-nonce cache for replay rejection.
+    """Bounded, thread-safe nonce reservation cache for replay rejection.
 
     A signed envelope carries a per-envelope ``nonce``; the freshness window
-    (±``max_age_seconds``) bounds how long a captured envelope is replayable,
-    and this guard rejects a verbatim re-submission of the same ``(sender,
-    nonce)`` inside that window. Entries are pruned past ``ttl_seconds`` (the
-    freshness window) so the cache stays small without unbounded growth.
+    (±``ttl_seconds``) bounds how long a captured envelope is replayable, and
+    this guard rejects a re-submission of the same ``(sender, nonce)`` inside
+    that window. Entries are pruned past ``ttl_seconds`` so the cache stays small.
+
+    Reserve/rollback semantics give both atomicity and retry-safety:
+
+    * :meth:`reserve` atomically checks-and-records under one lock, so two
+      concurrent submissions of the same body can't both pass (the second loses
+      the race and is rejected) — this is the only consume path.
+    * :meth:`rollback` frees a reservation if the downstream task creation fails,
+      so a legitimate client retry after a transient error still verifies.
     """
 
     def __init__(self, ttl_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> None:
@@ -355,32 +371,33 @@ class ReplayGuard:
     def _key(sender: str, nonce: str) -> str:
         return f"{sender}\x00{nonce}"
 
-    def seen(self, sender: str, nonce: str, *, now_ts: float) -> bool:
-        """Return True if this ``(sender, nonce)`` was already committed in-window.
+    def reserve(self, sender: str, nonce: str, *, now_ts: float) -> bool:
+        """Atomically reserve a ``(sender, nonce)``. Return True if fresh (now
+        reserved), False if already reserved/consumed in-window (a replay).
 
-        A pure peek — does NOT record. An empty nonce is never a replay (replay
-        binding is best-effort; the freshness window still applies). Recording is
-        deferred to :meth:`record` so a verified-but-not-yet-accepted envelope
-        doesn't burn its nonce (a transient failure must stay retryable).
-        """
+        An empty nonce is always fresh (replay binding is best-effort; the
+        freshness window still applies). The check and the record happen under a
+        single lock so concurrent duplicates can't both succeed."""
         if not nonce:
-            return False
-        cutoff = now_ts - self._ttl
+            return True
+        key = self._key(sender, nonce)
         with self._lock:
-            seen_at = self._seen.get(self._key(sender, nonce))
-            return seen_at is not None and seen_at >= cutoff
+            cutoff = now_ts - self._ttl
+            # Opportunistic prune of expired entries.
+            if len(self._seen) > 1024:
+                self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
+            seen_at = self._seen.get(key)
+            if seen_at is not None and seen_at >= cutoff:
+                return False
+            self._seen[key] = now_ts
+            return True
 
-    def record(self, sender: str, nonce: str, *, now_ts: float) -> None:
-        """Commit a ``(sender, nonce)`` as consumed. Call only after the task is
-        durably accepted, so retries of a not-yet-accepted envelope still work."""
+    def rollback(self, sender: str, nonce: str) -> None:
+        """Release a reservation (downstream acceptance failed) so a retry works."""
         if not nonce:
             return
         with self._lock:
-            # Opportunistic prune of expired entries.
-            cutoff = now_ts - self._ttl
-            if len(self._seen) > 1024:
-                self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
-            self._seen[self._key(sender, nonce)] = now_ts
+            self._seen.pop(self._key(sender, nonce), None)
 
 
 # Process-wide default guard used by the inbound endpoint when no guard is
@@ -494,37 +511,37 @@ async def verify_inbound_envelope(
         logger.warning("A2A: rejecting signed envelope from %r: %s", sender, verdict.reason)
         return verdict
 
-    # Signature is valid; reject a verbatim replay of the same (sender, nonce)
-    # inside the freshness window. This is a PEEK — the nonce is committed only
-    # after the task is durably accepted (commit_envelope_nonce), so a verified
-    # request whose downstream create_task fails transiently stays retryable.
-    if replay_guard is not None:
+    # Signature is valid; ATOMICALLY reserve the (sender, nonce) to reject both
+    # verbatim replays and concurrent duplicate submissions inside the freshness
+    # window. The reservation is the consume; if the caller's downstream task
+    # creation fails it must call rollback_envelope_nonce() so a legitimate
+    # retry of the same body still verifies.
+    if replay_guard is not None and nonce:
         now_dt = now or datetime.now(timezone.utc)
-        if replay_guard.seen(sender, nonce, now_ts=now_dt.timestamp()):
+        if not replay_guard.reserve(sender, nonce, now_ts=now_dt.timestamp()):
             logger.warning("A2A: rejecting replayed envelope from %r (nonce reuse).", sender)
             return EnvelopeVerification(
                 ok=False, reason="replayed envelope (nonce already seen in window)"
             )
-    # Surface sender+nonce so the caller can commit after acceptance.
+    # Surface sender+nonce so the caller can roll the reservation back on failure.
     return EnvelopeVerification(
         ok=verdict.ok, reason=verdict.reason, verified=verdict.verified,
         sender=sender, nonce=nonce,
     )
 
 
-def commit_envelope_nonce(
+def rollback_envelope_nonce(
     verdict: EnvelopeVerification,
     *,
     replay_guard: Optional[ReplayGuard] = _DEFAULT_REPLAY_GUARD,
-    now: Optional[datetime] = None,
 ) -> None:
-    """Commit a verified envelope's nonce to the replay guard after acceptance.
+    """Release a verified envelope's nonce reservation after a downstream failure.
 
-    Call this only once the task has been durably created. A no-op for unsigned
-    or failed verdicts (no nonce) or when no guard is wired. Pair it with the
-    SAME guard passed to :func:`verify_inbound_envelope` (both default to the
-    process-wide guard, which is what the inbound endpoint uses)."""
+    Call this when task creation fails AFTER a successful verify, so the client
+    can retry the same signed body. A no-op for unsigned/failed verdicts (no
+    nonce) or when no guard is wired. Pair it with the SAME guard passed to
+    :func:`verify_inbound_envelope` (both default to the process-wide guard,
+    which is what the inbound endpoint uses)."""
     if replay_guard is None or not verdict.verified or not verdict.nonce:
         return
-    now_dt = now or datetime.now(timezone.utc)
-    replay_guard.record(verdict.sender, verdict.nonce, now_ts=now_dt.timestamp())
+    replay_guard.rollback(verdict.sender, verdict.nonce)

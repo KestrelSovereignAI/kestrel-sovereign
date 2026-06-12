@@ -230,29 +230,9 @@ def test_signed_but_unresolvable_rejected_when_require_signed():
     assert v.ok is False
 
 
-def test_replay_of_same_envelope_rejected_after_commit():
-    """A verbatim re-submission of a valid signed envelope (same nonce) inside
-    the freshness window is rejected ONCE the nonce is committed (#1721). The
-    commit models the endpoint recording the nonce after task acceptance."""
-    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard, commit_envelope_nonce
-
-    kp, doc = _keypair_and_doc()
-    meta = _signed_metadata(kp)
-    guard = ReplayGuard()
-    first = asyncio.run(verify_inbound_envelope(
-        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
-    assert first.ok is True and first.verified is True
-    commit_envelope_nonce(first, replay_guard=guard)  # task accepted → nonce consumed
-    second = asyncio.run(verify_inbound_envelope(
-        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
-    assert second.ok is False
-    assert "repla" in second.reason.lower()
-
-
-def test_retry_after_uncommitted_failure_is_allowed():
-    """Verifying without committing (e.g. downstream create_task failed) leaves
-    the nonce unconsumed, so a legitimate retry of the same signed body still
-    verifies — replay protection must not break ordinary retries (#1721 codex r2)."""
+def test_replay_of_same_envelope_rejected():
+    """A second verify of the same signed envelope (same nonce) inside the
+    window is rejected — verify atomically RESERVES the nonce (#1721)."""
     from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
 
     kp, doc = _keypair_and_doc()
@@ -260,11 +240,47 @@ def test_retry_after_uncommitted_failure_is_allowed():
     guard = ReplayGuard()
     first = asyncio.run(verify_inbound_envelope(
         meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert first.ok is True and first.verified is True
+    second = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert second.ok is False
+    assert "repla" in second.reason.lower()
+
+
+def test_rollback_after_failure_allows_retry():
+    """Rolling back the reservation (downstream task creation failed) lets a
+    legitimate retry of the same signed body verify again — replay protection
+    must not break ordinary retries (#1721 codex r2/r3)."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard, rollback_envelope_nonce
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    guard = ReplayGuard()
+    first = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
     assert first.ok is True
-    # No commit (simulating a transient downstream failure) → retry still passes.
+    rollback_envelope_nonce(first, replay_guard=guard)  # simulate create_task failure
     retry = asyncio.run(verify_inbound_envelope(
         meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
     assert retry.ok is True and retry.verified is True
+
+
+def test_causation_chain_type_substitution_rejected():
+    """An attacker can't erase lineage by swapping each frame dict for its string
+    repr: the bound chain is structure-preserving, so the bytes (and signature)
+    change (#1721 codex r3 P1)."""
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
+    kp, doc = _keypair_and_doc()
+    ts = _now_iso()
+    frames = [{"agent": "a", "source": "s", "depth": 1}]
+    signed_bound = bound_envelope_fields({"causation_chain": frames})
+    block = sign_envelope(kp, sender=DID, task_id="t", message="m", timestamp=ts, bound=signed_bound)
+    # Swap the frame dict for its exact string repr — a flattened projection
+    # would collide; the structure-preserving one must not.
+    forged_bound = bound_envelope_fields({"causation_chain": [str(frames[0])]})
+    v = verify_envelope(doc, block, sender=DID, task_id="t", message="m", timestamp=ts, bound=forged_bound, nonce=block["nonce"])
+    assert v.ok is False
 
 
 def test_inbound_binds_metadata_skill_and_artifacts():
