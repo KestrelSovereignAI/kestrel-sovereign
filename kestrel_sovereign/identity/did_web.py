@@ -41,8 +41,21 @@ from __future__ import annotations
 
 import json
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
+from urllib.error import HTTPError
 from urllib.parse import quote, unquote
-from urllib.request import urlopen
+from urllib.request import HTTPRedirectHandler, build_opener, urlopen
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """A redirect handler that REFUSES to follow redirects (#1727).
+
+    Returning None from ``redirect_request`` makes urllib raise the 3xx as an
+    ``HTTPError`` instead of silently following a ``Location`` that could point
+    at a private/metadata address the SSRF guard never got to validate.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 from kestrel_sovereign.security.crypto_suite import CryptoSuite, CryptoSuiteError
 from kestrel_sovereign.security.multikey import (
@@ -332,10 +345,22 @@ def _default_fetcher(url: str) -> bytes:
         validate_outbound_url(url, allowed_schemes=("https",))
     except SSRFError as e:
         raise DidWebError(f"did:web resolver refused non-public URL {url!r}: {e}") from e
-    with urlopen(url, timeout=10) as resp:  # noqa: S310 (HTTPS-checked above)
-        if resp.status != 200:
-            raise DidWebError(f"GET {url} returned {resp.status}")
-        return resp.read()
+    # DISABLE redirects (#1727 codex r1): a public DID host could 30x-redirect to
+    # a private/metadata address, which urlopen would follow automatically —
+    # bypassing the guard above (only the original URL was validated). The
+    # did.json must be served directly, so treat any 3xx as an error.
+    opener = build_opener(_NoRedirect)
+    try:
+        with opener.open(url, timeout=10) as resp:  # noqa: S310 (HTTPS + SSRF-checked)
+            if resp.status != 200:
+                raise DidWebError(f"GET {url} returned {resp.status}")
+            return resp.read()
+    except HTTPError as e:
+        if 300 <= e.code < 400:
+            raise DidWebError(
+                f"did:web resolver refuses to follow redirect ({e.code}) from {url!r}"
+            ) from e
+        raise DidWebError(f"GET {url} returned {e.code}") from e
 
 
 def resolve(

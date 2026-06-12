@@ -61,17 +61,23 @@ def validate_outbound_url(url: str, *, allowed_schemes: "tuple[str, ...]" = ("ht
     Synchronous (uses ``socket.getaddrinfo``). Prefer :func:`assert_safe_url` in
     async code so DNS resolution doesn't block the event loop.
     """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in allowed_schemes:
+    # Malformed URLs (bad port, invalid IPv6 literal, …) make urlparse/.port
+    # raise ValueError; convert to SSRFError so callers get a clean rejection
+    # (400) instead of an uncaught 500 (codex r1).
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError as e:
+        raise SSRFError(f"malformed URL {url!r}: {e}") from e
+
+    if scheme not in allowed_schemes:
         raise SSRFError(
             f"URL scheme {parsed.scheme!r} not allowed (allowed: {allowed_schemes})"
         )
-    host = parsed.hostname
     if not host:
         raise SSRFError(f"URL has no host: {url!r}")
-
-    default_port = 443 if parsed.scheme.lower() == "https" else 80
-    port = parsed.port or default_port
 
     # Literal IP host: validate directly (no DNS).
     try:

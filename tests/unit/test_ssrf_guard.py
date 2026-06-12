@@ -63,6 +63,16 @@ class TestValidateOutboundUrl:
         with pytest.raises(SSRFError):
             validate_outbound_url("http://localhost:9999/")
 
+    @pytest.mark.parametrize("bad", [
+        "http://example.com:abc",       # non-numeric port
+        "http://[not-an-ipv6/",         # malformed IPv6 literal
+    ])
+    def test_malformed_url_raises_ssrferror_not_valueerror(self, bad):
+        # #1727 codex r1: malformed input must surface as SSRFError (→ 400),
+        # never an uncaught ValueError (→ 500).
+        with pytest.raises(SSRFError):
+            validate_outbound_url(bad)
+
 
 class TestDidWebSSRF:
     def test_didweb_fetcher_refuses_metadata_host(self):
@@ -70,3 +80,18 @@ class TestDidWebSSRF:
         # did:web:169.254.169.254 → https://169.254.169.254/.well-known/did.json
         with pytest.raises(DidWebError):
             _default_fetcher("https://169.254.169.254/.well-known/did.json")
+
+    def test_didweb_fetcher_does_not_follow_redirects(self, monkeypatch):
+        """#1727 codex r1: a public DID host that 30x-redirects to a private
+        address must be refused, not followed."""
+        from kestrel_sovereign.identity import did_web
+        from urllib.error import HTTPError
+        import io
+
+        def fake_open(self, url, timeout=None):
+            # Simulate a 302 → urllib (no-redirect opener) raising HTTPError.
+            raise HTTPError(url, 302, "Found", {"Location": "https://169.254.169.254/x"}, io.BytesIO(b""))
+
+        monkeypatch.setattr("urllib.request.OpenerDirector.open", fake_open)
+        with pytest.raises(did_web.DidWebError, match="redirect"):
+            did_web._default_fetcher("https://example.com/.well-known/did.json")
