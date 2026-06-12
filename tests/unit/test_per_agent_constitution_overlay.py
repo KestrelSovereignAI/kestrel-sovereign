@@ -202,6 +202,22 @@ class TestComputerUseFeaturePicksUpOverlay:
         # Authoritative empty → deny-all, regardless of what the package grants.
         assert granted == frozenset()
 
+    def test_verified_completely_empty_overlay_file_is_authoritative(self, tmp_path):
+        """#1722 codex r4: a 0-byte verified overlay (constitution_text == "")
+        must still be authoritative deny-all, not fall through to package."""
+        from kestrel_sovereign.features.computer_use.feature import (
+            ComputerUseFeature,
+        )
+
+        agent_dir = tmp_path / "empty_file"
+        agent_dir.mkdir()
+        (agent_dir / "CONSTITUTION.md").write_text("")  # 0 bytes
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        assert agent.constitution_text == ""  # present-but-empty, not None
+        agent.constitution_overlay_verified = True
+        feature = ComputerUseFeature(agent=agent)
+        assert feature._granted_capabilities() == frozenset()
+
 
 class TestOverlayAnchorVerification:
     """``ConstitutionMixin.verify_constitution_overlay`` decision matrix (#1722).
