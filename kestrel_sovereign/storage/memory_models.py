@@ -228,6 +228,10 @@ class MemoryEpisode:
     key_message_ids: List[str] = field(default_factory=list)
     emotional_arc: str = ""     # "frustration → breakthrough → celebration"
     created_at: Optional[datetime] = None
+    # Decay signal (#1674): the consolidator's avg-importance over the
+    # episode's constituent messages, used by the forgetting curve to decide
+    # when a faded episode becomes deletion-eligible. 0.5 = neutral default.
+    importance: float = 0.5
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for database storage."""
@@ -241,6 +245,7 @@ class MemoryEpisode:
             "key_message_ids": self.key_message_ids,
             "emotional_arc": self.emotional_arc,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "importance": self.importance,
         }
 
     @classmethod
@@ -257,4 +262,6 @@ class MemoryEpisode:
             key_message_ids=json.loads(row[6]) if row[6] else [],
             emotional_arc=row[7] or "",
             created_at=datetime.fromisoformat(row[8]) if row[8] else None,
+            # Tolerate legacy rows / shorter SELECTs that pre-date the column.
+            importance=row[9] if len(row) > 9 and row[9] is not None else 0.5,
         )

@@ -1,14 +1,18 @@
 # Nightly Forgetting — Unified Cognition Maintenance
 
-> **Status (2026-06-12): Aspirational — design-of-record, partially implemented.**
-> This proposes consolidating Kestrel's scattered nightly-maintenance crons
-> and the unbounded-cognition-table problem (#1674) under one orchestrated
-> "sleep" pass, and adding the missing *deletion tier* to the existing
-> importance-decay forgetting curve. The decay/archive engine it builds on is
-> real and deployed (see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md)); the deletion
-> tier, episode participation, and the unified `sleep` cron are not yet built.
-> The opt-in age-based `cognition_retention` cron (#1715) is a **stopgap** this
-> design supersedes — see [Migration](#migration).
+> **Status (2026-06-12): Active for P1; Aspirational for P2–P4.**
+> This consolidates Kestrel's scattered nightly-maintenance crons and the
+> unbounded-cognition-table problem (#1674) under one orchestrated "sleep"
+> pass, and adds the missing *deletion tier* to the existing importance-decay
+> forgetting curve. The decay/archive engine it builds on is real and deployed
+> (see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md)).
+> **P1 is implemented:** episodes now carry an `importance` decay signal, and a
+> decay-aware deletion tier (`AsyncStorage.purge_decayed_episodes`) runs inside
+> the nightly consolidation pass, gated by the opt-in/off `[forgetting]` config.
+> The age-based `cognition_retention` cron (#1715) — the **stopgap** this
+> supersedes — has been removed (see [Migration](#migration)).
+> **Still aspirational:** episode access tracking (P2), the unified `sleep`
+> cron (P3), and reflection-table participation (P4).
 
 ## TL;DR
 
@@ -118,7 +122,28 @@ Frequently-recalled / load-bearing rows are never eligible (access + applied
 heat keep strength up). Both thresholds and the grace window live under one
 config section ([Config](#config)). The reusable `purge_*` storage primitive
 from #1715 stays — its **trigger and predicate** change from "age < cutoff" to
-"archived ∧ decayed-below-delete ∧ past grace."
+decay-based.
+
+**Episodes vs messages (as implemented in P1).** The pseudocode above is the
+message lifecycle, which has an `archived` state. *Episodes have no `archived`
+state* — nothing archives them today — so the implemented episode predicate
+(`AsyncStorage.purge_decayed_episodes`) drops the `archived ∧` clause and
+measures grace from `created_at` directly:
+
+```
+strength = calculate_decay(created_at, importance)   # P1: importance + age
+                                                     # (access/applied/pin: P2)
+if strength < delete_threshold and age(created_at) > delete_grace_days:
+    hard-delete episode row (+ paired KG node + edges)
+```
+
+The deletion runs inside the nightly consolidation pass (the `memory_consolidate`
+tool, which both the cron and `!memory consolidate` invoke), under the same
+`ResourceLock.MEMORY` as consolidation, so it never races a concurrent run. It
+is best-effort: a failure in the deletion tier never fails the consolidation it
+rides on. The robust KG mechanics from #1715 are preserved verbatim — the paired
+node is deleted before the row, the row is removed only if its node delete
+succeeded (no orphans), and a non-positive cap is a safe no-op.
 
 ### 2. Episode participation in the decay model
 
@@ -171,15 +196,21 @@ the genuinely-different cadences of backup and reflection.
 
 ## Config
 
-One section, replacing the #1715 `[retention.cognition]` age window:
+One section, replacing the #1715 `[retention.cognition]` age window. The archive
+threshold (tier 2) is *not* a `[forgetting]` key — it stays the code constant
+`DECAY_ARCHIVE_THRESHOLD` (0.1); `[forgetting]` configures only the new
+deletion tier (tier 3):
 
 ```toml
 [forgetting]
-archive_threshold = 0.10      # tier 2 — already DECAY_ARCHIVE_THRESHOLD
-delete_threshold  = 0.02      # tier 3 — new; below this AND archived AND past grace
-delete_grace_days = 90        # min time in archived state before deletion
+delete_threshold  = 0.02      # tier 3 — strength below this (and past grace) is eligible
+delete_grace_days = 90        # minimum lifetime (from created_at) regardless of strength
 enabled           = false     # opt-in until the Sovereign turns it on
 ```
+
+`load_forgetting_config()` always returns a fully-populated dict — malformed or
+non-positive values fall back to the compiled-in defaults with a warning rather
+than silently disabling the rail, and a non-bool `enabled` fails safe to OFF.
 
 Deletion stays **opt-in/off by default** — episodes are autobiographical
 long-term memory; the Sovereign enables forgetting deliberately.
@@ -206,9 +237,10 @@ long-term memory; the Sovereign enables forgetting deliberately.
 
 ## Phasing
 
-- **P1** — Decay-aware episode deletion in the consolidation pass: episode
-  importance (E1), deletion tier, remove `cognition_retention` cron,
-  `[forgetting]` config. Opt-in/off.
+- **P1** — *(Done, 2026-06-12.)* Decay-aware episode deletion in the
+  consolidation pass: episode importance (E1), deletion tier
+  (`purge_decayed_episodes`), removed `cognition_retention` cron, `[forgetting]`
+  config. Opt-in/off.
 - **P2** — Episode access tracking (E2) so consulted episodes resist deletion
   (ties #1342).
 - **P3** — Scheduling unification: promote `sleep` to the nightly cron, absorb

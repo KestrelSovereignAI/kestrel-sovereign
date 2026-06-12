@@ -267,7 +267,7 @@ class IdentityExporter:
         """Get consolidated memory episodes."""
         rows = await self.db.fetchall(
             """SELECT id, title, summary, timespan_start, timespan_end,
-                      key_message_ids, emotional_arc, created_at
+                      key_message_ids, emotional_arc, created_at, importance
                FROM memory_episodes
                WHERE agent_id = ?
                ORDER BY created_at DESC""",
@@ -285,6 +285,7 @@ class IdentityExporter:
                 "key_message_ids": json.loads(row[5]) if row[5] else [],
                 "emotional_arc": row[6],
                 "created_at": row[7],
+                "importance": row[8] if row[8] is not None else 0.5,
             })
         return episodes
 

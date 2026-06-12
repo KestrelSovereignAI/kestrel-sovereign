@@ -625,3 +625,24 @@ role = "technical_reviewer"
 # enabled = true
 # agents = ["Emma"]
 # max_tokens = 500
+
+
+# ---------------------------------------------------------------------------
+# [forgetting] — memory-episode deletion tier (#1674)
+# ---------------------------------------------------------------------------
+# The deletion tier of the importance-decay forgetting curve. It runs INSIDE
+# the nightly memory-consolidation pass (not on a separate cron): after faded
+# messages are archived, an episode is hard-deleted (with its paired knowledge-
+# graph node + edges) only when BOTH hold:
+#   * its importance-scaled Ebbinghaus decay strength has fallen below
+#     delete_threshold (so high-importance / load-bearing episodes — which decay
+#     far slower — survive much longer than throwaway ones of the same age), AND
+#   * it is older than delete_grace_days (a guaranteed minimum lifetime).
+# Age alone never deletes anything. OFF by default — episodes are the agent's
+# autobiographical long-term memory; the Sovereign turns forgetting on
+# deliberately.
+#
+# [forgetting]
+# enabled = true            # default false — opt-in
+# delete_threshold = 0.02   # strength below this (and past grace) is eligible
+# delete_grace_days = 90    # minimum lifetime regardless of strength

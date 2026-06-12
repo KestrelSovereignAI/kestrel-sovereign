@@ -16,12 +16,13 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     signal_dispatch       -- dispatch queued work to Talon
     trash_retention       -- hard-purge soft-deleted conversation rows
                              past their per-agent retention window (#764)
-    cognition_retention   -- bound memory_episodes (+ paired KG nodes) past
-                             [retention.cognition].episodes_days; opt-in (#1674)
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
     morning_signal        -- produce the daily briefing artifact
     reflect               -- run a reflection workflow (ReflectionFeature)
-    memory_consolidate    -- consolidate short-term memory into episodes
+    memory_consolidate    -- consolidate short-term memory into episodes;
+                             also runs the forgetting deletion tier that prunes
+                             decayed memory_episodes (+ paired KG nodes) when
+                             [forgetting].enabled (#1674)
     talon_monitor         -- poll Talon jobs, wake on completion (#1510)
     restart_coordinator   -- execute pending restart requests (#1512)
     github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
@@ -106,7 +107,6 @@ class SchedulerFeature(Feature):
                 builtin_handlers={
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
-                    "cognition_retention": self._run_cognition_retention,
                     "github_pr_watch": self._run_github_pr_watch,
                 },
             )
@@ -212,7 +212,6 @@ class SchedulerFeature(Feature):
         has_reflection = "ReflectionFeature" in agent.features
 
         from kestrel_sovereign.storage.retention import (
-            DEFAULT_COGNITION_RETENTION_CRON,
             DEFAULT_RETENTION_CRON,
         )
 
@@ -225,13 +224,6 @@ class SchedulerFeature(Feature):
             # Operators tune frequency via `!schedule` and the window
             # via [trash] in kestrel.toml.
             ("trash_retention", DEFAULT_RETENTION_CRON, "{}"),
-            # Cognition retention sweep (#1674). Bounds memory_episodes (+ the
-            # paired KG nodes). OPT-IN: does nothing until an operator sets
-            # [retention.cognition].episodes_days in kestrel.toml — episodes
-            # are long-term memory, never aged out by default. Seeding the cron
-            # anyway means enabling it is a one-line config change, no restart
-            # surgery.
-            ("cognition_retention", DEFAULT_COGNITION_RETENTION_CRON, "{}"),
         ]
 
         # Memory consolidation only if MemoryFeature is loaded (it owns the tool)
@@ -568,80 +560,6 @@ class SchedulerFeature(Feature):
             "rows_purged": purged,
             "privacy_mode": privacy_mode,
             "retention_days": retention_days,
-            "cutoff": cutoff_iso,
-            "max_rows": max_rows,
-        })
-
-    async def _run_cognition_retention(self, args: dict) -> str:
-        """Built-in handler for the ``cognition_retention`` task (#1674).
-
-        Bounds the in-core ``memory_episodes`` table (and its paired KG nodes)
-        past the configured window. **Opt-in**: skips unless
-        ``[retention.cognition].episodes_days`` is set in ``kestrel.toml`` —
-        episodes are autobiographical long-term memory, so the rail never ages
-        them out by default. (``reflection_*`` tables live in the
-        kestrel-feature-reflection package and are swept by that feature's own
-        cron; core must not import features.)
-
-        Args:
-            args: Optional overrides — ``max_rows`` (int) caps the per-sweep
-                episode count. Empty dict is the common case.
-        """
-        from datetime import datetime, timedelta, timezone
-        from kestrel_sovereign.storage.retention import (
-            DEFAULT_MAX_ROWS_PER_SWEEP,
-            load_cognition_config,
-            resolve_cognition_retention_days,
-        )
-
-        storage = getattr(self.agent, "storage", None)
-        if storage is None or not hasattr(storage, "purge_episodes_older_than"):
-            return json.dumps({
-                "skipped": True,
-                "reason": "storage facade missing purge_episodes_older_than",
-            })
-
-        config = load_cognition_config()
-        episodes_days = resolve_cognition_retention_days(
-            config=config, key="episodes_days",
-        )
-        if episodes_days is None:
-            # Opt-in: no window configured -> keep episodes forever.
-            return json.dumps({
-                "skipped": True,
-                "reason": "no [retention.cognition].episodes_days configured",
-            })
-
-        max_rows = int(args.get("max_rows") or DEFAULT_MAX_ROWS_PER_SWEEP)
-        # memory_episodes.created_at is written by the consolidator as
-        # datetime.now(timezone.utc).isoformat() (e.g. "...T...+00:00"), so the
-        # cutoff MUST use the same format — a space-separated / naive cutoff
-        # (as the trash rail uses for its differently-formatted deleted_at)
-        # would mis-sort against the 'T' and miss same-day rows. ISO-8601 in a
-        # consistent format sorts lexicographically == chronologically.
-        cutoff_iso = (
-            datetime.now(timezone.utc) - timedelta(days=episodes_days)
-        ).isoformat()
-
-        try:
-            purged = await storage.purge_episodes_older_than(
-                cutoff_iso, max_rows=max_rows, reason="cognition-retention",
-            )
-        except Exception as e:
-            logger.warning(
-                "[retention.cognition] agent=%s sweep failed: %s",
-                self._agent_id, e,
-            )
-            return json.dumps({"error": str(e)})
-
-        if purged:
-            logger.info(
-                "[retention.cognition] agent=%s window=%dd episodes_purged=%d cap=%d",
-                self._agent_id, episodes_days, purged, max_rows,
-            )
-        return json.dumps({
-            "episodes_purged": purged,
-            "episodes_days": episodes_days,
             "cutoff": cutoff_iso,
             "max_rows": max_rows,
         })

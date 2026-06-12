@@ -908,23 +908,30 @@ class PrivacyEnforcingStorage:
             cutoff_iso, max_rows=max_rows, reason=reason,
         )
 
-    async def purge_episodes_older_than(
+    async def purge_decayed_episodes(
         self,
-        cutoff_iso: str,
         *,
+        delete_threshold: float,
+        grace_days: int,
         max_rows: int = 10_000,
-        reason: str = "retention-janitor",
+        half_life_days: int = 30,
+        reason: str = "forgetting",
     ) -> int:
-        """Cognition-retention primitive — wrapper delegator (#1674).
+        """Forgetting primitive — wrapper delegator (#1674).
 
-        Exposed on the wrapper because the cron handler reads
-        ``agent.storage.purge_episodes_older_than`` and ``agent.storage`` is
+        Exposed on the wrapper because the consolidation pass reads
+        ``agent.storage.purge_decayed_episodes`` and ``agent.storage`` is
         the wrapper, not the raw facade (same reason as
-        ``purge_trash_older_than``). No extra privacy gating: the sweep only
-        removes episodes already older than the operator-configured window.
+        ``purge_trash_older_than``). No extra privacy gating: the deletion tier
+        only removes episodes whose importance-scaled decay has fallen below the
+        operator-configured threshold and are past the grace window.
         """
-        return await self._storage.purge_episodes_older_than(
-            cutoff_iso, max_rows=max_rows, reason=reason,
+        return await self._storage.purge_decayed_episodes(
+            delete_threshold=delete_threshold,
+            grace_days=grace_days,
+            max_rows=max_rows,
+            half_life_days=half_life_days,
+            reason=reason,
         )
 
     async def delete_conversation_session(

@@ -115,60 +115,93 @@ def resolve_retention_days(
 
 
 # --------------------------------------------------------------------------
-# Cognition retention (#1674) — bounds the unbounded cognition tables that
-# the trash rail never touched. memory_episodes is the in-core table (also
-# mirrored into KG nodes, so the janitor must drop the paired node too);
-# reflection_* lives in the kestrel-feature-reflection package and is swept
-# by that feature's own cron (core must not import features).
+# Forgetting (#1674) — the deletion tier of the importance-decay forgetting
+# curve. Unlike the trash rail (raw-age purge of soft-deleted conversation
+# rows), forgetting deletes memory_episodes by *decay strength*: an episode is
+# eligible only once its importance-scaled Ebbinghaus strength has fallen below
+# a threshold AND it is past a grace window. This runs inside the nightly
+# consolidation pass (next to message archival), not on a separate cron — so
+# all forgetting lives in one place. memory_episodes is the in-core table (also
+# mirrored into KG nodes, so the deletion drops the paired node too);
+# reflection_* lives in the kestrel-feature-reflection package and is swept by
+# that feature's own maintenance hook (core must not import features).
 # --------------------------------------------------------------------------
 
-# Daily at 04:30 — runs just after the 04:00 memory_consolidate so a freshly
-# written episode is never a sweep candidate on its own creation day.
-DEFAULT_COGNITION_RETENTION_CRON = "30 4 * * *"
+# Deletion-tier defaults. ``enabled`` is OFF: episodes are the agent's
+# autobiographical long-term memory, so the Sovereign turns forgetting on
+# deliberately. ``delete_threshold`` sits an order of magnitude below the
+# archive threshold (0.1) so only deeply-faded episodes are eligible;
+# ``delete_grace_days`` guarantees a minimum lifetime regardless of strength.
+DEFAULT_FORGETTING_ENABLED = False
+DEFAULT_FORGETTING_DELETE_THRESHOLD = 0.02
+DEFAULT_FORGETTING_GRACE_DAYS = 90
 
 
-def load_cognition_config() -> Dict[str, Any]:
-    """Read the merged ``[retention.cognition]`` table from ``kestrel.toml``.
+def load_forgetting_config() -> Dict[str, Any]:
+    """Resolve the ``[forgetting]`` table from ``kestrel.toml``, with defaults.
 
-    Returns ``{}`` when the section is absent — which the resolver treats as
-    "retention disabled" (opt-in). Episodes are the agent's autobiographical
-    long-term memory, so the rail never deletes them unless an operator sets
-    an explicit window.
+    Always returns a fully-populated dict — ``{enabled, delete_threshold,
+    grace_days}`` — so callers never branch on missing keys. Malformed values
+    fall back to the compiled-in defaults with a warning rather than disabling
+    the rail silently. Forgetting stays **opt-in**: ``enabled`` defaults to
+    ``False``, so an absent section keeps every episode forever.
     """
+    section: Dict[str, Any] = {}
     try:
         from kestrel_sovereign.config import load_section
-        retention = load_section("retention") or {}
-        cognition = retention.get("cognition")
-        return cognition if isinstance(cognition, dict) else {}
+        section = load_section("forgetting") or {}
     except Exception as e:
-        logger.debug("[retention] cognition config load failed (using defaults): %s", e)
-        return {}
+        logger.debug("[forgetting] config load failed (using defaults): %s", e)
+
+    enabled = section.get("enabled", DEFAULT_FORGETTING_ENABLED)
+    if not isinstance(enabled, bool):
+        logger.warning("[forgetting] enabled is not a bool: %r", enabled)
+        enabled = DEFAULT_FORGETTING_ENABLED
+
+    delete_threshold = _coerce_float(
+        section.get("delete_threshold"),
+        DEFAULT_FORGETTING_DELETE_THRESHOLD,
+        "delete_threshold",
+    )
+    grace_days = _coerce_int(
+        section.get("delete_grace_days"),
+        DEFAULT_FORGETTING_GRACE_DAYS,
+        "delete_grace_days",
+    )
+
+    return {
+        "enabled": enabled,
+        "delete_threshold": delete_threshold,
+        "grace_days": grace_days,
+    }
 
 
-def resolve_cognition_retention_days(
-    *,
-    config: Dict[str, Any],
-    key: str,
-) -> Optional[int]:
-    """Resolve a cognition retention window (in days) from ``config[key]``.
-
-    Returns ``None`` to signal "skip" when the key is absent, non-integer, or
-    non-positive. There is no compiled-in default and no privacy-override
-    table: cognition retention is **opt-in**, so omitting the key keeps the
-    data forever rather than silently aging out an agent's memory.
-    """
-    if key not in config:
-        return None
+def _coerce_float(value: Any, fallback: float, key: str) -> float:
+    if value is None:
+        return fallback
     try:
-        days = int(config[key])
+        coerced = float(value)
     except (TypeError, ValueError):
-        logger.warning(
-            "[retention] cognition.%s is not an int: %r", key, config[key],
-        )
-        return None
-    if days <= 0:
-        return None
-    return days
+        logger.warning("[forgetting] %s is not a number: %r", key, value)
+        return fallback
+    if coerced <= 0:
+        logger.warning("[forgetting] %s must be > 0: %r", key, value)
+        return fallback
+    return coerced
+
+
+def _coerce_int(value: Any, fallback: int, key: str) -> int:
+    if value is None:
+        return fallback
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        logger.warning("[forgetting] %s is not an int: %r", key, value)
+        return fallback
+    if coerced <= 0:
+        logger.warning("[forgetting] %s must be > 0: %r", key, value)
+        return fallback
+    return coerced
 
 
 def agent_privacy_mode(agent: Any) -> Optional[str]:

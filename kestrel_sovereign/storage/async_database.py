@@ -133,7 +133,8 @@ CREATE TABLE IF NOT EXISTS memory_episodes (
     timespan_end TIMESTAMP,
     key_message_ids TEXT,
     emotional_arc TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    importance REAL DEFAULT 0.5
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_episodes_agent ON memory_episodes(agent_id);
@@ -604,6 +605,13 @@ class AsyncDatabase:
         )
         await self._migrate_add_column(
             "pending_a2a_questions", "retry_reply_text", "TEXT DEFAULT NULL"
+        )
+        # Decay-aware forgetting (#1674): memory_episodes need a decay signal
+        # before they can be deleted by importance rather than raw age. Stamp
+        # the consolidator's avg-importance per episode; legacy episodes default
+        # to 0.5 (neutral) so they decay on the median half-life until rewritten.
+        await self._migrate_add_column(
+            "memory_episodes", "importance", "REAL DEFAULT 0.5"
         )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(
