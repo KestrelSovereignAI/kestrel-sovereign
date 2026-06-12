@@ -134,6 +134,24 @@ async def test_consolidate_skips_forgetting_when_disabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_consolidate_skips_forgetting_when_consolidation_errored(monkeypatch):
+    """The consolidator reports many failures as {"error": ...} instead of
+    raising. Destructive forgetting must NOT ride such a failed/partial pass."""
+    feature, agent = _make_memory_feature(dispatcher=None)
+    agent.memory_system.consolidate = AsyncMock(
+        return_value={"error": "salvage summariser unavailable"}
+    )
+    agent.storage = MagicMock()
+    agent.storage.purge_decayed_episodes = AsyncMock(return_value=5)
+    _set_forgetting(monkeypatch, enabled=True)
+
+    result = await feature.memory_consolidate()
+
+    assert result.status == "error"
+    agent.storage.purge_decayed_episodes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_consolidate_survives_forgetting_failure(monkeypatch):
     """A failure in the deletion tier must not fail the consolidation it rides
     on — the episodes are simply retried next pass."""

@@ -736,7 +736,13 @@ class MemoryFeature(Feature):
                 # scaled decay has dropped below the delete threshold and are
                 # past the grace window. Runs under the same MEMORY lock so it
                 # never races a concurrent consolidation. Opt-in/off by default.
-                episodes_deleted = await self._forget_decayed_episodes()
+                # Only ride a SUCCESSFUL pass: the consolidator reports many
+                # internal failures as {"error": ...} instead of raising, and
+                # destructive forgetting must never follow a failed/partial run.
+                if isinstance(result, dict) and "error" in result:
+                    episodes_deleted = 0
+                else:
+                    episodes_deleted = await self._forget_decayed_episodes()
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))

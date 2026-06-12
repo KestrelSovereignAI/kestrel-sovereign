@@ -422,36 +422,49 @@ class AsyncStorage:
 
         from .memory_retriever import calculate_decay
 
-        # Pre-filter to past-grace rows in SQL (cheap, bounds the candidate scan);
-        # the decay-strength test then runs per row in Python. created_at is
-        # written by the consolidator as ``datetime.now(utc).isoformat()`` ("T"+
-        # offset), so the cutoff MUST use the same format to sort correctly.
+        # Pre-filter to past-grace rows in SQL; the decay-strength test then runs
+        # per row in Python. created_at is written by the consolidator as
+        # ``datetime.now(utc).isoformat()`` ("T"+offset), so the cutoff MUST use
+        # the same format to sort correctly.
         grace_cutoff_iso = (
             datetime.now(UTC) - timedelta(days=grace_days)
         ).isoformat()
-        rows = await self.db.fetchall(
-            """
-            SELECT id, created_at, importance FROM memory_episodes
-            WHERE agent_id = ? AND created_at < ?
-            ORDER BY created_at ASC
-            """,
-            (self.agent_id, grace_cutoff_iso),
-        )
 
-        # Of the past-grace candidates, keep only those whose importance-scaled
-        # decay strength has fallen below the delete threshold. Cap at max_rows
-        # (oldest-first, since the SELECT is ASC) so a backlog drains over runs.
+        # Scan past-grace candidates oldest-first in bounded pages rather than
+        # pulling the whole tail into memory: a table with many old-but-high-
+        # importance episodes (not yet below threshold) could otherwise make the
+        # nightly pass O(all old episodes) in memory. We page until we've
+        # collected max_rows eligible ids or exhaust the candidates; only the
+        # most-decayed (oldest, lowest-importance) survive the strength test.
+        # Pagination is snapshot-stable because no rows are deleted mid-scan.
+        page_size = max(max_rows, 1000)
+        offset = 0
         episode_ids: list[str] = []
-        for ep_id, created_at, importance in rows or []:
-            strength = calculate_decay(
-                created_at,
-                importance=importance if importance is not None else 0.5,
-                half_life_days=half_life_days,
+        while len(episode_ids) < max_rows:
+            page = await self.db.fetchall(
+                """
+                SELECT id, created_at, importance FROM memory_episodes
+                WHERE agent_id = ? AND created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ? OFFSET ?
+                """,
+                (self.agent_id, grace_cutoff_iso, page_size, offset),
             )
-            if strength < delete_threshold:
-                episode_ids.append(ep_id)
-                if len(episode_ids) >= max_rows:
-                    break
+            if not page:
+                break
+            for ep_id, created_at, importance in page:
+                strength = calculate_decay(
+                    created_at,
+                    importance=importance if importance is not None else 0.5,
+                    half_life_days=half_life_days,
+                )
+                if strength < delete_threshold:
+                    episode_ids.append(ep_id)
+                    if len(episode_ids) >= max_rows:
+                        break
+            if len(page) < page_size:
+                break
+            offset += page_size
         if not episode_ids:
             return 0
 
