@@ -690,22 +690,19 @@ class MemoryConsolidator:
             except Exception:  # noqa: BLE001 - defensive
                 profile_id = None
         from .saved_items_store import _serialize_embedding
-        backend_type = getattr(self._db, "backend_type", None)
+        # Store float32 bytes on BOTH backends — episode embedding_vec is BLOB
+        # (SQLite) / BYTEA (PG), not a native pgvector column yet. The SQLite
+        # PurePythonBackend reads these bytes for cosine; PG semantic recall
+        # awaits a pgvector episode migration (keyword recall works meanwhile),
+        # mirroring saved_items' staged #1447 rollout. Writing ``?::vector``
+        # here would fail against a BYTEA column.
         try:
-            if backend_type == "postgres":
-                vec_text = "[" + ",".join(repr(float(v)) for v in embedding) + "]"
-                await self._db.execute(
-                    "UPDATE memory_episodes SET embedding_vec = ?::vector, "
-                    "embedding_profile_id = ? WHERE id = ? AND agent_id = ?",
-                    (vec_text, profile_id, episode_id, self.agent_id),
-                )
-            else:
-                await self._db.execute(
-                    "UPDATE memory_episodes SET embedding_vec = ?, "
-                    "embedding_profile_id = ? WHERE id = ? AND agent_id = ?",
-                    (_serialize_embedding(embedding), profile_id,
-                     episode_id, self.agent_id),
-                )
+            await self._db.execute(
+                "UPDATE memory_episodes SET embedding_vec = ?, "
+                "embedding_profile_id = ? WHERE id = ? AND agent_id = ?",
+                (_serialize_embedding(embedding), profile_id,
+                 episode_id, self.agent_id),
+            )
         except Exception as e:  # noqa: BLE001
             logger.debug("episode embedding_vec write failed for %s: %s",
                          episode_id, e)
@@ -765,29 +762,53 @@ class MemoryConsolidator:
         """Recall episodes RELEVANT to ``query`` (not just recent), and stamp
         the surfaced episodes as accessed so they resist the deletion tier.
 
-        Reuses the shared vector backend (SQLite PurePythonBackend / PG
-        pgvector) via ``build_episode_spec``. Falls back to a keyword LIKE
-        scan over title+summary when no embedding provider/vector path is
-        available — so old episodes (NULL embeddings) are still recallable.
+        Reuses the shared vector backend (SQLite PurePythonBackend) via
+        ``build_episode_spec``, MERGED with a keyword LIKE scan over
+        title+summary. The merge matters: semantic kNN only sees embedded
+        rows, so legacy / not-yet-backfilled episodes (``embedding_vec IS
+        NULL``) would otherwise be unrecallable even on an exact title match —
+        and would never accrue the access-heat that protects them from the
+        deletion tier. Vector hits rank first (relevance), keyword hits fill
+        in behind, deduped and capped at ``limit``.
         """
         query = (query or "").strip()
         if not query:
             return []
 
-        ids = await self._knn_episode_ids(query, limit)
-        if ids is None:
-            ids = await self._keyword_episode_ids(query, limit)
+        # Always run BOTH and merge (vector-first), so un-embedded episodes
+        # stay recallable by keyword. _knn returns None when the vector path
+        # can't run at all (no provider / non-SQLite / error) — treat as empty.
+        vec_ids = await self._knn_episode_ids(query, limit) or []
+        kw_ids = await self._keyword_episode_ids(query, limit)
 
-        episodes = await self._episodes_by_ids(ids)
+        ordered: List[str] = []
+        seen: set = set()
+        for eid in (*vec_ids, *kw_ids):
+            if eid in seen:
+                continue
+            seen.add(eid)
+            ordered.append(eid)
+            if len(ordered) >= limit:
+                break
+
+        episodes = await self._episodes_by_ids(ordered)
         await self._increment_episode_access([ep.id for ep in episodes])
         return episodes
 
     async def _knn_episode_ids(
         self, query: str, limit: int
     ) -> Optional[List[str]]:
-        """Vector recall → ordered episode ids, or None to signal the caller
-        to use the keyword fallback (no provider / no session factory /
-        backend error / no embedded rows)."""
+        """Vector recall → ordered episode ids, or None when the vector path
+        can't run (no provider / non-SQLite backend / no session factory /
+        backend error / no embedded rows); the caller then relies on keyword
+        recall.
+
+        Gated to SQLite: episode ``embedding_vec`` is BYTEA on Postgres (not a
+        native pgvector column yet), so the pgvector backend can't operate on
+        it. PG semantic episode recall awaits a pgvector migration — keyword
+        recall covers PG meanwhile. This mirrors saved_items' staged rollout."""
+        if getattr(self._db, "backend_type", None) == "postgres":
+            return None
         service = self._get_embedding_service()
         if service is None:
             return None

@@ -94,6 +94,27 @@ async def test_recall_empty_query_returns_nothing(db):
     assert await c.search_episodes("   ", limit=5) == []
 
 
+async def test_recall_merges_vector_and_keyword(db):
+    """Vector hits rank first; keyword hits (incl. un-embedded/legacy episodes
+    the kNN can't see) fill in behind, deduped and capped. Without the merge,
+    legacy NULL-embedding episodes could never be recalled or protected."""
+    c = MemoryConsolidator(db, "agent-p2", llm_service=None)
+    await _insert_episode(db, "emb", "Embedded sailing", "sailing semantic hit")
+    await _insert_episode(db, "legacy", "Legacy sailing", "sailing keyword only")
+
+    # Simulate: vector path saw only the embedded row; keyword sees both.
+    async def fake_knn(query, limit):
+        return ["emb"]
+
+    c._knn_episode_ids = fake_knn  # type: ignore[assignment]
+
+    found = await c.search_episodes("sailing", limit=5)
+    ids = [e.id for e in found]
+    assert ids[0] == "emb"           # vector hit ranks first
+    assert "legacy" in ids           # keyword-only legacy episode still recalled
+    assert len(ids) == len(set(ids))  # deduped
+
+
 async def test_recall_scoped_to_agent(db):
     c = MemoryConsolidator(db, "agent-p2", llm_service=None)
     await _insert_episode(db, "mine", "Sailing trip", "Sailing.", agent_id="agent-p2")
