@@ -212,9 +212,98 @@ function renderMarkdown(text) {
     return sanitizeHtml(normalized.replace(/\n/g, '<br>'));
 }
 
+// ===== #1660 block-based streaming markdown (Streamdown-style) =====
+//
+// Two pieces working together:
+//  1. Split the streamed text into a STABLE prefix (completed top-level blocks,
+//     separated by blank lines) and the still-growing TAIL block. The stable
+//     prefix's parse is memoized — it only re-parses when a new block finalizes,
+//     not on every chunk.
+//  2. Complete unclosed inline constructs (code/links/bold/math) on the TAIL
+//     BLOCK ONLY, so formatting renders immediately mid-stream. Scoping the
+//     synthetic closer to the tail block is what makes this flicker-free where
+//     #1547's whole-content completion was not: a completed-then-reverted
+//     construct can only repaint the actively-streaming tail block, never flip
+//     the entire bubble bold/italic for a frame.
+
+const _STREAM_STABLE_CACHE = new Map();
+const _STREAM_STABLE_CACHE_CAP = 64;
+
+function _streamMarkedParse(text) {
+    return sanitizeHtml(marked.parse(text, {
+        breaks: true, gfm: true, headerIds: false, mangle: false,
+    }));
+}
+
+// Render (and memoize) the stable prefix. Keyed by the exact prefix string, so
+// concurrently-streaming panes never collide and a growing message reuses the
+// prior render until a new block boundary forms.
+function _renderStreamStable(stable) {
+    if (!stable) return '';
+    const hit = _STREAM_STABLE_CACHE.get(stable);
+    if (hit !== undefined) return hit;
+    const html = _streamMarkedParse(stable);
+    _STREAM_STABLE_CACHE.set(stable, html);
+    if (_STREAM_STABLE_CACHE.size > _STREAM_STABLE_CACHE_CAP) {
+        // Evict oldest (insertion order) — the prior, now-superseded prefixes.
+        _STREAM_STABLE_CACHE.delete(_STREAM_STABLE_CACHE.keys().next().value);
+    }
+    return html;
+}
+
+// Fence-aware split into {stable, tail}. The boundary is the last blank line
+// that is NOT inside a fenced code block; an open (unclosed) fence keeps its
+// whole region in the tail. Blank-line-separated top-level blocks are
+// independent in markdown, so rendering stable and tail separately is safe.
+function _splitStreamingTail(text) {
+    const lines = text.split('\n');
+    let inFence = false;
+    let tailStartLine = 0;
+    for (let i = 0; i < lines.length; i++) {
+        if (/^\s*(```|~~~)/.test(lines[i])) {
+            inFence = !inFence;
+            continue;
+        }
+        if (!inFence && lines[i].trim() === '') {
+            tailStartLine = i + 1;
+        }
+    }
+    return {
+        stable: lines.slice(0, tailStartLine).join('\n'),
+        tail: lines.slice(tailStartLine).join('\n'),
+    };
+}
+
+// Complete unclosed constructs in the tail block. Conservative by design:
+// completes only the constructs that can be detected unambiguously, so it can't
+// reintroduce the #1547 mis-count flicker. Single-`*` italic and bare `$`
+// (currency) are deliberately NOT completed — they render fine unclosed until
+// their real closer streams in.
+function _completeStreamingInline(tail) {
+    let t = tail;
+    // Open fenced code block → close it; leave everything inside untouched.
+    const fences = (t.match(/^[ \t]*(```|~~~)/gm) || []).length;
+    if (fences % 2 !== 0) {
+        return t + '\n```';
+    }
+    // Inline code: odd backtick count (fences are balanced here) → close.
+    if (((t.match(/`/g) || []).length) % 2 !== 0) t += '`';
+    // Unclosed link/image target: `[text](url` / `![alt](url` with no `)`.
+    if (/!?\[[^\]\n]*\]\([^)\n]*$/.test(t)) t += ')';
+    // Bold ** (rarely a bullet/operator) → close if unbalanced.
+    if (((t.match(/\*\*/g) || []).length) % 2 !== 0) t += '**';
+    // Display math $$ and bracket/paren math \[ \] , \( \) — close if open.
+    if (((t.match(/\$\$/g) || []).length) % 2 !== 0) t += '$$';
+    if (((t.match(/\\\[/g) || []).length) > ((t.match(/\\\]/g) || []).length)) t += '\\]';
+    if (((t.match(/\\\(/g) || []).length) > ((t.match(/\\\)/g) || []).length)) t += '\\)';
+    return t;
+}
+
 /**
  * Render markdown for streaming content with implied closing tags.
- * Handles incomplete code blocks, bold, italic gracefully during streaming.
+ * Memoizes completed top-level blocks and only re-renders the growing tail
+ * block, completing its unclosed inline constructs so formatting appears
+ * immediately (#1660).
  * @param {string} content - Partial markdown content being streamed
  * @returns {string} HTML string safe for incomplete markdown
  */
@@ -225,48 +314,12 @@ function renderStreamingMarkdown(content) {
 
     _installMarkedLinkRenderer();
 
-    // Normalize excessive newlines before processing
-    let processedContent = normalizeNewlines(content);
-
-    // Close unclosed *fenced code blocks* (```) only.
-    //
-    // A fence is a BLOCK construct: until its closer arrives, marked
-    // treats everything after the opening ``` as code to the end of
-    // input, so the rest of the bubble renders as one giant code block.
-    // Appending a synthetic closer keeps it a bounded <pre> that simply
-    // grows as more lines stream in — stable, no flicker.
-    const codeBlockMatches = processedContent.match(/```/g) || [];
-    if (codeBlockMatches.length % 2 !== 0) {
-        processedContent += '\n```';
-    }
-
-    // NOTE: we deliberately do NOT synthesize closers for inline
-    // emphasis (`**`, `*`) or inline code (`) anymore (#1547). Those
-    // were counted with naive regexes that can't tell an emphasis
-    // delimiter from a list bullet (`* item`), a multiplication sign,
-    // or a stray asterisk. An odd count wrapped a synthetic delimiter
-    // around a large span, so the whole bubble flipped bold/italic for
-    // a frame and then reverted when the next chunk balanced the count
-    // — the "all the text gets bigger/bold then snaps back" flicker.
-    // Inline constructs render fine unclosed: marked emits the literal
-    // characters until the real closer streams in, then re-resolves to
-    // emphasis. That's the standard, non-flickering streaming behavior.
-
+    const processedContent = normalizeNewlines(content);
     try {
-        // Match the finalize-path options (renderMarkdown above) so the
-        // streamed bubble lays out the same way during stream as it does
-        // once finalized. The defaults here would collapse single `\n`
-        // into a space (CommonMark), scrunching chat lines — including
-        // the inline tool-activity markers — into one paragraph until
-        // the stream ended. The catch-fallback below already preserves
-        // line breaks via `\n` → `<br>`, so the no-`breaks` `try` path
-        // was the inconsistent branch.
-        return sanitizeHtml(marked.parse(processedContent, {
-            breaks: true,
-            gfm: true,
-            headerIds: false,
-            mangle: false,
-        }));
+        const { stable, tail } = _splitStreamingTail(processedContent);
+        const stableHtml = _renderStreamStable(stable);
+        const tailHtml = tail ? _streamMarkedParse(_completeStreamingInline(tail)) : '';
+        return stableHtml + tailHtml;
     } catch (e) {
         return sanitizeHtml(content.replace(/\n/g, '<br>'));
     }
