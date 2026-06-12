@@ -350,6 +350,30 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
 class StreamingMixin:
     """Mixin class providing streaming response methods."""
 
+    @staticmethod
+    def _lazy_attachment_hint(attachments) -> str:
+        """A compact note listing this turn's LAZY (non-inline) attachments so
+        the agent knows their ids for `read_attachment`. Empty when there are
+        none. Eager (inline) images are folded as vision and not listed.
+        """
+        if not attachments:
+            return ""
+        lazy = [
+            a for a in attachments
+            if isinstance(a, dict) and a.get("hash") and not a.get("inline")
+        ]
+        if not lazy:
+            return ""
+        lines = [
+            f"- {a.get('name') or 'attachment'} (id: {a['hash']})"
+            for a in lazy
+        ]
+        return (
+            "\n\n[Attachments available to read with the read_attachment tool:\n"
+            + "\n".join(lines)
+            + "\nCall read_attachment with an id above to read that file.]"
+        )
+
     async def _resolve_eager_images(self, attachments) -> list:
         """Resolve this turn's *inline* image attachments (#1662 eager vision)
         to raw bytes for the model.
@@ -642,7 +666,13 @@ class StreamingMixin:
         # Format: [system, ...history, user]
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(context_result.messages)  # Add conversation history
-        messages.append({"role": "user", "content": prompt})
+        # #1662: tell the agent which LAZY attachments it can read this turn, so
+        # it knows the ids to pass to `read_attachment`. Live-only — appended to
+        # the LLM-bound user content, NOT the persisted prompt (keeps sent-form
+        # cache stability and the raw-user extraction clean). Inline (eager)
+        # image attachments are folded as vision downstream and aren't listed.
+        lazy_hint = self._lazy_attachment_hint(attachments)
+        messages.append({"role": "user", "content": prompt + lazy_hint})
 
         logging.debug(f"[CONTEXT-STREAM] Sending {len(messages)} messages to LLM")
 
