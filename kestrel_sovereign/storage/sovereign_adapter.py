@@ -335,6 +335,27 @@ class SovereignStorageAdapter:
             return "NOW()"
         return "datetime('now')"
 
+    def _restored_created_at(self, metadata: Dict[str, Any]):
+        """Original ``created_at`` to bind on restore, from ``metadata.timestamp``.
+
+        Returns ``None`` when no usable timestamp is present (caller falls back to
+        ``_now_sql()``). For SQLite the value is formatted to match
+        ``datetime('now')`` (``YYYY-MM-DD HH:MM:SS``, UTC) so restored rows sort
+        consistently with natively-inserted ones; for Postgres a naive UTC
+        ``datetime`` is returned for the ``timestamp`` column (#1725)."""
+        ts_str = metadata.get("timestamp")
+        if not ts_str:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(ts_str).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(UTC).replace(tzinfo=None)
+        if self.db.backend_type == "postgres":
+            return dt
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
     async def _get_conversations(self) -> List[Dict]:
         """Get all conversations from DB for this agent.
 
@@ -811,22 +832,42 @@ class SovereignStorageAdapter:
                 )
                 all_conversations.extend(json.loads(shard_json.decode("utf-8")))
 
-            await self.db.execute(
-                "DELETE FROM conversation_history WHERE agent_id = ?",
-                (self.agent_id,),
-            )
-            for msg in sorted(all_conversations, key=lambda m: m.get("id", 0)):
-                metadata_json = json.dumps(msg.get("metadata", {}))
-                # rendered_content (#1402) restored if present; older
-                # backups (no key) default to NULL and get lazily split
-                # by AsyncConversationStore on first read.
-                rendered = msg.get("rendered_content")
+            # Atomic restore (#1725): wrap the destructive DELETE + row-by-row
+            # reinsert in ONE transaction so a crash mid-restore rolls back
+            # instead of leaving the agent's conversation history permanently
+            # truncated (the prior autocommit path deleted, then lost everything
+            # if the reinsert loop died partway).
+            async with self.db.transaction():
                 await self.db.execute(
-                    f"INSERT INTO conversation_history "
-                    f"(agent_id, role, content, rendered_content, metadata, created_at) "
-                    f"VALUES (?, ?, ?, ?, ?, {self._now_sql()})",
-                    (self.agent_id, msg["role"], msg["content"], rendered, metadata_json),
+                    "DELETE FROM conversation_history WHERE agent_id = ?",
+                    (self.agent_id,),
                 )
+                for msg in sorted(all_conversations, key=lambda m: m.get("id", 0)):
+                    metadata_json = json.dumps(msg.get("metadata", {}))
+                    # rendered_content (#1402) restored if present; older
+                    # backups (no key) default to NULL and get lazily split
+                    # by AsyncConversationStore on first read.
+                    rendered = msg.get("rendered_content")
+                    # Preserve the ORIGINAL timestamp (#1725) from
+                    # metadata.timestamp instead of collapsing every restored row
+                    # to import-time "now" (which broke session grouping +
+                    # retention). Falls back to now() only when absent.
+                    created_at = self._restored_created_at(msg.get("metadata") or {})
+                    if created_at is not None:
+                        await self.db.execute(
+                            "INSERT INTO conversation_history "
+                            "(agent_id, role, content, rendered_content, metadata, created_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?)",
+                            (self.agent_id, msg["role"], msg["content"], rendered,
+                             metadata_json, created_at),
+                        )
+                    else:
+                        await self.db.execute(
+                            f"INSERT INTO conversation_history "
+                            f"(agent_id, role, content, rendered_content, metadata, created_at) "
+                            f"VALUES (?, ?, ?, ?, ?, {self._now_sql()})",
+                            (self.agent_id, msg["role"], msg["content"], rendered, metadata_json),
+                        )
 
             # Asset restoration (#1391) — runs AFTER conversation
             # restore so a restorer failure surfaces against an

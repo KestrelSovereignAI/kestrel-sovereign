@@ -21,6 +21,12 @@ def main():
         required=True,
         help="The directory where the agent's identity files will be stored."
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing agent database (backs it up first). Without "
+             "--force, inception refuses to overwrite an existing agent.",
+    )
     args = parser.parse_args()
 
     output_dir = args.output_dir
@@ -28,7 +34,8 @@ def main():
 
     try:
         credentials = asyncio.run(inception_service.create_kestrel_identity(
-            output_dir=str(output_dir)
+            output_dir=str(output_dir),
+            force=args.force,
         ))
 
         logger.info("Inception Complete.")

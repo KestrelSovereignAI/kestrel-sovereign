@@ -33,6 +33,17 @@ from kestrel_sovereign.storage.providers.base import StorageTier, StorageResult
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
+def _looks_like_sha256(value: str) -> bool:
+    """True iff ``value`` is a 64-char lowercase-hex SHA-256 digest.
+
+    Used to decide whether ``retrieve_content``'s integrity check applies — some
+    callers pass an IPFS CID (base58 ``Qm…`` / base32 ``bafy…``) as the lookup
+    key, which is NOT a sha256 and must not be hashed-compared (#1725)."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(c in "0123456789abcdef" for c in value.lower())
+
+
 class FilecoinAdapter:
     """Adapter for integrating Filecoin/IPFS with Kestrel's storage"""
     
@@ -143,27 +154,33 @@ class FilecoinAdapter:
             encryption_key_hash=encryption_key_hash
         )
 
-        # Store based on tier
+        # Store based on tier. Each local-cache write records the EFFECTIVE
+        # tier/cid (result.tier/result.cid) so cleanup_cache knows whether a
+        # remote replica exists (#1725).
         if storage_tier == StorageTier.LOCAL_ONLY:
-            self._store_local_cache(content_hash, compressed_content, metadata)
+            self._store_local_cache(content_hash, compressed_content, metadata,
+                                    tier=result.tier, cid=result.cid)
 
         elif storage_tier == StorageTier.IPFS:
             if not self.ipfs_is_available():
                 logging.warning("IPFS not available. Storing locally instead.")
                 result.tier = StorageTier.LOCAL_ONLY
-                self._store_local_cache(content_hash, compressed_content, metadata)
+                self._store_local_cache(content_hash, compressed_content, metadata,
+                                        tier=result.tier, cid=result.cid)
                 return result
 
             ipfs_cid = self._store_ipfs(compressed_content, metadata)
             result.cid = ipfs_cid
             # Also cache locally for performance
-            self._store_local_cache(content_hash, compressed_content, metadata)
+            self._store_local_cache(content_hash, compressed_content, metadata,
+                                    tier=result.tier, cid=result.cid)
 
         elif storage_tier in [StorageTier.FILECOIN, StorageTier.ENCRYPTED_FILECOIN]:
             if not self.ipfs_is_available() or not self.lotus_is_available():
                 logging.warning("IPFS or Lotus not available. Storing locally instead.")
                 result.tier = StorageTier.LOCAL_ONLY
-                self._store_local_cache(content_hash, compressed_content, metadata)
+                self._store_local_cache(content_hash, compressed_content, metadata,
+                                        tier=result.tier, cid=result.cid)
                 return result
 
             # First store in IPFS
@@ -175,7 +192,8 @@ class FilecoinAdapter:
             result.deal_id = deal_id
 
             # Cache locally
-            self._store_local_cache(content_hash, compressed_content, metadata)
+            self._store_local_cache(content_hash, compressed_content, metadata,
+                                    tier=result.tier, cid=result.cid)
         
         logging.info(f"📁 Stored content: {content_hash[:16]}... -> {storage_tier.value}")
         return result
@@ -195,8 +213,17 @@ class FilecoinAdapter:
         Returns:
             Original content bytes
         """
+        # Normalize a SHA-256 lookup key to lowercase so cache lookup AND the
+        # integrity check are case-consistent on case-SENSITIVE filesystems too
+        # (Linux CI/prod). Cache files are written with the lowercase hexdigest,
+        # so an uppercase key would otherwise miss the file. CIDs are
+        # case-sensitive and pass through unchanged (#1725 codex r3).
+        if _looks_like_sha256(content_hash):
+            content_hash = content_hash.lower()
+
         # Try local cache first
         try:
+            from_ipfs = False
             retrieved_content = self._retrieve_local_cache(content_hash)
             if retrieved_content:
                 logging.info(f"📂 Retrieved from cache: {content_hash[:16]}...")
@@ -206,8 +233,7 @@ class FilecoinAdapter:
                     try:
                         retrieved_content = self._retrieve_ipfs(ipfs_cid)
                         if retrieved_content:
-                            # Update cache
-                            self._store_local_cache(content_hash, retrieved_content)
+                            from_ipfs = True
                             logging.info(f"📡 Retrieved from IPFS: {content_hash[:16]}...")
                     except Exception as e:
                         logging.error(f"IPFS retrieval failed for {ipfs_cid}: {e}")
@@ -216,11 +242,39 @@ class FilecoinAdapter:
                 raise ValueError(f"Content not found: {content_hash}")
 
             decompressed_content = zlib.decompress(retrieved_content)
-            
+
             if key_hash:
-                return self._decrypt_content(decompressed_content, key_hash)
+                result = self._decrypt_content(decompressed_content, key_hash)
             else:
-                return decompressed_content
+                result = decompressed_content
+
+            # Integrity check (#1725): when the lookup key is a genuine SHA-256
+            # content hash, the retrieved bytes — especially from an untrusted
+            # IPFS gateway — MUST hash back to it. We verify the fully-decoded
+            # (decompressed + decrypted) result to detect cache poisoning /
+            # gateway substitution, and only cache IPFS content AFTER it verifies.
+            # NOTE: some callers retrieve by CID and pass ``content_hash=cid``
+            # (a base58/base32 CID, NOT a sha256); those paths skip this check —
+            # comparing a sha256 to a CID string would always (wrongly) fail.
+            if _looks_like_sha256(content_hash):
+                # content_hash was lowercased above, matching hexdigest().
+                actual = hashlib.sha256(result).hexdigest()
+                if actual != content_hash:
+                    raise ValueError(
+                        f"Content integrity check failed for {content_hash[:16]}…: "
+                        f"computed {actual[:16]}… (possible cache poisoning / gateway "
+                        f"substitution)"
+                    )
+
+            if from_ipfs:
+                # This content is durably on IPFS (we just fetched it by CID), so
+                # the cache copy is safe to evict later.
+                self._store_local_cache(
+                    content_hash, retrieved_content,
+                    tier=StorageTier.IPFS, cid=ipfs_cid,
+                )
+
+            return result
 
         except Exception as e:
             logging.error(f"Failed to retrieve content for {content_hash}: {e}")
@@ -438,16 +492,30 @@ class FilecoinAdapter:
             logging.error(f"Error finding miners: {e}")
             return None
     
-    def _store_local_cache(self, content_hash: str, content: bytes, metadata: Optional[Dict] = None):
-        """Store content in local cache"""
+    def _store_local_cache(self, content_hash: str, content: bytes,
+                           metadata: Optional[Dict] = None, *,
+                           tier=None, cid: Optional[str] = None):
+        """Store content in local cache.
+
+        ``tier``/``cid`` record DURABILITY in the ``.meta`` so ``cleanup_cache``
+        can tell whether a remote replica exists (#1725) — LOCAL_ONLY content
+        lives ONLY here and must never be auto-evicted.
+        """
         cache_file = self.cache_dir / f"{content_hash}.cache"
         with open(cache_file, 'wb') as f:
             f.write(content)
-        
-        if metadata:
-            meta_file = self.cache_dir / f"{content_hash}.meta"
-            with open(meta_file, 'w') as f:
-                json.dump(metadata, f)
+
+        # Always write a .meta carrying the durability marker (reserved
+        # ``_kestrel_*`` keys) so cleanup is tier-aware even when the caller
+        # passed no user metadata.
+        meta: Dict[str, Any] = dict(metadata or {})
+        if tier is not None:
+            meta["_kestrel_tier"] = tier.value if hasattr(tier, "value") else str(tier)
+        if cid:
+            meta["_kestrel_cid"] = cid
+        meta_file = self.cache_dir / f"{content_hash}.meta"
+        with open(meta_file, 'w') as f:
+            json.dump(meta, f)
     
     def _retrieve_local_cache(self, content_hash: str) -> Optional[bytes]:
         """Retrieve content from local cache"""
@@ -586,18 +654,48 @@ class FilecoinAdapter:
         return stats
     
     def cleanup_cache(self, max_age_days: int = 30):
-        """Clean up old cache files"""
+        """Evict old cache files THAT HAVE A DURABLE REMOTE REPLICA.
+
+        TIER-AWARE (#1725): the cache is the ONLY copy of ``LOCAL_ONLY`` content,
+        so it must never be auto-deleted here — the old age-only sweep destroyed
+        local-only data permanently. We only evict content whose ``.meta`` records
+        a remote tier (IPFS/Filecoin) with a CID. Content with no/unknown
+        durability marker (legacy entries, local-only) is KEPT (fail safe).
+        Per-content key files (``key_*.key``) are never globbed here.
+        """
         import time
         cutoff_time = time.time() - (max_age_days * 24 * 60 * 60)
-        
+
+        durable_tiers = {
+            StorageTier.IPFS.value,
+            StorageTier.FILECOIN.value,
+            StorageTier.ENCRYPTED_FILECOIN.value,
+        }
+
         cleaned = 0
         for cache_file in self.cache_dir.glob('*.cache'):
-            if cache_file.stat().st_mtime < cutoff_time:
-                cache_file.unlink()
-                # Also remove metadata file if it exists
-                meta_file = cache_file.with_suffix('.meta')
-                if meta_file.exists():
-                    meta_file.unlink()
-                cleaned += 1
-        
+            if cache_file.stat().st_mtime >= cutoff_time:
+                continue
+            meta_file = cache_file.with_suffix('.meta')
+            tier = None
+            cid = None
+            if meta_file.exists():
+                try:
+                    meta = json.loads(meta_file.read_text())
+                    tier = meta.get("_kestrel_tier")
+                    cid = meta.get("_kestrel_cid")
+                except (OSError, ValueError):
+                    pass
+            # Keep anything we can't CONFIRM is durably replicated elsewhere.
+            if tier not in durable_tiers or not cid:
+                logging.debug(
+                    "Keeping cache %s (tier=%s, cid=%s): no confirmed remote replica.",
+                    cache_file.name, tier, bool(cid),
+                )
+                continue
+            cache_file.unlink()
+            if meta_file.exists():
+                meta_file.unlink()
+            cleaned += 1
+
         logging.info(f"🧹 Cleaned {cleaned} old cache files")
