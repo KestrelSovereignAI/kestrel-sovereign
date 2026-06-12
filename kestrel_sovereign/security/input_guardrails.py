@@ -46,6 +46,29 @@ MAX_TOOL_ARG_LENGTH = 10_000
 _VALID_ARG_TYPES = (str, int, float, bool, list, dict, type(None))
 
 
+# Zero-width space inserted after ``<`` to neutralize a delimiter the user
+# embedded in their own content, without visibly altering it. Breaks the literal
+# tag match the model would otherwise see as a real boundary.
+_ZWSP = "​"
+
+
+def _neutralize_boundary_markers(text: str) -> str:
+    """Defang any literal ``<user_input>`` / ``</user_input>`` the user embedded.
+
+    The boundary the guardrails call "the real defense" is only meaningful if the
+    user can't forge it: a literal ``</user_input>`` inside the message would let
+    the model treat the rest as outside the boundary (#1729). We insert a
+    zero-width space after the ``<`` so the embedded marker is no longer a literal
+    tag (the model sees plain text), while the WRAPPER's own markers — added
+    after neutralization — stay intact for both the model and
+    ``extract_raw_user_content``.
+    """
+    return (
+        text.replace("</user_input>", f"<{_ZWSP}/user_input>")
+            .replace("<user_input>", f"<{_ZWSP}user_input>")
+    )
+
+
 def wrap_user_input(user_message: str) -> str:
     """
     Wrap user input with boundary markers.
@@ -53,7 +76,9 @@ def wrap_user_input(user_message: str) -> str:
     The <user_input> tags create a clear boundary between trusted system
     instructions and untrusted user content. The LLM is instructed (via
     the system prompt) to treat content within these tags as user data,
-    never as system directives.
+    never as system directives. Any boundary markers the user embedded in
+    their own message are neutralized first so they can't forge the boundary
+    (#1729).
 
     Args:
         user_message: Raw user input string.
@@ -61,7 +86,7 @@ def wrap_user_input(user_message: str) -> str:
     Returns:
         The user message wrapped in <user_input> tags.
     """
-    return f"<user_input>\n{user_message}\n</user_input>"
+    return f"<user_input>\n{_neutralize_boundary_markers(user_message)}\n</user_input>"
 
 
 def extract_raw_user_content(content: str) -> str:

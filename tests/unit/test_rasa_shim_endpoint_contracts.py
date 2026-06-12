@@ -31,7 +31,9 @@ def _restore_app(app, original):
 
 
 def _api_headers():
-    return {"X-API-Key": "test-key"}
+    # The Rasa webhook now self-authenticates with a dedicated token (#1729),
+    # since /webhooks/* is exempt from the host API-key middleware.
+    return {"X-API-Key": "test-key", "X-Webhook-Token": "rasa-token"}
 
 
 def test_rasa_webhook_does_not_force_hardcoded_model_override():
@@ -40,7 +42,7 @@ def test_rasa_webhook_does_not_force_hardcoded_model_override():
 
     app, original = _prepare_app(agent)
     try:
-        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key", "KESTREL_RASA_WEBHOOK_TOKEN": "rasa-token"}):
             with TestClient(app) as client:
                 response = client.post(
                     "/webhooks/rest/webhook",

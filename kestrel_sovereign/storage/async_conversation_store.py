@@ -33,6 +33,22 @@ logger = logging.getLogger(__name__)
 CURRENT_KEY_VERSION = 1
 
 
+def _escape_like_session_value(session_id: str) -> str:
+    """JSON-escape then LIKE-escape a ``session_id`` for a ``metadata LIKE`` match.
+
+    The stored metadata is JSON, so the value appears JSON-escaped; we match that
+    form, then escape LIKE wildcards (``%``/``_``/``\\``) so a wildcard in the id
+    can't broaden the match to every row (#1729). Pair with ``ESCAPE '\\'``. For
+    an ordinary UUID session id every pass is a no-op.
+    """
+    json_frag = json.dumps(session_id)[1:-1]
+    return (
+        json_frag.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
 def _serialize_embedding(embedding: Sequence[float]) -> bytes:
     """Pack a Python embedding list to little-endian float32 bytes.
 
@@ -1159,24 +1175,28 @@ class AsyncConversationStore:
                 )
 
         # Also get messages that explicitly belong to this session (resumed conversations)
-        # These are messages with session_id in metadata that may come after a time gap
+        # These are messages with session_id in metadata that may come after a time gap.
+        # Escape LIKE wildcards so a `%`/`_` in session_id can't broaden the match
+        # to EVERY row (#1729); ESCAPE '\' makes the backslash the escape char. For
+        # an ordinary UUID this is a no-op.
+        esc = _escape_like_session_value(session_id)
         resumed_rows = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ?{del_clause}
+               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id": "{session_id}"%', limit)
+            (self.agent_id, f'%"session_id": "{esc}"%', limit)
         )
 
         # Also try without space after colon (JSON formatting varies)
         resumed_rows_alt = await self.db.fetchall(
             f"""SELECT id, role, content, metadata, created_at, rendered_content
                FROM conversation_history
-               WHERE agent_id = ? AND metadata LIKE ?{del_clause}
+               WHERE agent_id = ? AND metadata LIKE ? ESCAPE '\\'{del_clause}
                ORDER BY created_at ASC
                LIMIT ?""",
-            (self.agent_id, f'%"session_id":"{session_id}"%', limit)
+            (self.agent_id, f'%"session_id":"{esc}"%', limit)
         )
 
         # Merge resumed rows (dedupe by id)
@@ -1342,12 +1362,7 @@ class AsyncConversationStore:
             # wildcards added after aren't doubled). For an ordinary UUID
             # session id both passes are no-ops, so the common case is
             # unchanged.
-            json_frag = json.dumps(session_id)[1:-1]
-            esc = (
-                json_frag.replace("\\", "\\\\")
-                .replace("%", "\\%")
-                .replace("_", "\\_")
-            )
+            esc = _escape_like_session_value(session_id)
             rows = await self.db.fetchall(
                 "SELECT id, role, content, metadata, rendered_content "
                 "FROM conversation_history "

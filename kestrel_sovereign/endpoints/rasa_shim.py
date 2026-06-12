@@ -19,8 +19,12 @@ Reference: jaslogic1/RemoteCares#42
 """
 import asyncio
 import logging
+import os
+import secrets
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+
+from kestrel_sovereign.rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,31 @@ logger = logging.getLogger(__name__)
 _agent_semaphore = asyncio.Semaphore(10)
 
 router = APIRouter(prefix="/webhooks/rest", tags=["rasa-shim"])
+
+
+def _verify_webhook_token(request: Request) -> None:
+    """Authenticate the Rasa webhook (#1729).
+
+    ``/webhooks/*`` is exempt from the host API-key middleware (webhooks
+    self-authenticate), so this endpoint — which drives a full, paid
+    ``process_input`` turn — MUST authenticate itself. It requires a shared
+    secret in ``KESTREL_RASA_WEBHOOK_TOKEN``, presented as ``Authorization:
+    Bearer <token>`` or the ``X-Webhook-Token`` header. FAILS CLOSED: if the
+    token isn't configured, the endpoint is disabled (no anonymous LLM access).
+    """
+    expected = os.environ.get("KESTREL_RASA_WEBHOOK_TOKEN", "")
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Rasa webhook disabled: set KESTREL_RASA_WEBHOOK_TOKEN to enable.",
+        )
+    presented = request.headers.get("X-Webhook-Token", "")
+    if not presented:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            presented = auth[len("Bearer "):]
+    if not presented or not secrets.compare_digest(presented, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing webhook token.")
 
 # SMS context prefix prepended to every patient message so Kestrel understands
 # the channel without constitution changes.
@@ -51,7 +80,8 @@ class RasaWebhookResponse(BaseModel):
 
 
 @router.post("/webhook", response_model=list[RasaWebhookResponse])
-async def rasa_webhook(payload: RasaWebhookRequest, request: Request):
+@limiter.limit("30/minute")
+async def rasa_webhook(request: Request, payload: RasaWebhookRequest):
     """
     Rasa REST-channel compatible webhook.
 
@@ -60,7 +90,12 @@ async def rasa_webhook(payload: RasaWebhookRequest, request: Request):
 
     The patient GUID (sender) is used as the Kestrel session_id so that each
     patient has their own persistent conversation context.
+
+    Authenticated via a shared webhook token and rate-limited (#1729) — this is
+    an anonymous-path endpoint that drives a full paid LLM turn.
     """
+    _verify_webhook_token(request)
+
     if not hasattr(request.app.state, "agent") or not request.app.state.agent:
         raise HTTPException(status_code=503, detail="Kestrel agent not initialized.")
 

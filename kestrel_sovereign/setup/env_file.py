@@ -22,6 +22,7 @@ scope; we leave such lines untouched but never edit them.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import time
@@ -132,15 +133,28 @@ def write_env(
     if path.exists():
         backup_path = _backup_path(path)
         shutil.copy2(path, backup_path)
+        # The .env (and its backup) can hold KESTREL_DATA_KEY / KESTREL_API_KEY —
+        # restrict to owner-only so it isn't world-readable (#1729). copy2
+        # preserves the source mode, which may have been lax.
+        _chmod_600(backup_path)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(new_text, encoding="utf-8")
+    _chmod_600(path)
     return EnvWriteResult(
         path=path,
         backup_path=backup_path,
         added=tuple(added),
         updated=tuple(updated),
     )
+
+
+def _chmod_600(path: Path) -> None:
+    """Best-effort owner-only (0o600) perms; no-op on platforms without chmod."""
+    try:
+        os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
 
 
 def _backup_path(path: Path) -> Path:

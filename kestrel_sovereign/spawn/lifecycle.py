@@ -208,32 +208,39 @@ class SpawnedAgentLifecycle:
         Returns:
             The SpawnResult, or None if the child is not tracked.
         """
-        tracked = self._tracked.get(child_name)
-        if tracked is None:
-            logger.warning("report_result for untracked child '%s'", child_name)
-            return None
+        # Hold the lifecycle lock so report_result and the TTL monitor can't
+        # BOTH finalize the same child concurrently (double cleanup / result
+        # clobber). The lock was created but never acquired (#1729). Idempotent:
+        # if the child is already finalized, return the existing result.
+        async with self._lock:
+            tracked = self._tracked.get(child_name)
+            if tracked is None:
+                logger.warning("report_result for untracked child '%s'", child_name)
+                return None
+            if tracked.result is not None:
+                return tracked.result  # already finalized (e.g. by TTL)
 
-        result = SpawnResult(
-            child_name=child_name,
-            child_did=tracked.child_did,
-            status=status,
-            output_artifacts=output_artifacts or {},
-            budget_consumed=budget_consumed,
-            started_at=tracked.started_at,
-            parent_did=tracked.parent_did,
-        )
+            result = SpawnResult(
+                child_name=child_name,
+                child_did=tracked.child_did,
+                status=status,
+                output_artifacts=output_artifacts or {},
+                budget_consumed=budget_consumed,
+                started_at=tracked.started_at,
+                parent_did=tracked.parent_did,
+            )
 
-        tracked.result = result
-        self._results[child_name] = result
+            tracked.result = result
+            self._results[child_name] = result
 
-        # Cancel TTL timer since the child is done
-        if tracked.ttl_task and not tracked.ttl_task.done():
-            tracked.ttl_task.cancel()
+            # Cancel TTL timer since the child is done
+            if tracked.ttl_task and not tracked.ttl_task.done():
+                tracked.ttl_task.cancel()
 
-        # Terminate and clean up
-        await self._terminate_and_cleanup(child_name, status)
+            # Terminate and clean up
+            await self._terminate_and_cleanup(child_name, status)
 
-        return result
+            return result
 
     def get_result(self, child_name: str) -> Optional[SpawnResult]:
         """Retrieve the result for a terminated child.
@@ -321,25 +328,28 @@ class SpawnedAgentLifecycle:
         except asyncio.CancelledError:
             return
 
-        tracked = self._tracked.get(child_name)
-        if tracked is None:
-            return
+        # Same lock as report_result so TTL expiry and a just-in-time result
+        # report can't both finalize the child (#1729). Idempotent.
+        async with self._lock:
+            tracked = self._tracked.get(child_name)
+            if tracked is None or tracked.result is not None:
+                return  # already finalized by report_result
 
-        logger.info("TTL expired for child '%s' after %ds", child_name, ttl_seconds)
+            logger.info("TTL expired for child '%s' after %ds", child_name, ttl_seconds)
 
-        result = SpawnResult(
-            child_name=child_name,
-            child_did=tracked.child_did,
-            status=SpawnStatus.TIMED_OUT,
-            started_at=tracked.started_at,
-            parent_did=tracked.parent_did,
-        )
-        tracked.result = result
-        self._results[child_name] = result
+            result = SpawnResult(
+                child_name=child_name,
+                child_did=tracked.child_did,
+                status=SpawnStatus.TIMED_OUT,
+                started_at=tracked.started_at,
+                parent_did=tracked.parent_did,
+            )
+            tracked.result = result
+            self._results[child_name] = result
 
-        await self._terminate_and_cleanup(
-            child_name, SpawnStatus.TIMED_OUT, reason="TTL expired"
-        )
+            await self._terminate_and_cleanup(
+                child_name, SpawnStatus.TIMED_OUT, reason="TTL expired"
+            )
 
     async def _terminate_and_cleanup(
         self,
