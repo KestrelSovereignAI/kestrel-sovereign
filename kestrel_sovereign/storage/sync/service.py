@@ -40,6 +40,11 @@ class SyncState:
     # Lets force_snapshot skip a full re-snapshot when nothing changed — so
     # idle agents stop re-dumping the whole DB (notably to S3) every cycle.
     last_fingerprint: Optional[str] = None
+    # Target names that were successfully covered at last_fingerprint. The
+    # change-aware skip only applies when every CURRENT target is in this set —
+    # otherwise a newly-added backup destination would never get its baseline
+    # snapshot on an unchanged DB (#1674 P3 codex round 2).
+    last_snapshot_targets: List[str] = field(default_factory=list)
     stats: SyncStats = field(default_factory=SyncStats)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -48,6 +53,7 @@ class SyncState:
             "targets": self.targets,
             "last_snapshot": self.last_snapshot.isoformat() if self.last_snapshot else None,
             "last_fingerprint": self.last_fingerprint,
+            "last_snapshot_targets": self.last_snapshot_targets,
             "stats": {
                 "total_syncs": self.stats.total_syncs,
                 "successful_syncs": self.stats.successful_syncs,
@@ -66,6 +72,7 @@ class SyncState:
             targets=data.get("targets", {}),
             last_snapshot=datetime.fromisoformat(data["last_snapshot"]) if data.get("last_snapshot") else None,
             last_fingerprint=data.get("last_fingerprint"),
+            last_snapshot_targets=data.get("last_snapshot_targets", []),
             stats=SyncStats(
                 total_syncs=stats_data.get("total_syncs", 0),
                 successful_syncs=stats_data.get("successful_syncs", 0),
@@ -201,11 +208,15 @@ class SyncService:
         fingerprint is conservative: it never skips a real change. Explicit
         ``!backup`` and shutdown keep using ``force_snapshot`` (always runs)."""
         fingerprint = self._compute_db_fingerprint()
+        current_targets = {t.name for t in self._targets}
         if (
             fingerprint is not None
             and self._state is not None
             and self._state.last_snapshot is not None
             and self._state.last_fingerprint == fingerprint
+            # Every current target must already be covered — else a newly-added
+            # destination would never get its baseline snapshot on an idle DB.
+            and current_targets.issubset(set(self._state.last_snapshot_targets))
         ):
             logger.debug("Snapshot skipped — DB unchanged since last snapshot")
             return {
@@ -226,9 +237,13 @@ class SyncService:
         if (
             fingerprint is not None
             and self._state is not None
+            and results
             and all(r.success for r in results.values())
         ):
             self._state.last_fingerprint = fingerprint
+            self._state.last_snapshot_targets = sorted(
+                r.target_name for r in results.values() if r.success
+            )
             await self._save_state()
         return results
 

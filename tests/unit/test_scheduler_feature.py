@@ -262,9 +262,10 @@ class TestSleepCronHandler:
         agent = _make_mock_agent()
         agent.sleep = AsyncMock(return_value=_Report())
         agent.storage = MagicMock()
-        # No activity → reflection gated off.
+        # No messages at all → genuinely idle → reflection gated off. The gate
+        # queries conversation MAX(created_at) first; None → idle (early return).
         agent.storage.db = MagicMock()
-        agent.storage.db.fetchval = AsyncMock(side_effect=[None, 0])
+        agent.storage.db.fetchval = AsyncMock(side_effect=[None])
         f = SchedulerFeature(agent)
         with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
             await f.initialize()
@@ -288,8 +289,11 @@ class TestSleepCronHandler:
         agent.sleep = AsyncMock(return_value=_Report())
         agent.storage = MagicMock()
         agent.storage.db = MagicMock()
-        # last episode exists + new messages since → active.
-        agent.storage.db.fetchval = AsyncMock(side_effect=["2026-06-01T00:00:00+00:00", 5])
+        # Gate queries conversation MAX first, then episode MAX. Newest message
+        # (Jun 12, space-format) is newer than the last episode (Jun 1, ISO/tz)
+        # → active even across the two on-disk timestamp formats.
+        agent.storage.db.fetchval = AsyncMock(
+            side_effect=["2026-06-12 10:00:00", "2026-06-01T00:00:00+00:00"])
         f = SchedulerFeature(agent)
         with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
             await f.initialize()

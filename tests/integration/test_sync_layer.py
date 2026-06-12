@@ -555,6 +555,31 @@ class TestChangeAwareSnapshot:
         await sync.stop()
 
     @pytest.mark.asyncio
+    async def test_new_target_gets_baseline_even_when_unchanged(self, temp_db, tmp_path):
+        """A target added after a successful snapshot must still get its baseline
+        on the next change-aware snapshot, even on an unchanged DB."""
+        t1 = MockSyncTarget(name="t1")
+        sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
+        sync.add_target(t1)
+        await sync.start()
+
+        first = await sync.snapshot_if_changed()
+        assert first["t1"].success
+
+        # Add a NEW target; DB unchanged. The skip must NOT fire for it.
+        t2 = MockSyncTarget(name="t2")
+        sync.add_target(t2)
+        second = await sync.snapshot_if_changed()
+        assert "__unchanged__" not in second
+        assert second["t2"].success            # new destination got its baseline
+        assert len(t2._state.uploads) > 0
+
+        # Now both covered + unchanged → next snapshot skips.
+        third = await sync.snapshot_if_changed()
+        assert "__unchanged__" in third
+        await sync.stop()
+
+    @pytest.mark.asyncio
     async def test_force_snapshot_always_runs(self, temp_db, mock_target, tmp_path):
         """force_snapshot keeps its unconditional contract (explicit backups)."""
         sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))

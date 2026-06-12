@@ -610,33 +610,53 @@ class SchedulerFeature(Feature):
 
         Returns True (don't skip) on ANY uncertainty so reflection is never
         wrongly skipped — the gate may only ever skip when confidently idle.
-        Uses the agent's canonical conversation/episode store so timestamp
-        formats match (both written via the same code path)."""
+
+        Compares the newest conversation message against the newest episode by
+        parsing both in Python: memory_episodes.created_at is ISO-with-`T`/tz
+        (consolidator writes datetime.now(utc).isoformat()) while
+        conversation_history.created_at is SQLite CURRENT_TIMESTAMP (space-
+        separated, UTC). A raw SQL string `>` would mis-sort those formats and
+        wrongly mark an active agent idle, so we normalize both to naive-UTC."""
         storage = getattr(self.agent, "storage", None)
         db = getattr(storage, "db", None)
         if db is None:
             return True
         try:
-            last_ep = await db.fetchval(
-                "SELECT MAX(created_at) FROM memory_episodes WHERE agent_id = ?",
+            last_msg_raw = await db.fetchval(
+                "SELECT MAX(created_at) FROM conversation_history WHERE agent_id = ?",
                 (self._agent_id,),
             )
-            if last_ep is None:
-                # No episodes yet — any message at all counts as activity.
-                n = await db.fetchval(
-                    "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+            last_msg = self._parse_ts_utc(last_msg_raw)
+            if last_msg is None:
+                return False  # no messages at all → genuinely idle
+            last_ep = self._parse_ts_utc(
+                await db.fetchval(
+                    "SELECT MAX(created_at) FROM memory_episodes WHERE agent_id = ?",
                     (self._agent_id,),
                 )
-                return (n or 0) > 0
-            n = await db.fetchval(
-                "SELECT COUNT(*) FROM conversation_history "
-                "WHERE agent_id = ? AND created_at > ?",
-                (self._agent_id, last_ep),
             )
-            return (n or 0) > 0
+            # New message since the last episode (or no episode yet) → active.
+            return last_ep is None or last_msg > last_ep
         except Exception as e:  # noqa: BLE001 - never wrongly skip on error
             logger.debug("[sleep] activity check failed (assuming active): %s", e)
             return True
+
+    @staticmethod
+    def _parse_ts_utc(value) -> Optional[datetime]:
+        """Parse a stored timestamp (ISO-with-tz, space-separated, or native
+        datetime) to a naive-UTC datetime for safe cross-format comparison.
+        Returns None when absent/unparseable."""
+        if value is None:
+            return None
+        dt = value if isinstance(value, datetime) else None
+        if dt is None:
+            try:
+                dt = datetime.fromisoformat(str(value))
+            except (ValueError, TypeError):
+                return None
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
 
     async def _run_trash_retention(self, args: dict) -> str:
         """Built-in handler for the ``trash_retention`` scheduled task (#764).
