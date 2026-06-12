@@ -1268,6 +1268,7 @@ async def send_task(request: Request):
         task_id=params.id,
         message=signed_message_text,
         session_id=params.sessionId,
+        artifacts=getattr(params, "artifacts", None),
         resolver=_a2a_did_resolver(agent),
         require_signed=require_signed,
     )
@@ -1277,8 +1278,10 @@ async def send_task(request: Request):
             detail=f"A2A sender verification failed: {sender_verdict.reason}",
         )
     # Record the outcome so downstream governance can apply the right trust
-    # tier (a cryptographically-verified peer vs. an unverified same-host
-    # claim). This is the seed of the identity-injection layer (#1673).
+    # tier. The inbound-task signal source reads ``sender_verified`` and marks
+    # an unverified peer's wake UNTRUSTED (#1721) — a cryptographically-verified
+    # peer keeps the registration's TRUSTED tier; an unsigned/unverified claim
+    # is downgraded so the dispatcher routes it through the untrusted path.
     params.metadata["sender_verified"] = sender_verdict.verified
 
     # ``agent_name`` here is the local (recipient) agent's identifier —

@@ -328,12 +328,18 @@ class PeersFeature(Feature):
         try:
             from datetime import datetime, timezone
             from kestrel_sovereign.a2a.envelope_signing import (
+                bound_envelope_fields,
                 canonical_message,
                 kids_from_verification_methods,
                 sign_envelope,
             )
 
+            md = payload.setdefault("metadata", {})
             classical_kid, pq_kid = kids_from_verification_methods(vms)
+            # Bind the behaviour-steering fields (skill/verb/reply/causation
+            # chain) and the top-level artifacts so they can't be rewritten on
+            # an otherwise-valid envelope (#1721).
+            bound = bound_envelope_fields(md, artifacts=payload.get("artifacts"))
             block = sign_envelope(
                 keypair,
                 sender=signing_did,
@@ -341,10 +347,10 @@ class PeersFeature(Feature):
                 message=canonical_message([message]),
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 session_id=sess_id,
+                bound=bound,
                 classical_kid=classical_kid,
                 pq_kid=pq_kid,
             )
-            md = payload.setdefault("metadata", {})
             # The signed DID is the verified identifier the recipient binds to.
             md["sender"] = signing_did
             md["signature"] = block

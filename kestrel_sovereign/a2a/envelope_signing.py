@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping, Optional, Union
@@ -39,7 +41,10 @@ from kestrel_sovereign.security.verify_policy import VerifyPolicy
 logger = logging.getLogger(__name__)
 
 # Bumped if the canonical-bytes layout changes; both sides must agree.
-ENVELOPE_SIG_VERSION = 1
+# v2 (#1721): binds the behaviour-steering fields (skill, a2a_verb,
+# reply_expected, artifacts, causation_chain) and a per-envelope nonce in
+# addition to the v1 core (sender, task_id, session_id, message, timestamp).
+ENVELOPE_SIG_VERSION = 2
 # Algorithm tag for the signature block (hybrid v2 signatures array).
 ENVELOPE_SIG_ALG = "hybrid-v2"
 # Default replay window: a signed envelope older than this is rejected.
@@ -74,6 +79,63 @@ def canonical_message(part_texts: "list[str]") -> str:
     return json.dumps(list(part_texts), ensure_ascii=False, separators=(",", ":"))
 
 
+def _canonical_chain(chain: Any) -> "list[str]":
+    """Normalise a causation chain to a list of strings for binding.
+
+    The chain lives in ``metadata["causation_chain"]`` as a serialized list;
+    both signer and verifier project it identically so the loop-detection
+    lineage can't be rewritten on an otherwise-valid envelope.
+    """
+    if not isinstance(chain, (list, tuple)):
+        return []
+    return [str(x) for x in chain]
+
+
+def _canonical_artifacts(artifacts: Any) -> Any:
+    """Normalise artifacts to a JSON-stable structure for binding.
+
+    Accepts a list of mappings (or objects exposing ``model_dump``) and returns
+    plain data that ``json.dumps(sort_keys=True)`` renders deterministically, so
+    an attacker can't append/alter artifacts on a signed envelope. Non-list
+    inputs normalise to ``[]`` so a missing optional field is stable.
+    """
+    if not isinstance(artifacts, (list, tuple)):
+        return []
+    out: "list[Any]" = []
+    for a in artifacts:
+        if hasattr(a, "model_dump"):
+            try:
+                out.append(a.model_dump(mode="json"))
+                continue
+            except Exception:  # noqa: BLE001 - fall through to best-effort
+                pass
+        out.append(a)
+    return out
+
+
+def bound_envelope_fields(
+    metadata: Optional[Mapping[str, Any]],
+    *,
+    artifacts: Any = None,
+) -> "dict[str, Any]":
+    """The behaviour-steering fields bound into a v2 signature.
+
+    Both signer and verifier call this on their own view of the request so the
+    bytes are byte-identical by construction (no per-call drift). ``skill`` is
+    read under either ``skill`` or ``skill_id`` (both spellings appear on the
+    wire). ``artifacts`` is passed explicitly because it is a top-level
+    ``TaskSendParams`` field, not part of ``metadata``.
+    """
+    md = metadata or {}
+    return {
+        "skill": str(md.get("skill") or md.get("skill_id") or ""),
+        "a2a_verb": str(md.get("a2a_verb") or ""),
+        "reply_expected": bool(md.get("reply_expected", False)),
+        "causation_chain": _canonical_chain(md.get("causation_chain")),
+        "artifacts": _canonical_artifacts(artifacts),
+    }
+
+
 def canonical_signing_bytes(
     *,
     sender: str,
@@ -81,13 +143,18 @@ def canonical_signing_bytes(
     session_id: Optional[str],
     message: str,
     timestamp: str,
+    nonce: str = "",
+    bound: Optional[Mapping[str, Any]] = None,
 ) -> bytes:
     """Deterministic byte view of the signed envelope fields.
 
     Both signer and verifier MUST produce identical bytes, so this is a
     sorted-key, compact-separator JSON over a fixed field set plus a version
     tag. ``None`` session ids are normalised to ``""`` so a missing optional
-    field doesn't change the bytes between signer and verifier.
+    field doesn't change the bytes between signer and verifier. ``bound`` is the
+    :func:`bound_envelope_fields` projection of the behaviour-steering fields;
+    ``nonce`` is the per-envelope replay nonce. Both are signed so neither can
+    be altered on an otherwise-valid envelope.
     """
     payload = {
         "_v": ENVELOPE_SIG_VERSION,
@@ -96,6 +163,8 @@ def canonical_signing_bytes(
         "session_id": session_id or "",
         "message": message,
         "timestamp": timestamp,
+        "nonce": nonce or "",
+        "bound": dict(bound or {}),
     }
     return json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -135,6 +204,8 @@ def sign_envelope(
     message: str,
     timestamp: str,
     session_id: Optional[str] = None,
+    bound: Optional[Mapping[str, Any]] = None,
+    nonce: Optional[str] = None,
     classical_kid: str = "key-1",
     pq_kid: str = "key-2",
 ) -> dict:
@@ -142,30 +213,39 @@ def sign_envelope(
 
     The returned dict drops into ``metadata["signature"]``::
 
-        {"alg": "hybrid-v2", "v": 1,
+        {"alg": "hybrid-v2", "v": 2, "timestamp": "<iso>", "nonce": "<hex>",
          "signatures": [{"alg": "ed25519", "kid": "key-1", "sig": "<hex>"},
                         {"alg": "ml-dsa-65", "kid": "key-2", "sig": "<hex>"}]}
 
     ``sender`` should be the signer's DID (matching the DID document the
     receiver will resolve). ``timestamp`` is an ISO-8601 UTC string the
-    receiver checks for freshness. ``classical_kid`` / ``pq_kid`` must match the
-    signer's published verification-method ids — derive them with
+    receiver checks for freshness. ``bound`` is the
+    :func:`bound_envelope_fields` projection of the behaviour-steering fields
+    (skill/verb/reply/artifacts/causation_chain); a fresh ``nonce`` is generated
+    when not supplied so the receiver can reject verbatim replays inside the
+    freshness window. ``classical_kid`` / ``pq_kid`` must match the signer's
+    published verification-method ids — derive them with
     :func:`kids_from_verification_methods` when signing as a real identity.
     """
+    nonce = nonce or secrets.token_hex(16)
     data = canonical_signing_bytes(
         sender=sender,
         task_id=task_id,
         session_id=session_id,
         message=message,
         timestamp=timestamp,
+        nonce=nonce,
+        bound=bound,
     )
     return {
         "alg": ENVELOPE_SIG_ALG,
         "v": ENVELOPE_SIG_VERSION,
         # Carried in the block so the receiver can reconstruct the canonical
-        # bytes. It is part of the signed payload, so tampering it changes the
-        # bytes and fails verification (and the freshness check bounds replay).
+        # bytes. Both are part of the signed payload, so tampering either
+        # changes the bytes and fails verification (the freshness check + nonce
+        # cache together bound replay).
         "timestamp": timestamp,
+        "nonce": nonce,
         "signatures": sign_hybrid(data, keypair, classical_kid=classical_kid, pq_kid=pq_kid),
     }
 
@@ -198,6 +278,8 @@ def verify_envelope(
     message: str,
     timestamp: str,
     session_id: Optional[str] = None,
+    bound: Optional[Mapping[str, Any]] = None,
+    nonce: str = "",
     policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     now: Optional[datetime] = None,
@@ -207,7 +289,9 @@ def verify_envelope(
     Checks, in order: timestamp freshness (replay window), DID-document binding
     (``did_document["id"]`` must equal the claimed ``sender`` — a doc for a
     different DID can't authenticate this sender), then the hybrid signature
-    against the document's ``verificationMethod`` entries under ``policy``.
+    over the canonical bytes (which now include ``nonce`` and the ``bound``
+    behaviour-steering fields) against the document's ``verificationMethod``
+    entries under ``policy``.
     """
     now = now or datetime.now(timezone.utc)
 
@@ -238,11 +322,55 @@ def verify_envelope(
         session_id=session_id,
         message=message,
         timestamp=timestamp,
+        nonce=nonce,
+        bound=bound,
     )
     result = verify_hybrid(data, signatures, verification_methods, policy=policy)
     if not result.ok:
         return EnvelopeVerification(ok=False, reason=f"signature check failed: {result.reason}")
     return EnvelopeVerification(ok=True, reason=result.reason, verified=True)
+
+
+class ReplayGuard:
+    """Bounded, thread-safe seen-nonce cache for replay rejection.
+
+    A signed envelope carries a per-envelope ``nonce``; the freshness window
+    (±``max_age_seconds``) bounds how long a captured envelope is replayable,
+    and this guard rejects a verbatim re-submission of the same ``(sender,
+    nonce)`` inside that window. Entries are pruned past ``ttl_seconds`` (the
+    freshness window) so the cache stays small without unbounded growth.
+    """
+
+    def __init__(self, ttl_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> None:
+        self._ttl = ttl_seconds
+        self._seen: "dict[str, float]" = {}
+        self._lock = threading.Lock()
+
+    def check_and_record(self, sender: str, nonce: str, *, now_ts: float) -> bool:
+        """Return True if fresh (recorded now), False if a replay.
+
+        An empty nonce is treated as fresh — replay binding is best-effort and
+        the freshness window still applies; v2 signers always supply one.
+        """
+        if not nonce:
+            return True
+        key = f"{sender}\x00{nonce}"
+        with self._lock:
+            # Opportunistic prune of expired entries.
+            cutoff = now_ts - self._ttl
+            if len(self._seen) > 1024:
+                self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
+            seen_at = self._seen.get(key)
+            if seen_at is not None and seen_at >= cutoff:
+                return False
+            self._seen[key] = now_ts
+            return True
+
+
+# Process-wide default guard used by the inbound endpoint when no guard is
+# injected. Per-process is sufficient: replay protection only needs to span the
+# freshness window on the host that actually receives the envelope.
+_DEFAULT_REPLAY_GUARD = ReplayGuard()
 
 
 async def _resolve(resolver: Optional[Resolver], did: str) -> Optional[Mapping[str, Any]]:
@@ -260,30 +388,34 @@ async def verify_inbound_envelope(
     task_id: str,
     message: str,
     session_id: Optional[str] = None,
+    artifacts: Any = None,
     resolver: Optional[Resolver] = None,
     require_signed: bool = False,
     policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
+    replay_guard: Optional[ReplayGuard] = _DEFAULT_REPLAY_GUARD,
     now: Optional[datetime] = None,
 ) -> EnvelopeVerification:
     """Decide whether to accept an inbound A2A envelope based on its signature.
 
     ``session_id`` is the authoritative top-level value the task is created
     under (NOT read from caller-controlled metadata) so a signature can't bind
-    a different session than the task runs in.
+    a different session than the task runs in. ``artifacts`` is the authoritative
+    top-level ``TaskSendParams.artifacts`` list, bound into the signature so it
+    can't be altered post-signing.
 
-    Decision matrix (back-compat by default):
+    Decision matrix:
 
     * no ``signature`` block (key absent or null):
         - ``require_signed`` → reject;
         - else → **allow unsigned** (``verified=False``) — the same-host
           API-key boundary still applies.
-    * ``signature`` present but sender DID unresolvable:
-        - ``require_signed`` → reject;
-        - else → allow unsigned, logging that the claim couldn't be verified.
-    * ``signature`` present and sender resolvable: cryptographically verify;
-      a failure is **always** rejected (a present-but-bad signature is an
-      attack signal, never downgraded to "unsigned").
+    * ``signature`` present but sender DID unresolvable: **reject**. A present
+      signature is a verification claim; if it can't be checked it's a failure,
+      never silently downgraded to "allowed unsigned" (#1721). The only
+      escape hatch is genuinely *unsigned* traffic above.
+    * ``signature`` present and sender resolvable: cryptographically verify
+      (including the freshness window and replay nonce); any failure is rejected.
 
     A present-but-structurally-malformed block (``{}``, ``[]``, ``""``, or a
     mapping without ``signatures``) is rejected up front, regardless of
@@ -313,32 +445,46 @@ async def verify_inbound_envelope(
 
     did_document = await _resolve(resolver, sender)
     if did_document is None:
-        if require_signed:
-            return EnvelopeVerification(
-                ok=False, reason=f"cannot resolve sender DID {sender!r} (require_signed=True)"
-            )
+        # A present signature that cannot be resolved is a FAILURE, not benign
+        # absence — never downgrade to "allowed unsigned" (#1721). An attacker
+        # who attaches a garbage signature for an unknown DID must not be
+        # treated more leniently than one who sends a verifiable bad signature.
         logger.warning(
-            "A2A: signed envelope from %r but DID is unresolvable; allowing as unsigned "
-            "(same-host boundary). Provide a DID resolver to enforce verification.",
+            "A2A: rejecting signed envelope from %r: sender DID is unresolvable.",
             sender,
         )
         return EnvelopeVerification(
-            ok=True, reason=f"sender DID {sender!r} unresolvable; allowed as unsigned"
+            ok=False, reason=f"cannot resolve sender DID {sender!r}"
         )
 
-    timestamp = signature_block.get("timestamp") if isinstance(signature_block, Mapping) else ""
+    timestamp = signature_block.get("timestamp") or ""
+    nonce = str(signature_block.get("nonce") or "")
+    bound = bound_envelope_fields(metadata, artifacts=artifacts)
     verdict = verify_envelope(
         did_document,
-        signature_block if isinstance(signature_block, Mapping) else {},
+        signature_block,
         sender=sender,
         task_id=task_id,
         message=message,
-        timestamp=timestamp or "",
+        timestamp=timestamp,
         session_id=session_id,
+        bound=bound,
+        nonce=nonce,
         policy=policy,
         max_age_seconds=max_age_seconds,
         now=now,
     )
     if not verdict.ok:
         logger.warning("A2A: rejecting signed envelope from %r: %s", sender, verdict.reason)
+        return verdict
+
+    # Signature is valid; reject a verbatim replay of the same (sender, nonce)
+    # inside the freshness window.
+    if replay_guard is not None:
+        now_dt = now or datetime.now(timezone.utc)
+        if not replay_guard.check_and_record(sender, nonce, now_ts=now_dt.timestamp()):
+            logger.warning("A2A: rejecting replayed envelope from %r (nonce reuse).", sender)
+            return EnvelopeVerification(
+                ok=False, reason="replayed envelope (nonce already seen in window)"
+            )
     return verdict
