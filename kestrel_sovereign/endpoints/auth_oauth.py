@@ -9,6 +9,8 @@ Provides:
 Auth priority: OAuth session → JWT Bearer → API key header
 """
 
+import hashlib
+import hmac
 import os
 import re
 import logging
@@ -19,6 +21,8 @@ from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse
 from authlib.integrations.starlette_client import OAuth
 from pydantic import BaseModel, EmailStr
 
+from kestrel_sovereign.rate_limit import limiter
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -26,6 +30,13 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 # --- OAuth setup ---
 
 oauth = OAuth()
+
+
+def _oauth_required() -> bool:
+    """Whether OAuth is required (same env flag as server.py/host.py)."""
+    return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
+        "1", "true", "yes", "on"
+    }
 
 
 def _get_allowed_emails() -> set[str]:
@@ -40,6 +51,35 @@ def _get_allowed_emails() -> set[str]:
     """
     raw = os.environ.get("KESTREL_ALLOWED_EMAILS", "")
     return {e.strip().lower() for e in re.split(r"[,;]", raw) if e.strip()}
+
+
+def _email_authorized(email: str) -> bool:
+    """Whether ``email`` may sign in — FAIL CLOSED on a missing allowlist (#1724).
+
+    * allowlist contains ``*`` → open access (explicit opt-in).
+    * allowlist non-empty → admit iff the email is listed.
+    * allowlist EMPTY:
+        - if OAuth is required (``KESTREL_REQUIRE_OAUTH``) → DENY. A deploy that
+          forces OAuth but forgot the allowlist must not admit every Google
+          account on the internet — the prior ``if allowed and ...`` short-circuit
+          did exactly that. Set ``KESTREL_ALLOWED_EMAILS=*`` to intentionally
+          allow any authenticated account.
+        - else (OAuth not required, dev/local) → admit.
+    """
+    allowed = _get_allowed_emails()
+    if "*" in allowed:
+        return True
+    if allowed:
+        return email in allowed
+    if _oauth_required():
+        logger.error(
+            "Login denied for %s: KESTREL_REQUIRE_OAUTH is set but "
+            "KESTREL_ALLOWED_EMAILS is empty — failing closed. Set an allowlist "
+            "(or '*' to allow any authenticated account).",
+            email,
+        )
+        return False
+    return True
 
 
 def register_oauth(app):
@@ -110,10 +150,9 @@ async def callback(request: Request):
         return HTMLResponse("<h2>Authentication failed</h2><p>No user info returned.</p>", status_code=400)
 
     email = userinfo.get("email", "").lower()
-    allowed = _get_allowed_emails()
 
-    if allowed and email not in allowed:
-        logger.warning(f"OAuth login denied for {email} (not in allowlist)")
+    if not _email_authorized(email):
+        logger.warning(f"OAuth login denied for {email} (not authorized)")
         return HTMLResponse(
             f"<h2>Access Denied</h2>"
             f"<p>{email} is not authorized to access this application.</p>"
@@ -171,11 +210,30 @@ async def me(request: Request):
 # --- JWT Email/Password Auth ---
 
 def _get_jwt_secret() -> str:
-    """Get the JWT signing secret from env."""
-    secret = os.environ.get("JWT_SECRET_KEY") or os.environ.get("KESTREL_SESSION_SECRET") or os.environ.get("KESTREL_API_KEY")
-    if not secret:
-        raise RuntimeError("No JWT_SECRET_KEY, KESTREL_SESSION_SECRET, or KESTREL_API_KEY set")
-    return secret
+    """Get the JWT signing secret.
+
+    Prefers a dedicated ``JWT_SECRET_KEY``/``KESTREL_SESSION_SECRET``. When only
+    ``KESTREL_API_KEY`` is available we DERIVE a distinct signing key from it via
+    HMAC rather than using the API key verbatim (#1724): previously the JWT
+    signing secret and the universal-password API key were the SAME value, so
+    leaking/guessing one yielded both authentication AND the ability to forge
+    arbitrary JWTs. Deriving decouples them — the signing key is no longer the
+    API key — and we warn loudly so operators set a dedicated secret.
+    """
+    secret = os.environ.get("JWT_SECRET_KEY") or os.environ.get("KESTREL_SESSION_SECRET")
+    if secret:
+        return secret
+    api_key = os.environ.get("KESTREL_API_KEY")
+    if api_key:
+        logger.warning(
+            "No JWT_SECRET_KEY/KESTREL_SESSION_SECRET set; deriving the JWT "
+            "signing key from KESTREL_API_KEY. Set a dedicated JWT_SECRET_KEY "
+            "to fully separate token signing from the API key."
+        )
+        return hmac.new(
+            api_key.encode("utf-8"), b"kestrel-jwt-signing-v1", hashlib.sha256
+        ).hexdigest()
+    raise RuntimeError("No JWT_SECRET_KEY, KESTREL_SESSION_SECRET, or KESTREL_API_KEY set")
 
 
 def _create_jwt(email: str, name: str = "", expires_hours: int = 24) -> str:
@@ -207,17 +265,22 @@ class LoginRequest(BaseModel):
 
 
 @router.post("/token")
-async def login_token(body: LoginRequest):
+@limiter.limit("5/minute")
+async def login_token(request: Request, body: LoginRequest):
     """Authenticate via email/password and return a JWT token.
 
     Password is verified against KESTREL_USER_PASSWORDS env var,
     which is a comma-separated list of email:password pairs.
     Falls back to checking the KESTREL_API_KEY as a universal password.
+
+    Rate-limited (#1724): this is the only password-accepting POST and it accepts
+    the KESTREL_API_KEY as a universal password, so it must be throttled against
+    brute force. Authorization fails CLOSED on a missing allowlist via
+    ``_email_authorized``.
     """
-    allowed_emails = _get_allowed_emails()
     email = body.email.lower()
 
-    if allowed_emails and email not in allowed_emails:
+    if not _email_authorized(email):
         return JSONResponse({"detail": "Email not authorized"}, status_code=403)
 
     # Check user-specific passwords: "email1:pass1,email2:pass2"
