@@ -461,6 +461,15 @@ class ConstitutionMixin:
         Verify that the constitution file hasn't been tampered with.
         Compares current file hash against the anchored hash in storage.
         """
+        # Per-agent overlay verification runs FIRST and UNCONDITIONALLY (#1722) —
+        # before any base-constitution early-return — so it covers legacy agents
+        # that have an anchored overlay but no base ``constitution_hash``. Without
+        # this, those agents would skip the periodic overlay re-read and miss a
+        # runtime mutation/removal.
+        overlay_valid, overlay_msg = await self.verify_constitution_overlay()
+        if not overlay_valid:
+            return False, overlay_msg
+
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
             return False, "INTEGRITY FAILURE: Agent identity node not found"
@@ -502,10 +511,6 @@ class ConstitutionMixin:
                     spawn_valid, spawn_msg = await self._verify_spawn_mandate_constraints()
                     if not spawn_valid:
                         return False, spawn_msg
-                    # And the per-agent overlay against its anchor (#1722).
-                    overlay_valid, overlay_msg = await self.verify_constitution_overlay()
-                    if not overlay_valid:
-                        return False, overlay_msg
                     return True, base_msg
             except FileNotFoundError:
                 continue
@@ -519,11 +524,6 @@ class ConstitutionMixin:
         spawn_valid, spawn_msg = await self._verify_spawn_mandate_constraints()
         if not spawn_valid:
             return False, spawn_msg
-
-        # And the per-agent overlay against its anchor (#1722).
-        overlay_valid, overlay_msg = await self.verify_constitution_overlay()
-        if not overlay_valid:
-            return False, overlay_msg
 
         return True, f"Anchored constitution verified. Hash: {stored_hash[:16]}..."
 

@@ -280,11 +280,13 @@ class ComputerUseFeature(Feature):
         # constitution. ``constitution_overlay_verified`` defaults False until
         # verify_constitution_overlay() runs in initialize()/audit.
         overlay_text = getattr(self.agent, "constitution_text", None)
-        if overlay_text and getattr(self.agent, "constitution_overlay_verified", False):
-            grants = parse_amendment_ix_grants(overlay_text)
-            if grants:
-                return grants
-        elif overlay_text:
+        if overlay_text:
+            if getattr(self.agent, "constitution_overlay_verified", False):
+                # A verified per-agent overlay is AUTHORITATIVE: its parsed grants
+                # stand even when EMPTY, so it can NARROW capabilities the
+                # packaged constitution would otherwise grant. We do NOT fall
+                # through to the package for a verified overlay (#1722 codex r2).
+                return parse_amendment_ix_grants(overlay_text)
             logger.warning(
                 "Ignoring Amendment IX grants from an UNVERIFIED constitution "
                 "overlay (not anchored). Run `kestrel constitution anchor-overlay`."

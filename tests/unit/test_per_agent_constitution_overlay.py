@@ -181,6 +181,27 @@ class TestComputerUseFeaturePicksUpOverlay:
         # constitution doesn't grant shell_execution_host either.)
         assert "shell_execution_host" not in granted
 
+    def test_verified_empty_overlay_is_authoritative_not_package(self, tmp_path):
+        """#1722 codex r2: a VERIFIED overlay that grants nothing must NARROW
+        capabilities (return empty), not fall through to the packaged
+        constitution's grants."""
+        from kestrel_sovereign.features.computer_use.feature import (
+            ComputerUseFeature,
+        )
+
+        agent_dir = tmp_path / "narrowing"
+        agent_dir.mkdir()
+        # Valid Amendment IX section that intentionally grants NOTHING.
+        (agent_dir / "CONSTITUTION.md").write_text(
+            "### Amendment IX\n#### Granted Capabilities\n- [ ] shell_execution_host\n"
+        )
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        agent.constitution_overlay_verified = True
+        feature = ComputerUseFeature(agent=agent)
+        granted = feature._granted_capabilities()
+        # Authoritative empty → deny-all, regardless of what the package grants.
+        assert granted == frozenset()
+
 
 class TestOverlayAnchorVerification:
     """``ConstitutionMixin.verify_constitution_overlay`` decision matrix (#1722).
