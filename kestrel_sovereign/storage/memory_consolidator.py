@@ -832,11 +832,19 @@ class MemoryConsolidator:
             for msg in messages
         ]
         avg_intensity = sum(intensities) / len(intensities) if intensities else 0
+        # Stamp the same importance decay signal as nightly episodes (#1674) so
+        # session episodes participate in the forgetting curve consistently —
+        # without this they'd all default to 0.5 regardless of their content.
+        importances = [
+            msg.get("metadata", {}).get("importance", 0.5)
+            for msg in messages
+        ]
+        avg_importance = sum(importances) / len(importances) if importances else 0.5
 
         # Create episode
         date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
         episode = await self._create_episode_from_messages(
-            date_key, messages, avg_intensity
+            date_key, messages, avg_intensity, avg_importance
         )
 
         if episode:

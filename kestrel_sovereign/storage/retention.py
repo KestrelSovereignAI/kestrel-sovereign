@@ -158,10 +158,15 @@ def load_forgetting_config() -> Dict[str, Any]:
         logger.warning("[forgetting] enabled is not a bool: %r", enabled)
         enabled = DEFAULT_FORGETTING_ENABLED
 
+    # delete_threshold is compared against calculate_decay() which only ever
+    # returns a strength in (0, 1]. A value > 1 (e.g. a typo `2`) would make
+    # EVERY past-grace episode eligible, defeating the decay/importance gate, so
+    # values outside (0, 1] fail safe to the default.
     delete_threshold = _coerce_float(
         section.get("delete_threshold"),
         DEFAULT_FORGETTING_DELETE_THRESHOLD,
         "delete_threshold",
+        maximum=1.0,
     )
     grace_days = _coerce_int(
         section.get("delete_grace_days"),
@@ -176,7 +181,9 @@ def load_forgetting_config() -> Dict[str, Any]:
     }
 
 
-def _coerce_float(value: Any, fallback: float, key: str) -> float:
+def _coerce_float(
+    value: Any, fallback: float, key: str, *, maximum: float | None = None,
+) -> float:
     if value is None:
         return fallback
     try:
@@ -186,6 +193,11 @@ def _coerce_float(value: Any, fallback: float, key: str) -> float:
         return fallback
     if coerced <= 0:
         logger.warning("[forgetting] %s must be > 0: %r", key, value)
+        return fallback
+    if maximum is not None and coerced > maximum:
+        logger.warning(
+            "[forgetting] %s must be <= %s: %r", key, maximum, value,
+        )
         return fallback
     return coerced
 

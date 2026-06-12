@@ -161,6 +161,13 @@ def test_forgetting_garbage_threshold_falls_back(monkeypatch):
     assert cfg["delete_threshold"] == DEFAULT_FORGETTING_DELETE_THRESHOLD
 
 
+def test_forgetting_threshold_above_one_falls_back(monkeypatch):
+    """delete_threshold is compared to a decay strength in (0, 1]; a typo like
+    `2` would make every past-grace episode eligible, so it must fail safe."""
+    _patch_forgetting_section(monkeypatch, {"enabled": True, "delete_threshold": 2})
+    assert load_forgetting_config()["delete_threshold"] == DEFAULT_FORGETTING_DELETE_THRESHOLD
+
+
 def test_forgetting_non_positive_values_fall_back(monkeypatch):
     _patch_forgetting_section(monkeypatch, {
         "enabled": True, "delete_threshold": 0, "delete_grace_days": -5,
