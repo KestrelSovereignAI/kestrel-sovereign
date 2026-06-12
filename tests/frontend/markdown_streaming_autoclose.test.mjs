@@ -4,14 +4,15 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-// #1547: renderStreamingMarkdown used to count `*`/`**`/`` ` `` with naive
-// regexes and append synthetic closers mid-stream. That mis-fired on list
-// bullets ("* item"), multiplication, and stray asterisks — wrapping a
-// synthetic delimiter around a large span so the whole bubble flipped
-// bold/italic for a frame and then reverted. These tests pin the new
-// contract: ONLY an unterminated fenced code block (```) is auto-closed;
-// inline emphasis/code is passed through verbatim and resolves naturally
-// once the real closer streams in.
+// #1547 → #1660: the streaming renderer originally counted `*`/`**`/`` ` ``
+// across the WHOLE content and could wrap a synthetic delimiter around a large
+// span, flipping the entire bubble bold/italic for a frame (#1547 then disabled
+// inline completion entirely). #1660 re-enables it SAFELY: completion is scoped
+// to the TAIL block only (block-isolated), so a completed-then-reverted
+// construct can only repaint the actively-streaming tail, never the whole
+// bubble. The still-ambiguous cases — a single `*` (bullets, multiplication)
+// and bare `$` (currency) — are still NOT completed. These tests pin that
+// contract.
 
 const here = dirname(fileURLToPath(import.meta.url));
 const parseSrc = readFileSync(
@@ -34,11 +35,11 @@ function loadParseModule() {
     return { ...factory(marked), seen };
 }
 
-test('unbalanced ** is NOT auto-closed (no synthetic bold)', () => {
+test('unbalanced ** IS auto-closed on the tail block (#1660)', () => {
     const { renderStreamingMarkdown, seen } = loadParseModule();
     renderStreamingMarkdown('Here is **important');
-    assert.equal(seen.lastParsed, 'Here is **important',
-        'streaming render must not append a synthetic ** closer');
+    assert.equal(seen.lastParsed, 'Here is **important**',
+        'unclosed ** is completed on the tail block so bold renders immediately');
 });
 
 test('a growing bullet list (odd * count) is NOT italicized', () => {
@@ -58,11 +59,11 @@ test('a stray single * is NOT auto-closed', () => {
         'a multiplication asterisk must not synthesize an italic closer');
 });
 
-test('unterminated inline code is NOT auto-closed', () => {
+test('unterminated inline code IS auto-closed on the tail block (#1660)', () => {
     const { renderStreamingMarkdown, seen } = loadParseModule();
     renderStreamingMarkdown('run `git status');
-    assert.equal(seen.lastParsed, 'run `git status',
-        'inline code is rendered literally until its real closer arrives');
+    assert.equal(seen.lastParsed, 'run `git status`',
+        'unclosed inline code is completed on the tail so it renders as code');
 });
 
 test('an unterminated fenced code block IS auto-closed', () => {
