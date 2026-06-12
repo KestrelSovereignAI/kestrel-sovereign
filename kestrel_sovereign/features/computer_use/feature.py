@@ -82,7 +82,24 @@ _DEFAULT_DENY_PATHS = ["~/.ssh", "~/.aws", "~/.config", "~/.gnupg"]
 # newlines) so an allow-listed first token can never bless a piggy-
 # backed compound command.
 _DEFAULT_AUTO_APPROVED_BINS = ["ls", "cat", "rg"]
-_DEFAULT_DENIED_BINS = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
+# Deny-list = "hard refuse without ever asking the operator." Reserved
+# for binaries where even an operator yes-click is dangerous (host
+# shutdown, privilege escalation, raw disk writes, remote access,
+# filesystem creation). ``rm`` is deliberately NOT here (#1739): under
+# the workspace-write sandbox (#1737), in-workspace ``rm`` lands
+# silently and out-of-workspace ``rm`` routes through the queue so the
+# operator can authorize specific cleanups. Hard-deny on ``rm`` was
+# overcautious in an operator-in-the-loop system.
+#
+# Auto-mode interaction (per codex review on #1739, tracked at #1741):
+# the deny-list is the ONLY tier that survives global auto-mode today —
+# under auto-mode, anything not on the deny-list flows through as
+# ``PermissionLevel.AUTO`` and the queue silently approves. Operators
+# running with auto-mode ON who want ``rm`` to still prompt should
+# either (a) add ``"rm"`` to ``denied_binaries`` (hard-refuse), or
+# (b) wait for #1741's ``ALWAYS_ASK`` primitive that's exempt from
+# auto-mode downgrade.
+_DEFAULT_DENIED_BINS = ["dd", "mkfs", "shutdown", "sudo", "ssh"]
 _APPROVAL_TIMEOUT = 300.0
 
 
