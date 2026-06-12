@@ -67,9 +67,8 @@ class EnvelopeVerification:
     ok: bool
     reason: str
     verified: bool = False
-    # The verified sender DID and per-envelope nonce, surfaced so the caller can
-    # commit the nonce to the replay guard AFTER the task is durably accepted
-    # (see ``commit_envelope_nonce``). Empty for unsigned/failed verdicts.
+    # The verified sender DID and per-envelope nonce, surfaced on the verdict for
+    # observability/audit. Empty for unsigned/failed verdicts.
     sender: str = ""
     nonce: str = ""
 
@@ -353,13 +352,22 @@ class ReplayGuard:
     this guard rejects a re-submission of the same ``(sender, nonce)`` inside
     that window. Entries are pruned past ``ttl_seconds`` so the cache stays small.
 
-    Reserve/rollback semantics give both atomicity and retry-safety:
+    Consume-on-reserve semantics: :meth:`reserve` atomically checks-and-records
+    under one lock, so two concurrent submissions of the same body can't both
+    pass (the second loses the race) and a later replay of the same body is
+    rejected. A reserved nonce is *spent* — there is deliberately no rollback,
+    because downstream task creation is NOT idempotent (it appends a session
+    event), so releasing the nonce on a partial-create failure could double-
+    process (codex r5). A client retrying after a server error must send a
+    freshly-signed envelope — Kestrel peers re-sign every send with a new nonce +
+    timestamp — so this trades exact-body retryability for leak-free protection
+    without requiring idempotent task creation.
 
-    * :meth:`reserve` atomically checks-and-records under one lock, so two
-      concurrent submissions of the same body can't both pass (the second loses
-      the race and is rejected) — this is the only consume path.
-    * :meth:`rollback` frees a reservation if the downstream task creation fails,
-      so a legitimate client retry after a transient error still verifies.
+    Scope: this is a PER-PROCESS guard. It fully protects a single-process
+    deployment; in a multi-worker / multi-instance deployment a captured envelope
+    replayed to a *different* worker is not caught here. Shared cross-worker
+    replay state (a DB/Redis-backed nonce store) is tracked as follow-up
+    hardening (see epic #1720).
     """
 
     def __init__(self, ttl_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> None:
@@ -391,13 +399,6 @@ class ReplayGuard:
                 return False
             self._seen[key] = now_ts
             return True
-
-    def rollback(self, sender: str, nonce: str) -> None:
-        """Release a reservation (downstream acceptance failed) so a retry works."""
-        if not nonce:
-            return
-        with self._lock:
-            self._seen.pop(self._key(sender, nonce), None)
 
 
 # Process-wide default guard used by the inbound endpoint when no guard is
@@ -521,9 +522,9 @@ async def verify_inbound_envelope(
 
     # Signature is valid; ATOMICALLY reserve the (sender, nonce) to reject both
     # verbatim replays and concurrent duplicate submissions inside the freshness
-    # window. The reservation is the consume; if the caller's downstream task
-    # creation fails it must call rollback_envelope_nonce() so a legitimate
-    # retry of the same body still verifies.
+    # window. The reservation is the consume — deliberately no rollback (see
+    # ReplayGuard docstring): a retry after a downstream failure must be a
+    # freshly-signed envelope, which Kestrel peers produce automatically.
     if replay_guard is not None and nonce:
         now_dt = now or datetime.now(timezone.utc)
         if not replay_guard.reserve(sender, nonce, now_ts=now_dt.timestamp()):
@@ -531,25 +532,8 @@ async def verify_inbound_envelope(
             return EnvelopeVerification(
                 ok=False, reason="replayed envelope (nonce already seen in window)"
             )
-    # Surface sender+nonce so the caller can roll the reservation back on failure.
+    # Surface the verified sender+nonce on the verdict for observability/audit.
     return EnvelopeVerification(
         ok=verdict.ok, reason=verdict.reason, verified=verdict.verified,
         sender=sender, nonce=nonce,
     )
-
-
-def rollback_envelope_nonce(
-    verdict: EnvelopeVerification,
-    *,
-    replay_guard: Optional[ReplayGuard] = _DEFAULT_REPLAY_GUARD,
-) -> None:
-    """Release a verified envelope's nonce reservation after a downstream failure.
-
-    Call this when task creation fails AFTER a successful verify, so the client
-    can retry the same signed body. A no-op for unsigned/failed verdicts (no
-    nonce) or when no guard is wired. Pair it with the SAME guard passed to
-    :func:`verify_inbound_envelope` (both default to the process-wide guard,
-    which is what the inbound endpoint uses)."""
-    if replay_guard is None or not verdict.verified or not verdict.nonce:
-        return
-    replay_guard.rollback(verdict.sender, verdict.nonce)

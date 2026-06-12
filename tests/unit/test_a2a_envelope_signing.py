@@ -247,11 +247,11 @@ def test_replay_of_same_envelope_rejected():
     assert "repla" in second.reason.lower()
 
 
-def test_rollback_after_failure_allows_retry():
-    """Rolling back the reservation (downstream task creation failed) lets a
-    legitimate retry of the same signed body verify again — replay protection
-    must not break ordinary retries (#1721 codex r2/r3)."""
-    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard, rollback_envelope_nonce
+def test_nonce_is_consumed_on_verify_no_rollback():
+    """A verified nonce is spent on receipt (no rollback): the SAME signed body
+    can't be re-verified, but a freshly-signed envelope (new nonce) from the same
+    sender verifies fine — modelling a client re-signing on retry (#1721 codex r5)."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
 
     kp, doc = _keypair_and_doc()
     meta = _signed_metadata(kp)
@@ -259,10 +259,15 @@ def test_rollback_after_failure_allows_retry():
     first = asyncio.run(verify_inbound_envelope(
         meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
     assert first.ok is True
-    rollback_envelope_nonce(first, replay_guard=guard)  # simulate create_task failure
-    retry = asyncio.run(verify_inbound_envelope(
+    # Exact-body retry is rejected (nonce consumed)...
+    again = asyncio.run(verify_inbound_envelope(
         meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
-    assert retry.ok is True and retry.verified is True
+    assert again.ok is False
+    # ...but a freshly-signed envelope (new nonce) from the same sender passes.
+    resigned = _signed_metadata(kp)
+    fresh = asyncio.run(verify_inbound_envelope(
+        resigned, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert fresh.ok is True and fresh.verified is True
 
 
 def test_future_skewed_replay_rejected_for_full_validity_window():

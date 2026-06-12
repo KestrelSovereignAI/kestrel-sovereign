@@ -1302,11 +1302,11 @@ async def send_task(request: Request):
             artifacts=sender_artifacts or None,
         )
     except Exception as e:
-        # The replay nonce was reserved during verification; release it so a
-        # client retry of the same signed body after this transient failure
-        # isn't rejected as a replay (#1721 codex r2/r3).
-        from kestrel_sovereign.a2a.envelope_signing import rollback_envelope_nonce
-        rollback_envelope_nonce(sender_verdict)
+        # The replay nonce was consumed at verification time and is NOT released
+        # here: create_task is not idempotent (it appends a session event), so
+        # releasing the nonce on a partial-create failure could double-process a
+        # re-accepted retry (#1721 codex r5). A client retrying must send a
+        # freshly-signed envelope (Kestrel peers re-sign every send).
         logger.error(
             "Failed to create A2A task from peer submission: %s",
             e, exc_info=True,
