@@ -149,20 +149,25 @@ class AttachmentsFeature(Feature):
                 data={"attachment_id": attachment_id},
             )
 
-        # Conversation scope (defense-in-depth): prefer the in-conversation ref
-        # for the display name; fall back to the store's recorded name.
+        # Conversation membership (REQUIRED, not just for display): the hash
+        # must actually be referenced as an attachment in this conversation, so
+        # the tool can't be used to pull an attachment from a DIFFERENT thread
+        # by id alone. ``session_id`` is supplied by the tool executor for the
+        # active turn; when present this scopes to that thread, otherwise to the
+        # agent's recent history.
         try:
             history = await self.storage.get_conversation_history(
                 limit=200, session_id=session_id
             )
         except TypeError:
             history = await self.storage.get_conversation_history(limit=200)
-        ref = self._collect_session_attachments(history).get(attachment_id) or {
-            "hash": attachment_id,
-            "kind": meta.get("kind"),
-            "mime": meta.get("mime_type"),
-            "name": meta.get("original_name") or "attachment",
-        }
+        ref = self._collect_session_attachments(history).get(attachment_id)
+        if ref is None:
+            return ToolResult.failed(
+                "That attachment isn't part of this conversation. Only files "
+                "attached in this thread can be read.",
+                data={"attachment_id": attachment_id},
+            )
 
         data = await self.storage.retrieve_file(attachment_id)
         if not data:

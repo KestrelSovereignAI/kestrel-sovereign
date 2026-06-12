@@ -72,6 +72,19 @@ async def test_read_attachment_rejects_other_agents_attachment():
 
 
 @pytest.mark.asyncio
+async def test_read_attachment_rejects_hash_not_in_this_conversation():
+    # Valid store provenance (a real attachment owned by this agent) but NOT
+    # referenced in this conversation's history → rejected; the tool can't pull
+    # another thread's attachment by id alone.
+    feat, storage = _make(
+        att=None, bytes_=b"data",
+        file_meta={"type": "attachment", "agent_id": "did:test"})
+    res = await feat.read_attachment("a" * 64)
+    assert res.status == "error"
+    storage.retrieve_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_read_attachment_rejects_malformed_id():
     feat = _feature(MagicMock())
     res = await feat.read_attachment("not-a-hash")
