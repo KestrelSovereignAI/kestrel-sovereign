@@ -40,6 +40,44 @@ When using Kestrel:
 4. Regularly rotate cryptographic keys
 5. Review agent permissions before deployment
 
+## Feature Trust Model
+
+Kestrel features are **trusted, in-process extensions** — not a sandbox.
+
+A feature is loaded either from the in-tree `kestrel_sovereign/features/`
+directory or from any pip package registered under the
+`kestrel_sovereign.features` entry-point group. **Every loaded feature receives
+the full, unrestricted agent object** and through it can reach:
+
+- the LLM service (spend tokens, drive the model),
+- the agent's storage and a shared, unscoped database handle,
+- sibling features — including `keys` (i.e. `get_key()` for stored credentials),
+- the hooks manager and identity.
+
+There is **no capability scoping, signing requirement, or sandbox** between a
+feature and the agent. A typo-squatted or compromised dependency registered under
+that entry-point group is therefore equivalent to full agent compromise.
+
+**This is an accepted v1 trade-off, stated explicitly here so it is not a
+surprise:** installing a feature is a trust decision on par with installing any
+other Python dependency that runs in your process.
+
+**Operator guidance:**
+
+1. Treat `pip install`-ing a `kestrel-feature-*` (or anything that registers a
+   `kestrel_sovereign.features` entry point) as granting it full agent access.
+   Vet the source and pin versions, exactly as you would any dependency with
+   access to your secrets.
+2. Prefer in-tree / first-party features and audited packages.
+3. Run agents with the least-privileged host credentials that still let them do
+   their job, so a compromised feature's blast radius is bounded by the process,
+   not the host.
+4. Disable features you don't use (`KESTREL_DISABLED_FEATURES`) to shrink the
+   loaded surface.
+
+Tightening this — per-feature capability scoping, signed/allowlisted entry-point
+features, and per-feature database namespacing — is tracked as future hardening.
+
 ## Responsible Disclosure
 
 We follow responsible disclosure practices. After a fix is released,
