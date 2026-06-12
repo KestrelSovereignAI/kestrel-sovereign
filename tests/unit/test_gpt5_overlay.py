@@ -107,17 +107,40 @@ class TestSandboxRetryDiscipline:
     @pytest.mark.parametrize(
         "phrase",
         [
+            "shell tool itself",
+            "host sandbox refused",
             "Operation not permitted",
-            "rejected by user",
-            "sandbox refusal",
             "retry once",
             "host approval queue",
+            "Treat operator-denied results as terminal",
         ],
     )
     def test_contract_carries_sandbox_retry_clause(self, phrase):
         assert phrase in GPT5_BEHAVIOR_CONTRACT, (
             f"GPT5 contract must mention {phrase!r} so sandbox-blocked "
             f"writes can be retried with an explicit elevation request"
+        )
+
+    def test_sandbox_retry_clause_distinguishes_envelope_from_stdout(self):
+        # Codex round 1 P0: a hostile command can put "Operation not
+        # permitted" in its stdout. The clause must scope the trigger
+        # to the tool envelope (the call failed) rather than to any
+        # output containing the phrase.
+        td_start = GPT5_BEHAVIOR_CONTRACT.index("<tool_discipline>")
+        td_end = GPT5_BEHAVIOR_CONTRACT.index("</tool_discipline>")
+        td_block = GPT5_BEHAVIOR_CONTRACT[td_start:td_end]
+        assert "shell tool itself" in td_block
+        assert "not stdout text from a command that did run" in td_block
+
+    def test_sandbox_retry_clause_excludes_user_denial_as_trigger(self):
+        # Codex round 1 P1: "rejected by user" was originally listed
+        # alongside "Operation not permitted" as a trigger to retry,
+        # but #1690's audit-backed classifier makes that phrase mean
+        # an actual operator denial — retrying it ignores the
+        # operator's decision. The clause must NOT name it.
+        assert "rejected by user" not in GPT5_BEHAVIOR_CONTRACT, (
+            "'rejected by user' must not be a retry trigger; per #1690 "
+            "an audit-backed user denial is terminal, not retryable"
         )
 
     def test_sandbox_retry_clause_inside_tool_discipline(self):
