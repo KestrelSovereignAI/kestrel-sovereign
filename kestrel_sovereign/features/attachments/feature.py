@@ -121,37 +121,19 @@ class AttachmentsFeature(Feature):
         if self.storage is None or not hasattr(self.storage, "retrieve_file"):
             return ToolResult.failed("Attachment storage is unavailable.")
 
-        # Authoritative security gate: validate the STORE's own metadata, not
-        # the client-supplied conversation refs (a client can post an arbitrary
-        # well-formed hash into a turn's `attachments`, which then shows up in
-        # history — so history membership is NOT proof of a legitimate upload).
-        # The upload endpoint stamps every chat attachment with
-        # type="attachment" + the owning agent_id; require both. This keeps the
-        # content-addressed store from being read as an oracle for avatars,
-        # snapshots, or any other non-attachment file.
-        file_store = getattr(self.storage, "files", None)
-        meta = None
-        if file_store is not None and hasattr(file_store, "get_file_metadata"):
-            try:
-                meta = await file_store.get_file_metadata(attachment_id)
-            except Exception:
-                meta = None
-        if not isinstance(meta, dict) or meta.get("type") != "attachment":
-            return ToolResult.failed(
-                "That id isn't a readable chat attachment.",
-                data={"attachment_id": attachment_id},
-            )
-        owner = meta.get("agent_id")
-        my_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "did", None)
-        if owner and my_id and owner != my_id:
-            return ToolResult.failed(
-                "That attachment doesn't belong to this agent.",
-                data={"attachment_id": attachment_id},
-            )
-
-        # Conversation membership (REQUIRED, not just for display): the hash
-        # must actually be referenced as an attachment in THIS conversation, so
-        # the tool can't pull an attachment from a different thread by id alone.
+        # Security gate = conversation membership, scoped to the agent's active
+        # session. The hash must be referenced as an attachment in THIS thread's
+        # history before it can be read.
+        #
+        # Why not validate the file store's own metadata for "is this really a
+        # chat attachment"? Because that metadata is NOT reliable: ISOLATED
+        # privacy mode keeps attachment bytes only in the session buffer and
+        # never persists their metadata, and the content-addressed store dedups
+        # via INSERT-OR-IGNORE so an upload whose bytes already exist keeps the
+        # PRIOR metadata. The real trust boundary is the per-agent store (each
+        # agent reads only its own DB) plus the authenticated owner; membership
+        # then scopes a read to documents actually attached in this thread.
+        #
         # The tool-call ``session_id`` arg is model-controlled and usually
         # omitted, so the authoritative scope is the session the agent recorded
         # for the active turn; the arg only narrows further if supplied.

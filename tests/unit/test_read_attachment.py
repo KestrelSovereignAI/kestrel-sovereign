@@ -8,24 +8,14 @@ def _history_with(att):
     return [{"role": "user", "metadata": {"attachments": [att]}}]
 
 
-def _make(att=None, *, bytes_=b"", file_meta="attachment"):
-    """Build (feature, storage). `file_meta` is the store-side metadata the
-    provenance gate validates: "attachment" → a real chat-attachment upload,
-    None → not an attachment (e.g. an avatar or fabricated hash), or a dict to
-    supply custom metadata."""
+def _make(att=None, *, bytes_=b""):
+    """Build (feature, storage). When `att` is given it's the only attachment
+    referenced in the (single-session) conversation history; absent → empty."""
     from kestrel_sovereign.features.attachments.feature import AttachmentsFeature
     storage = MagicMock()
     storage.get_conversation_history = AsyncMock(
         return_value=_history_with(att) if att else [])
     storage.retrieve_file = AsyncMock(return_value=bytes_)
-    if file_meta == "attachment":
-        meta = {"type": "attachment", "kind": (att or {}).get("kind"),
-                "mime_type": (att or {}).get("mime"),
-                "original_name": (att or {}).get("name"), "agent_id": "did:test"}
-    else:
-        meta = file_meta  # None or a custom dict
-    storage.files = MagicMock()
-    storage.files.get_file_metadata = AsyncMock(return_value=meta)
     agent = MagicMock()
     agent.agent_id = "did:test"
     agent._active_session_id = None
@@ -48,38 +38,11 @@ def _feature(storage):
 # --- session-scoped security gate -------------------------------------------
 
 @pytest.mark.asyncio
-async def test_read_attachment_rejects_non_attachment_hash():
-    # A hash whose STORE metadata isn't type="attachment" — an avatar, a
-    # snapshot, or a fabricated hash coaxed into the turn's attachment metadata
-    # — is rejected before any bytes are fetched. Store provenance, not the
-    # client-supplied conversation refs, is the authoritative gate.
-    feat, storage = _make(
-        {"hash": "a" * 64, "kind": "document", "mime": "text/plain", "name": "x"},
-        bytes_=b"secret", file_meta=None)
-    res = await feat.read_attachment("a" * 64)
-    assert res.status == "error"
-    storage.retrieve_file.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_read_attachment_rejects_other_agents_attachment():
-    feat, storage = _make(
-        {"hash": "f" * 64, "kind": "document", "mime": "text/plain", "name": "x"},
-        bytes_=b"data",
-        file_meta={"type": "attachment", "agent_id": "did:someone-else"})
-    res = await feat.read_attachment("f" * 64)
-    assert res.status == "error"
-    storage.retrieve_file.assert_not_awaited()
-
-
-@pytest.mark.asyncio
 async def test_read_attachment_rejects_hash_not_in_this_conversation():
-    # Valid store provenance (a real attachment owned by this agent) but NOT
-    # referenced in this conversation's history → rejected; the tool can't pull
-    # another thread's attachment by id alone.
-    feat, storage = _make(
-        att=None, bytes_=b"data",
-        file_meta={"type": "attachment", "agent_id": "did:test"})
+    # A hash NOT referenced as an attachment in this thread's history is
+    # rejected before any bytes are fetched — the tool can't pull a file by id
+    # alone (e.g. an avatar hash or another thread's attachment).
+    feat, storage = _make(att=None, bytes_=b"secret")
     res = await feat.read_attachment("a" * 64)
     assert res.status == "error"
     storage.retrieve_file.assert_not_awaited()
