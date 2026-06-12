@@ -265,6 +265,36 @@ def test_rollback_after_failure_allows_retry():
     assert retry.ok is True and retry.verified is True
 
 
+def test_future_skewed_replay_rejected_for_full_validity_window():
+    """A future-skewed envelope is valid for up to 2× the window from first
+    receipt; the replay reservation must outlive that whole span, not just 1×
+    the window (#1721 codex r4)."""
+    from datetime import timedelta
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    window = 10
+    guard = ReplayGuard(ttl_seconds=2 * window)
+    now0 = datetime.now(timezone.utc)
+    # Timestamp at the max allowed future skew.
+    ts = _now_iso(now0 + timedelta(seconds=window))
+    meta = _signed_metadata(kp, ts=ts)
+
+    # First receipt at now0 (envelope is +window in the future, within skew).
+    first = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc,
+        replay_guard=guard, max_age_seconds=window, now=now0))
+    assert first.ok is True
+    # Replay at now0 + 2*window == ts + window: still signature-fresh, and the
+    # reservation must still be remembered → rejected as a replay.
+    later = now0 + timedelta(seconds=2 * window)
+    replay = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc,
+        replay_guard=guard, max_age_seconds=window, now=later))
+    assert replay.ok is False
+    assert "repla" in replay.reason.lower()
+
+
 def test_causation_chain_type_substitution_rejected():
     """An attacker can't erase lineage by swapping each frame dict for its string
     repr: the bound chain is structure-preserving, so the bytes (and signature)

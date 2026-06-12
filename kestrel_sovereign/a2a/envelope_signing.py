@@ -403,7 +403,15 @@ class ReplayGuard:
 # Process-wide default guard used by the inbound endpoint when no guard is
 # injected. Per-process is sufficient: replay protection only needs to span the
 # freshness window on the host that actually receives the envelope.
-_DEFAULT_REPLAY_GUARD = ReplayGuard()
+#
+# TTL = 2× the freshness window, NOT 1×: ``_timestamp_fresh`` accepts a timestamp
+# up to ``max_age_seconds`` in the FUTURE (clock-skew tolerance) and then for
+# ``max_age_seconds`` after it, so a single envelope can be validly replayable
+# for up to 2× the window measured from first receipt. A 1× TTL would prune the
+# reservation while the signature is still fresh, reopening a replay gap (codex
+# r4). The guard must outlive the full validity window.
+REPLAY_GUARD_TTL_SECONDS = 2 * DEFAULT_MAX_AGE_SECONDS
+_DEFAULT_REPLAY_GUARD = ReplayGuard(ttl_seconds=REPLAY_GUARD_TTL_SECONDS)
 
 
 async def _resolve(resolver: Optional[Resolver], did: str) -> Optional[Mapping[str, Any]]:
