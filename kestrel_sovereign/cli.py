@@ -690,10 +690,11 @@ def cmd_constitution(args) -> int:
     """Dispatch ``kestrel constitution`` subcommands."""
     constitution_commands = {
         "reanchor": cmd_constitution_reanchor,
+        "anchor-overlay": cmd_constitution_anchor_overlay,
     }
     handler = constitution_commands.get(args.constitution_command)
     if handler is None:
-        print("Usage: kestrel constitution {reanchor}")
+        print("Usage: kestrel constitution {reanchor|anchor-overlay}")
         return 1
     return handler(args)
 
@@ -776,6 +777,64 @@ def cmd_constitution_reanchor(args) -> int:
         f"  New: {result.new_hash[:12]}…\n"
         f"  Source:  {result.canonical_path}\n"
         f"  Backup:  {result.backup_path}"
+    )
+    return 0
+
+
+def cmd_constitution_anchor_overlay(args) -> int:
+    """Anchor an agent's per-agent CONSTITUTION.md overlay (#1722).
+
+    Establishes trust in the overlay so ComputerUseFeature honors its
+    Amendment IX grants. Refuses to run against a live agent (SQLite WAL safety),
+    same as ``reanchor``."""
+    import asyncio
+
+    from kestrel_sovereign.multi_agent.config import (
+        MULTI_AGENT_CONFIG_FILENAME, MultiAgentConfig,
+    )
+    from kestrel_sovereign.setup.overlay_anchor import anchor_overlay
+
+    project_dir = _get_project_dir()
+    multi_agent = MultiAgentConfig.load(
+        project_dir / MULTI_AGENT_CONFIG_FILENAME, auto_discover_fallback=False,
+    )
+    agents = multi_agent.get_local_agents()
+
+    if args.agent_name not in agents:
+        print(
+            f"error: '{args.agent_name}' not in multi_agent. "
+            f"Available: {', '.join(agents.keys()) or '(none)'}",
+            file=sys.stderr,
+        )
+        return 2
+
+    if _agent_appears_running(project_dir, args.agent_name, agents[args.agent_name]):
+        print(
+            f"error: agent '{args.agent_name}' appears to be running. "
+            f"Run `kestrel stop {args.agent_name}` first to avoid DB corruption.",
+            file=sys.stderr,
+        )
+        return 2
+
+    agent_dir = (project_dir / agents[args.agent_name].data_dir).resolve()
+    result = asyncio.run(
+        anchor_overlay(agent_name=args.agent_name, agent_dir=agent_dir)
+    )
+
+    if result.error:
+        print(f"error: {result.error}", file=sys.stderr)
+        return 1
+    if result.unchanged:
+        print(
+            f"{result.agent_name}: overlay already anchored "
+            f"({result.new_hash[:12]}…) — nothing to do."
+        )
+        return 0
+    print(
+        f"{result.agent_name}: constitution overlay anchored.\n"
+        f"  Old: {(result.old_hash[:12] + '…') if result.old_hash else '(none)'}\n"
+        f"  New: {result.new_hash[:12]}…\n"
+        f"  Overlay: {result.overlay_path}"
     )
     return 0
 
@@ -1396,6 +1455,15 @@ def build_parser() -> argparse.ArgumentParser:
     reanchor_p.add_argument(
         "--constitution-path", default=None,
         help="Override the canonical constitution path (defaults to package's KESTREL_CONSTITUTION.md)",
+    )
+
+    anchor_overlay_p = constitution_sub.add_parser(
+        "anchor-overlay",
+        help="Anchor an agent's per-agent CONSTITUTION.md overlay so its Amendment IX grants are trusted",
+    )
+    anchor_overlay_p.add_argument(
+        "--agent-name", required=True,
+        help="Name of the agent (must be in multi_agent.toml)",
     )
 
     # kestrel config <agent_dir>

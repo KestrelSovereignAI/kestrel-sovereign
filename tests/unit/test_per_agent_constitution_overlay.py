@@ -21,6 +21,10 @@ from unittest.mock import patch
 
 import pytest
 
+from unittest.mock import AsyncMock, MagicMock
+
+import hashlib
+
 from kestrel_sovereign.constitution.hierarchy import parse_amendment_ix_grants
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
@@ -133,11 +137,12 @@ class TestPerAgentOverlayLoading:
 
 class TestComputerUseFeaturePicksUpOverlay:
     """End-to-end at the lookup level: ``feature.py:_granted_capabilities``
-    must use ``agent.constitution_text`` when set, regardless of what's in
-    the package constitution. This is the consumer side that #898 unblocks.
+    uses ``agent.constitution_text`` ONLY when the overlay is integrity-verified
+    against its anchor (#1722) — an unverified overlay's grants are ignored so a
+    file written next to the agent DB can't self-grant host shell.
     """
 
-    def test_overlay_grants_take_precedence_over_package(self, tmp_path):
+    def test_verified_overlay_grants_take_precedence_over_package(self, tmp_path):
         from kestrel_sovereign.features.computer_use.feature import (
             ComputerUseFeature,
         )
@@ -149,8 +154,189 @@ class TestComputerUseFeaturePicksUpOverlay:
         )
 
         agent = _make_agent(agent_dir / "kestrel_prime.db")
+        # Anchored/verified overlay (set by verify_constitution_overlay in the
+        # real flow) → grants honored.
+        agent.constitution_overlay_verified = True
         feature = ComputerUseFeature(agent=agent)
-        # Don't await initialize; we only need the lookup helper to read
-        # ``self.agent.constitution_text``, which __init__ already populated.
         granted = feature._granted_capabilities()
         assert "shell_execution_host" in granted
+
+    def test_unverified_overlay_grants_are_ignored(self, tmp_path):
+        """#1722: the self-grant vector. An overlay present but NOT anchored
+        (verified defaults False) must NOT grant dangerous capabilities."""
+        from kestrel_sovereign.features.computer_use.feature import (
+            ComputerUseFeature,
+        )
+
+        agent_dir = tmp_path / "attacker_overlay"
+        agent_dir.mkdir()
+        (agent_dir / "CONSTITUTION.md").write_text(
+            "### Amendment IX\n- [x] shell_execution_host\n"
+        )
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        assert agent.constitution_overlay_verified is False  # default
+        feature = ComputerUseFeature(agent=agent)
+        granted = feature._granted_capabilities()
+        # The unverified overlay's host-shell grant is withheld. (The package
+        # constitution doesn't grant shell_execution_host either.)
+        assert "shell_execution_host" not in granted
+
+    def test_verified_empty_overlay_is_authoritative_not_package(self, tmp_path):
+        """#1722 codex r2: a VERIFIED overlay that grants nothing must NARROW
+        capabilities (return empty), not fall through to the packaged
+        constitution's grants."""
+        from kestrel_sovereign.features.computer_use.feature import (
+            ComputerUseFeature,
+        )
+
+        agent_dir = tmp_path / "narrowing"
+        agent_dir.mkdir()
+        # Valid Amendment IX section that intentionally grants NOTHING.
+        (agent_dir / "CONSTITUTION.md").write_text(
+            "### Amendment IX\n#### Granted Capabilities\n- [ ] shell_execution_host\n"
+        )
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        agent.constitution_overlay_verified = True
+        feature = ComputerUseFeature(agent=agent)
+        granted = feature._granted_capabilities()
+        # Authoritative empty → deny-all, regardless of what the package grants.
+        assert granted == frozenset()
+
+    def test_verified_completely_empty_overlay_file_is_authoritative(self, tmp_path):
+        """#1722 codex r4: a 0-byte verified overlay (constitution_text == "")
+        must still be authoritative deny-all, not fall through to package."""
+        from kestrel_sovereign.features.computer_use.feature import (
+            ComputerUseFeature,
+        )
+
+        agent_dir = tmp_path / "empty_file"
+        agent_dir.mkdir()
+        (agent_dir / "CONSTITUTION.md").write_text("")  # 0 bytes
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        assert agent.constitution_text == ""  # present-but-empty, not None
+        agent.constitution_overlay_verified = True
+        feature = ComputerUseFeature(agent=agent)
+        assert feature._granted_capabilities() == frozenset()
+
+
+class TestOverlayAnchorVerification:
+    """``ConstitutionMixin.verify_constitution_overlay`` decision matrix (#1722).
+
+    The overlay sha is computed at load in ``__init__``; the anchor lives in the
+    identity node. We mock ``storage.get_node`` to drive each case.
+    """
+
+    def _agent_with_overlay(self, tmp_path, text="### Amendment IX\n- [x] shell_execution_host\n"):
+        agent_dir = tmp_path / "agent"
+        agent_dir.mkdir(exist_ok=True)
+        (agent_dir / "CONSTITUTION.md").write_text(text, encoding="utf-8")
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        return agent, hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def _node(self, props):
+        n = MagicMock()
+        n.properties = dict(props)
+        return n
+
+    def _set_storage(self, agent, node):
+        storage = MagicMock()
+        storage.get_node = AsyncMock(return_value=node)
+        storage.add_node = AsyncMock()
+        agent.storage = storage
+        return storage
+
+    @pytest.mark.asyncio
+    async def test_present_and_anchor_matches_verifies(self, tmp_path):
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is True and agent.constitution_overlay_verified is True
+
+    @pytest.mark.asyncio
+    async def test_present_but_unanchored_fails_closed(self, tmp_path):
+        agent, _ = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({}))  # no anchor
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and agent.constitution_overlay_verified is False
+        assert "not anchored" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_present_but_mutated_fails_closed(self, tmp_path):
+        agent, _ = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": "deadbeef"}))
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and agent.constitution_overlay_verified is False
+        assert "modified" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_anchored_but_overlay_removed_fails_closed(self, tmp_path):
+        # No overlay file → sha is None, but an anchor exists → tampering.
+        agent_dir = tmp_path / "removed"
+        agent_dir.mkdir()
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        assert agent._constitution_overlay_sha is None
+        self._set_storage(agent, self._node({"constitution_overlay_hash": "abc123"}))
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and "missing" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_no_overlay_no_anchor_is_ok(self, tmp_path):
+        agent_dir = tmp_path / "plain"
+        agent_dir.mkdir()
+        agent = _make_agent(agent_dir / "kestrel_prime.db")
+        self._set_storage(agent, self._node({}))
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is True and agent.constitution_overlay_verified is False
+
+    @pytest.mark.asyncio
+    async def test_live_mutation_detected_on_reverify(self, tmp_path):
+        """#1722 P2: the audit re-reads the overlay from disk, so a file mutated
+        WHILE the agent runs flips verification to failed (not stuck on the
+        __init__ hash)."""
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        ok, _ = await agent.verify_constitution_overlay()
+        assert ok is True and agent.constitution_overlay_verified is True
+        # Attacker rewrites the overlay at runtime to add a grant.
+        (tmp_path / "agent" / "CONSTITUTION.md").write_text(
+            "### Amendment IX\n- [x] shell_execution_host\n- [x] filesystem_write\n",
+            encoding="utf-8",
+        )
+        ok2, msg = await agent.verify_constitution_overlay()
+        assert ok2 is False and agent.constitution_overlay_verified is False
+        assert "modified" in msg.lower()
+
+    @pytest.mark.asyncio
+    async def test_live_removal_detected_on_reverify(self, tmp_path):
+        """An anchored overlay deleted at runtime is detected as tampering."""
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        assert (await agent.verify_constitution_overlay())[0] is True
+        (tmp_path / "agent" / "CONSTITUTION.md").unlink()
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and "missing" in msg.lower()
+        assert agent.constitution_text is None
+
+    @pytest.mark.asyncio
+    async def test_non_utf8_overlay_fails_closed(self, tmp_path):
+        """#1722 codex r3: an overlay rewritten to non-UTF-8 bytes must fail
+        closed (hash mismatch), not raise UnicodeDecodeError past the check."""
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        assert (await agent.verify_constitution_overlay())[0] is True
+        # Attacker writes invalid UTF-8.
+        (tmp_path / "agent" / "CONSTITUTION.md").write_bytes(b"\xff\xfe\x00bad")
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and agent.constitution_overlay_verified is False
+        assert agent.constitution_text is None
+
+    @pytest.mark.asyncio
+    async def test_anchor_constitution_overlay_persists_hash(self, tmp_path):
+        agent, sha = self._agent_with_overlay(tmp_path)
+        node = self._node({})
+        storage = self._set_storage(agent, node)
+        ok, msg = await agent.anchor_constitution_overlay()
+        assert ok is True
+        assert node.properties["constitution_overlay_hash"] == sha
+        storage.add_node.assert_awaited()
+        assert agent.constitution_overlay_verified is True

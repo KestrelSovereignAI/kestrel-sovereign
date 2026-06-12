@@ -461,6 +461,15 @@ class ConstitutionMixin:
         Verify that the constitution file hasn't been tampered with.
         Compares current file hash against the anchored hash in storage.
         """
+        # Per-agent overlay verification runs FIRST and UNCONDITIONALLY (#1722) —
+        # before any base-constitution early-return — so it covers legacy agents
+        # that have an anchored overlay but no base ``constitution_hash``. Without
+        # this, those agents would skip the periodic overlay re-read and miss a
+        # runtime mutation/removal.
+        overlay_valid, overlay_msg = await self.verify_constitution_overlay()
+        if not overlay_valid:
+            return False, overlay_msg
+
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
             return False, "INTEGRITY FAILURE: Agent identity node not found"
@@ -517,6 +526,136 @@ class ConstitutionMixin:
             return False, spawn_msg
 
         return True, f"Anchored constitution verified. Hash: {stored_hash[:16]}..."
+
+    # ------------------------------------------------------------------
+    # Per-agent constitution overlay anchoring (#1722)
+    #
+    # The overlay (`<agent_dir>/CONSTITUTION.md`) can grant DANGEROUS Amendment
+    # IX capabilities (shell_execution_host, filesystem_write). Anyone able to
+    # write a file next to the agent DB could therefore self-grant host shell —
+    # the overlay was never integrity-checked. These methods anchor the overlay
+    # hash in the identity node and verify it; the capability gate
+    # (ComputerUseFeature._granted_capabilities) only honors overlay grants when
+    # ``constitution_overlay_verified`` is True, and the periodic audit fails
+    # CLOSED on an unanchored / mutated / removed overlay.
+    # ------------------------------------------------------------------
+
+    OVERLAY_HASH_PROPERTY = "constitution_overlay_hash"
+
+    async def verify_constitution_overlay(self) -> Tuple[bool, str]:
+        """Verify the per-agent overlay against its anchored hash.
+
+        Sets ``self.constitution_overlay_verified`` and returns
+        ``(is_valid, message)``. Decision matrix (overlay sha computed at load
+        in ``KestrelAgent.__init__``; anchor read from the identity node):
+
+        * overlay present + anchor matches            → verified, OK
+        * overlay present + anchor mismatches          → FAIL (tampered)
+        * overlay present + NO anchor                  → FAIL (unanchored: an
+          un-vetted overlay must not be trusted for capability grants)
+        * overlay absent + anchor present              → FAIL (anchored overlay
+          was removed — tampering)
+        * overlay absent + no anchor                   → OK (normal agent)
+
+        ``is_valid=False`` drives the integrity audit into safe mode.
+        """
+        # Re-read the overlay from disk EVERY call (not the __init__-cached hash)
+        # so the periodic audit detects live mutation/removal while the agent is
+        # running (#1722). Refresh the cached text + sha so the capability gate
+        # also sees current content.
+        overlay_path = getattr(self, "_constitution_overlay_path", None)
+        overlay_sha = None
+        if overlay_path is not None and overlay_path.exists():
+            try:
+                overlay_bytes = overlay_path.read_bytes()
+            except OSError as e:
+                logging.warning("Could not re-read constitution overlay %s: %s", overlay_path, e)
+                overlay_bytes = None
+            if overlay_bytes is not None:
+                # Hash the raw bytes FIRST so the anchor comparison runs even for
+                # a non-UTF-8 overlay; decode defensively (invalid UTF-8 must NOT
+                # raise past the comparison and skip fail-closed — codex r3). A
+                # non-text overlay yields no parseable grants, which is safe.
+                overlay_sha = hashlib.sha256(overlay_bytes).hexdigest()
+                try:
+                    self.constitution_text = overlay_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    logging.warning(
+                        "Constitution overlay %s is not valid UTF-8; no grants parseable.",
+                        overlay_path,
+                    )
+                    self.constitution_text = None
+            else:
+                self.constitution_text = None
+        else:
+            # File absent now (never existed, or removed at runtime).
+            if getattr(self, "constitution_text", None) is not None and overlay_path is not None:
+                self.constitution_text = None
+        self._constitution_overlay_sha = overlay_sha
+
+        anchor = None
+        try:
+            agent_node = await self.storage.get_node(self.agent_id)
+            if agent_node:
+                anchor = agent_node.properties.get(self.OVERLAY_HASH_PROPERTY)
+        except Exception as e:  # noqa: BLE001
+            # Can't read the anchor → can't trust an overlay if one is present.
+            if overlay_sha is not None:
+                self.constitution_overlay_verified = False
+                return False, f"OVERLAY INTEGRITY FAILURE: cannot read anchor: {e}"
+            self.constitution_overlay_verified = False
+            return True, "No overlay; anchor unreadable but not required"
+
+        if overlay_sha is None:
+            if anchor:
+                # An overlay was anchored before but is now gone — tampering.
+                self.constitution_overlay_verified = False
+                return False, (
+                    "OVERLAY INTEGRITY FAILURE: an anchored constitution overlay "
+                    "is missing (was it deleted?)"
+                )
+            self.constitution_overlay_verified = False
+            return True, "No per-agent constitution overlay"
+
+        if not anchor:
+            # Present but never anchored → must not be trusted (fail closed).
+            self.constitution_overlay_verified = False
+            return False, (
+                "OVERLAY INTEGRITY FAILURE: per-agent CONSTITUTION.md is present "
+                "but NOT anchored. Its capability grants are ignored. Anchor it "
+                "with `kestrel constitution anchor-overlay` if it is legitimate."
+            )
+
+        if anchor != overlay_sha:
+            self.constitution_overlay_verified = False
+            logging.critical(
+                "CONSTITUTION OVERLAY MISMATCH!\n  Anchored: %s\n  File:     %s",
+                anchor, overlay_sha,
+            )
+            return False, "OVERLAY INTEGRITY FAILURE: overlay has been modified since anchoring."
+
+        self.constitution_overlay_verified = True
+        return True, f"Constitution overlay verified. Hash: {overlay_sha[:16]}..."
+
+    async def anchor_constitution_overlay(self) -> Tuple[bool, str]:
+        """Anchor the CURRENT overlay's hash in the identity node (trusted action).
+
+        This is the one operation that establishes trust in an overlay; it must
+        only be reachable through a trusted channel (the host CLI/operator), not
+        from anything an attacker with mere file-write can drive. After
+        anchoring, ``constitution_overlay_verified`` becomes True and the
+        overlay's Amendment IX grants are honored."""
+        overlay_sha = getattr(self, "_constitution_overlay_sha", None)
+        if overlay_sha is None:
+            return False, "No per-agent constitution overlay to anchor."
+        agent_node = await self.storage.get_node(self.agent_id)
+        if not agent_node:
+            return False, "Agent identity node not found; cannot anchor overlay."
+        agent_node.properties[self.OVERLAY_HASH_PROPERTY] = overlay_sha
+        await self.storage.add_node(agent_node)  # upsert
+        self.constitution_overlay_verified = True
+        logging.info("Anchored constitution overlay hash %s", overlay_sha[:16])
+        return True, f"Anchored constitution overlay. Hash: {overlay_sha[:16]}..."
 
     async def _verify_spawn_mandate_constraints(self) -> Tuple[bool, str]:
         """Verify spawn mandate constraints if this agent was spawned.

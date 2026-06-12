@@ -272,9 +272,31 @@ class ComputerUseFeature(Feature):
             if grants:
                 return frozenset(grants)
 
-        text = getattr(self.agent, "constitution_text", None)
-        if not text:
-            text = self._read_constitution_text()
+        # The per-agent overlay (self.agent.constitution_text) may grant DANGEROUS
+        # capabilities via Amendment IX — but ONLY honor it when the overlay has
+        # been integrity-verified against its anchor (#1722). An unanchored or
+        # tampered overlay (e.g. one an attacker wrote next to the agent DB to
+        # self-grant shell) is ignored; we fall through to the packaged
+        # constitution. ``constitution_overlay_verified`` defaults False until
+        # verify_constitution_overlay() runs in initialize()/audit.
+        # ``is not None`` (not truthiness): an intentionally EMPTY overlay file
+        # is ``""`` and must still count as "overlay present" so a verified empty
+        # overlay denies all (rather than falling through to package grants) —
+        # #1722 codex r4. ``None`` means genuinely no overlay file.
+        overlay_text = getattr(self.agent, "constitution_text", None)
+        if overlay_text is not None:
+            if getattr(self.agent, "constitution_overlay_verified", False):
+                # A verified per-agent overlay is AUTHORITATIVE: its parsed grants
+                # stand even when EMPTY, so it can NARROW capabilities the
+                # packaged constitution would otherwise grant. We do NOT fall
+                # through to the package for a verified overlay (#1722 codex r2).
+                return parse_amendment_ix_grants(overlay_text)
+            logger.warning(
+                "Ignoring Amendment IX grants from an UNVERIFIED constitution "
+                "overlay (not anchored). Run `kestrel constitution anchor-overlay`."
+            )
+
+        text = self._read_constitution_text()
         if text:
             grants = parse_amendment_ix_grants(text)
             if grants:

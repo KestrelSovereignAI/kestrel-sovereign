@@ -2,6 +2,7 @@ import logging
 import json
 import os
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -210,14 +211,30 @@ class KestrelAgent(
         # parser scopes to. Absent file → ``constitution_text`` stays None
         # and the package fallback is used (existing behavior).
         self.constitution_text: Optional[str] = None
+        # sha256 of the overlay bytes as loaded, and whether that hash matches
+        # the anchor stored in the agent's identity node. Until verified against
+        # the anchor (in initialize()/audit), the overlay is treated as
+        # UNTRUSTED — its Amendment IX capability grants are NOT honored (#1722).
+        # This closes the self-grant: writing a CONSTITUTION.md next to the agent
+        # DB no longer grants host shell, because an unanchored overlay's grants
+        # are ignored and the integrity audit fails closed on it.
+        self._constitution_overlay_path: Optional[Path] = None
+        self._constitution_overlay_sha: Optional[str] = None
+        self.constitution_overlay_verified: bool = False
         if storage_path:
             overlay = Path(storage_path).parent / "CONSTITUTION.md"
+            self._constitution_overlay_path = overlay
             if overlay.exists():
                 try:
-                    self.constitution_text = overlay.read_text(encoding="utf-8")
+                    overlay_bytes = overlay.read_bytes()
+                    self.constitution_text = overlay_bytes.decode("utf-8")
+                    self._constitution_overlay_sha = hashlib.sha256(
+                        overlay_bytes
+                    ).hexdigest()
                     logging.info(
-                        "Loaded per-agent constitution overlay from %s",
-                        overlay,
+                        "Loaded per-agent constitution overlay from %s "
+                        "(sha256=%s, pending anchor verification)",
+                        overlay, self._constitution_overlay_sha[:16],
                     )
                 except OSError as exc:
                     logging.warning(
@@ -952,6 +969,22 @@ class KestrelAgent(
                 self._agent_name = _agent_node.properties.get("name", "Unnamed Agent")
             else:
                 self._agent_name = "Unnamed Agent"
+
+            # Verify the per-agent constitution overlay against its anchor BEFORE
+            # feature discovery (#1722). ComputerUseFeature.initialize() reads
+            # _granted_capabilities() to build its backend; if the overlay were
+            # verified later, a legitimate anchored overlay's grants would be
+            # ignored at feature-init time and the backend would never build.
+            # For a brand-new agent the identity node doesn't exist yet → no
+            # anchor → an overlay (if present) stays unverified until anchored,
+            # which is the correct fail-closed default.
+            try:
+                ok, msg = await self.verify_constitution_overlay()
+                if not ok:
+                    logging.warning("Constitution overlay not trusted: %s", msg)
+            except Exception as e:  # noqa: BLE001 - never block init on this
+                logging.warning("Constitution overlay verification errored: %s", e)
+                self.constitution_overlay_verified = False
 
             # Auto-discover and register features from features/ directory
             # Features can be disabled via KESTREL_DISABLED_FEATURES env var
