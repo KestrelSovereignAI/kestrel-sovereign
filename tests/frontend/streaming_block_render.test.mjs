@@ -187,6 +187,9 @@ test('balanced multi-backtick code span is not treated as unclosed', () => {
     assert.equal(_completeStreamingInline('run `git'), 'run `git`');
     // a balanced code span crossing a newline is not treated as unclosed
     assert.equal(_completeStreamingInline('Use `foo\nbar` now'), 'Use `foo\nbar` now');
+    // an UNCLOSED multi-backtick span closes with a matching run, and the **
+    // inside it is not bolded
+    assert.equal(_completeStreamingInline('Use `` **not bold'), 'Use `` **not bold``');
 });
 
 // --- stable-prefix memoization ----------------------------------------------

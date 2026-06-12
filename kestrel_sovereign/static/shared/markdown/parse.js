@@ -330,11 +330,16 @@ function _stripFences(text) {
     return kept.join('\n');
 }
 
+// A BALANCED inline code span: a maximal backtick run, content, then a matching
+// maximal run. The lookarounds keep the opener/closer runs maximal so a 2-tick
+// opener (``) is never matched as two empty single-tick spans (CommonMark).
+const _INLINE_CODE_RE = /(?<!`)(`+)(?![`])[\s\S]*?(?<!`)\1(?![`])/g;
+
 // Drop inline code spans so their delimiters (a `**` in `` `**` `` can't open
 // emphasis) don't count. Removes closed spans; an UNCLOSED span swallows to
 // end-of-line (its tail is code).
 function _stripInlineCode(text) {
-    let s = text.replace(/(`+)[\s\S]*?\1/g, '');
+    let s = text.replace(_INLINE_CODE_RE, '');
     const tick = s.lastIndexOf('`');
     if (tick !== -1) {
         const nl = s.indexOf('\n', tick);
@@ -400,7 +405,7 @@ function _completeStreamingInline(tail) {
     // backtick span like `` ` `` that contains a literal backtick is balanced),
     // then any remaining backtick run is an unclosed opener — close it with a
     // matching run.
-    const balanced = noFence.replace(/(`+)[\s\S]*?\1/g, '');
+    const balanced = noFence.replace(_INLINE_CODE_RE, '');
     const openTick = balanced.match(/`+/);
     if (openTick) t += openTick[0];
     // The remaining inline constructs must also ignore inline code spans.
