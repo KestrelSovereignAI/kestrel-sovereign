@@ -213,6 +213,14 @@ class FilecoinAdapter:
         Returns:
             Original content bytes
         """
+        # Normalize a SHA-256 lookup key to lowercase so cache lookup AND the
+        # integrity check are case-consistent on case-SENSITIVE filesystems too
+        # (Linux CI/prod). Cache files are written with the lowercase hexdigest,
+        # so an uppercase key would otherwise miss the file. CIDs are
+        # case-sensitive and pass through unchanged (#1725 codex r3).
+        if _looks_like_sha256(content_hash):
+            content_hash = content_hash.lower()
+
         # Try local cache first
         try:
             from_ipfs = False
@@ -249,10 +257,9 @@ class FilecoinAdapter:
             # (a base58/base32 CID, NOT a sha256); those paths skip this check —
             # comparing a sha256 to a CID string would always (wrongly) fail.
             if _looks_like_sha256(content_hash):
+                # content_hash was lowercased above, matching hexdigest().
                 actual = hashlib.sha256(result).hexdigest()
-                # hexdigest() is lowercase; normalize the (possibly uppercase)
-                # caller-supplied digest so a valid uppercase hash isn't rejected.
-                if actual != content_hash.lower():
+                if actual != content_hash:
                     raise ValueError(
                         f"Content integrity check failed for {content_hash[:16]}…: "
                         f"computed {actual[:16]}… (possible cache poisoning / gateway "

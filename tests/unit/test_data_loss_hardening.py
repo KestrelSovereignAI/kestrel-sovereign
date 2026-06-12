@@ -101,8 +101,8 @@ class TestFilecoinIntegrity:
         assert _looks_like_sha256(up) is True
         # The normalized comparison the retrieve path performs must hold.
         assert hashlib.sha256(b"casing matters").hexdigest() == up.lower()
-        # And retrieving by the uppercase key returns the bytes (case-insensitive
-        # FS resolves the cache file; the integrity check normalizes).
+        # Retrieving by the uppercase key works on ALL filesystems: the sha256
+        # lookup key is normalized to lowercase before the cache lookup.
         assert adapter.retrieve_content(up) == b"casing matters"
 
 
