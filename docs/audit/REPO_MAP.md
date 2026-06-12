@@ -55,8 +55,8 @@ Repo entry points and standard project files.
 - **server.py** — Backward-compat shim for ``uvicorn server:app`` from a source clone.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
   - `async def test_providers()`
-- **test_rcs_integration.py** — RCS (RemoteCares + Kestrel) Integration Test Suite — Healthcare Validation CV-005 Simulates exactly what RemoteCares staging sends to Kestrel via the Rasa shim.
-  - `class RCSIntegrationTester`; `async def main()`
+- **test_rasa_shim_integration.py** — Rasa Shim Integration Test Suite — SMS-over-Rasa healthcare validation. Simulates what a Rasa-protocol SMS client sends to Kestrel via the Rasa shim.
+  - `class RasaShimIntegrationTester`; `async def main()`
 - **uv.lock** — —
 
 ## `kestrel_sovereign/`

@@ -1,21 +1,19 @@
 """
 Rasa-compatible webhook shim for Kestrel AI.
 
-Allows RemoteCares (and any Rasa-protocol client) to send SMS messages to Kestrel
-without changing any client-side code. Just point RasaAI:Endpoint at the Kestrel
-host and this endpoint handles the protocol translation.
+Allows any Rasa-protocol client to send SMS messages to Kestrel without
+changing any client-side code. Just point the Rasa REST endpoint at the
+Kestrel host and this endpoint handles the protocol translation.
 
 Rasa webhook protocol:
   POST /webhooks/rest/webhook
-  Body: {"sender": "<patientGuid>", "message": "<sms text>"}
-  Response: [{"recipient_id": "<patientGuid>", "text": "<response>"}]
+  Body: {"sender": "<sender_id>", "message": "<sms text>"}
+  Response: [{"recipient_id": "<sender_id>", "text": "<response>"}]
 
 Kestrel maps:
-  sender → session_id (conversation continuity per patient)
+  sender → session_id (conversation continuity per sender)
   message → user_input
   response → text in Rasa response array
-
-Reference: jaslogic1/RemoteCares#42
 """
 import asyncio
 import logging

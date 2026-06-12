@@ -609,8 +609,8 @@ async def agent_logs(request: Request, agent_id: str, lines: int = 50):
     return PlainTextResponse(content=log_text)
 
 
-# --- Rasa Webhook Proxy (for RemoteCares RCS integration) ---
-# RCS calls /webhooks/rest/webhook directly; forward to the first agent.
+# --- Rasa Webhook Proxy (for Rasa-protocol SMS clients) ---
+# Rasa SMS clients call /webhooks/rest/webhook directly; forward to the first agent.
 
 
 @app.post("/webhooks/rest/webhook")
