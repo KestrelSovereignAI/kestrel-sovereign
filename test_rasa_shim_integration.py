@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RCS (RemoteCares + Kestrel) Integration Test Suite — Healthcare Validation CV-005
-Simulates exactly what RemoteCares staging sends to Kestrel via the Rasa shim.
+Rasa Shim Integration Test Suite — SMS-over-Rasa healthcare validation.
+Simulates what a Rasa-protocol SMS client sends to Kestrel via the Rasa shim.
 
 What this tests:
   - The /webhooks/rest/webhook endpoint (the inbound SMS path)
-  - Correct Rasa response format (RCS depends on this)
-  - Per-patient session isolation
+  - Correct Rasa response format (SMS clients depend on this)
+  - Per-sender session isolation
   - Healthcare message handling + safety
   - SMS-appropriate response length (no markdown, 1-3 sentences)
   - Error handling (missing sender, empty message)
 
 What this does NOT test (requires real phones — manual only):
-  - Twilio actually delivering an SMS
-  - RCS sending the webhook in the first place
-  - Outbound Kestrel → RCS delivery
-  - The RCS dashboard/conversation log
+  - The SMS gateway actually delivering an SMS
+  - The client sending the webhook in the first place
+  - Outbound Kestrel → SMS-client delivery
+  - Any client-side dashboard/conversation log
 
-Run: python test_rcs_integration.py
-Run against staging: python test_rcs_integration.py --url https://<staging-kestrel-url>
+Run: python test_rasa_shim_integration.py
+Run against a remote host: python test_rasa_shim_integration.py --url https://<kestrel-url>
 """
 
 import asyncio
@@ -39,19 +39,19 @@ DEFAULT_URL = "http://localhost:8888"
 WEBHOOK_PATH = "/webhooks/rest/webhook"
 TIMEOUT = 90.0
 
-# Fake patient GUIDs — same format RemoteCares uses
+# Fake sender GUIDs — the per-patient session-key format the shim expects
 PATIENT_A = "a1b2c3d4-0001-0001-0001-000000000001"
 PATIENT_B = "a1b2c3d4-0002-0002-0002-000000000002"
 
 
-class RCSIntegrationTester:
+class RasaShimIntegrationTester:
     def __init__(self, base_url: str):
         self.base_url = base_url.rstrip("/")
         self.client = httpx.AsyncClient(timeout=TIMEOUT)
         self.results: List[Dict[str, Any]] = []
 
     async def post_webhook(self, sender: str, message: str) -> dict:
-        """Post to /webhooks/rest/webhook exactly as RCS does."""
+        """Post to /webhooks/rest/webhook exactly as a Rasa SMS client does."""
         resp = await self.client.post(
             f"{self.base_url}{WEBHOOK_PATH}",
             json={"sender": sender, "message": message},
@@ -99,7 +99,7 @@ class RCSIntegrationTester:
 
     # ── Test 2: Rasa response format ──────────────────────────────────────────
     async def test_rasa_response_format(self):
-        """RCS parses [{"recipient_id": "...", "text": "..."}] — exact format required."""
+        """SMS clients parse [{"recipient_id": "...", "text": "..."}] — exact format required."""
         print("\n[Test 2] Rasa Response Format")
         try:
             result = await self.post_webhook(PATIENT_A, "Hello")
@@ -160,7 +160,7 @@ class RCSIntegrationTester:
             if result["status_code"] == 200 and result["body"]:
                 text = result["body"][0].get("text", "")
 
-                # No markdown — RCS patients see raw text, not rendered markdown
+                # No markdown — SMS recipients see raw text, not rendered markdown
                 markdown_patterns = [r'\*\*', r'^#+\s', r'^-\s', r'```']
                 has_markdown = any(re.search(p, text, re.MULTILINE) for p in markdown_patterns)
                 if not has_markdown:
@@ -192,7 +192,7 @@ class RCSIntegrationTester:
 
     # ── Test 4: Per-patient session isolation ─────────────────────────────────
     async def test_session_isolation(self):
-        """Each patient GUID must have its own isolated conversation."""
+        """Each sender GUID must have its own isolated conversation."""
         print("\n[Test 4] Per-Patient Session Isolation")
         try:
             # Patient A establishes context
@@ -263,7 +263,7 @@ class RCSIntegrationTester:
 
     # ── Test 6: Error handling ────────────────────────────────────────────────
     async def test_error_handling(self):
-        """Confirm the endpoint fails gracefully — RCS must handle errors."""
+        """Confirm the endpoint fails gracefully — SMS clients must handle errors."""
         print("\n[Test 6] Error Handling")
         try:
             # Empty message — should return 400
@@ -275,7 +275,7 @@ class RCSIntegrationTester:
                 self.log("Errors", "Empty message returns 400", "PASS")
             else:
                 self.log("Errors", "Empty message returns 400", "WARN",
-                         f"Got HTTP {resp.status_code} — RCS may send garbage to patients")
+                         f"Got HTTP {resp.status_code} — client may send garbage to patients")
 
             # Missing sender — should return 400 or 422
             resp = await self.client.post(
@@ -293,7 +293,7 @@ class RCSIntegrationTester:
 
     # ── Test 7: Concurrent patients ───────────────────────────────────────────
     async def test_concurrent_patients(self):
-        """Multiple patients messaging at the same time — staging load simulation."""
+        """Multiple patients messaging at the same time — load simulation."""
         print("\n[Test 7] Concurrent Patients (Load)")
         patients = [f"patient-concurrent-{i:04d}-guid-placeholder" for i in range(5)]
         messages = [
@@ -330,7 +330,7 @@ class RCSIntegrationTester:
     # ── Summary ───────────────────────────────────────────────────────────────
     def print_summary(self):
         print("\n" + "="*60)
-        print("CV-005 RCS INTEGRATION TEST SUMMARY")
+        print("RASA SHIM INTEGRATION TEST SUMMARY")
         print("="*60)
 
         total = len(self.results)
@@ -358,10 +358,10 @@ class RCSIntegrationTester:
                         print(f"     {r['details'][:100]}")
 
         print("\n" + "="*60)
-        print("MANUAL TESTS STILL REQUIRED (see HEALTHCARE_STAGING_TEST_PLAN.md)")
+        print("MANUAL TESTS STILL REQUIRED (real phones / SMS gateway)")
         print("="*60)
 
-        with open("rcs_integration_test_results.json", "w", encoding="utf-8") as f:
+        with open("rasa_shim_integration_test_results.json", "w", encoding="utf-8") as f:
             json.dump({
                 "summary": {
                     "total": total, "passed": passed,
@@ -372,11 +372,11 @@ class RCSIntegrationTester:
                 },
                 "results": self.results
             }, f, indent=2)
-        print("Results saved to: rcs_integration_test_results.json")
+        print("Results saved to: rasa_shim_integration_test_results.json")
 
     async def run(self):
         print("="*60)
-        print("CV-005 — RCS + KESTREL INTEGRATION TEST SUITE")
+        print("RASA SHIM + KESTREL INTEGRATION TEST SUITE")
         print("="*60)
         print(f"Target: {self.base_url}")
         print(f"Webhook: {self.base_url}{WEBHOOK_PATH}")
@@ -396,12 +396,12 @@ class RCSIntegrationTester:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="RCS Integration Tests")
+    parser = argparse.ArgumentParser(description="Rasa Shim Integration Tests")
     parser.add_argument("--url", default=DEFAULT_URL,
                         help=f"Kestrel base URL (default: {DEFAULT_URL})")
     args = parser.parse_args()
 
-    tester = RCSIntegrationTester(args.url)
+    tester = RasaShimIntegrationTester(args.url)
     try:
         await tester.run()
     except KeyboardInterrupt:
