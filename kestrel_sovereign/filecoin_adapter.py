@@ -250,7 +250,9 @@ class FilecoinAdapter:
             # comparing a sha256 to a CID string would always (wrongly) fail.
             if _looks_like_sha256(content_hash):
                 actual = hashlib.sha256(result).hexdigest()
-                if actual != content_hash:
+                # hexdigest() is lowercase; normalize the (possibly uppercase)
+                # caller-supplied digest so a valid uppercase hash isn't rejected.
+                if actual != content_hash.lower():
                     raise ValueError(
                         f"Content integrity check failed for {content_hash[:16]}…: "
                         f"computed {actual[:16]}… (possible cache poisoning / gateway "

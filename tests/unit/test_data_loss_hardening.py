@@ -89,6 +89,22 @@ class TestFilecoinIntegrity:
         assert _looks_like_sha256("A" * 64) is True   # case-insensitive
         assert _looks_like_sha256("z" * 64) is False  # non-hex
 
+    def test_uppercase_sha256_key_still_verifies(self, tmp_path):
+        """#1725 codex r2: an UPPERCASE sha256 lookup key must not be rejected by
+        the integrity check (hexdigest() is lowercase — normalize before
+        comparing). Verified directly against _decode_and_verify-style flow."""
+        from kestrel_sovereign.filecoin_adapter import _looks_like_sha256
+        import hashlib
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+        r = adapter.store_content(b"casing matters", storage_tier=StorageTier.LOCAL_ONLY)
+        up = r.content_hash.upper()
+        assert _looks_like_sha256(up) is True
+        # The normalized comparison the retrieve path performs must hold.
+        assert hashlib.sha256(b"casing matters").hexdigest() == up.lower()
+        # And retrieving by the uppercase key returns the bytes (case-insensitive
+        # FS resolves the cache file; the integrity check normalizes).
+        assert adapter.retrieve_content(up) == b"casing matters"
+
 
 # ---------------------------------------------------------------------------
 # Inception: --force gates DB overwrite
