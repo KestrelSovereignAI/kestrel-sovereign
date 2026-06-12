@@ -533,6 +533,28 @@ class TestChangeAwareSnapshot:
         await sync.stop()
 
     @pytest.mark.asyncio
+    async def test_partial_failure_does_not_skip_next_retry(self, temp_db, tmp_path):
+        """If one target fails, the fingerprint must NOT advance — the next
+        change-aware snapshot retries rather than skipping the failed target
+        as 'unchanged' on an idle DB."""
+        good = MockSyncTarget(name="good")
+        bad = MockSyncTarget(name="bad", state=MockSyncState(should_fail=True))
+        sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
+        sync.add_target(good)
+        sync.add_target(bad)
+        await sync.start()
+
+        first = await sync.snapshot_if_changed()
+        assert first["good"].success and not first["bad"].success
+
+        # DB unchanged, but because 'bad' failed the pass must run again (retry),
+        # NOT skip as "__unchanged__".
+        second = await sync.snapshot_if_changed()
+        assert "__unchanged__" not in second
+        assert "bad" in second  # the failed target was retried
+        await sync.stop()
+
+    @pytest.mark.asyncio
     async def test_force_snapshot_always_runs(self, temp_db, mock_target, tmp_path):
         """force_snapshot keeps its unconditional contract (explicit backups)."""
         sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))

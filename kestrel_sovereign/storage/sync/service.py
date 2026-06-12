@@ -218,10 +218,15 @@ class SyncService:
                 )
             }
         results = await self.force_snapshot()
+        # Advance the fingerprint ONLY when every target succeeded. If any
+        # target failed (transient per-target outage), leave the fingerprint
+        # so the next cycle retries rather than skipping the failed target as
+        # "unchanged" until some unrelated DB write happens to bump the
+        # fingerprint. (No targets → all() is True → record, nothing to retry.)
         if (
             fingerprint is not None
             and self._state is not None
-            and any(r.success for r in results.values())
+            and all(r.success for r in results.values())
         ):
             self._state.last_fingerprint = fingerprint
             await self._save_state()
