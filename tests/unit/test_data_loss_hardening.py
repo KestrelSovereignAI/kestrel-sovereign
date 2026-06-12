@@ -71,6 +71,24 @@ class TestFilecoinIntegrity:
         r = adapter.store_content(b"hello world", storage_tier=StorageTier.LOCAL_ONLY)
         assert adapter.retrieve_content(r.content_hash) == b"hello world"
 
+    def test_cid_keyed_lookup_skips_sha256_check(self, tmp_path):
+        """#1725 codex r1: callers that pass a CID as content_hash (CID-as-key)
+        must NOT trip the sha256 integrity check (a sha256 never equals a CID)."""
+        import zlib
+        adapter = FilecoinAdapter(cache_dir=str(tmp_path / "cache"))
+        cid = "QmSomeBase58CidNotASha256Hash"  # not 64-hex
+        # Place content in the cache under the CID key (as the IPFS-cache path does).
+        (adapter.cache_dir / f"{cid}.cache").write_bytes(zlib.compress(b"remote payload"))
+        # Retrieving by the CID key returns the bytes WITHOUT an integrity error.
+        assert adapter.retrieve_content(cid) == b"remote payload"
+
+    def test_looks_like_sha256(self):
+        from kestrel_sovereign.filecoin_adapter import _looks_like_sha256
+        assert _looks_like_sha256("a" * 64) is True
+        assert _looks_like_sha256("QmCid") is False
+        assert _looks_like_sha256("A" * 64) is True   # case-insensitive
+        assert _looks_like_sha256("z" * 64) is False  # non-hex
+
 
 # ---------------------------------------------------------------------------
 # Inception: --force gates DB overwrite

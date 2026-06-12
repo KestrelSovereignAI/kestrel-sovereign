@@ -33,6 +33,17 @@ from kestrel_sovereign.storage.providers.base import StorageTier, StorageResult
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
+def _looks_like_sha256(value: str) -> bool:
+    """True iff ``value`` is a 64-char lowercase-hex SHA-256 digest.
+
+    Used to decide whether ``retrieve_content``'s integrity check applies — some
+    callers pass an IPFS CID (base58 ``Qm…`` / base32 ``bafy…``) as the lookup
+    key, which is NOT a sha256 and must not be hashed-compared (#1725)."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(c in "0123456789abcdef" for c in value.lower())
+
+
 class FilecoinAdapter:
     """Adapter for integrating Filecoin/IPFS with Kestrel's storage"""
     
@@ -229,19 +240,22 @@ class FilecoinAdapter:
             else:
                 result = decompressed_content
 
-            # Integrity check (#1725): the retrieved bytes — especially from an
-            # untrusted IPFS gateway — MUST hash to the expected content_hash.
-            # ``content_hash`` is sha256 of the original content, so we verify the
-            # fully-decoded (decompressed + decrypted) result. This detects cache
-            # poisoning / gateway substitution before the caller trusts the bytes,
-            # and we only cache IPFS content AFTER it verifies (no poison cached).
-            actual = hashlib.sha256(result).hexdigest()
-            if actual != content_hash:
-                raise ValueError(
-                    f"Content integrity check failed for {content_hash[:16]}…: "
-                    f"computed {actual[:16]}… (possible cache poisoning / gateway "
-                    f"substitution)"
-                )
+            # Integrity check (#1725): when the lookup key is a genuine SHA-256
+            # content hash, the retrieved bytes — especially from an untrusted
+            # IPFS gateway — MUST hash back to it. We verify the fully-decoded
+            # (decompressed + decrypted) result to detect cache poisoning /
+            # gateway substitution, and only cache IPFS content AFTER it verifies.
+            # NOTE: some callers retrieve by CID and pass ``content_hash=cid``
+            # (a base58/base32 CID, NOT a sha256); those paths skip this check —
+            # comparing a sha256 to a CID string would always (wrongly) fail.
+            if _looks_like_sha256(content_hash):
+                actual = hashlib.sha256(result).hexdigest()
+                if actual != content_hash:
+                    raise ValueError(
+                        f"Content integrity check failed for {content_hash[:16]}…: "
+                        f"computed {actual[:16]}… (possible cache poisoning / gateway "
+                        f"substitution)"
+                    )
 
             if from_ipfs:
                 # This content is durably on IPFS (we just fetched it by CID), so
