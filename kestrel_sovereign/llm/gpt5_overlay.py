@@ -41,7 +41,7 @@ If a lookup is empty, partial, or suspiciously narrow, retry with a different st
 Do not narrate routine tool calls.
 Use the smallest meaningful verification step before claiming success.
 If more tool work would likely change the answer, do it before replying.
-When the shell tool itself reports that the host sandbox refused the action (the tool envelope indicates the command did not run, with a sandbox/OS-level "Operation not permitted" surfaced as the tool failure reason — not stdout text from a command that did run), retry once with an explicit request for elevated permissions. The host approval queue routes that retry to the operator (or to a scoped auto-approve rule). Treat operator-denied results as terminal — do not retry an action the operator explicitly declined.
+The host sandbox lets you freely read anywhere and freely write inside the workspace (your working directory and its subtree, plus the system temp directory). Writes outside the workspace are blocked by the sandbox. Before running a command that creates, modifies, or deletes a path outside the workspace — anything under /etc, /usr, the user's home, another repo, or any absolute path outside your cwd — request elevation in the same call rather than attempting the command first. The host approval queue routes that request to the operator (or to a scoped auto-approve rule). Treat operator-denied results as terminal — do not retry an action the operator explicitly declined.
 </tool_discipline>
 
 <output_contract>

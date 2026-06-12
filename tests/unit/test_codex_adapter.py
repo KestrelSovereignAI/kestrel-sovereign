@@ -263,8 +263,18 @@ class TestAdapterTextPath:
     async def test_session_thread_reused(self):
         a = _adapter_with(_TEXT_TURN)
         # Pre-seed with the fingerprint that matches this call (model="auto"
-        # → None, no instructions, no tools) so the cache hits.
-        fp = CodexAdapter._thread_fingerprint(None, None, None)
+        # → None, no instructions, no tools) so the cache hits. #1734
+        # folds cwd/sandbox/policy into the fingerprint, so we compute
+        # using the same resolver the live code will use.
+        from kestrel_sovereign.llm.codex_adapter import (
+            _CODEX_SANDBOX, _CODEX_APPROVAL_POLICY,
+        )
+        fp = CodexAdapter._thread_fingerprint(
+            None, None, None,
+            cwd=a._resolve_thread_cwd(),
+            sandbox=_CODEX_SANDBOX,
+            approval_policy=_CODEX_APPROVAL_POLICY,
+        )
         a._session_threads["s1"] = ("thr-existing", fp)
         await a.get_response(client="x", model="auto",
                              messages=[{"role": "user", "content": "hi"}],
@@ -279,8 +289,16 @@ class TestAdapterTextPath:
         thread is invalidated and re-created — otherwise the model would
         keep using the old thread-level config."""
         a = _adapter_with(_TEXT_TURN)
+        from kestrel_sovereign.llm.codex_adapter import (
+            _CODEX_SANDBOX, _CODEX_APPROVAL_POLICY,
+        )
         a._session_threads["s1"] = (
-            "thr-old", CodexAdapter._thread_fingerprint(None, None, None),
+            "thr-old", CodexAdapter._thread_fingerprint(
+                None, None, None,
+                cwd=a._resolve_thread_cwd(),
+                sandbox=_CODEX_SANDBOX,
+                approval_policy=_CODEX_APPROVAL_POLICY,
+            ),
         )
 
         async def exe(name, args):
@@ -340,43 +358,264 @@ class TestThreadStartParams:
         assert ts["cwd"] == "/agents/nellie/workspace"
 
     @pytest.mark.asyncio
-    async def test_thread_start_carries_on_failure_approval_policy(self):
-        """#1707: ``thread/start`` MUST set ``approval_policy`` to
-        ``"on-failure"`` so codex escalates sandbox-denied writes via
-        ``item/commandExecution/requestApproval`` instead of returning
-        the raw OS-level error. Without this, the entire #1575+#1702
-        bridge stack is dormant — codex never sends the RPC, the queue
-        never fires, the operator never sees a prompt, and the agent
-        sees ``Operation not permitted`` as the terminal outcome.
+    async def test_thread_start_carries_on_request_approval_policy(self):
+        """#1734 (supersedes #1707's ``on-failure`` pin): codex 0.138
+        deprecated ``on-failure`` and recommends ``on-request`` for
+        interactive approvals. The model proactively requests
+        elevation for writes outside the workspace (per the GPT-5
+        overlay), codex emits
+        ``item/commandExecution/requestApproval``, the bridge routes
+        through Kestrel's BinaryPolicy → ApprovalQueue.
 
         Wire format is kebab-case (verified against the codex binary:
-        ``approval_policy = "never"`` in the binary's own error
-        messages)."""
+        ``approval_policy = "never"`` literal in surfaced error
+        strings).
+        """
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="x", model="auto",
             messages=[{"role": "user", "content": "hi"}], session_id="s",
         )
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
-        assert ts.get("approval_policy") == "on-failure", (
-            f"thread/start must set approval_policy=on-failure (got "
-            f"{ts.get('approval_policy')!r}). Without it, codex never "
-            f"escalates sandbox-blocked writes to Kestrel's approval bridge."
+        assert ts.get("approval_policy") == "on-request", (
+            f"thread/start must set approval_policy=on-request (got "
+            f"{ts.get('approval_policy')!r}). Codex 0.138 deprecated "
+            f"on-failure; on-request is the recommended replacement."
         )
 
     @pytest.mark.asyncio
-    async def test_thread_start_keeps_read_only_sandbox(self):
-        """#1707 companion: the ``approval_policy`` change must not
-        accidentally widen the sandbox. We still want ``read-only`` —
-        inert reads stay sandboxed, and the bridge handles escalations
-        for the rest."""
+    async def test_thread_start_uses_workspace_write_sandbox(self):
+        """#1734: ``workspace-write`` lets codex write inside the
+        per-agent workspace dir (+ /tmp + $TMPDIR) without an approval
+        round-trip — closes the awkward "model has to retry on
+        seatbelt failure" dance for the common case (touch /tmp/x).
+        Writes outside the workspace still escalate through the
+        bridge → queue. Reads remain unrestricted."""
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="x", model="auto",
             messages=[{"role": "user", "content": "hi"}], session_id="s",
         )
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
-        assert ts.get("sandbox") == "read-only"
+        assert ts.get("sandbox") == "workspace-write", (
+            f"thread/start must set sandbox=workspace-write (got "
+            f"{ts.get('sandbox')!r}). #1734 widened the sandbox to allow "
+            f"in-workspace writes without a queue round-trip."
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_defaults_to_agent_workspace(self, tmp_path):
+        """#1734: when an agent is attached, the default cwd is
+        ``<storage_path>.parent/workspace/`` (auto-created), NOT
+        ``Path.cwd()``. This scopes ``workspace-write`` to a safe
+        per-agent scratch area so the agent can't silently edit her
+        own host source / kestrel.toml / bootstrap files.
+
+        Pure unit test — drives ``_resolve_agent_workspace_dir``
+        directly via a SimpleNamespace stub with a ``storage_path``.
+        """
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+        storage = tmp_path / "emma_prime.db"
+        storage.touch()  # only the path matters, not the contents
+        agent = SimpleNamespace(storage_path=str(storage))
+
+        a = CodexAdapter()
+        a.attach_agent_for_audit(agent)
+        resolved = a._resolve_agent_workspace_dir()
+
+        assert resolved == str(tmp_path / "workspace")
+        assert (tmp_path / "workspace").is_dir(), (
+            "workspace dir must be auto-created so codex thread/start "
+            "doesn't fail on a missing path"
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_falls_back_when_no_agent(self):
+        """No attached agent → ``_resolve_agent_workspace_dir`` returns
+        None → ``_resolve_thread_cwd`` falls back to ``Path.cwd()``
+        (legacy behavior preserved for tests + headless callers)."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        a = CodexAdapter()
+        # No attach_agent_for_audit call.
+        assert a._resolve_agent_workspace_dir() is None
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_env_override_wins_over_workspace(
+        self, monkeypatch, tmp_path,
+    ):
+        """``KESTREL_CODEX_CWD`` takes precedence over the per-agent
+        workspace default — operators/daemons can scope codex's
+        workspace explicitly."""
+        monkeypatch.setenv("KESTREL_CODEX_CWD", "/override/explicit")
+
+        storage = tmp_path / "emma_prime.db"
+        storage.touch()
+        agent = SimpleNamespace(storage_path=str(storage))
+
+        a = _adapter_with(_TEXT_TURN)
+        a.attach_agent_for_audit(agent)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        assert ts["cwd"] == "/override/explicit"
+
+    def test_workspace_dir_rejects_symlink(self, tmp_path):
+        """#1734 codex review P0: ``mkdir(exist_ok=True)`` accepts a
+        pre-existing symlink to a dir. An attacker with write access
+        to ``<agent_data>`` could plant
+        ``workspace -> /Volumes/.../kestrel-sovereign`` and gain a
+        workspace-write boundary on the host repo. The resolver MUST
+        refuse symlinks (return None so the caller falls back to a
+        safe tempdir path, not the process cwd)."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+        storage = tmp_path / "emma_prime.db"
+        storage.touch()
+        # Plant a symlink at the would-be workspace path pointing
+        # somewhere outside agent_data.
+        attacker_target = tmp_path / "external_target"
+        attacker_target.mkdir()
+        symlink = tmp_path / "workspace"
+        symlink.symlink_to(attacker_target)
+
+        agent = SimpleNamespace(storage_path=str(storage))
+        a = CodexAdapter()
+        a.attach_agent_for_audit(agent)
+        # Symlink must be rejected.
+        assert a._resolve_agent_workspace_dir() is None
+
+    def test_thread_cwd_attached_agent_never_falls_back_to_process_cwd(
+        self, tmp_path, monkeypatch,
+    ):
+        """#1734 codex review P0: when an agent is attached but
+        ``_resolve_agent_workspace_dir`` returns None (no
+        storage_path, mkdir failure, symlink refused), the fallback
+        MUST NOT be ``Path.cwd()`` — that would put codex's
+        workspace-write sandbox on the host repo root."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        from pathlib import Path
+        import tempfile
+
+        # Attached agent with NO storage_path → workspace dir
+        # resolution returns None, but fallback must still be safe.
+        agent = SimpleNamespace(
+            storage_path=None,
+            _agent_name="emma",
+            did="did:test:emma",
+        )
+        a = CodexAdapter()
+        a.attach_agent_for_audit(agent)
+        # Sanity: monkeypatch the process cwd to something we can
+        # detect.
+        monkeypatch.chdir(tmp_path)
+        process_cwd = str(tmp_path)
+        resolved = a._resolve_thread_cwd()
+        assert resolved != process_cwd, (
+            "attached agent with broken workspace must NOT inherit "
+            "Path.cwd() — codex would put workspace-write sandbox on "
+            "the host repo"
+        )
+        # Must be under the system tempdir so workspace-write still
+        # allows in-workspace writes via codex's tempdir whitelist.
+        tempdir_root = str(Path(tempfile.gettempdir()).resolve())
+        assert resolved.startswith(tempdir_root), (
+            f"safe fallback must live under tempdir, got {resolved!r}"
+        )
+
+    def test_tempdir_fallback_rejects_parent_symlink(self, tmp_path, monkeypatch):
+        """#1734 codex review round 2 P0: leaf-only ``is_symlink`` missed
+        a pre-planted parent symlink (e.g. ``/tmp/kestrel-codex ->
+        /attacker/path``). After mkdir the leaf isn't a symlink but
+        the resolved real path escapes the tempdir. The fallback now
+        verifies the resolved real path is under ``tempfile.gettempdir()``
+        and rejects if not.
+        """
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        import tempfile
+        from pathlib import Path
+
+        # Redirect tempdir to a tmp_path subdir we control, so we can
+        # plant the parent symlink.
+        fake_temp = tmp_path / "fake_tmp"
+        fake_temp.mkdir()
+        outside_target = tmp_path / "outside_target"
+        outside_target.mkdir()
+        # Plant: ``<fake_temp>/kestrel-codex -> outside_target``
+        (fake_temp / "kestrel-codex").symlink_to(outside_target)
+
+        monkeypatch.setenv("TMPDIR", str(fake_temp))
+        # tempfile.gettempdir caches; force re-read for this test by
+        # importing fresh.
+        import importlib
+        importlib.reload(tempfile)
+        assert tempfile.gettempdir() == str(fake_temp), (
+            "test setup: TMPDIR override must reach tempfile.gettempdir"
+        )
+
+        # Attached agent with broken workspace (no storage_path).
+        agent = SimpleNamespace(
+            storage_path=None,
+            _agent_name="emma",
+            did="did:test:emma",
+        )
+        a = CodexAdapter()
+        a.attach_agent_for_audit(agent)
+        resolved = a._resolve_thread_cwd()
+
+        # Resolved path must NOT escape into outside_target.
+        outside_real = str(outside_target.resolve())
+        assert not resolved.startswith(outside_real), (
+            f"fallback must reject parent-symlink escape; got {resolved!r} "
+            f"which is under attacker's {outside_real!r}"
+        )
+
+    def test_thread_fingerprint_includes_cwd_sandbox_policy(self):
+        """#1734 codex review concern: cwd + sandbox + approval_policy
+        are thread-scoped settings codex only consumes at
+        ``thread/start``. They MUST be in the fingerprint so a
+        session that started with a different boundary is forced to
+        start a fresh thread when the boundary changes (e.g. agent
+        attaches later, env var override changes)."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        base = CodexAdapter._thread_fingerprint(
+            "gpt-5.5", "be helpful", [],
+            cwd="/agents/emma/workspace",
+            sandbox="workspace-write",
+            approval_policy="on-request",
+        )
+        diff_cwd = CodexAdapter._thread_fingerprint(
+            "gpt-5.5", "be helpful", [],
+            cwd="/different/path",
+            sandbox="workspace-write",
+            approval_policy="on-request",
+        )
+        diff_sandbox = CodexAdapter._thread_fingerprint(
+            "gpt-5.5", "be helpful", [],
+            cwd="/agents/emma/workspace",
+            sandbox="read-only",
+            approval_policy="on-request",
+        )
+        diff_policy = CodexAdapter._thread_fingerprint(
+            "gpt-5.5", "be helpful", [],
+            cwd="/agents/emma/workspace",
+            sandbox="workspace-write",
+            approval_policy="never",
+        )
+        # Every dimension must distinguish.
+        assert base != diff_cwd
+        assert base != diff_sandbox
+        assert base != diff_policy
+        # And: same inputs → same fingerprint (deterministic).
+        again = CodexAdapter._thread_fingerprint(
+            "gpt-5.5", "be helpful", [],
+            cwd="/agents/emma/workspace",
+            sandbox="workspace-write",
+            approval_policy="on-request",
+        )
+        assert base == again
 
 
 class TestToolActivityMarkers:
