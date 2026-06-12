@@ -45,6 +45,24 @@ REVISE_SENTINEL_SUFFIX = "\x1e"
 # hash). Keep peak memory for one turn's pasted images bounded.
 _MAX_EAGER_IMAGES = 6
 _MAX_EAGER_IMAGE_BYTES = 12 * 1024 * 1024  # 12 MB (a touch over the 10 MB upload cap)
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """Magic-number check that ``data`` is a real PNG/JPEG/GIF/WEBP.
+
+    The client's declared ``kind``/``mime`` are not trusted: a tampered ref
+    could mark a stored PDF/text hash as an inline image, and the image
+    pipeline defaults unknown bytes to JPEG, so a non-image would be shipped to
+    a vision provider as a bogus image. Sniff the actual bytes instead — only
+    these four signatures are accepted for eager vision.
+    """
+    return (
+        data.startswith(b"\x89PNG")
+        or data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"GIF87a")
+        or data.startswith(b"GIF89a")
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    )
 THINKING_SENTINEL_PREFIX = "\x1eKESTREL:THINK:"
 THINKING_SENTINEL_SUFFIX = "\x1e"
 # #1659: tool activity is the last signal class still emitted as
@@ -386,6 +404,14 @@ class StreamingMixin:
                     "Eager vision: attachment %s is %d bytes (> %d cap); "
                     "skipped.", content_hash[:12], len(data),
                     _MAX_EAGER_IMAGE_BYTES,
+                )
+                continue
+            if not _looks_like_image(data):
+                # Client lied about kind/mime, or the file isn't really an
+                # image — don't ship non-image bytes to a vision provider.
+                logging.warning(
+                    "Eager vision: attachment %s is not a recognized image "
+                    "(PNG/JPEG/GIF/WEBP); skipped.", content_hash[:12],
                 )
                 continue
             images.append(data)

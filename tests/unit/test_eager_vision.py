@@ -159,7 +159,7 @@ def test_apply_eager_vision_errors_when_vision_adapter_lacks_helper(caplog):
 async def test_resolve_eager_images_caps_count():
     from kestrel_sovereign.agent.streaming import StreamingMixin, _MAX_EAGER_IMAGES
     agent = MagicMock()
-    agent.storage.retrieve_file = AsyncMock(return_value=b"img")
+    agent.storage.retrieve_file = AsyncMock(return_value=_PNG)
     resolve = StreamingMixin._resolve_eager_images.__get__(agent)
     atts = [{"hash": f"{i:064x}", "kind": "image", "inline": True}
             for i in range(_MAX_EAGER_IMAGES + 3)]
@@ -320,7 +320,7 @@ async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
 async def test_resolve_eager_images_resolves_inline_images_only():
     from kestrel_sovereign.agent.streaming import StreamingMixin
     agent = MagicMock()
-    agent.storage.retrieve_file = AsyncMock(return_value=b"IMGBYTES")
+    agent.storage.retrieve_file = AsyncMock(return_value=_PNG)
     resolve = StreamingMixin._resolve_eager_images.__get__(agent)
     h1, h2, h3 = "a" * 64, "b" * 64, "c" * 64
     out = await resolve([
@@ -328,8 +328,20 @@ async def test_resolve_eager_images_resolves_inline_images_only():
         {"hash": h2, "kind": "image", "inline": False},     # lazy image → skipped
         {"hash": h3, "kind": "document", "inline": True},   # document → skipped
     ])
-    assert out == [b"IMGBYTES"]
+    assert out == [_PNG]
     agent.storage.retrieve_file.assert_awaited_once_with(h1)
+
+
+@pytest.mark.asyncio
+async def test_resolve_eager_images_skips_non_image_bytes():
+    """Even if a ref is marked inline image, bytes that aren't a real image
+    (e.g. a tampered ref pointing at a PDF) must be skipped, not shipped."""
+    from kestrel_sovereign.agent.streaming import StreamingMixin
+    agent = MagicMock()
+    agent.storage.retrieve_file = AsyncMock(return_value=b"%PDF-1.4 not an image")
+    resolve = StreamingMixin._resolve_eager_images.__get__(agent)
+    out = await resolve([{"hash": "a" * 64, "kind": "image", "inline": True}])
+    assert out == []
 
 
 @pytest.mark.asyncio
@@ -365,7 +377,11 @@ def test_sanitize_attachments_inline_flag():
         {"hash": h, "kind": "image", "mime": "image/png", "inline": True},
         {"hash": h, "kind": "image", "inline": False},
         {"hash": h, "kind": "document", "inline": True},   # docs can't ride inline
+        {"hash": h, "kind": "image", "inline": True},      # image but NO mime
+        {"hash": h, "kind": "image", "mime": "application/pdf", "inline": True},  # non-image mime
     ])
     assert out[0]["inline"] is True
     assert out[1]["inline"] is False
     assert out[2]["inline"] is False
+    assert out[3]["inline"] is False    # missing mime → not inline
+    assert out[4]["inline"] is False    # non-image mime → not inline

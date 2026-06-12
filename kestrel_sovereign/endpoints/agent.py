@@ -148,14 +148,22 @@ def _sanitize_attachments(raw) -> list:
         if kind not in ("image", "document"):
             kind = "document"
         mime = item.get("mime")
+        safe_mime = mime if (isinstance(mime, str) and mime in _ATTACHMENT_TYPES) else None
         out.append({
             "hash": h,
             "kind": kind,
-            "mime": mime if (isinstance(mime, str) and mime in _ATTACHMENT_TYPES) else None,
+            "mime": safe_mime,
             "name": (str(item.get("name") or "attachment"))[:255],
-            # #1662 eager vision: only images can be sent inline (as vision
-            # input this turn); documents are always lazy refs.
-            "inline": bool(item.get("inline")) and kind == "image",
+            # #1662 eager vision: inline (sent as vision input this turn)
+            # requires an image kind AND a trusted image MIME. This is a cheap
+            # first filter — the bytes are re-validated by magic number before
+            # they're sent, so a tampered ref can't smuggle a document through.
+            "inline": (
+                bool(item.get("inline"))
+                and kind == "image"
+                and bool(safe_mime)
+                and safe_mime.startswith("image/")
+            ),
         })
     return out
 
