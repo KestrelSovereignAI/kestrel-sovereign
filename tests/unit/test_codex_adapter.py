@@ -340,43 +340,109 @@ class TestThreadStartParams:
         assert ts["cwd"] == "/agents/nellie/workspace"
 
     @pytest.mark.asyncio
-    async def test_thread_start_carries_on_failure_approval_policy(self):
-        """#1707: ``thread/start`` MUST set ``approval_policy`` to
-        ``"on-failure"`` so codex escalates sandbox-denied writes via
-        ``item/commandExecution/requestApproval`` instead of returning
-        the raw OS-level error. Without this, the entire #1575+#1702
-        bridge stack is dormant — codex never sends the RPC, the queue
-        never fires, the operator never sees a prompt, and the agent
-        sees ``Operation not permitted`` as the terminal outcome.
+    async def test_thread_start_carries_on_request_approval_policy(self):
+        """#1734 (supersedes #1707's ``on-failure`` pin): codex 0.138
+        deprecated ``on-failure`` and recommends ``on-request`` for
+        interactive approvals. The model proactively requests
+        elevation for writes outside the workspace (per the GPT-5
+        overlay), codex emits
+        ``item/commandExecution/requestApproval``, the bridge routes
+        through Kestrel's BinaryPolicy → ApprovalQueue.
 
         Wire format is kebab-case (verified against the codex binary:
-        ``approval_policy = "never"`` in the binary's own error
-        messages)."""
+        ``approval_policy = "never"`` literal in surfaced error
+        strings).
+        """
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="x", model="auto",
             messages=[{"role": "user", "content": "hi"}], session_id="s",
         )
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
-        assert ts.get("approval_policy") == "on-failure", (
-            f"thread/start must set approval_policy=on-failure (got "
-            f"{ts.get('approval_policy')!r}). Without it, codex never "
-            f"escalates sandbox-blocked writes to Kestrel's approval bridge."
+        assert ts.get("approval_policy") == "on-request", (
+            f"thread/start must set approval_policy=on-request (got "
+            f"{ts.get('approval_policy')!r}). Codex 0.138 deprecated "
+            f"on-failure; on-request is the recommended replacement."
         )
 
     @pytest.mark.asyncio
-    async def test_thread_start_keeps_read_only_sandbox(self):
-        """#1707 companion: the ``approval_policy`` change must not
-        accidentally widen the sandbox. We still want ``read-only`` —
-        inert reads stay sandboxed, and the bridge handles escalations
-        for the rest."""
+    async def test_thread_start_uses_workspace_write_sandbox(self):
+        """#1734: ``workspace-write`` lets codex write inside the
+        per-agent workspace dir (+ /tmp + $TMPDIR) without an approval
+        round-trip — closes the awkward "model has to retry on
+        seatbelt failure" dance for the common case (touch /tmp/x).
+        Writes outside the workspace still escalate through the
+        bridge → queue. Reads remain unrestricted."""
         a = _adapter_with(_TEXT_TURN)
         await a.get_response(
             client="x", model="auto",
             messages=[{"role": "user", "content": "hi"}], session_id="s",
         )
         ts = [p for m, p in a._client.requests if m == "thread/start"][0]
-        assert ts.get("sandbox") == "read-only"
+        assert ts.get("sandbox") == "workspace-write", (
+            f"thread/start must set sandbox=workspace-write (got "
+            f"{ts.get('sandbox')!r}). #1734 widened the sandbox to allow "
+            f"in-workspace writes without a queue round-trip."
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_defaults_to_agent_workspace(self, tmp_path):
+        """#1734: when an agent is attached, the default cwd is
+        ``<storage_path>.parent/workspace/`` (auto-created), NOT
+        ``Path.cwd()``. This scopes ``workspace-write`` to a safe
+        per-agent scratch area so the agent can't silently edit her
+        own host source / kestrel.toml / bootstrap files.
+
+        Pure unit test — drives ``_resolve_agent_workspace_dir``
+        directly via a SimpleNamespace stub with a ``storage_path``.
+        """
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+
+        storage = tmp_path / "emma_prime.db"
+        storage.touch()  # only the path matters, not the contents
+        agent = SimpleNamespace(storage_path=str(storage))
+
+        a = CodexAdapter()
+        a.attach_agent_for_audit(agent)
+        resolved = a._resolve_agent_workspace_dir()
+
+        assert resolved == str(tmp_path / "workspace")
+        assert (tmp_path / "workspace").is_dir(), (
+            "workspace dir must be auto-created so codex thread/start "
+            "doesn't fail on a missing path"
+        )
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_falls_back_when_no_agent(self):
+        """No attached agent → ``_resolve_agent_workspace_dir`` returns
+        None → ``thread/start`` falls back to ``Path.cwd()`` (legacy
+        behavior preserved for tests + headless callers)."""
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        a = CodexAdapter()
+        # No attach_agent_for_audit call.
+        assert a._resolve_agent_workspace_dir() is None
+
+    @pytest.mark.asyncio
+    async def test_thread_start_cwd_env_override_wins_over_workspace(
+        self, monkeypatch, tmp_path,
+    ):
+        """``KESTREL_CODEX_CWD`` takes precedence over the per-agent
+        workspace default — operators/daemons can scope codex's
+        workspace explicitly."""
+        monkeypatch.setenv("KESTREL_CODEX_CWD", "/override/explicit")
+
+        storage = tmp_path / "emma_prime.db"
+        storage.touch()
+        agent = SimpleNamespace(storage_path=str(storage))
+
+        a = _adapter_with(_TEXT_TURN)
+        a.attach_agent_for_audit(agent)
+        await a.get_response(
+            client="x", model="auto",
+            messages=[{"role": "user", "content": "hi"}], session_id="s",
+        )
+        ts = [p for m, p in a._client.requests if m == "thread/start"][0]
+        assert ts["cwd"] == "/override/explicit"
 
 
 class TestToolActivityMarkers:

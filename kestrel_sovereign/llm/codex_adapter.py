@@ -539,6 +539,44 @@ class CodexAdapter(LLMAdapter):
             self._teardown_codex_approval_bridge()
         self._agent_for_audit = agent
 
+    def _resolve_agent_workspace_dir(self) -> Optional[str]:
+        """Return the per-agent workspace dir for codex's ``cwd`` (#1734).
+
+        Resolves to ``<agent_data_dir>/workspace/`` where
+        ``agent_data_dir`` is the directory containing the agent's
+        sqlite db (``agent.storage_path`` is the db path itself).
+        Returns ``None`` when no agent is attached, no usable
+        ``storage_path`` is available, or directory creation fails —
+        the caller falls back to ``Path.cwd()`` in those cases.
+
+        Auto-creates the workspace dir on first call so codex's
+        ``thread/start`` doesn't fail on a missing path. ``mkdir`` is
+        idempotent and ``exist_ok=True`` so concurrent thread starts
+        for the same agent race safely.
+
+        Critical safety invariant: this MUST NOT default to the host
+        process cwd. Doing so would put codex's ``workspace-write``
+        sandbox on the kestrel-sovereign repo root, and an agent
+        could silently edit her own host source / kestrel.toml /
+        bootstrap files.
+        """
+        agent = self._agent_for_audit
+        if agent is None:
+            return None
+        storage_path = getattr(agent, "storage_path", None)
+        if not storage_path:
+            return None
+        try:
+            workspace = Path(storage_path).parent / "workspace"
+            workspace.mkdir(parents=True, exist_ok=True)
+            return str(workspace)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "codex_adapter: workspace dir resolution failed (%s) — "
+                "falling back to process cwd", exc,
+            )
+            return None
+
     def _teardown_codex_approval_bridge(self) -> None:
         """Drop bridge handlers registered against a prior (agent, app)."""
         for _unreg in self._codex_bridge_unregisters:
@@ -732,15 +770,27 @@ class CodexAdapter(LLMAdapter):
                 )
                 # Cached thread no longer matches; drop it.
                 self._session_threads.pop(session_id, None)
-            # cwd: codex's native shell tool runs `cd` and resolves relative
-            # paths against the thread cwd, not the process cwd. Without
-            # this, ``pwd`` inside a shell tool returns whatever directory
-            # the kestrel process happened to start in (often the install
-            # prefix). Anchor the thread to the user's current working
-            # directory so file lookups behave like an editor session.
-            # ``KESTREL_CODEX_CWD`` overrides for daemon/agent runtimes
-            # where ``Path.cwd()`` may not match the intended workspace.
-            cwd = os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd())
+            # cwd: codex's native shell tool runs ``cd`` and resolves
+            # relative paths against the thread cwd, not the process cwd.
+            # It is ALSO the workspace boundary under
+            # ``sandbox=workspace-write`` (#1734) — the sandbox allows
+            # writes inside ``cwd`` + subdirs (plus ``/tmp`` and
+            # ``$TMPDIR``) and blocks everywhere else.
+            #
+            # Resolution order:
+            #   1. ``KESTREL_CODEX_CWD`` env var (operator/daemon override)
+            #   2. Per-agent workspace dir under the agent's data dir
+            #      (``<agent_data>/workspace/``), auto-created. Scopes
+            #      ``workspace-write`` to a safe per-agent scratch area
+            #      so the agent can't silently edit her own host source
+            #      / bootstrap / kestrel.toml.
+            #   3. Process cwd (legacy fallback; only fires when no
+            #      agent is attached, e.g. headless tests).
+            cwd = (
+                os.environ.get("KESTREL_CODEX_CWD")
+                or self._resolve_agent_workspace_dir()
+                or str(Path.cwd())
+            )
             # Parity with kestrel-claw's thread-lifecycle.ts:599-619:
             # ``experimentalRawEvents`` flips codex's notification stream from
             # the legacy aggregated shape (which our adapter never wired up)
@@ -752,29 +802,32 @@ class CodexAdapter(LLMAdapter):
             # ``persistExtendedHistory`` mirrors what claw asks for so
             # multi-turn sessions retain the full prior context server-side.
             params: Dict[str, Any] = {
-                "sandbox": "read-only",
-                # #1707: tell codex to escalate sandbox failures via the
-                # ``item/commandExecution/requestApproval`` RPC instead
-                # of silently returning the OS-level error. Without
-                # this, the entire #1575+#1581+#1702 bridge stack is
-                # dormant for sandbox writes — codex never asks
-                # Kestrel to approve, so unlisted writes (``touch``,
-                # ``mkdir``, etc.) surface as ``Operation not
-                # permitted`` and the operator never sees a prompt.
+                # #1734: ``workspace-write`` allows codex's native shell
+                # to write inside the per-agent workspace dir (plus
+                # ``/tmp`` and ``$TMPDIR``) without an approval round
+                # trip. Reads everywhere still work. Writes outside the
+                # workspace are blocked by the sandbox and the model
+                # must explicitly request elevation (see the GPT-5
+                # overlay's proactive-elevation clause) — codex emits
+                # ``item/commandExecution/requestApproval``, which
+                # routes through Kestrel's bridge (#1575) →
+                # BinaryPolicy (#1702) → ApprovalQueue.
                 #
-                # Codex policy choices (kebab-case wire format,
-                # verified against the binary):
-                #   - ``unless-trusted``  → escalate every shell call
-                #   - ``on-failure``      → escalate on sandbox-denied
-                #   - ``on-request``      → only when the model asks
-                #   - ``never``           → never escalate
-                # ``on-failure`` is the operator-in-the-loop sweet
-                # spot: the sandbox handles inert reads, the bridge
-                # handles the rest. ``unless-trusted`` would spam the
-                # operator with prompts for ``ls``/``cat``;
-                # ``on-request`` requires model-mediated elevation
-                # tokens and is brittle.
-                "approval_policy": "on-failure",
+                # The workspace is scoped via ``cwd`` to
+                # ``<agent_data>/workspace/`` (resolved above), NOT the
+                # host process cwd, so an agent can't silently edit
+                # her own host source / kestrel.toml / bootstrap
+                # files.
+                "sandbox": "workspace-write",
+                # #1734 (also #1707): use ``on-request`` — codex 0.138's
+                # current recommendation. The deprecated ``on-failure``
+                # value still works in 0.138 but is silently mapped
+                # to ``on-request`` semantics, so naming it directly
+                # avoids surprise when the deprecation lands.
+                # ``unless-trusted`` is cyber-policy-specific
+                # (``TrustedAccessForCyber``); ``never`` disables
+                # elevation entirely.
+                "approval_policy": "on-request",
                 "cwd": cwd,
                 "experimentalRawEvents": True,
                 "persistExtendedHistory": True,
@@ -1814,10 +1867,17 @@ class CodexAdapter(LLMAdapter):
             # Without these, codex 0.131.0+ in app-server mode hangs after
             # ``session_loop: enter`` — the model/cwd/effort defaults from
             # thread/start aren't picked up by the turn pipeline.
+            # cwd resolution mirrors ``thread/start`` (#1734) — same
+            # priority order so per-turn overrides stay consistent
+            # with the workspace boundary the sandbox is enforcing.
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": turn_input}],
-                "cwd": os.environ.get("KESTREL_CODEX_CWD") or str(Path.cwd()),
+                "cwd": (
+                    os.environ.get("KESTREL_CODEX_CWD")
+                    or self._resolve_agent_workspace_dir()
+                    or str(Path.cwd())
+                ),
             }
             # Reuse _model_param's sentinel filter — "auto"/"default" are
             # kestrel-side route placeholders, not real model ids; the

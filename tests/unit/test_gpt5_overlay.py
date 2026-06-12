@@ -90,76 +90,79 @@ class TestPrependGpt5Overlay:
         assert a.startswith(GPT5_BEHAVIOR_CONTRACT)
 
 
-class TestSandboxRetryDiscipline:
-    """#1718: codex 0.138 merged approval_policy on-failure semantics into
-    on-request — agents must explicitly request elevation rather than
-    relying on auto-escalation. The overlay tells GPT-5 agents (which is
-    every codex-backed agent in our setup) to retry once with explicit
-    escalation instead of surfacing the raw sandbox error.
+class TestProactiveElevationDiscipline:
+    """#1734 (supersedes #1718's reactive retry): codex 0.138's sandbox
+    profile is ``workspace-write`` (#1734) — writes inside the per-agent
+    workspace + ``/tmp`` succeed silently, writes outside are blocked.
+    The reactive retry from #1718 was correct under ``read-only`` but
+    is no longer the dominant case.
 
-    Lives in <tool_discipline> so it composes naturally with the rest of
-    the tool-use guidance and inherits the byte-stable prefix-cache
-    invariant. Anthropic-backed agents do not see this overlay and do
-    not need it — their shell path goes through ``_run_gates`` directly
-    (no codex sandbox layer).
+    The proactive clause tells GPT-5 agents to request elevation
+    BEFORE running a command that writes outside the workspace, not
+    after a sandbox failure. Cleaner mental model, fewer round-trips,
+    and avoids the stdout-injection vector entirely (no parsing of
+    error text required).
+
+    Lives in <tool_discipline> so it inherits the byte-stable
+    prefix-cache invariant. Anthropic-backed agents do not see this
+    overlay and do not need it — their shell path goes through
+    ``_run_gates`` directly (no codex sandbox layer).
     """
 
     @pytest.mark.parametrize(
         "phrase",
         [
-            "shell tool itself",
-            "host sandbox refused",
-            "Operation not permitted",
-            "retry once",
+            "workspace",
+            "request elevation",
             "host approval queue",
             "Treat operator-denied results as terminal",
+            "outside the workspace",
         ],
     )
-    def test_contract_carries_sandbox_retry_clause(self, phrase):
+    def test_contract_carries_proactive_elevation_clause(self, phrase):
         assert phrase in GPT5_BEHAVIOR_CONTRACT, (
-            f"GPT5 contract must mention {phrase!r} so sandbox-blocked "
-            f"writes can be retried with an explicit elevation request"
+            f"GPT5 contract must mention {phrase!r} so the model knows "
+            f"to request elevation proactively for out-of-workspace writes"
         )
 
-    def test_sandbox_retry_clause_distinguishes_envelope_from_stdout(self):
-        # Codex round 1 P0: a hostile command can put "Operation not
-        # permitted" in its stdout. The clause must scope the trigger
-        # to the tool envelope (the call failed) rather than to any
-        # output containing the phrase.
+    def test_proactive_clause_inside_tool_discipline(self):
+        # Lives in <tool_discipline>, not floating, so it composes with
+        # the rest of the tool-use guidance and stays cache-stable.
         td_start = GPT5_BEHAVIOR_CONTRACT.index("<tool_discipline>")
         td_end = GPT5_BEHAVIOR_CONTRACT.index("</tool_discipline>")
         td_block = GPT5_BEHAVIOR_CONTRACT[td_start:td_end]
-        assert "shell tool itself" in td_block
-        assert "not stdout text from a command that did run" in td_block
+        assert "request elevation" in td_block
+        assert "outside the workspace" in td_block
 
-    def test_sandbox_retry_clause_excludes_user_denial_as_trigger(self):
-        # Codex round 1 P1: "rejected by user" was originally listed
-        # alongside "Operation not permitted" as a trigger to retry,
-        # but #1690's audit-backed classifier makes that phrase mean
-        # an actual operator denial — retrying it ignores the
-        # operator's decision. The clause must NOT name it.
-        assert "rejected by user" not in GPT5_BEHAVIOR_CONTRACT, (
-            "'rejected by user' must not be a retry trigger; per #1690 "
-            "an audit-backed user denial is terminal, not retryable"
+    def test_proactive_clause_replaces_reactive_retry(self):
+        # #1718's reactive clause keyed off "Operation not permitted"
+        # as a retry trigger. Under #1734's workspace-write sandbox,
+        # the model proactively requests elevation BEFORE the write,
+        # so the reactive trigger is no longer in the contract.
+        assert "Operation not permitted" not in GPT5_BEHAVIOR_CONTRACT, (
+            "reactive 'Operation not permitted' trigger from #1718 was "
+            "superseded by #1734's proactive elevation clause; the "
+            "phrase should no longer appear in the contract"
+        )
+        assert "retry once" not in GPT5_BEHAVIOR_CONTRACT, (
+            "the reactive 'retry once' wording was replaced by proactive "
+            "elevation — request before, not retry after"
         )
 
-    def test_sandbox_retry_clause_inside_tool_discipline(self):
-        # The clause is part of <tool_discipline>, not a floating
-        # paragraph — keeps the contract structurally clean.
-        td_start = GPT5_BEHAVIOR_CONTRACT.index("<tool_discipline>")
-        td_end = GPT5_BEHAVIOR_CONTRACT.index("</tool_discipline>")
-        td_block = GPT5_BEHAVIOR_CONTRACT[td_start:td_end]
-        assert "Operation not permitted" in td_block
-        assert "host approval queue" in td_block
+    def test_proactive_clause_excludes_user_denial_as_trigger(self):
+        # Carry-forward from #1718 codex review: "rejected by user"
+        # means an audit-backed operator denial (#1690). Retrying it
+        # ignores the operator's decision.
+        assert "rejected by user" not in GPT5_BEHAVIOR_CONTRACT
 
-    def test_sandbox_retry_clause_not_in_other_blocks(self):
+    def test_proactive_clause_not_in_other_blocks(self):
         # Spot-check: the clause must not have been duplicated into
-        # <execution_policy> / <output_contract> by a future edit.
+        # other contract sections by a future edit.
         for tag in ("<execution_policy>", "<output_contract>", "<completion_contract>"):
             start = GPT5_BEHAVIOR_CONTRACT.index(tag)
             end = GPT5_BEHAVIOR_CONTRACT.index(tag.replace("<", "</"))
             block = GPT5_BEHAVIOR_CONTRACT[start:end]
-            assert "Operation not permitted" not in block, (
-                f"sandbox-retry clause must live in <tool_discipline>, "
+            assert "request elevation" not in block, (
+                f"elevation clause must live in <tool_discipline>, "
                 f"not duplicated into {tag}"
             )
