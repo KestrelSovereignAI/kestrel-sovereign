@@ -66,6 +66,15 @@ test('a loose list (blank line between items) is NOT split into two lists', () =
     assert.match(tail, /- first\n\n- second/);
 });
 
+test('a paragraph before a list IS a boundary (no bolding across blocks)', () => {
+    const { _splitStreamingTail } = load();
+    // The blank after a paragraph is a real boundary even though a list
+    // follows, so tail completion can only touch the list, not the paragraph.
+    const { stable, tail } = _splitStreamingTail('Intro **bold\n\n- item');
+    assert.match(stable, /Intro \*\*bold/);
+    assert.equal(tail, '- item');
+});
+
 test('an indented loose-list continuation stays with the list', () => {
     const { _splitStreamingTail } = load();
     // "  more" continues the list item across the blank line — must not split.

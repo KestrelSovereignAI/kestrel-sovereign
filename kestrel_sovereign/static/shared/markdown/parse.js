@@ -347,17 +347,19 @@ function _splitStreamingTail(text) {
     _walkFences(text, (openFence, i) => {
         if (openFence !== null) return;  // inside a fenced block — never split
         if (lines[i].trim() !== '') return;
-        // Peek the next non-blank line. Keep the prefix in the tail (don't
-        // finalize this blank as a boundary) when the next content may still
-        // belong to the preceding block:
-        //   - a new list item   → loose list continuation
-        //   - an INDENTED line   → a list item's continuation paragraph/code
-        //     block, or an indented code block
-        // A non-indented, non-list line is an unambiguous new top-level block.
+        // Suppress this blank as a boundary ONLY for a genuine loose-list gap —
+        // i.e. the block BEFORE the blank is list-ish AND the content AFTER it
+        // is too (a new item or an indented continuation). A paragraph→list
+        // transition is a real boundary, so the paragraph still memoizes and
+        // tail completion can't bold across into the list (block-scoped flicker
+        // prevention). "List-ish" = a list-item marker or an indented line.
+        const listish = (s) => s !== undefined
+            && (_LIST_ITEM_RE.test(s) || /^[ \t]/.test(s));
         let j = i + 1;
         while (j < lines.length && lines[j].trim() === '') j++;
-        if (j < lines.length
-            && (_LIST_ITEM_RE.test(lines[j]) || /^[ \t]/.test(lines[j]))) return;
+        let k = i - 1;
+        while (k >= 0 && lines[k].trim() === '') k--;
+        if (listish(lines[j]) && listish(lines[k])) return;
         tailStartLine = i + 1;
     });
     return {
