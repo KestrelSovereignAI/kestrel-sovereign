@@ -324,6 +324,14 @@ def _default_fetcher(url: str) -> bytes:
     """
     if not url.startswith("https://"):
         raise DidWebError(f"did:web resolver requires HTTPS; got {url!r}")
+    # SSRF guard (#1727): the host comes from an attacker-controllable sender DID
+    # (e.g. did:web:169.254.169.254 → cloud metadata). Reject non-public targets
+    # before the request fires. HTTPS-only is enforced above.
+    from kestrel_sovereign.security.ssrf import validate_outbound_url, SSRFError
+    try:
+        validate_outbound_url(url, allowed_schemes=("https",))
+    except SSRFError as e:
+        raise DidWebError(f"did:web resolver refused non-public URL {url!r}: {e}") from e
     with urlopen(url, timeout=10) as resp:  # noqa: S310 (HTTPS-checked above)
         if resp.status != 200:
             raise DidWebError(f"GET {url} returned {resp.status}")
