@@ -95,6 +95,24 @@ class TestResponseAuditHook:
         assert output.continue_execution is False
 
     @pytest.mark.asyncio
+    async def test_hook_strict_fails_closed_when_audit_call_raises(self):
+        """#1723: if get_audit_response RAISES (provider outage) strict mode must
+        DENY, not allow('Audit skipped due to error')."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "x"})
+        agent.llm_service.get_audit_response = AsyncMock(side_effect=RuntimeError("provider down"))
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+        # Long enough to be audited (not the short-circuit path).
+        output = await hook.execute(_make_hook_input("a" * 60))
+        assert output.permission_decision == PermissionDecision.DENY
+
+    def test_strict_hook_is_marked_fail_closed(self):
+        """A strict audit hook is enforcing so the manager fails closed on a
+        hook-level timeout/crash (#1723)."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "x"})
+        assert ResponseAuditHook(agent=agent, mode="strict").fail_closed is True
+        assert ResponseAuditHook(agent=agent, mode="warn").fail_closed is False
+
+    @pytest.mark.asyncio
     async def test_hook_warn_does_not_hard_block_when_audit_did_not_run(self):
         """In non-strict modes an un-run audit does not hard-block (no deny)."""
         agent = _make_agent({
@@ -138,7 +156,9 @@ class TestResponseAuditHook:
 
     @pytest.mark.asyncio
     async def test_hook_error_handling(self):
-        """Audit errors should result in ALLOW with error reason."""
+        """#1723: in STRICT mode an audit error now fails CLOSED (DENY) rather
+        than allowing an unaudited response. (warn mode still allows — see
+        test_hook_warn_audit_error_allows.)"""
         agent = _make_agent()
         agent.llm_service.get_audit_response = AsyncMock(
             side_effect=RuntimeError("LLM provider unavailable")
@@ -147,6 +167,17 @@ class TestResponseAuditHook:
 
         output = await hook.execute(_make_hook_input())
 
+        assert output.permission_decision == PermissionDecision.DENY
+
+    @pytest.mark.asyncio
+    async def test_hook_warn_audit_error_allows(self):
+        """In warn (non-strict) mode an audit error stays advisory (allow)."""
+        agent = _make_agent()
+        agent.llm_service.get_audit_response = AsyncMock(
+            side_effect=RuntimeError("LLM provider unavailable")
+        )
+        hook = ResponseAuditHook(agent=agent, mode="warn", risk_threshold=3)
+        output = await hook.execute(_make_hook_input())
         assert output.permission_decision == PermissionDecision.ALLOW
         assert "error" in output.permission_reason.lower()
         assert hook.audit_count == 0
@@ -353,10 +384,10 @@ class TestResponseAuditHookNarrationFolding:
         assert hook.last_risk_level >= hook.risk_threshold
 
     @pytest.mark.asyncio
-    async def test_narration_clean_when_llm_audit_unavailable_falls_through_to_allow(self):
-        """LLM down + narration check clean → existing skip-on-error
-        path retained. Behavior matches pre-Wave-5D expectations for
-        the no-violation case."""
+    async def test_narration_clean_when_llm_audit_unavailable_strict_fails_closed(self):
+        """#1723: LLM audit down + narration clean, in STRICT mode now fails
+        CLOSED (DENY) — an unaudited response must not pass in strict. (In warn
+        mode this still falls through to allow; covered elsewhere.)"""
         agent = _make_agent()
         agent.llm_service.get_audit_response = AsyncMock(
             side_effect=RuntimeError("audit LLM down")
@@ -371,8 +402,8 @@ class TestResponseAuditHookNarrationFolding:
         )
         output = await hook.execute(clean_input)
 
-        assert output.permission_decision == PermissionDecision.ALLOW
-        assert "error" in output.permission_reason.lower()
+        assert output.permission_decision == PermissionDecision.DENY
+        assert "fail-closed" in output.permission_reason.lower()
 
 
 # =========================================================================

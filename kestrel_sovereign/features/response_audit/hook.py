@@ -38,6 +38,11 @@ class ResponseAuditHook(Hook):
         )
         self.agent = agent
         self.mode = mode
+        # In strict mode this hook is ENFORCING: if it crashes or times out at
+        # the manager level (e.g. audit provider hang past the hook timeout), the
+        # manager must fail CLOSED (deny) rather than allow the unaudited
+        # response (#1723). warn/other modes are advisory.
+        self.fail_closed = (mode == "strict")
         self.strategy = strategy
         self.risk_threshold = risk_threshold
         self.audit_count = 0
@@ -144,6 +149,15 @@ class ResponseAuditHook(Hook):
                     response_text=response_text,
                     risk_level=narration_risk,
                     reasoning=narration_verdict.reasoning,
+                )
+            # FAIL CLOSED in strict mode (#1723): an audit provider outage must
+            # not silently pass an unaudited response. warn/other modes keep
+            # surfacing the error without hard-blocking.
+            if self.mode == "strict":
+                await self._notify_audit_anchor(self.risk_threshold, f"audit error: {e}")
+                return HookOutput.deny(
+                    f"Response audit unavailable ({e}); blocked by fail-closed "
+                    f"policy (mode=strict)."
                 )
             return HookOutput.allow(f"Audit skipped due to error: {e}")
 
