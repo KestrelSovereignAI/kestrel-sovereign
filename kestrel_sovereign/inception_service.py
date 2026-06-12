@@ -308,6 +308,7 @@ async def create_kestrel_identity_async(
     spawn_mandate: Optional["SpawnMandate"] = None,
     is_demo: bool = False,
     emancipation_contract: Optional["EmancipationContract"] = None,
+    force: bool = False,
 ) -> AgentCredentials:
     """
     Generates a new Kestrel identity, including cryptographic keys, a W3C DID,
@@ -368,8 +369,25 @@ async def create_kestrel_identity_async(
             output_dir = get_default_agent_data_dir()
         db_path = os.path.join(output_dir, "kestrel_prime.db")
         if os.path.exists(db_path):
-            os.remove(db_path)
-            logger.warning(f"Removed existing database at {db_path} to create a new one.")
+            # Don't silently destroy an existing agent's memory (#1725). Refuse
+            # unless force=True; the CLI surfaces this as a FileExistsError that
+            # tells the operator to pass --force. With force, back the DB up
+            # (and its WAL/SHM sidecars) before removing so the overwrite is
+            # recoverable.
+            if not force:
+                raise FileExistsError(
+                    f"An agent database already exists at {db_path}. Refusing to "
+                    f"overwrite it."
+                )
+            import shutil
+            import time
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            for suffix in ("", "-wal", "-shm"):
+                src = db_path + suffix
+                if os.path.exists(src):
+                    backup = f"{src}.backup-{stamp}"
+                    shutil.move(src, backup)
+                    logger.warning("Backed up existing %s → %s before overwrite.", src, backup)
         os.makedirs(output_dir, exist_ok=True)
 
         # Initialize SQLite database
@@ -578,6 +596,7 @@ def create_kestrel_identity(
     expected_duration: Optional[str] = None,
     is_demo: bool = False,
     emancipation_contract: Optional["EmancipationContract"] = None,
+    force: bool = False,
 ) -> AgentCredentials:
     """
     Sync wrapper for create_kestrel_identity_async.
@@ -599,6 +618,7 @@ def create_kestrel_identity(
         expected_duration=expected_duration,
         is_demo=is_demo,
         emancipation_contract=emancipation_contract,
+        force=force,
     ))
 
 
@@ -621,6 +641,12 @@ def build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--demo", action="store_true", help="Mark agent as demo-scoped (#766: server-side guardrails permit destructive ops)")
     parser.add_argument("--name", type=str, default=None, help="Custom agent name")
     parser.add_argument("--duration", type=str, default=None, help="Expected test duration (e.g., '1 hour')")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite an existing agent database (backs it up first). Without "
+             "--force, inception refuses to overwrite an existing agent.",
+    )
     return parser
 
 
@@ -646,6 +672,7 @@ def main():
         agent_name=args.name,
         expected_duration=args.duration,
         is_demo=args.demo,
+        force=args.force,
     )
 
     if args.test:
