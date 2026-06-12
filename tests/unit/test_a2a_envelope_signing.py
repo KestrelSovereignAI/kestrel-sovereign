@@ -230,10 +230,11 @@ def test_signed_but_unresolvable_rejected_when_require_signed():
     assert v.ok is False
 
 
-def test_replay_of_same_envelope_rejected():
+def test_replay_of_same_envelope_rejected_after_commit():
     """A verbatim re-submission of a valid signed envelope (same nonce) inside
-    the freshness window is rejected by the replay guard (#1721)."""
-    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+    the freshness window is rejected ONCE the nonce is committed (#1721). The
+    commit models the endpoint recording the nonce after task acceptance."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard, commit_envelope_nonce
 
     kp, doc = _keypair_and_doc()
     meta = _signed_metadata(kp)
@@ -241,10 +242,29 @@ def test_replay_of_same_envelope_rejected():
     first = asyncio.run(verify_inbound_envelope(
         meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
     assert first.ok is True and first.verified is True
+    commit_envelope_nonce(first, replay_guard=guard)  # task accepted → nonce consumed
     second = asyncio.run(verify_inbound_envelope(
         meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
     assert second.ok is False
     assert "repla" in second.reason.lower()
+
+
+def test_retry_after_uncommitted_failure_is_allowed():
+    """Verifying without committing (e.g. downstream create_task failed) leaves
+    the nonce unconsumed, so a legitimate retry of the same signed body still
+    verifies — replay protection must not break ordinary retries (#1721 codex r2)."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    guard = ReplayGuard()
+    first = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert first.ok is True
+    # No commit (simulating a transient downstream failure) → retry still passes.
+    retry = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert retry.ok is True and retry.verified is True
 
 
 def test_inbound_binds_metadata_skill_and_artifacts():

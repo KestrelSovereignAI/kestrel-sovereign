@@ -67,6 +67,11 @@ class EnvelopeVerification:
     ok: bool
     reason: str
     verified: bool = False
+    # The verified sender DID and per-envelope nonce, surfaced so the caller can
+    # commit the nonce to the replay guard AFTER the task is durably accepted
+    # (see ``commit_envelope_nonce``). Empty for unsigned/failed verdicts.
+    sender: str = ""
+    nonce: str = ""
 
 
 def canonical_message(part_texts: "list[str]") -> str:
@@ -346,25 +351,36 @@ class ReplayGuard:
         self._seen: "dict[str, float]" = {}
         self._lock = threading.Lock()
 
-    def check_and_record(self, sender: str, nonce: str, *, now_ts: float) -> bool:
-        """Return True if fresh (recorded now), False if a replay.
+    @staticmethod
+    def _key(sender: str, nonce: str) -> str:
+        return f"{sender}\x00{nonce}"
 
-        An empty nonce is treated as fresh — replay binding is best-effort and
-        the freshness window still applies; v2 signers always supply one.
+    def seen(self, sender: str, nonce: str, *, now_ts: float) -> bool:
+        """Return True if this ``(sender, nonce)`` was already committed in-window.
+
+        A pure peek — does NOT record. An empty nonce is never a replay (replay
+        binding is best-effort; the freshness window still applies). Recording is
+        deferred to :meth:`record` so a verified-but-not-yet-accepted envelope
+        doesn't burn its nonce (a transient failure must stay retryable).
         """
         if not nonce:
-            return True
-        key = f"{sender}\x00{nonce}"
+            return False
+        cutoff = now_ts - self._ttl
+        with self._lock:
+            seen_at = self._seen.get(self._key(sender, nonce))
+            return seen_at is not None and seen_at >= cutoff
+
+    def record(self, sender: str, nonce: str, *, now_ts: float) -> None:
+        """Commit a ``(sender, nonce)`` as consumed. Call only after the task is
+        durably accepted, so retries of a not-yet-accepted envelope still work."""
+        if not nonce:
+            return
         with self._lock:
             # Opportunistic prune of expired entries.
             cutoff = now_ts - self._ttl
             if len(self._seen) > 1024:
                 self._seen = {k: t for k, t in self._seen.items() if t >= cutoff}
-            seen_at = self._seen.get(key)
-            if seen_at is not None and seen_at >= cutoff:
-                return False
-            self._seen[key] = now_ts
-            return True
+            self._seen[self._key(sender, nonce)] = now_ts
 
 
 # Process-wide default guard used by the inbound endpoint when no guard is
@@ -479,12 +495,36 @@ async def verify_inbound_envelope(
         return verdict
 
     # Signature is valid; reject a verbatim replay of the same (sender, nonce)
-    # inside the freshness window.
+    # inside the freshness window. This is a PEEK — the nonce is committed only
+    # after the task is durably accepted (commit_envelope_nonce), so a verified
+    # request whose downstream create_task fails transiently stays retryable.
     if replay_guard is not None:
         now_dt = now or datetime.now(timezone.utc)
-        if not replay_guard.check_and_record(sender, nonce, now_ts=now_dt.timestamp()):
+        if replay_guard.seen(sender, nonce, now_ts=now_dt.timestamp()):
             logger.warning("A2A: rejecting replayed envelope from %r (nonce reuse).", sender)
             return EnvelopeVerification(
                 ok=False, reason="replayed envelope (nonce already seen in window)"
             )
-    return verdict
+    # Surface sender+nonce so the caller can commit after acceptance.
+    return EnvelopeVerification(
+        ok=verdict.ok, reason=verdict.reason, verified=verdict.verified,
+        sender=sender, nonce=nonce,
+    )
+
+
+def commit_envelope_nonce(
+    verdict: EnvelopeVerification,
+    *,
+    replay_guard: Optional[ReplayGuard] = _DEFAULT_REPLAY_GUARD,
+    now: Optional[datetime] = None,
+) -> None:
+    """Commit a verified envelope's nonce to the replay guard after acceptance.
+
+    Call this only once the task has been durably created. A no-op for unsigned
+    or failed verdicts (no nonce) or when no guard is wired. Pair it with the
+    SAME guard passed to :func:`verify_inbound_envelope` (both default to the
+    process-wide guard, which is what the inbound endpoint uses)."""
+    if replay_guard is None or not verdict.verified or not verdict.nonce:
+        return
+    now_dt = now or datetime.now(timezone.utc)
+    replay_guard.record(verdict.sender, verdict.nonce, now_ts=now_dt.timestamp())
