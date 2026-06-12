@@ -539,12 +539,15 @@ class StreamingMixin:
             models = get_shared_model_cache().get_any() or []
         except Exception:
             return None
+        # Route names are ``vendor:route`` (e.g. ``openai:api``) but
+        # ModelInfo.provider is the bare vendor (``openai``); compare on vendor.
+        vendor = (provider_name or "").split(":", 1)[0]
         for info in models:
             if getattr(info, "id", None) != model:
                 continue
             prov = getattr(info, "provider", None)
             # Guard against id collisions across providers.
-            if prov in (None, provider_name):
+            if prov in (None, provider_name, vendor):
                 return bool(getattr(info, "supports_vision", False))
         return None
 

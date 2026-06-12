@@ -231,13 +231,14 @@ def test_apply_eager_vision_respects_model_level_capability(monkeypatch, caplog)
     from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
     svc = StreamingMixin.__new__(StreamingMixin)
     adapter = OpenAIAdapter()  # adapter-family supports_vision is True
+    # Realistic shapes: route key is "vendor:route"; ModelInfo.provider is bare.
     cache = SimpleNamespace(get_any=lambda: [
         SimpleNamespace(id="text-only-x", provider="openai", supports_vision=False)])
     monkeypatch.setattr(
         "kestrel_sovereign.llm.model_cache.get_shared_model_cache", lambda: cache)
     msgs = [{"role": "user", "content": "hi"}]
     with caplog.at_level(logging.WARNING):
-        out = svc._apply_eager_vision(adapter, msgs, [b"img"], "openai", "text-only-x")
+        out = svc._apply_eager_vision(adapter, msgs, [b"img"], "openai:api", "text-only-x")
     assert out is msgs
     assert "not vision-capable" in caplog.text
 
