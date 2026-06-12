@@ -101,6 +101,20 @@ test('closes a TILDE fence with a tilde marker, not backticks', () => {
     assert.equal(_completeStreamingInline('~~~\ncode'), '~~~\ncode\n~~~');
 });
 
+test('respects fence delimiter length (```` is not closed by ```)', () => {
+    const { _completeStreamingInline, _splitStreamingTail } = load();
+    assert.equal(_completeStreamingInline('````\n```\ncode'), '````\n```\ncode\n````');
+    const { tail } = _splitStreamingTail('````\n```\n\ncode');
+    assert.match(tail, /````\n```\n\ncode/);  // inner ``` + blank line don't split
+});
+
+test('does NOT count ** delimiters that live inside an inline code span', () => {
+    const { _completeStreamingInline } = load();
+    assert.equal(_completeStreamingInline('Use `**` for bold'), 'Use `**` for bold');
+    // an open inline-code span swallows the ** — close the span, not add bold
+    assert.equal(_completeStreamingInline('text `code with **'), 'text `code with **`');
+});
+
 test('does NOT complete ambiguous single-* or bare $ (the #1547 trap)', () => {
     const { _completeStreamingInline } = load();
     assert.equal(_completeStreamingInline('* a list item'), '* a list item');

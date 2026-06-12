@@ -251,23 +251,49 @@ function _renderStreamStable(stable) {
     return html;
 }
 
-const _FENCE_RE = /^[ \t]*(```+|~~~+)/;
+const _FENCE_RE = /^[ \t]*(`{3,}|~{3,})/;
 const _LIST_ITEM_RE = /^[ \t]*([-*+]|\d+[.)])\s/;
 
-// Return the marker char ('`' or '~') of a still-OPEN fence in `text`, else
-// null. A fence only closes with the SAME marker character it opened with, so a
-// ``` block containing a `~~~` line stays open (CommonMark).
-function _openFenceMarker(text) {
-    let marker = null;
-    for (const line of text.split('\n')) {
-        const m = line.match(_FENCE_RE);
-        if (!m) continue;
-        const c = m[1][0];
-        if (marker === null) marker = c;
-        else if (marker === c) marker = null;
-        // a different marker while inside a fence is literal code — ignore
+// Walk the fence state of `text` line by line, invoking `onLine(openMarkerOrNull,
+// lineIndex, line)` after each line's fence transition is applied. Returns the
+// final open fence marker STRING (e.g. "```", "````", "~~~"), or null. Per
+// CommonMark a fence closes only with the SAME marker char and a run AT LEAST AS
+// LONG as the opener — so a ```` block containing a ``` line stays open, and a
+// ``` block containing a ~~~ line stays open.
+function _walkFences(text, onLine) {
+    let open = null; // {char, len}
+    const lines = text.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(_FENCE_RE);
+        if (m) {
+            const run = m[1];
+            const char = run[0];
+            const len = run.length;
+            if (open === null) open = { char, len };
+            else if (char === open.char && len >= open.len) open = null;
+            // else: shorter/other-marker fence line — literal inside the block
+        } else if (onLine) {
+            onLine(open, i, lines[i]);
+        }
     }
-    return marker;
+    return open ? open.char.repeat(open.len) : null;
+}
+
+function _openFence(text) {
+    return _walkFences(text, null);
+}
+
+// Drop code regions so inline-delimiter counts ignore markdown that lives
+// inside code (a `**` in `` `**` `` can't open emphasis). Removes closed inline
+// code spans; an UNCLOSED span swallows to end-of-line (its tail is code).
+function _stripCodeSpans(text) {
+    let s = text.replace(/(`+)[^\n]*?\1/g, '');
+    const tick = s.lastIndexOf('`');
+    if (tick !== -1) {
+        const nl = s.indexOf('\n', tick);
+        s = s.slice(0, tick) + (nl !== -1 ? s.slice(nl) : '');
+    }
+    return s;
 }
 
 // Fence-aware split into {stable, tail}. The boundary is the last blank line
@@ -279,26 +305,18 @@ function _openFenceMarker(text) {
 // list item.
 function _splitStreamingTail(text) {
     const lines = text.split('\n');
-    let fenceMarker = null;
     let tailStartLine = 0;
-    for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(_FENCE_RE);
-        if (m) {
-            const c = m[1][0];
-            if (fenceMarker === null) fenceMarker = c;
-            else if (fenceMarker === c) fenceMarker = null;
-            continue;
-        }
-        if (fenceMarker === null && lines[i].trim() === '') {
-            // Peek the next non-blank line: if it's a list item this blank may
-            // be a loose-list gap, so keep the prefix in the tail (don't split
-            // a multi-item list into separate lists mid-stream).
-            let j = i + 1;
-            while (j < lines.length && lines[j].trim() === '') j++;
-            if (j < lines.length && _LIST_ITEM_RE.test(lines[j])) continue;
-            tailStartLine = i + 1;
-        }
-    }
+    _walkFences(text, (openFence, i) => {
+        if (openFence !== null) return;  // inside a fenced block — never split
+        if (lines[i].trim() !== '') return;
+        // Peek the next non-blank line: if it's a list item this blank may be a
+        // loose-list gap, so keep the prefix in the tail (don't split a
+        // multi-item list into separate lists mid-stream).
+        let j = i + 1;
+        while (j < lines.length && lines[j].trim() === '') j++;
+        if (j < lines.length && _LIST_ITEM_RE.test(lines[j])) return;
+        tailStartLine = i + 1;
+    });
     return {
         stable: lines.slice(0, tailStartLine).join('\n'),
         tail: lines.slice(tailStartLine).join('\n'),
@@ -312,22 +330,26 @@ function _splitStreamingTail(text) {
 // their real closer streams in.
 function _completeStreamingInline(tail) {
     let t = tail;
-    // Open fenced code block → close it with the SAME marker that opened it;
-    // leave everything inside untouched.
-    const openMarker = _openFenceMarker(t);
-    if (openMarker) {
-        return t + (openMarker === '~' ? '\n~~~' : '\n```');
+    // Open fenced code block → close it with the SAME marker+length that opened
+    // it (CommonMark); leave everything inside untouched.
+    const openFence = _openFence(t);
+    if (openFence) {
+        return t + '\n' + openFence;
     }
-    // Inline code: odd backtick count (fences are balanced here) → close.
+    // Inline code: odd backtick count → open span; close it. (Fences are
+    // balanced here, and a closed fence contributes an even backtick count.)
     if (((t.match(/`/g) || []).length) % 2 !== 0) t += '`';
+    // The remaining inline constructs must ignore delimiters that live inside
+    // code spans (e.g. `**` in `` `**` `` can't open emphasis).
+    const code = _stripCodeSpans(t);
     // Unclosed link/image target: `[text](url` / `![alt](url` with no `)`.
-    if (/!?\[[^\]\n]*\]\([^)\n]*$/.test(t)) t += ')';
+    if (/!?\[[^\]\n]*\]\([^)\n]*$/.test(code)) t += ')';
     // Bold ** (rarely a bullet/operator) → close if unbalanced.
-    if (((t.match(/\*\*/g) || []).length) % 2 !== 0) t += '**';
+    if (((code.match(/\*\*/g) || []).length) % 2 !== 0) t += '**';
     // Display math $$ and bracket/paren math \[ \] , \( \) — close if open.
-    if (((t.match(/\$\$/g) || []).length) % 2 !== 0) t += '$$';
-    if (((t.match(/\\\[/g) || []).length) > ((t.match(/\\\]/g) || []).length)) t += '\\]';
-    if (((t.match(/\\\(/g) || []).length) > ((t.match(/\\\)/g) || []).length)) t += '\\)';
+    if (((code.match(/\$\$/g) || []).length) % 2 !== 0) t += '$$';
+    if (((code.match(/\\\[/g) || []).length) > ((code.match(/\\\]/g) || []).length)) t += '\\]';
+    if (((code.match(/\\\(/g) || []).length) > ((code.match(/\\\)/g) || []).length)) t += '\\)';
     return t;
 }
 
