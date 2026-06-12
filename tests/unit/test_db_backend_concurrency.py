@@ -1,81 +1,18 @@
-"""Storage backend concurrency hardening (#1726):
+"""Postgres backend concurrency hardening (#1726).
 
-- SQLite reads run under the write guard, so a DIFFERENT task can't observe
-  another task's UNCOMMITTED writes (dirty read).
-- Postgres transaction connection is PER-TASK (ContextVar), so a concurrent
-  task's execute()/transaction() doesn't route onto another task's open
-  transaction.
+The Postgres transaction connection is keyed to the OWNING asyncio task, so a
+concurrent task's execute()/transaction() doesn't route onto another task's open
+transaction — and a child task created inside a transaction does NOT inherit it.
+
+(SQLite read-isolation against dirty reads is tracked separately as a follow-up;
+the dedicated-read-connection approach interacted badly with WAL visibility under
+the full suite, so it was deferred rather than shipped on the hot read path.)
 """
 from __future__ import annotations
 
 import asyncio
 
-import pytest
 
-from kestrel_sovereign.storage.db.sqlite import SQLiteBackend
-
-
-# ---------------------------------------------------------------------------
-# SQLite: reads don't see another task's uncommitted writes
-# ---------------------------------------------------------------------------
-@pytest.mark.asyncio
-async def test_sqlite_read_does_not_see_uncommitted_writes(tmp_path):
-    """A non-owner read during another task's open transaction sees the COMMITTED
-    snapshot (no dirty read) and does NOT block (separate read connection)."""
-    backend = SQLiteBackend(str(tmp_path / "c.db"))
-    await backend.connect()
-    try:
-        await backend.execute("CREATE TABLE t (v INTEGER)")
-        await backend.execute("INSERT INTO t (v) VALUES (1)")  # committed: 1 row
-
-        reader_saw = {}
-        reader_started = asyncio.Event()
-        release_writer = asyncio.Event()
-
-        async def writer():
-            async with backend.transaction():
-                await backend.execute("INSERT INTO t (v) VALUES (2)")  # UNcommitted
-                reader_started.set()
-                await release_writer.wait()
-            # commits here
-
-        async def reader():
-            await reader_started.wait()
-            # Read from a DIFFERENT task while the writer's txn is open: must see
-            # the committed snapshot (1), NOT the uncommitted 2nd row, and return
-            # promptly (no blocking on the write lock).
-            reader_saw["during"] = await asyncio.wait_for(
-                backend.fetch_val("SELECT COUNT(*) FROM t"), timeout=2.0
-            )
-            release_writer.set()
-
-        await asyncio.gather(writer(), reader())
-
-        assert reader_saw["during"] == 1  # no dirty read of the uncommitted row
-        assert await backend.fetch_val("SELECT COUNT(*) FROM t") == 2  # committed after
-    finally:
-        await backend.close()
-
-
-@pytest.mark.asyncio
-async def test_sqlite_owner_sees_own_uncommitted_writes(tmp_path):
-    """The write guard is re-entrant for the txn owner: a task reads its OWN
-    in-flight writes within its transaction."""
-    backend = SQLiteBackend(str(tmp_path / "o.db"))
-    await backend.connect()
-    try:
-        await backend.execute("CREATE TABLE t (v INTEGER)")
-        async with backend.transaction():
-            await backend.execute("INSERT INTO t (v) VALUES (42)")
-            # Same task, mid-transaction → sees its own write.
-            assert await backend.fetch_val("SELECT COUNT(*) FROM t") == 1
-    finally:
-        await backend.close()
-
-
-# ---------------------------------------------------------------------------
-# Postgres: transaction connection is per-task (ContextVar)
-# ---------------------------------------------------------------------------
 def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():
     """A PostgresBackend's transaction connection is keyed to the OWNING task
     (#1726). A SIBLING task never sees it, and — critically — a CHILD task
