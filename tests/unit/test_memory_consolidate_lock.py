@@ -75,3 +75,98 @@ async def test_manual_consolidate_runs_without_dispatcher_lock():
 
     agent.memory_system.consolidate.assert_awaited_once()
     assert result.data.get("episodes_created") == 0
+
+
+# ---------------------------------------------------------------------------
+# Forgetting deletion tier rides the consolidation pass (#1674)
+# ---------------------------------------------------------------------------
+
+
+def _set_forgetting(monkeypatch, *, enabled, delete_threshold=0.02, grace_days=90):
+    import kestrel_sovereign.storage.retention as retention_mod
+    monkeypatch.setattr(
+        retention_mod, "load_forgetting_config",
+        lambda: {
+            "enabled": enabled,
+            "delete_threshold": delete_threshold,
+            "grace_days": grace_days,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_consolidate_runs_forgetting_when_enabled(monkeypatch):
+    """With [forgetting].enabled, the consolidate pass prunes decayed episodes
+    via the storage primitive and reports the count."""
+    feature, agent = _make_memory_feature(dispatcher=None)
+    agent.memory_system.consolidate = AsyncMock(
+        return_value={"episodes_created": 2, "patterns_found": 0, "messages_archived": 0}
+    )
+    agent.storage = MagicMock()
+    agent.storage.purge_decayed_episodes = AsyncMock(return_value=3)
+    _set_forgetting(monkeypatch, enabled=True, delete_threshold=0.05, grace_days=45)
+
+    result = await feature.memory_consolidate()
+
+    agent.storage.purge_decayed_episodes.assert_awaited_once_with(
+        delete_threshold=0.05, grace_days=45, reason="forgetting",
+    )
+    assert result.data.get("episodes_deleted") == 3
+    assert "3 episode(s) forgotten" in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_consolidate_skips_forgetting_when_disabled(monkeypatch):
+    """Opt-in/off default: no purge call, and no 'forgotten' clause."""
+    feature, agent = _make_memory_feature(dispatcher=None)
+    agent.memory_system.consolidate = AsyncMock(
+        return_value={"episodes_created": 1, "patterns_found": 0, "messages_archived": 0}
+    )
+    agent.storage = MagicMock()
+    agent.storage.purge_decayed_episodes = AsyncMock(return_value=99)
+    _set_forgetting(monkeypatch, enabled=False)
+
+    result = await feature.memory_consolidate()
+
+    agent.storage.purge_decayed_episodes.assert_not_awaited()
+    assert result.data.get("episodes_deleted") == 0
+    assert "forgotten" not in result.confirmation
+
+
+@pytest.mark.asyncio
+async def test_consolidate_skips_forgetting_when_consolidation_errored(monkeypatch):
+    """The consolidator reports many failures as {"error": ...} instead of
+    raising. Destructive forgetting must NOT ride such a failed/partial pass."""
+    feature, agent = _make_memory_feature(dispatcher=None)
+    agent.memory_system.consolidate = AsyncMock(
+        return_value={"error": "salvage summariser unavailable"}
+    )
+    agent.storage = MagicMock()
+    agent.storage.purge_decayed_episodes = AsyncMock(return_value=5)
+    _set_forgetting(monkeypatch, enabled=True)
+
+    result = await feature.memory_consolidate()
+
+    assert result.status == "error"
+    agent.storage.purge_decayed_episodes.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_consolidate_survives_forgetting_failure(monkeypatch):
+    """A failure in the deletion tier must not fail the consolidation it rides
+    on — the episodes are simply retried next pass."""
+    feature, agent = _make_memory_feature(dispatcher=None)
+    agent.memory_system.consolidate = AsyncMock(
+        return_value={"episodes_created": 1, "patterns_found": 0, "messages_archived": 0}
+    )
+    agent.storage = MagicMock()
+    agent.storage.purge_decayed_episodes = AsyncMock(
+        side_effect=RuntimeError("graph store down")
+    )
+    _set_forgetting(monkeypatch, enabled=True)
+
+    result = await feature.memory_consolidate()
+
+    assert result.status == "ok"
+    assert result.data.get("episodes_deleted") == 0
+    assert result.data.get("episodes_created") == 1

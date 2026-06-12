@@ -13,7 +13,7 @@ import logging
 import tarfile
 import tempfile
 import shutil
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from typing import Dict, Optional, List, Any, Union
 
 from .async_database import AsyncDatabase
@@ -373,27 +373,40 @@ class AsyncStorage:
             self.agent_id, since_iso=since_iso
         )
 
-    async def purge_episodes_older_than(
+    async def purge_decayed_episodes(
         self,
-        cutoff_iso: str,
         *,
+        delete_threshold: float,
+        grace_days: int,
         max_rows: int = 10_000,
-        reason: str = "retention-janitor",
+        half_life_days: int = 30,
+        reason: str = "forgetting",
     ) -> int:
-        """Cognition-retention primitive — hard-delete old memory episodes (#1674).
+        """Forgetting primitive — hard-delete *decayed* memory episodes (#1674).
 
-        Deletes ``memory_episodes`` rows for THIS agent whose ``created_at`` is
-        older than ``cutoff_iso``, oldest first, capped at ``max_rows``. Each
-        episode is mirrored into the knowledge graph as a node whose
-        ``node_id`` IS the episode id (see ``memory_consolidator``), so the
-        paired graph node — and, via ``delete_node``, its edges — is removed
-        too, leaving no orphans.
+        This is the deletion tier of the importance-decay forgetting curve, NOT
+        an age-based sweep. An episode for THIS agent is eligible only when both:
 
-        The graph node is deleted BEFORE the episode row, and an episode row is
-        removed ONLY if its node delete succeeded — so a node-delete failure (or
-        a mid-sweep crash) can never leave an orphan graph node pointing at a
-        deleted episode. The worst case is an episode whose row+node both
-        survive and are retried next run.
+        * it is older than ``grace_days`` (a faded-but-recent episode is never
+          deleted — there is always a minimum lifetime), AND
+        * its decay strength — ``calculate_decay(created_at, importance)`` on the
+          same Ebbinghaus curve used for messages — has fallen below
+          ``delete_threshold``.
+
+        Because strength is importance-scaled, a high-importance episode decays
+        far slower and survives much longer than a throwaway one of the same age;
+        age alone never deletes anything. (Episodes don't yet carry access /
+        applied / decay_protected signals — those arrive in P2 — so for now decay
+        runs on importance + age, which is already the load-bearing dimension.)
+
+        Eligible episodes are deleted oldest-first, capped at ``max_rows``. Each
+        episode is mirrored into the knowledge graph as a node whose ``node_id``
+        IS the episode id (see ``memory_consolidator``), so the paired graph node
+        — and, via ``delete_node``, its edges — is removed too, leaving no
+        orphans. The graph node is deleted BEFORE the episode row, and a row is
+        removed ONLY if its node delete succeeded, so a node-delete failure (or a
+        mid-sweep crash) can never orphan a graph node. Worst case: an episode
+        whose row+node both survive and are retried next run.
 
         Returns the number of episodes removed. ``reason`` is informational
         (parity with ``purge_trash_older_than``; episodes carry no audit row).
@@ -407,16 +420,51 @@ class AsyncStorage:
         if max_rows <= 0:
             return 0
 
-        rows = await self.db.fetchall(
-            """
-            SELECT id FROM memory_episodes
-            WHERE agent_id = ? AND created_at < ?
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (self.agent_id, cutoff_iso, max_rows),
-        )
-        episode_ids = [r[0] for r in rows]
+        from .memory_retriever import calculate_decay
+
+        # Pre-filter to past-grace rows in SQL; the decay-strength test then runs
+        # per row in Python. created_at is written by the consolidator as
+        # ``datetime.now(utc).isoformat()`` ("T"+offset), so the cutoff MUST use
+        # the same format to sort correctly.
+        grace_cutoff_iso = (
+            datetime.now(UTC) - timedelta(days=grace_days)
+        ).isoformat()
+
+        # Scan past-grace candidates oldest-first in bounded pages rather than
+        # pulling the whole tail into memory: a table with many old-but-high-
+        # importance episodes (not yet below threshold) could otherwise make the
+        # nightly pass O(all old episodes) in memory. We page until we've
+        # collected max_rows eligible ids or exhaust the candidates; only the
+        # most-decayed (oldest, lowest-importance) survive the strength test.
+        # Pagination is snapshot-stable because no rows are deleted mid-scan.
+        page_size = max(max_rows, 1000)
+        offset = 0
+        episode_ids: list[str] = []
+        while len(episode_ids) < max_rows:
+            page = await self.db.fetchall(
+                """
+                SELECT id, created_at, importance FROM memory_episodes
+                WHERE agent_id = ? AND created_at < ?
+                ORDER BY created_at ASC
+                LIMIT ? OFFSET ?
+                """,
+                (self.agent_id, grace_cutoff_iso, page_size, offset),
+            )
+            if not page:
+                break
+            for ep_id, created_at, importance in page:
+                strength = calculate_decay(
+                    created_at,
+                    importance=importance if importance is not None else 0.5,
+                    half_life_days=half_life_days,
+                )
+                if strength < delete_threshold:
+                    episode_ids.append(ep_id)
+                    if len(episode_ids) >= max_rows:
+                        break
+            if len(page) < page_size:
+                break
+            offset += page_size
         if not episode_ids:
             return 0
 

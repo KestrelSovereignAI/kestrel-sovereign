@@ -783,6 +783,32 @@ class TestEpisodeManagement:
         # Should create even though threshold not met
         consolidator.create_session_episode.assert_called_once_with(force=True)
 
+    @pytest.mark.asyncio
+    async def test_episode_stamps_average_importance(self):
+        """#1674: episodes carry the mean message-importance so the forgetting
+        curve can decay them at an importance-scaled half-life. Both the nightly
+        and session paths feed avg_importance into _create_episode_from_messages."""
+        from kestrel_sovereign.storage.memory_consolidator import MemoryConsolidator
+
+        consolidator = MemoryConsolidator(db=MagicMock(), agent_id="did:test:imp")
+        messages = [
+            {"id": 1, "metadata": {"importance": 0.9}, "created_at": "2026-06-01T00:00:00+00:00", "role": "user"},
+            {"id": 2, "metadata": {"importance": 0.7}, "created_at": "2026-06-01T00:05:00+00:00", "role": "assistant"},
+        ]
+        avg_importance = sum(m["metadata"]["importance"] for m in messages) / len(messages)
+
+        episode = await consolidator._create_episode_from_messages(
+            "2026-06-01", messages, avg_intensity=0.5, avg_importance=avg_importance,
+        )
+
+        assert episode is not None
+        assert episode.importance == pytest.approx(0.8)
+        # Default when caller omits it (legacy path) stays neutral.
+        legacy = await consolidator._create_episode_from_messages(
+            "2026-06-01", messages, avg_intensity=0.5,
+        )
+        assert legacy.importance == 0.5
+
 
 class TestHierarchicalCompaction:
     """Tests for hierarchical_compact() operation."""

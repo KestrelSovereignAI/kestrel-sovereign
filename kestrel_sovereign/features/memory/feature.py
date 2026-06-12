@@ -731,6 +731,18 @@ class MemoryFeature(Feature):
                         lock_manager.acquire([ResourceLock.MEMORY])
                     )
                 result = await memory_system.consolidate()
+                # Forgetting deletion tier (#1674): once consolidation has
+                # archived faded messages, prune episodes whose importance-
+                # scaled decay has dropped below the delete threshold and are
+                # past the grace window. Runs under the same MEMORY lock so it
+                # never races a concurrent consolidation. Opt-in/off by default.
+                # Only ride a SUCCESSFUL pass: the consolidator reports many
+                # internal failures as {"error": ...} instead of raising, and
+                # destructive forgetting must never follow a failed/partial run.
+                if isinstance(result, dict) and "error" in result:
+                    episodes_deleted = 0
+                else:
+                    episodes_deleted = await self._forget_decayed_episodes()
         except Exception as e:
             logger.error(f"memory_consolidate failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
@@ -741,17 +753,53 @@ class MemoryFeature(Feature):
                 data={k: v for k, v in result.items() if k != "error"},
             )
 
-        episodes_created = (result or {}).get("episodes_created", 0)
-        patterns_found = (result or {}).get("patterns_found", 0)
-        messages_archived = (result or {}).get("messages_archived", 0)
+        result = dict(result or {})
+        result["episodes_deleted"] = episodes_deleted
+        episodes_created = result.get("episodes_created", 0)
+        patterns_found = result.get("patterns_found", 0)
+        messages_archived = result.get("messages_archived", 0)
+        forget_clause = (
+            f", {episodes_deleted} episode(s) forgotten"
+            if episodes_deleted else ""
+        )
         return ToolResult.ok(
             confirmation=(
                 f"Consolidation complete: {episodes_created} episode(s), "
                 f"{patterns_found} pattern(s), "
-                f"{messages_archived} message(s) archived"
+                f"{messages_archived} message(s) archived{forget_clause}"
             ),
-            data=dict(result or {}),
+            data=result,
         )
+
+    async def _forget_decayed_episodes(self) -> int:
+        """Deletion tier of the forgetting curve (#1674).
+
+        Deletes episodes whose importance-scaled decay strength has fallen below
+        ``[forgetting].delete_threshold`` and that are past
+        ``[forgetting].delete_grace_days``. Opt-in: a no-op unless
+        ``[forgetting].enabled`` is set. Best-effort — a failure here must not
+        fail the consolidation it rides on (the episodes are simply retried next
+        pass). Returns the number of episodes forgotten.
+        """
+        from kestrel_sovereign.storage.retention import load_forgetting_config
+
+        config = load_forgetting_config()
+        if not config["enabled"]:
+            return 0
+
+        storage = getattr(self.agent, "storage", None)
+        if storage is None or not hasattr(storage, "purge_decayed_episodes"):
+            return 0
+
+        try:
+            return await storage.purge_decayed_episodes(
+                delete_threshold=config["delete_threshold"],
+                grace_days=config["grace_days"],
+                reason="forgetting",
+            )
+        except Exception as e:  # noqa: BLE001 - forgetting must not fail consolidation
+            logger.warning("forgetting: episode deletion tier failed: %s", e)
+            return 0
 
     # ------------------------------------------------------------------
     # Schema-aware recall tools (#628)

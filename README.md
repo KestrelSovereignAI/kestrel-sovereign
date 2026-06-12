@@ -16,7 +16,7 @@ Kestrel is a continuously-developing framework for creating autonomous AI agents
 
 `pip install kestrel-sovereign` gives you a complete, working sovereign agent: identity, memory, constitution, privacy modes, multi-LLM support, local guarded compute, and a Cloud Run deployment path. Everything you need to run an agent locally with zero cloud commitment.
 
-Voice, MCP, GitHub App, wallet, council, observability, and similar specialized capabilities are **installable feature packages**. RunPod, Vast.ai, GCP Compute, voice cloud backends, and storage backends are **provider packages** that register with provider-specific entry points rather than the feature entry-point group. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md).
+Voice, MCP, GitHub App, wallet, council, observability, and similar specialized capabilities are **installable feature packages**. RunPod, Vast.ai, GCP Compute, voice cloud backends, and storage backends are **provider packages** that register with provider-specific entry points rather than the feature entry-point group. This split is being completed across [#462](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/462) and [#560](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/560); current state is documented in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md).
 
 ## 🚀 Quick Start
 
@@ -207,7 +207,7 @@ kestrel feature disable <name>         # Disable without uninstalling
 kestrel feature scaffold <name>        # Generate a new feature package skeleton
 ```
 
-The canonical inventory of features lives in [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/kestrel_sovereign/data/feature_registry.toml).
+The canonical inventory of features lives in [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md); the runtime registry is in [`kestrel_sovereign/data/feature_registry.toml`](kestrel_sovereign/data/feature_registry.toml).
 
 #### Keeping features installed across `uv sync` (`kestrel feature sync`)
 
@@ -549,7 +549,7 @@ See `.env.example` for a complete list. Key variables:
 
 ## 🚢 Deployment
 
-Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md#11-deployment) for the full catalog.
+Kestrel supports multiple deployment targets. See [KESTREL_FEATURES.md](KESTREL_FEATURES.md#11-deployment) for the full catalog.
 
 ### Cloud Run (Serverless)
 
@@ -665,7 +665,7 @@ Apache 2.0 — see [LICENSE](https://github.com/KestrelSovereignAI/kestrel-sover
 
 - **Issues**: GitHub Issues for bug reports and feature requests
 - **Discussions**: GitHub Discussions for questions and ideas
-- **Documentation**: See [`docs/`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/README.md) and [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md)
+- **Documentation**: See [`docs/`](docs/README.md) and [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md)
 
 ---
 
@@ -718,4 +718,4 @@ This process guarantees that every agent in the ecosystem starts from a foundati
 
 After getting started:
 
-1.  **Explore Features**: Read [`KESTREL_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/KESTREL_FEATURES.md) and [`docs/guides/BUILDING_FEATURES.md`](https://github.com/KestrelSovereignAI/kestrel-sovereign/blob/main/docs/guides/BUILDING_FEATURES.md)
+1.  **Explore Features**: Read [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md) and [`docs/guides/BUILDING_FEATURES.md`](docs/guides/BUILDING_FEATURES.md)

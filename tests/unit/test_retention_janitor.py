@@ -117,33 +117,68 @@ def test_agent_privacy_mode_handles_enum_and_string():
 
 
 # ---------------------------------------------------------------------------
-# resolve_cognition_retention_days (#1674) — opt-in, no compiled default
+# load_forgetting_config (#1674) — [forgetting] deletion tier, opt-in/off,
+# always fully-defaulted so callers never branch on missing keys.
 # ---------------------------------------------------------------------------
 
-from kestrel_sovereign.storage.retention import resolve_cognition_retention_days
+from kestrel_sovereign.storage.retention import (
+    load_forgetting_config,
+    DEFAULT_FORGETTING_DELETE_THRESHOLD,
+    DEFAULT_FORGETTING_GRACE_DAYS,
+)
 
 
-def test_cognition_resolve_returns_none_when_key_absent():
-    """Opt-in: an unset window keeps episodes forever (skip)."""
-    assert resolve_cognition_retention_days(config={}, key="episodes_days") is None
+def _patch_forgetting_section(monkeypatch, section):
+    """Make ``load_section('forgetting')`` return ``section``."""
+    import kestrel_sovereign.config as cfg
+    monkeypatch.setattr(
+        cfg, "load_section",
+        lambda name: section if name == "forgetting" else {},
+    )
 
 
-def test_cognition_resolve_reads_configured_window():
-    assert resolve_cognition_retention_days(
-        config={"episodes_days": 180}, key="episodes_days",
-    ) == 180
+def test_forgetting_absent_section_is_opt_out_with_defaults(monkeypatch):
+    """No [forgetting] section → disabled, but the threshold/grace defaults are
+    still populated so the (skipped) call site never sees missing keys."""
+    _patch_forgetting_section(monkeypatch, {})
+    cfg = load_forgetting_config()
+    assert cfg["enabled"] is False
+    assert cfg["delete_threshold"] == DEFAULT_FORGETTING_DELETE_THRESHOLD
+    assert cfg["grace_days"] == DEFAULT_FORGETTING_GRACE_DAYS
 
 
-def test_cognition_resolve_none_for_non_positive():
-    assert resolve_cognition_retention_days(
-        config={"episodes_days": 0}, key="episodes_days",
-    ) is None
-    assert resolve_cognition_retention_days(
-        config={"episodes_days": -5}, key="episodes_days",
-    ) is None
+def test_forgetting_reads_configured_values(monkeypatch):
+    _patch_forgetting_section(monkeypatch, {
+        "enabled": True, "delete_threshold": 0.05, "delete_grace_days": 30,
+    })
+    cfg = load_forgetting_config()
+    assert cfg == {"enabled": True, "delete_threshold": 0.05, "grace_days": 30}
 
 
-def test_cognition_resolve_none_for_non_int():
-    assert resolve_cognition_retention_days(
-        config={"episodes_days": "soon"}, key="episodes_days",
-    ) is None
+def test_forgetting_garbage_threshold_falls_back(monkeypatch):
+    _patch_forgetting_section(monkeypatch, {"enabled": True, "delete_threshold": "low"})
+    cfg = load_forgetting_config()
+    assert cfg["delete_threshold"] == DEFAULT_FORGETTING_DELETE_THRESHOLD
+
+
+def test_forgetting_threshold_above_one_falls_back(monkeypatch):
+    """delete_threshold is compared to a decay strength in (0, 1]; a typo like
+    `2` would make every past-grace episode eligible, so it must fail safe."""
+    _patch_forgetting_section(monkeypatch, {"enabled": True, "delete_threshold": 2})
+    assert load_forgetting_config()["delete_threshold"] == DEFAULT_FORGETTING_DELETE_THRESHOLD
+
+
+def test_forgetting_non_positive_values_fall_back(monkeypatch):
+    _patch_forgetting_section(monkeypatch, {
+        "enabled": True, "delete_threshold": 0, "delete_grace_days": -5,
+    })
+    cfg = load_forgetting_config()
+    assert cfg["delete_threshold"] == DEFAULT_FORGETTING_DELETE_THRESHOLD
+    assert cfg["grace_days"] == DEFAULT_FORGETTING_GRACE_DAYS
+
+
+def test_forgetting_non_bool_enabled_is_disabled(monkeypatch):
+    """A non-bool ``enabled`` must fail safe to OFF, never truthy-coerce a
+    string like "false" into deletion being on."""
+    _patch_forgetting_section(monkeypatch, {"enabled": "false"})
+    assert load_forgetting_config()["enabled"] is False

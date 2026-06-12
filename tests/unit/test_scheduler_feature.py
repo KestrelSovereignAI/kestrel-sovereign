@@ -165,6 +165,47 @@ class TestScheduleList:
 
 
 # =========================================================================
+# post_all_features_loaded — retired-cron cutover cleanup (#1674)
+# =========================================================================
+
+
+class TestRetiredCronCleanup:
+    @pytest.mark.asyncio
+    async def test_post_load_removes_orphaned_cognition_retention(self):
+        """An agent upgraded from #1715 has a persisted cognition_retention
+        schedule. After #1674 removed its handler/source, post_all_features_loaded
+        must delete that orphan row so it doesn't fire forever as 'Unknown task'."""
+        from kestrel_sdk.tools.result import ToolResult
+
+        agent = _make_mock_agent()
+        f = SchedulerFeature(agent)
+        with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
+            await f.initialize()
+
+        # Mirror schedule_list's real envelope: the row id is under "id".
+        f.schedule_list = AsyncMock(return_value=ToolResult.ok(
+            confirmation="ok",
+            data={"tasks": [
+                {"task_name": "cognition_retention", "id": "orphan-1"},
+                {"task_name": "backup_snapshot", "id": "keep-1"},
+            ]},
+        ))
+        f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
+        f.schedule_add = AsyncMock(return_value=ToolResult.ok(
+            confirmation="added", data={"next_run_at": None}))
+
+        await f.post_all_features_loaded(agent)
+
+        # The orphaned built-in was removed by id...
+        f.schedule_remove.assert_awaited_once_with("orphan-1")
+        # ...and never re-seeded (it's no longer a default).
+        readded = [c.kwargs.get("task_name") for c in f.schedule_add.await_args_list]
+        assert "cognition_retention" not in readded
+        # An already-present live default is not duplicated.
+        assert "backup_snapshot" not in readded
+
+
+# =========================================================================
 # schedule_add
 # =========================================================================
 

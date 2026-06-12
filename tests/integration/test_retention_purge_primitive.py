@@ -247,22 +247,30 @@ async def test_privacy_wrapper_purge_trash_works_in_ephemeral_mode(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Cognition retention — purge_episodes_older_than (#1674)
+# Forgetting deletion tier — purge_decayed_episodes (#1674)
+#
+# Unlike the trash rail above, episode deletion is decay-driven, not age-driven:
+# eligibility = (importance-scaled Ebbinghaus strength < delete_threshold) AND
+# (age > grace_days). A high-importance episode decays slower and outlives a
+# throwaway one of the same age; age alone never deletes anything.
 # ---------------------------------------------------------------------------
 
 from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 
-async def _add_episode(storage, episode_id: str, created_at: datetime, *, agent_id=AGENT_ID):
+async def _add_episode(
+    storage, episode_id: str, created_at: datetime, *,
+    importance: float = 0.5, agent_id=AGENT_ID,
+):
     """Insert a memory_episodes row + its paired KG node (node_id == episode id),
     matching what memory_consolidator writes."""
     # Match the consolidator: datetime.now(tz=utc).isoformat() -> "...T...+00:00".
     iso = created_at.isoformat()
     await storage.db.execute(
         """INSERT INTO memory_episodes
-           (id, agent_id, title, summary, created_at)
-           VALUES (?, ?, ?, ?, ?)""",
-        (episode_id, agent_id, f"title-{episode_id}", "summary", iso),
+           (id, agent_id, title, summary, created_at, importance)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (episode_id, agent_id, f"title-{episode_id}", "summary", iso, importance),
     )
     await storage.add_node(GraphNode(
         node_id=episode_id,
@@ -273,97 +281,127 @@ async def _add_episode(storage, episode_id: str, created_at: datetime, *, agent_
 
 
 @pytest.mark.asyncio
-async def test_purge_episodes_removes_aged_rows_and_paired_nodes(tmp_path):
+async def test_purge_decayed_removes_faded_episode_and_paired_nodes(tmp_path):
     db = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
         now = datetime.now(timezone.utc)
-        await _add_episode(storage, "old-1", now - timedelta(days=200))
-        await _add_episode(storage, "old-2", now - timedelta(days=400))
-        await _add_episode(storage, "recent", now - timedelta(days=10))
-        # An edge touching an old episode node must be scrubbed (no orphan).
-        await storage.graph.add_edge("old-1", "recent", "followed_by", {})
+        # Low-importance + very old → strength ≈ 0.5^(400/36) ≪ 0.02 → eligible.
+        await _add_episode(storage, "faded", now - timedelta(days=400), importance=0.1)
+        # Recent → within grace, never eligible.
+        await _add_episode(storage, "recent", now - timedelta(days=10), importance=0.1)
+        # An edge touching the faded node must be scrubbed (no orphan).
+        await storage.graph.add_edge("faded", "recent", "followed_by", {})
 
-        cutoff = (now - timedelta(days=180)).isoformat()
-        purged = await storage.purge_episodes_older_than(cutoff)
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90,
+        )
 
-        assert purged == 2
-        # Old episodes gone from the table; recent survives.
+        assert purged == 1
         remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
         assert {r[0] for r in remaining} == {"recent"}
-        # Paired KG nodes gone too; recent node survives.
-        assert await storage.get_node("old-1") is None
-        assert await storage.get_node("old-2") is None
+        # Paired KG node gone; recent node survives.
+        assert await storage.get_node("faded") is None
         assert await storage.get_node("recent") is not None
         # The edge touching the purged node was scrubbed (no orphan edge).
         assert await storage.graph.get_edges("recent") == []
 
 
 @pytest.mark.asyncio
-async def test_purge_episodes_respects_window_and_cap(tmp_path):
+async def test_purge_decayed_is_importance_aware_not_age_based(tmp_path):
+    """The core of #1674: two episodes of the SAME age, different importance —
+    the load-bearing one survives, the throwaway one is forgotten. An age-based
+    sweep would (wrongly) delete both."""
     db = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
         now = datetime.now(timezone.utc)
-        for i in range(5):
-            await _add_episode(storage, f"old-{i}", now - timedelta(days=300))
-        await _add_episode(storage, "within-window", now - timedelta(days=30))
+        # Same age (400d). importance 0.1 → eff half-life 36d → strength ≪ 0.02.
+        # importance 1.0 → eff half-life 90d → strength ≈ 0.046 > 0.02.
+        await _add_episode(storage, "throwaway", now - timedelta(days=400), importance=0.1)
+        await _add_episode(storage, "load-bearing", now - timedelta(days=400), importance=1.0)
 
-        cutoff = (now - timedelta(days=180)).isoformat()
-        # Cap at 2 — only the two oldest of the 5 aged rows are removed this sweep.
-        purged = await storage.purge_episodes_older_than(cutoff, max_rows=2)
-        assert purged == 2
-        remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
-        assert len(remaining) == 4  # 5 old - 2 purged + 1 within-window
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90,
+        )
 
-        # within-window is never a candidate regardless of cap.
-        ids = {r[0] for r in remaining}
-        assert "within-window" in ids
+        assert purged == 1
+        remaining = {r[0] for r in await storage.db.fetchall("SELECT id FROM memory_episodes")}
+        assert remaining == {"load-bearing"}  # high-importance episode outlives same-age throwaway
 
 
 @pytest.mark.asyncio
-async def test_purge_episodes_scopes_to_agent(tmp_path):
+async def test_purge_decayed_grace_window_is_an_independent_gate(tmp_path):
+    """Even a fully-faded episode (strength ≈ 0) is kept while it is younger
+    than grace_days — there is always a minimum lifetime. Shrinking grace below
+    the age then makes the same episode eligible, proving grace gates on its own.
+    Uses a 1-day half-life so decay is unambiguous well before normal windows."""
     db = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
         now = datetime.now(timezone.utc)
-        await _add_episode(storage, "mine-old", now - timedelta(days=300))
-        await _add_episode(storage, "other-old", now - timedelta(days=300),
-                           agent_id=OTHER_AGENT_ID)
+        # 30 days old, half_life 1d → strength ≈ 0.5^25 ≈ 3e-8 ≪ 0.02.
+        await _add_episode(storage, "faded-but-young", now - timedelta(days=30), importance=0.1)
 
-        cutoff = (now - timedelta(days=180)).isoformat()
-        purged = await storage.purge_episodes_older_than(cutoff)
+        # grace 90 > age 30 → kept despite near-zero strength.
+        kept = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90, half_life_days=1,
+        )
+        assert kept == 0
+        assert len(await storage.db.fetchall("SELECT id FROM memory_episodes")) == 1
 
-        assert purged == 1  # only this agent's episode
-        remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
-        assert {r[0] for r in remaining} == {"other-old"}
-
-
-@pytest.mark.asyncio
-async def test_purge_episodes_timestamp_format_matches_consolidator(tmp_path):
-    """Regression (#1674): created_at is stored as isoformat() with a 'T' and
-    a '+00:00' offset; the cutoff MUST use the same format. A space-separated
-    cutoff would sort wrong against the 'T' and miss a same-day-earlier row."""
-    db = tmp_path / "kestrel.db"
-    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
-        now = datetime.now(timezone.utc)
-        cutoff_dt = now - timedelta(days=180)
-        # 1 hour OLDER than the cutoff, on the same calendar day.
-        await _add_episode(storage, "same-day-older", cutoff_dt - timedelta(hours=1))
-
-        purged = await storage.purge_episodes_older_than(cutoff_dt.isoformat())
-
+        # grace 20 < age 30 AND strength < threshold → now eligible.
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=20, half_life_days=1,
+        )
         assert purged == 1
         assert await storage.db.fetchall("SELECT id FROM memory_episodes") == []
 
 
 @pytest.mark.asyncio
-async def test_purge_episodes_keeps_row_when_node_delete_fails(tmp_path):
+async def test_purge_decayed_caps_a_single_sweep(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        for i in range(5):
+            await _add_episode(storage, f"faded-{i}", now - timedelta(days=300), importance=0.1)
+        await _add_episode(storage, "recent", now - timedelta(days=10), importance=0.1)
+
+        # Cap at 2 — only the two oldest eligible rows go this sweep.
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90, max_rows=2,
+        )
+        assert purged == 2
+        remaining = await storage.db.fetchall("SELECT id FROM memory_episodes")
+        assert len(remaining) == 4  # 5 faded - 2 purged + 1 recent
+        assert "recent" in {r[0] for r in remaining}
+
+
+@pytest.mark.asyncio
+async def test_purge_decayed_scopes_to_agent(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        await _add_episode(storage, "mine", now - timedelta(days=400), importance=0.1)
+        await _add_episode(storage, "other", now - timedelta(days=400), importance=0.1,
+                           agent_id=OTHER_AGENT_ID)
+
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90,
+        )
+
+        assert purged == 1  # only this agent's episode
+        remaining = {r[0] for r in await storage.db.fetchall("SELECT id FROM memory_episodes")}
+        assert remaining == {"other"}
+
+
+@pytest.mark.asyncio
+async def test_purge_decayed_keeps_row_when_node_delete_fails(tmp_path):
     """Regression (#1674): if a paired KG node delete fails, the episode row
     must NOT be deleted — otherwise we create the orphan node the ordering is
     meant to prevent. The episode is retried on the next sweep."""
     db = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
         now = datetime.now(timezone.utc)
-        await _add_episode(storage, "good", now - timedelta(days=300))
-        await _add_episode(storage, "bad", now - timedelta(days=300))
+        await _add_episode(storage, "good", now - timedelta(days=400), importance=0.1)
+        await _add_episode(storage, "bad", now - timedelta(days=400), importance=0.1)
 
         real_delete = storage.graph.delete_node
 
@@ -374,29 +412,53 @@ async def test_purge_episodes_keeps_row_when_node_delete_fails(tmp_path):
 
         storage.graph.delete_node = flaky
 
-        purged = await storage.purge_episodes_older_than(
-            (now - timedelta(days=180)).isoformat()
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90,
         )
 
         assert purged == 1  # only "good" removed
         remaining = {r[0] for r in await storage.db.fetchall("SELECT id FROM memory_episodes")}
         assert remaining == {"bad"}  # row kept — its node could not be deleted
-        # "bad" node is still present (not orphaned).
-        assert await storage.get_node("bad") is not None
+        assert await storage.get_node("bad") is not None  # node not orphaned
 
 
 @pytest.mark.asyncio
-async def test_purge_episodes_non_positive_cap_purges_nothing(tmp_path):
+async def test_purge_decayed_non_positive_cap_purges_nothing(tmp_path):
     """Regression (#1674): max_rows<=0 must purge nothing, not fall through to
-    SQLite's unbounded LIMIT -1 (which would bypass the per-sweep cap)."""
+    an unbounded sweep."""
     db = tmp_path / "kestrel.db"
     async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
         now = datetime.now(timezone.utc)
-        await _add_episode(storage, "old", now - timedelta(days=300))
-        cutoff = (now - timedelta(days=180)).isoformat()
+        await _add_episode(storage, "faded", now - timedelta(days=400), importance=0.1)
 
-        assert await storage.purge_episodes_older_than(cutoff, max_rows=0) == 0
-        assert await storage.purge_episodes_older_than(cutoff, max_rows=-1) == 0
+        assert await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90, max_rows=0) == 0
+        assert await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90, max_rows=-1) == 0
         # The episode (and its node) survive.
         assert len(await storage.db.fetchall("SELECT id FROM memory_episodes")) == 1
-        assert await storage.get_node("old") is not None
+        assert await storage.get_node("faded") is not None
+
+
+@pytest.mark.asyncio
+async def test_privacy_wrapper_exposes_purge_decayed_episodes(tmp_path):
+    """The consolidation pass reads ``agent.storage.purge_decayed_episodes``
+    where ``agent.storage`` is the ``PrivacyEnforcingStorage`` wrapper. Pin the
+    delegator so it can't be dropped without breaking a test."""
+    from kestrel_sovereign.privacy import PrivacyMode
+    from kestrel_sovereign.storage.privacy_wrapper import PrivacyEnforcingStorage
+
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as underlying:
+        wrapper = PrivacyEnforcingStorage(underlying, PrivacyMode.NORMAL)
+        assert hasattr(wrapper, "purge_decayed_episodes"), (
+            "privacy wrapper must expose purge_decayed_episodes so the "
+            "consolidation forgetting tier can find it"
+        )
+
+        now = datetime.now(timezone.utc)
+        await _add_episode(underlying, "faded", now - timedelta(days=400), importance=0.1)
+        purged = await wrapper.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90,
+        )
+        assert purged == 1

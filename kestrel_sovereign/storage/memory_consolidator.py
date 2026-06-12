@@ -288,7 +288,7 @@ class MemoryConsolidator:
 
             # Create episode
             episode = await self._create_episode_from_messages(
-                date_key, messages, avg_intensity
+                date_key, messages, avg_intensity, avg_importance
             )
             if episode:
                 episodes.append(episode)
@@ -410,9 +410,15 @@ class MemoryConsolidator:
         self,
         date_key: str,
         messages: List[Dict],
-        avg_intensity: float
+        avg_intensity: float,
+        avg_importance: float = 0.5,
     ) -> Optional[MemoryEpisode]:
-        """Create a MemoryEpisode from a cluster of messages."""
+        """Create a MemoryEpisode from a cluster of messages.
+
+        ``avg_importance`` is the mean message-importance over the cluster,
+        stamped onto the episode so the forgetting curve (#1674) can decay it
+        at an importance-scaled half-life rather than by raw age.
+        """
         if not messages:
             return None
 
@@ -458,6 +464,7 @@ class MemoryConsolidator:
             key_message_ids=key_message_ids,
             emotional_arc=emotional_arc,
             created_at=datetime.now(timezone.utc),
+            importance=avg_importance,
         )
 
     def _describe_emotional_arc(self, valences: List[float]) -> str:
@@ -535,8 +542,8 @@ class MemoryConsolidator:
         await self._db.execute(
             """INSERT INTO memory_episodes
                (id, agent_id, title, summary, timespan_start, timespan_end,
-                key_message_ids, emotional_arc, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                key_message_ids, emotional_arc, created_at, importance)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 episode.id,
                 episode.agent_id,
@@ -547,6 +554,7 @@ class MemoryConsolidator:
                 json.dumps(episode.key_message_ids),
                 episode.emotional_arc,
                 datetime.now(timezone.utc).isoformat(),
+                episode.importance,
             )
         )
 
@@ -824,11 +832,19 @@ class MemoryConsolidator:
             for msg in messages
         ]
         avg_intensity = sum(intensities) / len(intensities) if intensities else 0
+        # Stamp the same importance decay signal as nightly episodes (#1674) so
+        # session episodes participate in the forgetting curve consistently —
+        # without this they'd all default to 0.5 regardless of their content.
+        importances = [
+            msg.get("metadata", {}).get("importance", 0.5)
+            for msg in messages
+        ]
+        avg_importance = sum(importances) / len(importances) if importances else 0.5
 
         # Create episode
         date_key = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
         episode = await self._create_episode_from_messages(
-            date_key, messages, avg_intensity
+            date_key, messages, avg_intensity, avg_importance
         )
 
         if episode:
@@ -903,7 +919,7 @@ class MemoryConsolidator:
         """
         rows = await self._db.fetchall(
             """SELECT id, agent_id, title, summary, timespan_start, timespan_end,
-                      key_message_ids, emotional_arc, created_at
+                      key_message_ids, emotional_arc, created_at, importance
                FROM memory_episodes
                WHERE agent_id = ?
                ORDER BY created_at DESC
@@ -914,7 +930,7 @@ class MemoryConsolidator:
         episodes = []
         for row in rows:
             (ep_id, agent_id, title, summary, timespan_start, timespan_end,
-             key_message_ids, emotional_arc, created_at) = row
+             key_message_ids, emotional_arc, created_at, importance) = row
 
             # Parse JSON fields
             if isinstance(key_message_ids, str):
@@ -955,6 +971,7 @@ class MemoryConsolidator:
                 key_message_ids=key_message_ids,
                 emotional_arc=emotional_arc,
                 created_at=created_at,
+                importance=importance if importance is not None else 0.5,
             ))
 
         return episodes
