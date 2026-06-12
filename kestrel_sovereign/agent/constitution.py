@@ -568,11 +568,24 @@ class ConstitutionMixin:
         if overlay_path is not None and overlay_path.exists():
             try:
                 overlay_bytes = overlay_path.read_bytes()
-                overlay_sha = hashlib.sha256(overlay_bytes).hexdigest()
-                self.constitution_text = overlay_bytes.decode("utf-8")
             except OSError as e:
                 logging.warning("Could not re-read constitution overlay %s: %s", overlay_path, e)
-                overlay_sha = None
+                overlay_bytes = None
+            if overlay_bytes is not None:
+                # Hash the raw bytes FIRST so the anchor comparison runs even for
+                # a non-UTF-8 overlay; decode defensively (invalid UTF-8 must NOT
+                # raise past the comparison and skip fail-closed — codex r3). A
+                # non-text overlay yields no parseable grants, which is safe.
+                overlay_sha = hashlib.sha256(overlay_bytes).hexdigest()
+                try:
+                    self.constitution_text = overlay_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    logging.warning(
+                        "Constitution overlay %s is not valid UTF-8; no grants parseable.",
+                        overlay_path,
+                    )
+                    self.constitution_text = None
+            else:
                 self.constitution_text = None
         else:
             # File absent now (never existed, or removed at runtime).

@@ -302,6 +302,19 @@ class TestOverlayAnchorVerification:
         assert agent.constitution_text is None
 
     @pytest.mark.asyncio
+    async def test_non_utf8_overlay_fails_closed(self, tmp_path):
+        """#1722 codex r3: an overlay rewritten to non-UTF-8 bytes must fail
+        closed (hash mismatch), not raise UnicodeDecodeError past the check."""
+        agent, sha = self._agent_with_overlay(tmp_path)
+        self._set_storage(agent, self._node({"constitution_overlay_hash": sha}))
+        assert (await agent.verify_constitution_overlay())[0] is True
+        # Attacker writes invalid UTF-8.
+        (tmp_path / "agent" / "CONSTITUTION.md").write_bytes(b"\xff\xfe\x00bad")
+        ok, msg = await agent.verify_constitution_overlay()
+        assert ok is False and agent.constitution_overlay_verified is False
+        assert agent.constitution_text is None
+
+    @pytest.mark.asyncio
     async def test_anchor_constitution_overlay_persists_hash(self, tmp_path):
         agent, sha = self._agent_with_overlay(tmp_path)
         node = self._node({})
