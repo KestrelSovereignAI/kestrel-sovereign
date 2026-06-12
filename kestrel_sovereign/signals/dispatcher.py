@@ -431,12 +431,24 @@ class SignalDispatcher:
                 registration=registration,
             )
 
-        # Inherit trust from registration so callers can't lie.
-        signal.origin_trust = registration.trust
+        # Trust is the MINIMUM of the registration ceiling and any per-signal
+        # downgrade. A source registered TRUSTED still lets an individual signal
+        # mark ITSELF untrusted (e.g. an inbound A2A wake whose sender signature
+        # didn't verify, #1721) — but a caller can never RAISE trust above the
+        # registration ceiling, so callers still can't lie upward. Concretely:
+        # keep a self-downgraded UNTRUSTED signal, otherwise inherit the
+        # registration's trust.
+        if (
+            registration.trust.value != "untrusted"
+            and getattr(signal.origin_trust, "value", None) == "untrusted"
+        ):
+            pass  # honor the per-signal downgrade
+        else:
+            signal.origin_trust = registration.trust
 
         # UNTRUSTED → run sanitizer for non-ACTION modes
         if (
-            registration.trust.value == "untrusted"
+            signal.origin_trust.value == "untrusted"
             and signal.mode != SignalMode.ACTION
             and registration.sanitizer is not None
         ):

@@ -542,6 +542,33 @@ class TestA2ATaskSubmittedSignalSource:
         # Dedupe by task_id so idempotency retries collapse to one wake.
         assert sig.dedupe_key == "task-123"
 
+    def test_signal_trust_tiers_on_sender_verified(self):
+        """#1721: an unverified claimed sender self-downgrades to UNTRUSTED; a
+        cryptographically-verified sender keeps TRUSTED; a blank sender (local
+        self-spawn) keeps the trusted default."""
+        from kestrel_sdk.signals import Trust
+        from kestrel_sovereign.signals.sources.a2a_task_submitted import (
+            build_signal_for_submitted_task,
+        )
+
+        def _task(metadata):
+            return type("_T", (), {"id": "t", "sessionId": "s", "metadata": metadata})()
+
+        # Claimed sender, no verification → UNTRUSTED.
+        unverified = build_signal_for_submitted_task(
+            _task({"sender": "emma"}), target_agent="me", sender="emma")
+        assert unverified.origin_trust == Trust.UNTRUSTED
+
+        # Claimed sender + verified signature → TRUSTED.
+        verified = build_signal_for_submitted_task(
+            _task({"sender": "emma", "sender_verified": True}), target_agent="me", sender="emma")
+        assert verified.origin_trust == Trust.TRUSTED
+
+        # No sender (local self-spawn / subagent dispatch) → TRUSTED default.
+        local = build_signal_for_submitted_task(
+            _task({}), target_agent="me", sender="")
+        assert local.origin_trust == Trust.TRUSTED
+
     def test_schema_rejects_missing_keys(self):
         from kestrel_sovereign.signals.sources.a2a_task_submitted import (
             build_a2a_task_submitted_registration,

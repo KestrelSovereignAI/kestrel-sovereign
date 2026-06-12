@@ -51,8 +51,18 @@ class SpawnMandate:
     def _signable_payload(self) -> bytes:
         """Return the canonical bytes representation for signing.
 
-        Excludes parent_signature (obviously) and created_at (to allow
-        signing before or after timestamp assignment without invalidating).
+        Excludes only ``parent_signature`` (obviously). ``created_at`` IS bound
+        (#1721): expiry is ``created_at + ttl_seconds``, so signing ``ttl_seconds``
+        without ``created_at`` left the effective validity window forgeable — a
+        holder could move ``created_at`` forward to refresh the TTL on an
+        otherwise-valid mandate. ``created_at`` is assigned at construction
+        (``default_factory``), so it is always present by signing time.
+
+        Format note: mandates are ephemeral — signed at spawn and held in the
+        AgentManager's in-memory ``_child_mandates`` map, never persisted or
+        re-verified across restarts (a restart re-spawns and re-signs). So
+        adding ``created_at`` to the signed bytes is a clean cutover: there are
+        no stored old-format signatures to invalidate.
         """
         payload = {
             "parent_did": self.parent_did,
@@ -64,6 +74,7 @@ class SpawnMandate:
             "features_allowed": self.features_allowed,
             "purpose": self.purpose,
             "max_child_depth": self.max_child_depth,
+            "created_at": self.created_at,
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"

@@ -174,18 +174,22 @@ def _signer_and_doc():
     from datetime import datetime, timezone
     from kestrel_sovereign.identity.hybrid_keypair import generate_hybrid_keypair
     from kestrel_sovereign.identity.did_web import build_verification_methods
-    from kestrel_sovereign.a2a.envelope_signing import sign_envelope, canonical_message
+    from kestrel_sovereign.a2a.envelope_signing import (
+        bound_envelope_fields, sign_envelope, canonical_message,
+    )
 
     kp = generate_hybrid_keypair()
     doc = {"id": _SENDER_DID, "verificationMethod": build_verification_methods(_SENDER_DID, kp.public_keys())}
 
-    def sign(part_texts, *, task_id="task-1", session_id="sess-1"):
+    def sign(part_texts, *, task_id="task-1", session_id="sess-1", metadata=None, artifacts=None):
         # Mirror exactly what the endpoint signs/verifies: the canonical
-        # (structure-preserving) message form + authoritative sessionId.
+        # (structure-preserving) message form + authoritative sessionId + the
+        # behaviour-steering bound fields derived from the same metadata (#1721).
         return sign_envelope(
             kp, sender=_SENDER_DID, task_id=task_id,
             message=canonical_message(part_texts), session_id=session_id,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            bound=bound_envelope_fields(metadata, artifacts=artifacts),
         )
 
     return sign, doc
@@ -216,6 +220,46 @@ def test_valid_signed_envelope_verifies(app_with_send):
 
     assert resp.status_code == 200
     assert agent.task_manager.create_task.await_args.kwargs["params"].metadata["sender_verified"] is True
+
+
+def test_valid_signed_envelope_with_artifacts_verifies(app_with_send):
+    """#1721 regression: a signed envelope that carries top-level artifacts must
+    verify — the receiver binds the RAW wire artifacts (not a non-existent
+    ``params.artifacts``), matching what the signer bound."""
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc if did == _SENDER_DID else None
+    _attach(app_with_send, agent)
+
+    artifacts = [{"name": "plan", "parts": [{"type": "text", "text": "step one"}], "index": 0}]
+    body = _body(
+        artifacts=artifacts,
+        metadata={"sender": _SENDER_DID, "signature": sign(["do it"], artifacts=artifacts)},
+    )
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 200
+    assert agent.task_manager.create_task.await_args.kwargs["params"].metadata["sender_verified"] is True
+
+
+def test_signed_envelope_with_tampered_artifacts_rejected_403(app_with_send):
+    """Altering an artifact after signing fails verification (#1721)."""
+    sign, doc = _signer_and_doc()
+    agent = _stub_agent()
+    agent.a2a_did_resolver = lambda did: doc
+    _attach(app_with_send, agent)
+
+    signed_artifacts = [{"name": "plan", "parts": [{"type": "text", "text": "step one"}], "index": 0}]
+    tampered = [{"name": "plan", "parts": [{"type": "text", "text": "INJECTED"}], "index": 0}]
+    body = _body(
+        artifacts=tampered,
+        metadata={"sender": _SENDER_DID, "signature": sign(["do it"], artifacts=signed_artifacts)},
+    )
+    with TestClient(app_with_send) as client:
+        resp = client.post("/api/agent/tasks/send", json=body)
+
+    assert resp.status_code == 403
 
 
 def test_tampered_signed_envelope_rejected_403(app_with_send):

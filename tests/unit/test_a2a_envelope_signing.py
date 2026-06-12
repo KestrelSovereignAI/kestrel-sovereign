@@ -64,10 +64,41 @@ def test_sign_then_verify_roundtrip_ok():
     kp, doc = _keypair_and_doc()
     ts = _now_iso()
     block = sign_envelope(kp, sender=DID, task_id="task-1", message="ping", timestamp=ts, session_id="s1")
-
-    v = verify_envelope(doc, block, sender=DID, task_id="task-1", message="ping", timestamp=ts, session_id="s1")
+    # v2 blocks carry a per-envelope nonce; the verifier reconstructs the bytes
+    # with it (verify_inbound_envelope reads it from the block automatically).
+    assert block["v"] == 2 and block["nonce"]
+    v = verify_envelope(doc, block, sender=DID, task_id="task-1", message="ping", timestamp=ts, session_id="s1", nonce=block["nonce"])
     assert v.ok is True
     assert v.verified is True
+
+
+def test_sign_then_verify_roundtrip_with_bound_fields_ok():
+    """skill/verb/reply/artifacts/causation_chain are bound and round-trip."""
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
+    kp, doc = _keypair_and_doc()
+    ts = _now_iso()
+    md = {"skill": "review", "a2a_verb": "ask", "reply_expected": True,
+          "causation_chain": ["a", "b"]}
+    bound = bound_envelope_fields(md, artifacts=[{"name": "x", "parts": ["p"]}])
+    block = sign_envelope(kp, sender=DID, task_id="t", message="m", timestamp=ts, bound=bound)
+    v = verify_envelope(doc, block, sender=DID, task_id="t", message="m", timestamp=ts, bound=bound, nonce=block["nonce"])
+    assert v.ok is True and v.verified is True
+
+
+def test_tampered_bound_field_fails():
+    """Rewriting the causation_chain (loop-detection lineage) on an otherwise
+    valid envelope must fail verification (#1721)."""
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
+    kp, doc = _keypair_and_doc()
+    ts = _now_iso()
+    signed_bound = bound_envelope_fields({"causation_chain": ["a", "b"]})
+    block = sign_envelope(kp, sender=DID, task_id="t", message="m", timestamp=ts, bound=signed_bound)
+    # Attacker resets the chain to escape the depth-2 cycle guard.
+    forged_bound = bound_envelope_fields({"causation_chain": []})
+    v = verify_envelope(doc, block, sender=DID, task_id="t", message="m", timestamp=ts, bound=forged_bound, nonce=block["nonce"])
+    assert v.ok is False
 
 
 def test_tampered_message_fails():
@@ -134,12 +165,19 @@ def test_wrong_key_fails():
 
 
 def _signed_metadata(kp, *, sender=DID, task_id="t", message="m", session_id=None, ts=None):
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
     ts = ts or _now_iso()
-    return {
-        "sender": sender,
-        "session_id": session_id,
-        "signature": sign_envelope(kp, sender=sender, task_id=task_id, message=message, timestamp=ts, session_id=session_id),
-    }
+    meta = {"sender": sender, "session_id": session_id}
+    # Mirror the real signer (peers.feature._maybe_sign_outbound): bind the
+    # behaviour-steering fields derived from the same metadata so the inbound
+    # verifier reconstructs identical bytes.
+    bound = bound_envelope_fields(meta, artifacts=None)
+    meta["signature"] = sign_envelope(
+        kp, sender=sender, task_id=task_id, message=message, timestamp=ts,
+        session_id=session_id, bound=bound,
+    )
+    return meta
 
 
 def test_unsigned_allowed_by_default():
@@ -175,11 +213,14 @@ def test_signed_async_resolver_verifies():
     assert v.ok is True and v.verified is True
 
 
-def test_signed_but_unresolvable_allowed_by_default():
+def test_signed_but_unresolvable_rejected_by_default():
+    """A present signature whose sender can't be resolved is a FAILURE, never
+    downgraded to 'allowed unsigned' (#1721) — even when require_signed=False."""
     kp, _ = _keypair_and_doc()
     meta = _signed_metadata(kp)
     v = asyncio.run(verify_inbound_envelope(meta, task_id="t", message="m", resolver=lambda did: None))
-    assert v.ok is True and v.verified is False
+    assert v.ok is False
+    assert "cannot resolve" in v.reason
 
 
 def test_signed_but_unresolvable_rejected_when_require_signed():
@@ -187,6 +228,117 @@ def test_signed_but_unresolvable_rejected_when_require_signed():
     meta = _signed_metadata(kp)
     v = asyncio.run(verify_inbound_envelope(meta, task_id="t", message="m", resolver=lambda did: None, require_signed=True))
     assert v.ok is False
+
+
+def test_replay_of_same_envelope_rejected():
+    """A second verify of the same signed envelope (same nonce) inside the
+    window is rejected — verify atomically RESERVES the nonce (#1721)."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    guard = ReplayGuard()
+    first = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert first.ok is True and first.verified is True
+    second = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert second.ok is False
+    assert "repla" in second.reason.lower()
+
+
+def test_nonce_is_consumed_on_verify_no_rollback():
+    """A verified nonce is spent on receipt (no rollback): the SAME signed body
+    can't be re-verified, but a freshly-signed envelope (new nonce) from the same
+    sender verifies fine — modelling a client re-signing on retry (#1721 codex r5)."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    meta = _signed_metadata(kp)
+    guard = ReplayGuard()
+    first = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert first.ok is True
+    # Exact-body retry is rejected (nonce consumed)...
+    again = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert again.ok is False
+    # ...but a freshly-signed envelope (new nonce) from the same sender passes.
+    resigned = _signed_metadata(kp)
+    fresh = asyncio.run(verify_inbound_envelope(
+        resigned, task_id="t", message="m", resolver=lambda did: doc, replay_guard=guard))
+    assert fresh.ok is True and fresh.verified is True
+
+
+def test_future_skewed_replay_rejected_for_full_validity_window():
+    """A future-skewed envelope is valid for up to 2× the window from first
+    receipt; the replay reservation must outlive that whole span, not just 1×
+    the window (#1721 codex r4)."""
+    from datetime import timedelta
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+
+    kp, doc = _keypair_and_doc()
+    window = 10
+    guard = ReplayGuard(ttl_seconds=2 * window)
+    now0 = datetime.now(timezone.utc)
+    # Timestamp at the max allowed future skew.
+    ts = _now_iso(now0 + timedelta(seconds=window))
+    meta = _signed_metadata(kp, ts=ts)
+
+    # First receipt at now0 (envelope is +window in the future, within skew).
+    first = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc,
+        replay_guard=guard, max_age_seconds=window, now=now0))
+    assert first.ok is True
+    # Replay at now0 + 2*window == ts + window: still signature-fresh, and the
+    # reservation must still be remembered → rejected as a replay.
+    later = now0 + timedelta(seconds=2 * window)
+    replay = asyncio.run(verify_inbound_envelope(
+        meta, task_id="t", message="m", resolver=lambda did: doc,
+        replay_guard=guard, max_age_seconds=window, now=later))
+    assert replay.ok is False
+    assert "repla" in replay.reason.lower()
+
+
+def test_causation_chain_type_substitution_rejected():
+    """An attacker can't erase lineage by swapping each frame dict for its string
+    repr: the bound chain is structure-preserving, so the bytes (and signature)
+    change (#1721 codex r3 P1)."""
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
+    kp, doc = _keypair_and_doc()
+    ts = _now_iso()
+    frames = [{"agent": "a", "source": "s", "depth": 1}]
+    signed_bound = bound_envelope_fields({"causation_chain": frames})
+    block = sign_envelope(kp, sender=DID, task_id="t", message="m", timestamp=ts, bound=signed_bound)
+    # Swap the frame dict for its exact string repr — a flattened projection
+    # would collide; the structure-preserving one must not.
+    forged_bound = bound_envelope_fields({"causation_chain": [str(frames[0])]})
+    v = verify_envelope(doc, block, sender=DID, task_id="t", message="m", timestamp=ts, bound=forged_bound, nonce=block["nonce"])
+    assert v.ok is False
+
+
+def test_inbound_binds_metadata_skill_and_artifacts():
+    """The inbound verifier binds the behaviour-steering metadata + top-level
+    artifacts; tampering either after signing fails verification."""
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
+    kp, doc = _keypair_and_doc()
+    ts = _now_iso()
+    md = {"sender": DID, "skill": "review", "a2a_verb": "ask"}
+    artifacts = [{"name": "report", "parts": ["original"]}]
+    bound = bound_envelope_fields(md, artifacts=artifacts)
+    md["signature"] = sign_envelope(kp, sender=DID, task_id="t", message="m", timestamp=ts, bound=bound)
+    # Honest path verifies.
+    ok = asyncio.run(verify_inbound_envelope(
+        md, task_id="t", message="m", artifacts=artifacts, resolver=lambda did: doc))
+    assert ok.ok is True and ok.verified is True
+    # Tampered artifact text fails.
+    bad = asyncio.run(verify_inbound_envelope(
+        md, task_id="t", message="m",
+        artifacts=[{"name": "report", "parts": ["INJECTED"]}],
+        resolver=lambda did: doc, replay_guard=None))
+    assert bad.ok is False
 
 
 def test_signed_but_bad_signature_always_rejected_even_without_require():

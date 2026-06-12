@@ -221,6 +221,19 @@ def build_signal_for_submitted_task(
         a2a_verb = str(metadata.get("a2a_verb") or "")
         reply_expected = bool(metadata.get("reply_expected", False))
     chain = _deserialize_chain(metadata if isinstance(metadata, dict) else {})
+    effective_sender = sender or str(metadata.get("sender", "") or "")
+    # Trust tiering (#1721): the source is registered TRUSTED (the v1 same-host
+    # posture), but a wake whose claimed sender was NOT cryptographically
+    # verified self-downgrades to UNTRUSTED so the dispatcher routes it through
+    # the untrusted path (sanitizer / stricter governance). The endpoint stamps
+    # ``metadata["sender_verified"]`` from the envelope-signature verdict; a
+    # missing flag with a claimed sender is treated as unverified. A blank
+    # sender (local self-spawn / subagent dispatch) keeps the trusted default.
+    origin_trust = Trust.TRUSTED
+    if effective_sender:
+        verified = isinstance(metadata, dict) and bool(metadata.get("sender_verified"))
+        if not verified:
+            origin_trust = Trust.UNTRUSTED
     return Signal(
         source=SOURCE_NAME,
         kind="inbound",
@@ -228,7 +241,7 @@ def build_signal_for_submitted_task(
         payload={
             "task_id": task_id,
             "session_id": session_id,
-            "sender": sender or str(metadata.get("sender", "") or ""),
+            "sender": effective_sender,
             "skill_id": skill_id,
             "a2a_verb": a2a_verb,
             "reply_expected": reply_expected,
@@ -238,6 +251,7 @@ def build_signal_for_submitted_task(
         visibility=Visibility.INTERNAL,
         caller=sender or None,
         urgency=Urgency.NORMAL,
+        origin_trust=origin_trust,
         # Idempotency retries (same task_id resubmitted) collapse to
         # one wake within the registration's coalescing window.
         dedupe_key=task_id,
