@@ -352,6 +352,24 @@ class LLMAdapter(_SDKLLMAdapter):
                     texts.append(part["text"])
         return "\n".join(texts) if texts else None
 
+    @staticmethod
+    def _is_tool_result_turn(message: Dict[str, Any]) -> bool:
+        """True for a user turn that carries tool plumbing rather than prose.
+
+        In a post-tool continuation the message list ends in a user-role turn
+        whose content is ``tool_result`` blocks. Eager vision must weld the
+        image to the *genuine* prompt, not the tool-result turn, so the
+        injection scan skips these.
+        """
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "tool_result", "tool_use",
+                ):
+                    return True
+        return False
+
     def attach_images_to_last_user_message(
         self,
         messages: List[Dict[str, Any]],
@@ -378,6 +396,11 @@ class LLMAdapter(_SDKLLMAdapter):
         out = list(messages)
         for i in range(len(out) - 1, -1, -1):
             if out[i].get("role") != "user":
+                continue
+            # Skip a tool-result continuation turn so the image welds to the
+            # genuine prompt (which carries the user's question), not the
+            # tool plumbing that follows it.
+            if self._is_tool_result_turn(out[i]):
                 continue
             text = self._extract_user_text(out[i])
             rebuilt = self.create_messages(user_prompt=text, images=images)

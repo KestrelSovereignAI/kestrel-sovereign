@@ -100,6 +100,84 @@ def test_attach_noop_without_images():
     assert a.attach_images_to_last_user_message(msgs, []) is msgs
 
 
+def test_google_adapter_injects_inline_data_parts():
+    # The only adapter whose native shape is Gemini "parts"/"inline_data".
+    from kestrel_sovereign.llm.google_adapter import GoogleAdapter
+    a = GoogleAdapter()
+    out = a.attach_images_to_last_user_message(
+        [{"role": "user", "content": "see"}], [_PNG])
+    parts = out[0]["parts"]
+    assert parts[0] == {"text": "see"}
+    assert parts[1]["inline_data"]["mime_type"] == "image/png"
+    assert parts[1]["inline_data"]["data"]
+    # The original string `content` key must not linger beside the new parts.
+    assert "content" not in out[0]
+
+
+def test_attach_skips_tool_result_turn_and_welds_to_prompt():
+    # In a post-tool continuation the last user turn is a tool_result; the
+    # image must weld to the genuine prompt above it, not the tool plumbing.
+    from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    a = OpenAIAdapter()
+    msgs = [
+        {"role": "user", "content": "what is in this image?"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "t1", "function": {"name": "x", "arguments": "{}"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "42"}]},
+    ]
+    out = a.attach_images_to_last_user_message(msgs, [_PNG])
+    # tool_result turn untouched
+    assert out[2]["content"][0]["type"] == "tool_result"
+    # image welded to the genuine prompt turn
+    assert out[0]["content"][0] == {"type": "text", "text": "what is in this image?"}
+    assert any(p.get("type") == "image_url" for p in out[0]["content"])
+
+
+class _VisionNoHelperAdapter:
+    """Vision-capable but missing the fold helper (a third-party SDK-base
+    adapter that subclasses kestrel_sdk directly)."""
+    def provider_capabilities(self):
+        return MagicMock(supports_vision=True)
+
+
+def test_apply_eager_vision_errors_when_vision_adapter_lacks_helper(caplog):
+    from kestrel_sovereign.llm.streaming import StreamingMixin
+    svc = StreamingMixin.__new__(StreamingMixin)
+    msgs = [{"role": "user", "content": "x"}]
+    with caplog.at_level(logging.ERROR):
+        out = svc._apply_eager_vision(
+            _VisionNoHelperAdapter(), msgs, [b"i"], "thirdparty", "m")
+    # Not mislabelled as blind: distinct "cannot fold images" error, unchanged.
+    assert out is msgs
+    assert "cannot fold images" in caplog.text
+
+
+# --- agent eager-image resolution bounds ------------------------------------
+
+@pytest.mark.asyncio
+async def test_resolve_eager_images_caps_count():
+    from kestrel_sovereign.agent.streaming import StreamingMixin, _MAX_EAGER_IMAGES
+    agent = MagicMock()
+    agent.storage.retrieve_file = AsyncMock(return_value=b"img")
+    resolve = StreamingMixin._resolve_eager_images.__get__(agent)
+    atts = [{"hash": f"{i:064x}", "kind": "image", "inline": True}
+            for i in range(_MAX_EAGER_IMAGES + 3)]
+    out = await resolve(atts)
+    assert len(out) == _MAX_EAGER_IMAGES
+
+
+@pytest.mark.asyncio
+async def test_resolve_eager_images_skips_oversized():
+    from kestrel_sovereign.agent.streaming import StreamingMixin, _MAX_EAGER_IMAGE_BYTES
+    agent = MagicMock()
+    agent.storage.retrieve_file = AsyncMock(
+        return_value=b"x" * (_MAX_EAGER_IMAGE_BYTES + 1))
+    resolve = StreamingMixin._resolve_eager_images.__get__(agent)
+    out = await resolve([{"hash": "a" * 64, "kind": "image", "inline": True}])
+    assert out == []
+
+
 # --- service-layer capability gate ------------------------------------------
 
 class _VisionAdapter:
@@ -143,6 +221,60 @@ def test_apply_eager_vision_noop_without_images():
     svc = StreamingMixin.__new__(StreamingMixin)
     msgs = [{"role": "user", "content": "x"}]
     assert svc._apply_eager_vision(_BlindAdapter(), msgs, None, "codex", "gpt-5") is msgs
+
+
+@pytest.mark.asyncio
+async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
+    """An image-bearing turn must NOT take the remote-GPU first-try shortcut
+    (its fixed OpenAIAdapter can't tell us the configured local model's real
+    vision capability). It falls through to normal routing, which folds the
+    image for a provider whose capability is resolved per concrete model."""
+    from kestrel_sovereign.llm.service import LLMService
+    from kestrel_sovereign.llm.remote_backend import BackendType
+    from kestrel_sovereign.llm.adapter import LLMResponse
+    from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+
+    svc = LLMService()
+    svc._backend = BackendType.REMOTE_GPU
+    svc._remote_client = object()
+    monkeypatch.setattr(svc, "_remote_first_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(svc, "_check_policy", lambda *a, **k: None)
+    monkeypatch.setattr(svc, "_ensure_remote_active", lambda *a, **k: None)
+    monkeypatch.setattr(svc, "_record_streamed_usage", AsyncMock())
+    monkeypatch.setattr(svc, "_check_model_tool_support", lambda providers, tools, mo: tools)
+    monkeypatch.setattr(svc, "_resolve_concrete_model", lambda tm, p: "gpt-4o")
+    monkeypatch.setattr("kestrel_sovereign.llm.streaming.provider_cache_body", lambda p: None)
+
+    remote_called = {"n": 0}
+
+    class _Remote:
+        async def get_streaming_response_with_tools(self, **kw):
+            remote_called["n"] += 1
+            if False:  # pragma: no cover - never yields
+                yield
+
+    svc._remote_adapter = _Remote()
+
+    normal = {"n": 0, "messages": None}
+    adapter = OpenAIAdapter()
+
+    async def _fake_stream(**kw):
+        normal["n"] += 1
+        normal["messages"] = kw["messages"]
+        yield LLMResponse(content="ok", tool_calls=[])
+
+    adapter.get_streaming_response_with_tools = _fake_stream
+    provider = {"name": "openai", "adapter": adapter, "client": MagicMock()}
+    monkeypatch.setattr(svc, "resolve_provider_routing", lambda **k: ([provider], "gpt-4o"))
+
+    _ = [x async for x in svc.stream_with_tool_detection(
+        messages=[{"role": "user", "content": "what is this?"}], images=[_PNG])]
+
+    assert remote_called["n"] == 0     # remote-GPU shortcut skipped
+    assert normal["n"] == 1            # normal routing handled the turn
+    folded_user = normal["messages"][-1]
+    assert isinstance(folded_user["content"], list)
+    assert any(p.get("type") == "image_url" for p in folded_user["content"])
 
 
 # --- agent eager-image resolution -------------------------------------------

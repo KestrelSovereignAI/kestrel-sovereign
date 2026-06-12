@@ -39,6 +39,12 @@ from kestrel_sovereign.telemetry import start_span, end_span
 # ``pane.pendingRevise``; the other is a no-op.
 REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
 REVISE_SENTINEL_SUFFIX = "\x1e"
+
+# #1662 eager-vision read-path bounds (independent of the upload endpoint's
+# per-file/count caps, since a content-addressed read can name any stored
+# hash). Keep peak memory for one turn's pasted images bounded.
+_MAX_EAGER_IMAGES = 6
+_MAX_EAGER_IMAGE_BYTES = 12 * 1024 * 1024  # 12 MB (a touch over the 10 MB upload cap)
 THINKING_SENTINEL_PREFIX = "\x1eKESTREL:THINK:"
 THINKING_SENTINEL_SUFFIX = "\x1e"
 # #1659: tool activity is the last signal class still emitted as
@@ -337,6 +343,13 @@ class StreamingMixin:
         skipped here. The ref is already persisted on the user turn, so an
         attachment whose bytes are missing/unreadable is skipped without losing
         the history record.
+
+        Resolution is bounded independently of the upload endpoint. The
+        content-addressed read can name *any* stored hash (up to the 50 MB
+        store cap), not just files that came through the 10 MB upload gate, so
+        a turn could otherwise pull many large blobs into memory at once. We
+        cap both the number of eager images and each image's size, and log
+        loudly when something is dropped.
         """
         if not attachments:
             return []
@@ -352,6 +365,12 @@ class StreamingMixin:
             content_hash = att.get("hash")
             if not isinstance(content_hash, str):
                 continue
+            if len(images) >= _MAX_EAGER_IMAGES:
+                logging.warning(
+                    "Eager vision: more than %d inline images this turn; "
+                    "extras ignored.", _MAX_EAGER_IMAGES,
+                )
+                break
             try:
                 data = await storage.retrieve_file(content_hash)
             except Exception as exc:
@@ -360,8 +379,16 @@ class StreamingMixin:
                     content_hash[:12], exc,
                 )
                 continue
-            if data:
-                images.append(data)
+            if not data:
+                continue
+            if len(data) > _MAX_EAGER_IMAGE_BYTES:
+                logging.warning(
+                    "Eager vision: attachment %s is %d bytes (> %d cap); "
+                    "skipped.", content_hash[:12], len(data),
+                    _MAX_EAGER_IMAGE_BYTES,
+                )
+                continue
+            images.append(data)
         return images
 
     async def process_input_streaming(
@@ -785,6 +812,7 @@ class StreamingMixin:
                 tool_results=tool_results,
                 session_id=session_id,
                 request_id=request_id,
+                images=eager_images or None,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     yield _build_thinking_sentinel(chunk)

@@ -543,17 +543,25 @@ class StreamingMixin:
         """
         if not images:
             return messages
-        if self._adapter_supports_vision(adapter) and hasattr(
-            adapter, "attach_images_to_last_user_message"
-        ):
-            return adapter.attach_images_to_last_user_message(messages, images)
-        logger.warning(
-            "Eager vision: %s/%s is not vision-capable; %d image "
-            "attachment(s) were NOT sent to the model this turn. Switch to a "
-            "vision-capable model to let the agent see pasted images.",
-            provider_name, model, len(images),
-        )
-        return messages
+        if not self._adapter_supports_vision(adapter):
+            logger.warning(
+                "Eager vision: %s/%s is not vision-capable; %d image "
+                "attachment(s) were NOT sent to the model this turn. Switch to "
+                "a vision-capable model to let the agent see pasted images.",
+                provider_name, model, len(images),
+            )
+            return messages
+        if not hasattr(adapter, "attach_images_to_last_user_message"):
+            # Vision-capable, but a third-party adapter that doesn't implement
+            # the fold helper — say THAT, don't mislabel the model as blind.
+            logger.error(
+                "Eager vision: %s/%s reports vision support but cannot fold "
+                "images (no attach_images_to_last_user_message); %d "
+                "attachment(s) dropped this turn.",
+                provider_name, model, len(images),
+            )
+            return messages
+        return adapter.attach_images_to_last_user_message(messages, images)
 
     async def stream_with_tool_detection(
         self,
@@ -638,22 +646,22 @@ class StreamingMixin:
             and self._remote_client
             and not force_local_only
             and self._remote_first_allowed(model_override)
-            # Don't shortcut to the remote GPU when this turn carries images and
-            # the remote model can't see them — fall through to normal routing
-            # so a vision-capable cloud provider gets the chance (#1662).
-            and (not images or self._adapter_supports_vision(self._remote_adapter))
+            # Never shortcut to the remote GPU for an image-bearing turn (#1662).
+            # `_remote_adapter` is a fixed OpenAIAdapter whose static capability
+            # flag can't tell us whether the *configured* remote model (often a
+            # text-only local GGUF) can actually see images — so probing it
+            # would lie. Fall through to normal routing, which resolves vision
+            # per concrete model and picks a vision-capable provider.
+            and not images
         ):
             try:
                 self._ensure_remote_active()
                 model = self._scrub_auto(model_override) or self._remote_config.model
                 if hasattr(self._remote_adapter, "get_streaming_response_with_tools"):
-                    remote_messages = self._apply_eager_vision(
-                        self._remote_adapter, messages, images, "remote_gpu", model
-                    )
                     async for item in self._remote_adapter.get_streaming_response_with_tools(
                         client=self._remote_client,
                         model=model,
-                        messages=remote_messages,
+                        messages=messages,
                         tools=tools,
                     ):
                         yield item
@@ -683,6 +691,14 @@ class StreamingMixin:
 
                 logger.info(f"Attempting streaming with tools from {provider_name} with {model}")
 
+                # Fold this turn's eager images into the last user message in
+                # the resolved provider's native format BEFORE either dispatch
+                # branch, so the non-streaming fallback (e.g. Gemini, which has
+                # no get_streaming_response_with_tools) sees them too (#1662).
+                adapter_messages = self._apply_eager_vision(
+                    adapter, messages, images, provider_name, model
+                )
+
                 # Check if adapter supports streaming with tool detection
                 if hasattr(adapter, "get_streaming_response_with_tools"):
                     # Build kwargs for provider-specific parameters
@@ -709,9 +725,6 @@ class StreamingMixin:
                     usage_sink: Dict[str, Any] = {}
                     if getattr(adapter, "supports_partial_usage_flush", False):
                         kwargs["usage_sink"] = usage_sink
-                    adapter_messages = self._apply_eager_vision(
-                        adapter, messages, images, provider_name, model
-                    )
                     stream_start = time.monotonic()
                     final_response = None
                     try:
@@ -758,7 +771,7 @@ class StreamingMixin:
                         response = await adapter.get_response(
                             client=provider["client"],
                             model=model,
-                            messages=messages,
+                            messages=adapter_messages,
                             tools=tools,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
@@ -781,7 +794,7 @@ class StreamingMixin:
                         async for chunk in adapter.get_streaming_response(
                             client=provider["client"],
                             model=model,
-                            messages=messages,
+                            messages=adapter_messages,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
                         ):

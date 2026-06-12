@@ -2070,6 +2070,7 @@ class OrchestratorEngineMixin:
         tool_results: list = None,
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        images: Optional[list] = None,
     ):
         """
         Streaming version of _handle_orchestrator_response.
@@ -2232,6 +2233,11 @@ class OrchestratorEngineMixin:
                         model_override=effective_model,
                         session_id=session_id,
                         tool_executor=self._make_inline_tool_executor(session_id),
+                        # #1662: keep the pasted image visible to the model that
+                        # synthesizes the post-tool answer. The fold targets the
+                        # genuine prompt turn (tool_result turns are skipped), so
+                        # "what's in this image?" + a tool call still sees it.
+                        images=images,
                     ):
                         if _cancelled():
                             break
