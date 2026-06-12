@@ -169,6 +169,16 @@ test('the stable prefix is parsed once across growing chunks', () => {
     assert.equal(stableParses.length, 1);
 });
 
+test('reference-style link content is parsed whole (not split), so refs resolve', () => {
+    const mod = load();
+    mod.renderStreamingMarkdown('[docs]: https://example.com\n\nsee [docs]');
+    // One whole-content parse (the definition + reference together), not two
+    // independent block parses that would lose the document-global definition.
+    const refParses = mod._markedCalls.filter((s) => s.includes('[docs]:'));
+    assert.equal(refParses.length, 1);
+    assert.match(refParses[0], /see \[docs\]/);  // ref + def in the SAME parse
+});
+
 test('renderStreamingMarkdown concatenates stable + completed tail', () => {
     const mod = load();
     const html = mod.renderStreamingMarkdown('intro para\n\nstart **bo');

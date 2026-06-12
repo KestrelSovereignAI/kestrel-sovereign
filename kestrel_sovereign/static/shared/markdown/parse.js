@@ -253,6 +253,8 @@ function _renderStreamStable(stable) {
 
 const _FENCE_RE = /^[ \t]*(`{3,}|~{3,})/;
 const _LIST_ITEM_RE = /^[ \t]*([-*+]|\d+[.)])\s/;
+// A reference-style link/image definition line: `[label]: url`.
+const _REF_DEF_RE = /^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*\S/m;
 
 // Walk the fence state of `text` line by line, invoking `onLine(openMarkerOrNull,
 // lineIndex, line)` after each line's fence transition is applied. Returns the
@@ -405,6 +407,16 @@ function renderStreamingMarkdown(content) {
 
     const processedContent = normalizeNewlines(content);
     try {
+        // Reference-style link definitions (`[label]: url`) are document-global:
+        // the definition and the `[label]` that uses it can live in different
+        // blank-line blocks. Parsing stable/tail independently would lose that
+        // context, so for these (uncommon) messages fall back to a single
+        // whole-content parse (fence-close only) — references resolve, at the
+        // cost of memoization + immediate inline formatting for just this turn.
+        if (_REF_DEF_RE.test(processedContent)) {
+            const openFence = _openFence(processedContent);
+            return _streamMarkedParse(openFence ? processedContent + '\n' + openFence : processedContent);
+        }
         const { stable, tail } = _splitStreamingTail(processedContent);
         const stableHtml = _renderStreamStable(stable);
         const tailHtml = tail ? _streamMarkedParse(_completeStreamingInline(tail)) : '';
