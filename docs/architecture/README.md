@@ -38,6 +38,7 @@ Storage protocols, memory systems, and data ownership.
 
 - **[MEMORY_SYSTEM.md](MEMORY_SYSTEM.md)** — Emotional tagging, Ebbinghaus decay, consolidation, memory pinning. *Active.*
 - **[MEMORY_OWNERSHIP.md](MEMORY_OWNERSHIP.md)** — Memory layer assignments and the facade pattern. *Active.*
+- **[NIGHTLY_FORGETTING.md](NIGHTLY_FORGETTING.md)** — Unifying nightly maintenance under `sleep`; adding the deletion tier to the decay curve (#1674). *Aspirational* — see banner.
 - **[storage/STORAGE_ARCHITECTURE.md](storage/STORAGE_ARCHITECTURE.md)** — Multi-tier storage (PostgreSQL / SQLite / IndexedDB / ephemeral). *Active.*
 - **[storage/HUMAN_MEMORY_SYSTEM.md](storage/HUMAN_MEMORY_SYSTEM.md)** — Human-like memory with temporal patterns. *Active.*
 - **[storage/DECENTRALIZED_STORAGE.md](storage/DECENTRALIZED_STORAGE.md)** — IPFS / Filecoin integration design. *Active.*
