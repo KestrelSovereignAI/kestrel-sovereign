@@ -2,7 +2,6 @@
 """
 A FastAPI server to expose Kestrel agent functionality as a service.
 """
-import ipaddress
 import os
 import secrets
 from typing import Optional
@@ -22,6 +21,7 @@ from dotenv import load_dotenv
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from kestrel_sovereign.rate_limit import limiter
+from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
 
 import re
 
@@ -906,27 +906,19 @@ if SERVE_UI:
             raise HTTPException(status_code=404, detail="Index file not found.")
 
 
-def _is_docker_network(host: str) -> bool:
-    """Check if the host IP is within Docker's internal network range (172.16.0.0/12)."""
-    try:
-        return ipaddress.ip_address(host) in ipaddress.ip_network("172.16.0.0/12")
-    except ValueError:
-        return False
-
-
 @app.get("/api/auth/key")
 @limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
-    """Return API key for initial frontend setup (localhost only)."""
+    """Return API key for initial frontend setup (localhost / Docker gateway only)."""
     if not _bootstrap_key_enabled():
         raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
 
+    # Narrowed from the whole 172.16.0.0/12 bridge range to loopback + the
+    # Docker gateway (+ explicit KESTREL_BOOTSTRAP_ALLOWED_HOSTS) so a sibling
+    # container can't fetch sovereign credentials (#1724).
     client_host = request.client.host if request.client else None
-    allowed_hosts = {"127.0.0.1", "localhost", "::1", "172.17.0.1"}
-    is_docker_internal = client_host and _is_docker_network(client_host)
-
-    if client_host not in allowed_hosts and not is_docker_internal:
-        logger.warning(f"Auth key request from non-local host: {client_host}")
+    if not is_bootstrap_host_allowed(client_host):
+        logger.warning(f"Auth key request from non-allowed host: {client_host}")
         raise HTTPException(status_code=403, detail="API key bootstrap only accessible from localhost")
 
     return {
