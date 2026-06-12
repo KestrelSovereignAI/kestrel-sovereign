@@ -359,6 +359,17 @@ export function createApiClient({
                 body: formData,
             });
         },
+        // #1662: upload a chat attachment (image or document). Returns a ref
+        // {hash, mime, name, kind, size, url}; the bytes stay in the encrypted
+        // store. Same multipart pattern as the avatar upload.
+        uploadAttachment: (file) => {
+            const formData = new FormData();
+            formData.append('file', file);
+            return client.request('/api/agent/attachments', {
+                method: 'POST',
+                body: formData,
+            });
+        },
         setAvatarFromUrl: (url) => client.request('/api/identity/avatar', {
             method: 'POST',
             body: JSON.stringify({ url }),
@@ -539,7 +550,7 @@ export function createApiClient({
             const key = agent === undefined ? state.selectedHostAgent : agent;
             return state.effectiveSessionIds.get(key) || null;
         },
-        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false, agent) {
+        async *streamInvoke(input, model = null, sessionId = null, provider = null, retried = false, agent, attachments = null) {
             // Pin the dispatch agent. The sixth `agent` parameter lets a
             // caller (sendMessage) capture state.selectedHostAgent at
             // its own dispatch boundary and pass it through, so the user
@@ -566,7 +577,13 @@ export function createApiClient({
                 const response = await fetchImpl(url, {
                     method: 'POST',
                     headers,
-                    body: JSON.stringify({ input, model, session_id: sessionId, provider }),
+                    body: JSON.stringify({
+                        input, model, session_id: sessionId, provider,
+                        // #1662: attachment refs for this turn (uploaded
+                        // separately via /api/agent/attachments). Omitted when
+                        // there are none so non-attachment turns are unchanged.
+                        ...(attachments && attachments.length ? { attachments } : {}),
+                    }),
                     signal,
                 });
 
@@ -576,7 +593,7 @@ export function createApiClient({
                     if (recovery === 'refreshed') {
                         // Pass the SAME dispatchAgent to the retry — do
                         // NOT let it recapture state.selectedHostAgent.
-                        yield* client.streamInvoke(input, model, sessionId, provider, true, dispatchAgent);
+                        yield* client.streamInvoke(input, model, sessionId, provider, true, dispatchAgent, attachments);
                         return;
                     }
 

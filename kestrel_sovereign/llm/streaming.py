@@ -515,6 +515,93 @@ class StreamingMixin:
             underlying=last_error,
         )
 
+    @staticmethod
+    def _adapter_supports_vision(adapter: Any) -> bool:
+        """True when the adapter *family* can accept image input."""
+        try:
+            caps = adapter.provider_capabilities()
+        except Exception:
+            return False
+        return bool(getattr(caps, "supports_vision", False))
+
+    @staticmethod
+    def _discovered_model_supports_vision(provider_name: str, model: str):
+        """Per-model vision support from discovery, or ``None`` if unknown.
+
+        The adapter-family flag is too coarse: an Ollama/OpenAI/OpenRouter
+        route reports ``supports_vision=True`` at the adapter level even when
+        the *configured* model is text-only (vision is in ``model_dependent``).
+        Discovery already computes per-model ``supports_vision``; consult it so
+        an image isn't shipped to a model that will reject it.
+        """
+        try:
+            from .model_cache import get_shared_model_cache
+            models = get_shared_model_cache().get_any() or []
+        except Exception:
+            return None
+        # Route names are ``vendor:route`` (e.g. ``openai:api``) but
+        # ModelInfo.provider is the bare vendor (``openai``); compare on vendor.
+        vendor = (provider_name or "").split(":", 1)[0]
+        for info in models:
+            if getattr(info, "id", None) != model:
+                continue
+            prov = getattr(info, "provider", None)
+            # Guard against id collisions across providers.
+            if prov in (None, provider_name, vendor):
+                return bool(getattr(info, "supports_vision", False))
+        return None
+
+    def _turn_can_see_images(self, adapter: Any, provider_name: str, model: str) -> bool:
+        """Whether this concrete provider+model can accept image input.
+
+        Concrete-model metadata wins when discovery knows the model; otherwise
+        fall back to the adapter-family capability (the conservative default
+        for models discovery hasn't catalogued).
+        """
+        model_vision = self._discovered_model_supports_vision(provider_name, model)
+        if model_vision is not None:
+            return model_vision
+        return self._adapter_supports_vision(adapter)
+
+    def _apply_eager_vision(
+        self,
+        adapter: Any,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Union[str, bytes]]],
+        provider_name: str,
+        model: str,
+    ) -> List[Dict[str, Any]]:
+        """Fold this turn's eager image attachments (#1662) into the last user
+        message in the *resolved* provider's native vision format.
+
+        Vision shape is provider-specific and routing is dynamic, so the fold
+        happens here — after a provider is chosen — not at the agent layer. If
+        the resolved model can't see images, leave the messages untouched and
+        warn LOUDLY rather than silently dropping the user's image (no blind
+        fallbacks): the turn still runs as text, and the log says why.
+        """
+        if not images:
+            return messages
+        if not self._turn_can_see_images(adapter, provider_name, model):
+            logger.warning(
+                "Eager vision: %s/%s is not vision-capable; %d image "
+                "attachment(s) were NOT sent to the model this turn. Switch to "
+                "a vision-capable model to let the agent see pasted images.",
+                provider_name, model, len(images),
+            )
+            return messages
+        if not hasattr(adapter, "attach_images_to_last_user_message"):
+            # Vision-capable, but a third-party adapter that doesn't implement
+            # the fold helper — say THAT, don't mislabel the model as blind.
+            logger.error(
+                "Eager vision: %s/%s reports vision support but cannot fold "
+                "images (no attach_images_to_last_user_message); %d "
+                "attachment(s) dropped this turn.",
+                provider_name, model, len(images),
+            )
+            return messages
+        return adapter.attach_images_to_last_user_message(messages, images)
+
     async def stream_with_tool_detection(
         self,
         *,
@@ -525,6 +612,7 @@ class StreamingMixin:
         system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        images: Optional[List[Union[str, bytes]]] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -561,6 +649,10 @@ class StreamingMixin:
                 ``"provider/model"`` or just ``"model"``)
             system_prompt: Optional system prompt (only used for
                 Anthropic adapter)
+            images: Optional eager image attachments for *this* turn
+                (#1662). Folded into the last user message in the resolved
+                provider's native vision format once a provider is chosen;
+                ignored with a loud warning if that provider can't see images.
 
         Yields:
             ``Union[str, ToolCallStarted, LLMResponse]`` per the
@@ -593,6 +685,13 @@ class StreamingMixin:
             and self._remote_client
             and not force_local_only
             and self._remote_first_allowed(model_override)
+            # Never shortcut to the remote GPU for an image-bearing turn (#1662).
+            # `_remote_adapter` is a fixed OpenAIAdapter whose static capability
+            # flag can't tell us whether the *configured* remote model (often a
+            # text-only local GGUF) can actually see images — so probing it
+            # would lie. Fall through to normal routing, which resolves vision
+            # per concrete model and picks a vision-capable provider.
+            and not images
         ):
             try:
                 self._ensure_remote_active()
@@ -631,6 +730,14 @@ class StreamingMixin:
 
                 logger.info(f"Attempting streaming with tools from {provider_name} with {model}")
 
+                # Fold this turn's eager images into the last user message in
+                # the resolved provider's native format BEFORE either dispatch
+                # branch, so the non-streaming fallback (e.g. Gemini, which has
+                # no get_streaming_response_with_tools) sees them too (#1662).
+                adapter_messages = self._apply_eager_vision(
+                    adapter, messages, images, provider_name, model
+                )
+
                 # Check if adapter supports streaming with tool detection
                 if hasattr(adapter, "get_streaming_response_with_tools"):
                     # Build kwargs for provider-specific parameters
@@ -663,7 +770,7 @@ class StreamingMixin:
                         async for item in adapter.get_streaming_response_with_tools(
                             client=provider["client"],
                             model=model,
-                            messages=messages,
+                            messages=adapter_messages,
                             tools=tools,
                             **kwargs
                         ):
@@ -703,7 +810,7 @@ class StreamingMixin:
                         response = await adapter.get_response(
                             client=provider["client"],
                             model=model,
-                            messages=messages,
+                            messages=adapter_messages,
                             tools=tools,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
@@ -726,7 +833,7 @@ class StreamingMixin:
                         async for chunk in adapter.get_streaming_response(
                             client=provider["client"],
                             model=model,
-                            messages=messages,
+                            messages=adapter_messages,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
                         ):

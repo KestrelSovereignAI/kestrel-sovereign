@@ -324,3 +324,102 @@ class LLMAdapter(_SDKLLMAdapter):
                     },
                 }
             )
+
+    @staticmethod
+    def _extract_user_text(message: Dict[str, Any]) -> Optional[str]:
+        """Pull the plain-text portion out of a (possibly multimodal) user
+        message, regardless of the provider shape it is carried in.
+
+        Handles every shape the streaming path can present:
+
+        * ``content`` as a plain string (the common case the agent builds).
+        * ``content`` as an OpenAI/Anthropic-style list of typed parts
+          (``{"type": "text", "text": ...}``).
+        * ``parts`` as a Gemini-style list (``{"text": ...}``).
+        """
+        content = message.get("content")
+        if isinstance(content, str):
+            return content or None
+        texts: List[str] = []
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+        parts = message.get("parts")
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+        return "\n".join(texts) if texts else None
+
+    @staticmethod
+    def _is_tool_result_turn(message: Dict[str, Any]) -> bool:
+        """True for a user turn that carries tool plumbing rather than prose.
+
+        In a post-tool continuation the message list ends in a user-role turn
+        whose content is ``tool_result`` blocks. Eager vision must weld the
+        image to the *genuine* prompt, not the tool-result turn, so the
+        injection scan skips these.
+        """
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") in (
+                    "tool_result", "tool_use",
+                ):
+                    return True
+        return False
+
+    def attach_images_to_last_user_message(
+        self,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Union[str, bytes]]],
+    ) -> List[Dict[str, Any]]:
+        """Return a copy of ``messages`` with ``images`` folded into the most
+        recent user turn, in this adapter's native vision format.
+
+        Eager vision (#1662): the streaming-with-tools path builds a plain
+        ``{"role": "user", "content": "<text>"}`` message. When the user
+        pasted/dropped images for *this* turn, the service layer rewrites that
+        last user turn as a multimodal message via this method. The provider-
+        correct shape is delegated to :meth:`create_messages`, which every
+        adapter already implements per its declared ``vision_input_mode``
+        (OpenAI ``image_url``, Anthropic content block, Gemini ``inline_data``,
+        Ollama ``images`` key). So there is exactly one place per provider that
+        knows the format — no parallel implementation lives here.
+
+        Callers MUST gate on ``provider_capabilities().supports_vision`` first;
+        a non-vision adapter would otherwise build a message its API rejects.
+        """
+        if not images:
+            return messages
+        out = list(messages)
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].get("role") != "user":
+                continue
+            # Skip a tool-result continuation turn so the image welds to the
+            # genuine prompt (which carries the user's question), not the
+            # tool plumbing that follows it.
+            if self._is_tool_result_turn(out[i]):
+                continue
+            text = self._extract_user_text(out[i])
+            rebuilt = self.create_messages(user_prompt=text, images=images)
+            user_msg = next(
+                (m for m in rebuilt if m.get("role") == "user"), None
+            )
+            if user_msg is None:
+                return out
+            # Keep any non-shape keys the original carried (e.g. ``name``) but
+            # drop every shape-bearing key, so a stale string ``content`` can't
+            # linger next to the freshly built ``parts``/``images``.
+            merged = {
+                k: v
+                for k, v in out[i].items()
+                if k not in ("content", "parts", "images")
+            }
+            merged.update(user_msg)
+            out[i] = merged
+            return out
+        # No user turn to attach to — append a fresh image-only user message.
+        rebuilt = self.create_messages(user_prompt=None, images=images)
+        return out + [m for m in rebuilt if m.get("role") == "user"]

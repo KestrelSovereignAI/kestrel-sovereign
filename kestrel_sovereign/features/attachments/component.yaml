@@ -1,0 +1,13 @@
+name: attachments
+description: Read documents the user attached to the conversation (text, markdown, PDF) on demand
+version: 1.0.0
+entry_point: feature.py
+
+tools:
+  - read_attachment
+
+files:
+  - feature.py
+
+dependencies:
+  - pypdf

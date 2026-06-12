@@ -714,6 +714,10 @@ let messageInput = null;
 let sendButton = null;
 let modelSelector = null;
 let thinkingIndicator = null;
+// #1662 attachment composer elements (bound in initChat).
+let attachButton = null;
+let attachInput = null;
+let attachTray = null;
 let composerModeToggle = null;  // #1257 send-while-busy mode toggle
 
 // Shared model selector instance
@@ -814,6 +818,8 @@ export function mountChatPane(agentName) {
     // #1257: mode is per-pane (like session). Reflect the now-visible
     // agent's send-while-busy mode on the toggle.
     updateComposerModeToggle();
+    // #1662: attachments stage per-pane; show the now-mounted agent's tray.
+    renderAttachmentTray();
     return target;
 }
 
@@ -852,6 +858,156 @@ export function wipeAgentChatPane(agentName, html = '') {
 // ============================================================================
 // Initialization
 // ============================================================================
+
+// ===== #1662 attachment composer =====
+// Staged attachments live on the MOUNTED agent's pane (pane.pendingAttachments),
+// so switching agents shows that agent's own staged files. Paste/drop mark an
+// image `inline:true` (sent as vision THIS turn); the attach button stages a
+// `inline:false` lazy ref the agent reads on demand. The backend re-validates
+// kind/mime and magic-number-checks the bytes — these flags are a hint, not a
+// trust boundary.
+
+function _composerPane() {
+    return deps().getOrCreateChatPane(deps().api.getHostAgent());
+}
+
+function _stagedAttachments(pane) {
+    if (!pane.pendingAttachments) pane.pendingAttachments = [];
+    return pane.pendingAttachments;
+}
+
+function attachmentThumbHtml(att) {
+    const esc = deps().escapeHtml;
+    const name = esc(att.name || 'attachment');
+    const hash = esc(att.hash || '');
+    const inner = (att.kind === 'image' && att.url)
+        ? `<img src="${esc(att.url)}" alt="${name}">`
+        : `<span class="attachment-doc-icon" aria-hidden="true">&#128196;</span>`
+          + `<span class="attachment-doc-name">${name}</span>`;
+    return `<div class="attachment-thumb" data-hash="${hash}" title="${name}">`
+        + inner
+        + `<button type="button" class="attachment-thumb-remove" data-hash="${hash}"`
+        + ` aria-label="Remove ${name}">&times;</button></div>`;
+}
+
+function renderAttachmentTray() {
+    if (!attachTray) return;
+    const staged = _stagedAttachments(_composerPane());
+    if (!staged.length) {
+        attachTray.innerHTML = '';
+        attachTray.style.display = 'none';
+        return;
+    }
+    attachTray.innerHTML = staged.map(attachmentThumbHtml).join('');
+    attachTray.style.display = 'flex';
+}
+
+function removeStagedAttachment(hash) {
+    const pane = _composerPane();
+    pane.pendingAttachments = _stagedAttachments(pane).filter(a => a.hash !== hash);
+    renderAttachmentTray();
+}
+
+function uploadAndStage(file, inline) {
+    // Capture the target pane NOW (upload is async; the user could switch
+    // agents before it resolves — the file must land on the pane it was added
+    // to). Track the in-flight promise on that pane so a send can wait for it
+    // (#1662 — don't drop a file the user is still uploading).
+    const pane = _composerPane();
+    pane.pendingUploads = pane.pendingUploads || new Set();
+    const p = (async () => {
+        try {
+            const ref = await deps().api.uploadAttachment(file);
+            if (!ref || !ref.hash) throw new Error('upload returned no reference');
+            const isImage = ref.kind === 'image'
+                || String(ref.mime || '').startsWith('image/');
+            _stagedAttachments(pane).push({
+                hash: ref.hash,
+                kind: ref.kind || (isImage ? 'image' : 'document'),
+                mime: ref.mime || null,
+                name: ref.name || file.name || 'attachment',
+                url: ref.url || null,
+                // Only an image can ride inline (vision this turn); the backend
+                // enforces this regardless of what we send.
+                inline: !!inline && isImage,
+            });
+            renderAttachmentTray();
+        } catch (err) {
+            Toast.error(`Attachment upload failed: ${err && err.message ? err.message : err}`);
+        }
+    })();
+    pane.pendingUploads.add(p);
+    p.finally(() => pane.pendingUploads.delete(p));
+    return p;
+}
+
+// Resolve when this pane's in-flight attachment uploads have all settled, so a
+// turn never sends before its files are staged.
+async function awaitPendingUploads(pane) {
+    if (pane && pane.pendingUploads && pane.pendingUploads.size) {
+        await Promise.all([...pane.pendingUploads]);
+    }
+}
+
+function handleComposerFiles(fileList, inline) {
+    for (const file of Array.from(fileList || [])) uploadAndStage(file, inline);
+}
+
+function handleComposerPaste(event) {
+    const items = event.clipboardData && event.clipboardData.items;
+    if (!items) return;
+    let took = false;
+    for (const item of items) {
+        if (item.kind === 'file' && String(item.type || '').startsWith('image/')) {
+            const file = item.getAsFile();
+            if (file) { uploadAndStage(file, true); took = true; }
+        }
+    }
+    // Only swallow the paste when we actually took an image; normal text paste
+    // must pass through untouched.
+    if (took) event.preventDefault();
+}
+
+function handleComposerDrop(event) {
+    const files = event.dataTransfer && event.dataTransfer.files;
+    if (!files || !files.length) return;
+    event.preventDefault();
+    // Dropped files share the paste intent: images ride inline (eager vision);
+    // documents fall back to lazy refs (the backend forces inline=false).
+    handleComposerFiles(files, true);
+}
+
+// Pull the staged attachments for the current send and clear the tray. Returns
+// the plain array of {hash,kind,mime,name,inline} the stream POST carries.
+function takeStagedAttachments(pane) {
+    const staged = (pane.pendingAttachments || []).slice();
+    if (staged.length) {
+        pane.pendingAttachments = [];
+        renderAttachmentTray();
+    }
+    return staged;
+}
+
+export function initAttachmentComposer() {
+    attachButton = el('attach-button');
+    attachInput = el('attach-input');
+    attachTray = el('attachment-tray');
+    attachButton?.addEventListener('click', () => attachInput?.click());
+    attachInput?.addEventListener('change', () => {
+        if (attachInput.files) handleComposerFiles(attachInput.files, false);
+        attachInput.value = '';  // allow re-selecting the same file
+    });
+    messageInput?.addEventListener('paste', handleComposerPaste);
+    const dropZone = el('input-area') || chatContainer;
+    dropZone?.addEventListener('dragover', (e) => e.preventDefault());
+    dropZone?.addEventListener('drop', handleComposerDrop);
+    attachTray?.addEventListener('click', (e) => {
+        const btn = e.target instanceof Element
+            ? e.target.closest('.attachment-thumb-remove') : null;
+        if (btn) removeStagedAttachment(btn.getAttribute('data-hash'));
+    });
+    renderAttachmentTray();
+}
 
 export function initChat() {
     // #879: skip wiring when the host has its own chat surface.  The chat
@@ -926,6 +1082,9 @@ export function initChat() {
     messageInput?.addEventListener('blur', () => {
         setTimeout(hideCommandAutocomplete, 200);
     });
+
+    // #1662: attachment composer (attach button, paste/drop, thumbnail tray).
+    initAttachmentComposer();
 
     // Note: Model selector events are now handled by SharedModelSelector in loadModels()
 
@@ -1719,6 +1878,11 @@ export async function sendMessage(overrideText, overrideAgent) {
 
     const pane = deps().getOrCreateChatPane(dispatchAgent);
 
+    // #1662: if the user hit Enter while a pasted/dropped file is still
+    // uploading, wait for it so the turn carries the attachment instead of
+    // dropping it (and leaving it staged for the next turn).
+    if (fromComposer) await awaitPendingUploads(pane);
+
     // Send-while-busy. Behavior depends on the pane's composerMode.
     if (deps().state.waitingAgents.has(dispatchAgent)) {
         if (pane.composerMode === 'queue') {
@@ -1728,6 +1892,9 @@ export async function sendMessage(overrideText, overrideAgent) {
             // it — single-slot queue (multi-message queue is a
             // deferred follow-up). Do NOT interrupt the in-flight turn.
             pane.queuedMessage = text;
+            // #1662: stash this turn's staged attachments with the queued
+            // message so they ride the eventual re-dispatch; clear the tray now.
+            if (fromComposer) pane.queuedAttachments = takeStagedAttachments(pane);
             if (fromComposer) messageInput.value = '';
             renderQueuedChip(pane, dispatchAgent, text);
             return;
@@ -1793,7 +1960,15 @@ export async function sendMessage(overrideText, overrideAgent) {
     // pane directly).
     const sessionId = pane.sessionId || null;
 
-    await addMessage('user', text, pane.element);
+    // #1662: the attachments for THIS turn. A composer send takes whatever is
+    // staged in the tray; a queued re-dispatch (fromComposer false) carries the
+    // attachments stashed when it was queued.
+    const turnAttachments = fromComposer
+        ? takeStagedAttachments(pane)
+        : (pane.queuedAttachments || []);
+    pane.queuedAttachments = [];
+
+    await addMessage('user', text, pane.element, turnAttachments);
     // Only clear the composer when the text CAME from it. A #1257
     // queued re-dispatch passes overrideText and must not wipe
     // whatever the user has since typed for the (possibly different)
@@ -1879,7 +2054,7 @@ export async function sendMessage(overrideText, overrideAgent) {
                 // no visible char after it; consumed when the next
                 // packet's leading visible text is welded onto fullContent.
                 let pendingReviseBoundary = false;
-                for await (const rawChunk of deps().api.streamInvoke(text, null, sessionId, null, false, dispatchAgent)) {
+                for await (const rawChunk of deps().api.streamInvoke(text, null, sessionId, null, false, dispatchAgent, turnAttachments)) {
                     const merged = sentinelBuffer + rawChunk;
                     sentinelBuffer = '';
                     let processable = merged;
@@ -2868,7 +3043,26 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
  * the paneElement contract; the same default applies. checkForModelChange
  * is intentionally NOT invoked here — see finalizeStreamingMessage.
  */
-export async function addMessage(role, content, paneElement = null) {
+// Read-only thumbnail strip rendered inside a user bubble (live send + history
+// reload). No remove button — that's only on the composer tray. #1662.
+export function messageAttachmentsHtml(atts) {
+    if (!atts || !atts.length) return '';
+    const esc = deps().escapeHtml;
+    const items = atts.map((att) => {
+        const name = esc(att.name || 'attachment');
+        const url = esc(att.url || (att.hash ? `/api/files/${att.hash}` : ''));
+        if (att.kind === 'image' && url) {
+            return `<a class="msg-attachment" href="${url}" target="_blank"`
+                + ` rel="noopener" title="${name}"><img src="${url}" alt="${name}"></a>`;
+        }
+        return `<a class="msg-attachment msg-attachment-doc" href="${url}"`
+            + ` target="_blank" rel="noopener" title="${name}">`
+            + `<span aria-hidden="true">&#128196;</span><span>${name}</span></a>`;
+    }).join('');
+    return `<div class="message-attachments">${items}</div>`;
+}
+
+export async function addMessage(role, content, paneElement = null, attachments = null) {
     const target = resolvePaneElement(paneElement);
     const div = document.createElement('div');
     div.className = `message ${role === 'user' ? 'user-message' : 'agent-message'}`;
@@ -2886,12 +3080,20 @@ export async function addMessage(role, content, paneElement = null) {
     }
 
     div.appendChild(contentDiv);
+    // #1662: render the turn's attachments as a read-only thumbnail strip in
+    // the user bubble.
+    if (role === 'user' && attachments && attachments.length) {
+        const strip = document.createElement('div');
+        strip.innerHTML = messageAttachmentsHtml(attachments);
+        if (strip.firstChild) div.appendChild(strip.firstChild);
+    }
     if (target) target.appendChild(div);
 
     const c = getChatContainer();
     if (c && target && target.parentNode === c) {
         c.scrollTop = c.scrollHeight;
     }
+    return div;
 }
 
 // ============================================================================

@@ -39,6 +39,30 @@ from kestrel_sovereign.telemetry import start_span, end_span
 # ``pane.pendingRevise``; the other is a no-op.
 REVISE_SENTINEL_PREFIX = "\x1eKESTREL:REVISE:"
 REVISE_SENTINEL_SUFFIX = "\x1e"
+
+# #1662 eager-vision read-path bounds (independent of the upload endpoint's
+# per-file/count caps, since a content-addressed read can name any stored
+# hash). Keep peak memory for one turn's pasted images bounded.
+_MAX_EAGER_IMAGES = 6
+_MAX_EAGER_IMAGE_BYTES = 12 * 1024 * 1024  # 12 MB (a touch over the 10 MB upload cap)
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """Magic-number check that ``data`` is a real PNG/JPEG/GIF/WEBP.
+
+    The client's declared ``kind``/``mime`` are not trusted: a tampered ref
+    could mark a stored PDF/text hash as an inline image, and the image
+    pipeline defaults unknown bytes to JPEG, so a non-image would be shipped to
+    a vision provider as a bogus image. Sniff the actual bytes instead — only
+    these four signatures are accepted for eager vision.
+    """
+    return (
+        data.startswith(b"\x89PNG")
+        or data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"GIF87a")
+        or data.startswith(b"GIF89a")
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    )
 THINKING_SENTINEL_PREFIX = "\x1eKESTREL:THINK:"
 THINKING_SENTINEL_SUFFIX = "\x1e"
 # #1659: tool activity is the last signal class still emitted as
@@ -326,6 +350,97 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
 class StreamingMixin:
     """Mixin class providing streaming response methods."""
 
+    @staticmethod
+    def _lazy_attachment_hint(attachments) -> str:
+        """A compact note listing this turn's LAZY (non-inline) attachments so
+        the agent knows their ids for `read_attachment`. Empty when there are
+        none. Eager (inline) images are folded as vision and not listed.
+        """
+        if not attachments:
+            return ""
+        lazy = [
+            a for a in attachments
+            if isinstance(a, dict) and a.get("hash") and not a.get("inline")
+        ]
+        if not lazy:
+            return ""
+        lines = [
+            f"- {a.get('name') or 'attachment'} (id: {a['hash']})"
+            for a in lazy
+        ]
+        return (
+            "\n\n[Attachments available to read with the read_attachment tool:\n"
+            + "\n".join(lines)
+            + "\nCall read_attachment with an id above to read that file.]"
+        )
+
+    async def _resolve_eager_images(self, attachments) -> list:
+        """Resolve this turn's *inline* image attachments (#1662 eager vision)
+        to raw bytes for the model.
+
+        ``inline`` marks an image pasted or dropped straight into the composer
+        — the user's intent is "see this now", so it rides this turn as vision
+        input. Non-inline attachments are lazy references the agent reads on
+        demand via a tool (PR C), and documents are always lazy; both are
+        skipped here. The ref is already persisted on the user turn, so an
+        attachment whose bytes are missing/unreadable is skipped without losing
+        the history record.
+
+        Resolution is bounded independently of the upload endpoint. The
+        content-addressed read can name *any* stored hash (up to the 50 MB
+        store cap), not just files that came through the 10 MB upload gate, so
+        a turn could otherwise pull many large blobs into memory at once. We
+        cap both the number of eager images and each image's size, and log
+        loudly when something is dropped.
+        """
+        if not attachments:
+            return []
+        storage = getattr(self, "storage", None)
+        if storage is None or not hasattr(storage, "retrieve_file"):
+            return []
+        images: list = []
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            if att.get("kind") != "image" or not att.get("inline"):
+                continue
+            content_hash = att.get("hash")
+            if not isinstance(content_hash, str):
+                continue
+            if len(images) >= _MAX_EAGER_IMAGES:
+                logging.warning(
+                    "Eager vision: more than %d inline images this turn; "
+                    "extras ignored.", _MAX_EAGER_IMAGES,
+                )
+                break
+            try:
+                data = await storage.retrieve_file(content_hash)
+            except Exception as exc:
+                logging.warning(
+                    "Eager vision: could not load attachment %s: %s",
+                    content_hash[:12], exc,
+                )
+                continue
+            if not data:
+                continue
+            if len(data) > _MAX_EAGER_IMAGE_BYTES:
+                logging.warning(
+                    "Eager vision: attachment %s is %d bytes (> %d cap); "
+                    "skipped.", content_hash[:12], len(data),
+                    _MAX_EAGER_IMAGE_BYTES,
+                )
+                continue
+            if not _looks_like_image(data):
+                # Client lied about kind/mime, or the file isn't really an
+                # image — don't ship non-image bytes to a vision provider.
+                logging.warning(
+                    "Eager vision: attachment %s is not a recognized image "
+                    "(PNG/JPEG/GIF/WEBP); skipped.", content_hash[:12],
+                )
+                continue
+            images.append(data)
+        return images
+
     async def process_input_streaming(
         self,
         user_input: str,
@@ -334,6 +449,7 @@ class StreamingMixin:
         session_id: str = None,
         caller=None,
         request_id: Optional[str] = None,
+        attachments: Optional[list] = None,
     ):
         """
         Streaming version of process_input. Yields text chunks as generated.
@@ -383,7 +499,7 @@ class StreamingMixin:
                 async with self._turn_lifecycle():
                     async for chunk in self._process_input_streaming_traced_locked(
                         user_input, model_override, session_id, _otel_span,
-                        request_id=request_id,
+                        request_id=request_id, attachments=attachments,
                     ):
                         yield chunk
         except Exception as exc:
@@ -395,7 +511,7 @@ class StreamingMixin:
 
     async def _process_input_streaming_traced_locked(
         self, user_input, model_override, session_id, _otel_span,
-        request_id: Optional[str] = None,
+        request_id: Optional[str] = None, attachments: Optional[list] = None,
     ):
         """Inner streaming logic wrapped in an OTEL span.
 
@@ -405,6 +521,13 @@ class StreamingMixin:
         non-reentrant-lock self-deadlock that the dispatcher (Phase 1)
         would otherwise hit when COGNITION signals route through this
         path."""
+        # #1662: record THIS turn's session so tools that must scope to the
+        # active conversation (read_attachment) have an authoritative value —
+        # the tool-call `session_id` arg is model-controlled and usually omitted,
+        # and the inline executor binds session only into hook context, not tool
+        # args. The turn-lifecycle lock serializes turns per agent, so this is
+        # safe per-turn.
+        self._active_session_id = session_id
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 
@@ -494,9 +617,15 @@ class StreamingMixin:
         # verbatim so Anthropic's cache_control marker at messages[-2]
         # still compounds across turns, while every other consumer
         # (search, audit, UI, memory ingestion) sees clean user speech.
+        # #1662: persist attachment refs on the user turn so the composer's
+        # images/docs survive reload (and a later turn can resolve them). The
+        # bytes live in the encrypted file store; only the refs ride here.
+        _user_meta = {"sent_form": True}
+        if attachments:
+            _user_meta["attachments"] = attachments
         await self.privacy_agent.add_conversation(
             "user", wrapped_user,
-            metadata={"sent_form": True},
+            metadata=_user_meta,
             session_id=session_id,
             rendered_content=prompt,
         )
@@ -544,7 +673,13 @@ class StreamingMixin:
         # Format: [system, ...history, user]
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(context_result.messages)  # Add conversation history
-        messages.append({"role": "user", "content": prompt})
+        # #1662: tell the agent which LAZY attachments it can read this turn, so
+        # it knows the ids to pass to `read_attachment`. Live-only — appended to
+        # the LLM-bound user content, NOT the persisted prompt (keeps sent-form
+        # cache stability and the raw-user extraction clean). Inline (eager)
+        # image attachments are folded as vision downstream and aren't listed.
+        lazy_hint = self._lazy_attachment_hint(attachments)
+        messages.append({"role": "user", "content": prompt + lazy_hint})
 
         logging.debug(f"[CONTEXT-STREAM] Sending {len(messages)} messages to LLM")
 
@@ -581,6 +716,14 @@ class StreamingMixin:
         # the client never rendered.
         pending_visible_boundary = False
 
+        # #1662 eager vision: resolve this turn's inline (pasted/dropped) image
+        # attachments to bytes so the LLM service can fold them into the user
+        # message in the resolved provider's native format. Lazy refs and
+        # documents are skipped here — the agent reads those on demand.
+        eager_images = (
+            await self._resolve_eager_images(attachments) if attachments else None
+        )
+
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
             tools=feature_tools if feature_tools else None,
@@ -589,6 +732,7 @@ class StreamingMixin:
             system_prompt=system_prompt,
             session_id=session_id,
             tool_executor=self._make_inline_tool_executor(session_id),
+            images=eager_images or None,
         ):
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this
@@ -731,6 +875,7 @@ class StreamingMixin:
                 tool_results=tool_results,
                 session_id=session_id,
                 request_id=request_id,
+                images=eager_images or None,
             ):
                 if isinstance(chunk, ThinkingDelta):
                     yield _build_thinking_sentinel(chunk)

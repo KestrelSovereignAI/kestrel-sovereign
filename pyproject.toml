@@ -104,6 +104,8 @@ dependencies = [
     "rank_bm25>=0.2.2",
     # Web scraping (lightweight)
     "beautifulsoup4==4.14.3",
+    # PDF text extraction for the read_attachment tool (#1662, pure-python)
+    "pypdf>=5.1.0",
     # Graph operations (lightweight)
     "networkx==3.6.1",
     # Misc

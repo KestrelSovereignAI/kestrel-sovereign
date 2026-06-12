@@ -222,8 +222,14 @@
                         " data-label-key="btn_stop">Stop</button>
                     </div>
 
+                    <!-- #1662: staged attachment thumbnails (above the input) -->
+                    <div id="attachment-tray" class="attachment-tray" style="display: none;"></div>
                     <!-- Input Area -->
-                    <div class="input-area">
+                    <div id="input-area" class="input-area">
+                        <input id="attach-input" type="file" multiple hidden
+                            accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,text/markdown">
+                        <button id="attach-button" type="button" class="attach-button"
+                            title="Attach a file (the agent reads it on demand). Paste or drop an image to send it as vision.">&#128206;</button>
                         <textarea id="message-input" data-label-attr-placeholder="chat_input_placeholder" placeholder="Ask me anything or use !commands..." rows="1"></textarea>
                         <button id="send-button" data-label-attr-title="btn_send" title="Send">&#8679;</button>
                     </div>
