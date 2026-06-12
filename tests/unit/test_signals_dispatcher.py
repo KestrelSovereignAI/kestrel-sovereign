@@ -231,6 +231,66 @@ async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp
 
 
 @pytest.mark.asyncio
+async def test_trusted_registration_honors_per_signal_downgrade(dispatcher_components, tmp_path):
+    """#1721: a source registered TRUSTED still lets an individual signal mark
+    itself UNTRUSTED (e.g. an A2A wake whose sender signature didn't verify) —
+    the sanitizer runs, proving the dispatcher didn't overwrite the downgrade."""
+    c = dispatcher_components
+
+    def sanitize(payload: dict) -> dict:
+        return {k: "<scrubbed>" for k in payload}
+
+    template = tmp_path / "tpl.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(
+        _cognition_reg(
+            template,
+            name="trusted_src",
+            trust=Trust.TRUSTED,  # registration ceiling is TRUSTED
+            sanitizer=sanitize,
+        )
+    )
+    result = await c.dispatcher.dispatch_signal(
+        _signal(
+            "trusted_src", mode=SignalMode.COGNITION,
+            payload={"secret": "x"}, origin_trust=Trust.UNTRUSTED,
+        )
+    )
+    assert result.status == Status.OK
+    # Downgrade honored: sanitizer ran on the untrusted signal.
+    assert "scrubbed" in c.agent.process_input_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_caller_cannot_raise_trust_above_registration(dispatcher_components, tmp_path):
+    """The downgrade is one-directional: a signal can't RAISE its trust above an
+    UNTRUSTED registration ceiling, so the sanitizer still runs."""
+    c = dispatcher_components
+
+    def sanitize(payload: dict) -> dict:
+        return {k: "<scrubbed>" for k in payload}
+
+    template = tmp_path / "tpl.md"
+    template.write_text("payload: {payload}")
+    c.registry.register(
+        _cognition_reg(
+            template,
+            name="untrusted_ceiling",
+            trust=Trust.UNTRUSTED,  # ceiling is UNTRUSTED
+            sanitizer=sanitize,
+        )
+    )
+    result = await c.dispatcher.dispatch_signal(
+        _signal(
+            "untrusted_ceiling", mode=SignalMode.COGNITION,
+            payload={"secret": "x"}, origin_trust=Trust.TRUSTED,  # caller tries to lie upward
+        )
+    )
+    assert result.status == Status.OK
+    assert "scrubbed" in c.agent.process_input_calls[0]
+
+
+@pytest.mark.asyncio
 async def test_schema_failure_drops_validation(dispatcher_components):
     """Registered schema must reject malformed payloads BEFORE they reach
     handlers, artifact handlers, cognition templates, or signal logs.

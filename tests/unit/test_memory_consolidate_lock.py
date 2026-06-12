@@ -78,95 +78,38 @@ async def test_manual_consolidate_runs_without_dispatcher_lock():
 
 
 # ---------------------------------------------------------------------------
-# Forgetting deletion tier rides the consolidation pass (#1674)
+# The tool SURFACES episodes_deleted from the consolidate() chokepoint (#1674 P3)
+#
+# Forgetting now lives in MemorySystem.consolidate() (one place, shared by the
+# tool AND the nightly sleep cycle), so the tool's only job is to surface the
+# count consolidate() returns. The forgetting LOGIC (enabled/disabled/errored/
+# best-effort) is tested at its real home in test_memory_system.py.
 # ---------------------------------------------------------------------------
 
 
-def _set_forgetting(monkeypatch, *, enabled, delete_threshold=0.02, grace_days=90):
-    import kestrel_sovereign.storage.retention as retention_mod
-    monkeypatch.setattr(
-        retention_mod, "load_forgetting_config",
-        lambda: {
-            "enabled": enabled,
-            "delete_threshold": delete_threshold,
-            "grace_days": grace_days,
-        },
-    )
-
-
 @pytest.mark.asyncio
-async def test_consolidate_runs_forgetting_when_enabled(monkeypatch):
-    """With [forgetting].enabled, the consolidate pass prunes decayed episodes
-    via the storage primitive and reports the count."""
+async def test_tool_surfaces_episodes_deleted_from_consolidate():
     feature, agent = _make_memory_feature(dispatcher=None)
-    agent.memory_system.consolidate = AsyncMock(
-        return_value={"episodes_created": 2, "patterns_found": 0, "messages_archived": 0}
-    )
-    agent.storage = MagicMock()
-    agent.storage.purge_decayed_episodes = AsyncMock(return_value=3)
-    _set_forgetting(monkeypatch, enabled=True, delete_threshold=0.05, grace_days=45)
+    agent.memory_system.consolidate = AsyncMock(return_value={
+        "episodes_created": 2, "patterns_found": 0, "messages_archived": 0,
+        "episodes_deleted": 3,
+    })
 
     result = await feature.memory_consolidate()
 
-    agent.storage.purge_decayed_episodes.assert_awaited_once_with(
-        delete_threshold=0.05, grace_days=45, reason="forgetting",
-    )
     assert result.data.get("episodes_deleted") == 3
     assert "3 episode(s) forgotten" in result.confirmation
 
 
 @pytest.mark.asyncio
-async def test_consolidate_skips_forgetting_when_disabled(monkeypatch):
-    """Opt-in/off default: no purge call, and no 'forgotten' clause."""
+async def test_tool_no_forgotten_clause_when_none_deleted():
     feature, agent = _make_memory_feature(dispatcher=None)
-    agent.memory_system.consolidate = AsyncMock(
-        return_value={"episodes_created": 1, "patterns_found": 0, "messages_archived": 0}
-    )
-    agent.storage = MagicMock()
-    agent.storage.purge_decayed_episodes = AsyncMock(return_value=99)
-    _set_forgetting(monkeypatch, enabled=False)
+    agent.memory_system.consolidate = AsyncMock(return_value={
+        "episodes_created": 1, "patterns_found": 0, "messages_archived": 0,
+        "episodes_deleted": 0,
+    })
 
     result = await feature.memory_consolidate()
 
-    agent.storage.purge_decayed_episodes.assert_not_awaited()
     assert result.data.get("episodes_deleted") == 0
     assert "forgotten" not in result.confirmation
-
-
-@pytest.mark.asyncio
-async def test_consolidate_skips_forgetting_when_consolidation_errored(monkeypatch):
-    """The consolidator reports many failures as {"error": ...} instead of
-    raising. Destructive forgetting must NOT ride such a failed/partial pass."""
-    feature, agent = _make_memory_feature(dispatcher=None)
-    agent.memory_system.consolidate = AsyncMock(
-        return_value={"error": "salvage summariser unavailable"}
-    )
-    agent.storage = MagicMock()
-    agent.storage.purge_decayed_episodes = AsyncMock(return_value=5)
-    _set_forgetting(monkeypatch, enabled=True)
-
-    result = await feature.memory_consolidate()
-
-    assert result.status == "error"
-    agent.storage.purge_decayed_episodes.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_consolidate_survives_forgetting_failure(monkeypatch):
-    """A failure in the deletion tier must not fail the consolidation it rides
-    on — the episodes are simply retried next pass."""
-    feature, agent = _make_memory_feature(dispatcher=None)
-    agent.memory_system.consolidate = AsyncMock(
-        return_value={"episodes_created": 1, "patterns_found": 0, "messages_archived": 0}
-    )
-    agent.storage = MagicMock()
-    agent.storage.purge_decayed_episodes = AsyncMock(
-        side_effect=RuntimeError("graph store down")
-    )
-    _set_forgetting(monkeypatch, enabled=True)
-
-    result = await feature.memory_consolidate()
-
-    assert result.status == "ok"
-    assert result.data.get("episodes_deleted") == 0
-    assert result.data.get("episodes_created") == 1

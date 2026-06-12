@@ -80,13 +80,18 @@ def test_hybrid_agent_signs_and_sets_did_sender():
     md = payload["metadata"]
     assert md["sender"] == DID  # verified identifier, not the display name
     assert "signature" in md
-    # The produced signature verifies against the agent's own VMs.
+    # The produced signature verifies against the agent's own VMs. v2 binds the
+    # nonce + behaviour-steering fields, so reconstruct them as the verifier does.
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
     block = md["signature"]
+    assert block["v"] == 2 and block["nonce"]
+    bound = bound_envelope_fields(md, artifacts=payload.get("artifacts"))
     doc = {"id": DID, "verificationMethod": vms}
     v = verify_envelope(
         doc, block, sender=DID, task_id="t1",
         message=canonical_message(["hello"]), session_id="s1",
-        timestamp=block["timestamp"],
+        timestamp=block["timestamp"], bound=bound, nonce=block["nonce"],
     )
     assert v.ok is True and v.verified is True
 

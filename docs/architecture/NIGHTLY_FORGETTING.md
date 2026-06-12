@@ -1,18 +1,20 @@
 # Nightly Forgetting — Unified Cognition Maintenance
 
-> **Status (2026-06-12): Active for P1; Aspirational for P2–P4.**
+> **Status (2026-06-12): Active for P1–P3; Aspirational for P4.**
 > This consolidates Kestrel's scattered nightly-maintenance crons and the
 > unbounded-cognition-table problem (#1674) under one orchestrated "sleep"
 > pass, and adds the missing *deletion tier* to the existing importance-decay
 > forgetting curve. The decay/archive engine it builds on is real and deployed
 > (see [MEMORY_SYSTEM.md](MEMORY_SYSTEM.md)).
-> **P1 is implemented:** episodes now carry an `importance` decay signal, and a
-> decay-aware deletion tier (`AsyncStorage.purge_decayed_episodes`) runs inside
-> the nightly consolidation pass, gated by the opt-in/off `[forgetting]` config.
-> The age-based `cognition_retention` cron (#1715) — the **stopgap** this
-> supersedes — has been removed (see [Migration](#migration)).
-> **Still aspirational:** episode access tracking (P2), the unified `sleep`
-> cron (P3), and reflection-table participation (P4).
+> **P1 (importance-aware deletion tier), P2 (relevance-based episode recall +
+> access heat), and P3 (unified `sleep` cycle) are implemented.** Forgetting now
+> lives in the single `MemorySystem.consolidate()` chokepoint — the manual
+> `!memory consolidate` tool AND the nightly `sleep` cron both route through it,
+> so there is ONE memory-maintenance path, not a cron per memory kind. The
+> age-based `cognition_retention` (#1715) and the auto-seeded `memory_consolidate`
+> + `reflect` crons are retired; reflection subscribes to the sleep cycle via its
+> hook; backups stay on their own change-aware 4h cadence.
+> **Still aspirational:** reflection-table participation (P4).
 
 ## TL;DR
 
@@ -223,29 +225,35 @@ long-term memory; the Sovereign enables forgetting deliberately.
 - The age-based predicate + the standalone `cognition_retention` cron are
   **removed** in favor of the decay-aware predicate inside the consolidation
   pass. Clean cutover (the cron is opt-in/off; nothing in prod depends on it).
-- `memory_consolidate` cron is absorbed by the `sleep` cron (P3).
+- `memory_consolidate` + auto-seeded `reflect` crons are absorbed by the `sleep`
+  cron (P3). They remain schedulable TOOLS, so the cutover removes only rows that
+  exactly match the old core auto-seed (name+cron+args), preserving any
+  user-customized schedule.
 
-## Open decisions
+## Decisions (resolved 2026-06-12)
 
-1. **Backup cadence** — keep frequent intra-day `backup_snapshot` (sleep skips
-   export) or fold export into nightly `sleep` only?
-2. **Reflection cadence** — keep the 4h `reflect` cron, or make reflection
-   nightly-in-`sleep` only?
-3. **Episode importance derivation** — E1+E2 (recommended) vs full E3 parity?
-4. **Threshold/grace values** — `delete_threshold`, `delete_grace_days`
-   defaults.
+1. **Backup cadence** — KEEP the intra-day `backup_snapshot` (every 4h) for
+   disaster recovery; `sleep` runs `skip_export=True` so it never double-
+   snapshots. Backups are now **change-aware** (`SyncService.snapshot_if_changed`
+   skips an unchanged DB) so idle agents stop re-dumping (notably the full S3
+   upload). Explicit `!backup` / shutdown still call unconditional `force_snapshot`.
+2. **Reflection cadence** — reflection rides the nightly `sleep` cycle via its
+   `reflection_hook`; the auto-seeded 4h `reflect` cron is retired.
+3. **Episode importance derivation** — E1 (P1) + E2 (P2) shipped.
+4. **Threshold/grace values** — `delete_threshold=0.02`, `delete_grace_days=90`.
 
 ## Phasing
 
-- **P1** — *(Done, 2026-06-12.)* Decay-aware episode deletion in the
-  consolidation pass: episode importance (E1), deletion tier
-  (`purge_decayed_episodes`), removed `cognition_retention` cron, `[forgetting]`
-  config. Opt-in/off.
-- **P2** — Episode access tracking (E2) so consulted episodes resist deletion
-  (ties #1342).
-- **P3** — Scheduling unification: promote `sleep` to the nightly cron, absorb
-  `memory_consolidate`; reconcile backup/reflection cadences (open decisions;
-  relates #626 dynamic scheduler).
+- **P1** — *(Done.)* Decay-aware episode deletion: episode importance (E1),
+  deletion tier (`purge_decayed_episodes`), removed `cognition_retention` cron,
+  `[forgetting]` config. Opt-in/off.
+- **P2** — *(Done.)* Relevance-based episode recall (reusing the shared vector
+  backend) + access tracking so consulted episodes resist deletion (ties #1342).
+- **P3** — *(Done.)* Scheduling unification: forgetting relocated into the single
+  `MemorySystem.consolidate()` chokepoint; `sleep` promoted to the nightly cron
+  (skip_export); auto-seeded `memory_consolidate` + `reflect` crons retired
+  (reflection subscribes via hook); change-aware backups; activity-gated sleep
+  (idle agents skip the reflection pass). Relates #626 dynamic scheduler.
 - **P4** — reflection feature adopts the shared model for `reflection_insights`
   / `reflection_sessions` in its own maintenance hook (kestrel-feature-reflection).
 

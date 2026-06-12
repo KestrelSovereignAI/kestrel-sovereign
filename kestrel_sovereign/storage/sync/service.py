@@ -36,6 +36,15 @@ class SyncState:
     db_path: str
     targets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     last_snapshot: Optional[datetime] = None
+    # Change fingerprint of the DB at the last completed snapshot (#1674 P3).
+    # Lets force_snapshot skip a full re-snapshot when nothing changed — so
+    # idle agents stop re-dumping the whole DB (notably to S3) every cycle.
+    last_fingerprint: Optional[str] = None
+    # Target names that were successfully covered at last_fingerprint. The
+    # change-aware skip only applies when every CURRENT target is in this set —
+    # otherwise a newly-added backup destination would never get its baseline
+    # snapshot on an unchanged DB (#1674 P3 codex round 2).
+    last_snapshot_targets: List[str] = field(default_factory=list)
     stats: SyncStats = field(default_factory=SyncStats)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -43,6 +52,8 @@ class SyncState:
             "db_path": self.db_path,
             "targets": self.targets,
             "last_snapshot": self.last_snapshot.isoformat() if self.last_snapshot else None,
+            "last_fingerprint": self.last_fingerprint,
+            "last_snapshot_targets": self.last_snapshot_targets,
             "stats": {
                 "total_syncs": self.stats.total_syncs,
                 "successful_syncs": self.stats.successful_syncs,
@@ -60,6 +71,8 @@ class SyncState:
             db_path=data["db_path"],
             targets=data.get("targets", {}),
             last_snapshot=datetime.fromisoformat(data["last_snapshot"]) if data.get("last_snapshot") else None,
+            last_fingerprint=data.get("last_fingerprint"),
+            last_snapshot_targets=data.get("last_snapshot_targets", []),
             stats=SyncStats(
                 total_syncs=stats_data.get("total_syncs", 0),
                 successful_syncs=stats_data.get("successful_syncs", 0),
@@ -164,6 +177,75 @@ class SyncService:
                 await self.force_snapshot()
             except Exception as e:
                 logger.error(f"Periodic sync error: {e}")
+
+    def _compute_db_fingerprint(self) -> Optional[str]:
+        """Cheap change signal for the DB: size + mtime of the main file and
+        its WAL/SHM sidecars. Any write bumps mtime, so this never reports
+        "unchanged" for a real change (it may over-report changes after a
+        touch, which only costs one redundant snapshot). Returns None on any
+        stat error — callers then never skip."""
+        import os
+        parts = []
+        try:
+            for suffix in ("", "-wal", "-shm"):
+                p = f"{self.db_path}{suffix}"
+                try:
+                    st = os.stat(p)
+                    parts.append(f"{suffix or 'db'}:{st.st_size}:{st.st_mtime_ns}")
+                except FileNotFoundError:
+                    parts.append(f"{suffix or 'db'}:absent")
+            return "|".join(parts) if parts else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def snapshot_if_changed(self) -> Dict[str, SyncResult]:
+        """Change-aware snapshot for the SCHEDULED backup cron (#1674 P3).
+
+        Skips the whole pass when the DB fingerprint is unchanged since the last
+        completed snapshot — an idle agent should not re-dump its entire DB
+        (notably the full S3 upload) every cycle. Records the fingerprint only
+        after a successful snapshot so a fully-failed attempt is retried. The
+        fingerprint is conservative: it never skips a real change. Explicit
+        ``!backup`` and shutdown keep using ``force_snapshot`` (always runs)."""
+        fingerprint = self._compute_db_fingerprint()
+        current_targets = {t.name for t in self._targets}
+        if (
+            fingerprint is not None
+            and self._state is not None
+            and self._state.last_snapshot is not None
+            and self._state.last_fingerprint == fingerprint
+            # Every current target must already be covered — else a newly-added
+            # destination would never get its baseline snapshot on an idle DB.
+            and current_targets.issubset(set(self._state.last_snapshot_targets))
+        ):
+            logger.debug("Snapshot skipped — DB unchanged since last snapshot")
+            return {
+                "__unchanged__": SyncResult(
+                    success=True,
+                    target_name="__unchanged__",
+                    bytes_synced=0,
+                    frames_synced=0,
+                    timestamp=datetime.now(timezone.utc),
+                )
+            }
+        results = await self.force_snapshot()
+        # Advance the fingerprint ONLY when every target succeeded. If any
+        # target failed (transient per-target outage), leave the fingerprint
+        # so the next cycle retries rather than skipping the failed target as
+        # "unchanged" until some unrelated DB write happens to bump the
+        # fingerprint. (No targets → all() is True → record, nothing to retry.)
+        if (
+            fingerprint is not None
+            and self._state is not None
+            and results
+            and all(r.success for r in results.values())
+        ):
+            self._state.last_fingerprint = fingerprint
+            self._state.last_snapshot_targets = sorted(
+                r.target_name for r in results.values() if r.success
+            )
+            await self._save_state()
+        return results
 
     async def force_snapshot(self) -> Dict[str, SyncResult]:
         """Snapshot to all targets. Called on shutdown, scheduled backup, or !backup."""

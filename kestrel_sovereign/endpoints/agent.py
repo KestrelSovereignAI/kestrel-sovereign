@@ -1268,6 +1268,10 @@ async def send_task(request: Request):
         task_id=params.id,
         message=signed_message_text,
         session_id=params.sessionId,
+        # Bind the RAW wire artifacts (the same dicts the signer bound as
+        # ``payload["artifacts"]``); ``TaskSendParams`` has no artifacts field —
+        # they are parsed separately into ``sender_artifacts`` (#1721).
+        artifacts=raw_artifacts,
         resolver=_a2a_did_resolver(agent),
         require_signed=require_signed,
     )
@@ -1277,8 +1281,10 @@ async def send_task(request: Request):
             detail=f"A2A sender verification failed: {sender_verdict.reason}",
         )
     # Record the outcome so downstream governance can apply the right trust
-    # tier (a cryptographically-verified peer vs. an unverified same-host
-    # claim). This is the seed of the identity-injection layer (#1673).
+    # tier. The inbound-task signal source reads ``sender_verified`` and marks
+    # an unverified peer's wake UNTRUSTED (#1721) — a cryptographically-verified
+    # peer keeps the registration's TRUSTED tier; an unsigned/unverified claim
+    # is downgraded so the dispatcher routes it through the untrusted path.
     params.metadata["sender_verified"] = sender_verdict.verified
 
     # ``agent_name`` here is the local (recipient) agent's identifier —
@@ -1296,6 +1302,11 @@ async def send_task(request: Request):
             artifacts=sender_artifacts or None,
         )
     except Exception as e:
+        # The replay nonce was consumed at verification time and is NOT released
+        # here: create_task is not idempotent (it appends a session event), so
+        # releasing the nonce on a partial-create failure could double-process a
+        # re-accepted retry (#1721 codex r5). A client retrying must send a
+        # freshly-signed envelope (Kestrel peers re-sign every send).
         logger.error(
             "Failed to create A2A task from peer submission: %s",
             e, exc_info=True,

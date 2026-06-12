@@ -99,9 +99,15 @@ def test_resolver_composes_with_1673_verifier_end_to_end():
     install_a2a_did_resolver(mgr)
 
     # emma signs an envelope; claw verifies it using its injected resolver.
+    from kestrel_sovereign.a2a.envelope_signing import bound_envelope_fields
+
     ts = datetime.now(timezone.utc).isoformat()
-    block = sign_envelope(kp_a, sender=DID_A, task_id="t1", message="hello", timestamp=ts, session_id="s1")
-    metadata = {"sender": DID_A, "signature": block}
+    metadata = {"sender": DID_A}
+    block = sign_envelope(
+        kp_a, sender=DID_A, task_id="t1", message="hello", timestamp=ts,
+        session_id="s1", bound=bound_envelope_fields(metadata),
+    )
+    metadata["signature"] = block
 
     verdict = asyncio.run(verify_inbound_envelope(
         metadata, task_id="t1", message="hello", session_id="s1",

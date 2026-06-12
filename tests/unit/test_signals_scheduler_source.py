@@ -95,6 +95,7 @@ def test_all_cron_tasks_are_classified():
         "training_cycle",
         "reflect",
         "memory_consolidate",
+        "sleep",  # #1674 P3 — nightly memory-maintenance cycle
         "talon_monitor",  # #1510
         "restart_coordinator",  # #1512
         "github_pr_watch",  # #1618
@@ -113,6 +114,8 @@ def test_action_vs_artifact_split_matches_design():
         "signal_dispatch",
         "trash_retention",
         "training_cycle",
+        "sleep",  # #1674 P3 — built-in handler (_handle_sleep); ACTION so the
+                  # handler is wired (builtin_handlers are ACTION-only)
         "talon_monitor",  # #1510 — polls jobs, emits signals, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
         "github_pr_watch",  # #1618 — polls a PR, emits signal on change
@@ -150,6 +153,7 @@ def test_state_mutating_tasks_declare_memory():
     assert ResourceLock.MEMORY in by_name["training_cycle"]
     assert ResourceLock.MEMORY in by_name["memory_consolidate"]
     assert ResourceLock.MEMORY in by_name["reflect"]
+    assert ResourceLock.MEMORY in by_name["sleep"]  # #1674 P3
 
 
 # ---------------------------------------------------------------------------
