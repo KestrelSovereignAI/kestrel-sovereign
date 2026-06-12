@@ -266,6 +266,38 @@ def test_default_auto_approved_binaries_exclude_interpreters():
     )
 
 
+def test_default_denied_binaries_reserved_for_unrecoverable():
+    """#1739: the deny-list is "hard refuse without ever asking the
+    operator." It is reserved for binaries whose blast radius is so
+    wide that even an operator yes-click could be catastrophic.
+
+    Pins:
+
+    - Unrecoverable binaries MUST stay denied (host shutdown,
+      privilege escalation, raw disk writes, remote access, filesystem
+      creation).
+    - ``rm`` MUST NOT be on the default deny-list. The workspace-write
+      sandbox (#1737) handles in-workspace ``rm`` silently;
+      out-of-workspace ``rm`` routes through the queue so the operator
+      authorizes specific cleanups. Hard-deny was hostile UX in an
+      operator-in-the-loop system (Emma's #1737 dogfood: couldn't
+      clean up an approved-but-no-longer-needed probe file).
+    """
+    from kestrel_sovereign.features.computer_use.feature import (
+        _DEFAULT_DENIED_BINS,
+    )
+    must_be_denied = {"dd", "mkfs", "shutdown", "sudo", "ssh"}
+    missing = must_be_denied - set(_DEFAULT_DENIED_BINS)
+    assert missing == set(), (
+        f"default deny-list dropped binaries that must stay denied: "
+        f"{missing}"
+    )
+    assert "rm" not in _DEFAULT_DENIED_BINS, (
+        "rm must NOT be on the default deny-list (#1739) — under "
+        "workspace-write the queue routes it for operator approval"
+    )
+
+
 @pytest.mark.asyncio
 async def test_shell_compound_command_with_allow_listed_head_queues(workspace: Path):
     """#1694 codex review P1: an allow-listed first token can't bless
