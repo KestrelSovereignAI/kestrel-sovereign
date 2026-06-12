@@ -326,6 +326,44 @@ def _strip_and_weld_revise_sentinels(text: str) -> str:
 class StreamingMixin:
     """Mixin class providing streaming response methods."""
 
+    async def _resolve_eager_images(self, attachments) -> list:
+        """Resolve this turn's *inline* image attachments (#1662 eager vision)
+        to raw bytes for the model.
+
+        ``inline`` marks an image pasted or dropped straight into the composer
+        — the user's intent is "see this now", so it rides this turn as vision
+        input. Non-inline attachments are lazy references the agent reads on
+        demand via a tool (PR C), and documents are always lazy; both are
+        skipped here. The ref is already persisted on the user turn, so an
+        attachment whose bytes are missing/unreadable is skipped without losing
+        the history record.
+        """
+        if not attachments:
+            return []
+        storage = getattr(self, "storage", None)
+        if storage is None or not hasattr(storage, "retrieve_file"):
+            return []
+        images: list = []
+        for att in attachments:
+            if not isinstance(att, dict):
+                continue
+            if att.get("kind") != "image" or not att.get("inline"):
+                continue
+            content_hash = att.get("hash")
+            if not isinstance(content_hash, str):
+                continue
+            try:
+                data = await storage.retrieve_file(content_hash)
+            except Exception as exc:
+                logging.warning(
+                    "Eager vision: could not load attachment %s: %s",
+                    content_hash[:12], exc,
+                )
+                continue
+            if data:
+                images.append(data)
+        return images
+
     async def process_input_streaming(
         self,
         user_input: str,
@@ -588,6 +626,14 @@ class StreamingMixin:
         # the client never rendered.
         pending_visible_boundary = False
 
+        # #1662 eager vision: resolve this turn's inline (pasted/dropped) image
+        # attachments to bytes so the LLM service can fold them into the user
+        # message in the resolved provider's native format. Lazy refs and
+        # documents are skipped here — the agent reads those on demand.
+        eager_images = (
+            await self._resolve_eager_images(attachments) if attachments else None
+        )
+
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
             tools=feature_tools if feature_tools else None,
@@ -596,6 +642,7 @@ class StreamingMixin:
             system_prompt=system_prompt,
             session_id=session_id,
             tool_executor=self._make_inline_tool_executor(session_id),
+            images=eager_images or None,
         ):
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this

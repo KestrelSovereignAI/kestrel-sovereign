@@ -515,6 +515,46 @@ class StreamingMixin:
             underlying=last_error,
         )
 
+    @staticmethod
+    def _adapter_supports_vision(adapter: Any) -> bool:
+        """True when the resolved adapter can accept image input this turn."""
+        try:
+            caps = adapter.provider_capabilities()
+        except Exception:
+            return False
+        return bool(getattr(caps, "supports_vision", False))
+
+    def _apply_eager_vision(
+        self,
+        adapter: Any,
+        messages: List[Dict[str, Any]],
+        images: Optional[List[Union[str, bytes]]],
+        provider_name: str,
+        model: str,
+    ) -> List[Dict[str, Any]]:
+        """Fold this turn's eager image attachments (#1662) into the last user
+        message in the *resolved* provider's native vision format.
+
+        Vision shape is provider-specific and routing is dynamic, so the fold
+        happens here — after a provider is chosen — not at the agent layer. If
+        the resolved model can't see images, leave the messages untouched and
+        warn LOUDLY rather than silently dropping the user's image (no blind
+        fallbacks): the turn still runs as text, and the log says why.
+        """
+        if not images:
+            return messages
+        if self._adapter_supports_vision(adapter) and hasattr(
+            adapter, "attach_images_to_last_user_message"
+        ):
+            return adapter.attach_images_to_last_user_message(messages, images)
+        logger.warning(
+            "Eager vision: %s/%s is not vision-capable; %d image "
+            "attachment(s) were NOT sent to the model this turn. Switch to a "
+            "vision-capable model to let the agent see pasted images.",
+            provider_name, model, len(images),
+        )
+        return messages
+
     async def stream_with_tool_detection(
         self,
         *,
@@ -525,6 +565,7 @@ class StreamingMixin:
         system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        images: Optional[List[Union[str, bytes]]] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -561,6 +602,10 @@ class StreamingMixin:
                 ``"provider/model"`` or just ``"model"``)
             system_prompt: Optional system prompt (only used for
                 Anthropic adapter)
+            images: Optional eager image attachments for *this* turn
+                (#1662). Folded into the last user message in the resolved
+                provider's native vision format once a provider is chosen;
+                ignored with a loud warning if that provider can't see images.
 
         Yields:
             ``Union[str, ToolCallStarted, LLMResponse]`` per the
@@ -593,15 +638,22 @@ class StreamingMixin:
             and self._remote_client
             and not force_local_only
             and self._remote_first_allowed(model_override)
+            # Don't shortcut to the remote GPU when this turn carries images and
+            # the remote model can't see them — fall through to normal routing
+            # so a vision-capable cloud provider gets the chance (#1662).
+            and (not images or self._adapter_supports_vision(self._remote_adapter))
         ):
             try:
                 self._ensure_remote_active()
                 model = self._scrub_auto(model_override) or self._remote_config.model
                 if hasattr(self._remote_adapter, "get_streaming_response_with_tools"):
+                    remote_messages = self._apply_eager_vision(
+                        self._remote_adapter, messages, images, "remote_gpu", model
+                    )
                     async for item in self._remote_adapter.get_streaming_response_with_tools(
                         client=self._remote_client,
                         model=model,
-                        messages=messages,
+                        messages=remote_messages,
                         tools=tools,
                     ):
                         yield item
@@ -657,13 +709,16 @@ class StreamingMixin:
                     usage_sink: Dict[str, Any] = {}
                     if getattr(adapter, "supports_partial_usage_flush", False):
                         kwargs["usage_sink"] = usage_sink
+                    adapter_messages = self._apply_eager_vision(
+                        adapter, messages, images, provider_name, model
+                    )
                     stream_start = time.monotonic()
                     final_response = None
                     try:
                         async for item in adapter.get_streaming_response_with_tools(
                             client=provider["client"],
                             model=model,
-                            messages=messages,
+                            messages=adapter_messages,
                             tools=tools,
                             **kwargs
                         ):

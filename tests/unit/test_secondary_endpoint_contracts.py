@@ -91,8 +91,10 @@ def test_database_table_query_contract_supports_search_and_pagination():
 
 
 def test_file_get_and_observability_summary_contracts():
+    # The endpoint reads bytes through the privacy-wrapper facade
+    # (storage.retrieve_file) so ISOLATED session-buffered files serve too
+    # (#1662); MIME metadata still comes from the persistent files store.
     file_store = MagicMock()
-    file_store.retrieve_file = AsyncMock(return_value=b"image-bytes")
     file_store.get_file_metadata = AsyncMock(return_value={"mime_type": "image/png"})
     event_error = SimpleNamespace(
         event_type="error",
@@ -110,6 +112,7 @@ def test_file_get_and_observability_summary_contracts():
     )
     observability_store = MagicMock(query_events=AsyncMock(return_value=[event_error, event_tool]))
     storage = MagicMock(files=file_store)
+    storage.retrieve_file = AsyncMock(return_value=b"image-bytes")
     agent = MagicMock(storage=storage, observability_store=observability_store)
 
     app, original = _prepare_app(agent)

@@ -153,6 +153,9 @@ def _sanitize_attachments(raw) -> list:
             "kind": kind,
             "mime": mime if (isinstance(mime, str) and mime in _ATTACHMENT_TYPES) else None,
             "name": (str(item.get("name") or "attachment"))[:255],
+            # #1662 eager vision: only images can be sent inline (as vision
+            # input this turn); documents are always lazy refs.
+            "inline": bool(item.get("inline")) and kind == "image",
         })
     return out
 

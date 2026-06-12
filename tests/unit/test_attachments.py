@@ -12,7 +12,8 @@ def test_sanitize_attachments_keeps_only_valid_refs():
     out = _sanitize_attachments([
         {"hash": h, "kind": "image", "mime": "image/png", "name": "shot.png"},
     ])
-    assert out == [{"hash": h, "kind": "image", "mime": "image/png", "name": "shot.png"}]
+    assert out == [{"hash": h, "kind": "image", "mime": "image/png",
+                    "name": "shot.png", "inline": False}]
 
 
 def test_sanitize_attachments_drops_malformed_and_bounds_count():
@@ -106,6 +107,8 @@ async def test_attachments_persist_on_user_turn_metadata():
         StreamingMixin._process_input_streaming_traced_locked.__get__(mock_agent))
     mock_agent._persist_assistant_turn_safely = (
         StreamingMixin._persist_assistant_turn_safely.__get__(mock_agent))
+    mock_agent._resolve_eager_images = (
+        StreamingMixin._resolve_eager_images.__get__(mock_agent))
 
     h = "c" * 64
     attachments = [{"hash": h, "kind": "image", "mime": "image/png", "name": "shot.png"}]
@@ -175,6 +178,8 @@ async def test_no_attachments_means_no_attachments_key():
         StreamingMixin._process_input_streaming_traced_locked.__get__(mock_agent))
     mock_agent._persist_assistant_turn_safely = (
         StreamingMixin._persist_assistant_turn_safely.__get__(mock_agent))
+    mock_agent._resolve_eager_images = (
+        StreamingMixin._resolve_eager_images.__get__(mock_agent))
 
     async for _ in mock_agent.process_input_streaming("hi", session_id="s"):
         pass
