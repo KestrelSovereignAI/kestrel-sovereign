@@ -112,6 +112,16 @@ class TestResponseAuditHook:
         assert ResponseAuditHook(agent=agent, mode="strict").fail_closed is True
         assert ResponseAuditHook(agent=agent, mode="warn").fail_closed is False
 
+    def test_fail_closed_tracks_runtime_mode_switch(self):
+        """#1723 codex r2: fail_closed is derived from mode, so switching a live
+        hook warn→strict (as enable_audit does) updates enforcement too — it
+        can't go stale."""
+        agent = _make_agent({"risk_level": 1, "reasoning": "x"})
+        hook = ResponseAuditHook(agent=agent, mode="warn")
+        assert hook.fail_closed is False
+        hook.mode = "strict"  # what ResponseAuditFeature.enable_audit mutates
+        assert hook.fail_closed is True
+
     @pytest.mark.asyncio
     async def test_hook_warn_does_not_hard_block_when_audit_did_not_run(self):
         """In non-strict modes an un-run audit does not hard-block (no deny)."""

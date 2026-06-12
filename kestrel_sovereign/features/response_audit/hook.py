@@ -38,16 +38,20 @@ class ResponseAuditHook(Hook):
         )
         self.agent = agent
         self.mode = mode
-        # In strict mode this hook is ENFORCING: if it crashes or times out at
-        # the manager level (e.g. audit provider hang past the hook timeout), the
-        # manager must fail CLOSED (deny) rather than allow the unaudited
-        # response (#1723). warn/other modes are advisory.
-        self.fail_closed = (mode == "strict")
         self.strategy = strategy
         self.risk_threshold = risk_threshold
         self.audit_count = 0
         self.last_risk_level = None
         self.last_narration_verdict = None
+
+    @property
+    def fail_closed(self) -> bool:
+        """ENFORCING in strict mode: if this hook crashes or times out at the
+        manager level (e.g. audit provider hang past the hook timeout), the
+        manager must fail CLOSED (deny) rather than allow the unaudited response
+        (#1723). Derived from ``mode`` (not a stored flag) so a runtime
+        warn→strict switch via ``enable_audit`` can't leave it stale."""
+        return self.mode == "strict"
 
     async def execute(self, input: HookInput) -> HookOutput:
         response_text = input.response_text or ""
