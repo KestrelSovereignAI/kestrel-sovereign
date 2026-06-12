@@ -1667,7 +1667,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         """Get a structured audit response from the normal provider chain."""
         self._check_policy()
         if not self.providers:
-            return {"risk_level": 1, "reasoning": "Audit skipped - no providers available."}
+            return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         target_selector = self._get_default_mandate_selector()
         if not target_selector:
@@ -1768,7 +1768,7 @@ No other text or formatting.
             if errors:
                 joined = "; ".join(f"{name}: {error}" for name, error in errors.items())
                 return {"risk_level": 3, "reasoning": f"Audit provider failed: {joined}"}
-            return {"risk_level": 1, "reasoning": "Audit skipped - no providers available."}
+            return {"risk_level": 1, "reasoning": "Audit skipped - no providers available.", "audited": False}
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse audit JSON: {e}")

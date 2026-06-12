@@ -44,6 +44,15 @@ class ResponseAuditHook(Hook):
         self.last_risk_level = None
         self.last_narration_verdict = None
 
+    @property
+    def fail_closed(self) -> bool:
+        """ENFORCING in strict mode: if this hook crashes or times out at the
+        manager level (e.g. audit provider hang past the hook timeout), the
+        manager must fail CLOSED (deny) rather than allow the unaudited response
+        (#1723). Derived from ``mode`` (not a stored flag) so a runtime
+        warn→strict switch via ``enable_audit`` can't leave it stale."""
+        return self.mode == "strict"
+
     async def execute(self, input: HookInput) -> HookOutput:
         response_text = input.response_text or ""
 
@@ -145,10 +154,36 @@ class ResponseAuditHook(Hook):
                     risk_level=narration_risk,
                     reasoning=narration_verdict.reasoning,
                 )
+            # FAIL CLOSED in strict mode (#1723): an audit provider outage must
+            # not silently pass an unaudited response. warn/other modes keep
+            # surfacing the error without hard-blocking.
+            if self.mode == "strict":
+                await self._notify_audit_anchor(self.risk_threshold, f"audit error: {e}")
+                return HookOutput.deny(
+                    f"Response audit unavailable ({e}); blocked by fail-closed "
+                    f"policy (mode=strict)."
+                )
             return HookOutput.allow(f"Audit skipped due to error: {e}")
 
         risk_level = audit_result.get("risk_level", 1)
         reasoning = audit_result.get("reasoning", "")
+
+        # FAIL CLOSED (#1723): if the audit could not actually run (e.g. no
+        # providers available), the service tags ``audited=False`` with a benign
+        # risk_level 1. In strict (enforcing) mode that must NOT pass as audited —
+        # treat an un-run audit as blocking so a misconfigured/empty provider
+        # chain can't silently disable the integrity gate. warn/other modes keep
+        # surfacing it without hard-blocking.
+        if audit_result.get("audited", True) is False and self.mode == "strict":
+            logger.error(
+                "Response audit could not run (%s) and mode=strict — failing "
+                "closed (deny).", reasoning or "no providers",
+            )
+            await self._notify_audit_anchor(self.risk_threshold, reasoning)
+            return HookOutput.deny(
+                f"Response audit unavailable ({reasoning or 'no providers'}); "
+                f"blocked by fail-closed policy (mode=strict)."
+            )
 
         # Fold the narration verdict into the LLM audit score:
         # additive (so an LLM-flagged response with a narration

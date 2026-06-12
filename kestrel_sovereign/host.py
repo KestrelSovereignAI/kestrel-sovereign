@@ -22,7 +22,6 @@ Architecture:
 Key principle: No agent is privileged. The host treats all agents as equal peers.
 """
 
-import ipaddress
 import os
 import secrets
 import logging
@@ -182,6 +181,18 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Kestrel Host", lifespan=lifespan)
 
+# Rate limiting (#1724): wire the shared slowapi limiter so the host's
+# bootstrap-key endpoint is throttled like server.py's.
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from kestrel_sovereign.rate_limit import limiter as _rate_limiter
+from kestrel_sovereign.security.bootstrap_access import is_bootstrap_host_allowed
+
+app.state.limiter = _rate_limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
 # --- OAuth setup (Google sign-in for browser sessions) ---
 # Mirrors server.py wiring so multi_agent mode supports the same auth flow.
 from kestrel_sovereign.endpoints.auth_oauth import (
@@ -201,6 +212,12 @@ def _oauth_required() -> bool:
     return os.environ.get("KESTREL_REQUIRE_OAUTH", "").lower() in {
         "1", "true", "yes", "on"
     }
+
+
+def _bootstrap_key_enabled() -> bool:
+    """Localhost API-key bootstrap is available when OAuth is not required
+    (mirrors server.py so both servers gate the endpoint identically) (#1724)."""
+    return not _oauth_required()
 
 
 # Mount static files. Static assets ship inside the package (we're already
@@ -329,14 +346,6 @@ app.add_middleware(
 # --- Routes ---
 
 
-def _is_docker_network(host: str) -> bool:
-    """Check if the host IP is within Docker's internal network range (172.16.0.0/12)."""
-    try:
-        return ipaddress.ip_address(host) in ipaddress.ip_network("172.16.0.0/12")
-    except ValueError:
-        return False
-
-
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
     """Serve the main web UI."""
@@ -347,13 +356,17 @@ async def serve_index():
 
 
 @app.get("/api/auth/key")
+@_rate_limiter.limit("5/minute")
 async def get_bootstrap_key(request: Request):
-    """Return API key for initial frontend setup (localhost only)."""
-    client_host = request.client.host if request.client else None
-    allowed_hosts = {"127.0.0.1", "localhost", "::1", "172.17.0.1"}
-    is_docker_internal = client_host and _is_docker_network(client_host)
+    """Return API key for initial frontend setup (localhost / Docker gateway only)."""
+    if not _bootstrap_key_enabled():
+        raise HTTPException(status_code=404, detail="API key bootstrap endpoint is disabled")
 
-    if client_host not in allowed_hosts and not is_docker_internal:
+    # Narrowed from 172.16.0.0/12 to loopback + Docker gateway (+ explicit
+    # KESTREL_BOOTSTRAP_ALLOWED_HOSTS); now also rate-limited and gated by the
+    # bootstrap-enabled flag, matching server.py (#1724).
+    client_host = request.client.host if request.client else None
+    if not is_bootstrap_host_allowed(client_host):
         raise HTTPException(
             status_code=403,
             detail="API key bootstrap only accessible from localhost",
