@@ -4,10 +4,11 @@ ARG TARGETARCH
 FROM --platform=linux/${TARGETARCH} python:3.11-slim
 
 # Set environment variables
-# KESTREL_DB_PATH is a DIRECTORY (config.py reads <KESTREL_DB_PATH>/kestrel.toml
-# and <KESTREL_DB_PATH>/trusted_agents/), NOT a .db file — pointing it at a file
-# crashed config imports / blocked DB creation (#1729).
-ENV KESTREL_DB_PATH=/app/agent_data
+# NOTE: KESTREL_DB_PATH semantics (config.py treats it as a DIRECTORY, but the
+# entrypoint/init script use /app/kestrel.db as a file) are inconsistent across
+# Dockerfile / docker_entrypoint.sh / scripts/init_agent_identity.py / compose;
+# reconciling them needs an end-to-end container test and is tracked separately.
+ENV KESTREL_DB_PATH=/app/kestrel.db
 ENV KESTREL_IDENTITY_PATH=/app/kestrel_did.json
 ENV KESTREL_ENV=production
 ENV PYTHONUNBUFFERED=1
