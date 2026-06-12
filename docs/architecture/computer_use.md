@@ -71,7 +71,13 @@ max_read_bytes = 5_000_000
 # a scoped auto-approve rule) decides. Operators add to this list to
 # broaden the no-prompt set; never blindly copy the broad list below.
 auto_approved_binaries = ["ls", "cat", "rg"]
-denied_binaries = ["rm", "dd", "mkfs", "shutdown", "sudo", "ssh"]
+denied_binaries = ["dd", "mkfs", "shutdown", "sudo", "ssh"]
+# rm is intentionally NOT on the default deny-list (#1739). Under
+# workspace-write, in-workspace rm is silent and out-of-workspace rm
+# routes through the ApprovalQueue so the operator can authorize
+# specific cleanups. Operators running with auto-mode ON who want rm
+# to still prompt should add it explicitly to denied_binaries until
+# #1741's ALWAYS_ASK primitive lands.
 auto_approve_read = true              # only inside allowed_paths
 audit_log_path = ".kestrel/computer_use_audit.jsonl"
 ```

@@ -213,18 +213,46 @@ async def retire_agent(
     agent_archive_path = archive_dir / archive_name
     agent_archive_path.mkdir(exist_ok=True)
 
-    # Move database to archive
+    # Move database to archive, INCLUDING its WAL/SHM sidecars (#1725) — moving
+    # the .db alone can strand uncommitted WAL state and orphan the sidecars.
     archived_db = agent_archive_path / db_path.name
-    shutil.move(str(db_path), str(archived_db))
+    for suffix in ("", "-wal", "-shm"):
+        src = Path(str(db_path) + suffix)
+        if src.exists():
+            shutil.move(str(src), str(agent_archive_path / src.name))
     logger.info(f"Archived database to {archived_db}")
 
-    # Move related files (keys, DID document)
+    # Move related files (keys, DID document) — SCOPED TO THIS AGENT (#1725).
+    # The old broad glob (*.pem, *.key.enc, *kestrel*.json) over the DB's parent
+    # confiscated EVERY co-located agent's private keys in a shared data dir.
+    # Instead, find the DID document whose ``id`` matches this agent, then
+    # archive only that key_id's siblings (``{key_id}.json/.pem/.key.enc``).
     db_dir = db_path.parent
-    for pattern in ["*.pem", "*.key.enc", "*kestrel*.json"]:
-        for file in db_dir.glob(pattern):
-            if file.exists():
-                shutil.move(str(file), str(agent_archive_path / file.name))
-                logger.info(f"Archived {file.name}")
+    archived_keys = False
+    for did_doc in db_dir.glob("*kestrel*.json"):
+        try:
+            doc = json.loads(did_doc.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if doc.get("id") != agent_did:
+            continue
+        key_id = did_doc.stem
+        for sibling in (
+            did_doc,
+            db_dir / f"{key_id}.pem",
+            db_dir / f"{key_id}.key.enc",
+        ):
+            if sibling.exists():
+                shutil.move(str(sibling), str(agent_archive_path / sibling.name))
+                logger.info(f"Archived {sibling.name}")
+        archived_keys = True
+        break
+    if not archived_keys:
+        logger.warning(
+            "No DID document matching %s found in %s; key files not archived "
+            "(refusing to glob a possibly-shared directory).",
+            agent_did, db_dir,
+        )
 
     # Create retirement summary
     record = RetirementRecord(

@@ -1401,6 +1401,48 @@ class TestCodexApprovalBridge:
         assert reply2 == {"decision": "decline"}
 
     @pytest.mark.asyncio
+    async def test_rm_routes_through_queue_under_default_deny(self):
+        """#1739: ``rm`` is no longer on the default deny-list. Under
+        the default BinaryPolicy (allow=auto-approved, deny=defaults),
+        an out-of-workspace ``rm`` reaches the ApprovalQueue rather
+        than hard-declining.
+
+        Without this, an operator who needed to clean up an
+        approval-gated file they previously authorized had no way to
+        do so — the bridge declined without ever raising a prompt
+        (Emma's #1737 dogfood).
+        """
+        from kestrel_sovereign.features.computer_use.policy import (
+            BinaryPolicy, PathPolicy,
+        )
+        from kestrel_sovereign.features.computer_use.feature import (
+            _DEFAULT_AUTO_APPROVED_BINS, _DEFAULT_DENIED_BINS,
+        )
+
+        a = CodexAdapter()
+        agent, captured = self._agent_with_queue(approves=True)
+        # Use the actual production defaults so this is a real
+        # regression pin, not a synthetic fixture.
+        agent.features["ComputerUseFeature"] = SimpleNamespace(
+            _binary_policy=BinaryPolicy(
+                allow=list(_DEFAULT_AUTO_APPROVED_BINS),
+                deny=list(_DEFAULT_DENIED_BINS),
+            ),
+            _path_policy=PathPolicy(allow=["/Volumes/foo"], deny=[]),
+        )
+        handler = a._make_codex_approval_handler(agent, "commandExecution")
+        reply = await handler({
+            "command": "rm /Volumes/foo/anything.py",
+        })
+        assert reply == {"decision": "accept"}, (
+            "rm under default deny-list must reach the queue and "
+            "accept on operator approval (#1739)"
+        )
+        assert len(captured) == 1, (
+            "queue must be consulted for rm under default deny-list"
+        )
+
+    @pytest.mark.asyncio
     async def test_bridged_denial_returns_decline(self):
         """Queue denies → bridge returns decline. Use an allow-listed
         path so the policy gate passes through to the queue (otherwise
