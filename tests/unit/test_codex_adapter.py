@@ -525,6 +525,53 @@ class TestThreadStartParams:
             f"safe fallback must live under tempdir, got {resolved!r}"
         )
 
+    def test_tempdir_fallback_rejects_parent_symlink(self, tmp_path, monkeypatch):
+        """#1734 codex review round 2 P0: leaf-only ``is_symlink`` missed
+        a pre-planted parent symlink (e.g. ``/tmp/kestrel-codex ->
+        /attacker/path``). After mkdir the leaf isn't a symlink but
+        the resolved real path escapes the tempdir. The fallback now
+        verifies the resolved real path is under ``tempfile.gettempdir()``
+        and rejects if not.
+        """
+        from kestrel_sovereign.llm.codex_adapter import CodexAdapter
+        import tempfile
+        from pathlib import Path
+
+        # Redirect tempdir to a tmp_path subdir we control, so we can
+        # plant the parent symlink.
+        fake_temp = tmp_path / "fake_tmp"
+        fake_temp.mkdir()
+        outside_target = tmp_path / "outside_target"
+        outside_target.mkdir()
+        # Plant: ``<fake_temp>/kestrel-codex -> outside_target``
+        (fake_temp / "kestrel-codex").symlink_to(outside_target)
+
+        monkeypatch.setenv("TMPDIR", str(fake_temp))
+        # tempfile.gettempdir caches; force re-read for this test by
+        # importing fresh.
+        import importlib
+        importlib.reload(tempfile)
+        assert tempfile.gettempdir() == str(fake_temp), (
+            "test setup: TMPDIR override must reach tempfile.gettempdir"
+        )
+
+        # Attached agent with broken workspace (no storage_path).
+        agent = SimpleNamespace(
+            storage_path=None,
+            _agent_name="emma",
+            did="did:test:emma",
+        )
+        a = CodexAdapter()
+        a.attach_agent_for_audit(agent)
+        resolved = a._resolve_thread_cwd()
+
+        # Resolved path must NOT escape into outside_target.
+        outside_real = str(outside_target.resolve())
+        assert not resolved.startswith(outside_real), (
+            f"fallback must reject parent-symlink escape; got {resolved!r} "
+            f"which is under attacker's {outside_real!r}"
+        )
+
     def test_thread_fingerprint_includes_cwd_sandbox_policy(self):
         """#1734 codex review concern: cwd + sandbox + approval_policy
         are thread-scoped settings codex only consumes at

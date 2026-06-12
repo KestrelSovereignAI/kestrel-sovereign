@@ -571,6 +571,18 @@ class CodexAdapter(LLMAdapter):
         ``mkdir`` we ``lstat`` the path and refuse if it's a symlink.
         We also verify the resolved real path is still inside the
         agent's data dir.
+
+        Acknowledged TOCTOU window: between this validation and the
+        time codex consumes ``cwd`` from ``thread/start``, an attacker
+        with write access to ``<agent_data_dir>`` could swap
+        ``workspace`` for a symlink. Closing this within pure-Python
+        would require codex to consume a file descriptor we opened
+        with ``O_NOFOLLOW``, which the codex app-server protocol does
+        not support today. The threat model already requires write
+        access to ``<agent_data_dir>``, at which point the attacker
+        can also modify the agent's DB / bootstrap / kestrel.toml
+        directly — the marginal additional capability from a
+        post-validation symlink swap is small enough to accept.
         """
         agent = self._agent_for_audit
         if agent is None:
@@ -651,29 +663,44 @@ class CodexAdapter(LLMAdapter):
             safe_name = "".join(
                 c if c.isalnum() or c in "-_." else "_" for c in str(agent_name)
             )[:64]
-            fallback = (
-                Path(tempfile.gettempdir())
-                / "kestrel-codex"
-                / safe_name
-            )
+            tempdir_root = Path(tempfile.gettempdir())
+            fallback = tempdir_root / "kestrel-codex" / safe_name
             try:
                 fallback.mkdir(parents=True, exist_ok=True)
-                if not fallback.is_symlink():
+                # Codex review round 2 P0: the leaf-only check missed
+                # a pre-planted parent symlink (e.g. ``/tmp/kestrel-codex
+                # -> /attacker/path``). Require the resolved real path
+                # to live under the resolved tempdir root — that
+                # rejects parent-symlink escapes too.
+                real_fallback = fallback.resolve()
+                real_tempdir = tempdir_root.resolve()
+                try:
+                    real_fallback.relative_to(real_tempdir)
+                except ValueError:
                     logger.warning(
-                        "codex_adapter: per-agent workspace unavailable; "
-                        "using fallback tempdir %s (sandbox boundary)",
-                        fallback,
+                        "codex_adapter: fallback tempdir %s resolves "
+                        "outside %s (%s) — refusing (potential parent "
+                        "symlink escape)",
+                        fallback, real_tempdir, real_fallback,
                     )
-                    return str(fallback.resolve())
+                else:
+                    if not fallback.is_symlink():
+                        logger.warning(
+                            "codex_adapter: per-agent workspace unavailable; "
+                            "using fallback tempdir %s (sandbox boundary)",
+                            real_fallback,
+                        )
+                        return str(real_fallback)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "codex_adapter: fallback tempdir failed: %s — last "
-                    "resort: refusing workspace cwd to Path.cwd() and "
-                    "using tempdir root", exc,
+                    "resort: tempdir root", exc,
                 )
-            # Last resort when even tempdir is unusable: the tempdir
-            # root itself. Still safer than Path.cwd() (host repo).
-            return tempfile.gettempdir()
+            # Last resort when even per-agent tempdir is unusable: the
+            # tempdir root itself. Still safer than Path.cwd() (host
+            # repo) — codex's workspace-write whitelist already
+            # includes /tmp / $TMPDIR.
+            return str(tempdir_root.resolve())
         return str(Path.cwd())
 
     def _teardown_codex_approval_bridge(self) -> None:
