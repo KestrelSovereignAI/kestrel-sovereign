@@ -521,6 +521,13 @@ class StreamingMixin:
         non-reentrant-lock self-deadlock that the dispatcher (Phase 1)
         would otherwise hit when COGNITION signals route through this
         path."""
+        # #1662: record THIS turn's session so tools that must scope to the
+        # active conversation (read_attachment) have an authoritative value —
+        # the tool-call `session_id` arg is model-controlled and usually omitted,
+        # and the inline executor binds session only into hook context, not tool
+        # args. The turn-lifecycle lock serializes turns per agent, so this is
+        # safe per-turn.
+        self._active_session_id = session_id
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 

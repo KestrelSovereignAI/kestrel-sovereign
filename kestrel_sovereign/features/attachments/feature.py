@@ -150,14 +150,15 @@ class AttachmentsFeature(Feature):
             )
 
         # Conversation membership (REQUIRED, not just for display): the hash
-        # must actually be referenced as an attachment in this conversation, so
-        # the tool can't be used to pull an attachment from a DIFFERENT thread
-        # by id alone. ``session_id`` is supplied by the tool executor for the
-        # active turn; when present this scopes to that thread, otherwise to the
-        # agent's recent history.
+        # must actually be referenced as an attachment in THIS conversation, so
+        # the tool can't pull an attachment from a different thread by id alone.
+        # The tool-call ``session_id`` arg is model-controlled and usually
+        # omitted, so the authoritative scope is the session the agent recorded
+        # for the active turn; the arg only narrows further if supplied.
+        effective_session = session_id or getattr(self.agent, "_active_session_id", None)
         try:
             history = await self.storage.get_conversation_history(
-                limit=200, session_id=session_id
+                limit=200, session_id=effective_session
             )
         except TypeError:
             history = await self.storage.get_conversation_history(limit=200)

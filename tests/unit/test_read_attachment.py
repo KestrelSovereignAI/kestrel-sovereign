@@ -28,6 +28,7 @@ def _make(att=None, *, bytes_=b"", file_meta="attachment"):
     storage.files.get_file_metadata = AsyncMock(return_value=meta)
     agent = MagicMock()
     agent.agent_id = "did:test"
+    agent._active_session_id = None
     agent.storage = storage
     feat = AttachmentsFeature(agent)
     feat.storage = storage
@@ -82,6 +83,20 @@ async def test_read_attachment_rejects_hash_not_in_this_conversation():
     res = await feat.read_attachment("a" * 64)
     assert res.status == "error"
     storage.retrieve_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_scopes_to_agents_active_session():
+    # The model omits session_id; the tool must scope to the session the agent
+    # recorded for the active turn (not the agent's whole history).
+    h = "b" * 64
+    feat, storage = _make(
+        {"hash": h, "kind": "document", "mime": "text/plain", "name": "n.txt"},
+        bytes_=b"hi")
+    feat.agent._active_session_id = "sess-active"
+    await feat.read_attachment(h)  # no session_id arg
+    storage.get_conversation_history.assert_awaited_once()
+    assert storage.get_conversation_history.await_args.kwargs["session_id"] == "sess-active"
 
 
 @pytest.mark.asyncio
