@@ -66,6 +66,21 @@ test('a loose list (blank line between items) is NOT split into two lists', () =
     assert.match(tail, /- first\n\n- second/);
 });
 
+test('an indented loose-list continuation stays with the list', () => {
+    const { _splitStreamingTail } = load();
+    // "  more" continues the list item across the blank line — must not split.
+    const { stable, tail } = _splitStreamingTail('- item\n\n  more text');
+    assert.equal(stable, '');
+    assert.match(tail, /- item\n\n  more text/);
+});
+
+test('a ```js info-string line inside a ``` block does not close it', () => {
+    const { _completeStreamingInline, _splitStreamingTail } = load();
+    assert.equal(_completeStreamingInline('```\n```js\nx'), '```\n```js\nx\n```');
+    const { tail } = _splitStreamingTail('```\n```js\n\nx');
+    assert.match(tail, /```\n```js\n\nx/);  // info-string line + blank don't split
+});
+
 test('a non-list block after a loose list still finalizes', () => {
     const { _splitStreamingTail } = load();
     const { stable, tail } = _splitStreamingTail('- a\n\n- b\n\nparagraph');

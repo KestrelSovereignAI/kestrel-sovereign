@@ -260,21 +260,28 @@ const _LIST_ITEM_RE = /^[ \t]*([-*+]|\d+[.)])\s/;
 // CommonMark a fence closes only with the SAME marker char and a run AT LEAST AS
 // LONG as the opener — so a ```` block containing a ``` line stays open, and a
 // ``` block containing a ~~~ line stays open.
+const _FENCE_CLOSE_RE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;  // closer: whitespace-only after
 function _walkFences(text, onLine) {
     let open = null; // {char, len}
     const lines = text.split('\n');
     for (let i = 0; i < lines.length; i++) {
-        const m = lines[i].match(_FENCE_RE);
-        if (m) {
-            const run = m[1];
-            const char = run[0];
-            const len = run.length;
-            if (open === null) open = { char, len };
-            else if (char === open.char && len >= open.len) open = null;
-            // else: shorter/other-marker fence line — literal inside the block
-        } else if (onLine) {
-            onLine(open, i, lines[i]);
+        const line = lines[i];
+        let transitioned = false;
+        if (open === null) {
+            // Opener: may carry an info string (e.g. ```js).
+            const m = line.match(_FENCE_RE);
+            if (m) { open = { char: m[1][0], len: m[1].length }; transitioned = true; }
+        } else {
+            // Closer: same char, run AT LEAST AS LONG, and NOTHING but
+            // whitespace after it (CommonMark) — so ```js inside a ``` block is
+            // literal code, not a close.
+            const m = line.match(_FENCE_CLOSE_RE);
+            if (m && m[1][0] === open.char && m[1].length >= open.len) {
+                open = null;
+                transitioned = true;
+            }
         }
+        if (!transitioned && onLine) onLine(open, i, line);
     }
     return open ? open.char.repeat(open.len) : null;
 }
@@ -309,12 +316,17 @@ function _splitStreamingTail(text) {
     _walkFences(text, (openFence, i) => {
         if (openFence !== null) return;  // inside a fenced block — never split
         if (lines[i].trim() !== '') return;
-        // Peek the next non-blank line: if it's a list item this blank may be a
-        // loose-list gap, so keep the prefix in the tail (don't split a
-        // multi-item list into separate lists mid-stream).
+        // Peek the next non-blank line. Keep the prefix in the tail (don't
+        // finalize this blank as a boundary) when the next content may still
+        // belong to the preceding block:
+        //   - a new list item   → loose list continuation
+        //   - an INDENTED line   → a list item's continuation paragraph/code
+        //     block, or an indented code block
+        // A non-indented, non-list line is an unambiguous new top-level block.
         let j = i + 1;
         while (j < lines.length && lines[j].trim() === '') j++;
-        if (j < lines.length && _LIST_ITEM_RE.test(lines[j])) return;
+        if (j < lines.length
+            && (_LIST_ITEM_RE.test(lines[j]) || /^[ \t]/.test(lines[j]))) return;
         tailStartLine = i + 1;
     });
     return {
