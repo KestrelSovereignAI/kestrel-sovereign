@@ -93,5 +93,7 @@ class TestDidWebSSRF:
             raise HTTPError(url, 302, "Found", {"Location": "https://169.254.169.254/x"}, io.BytesIO(b""))
 
         monkeypatch.setattr("urllib.request.OpenerDirector.open", fake_open)
+        # Public LITERAL IP so validate_outbound_url passes WITHOUT real DNS
+        # (keeps the unit test offline-safe); the redirect is what's under test.
         with pytest.raises(did_web.DidWebError, match="redirect"):
-            did_web._default_fetcher("https://example.com/.well-known/did.json")
+            did_web._default_fetcher("https://93.184.216.34/.well-known/did.json")
