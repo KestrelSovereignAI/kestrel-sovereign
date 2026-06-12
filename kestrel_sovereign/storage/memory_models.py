@@ -257,16 +257,30 @@ class MemoryEpisode:
     def from_row(cls, row: tuple) -> "MemoryEpisode":
         """Create from database row."""
         import json
+
+        def _dt(value):
+            # SQLite returns ISO strings; asyncpg (Postgres) returns native
+            # datetime objects. Tolerate both (and None) so callers on either
+            # backend can materialize episodes via from_row.
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+
         return cls(
             id=row[0],
             agent_id=row[1],
             title=row[2],
             summary=row[3],
-            timespan_start=datetime.fromisoformat(row[4]) if row[4] else None,
-            timespan_end=datetime.fromisoformat(row[5]) if row[5] else None,
+            timespan_start=_dt(row[4]),
+            timespan_end=_dt(row[5]),
             key_message_ids=json.loads(row[6]) if row[6] else [],
             emotional_arc=row[7] or "",
-            created_at=datetime.fromisoformat(row[8]) if row[8] else None,
+            created_at=_dt(row[8]),
             # Tolerate legacy rows / shorter SELECTs that pre-date the columns.
             importance=row[9] if len(row) > 9 and row[9] is not None else 0.5,
             access_count=row[10] if len(row) > 10 and row[10] is not None else 0,

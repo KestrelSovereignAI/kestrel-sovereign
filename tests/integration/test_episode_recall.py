@@ -87,6 +87,27 @@ async def test_recall_increments_access_count(db):
     assert after_two == 2
 
 
+async def test_from_row_tolerates_native_datetimes():
+    """asyncpg (Postgres) returns native datetime objects, not ISO strings;
+    from_row must accept both so PG keyword recall can materialize episodes."""
+    import datetime as _dt
+    from kestrel_sovereign.storage.memory_models import MemoryEpisode
+
+    now = _dt.datetime(2026, 6, 1, 12, 0, tzinfo=_dt.timezone.utc)
+    ep = MemoryEpisode.from_row(
+        ("id1", "agent", "Title", "Summary", now, now, "[]", "arc", now, 0.7, 4)
+    )
+    assert ep.created_at == now and ep.timespan_start == now
+    assert ep.importance == 0.7 and ep.access_count == 4
+
+    # ISO strings (SQLite) still work.
+    ep2 = MemoryEpisode.from_row(
+        ("id2", "agent", "T", "S", now.isoformat(), now.isoformat(),
+         "[]", "arc", now.isoformat(), 0.5, 0)
+    )
+    assert ep2.created_at == now
+
+
 async def test_recall_empty_query_returns_nothing(db):
     c = MemoryConsolidator(db, "agent-p2", llm_service=None)
     await _insert_episode(db, "sail", "Sailing trip", "We sailed the lake.")
