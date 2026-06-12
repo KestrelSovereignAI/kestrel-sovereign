@@ -57,6 +57,13 @@ class AgentManager:
         self._child_mandates: dict[str, SpawnMandate] = {}  # child_name -> mandate
         self._base_data_dir = base_data_dir or Path.cwd()
         self._lock = asyncio.Lock()
+        # MONOTONIC port allocator (#1729). ``8800 + len(self._agents) + 1``
+        # collides after an agent is unloaded — len shrinks and the next spawn
+        # reuses a live port. A counter that only ever increases avoids reuse.
+        self._port_seq = 8800
+        # Hard cap on dynamically-spawned agents so a runaway spawn loop can't
+        # exhaust ports / resources (#1729).
+        self._max_spawned_agents = int(os.environ.get("KESTREL_MAX_SPAWNED_AGENTS", "64"))
         # Per-agent initialization failures recorded by load_from_config so
         # the FastAPI lifespan can surface them via /health (#377 lifecycle
         # hardening for multi-agent boot).
@@ -231,9 +238,10 @@ class AgentManager:
         except Exception as e:
             raise ValueError(f"Inception failed for '{name}': {e}")
 
+        self._port_seq += 1
         config = LocalAgentConfig(
             data_dir=Path("agent_data") / name,
-            port=8800 + len(self._agents) + 1,
+            port=self._port_seq,  # monotonic — never reuses an unloaded agent's port
             autostart=True,
         )
         return await self.load_agent(name, config)
@@ -260,6 +268,23 @@ class AgentManager:
         Raises:
             ValueError: If an agent with this name already exists or inception fails.
         """
+        # Spawn caps (#1729): bound runaway spawning.
+        # 1. Global count cap — total dynamically-spawned children.
+        if len(self._child_mandates) >= self._max_spawned_agents:
+            raise ValueError(
+                f"Spawn refused: at the spawned-agent cap "
+                f"({self._max_spawned_agents}). Set KESTREL_MAX_SPAWNED_AGENTS to raise."
+            )
+        # 2. Depth cap — if the PARENT was itself spawned and its mandate marks it
+        #    a leaf (max_child_depth <= 0), it may not spawn further.
+        parent_name = self._agent_names.get(parent_agent.agent_id)
+        parent_mandate = self._child_mandates.get(parent_name) if parent_name else None
+        if parent_mandate is not None and getattr(parent_mandate, "max_child_depth", 0) <= 0:
+            raise ValueError(
+                f"Spawn refused: parent '{parent_name}' is at its max child depth "
+                f"(mandate max_child_depth={getattr(parent_mandate, 'max_child_depth', 0)})."
+            )
+
         # Sign the mandate with the parent's keys if available.
         # Hybrid parents (post-rotation ceremony) get an additional
         # ``parent_identity`` arg so the mandate is signed with both

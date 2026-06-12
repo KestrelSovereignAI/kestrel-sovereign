@@ -5,13 +5,16 @@ services:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "7777:7777"
+      # The server listens on 8888 (see Dockerfile EXPOSE/HEALTHCHECK); publish
+      # that, not 7777 (#1729).
+      - "8888:8888"
     depends_on:
       - ipfs
     environment:
       - KESTREL_ENV=test
       - IPFS_API_URL=${IPFS_API_URL:-http://ipfs:5001}
-      - KESTREL_DB_PATH=/usr/src/app/kestrel.db
+      # KESTREL_DB_PATH is a DIRECTORY, not a .db file (#1729).
+      - KESTREL_DB_PATH=/usr/src/app/agent_data
       - KESTREL_IDENTITY_PATH=/usr/src/app/kestrel_did.json
     volumes:
       - ./agent_data:/app/agent_data

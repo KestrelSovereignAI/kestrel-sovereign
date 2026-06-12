@@ -4,7 +4,10 @@ ARG TARGETARCH
 FROM --platform=linux/${TARGETARCH} python:3.11-slim
 
 # Set environment variables
-ENV KESTREL_DB_PATH=/app/kestrel.db
+# KESTREL_DB_PATH is a DIRECTORY (config.py reads <KESTREL_DB_PATH>/kestrel.toml
+# and <KESTREL_DB_PATH>/trusted_agents/), NOT a .db file — pointing it at a file
+# crashed config imports / blocked DB creation (#1729).
+ENV KESTREL_DB_PATH=/app/agent_data
 ENV KESTREL_IDENTITY_PATH=/app/kestrel_did.json
 ENV KESTREL_ENV=production
 ENV PYTHONUNBUFFERED=1
