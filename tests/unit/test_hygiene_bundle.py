@@ -137,6 +137,27 @@ class TestSpawnCaps:
         with pytest.raises(ValueError, match="max child depth"):
             await m.spawn_agent("child", parent, MagicMock())
 
+    @pytest.mark.asyncio
+    async def test_child_depth_is_decremented_from_parent(self):
+        """#1729 codex r2: a non-leaf spawned parent's child gets strictly less
+        depth, regardless of the caller-supplied mandate value."""
+        from unittest.mock import MagicMock, AsyncMock
+        from kestrel_sovereign.multi_agent.agent_manager import AgentManager
+        m = AgentManager()
+        parent = MagicMock()
+        parent.agent_id = "did:test:parent"
+        m._agent_names = {"did:test:parent": "parentname"}
+        parent_mandate = MagicMock()
+        parent_mandate.max_child_depth = 2
+        m._child_mandates = {"parentname": parent_mandate}
+        # Caller tries to keep depth high.
+        child_mandate = MagicMock()
+        child_mandate.max_child_depth = 5
+        m._do_spawn = AsyncMock(return_value=MagicMock())
+        await m.spawn_agent("child", parent, child_mandate)
+        # Clamped to parent (2) - 1 = 1.
+        assert child_mandate.max_child_depth == 1
+
     def test_port_allocation_is_monotonic(self):
         from kestrel_sovereign.multi_agent.agent_manager import AgentManager
         m = AgentManager()
