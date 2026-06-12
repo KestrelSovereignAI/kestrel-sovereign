@@ -381,7 +381,10 @@ async def create_kestrel_identity_async(
                 )
             import shutil
             import time
-            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+            import uuid
+            # Unique stamp (sub-second-safe): a same-second second --force must
+            # NOT clobber the prior backup — that would defeat recoverability.
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime()) + "-" + uuid.uuid4().hex[:8]
             for suffix in ("", "-wal", "-shm"):
                 src = db_path + suffix
                 if os.path.exists(src):
