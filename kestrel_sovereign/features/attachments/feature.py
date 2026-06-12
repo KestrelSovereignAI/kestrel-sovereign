@@ -121,23 +121,48 @@ class AttachmentsFeature(Feature):
         if self.storage is None or not hasattr(self.storage, "retrieve_file"):
             return ToolResult.failed("Attachment storage is unavailable.")
 
-        # Security gate: only ids that appear as attachments in this agent's own
-        # conversation are readable (the store is content-addressed, so without
-        # this an arbitrary hash would read any file).
+        # Authoritative security gate: validate the STORE's own metadata, not
+        # the client-supplied conversation refs (a client can post an arbitrary
+        # well-formed hash into a turn's `attachments`, which then shows up in
+        # history — so history membership is NOT proof of a legitimate upload).
+        # The upload endpoint stamps every chat attachment with
+        # type="attachment" + the owning agent_id; require both. This keeps the
+        # content-addressed store from being read as an oracle for avatars,
+        # snapshots, or any other non-attachment file.
+        file_store = getattr(self.storage, "files", None)
+        meta = None
+        if file_store is not None and hasattr(file_store, "get_file_metadata"):
+            try:
+                meta = await file_store.get_file_metadata(attachment_id)
+            except Exception:
+                meta = None
+        if not isinstance(meta, dict) or meta.get("type") != "attachment":
+            return ToolResult.failed(
+                "That id isn't a readable chat attachment.",
+                data={"attachment_id": attachment_id},
+            )
+        owner = meta.get("agent_id")
+        my_id = getattr(self.agent, "agent_id", None) or getattr(self.agent, "did", None)
+        if owner and my_id and owner != my_id:
+            return ToolResult.failed(
+                "That attachment doesn't belong to this agent.",
+                data={"attachment_id": attachment_id},
+            )
+
+        # Conversation scope (defense-in-depth): prefer the in-conversation ref
+        # for the display name; fall back to the store's recorded name.
         try:
             history = await self.storage.get_conversation_history(
                 limit=200, session_id=session_id
             )
         except TypeError:
             history = await self.storage.get_conversation_history(limit=200)
-        available = self._collect_session_attachments(history)
-        ref = available.get(attachment_id)
-        if ref is None:
-            return ToolResult.failed(
-                "That attachment id isn't part of this conversation. Only files "
-                "the user attached here can be read.",
-                data={"attachment_id": attachment_id},
-            )
+        ref = self._collect_session_attachments(history).get(attachment_id) or {
+            "hash": attachment_id,
+            "kind": meta.get("kind"),
+            "mime": meta.get("mime_type"),
+            "name": meta.get("original_name") or "attachment",
+        }
 
         data = await self.storage.retrieve_file(attachment_id)
         if not data:

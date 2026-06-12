@@ -4,30 +4,70 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 
+def _history_with(att):
+    return [{"role": "user", "metadata": {"attachments": [att]}}]
+
+
+def _make(att=None, *, bytes_=b"", file_meta="attachment"):
+    """Build (feature, storage). `file_meta` is the store-side metadata the
+    provenance gate validates: "attachment" → a real chat-attachment upload,
+    None → not an attachment (e.g. an avatar or fabricated hash), or a dict to
+    supply custom metadata."""
+    from kestrel_sovereign.features.attachments.feature import AttachmentsFeature
+    storage = MagicMock()
+    storage.get_conversation_history = AsyncMock(
+        return_value=_history_with(att) if att else [])
+    storage.retrieve_file = AsyncMock(return_value=bytes_)
+    if file_meta == "attachment":
+        meta = {"type": "attachment", "kind": (att or {}).get("kind"),
+                "mime_type": (att or {}).get("mime"),
+                "original_name": (att or {}).get("name"), "agent_id": "did:test"}
+    else:
+        meta = file_meta  # None or a custom dict
+    storage.files = MagicMock()
+    storage.files.get_file_metadata = AsyncMock(return_value=meta)
+    agent = MagicMock()
+    agent.agent_id = "did:test"
+    agent.storage = storage
+    feat = AttachmentsFeature(agent)
+    feat.storage = storage
+    return feat, storage
+
+
 def _feature(storage):
     from kestrel_sovereign.features.attachments.feature import AttachmentsFeature
     agent = MagicMock()
+    agent.agent_id = "did:test"
     agent.storage = storage
     feat = AttachmentsFeature(agent)
     feat.storage = storage
     return feat
 
 
-def _history_with(att):
-    return [{"role": "user", "metadata": {"attachments": [att]}}]
-
-
 # --- session-scoped security gate -------------------------------------------
 
 @pytest.mark.asyncio
-async def test_read_attachment_rejects_hash_not_in_conversation():
-    storage = MagicMock()
-    storage.get_conversation_history = AsyncMock(return_value=[])  # no attachments
-    storage.retrieve_file = AsyncMock(return_value=b"secret")
-    feat = _feature(storage)
+async def test_read_attachment_rejects_non_attachment_hash():
+    # A hash whose STORE metadata isn't type="attachment" — an avatar, a
+    # snapshot, or a fabricated hash coaxed into the turn's attachment metadata
+    # — is rejected before any bytes are fetched. Store provenance, not the
+    # client-supplied conversation refs, is the authoritative gate.
+    feat, storage = _make(
+        {"hash": "a" * 64, "kind": "document", "mime": "text/plain", "name": "x"},
+        bytes_=b"secret", file_meta=None)
     res = await feat.read_attachment("a" * 64)
     assert res.status == "error"
-    # The hash was never even fetched — security gate fired first.
+    storage.retrieve_file.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_read_attachment_rejects_other_agents_attachment():
+    feat, storage = _make(
+        {"hash": "f" * 64, "kind": "document", "mime": "text/plain", "name": "x"},
+        bytes_=b"data",
+        file_meta={"type": "attachment", "agent_id": "did:someone-else"})
+    res = await feat.read_attachment("f" * 64)
+    assert res.status == "error"
     storage.retrieve_file.assert_not_awaited()
 
 
@@ -43,11 +83,9 @@ async def test_read_attachment_rejects_malformed_id():
 @pytest.mark.asyncio
 async def test_read_attachment_returns_text_document():
     h = "b" * 64
-    storage = MagicMock()
-    storage.get_conversation_history = AsyncMock(return_value=_history_with(
-        {"hash": h, "kind": "document", "mime": "text/markdown", "name": "notes.md"}))
-    storage.retrieve_file = AsyncMock(return_value=b"# Title\n\nhello world")
-    feat = _feature(storage)
+    feat, _ = _make(
+        {"hash": h, "kind": "document", "mime": "text/markdown", "name": "notes.md"},
+        bytes_=b"# Title\n\nhello world")
     res = await feat.read_attachment(h)
     assert res.status == "ok"
     assert res.data["content"] == "# Title\n\nhello world"
@@ -58,11 +96,9 @@ async def test_read_attachment_returns_text_document():
 async def test_read_attachment_truncates_long_text():
     from kestrel_sovereign.features.attachments.feature import _MAX_TEXT_CHARS
     h = "c" * 64
-    storage = MagicMock()
-    storage.get_conversation_history = AsyncMock(return_value=_history_with(
-        {"hash": h, "kind": "document", "mime": "text/plain", "name": "big.txt"}))
-    storage.retrieve_file = AsyncMock(return_value=b"x" * (_MAX_TEXT_CHARS + 500))
-    feat = _feature(storage)
+    feat, _ = _make(
+        {"hash": h, "kind": "document", "mime": "text/plain", "name": "big.txt"},
+        bytes_=b"x" * (_MAX_TEXT_CHARS + 500))
     res = await feat.read_attachment(h)
     assert res.status == "ok"
     assert res.data["truncated"] is True
@@ -85,11 +121,9 @@ def _one_page_pdf(text: str) -> bytes:
 @pytest.mark.asyncio
 async def test_read_attachment_parses_pdf():
     h = "d" * 64
-    storage = MagicMock()
-    storage.get_conversation_history = AsyncMock(return_value=_history_with(
-        {"hash": h, "kind": "document", "mime": "application/pdf", "name": "doc.pdf"}))
-    storage.retrieve_file = AsyncMock(return_value=_one_page_pdf("hi"))
-    feat = _feature(storage)
+    feat, _ = _make(
+        {"hash": h, "kind": "document", "mime": "application/pdf", "name": "doc.pdf"},
+        bytes_=_one_page_pdf("hi"))
     res = await feat.read_attachment(h)
     assert res.status == "ok"
     assert "content" in res.data  # parsed without error (text may be empty)
@@ -100,11 +134,9 @@ async def test_read_attachment_parses_pdf():
 @pytest.mark.asyncio
 async def test_read_attachment_image_directs_to_paste():
     h = "e" * 64
-    storage = MagicMock()
-    storage.get_conversation_history = AsyncMock(return_value=_history_with(
-        {"hash": h, "kind": "image", "mime": "image/png", "name": "shot.png"}))
-    storage.retrieve_file = AsyncMock(return_value=b"\x89PNG\r\n")
-    feat = _feature(storage)
+    feat, _ = _make(
+        {"hash": h, "kind": "image", "mime": "image/png", "name": "shot.png"},
+        bytes_=b"\x89PNG\r\n")
     res = await feat.read_attachment(h)
     # Not a failure, but tells the agent to use the paste/vision path.
     assert res.status == "ok"

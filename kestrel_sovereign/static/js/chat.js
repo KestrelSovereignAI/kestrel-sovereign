@@ -908,25 +908,44 @@ function removeStagedAttachment(hash) {
     renderAttachmentTray();
 }
 
-async function uploadAndStage(file, inline) {
-    try {
-        const ref = await deps().api.uploadAttachment(file);
-        if (!ref || !ref.hash) throw new Error('upload returned no reference');
-        const isImage = ref.kind === 'image'
-            || String(ref.mime || '').startsWith('image/');
-        _stagedAttachments(_composerPane()).push({
-            hash: ref.hash,
-            kind: ref.kind || (isImage ? 'image' : 'document'),
-            mime: ref.mime || null,
-            name: ref.name || file.name || 'attachment',
-            url: ref.url || null,
-            // Only an image can ride inline (vision this turn); the backend
-            // enforces this regardless of what we send.
-            inline: !!inline && isImage,
-        });
-        renderAttachmentTray();
-    } catch (err) {
-        Toast.error(`Attachment upload failed: ${err && err.message ? err.message : err}`);
+function uploadAndStage(file, inline) {
+    // Capture the target pane NOW (upload is async; the user could switch
+    // agents before it resolves — the file must land on the pane it was added
+    // to). Track the in-flight promise on that pane so a send can wait for it
+    // (#1662 — don't drop a file the user is still uploading).
+    const pane = _composerPane();
+    pane.pendingUploads = pane.pendingUploads || new Set();
+    const p = (async () => {
+        try {
+            const ref = await deps().api.uploadAttachment(file);
+            if (!ref || !ref.hash) throw new Error('upload returned no reference');
+            const isImage = ref.kind === 'image'
+                || String(ref.mime || '').startsWith('image/');
+            _stagedAttachments(pane).push({
+                hash: ref.hash,
+                kind: ref.kind || (isImage ? 'image' : 'document'),
+                mime: ref.mime || null,
+                name: ref.name || file.name || 'attachment',
+                url: ref.url || null,
+                // Only an image can ride inline (vision this turn); the backend
+                // enforces this regardless of what we send.
+                inline: !!inline && isImage,
+            });
+            renderAttachmentTray();
+        } catch (err) {
+            Toast.error(`Attachment upload failed: ${err && err.message ? err.message : err}`);
+        }
+    })();
+    pane.pendingUploads.add(p);
+    p.finally(() => pane.pendingUploads.delete(p));
+    return p;
+}
+
+// Resolve when this pane's in-flight attachment uploads have all settled, so a
+// turn never sends before its files are staged.
+async function awaitPendingUploads(pane) {
+    if (pane && pane.pendingUploads && pane.pendingUploads.size) {
+        await Promise.all([...pane.pendingUploads]);
     }
 }
 
@@ -1858,6 +1877,11 @@ export async function sendMessage(overrideText, overrideAgent) {
     if (!text) return;
 
     const pane = deps().getOrCreateChatPane(dispatchAgent);
+
+    // #1662: if the user hit Enter while a pasted/dropped file is still
+    // uploading, wait for it so the turn carries the attachment instead of
+    // dropping it (and leaving it staged for the next turn).
+    if (fromComposer) await awaitPendingUploads(pane);
 
     // Send-while-busy. Behavior depends on the pane's composerMode.
     if (deps().state.waitingAgents.has(dispatchAgent)) {
