@@ -106,6 +106,10 @@ class MemorySystem:
             self.storage.db,
             self.agent_id,
             graph_store=self.storage.graph,
+            # Reuse the agent-scoped LLM service for episode embeddings +
+            # semantic recall (#1674 P2). None-safe: recall degrades to
+            # keyword search when no embedding provider is configured.
+            llm_service=getattr(self.storage, "llm_service", None),
         )
 
         # Schema-aware routing: promote extracted structure (action items,

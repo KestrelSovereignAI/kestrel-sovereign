@@ -371,16 +371,23 @@ class MemoryFeature(Feature):
 
     @tool(
         name="get_episodes",
-        description="Get consolidated memory episodes - narrative summaries of past conversation themes. Use this for high-level recall of what we've discussed over time.",
+        description="Get consolidated memory episodes - narrative summaries of past conversation themes. Use this for high-level recall of what we've discussed over time. Pass `query` to recall episodes RELEVANT to a topic (semantic search, can surface older episodes); omit it for the most recent episodes.",
         category=ToolCategory.MEMORY,
         command_prefix="!memory episodes"
     )
-    async def get_episodes(self, limit: int = 10) -> ToolResult:
+    async def get_episodes(
+        self, limit: int = 10, query: Optional[str] = None
+    ) -> ToolResult:
         """
         Get memory episodes from consolidation.
 
         Args:
             limit: Maximum episodes to return (the request).
+            query: Optional topic to recall episodes by RELEVANCE (semantic
+                recall via the shared vector backend; #1674 P2). Surfaced
+                episodes are marked as accessed so consulted memories resist
+                the forgetting deletion tier. When omitted, returns the most
+                recent episodes (unchanged legacy behavior).
         """
         if not self.consolidator:
             return ToolResult.failed(
@@ -395,10 +402,31 @@ class MemoryFeature(Feature):
         if limit_val < 1:
             return ToolResult.failed("limit must be >= 1")
 
+        query_str = (query or "").strip()
         try:
-            episodes = await self.consolidator.get_recent_episodes_for_context(
-                max_episodes=limit_val
-            )
+            if query_str:
+                # Relevance recall — returns MemoryEpisode objects and bumps
+                # their access_count. Format to the same dict shape the
+                # recency path emits so callers see one contract.
+                found = await self.consolidator.search_episodes(
+                    query_str, limit=limit_val
+                )
+                episodes = [
+                    {
+                        "title": ep.title,
+                        "summary": ep.summary,
+                        "emotional_arc": ep.emotional_arc,
+                        "timespan": (
+                            ep.timespan_start.strftime("%Y-%m-%d")
+                            if ep.timespan_start else "unknown"
+                        ),
+                    }
+                    for ep in found
+                ]
+            else:
+                episodes = await self.consolidator.get_recent_episodes_for_context(
+                    max_episodes=limit_val
+                )
         except (AttributeError, TypeError) as e:
             logger.error(f"get_episodes failed: {e}")
             return ToolResult.failed(str(e))
@@ -406,15 +434,17 @@ class MemoryFeature(Feature):
             logger.error(f"get_episodes failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
+        mode = "relevance" if query_str else "recency"
         return ToolResult.ok(
             confirmation=(
-                f"Retrieved {len(episodes)} episode(s) "
+                f"Retrieved {len(episodes)} episode(s) by {mode} "
                 f"(limit requested: {limit_val})"
             ),
             data={
                 "episodes": episodes,
                 "count": len(episodes),
                 "limit_requested": limit_val,
+                "mode": mode,
             },
         )
 
