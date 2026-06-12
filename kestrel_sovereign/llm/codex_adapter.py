@@ -243,6 +243,15 @@ _KESTREL_DISPATCHED_TOOL_ITEM_TYPES = frozenset({
 })
 
 
+# Codex thread/start sandbox + approval profile (#1734).
+# Constants so the same values feed both the params block AND the
+# thread fingerprint — without them as a single source of truth a
+# silent edit to one but not the other would let a session reuse a
+# cached thread whose boundary no longer matches.
+_CODEX_SANDBOX = "workspace-write"
+_CODEX_APPROVAL_POLICY = "on-request"
+
+
 def _item_display_label(item: Dict[str, Any]) -> str:
     """Human label for an item/started or item/completed marker.
 
@@ -546,19 +555,22 @@ class CodexAdapter(LLMAdapter):
         ``agent_data_dir`` is the directory containing the agent's
         sqlite db (``agent.storage_path`` is the db path itself).
         Returns ``None`` when no agent is attached, no usable
-        ``storage_path`` is available, or directory creation fails —
-        the caller falls back to ``Path.cwd()`` in those cases.
+        ``storage_path`` is available, the path resolves to a symlink
+        (refused for safety), or directory creation fails.
 
         Auto-creates the workspace dir on first call so codex's
         ``thread/start`` doesn't fail on a missing path. ``mkdir`` is
         idempotent and ``exist_ok=True`` so concurrent thread starts
         for the same agent race safely.
 
-        Critical safety invariant: this MUST NOT default to the host
-        process cwd. Doing so would put codex's ``workspace-write``
-        sandbox on the kestrel-sovereign repo root, and an agent
-        could silently edit her own host source / kestrel.toml /
-        bootstrap files.
+        Symlink rejection (codex #1734 review P0): ``mkdir(exist_ok=True)``
+        accepts a pre-existing symlink to a directory, so an attacker
+        with write access to ``<agent_data_dir>`` could plant
+        ``workspace -> /Volumes/data2/projects/kestrel-sovereign`` and
+        gain a workspace-write boundary on the host repo. After
+        ``mkdir`` we ``lstat`` the path and refuse if it's a symlink.
+        We also verify the resolved real path is still inside the
+        agent's data dir.
         """
         agent = self._agent_for_audit
         if agent is None:
@@ -567,15 +579,102 @@ class CodexAdapter(LLMAdapter):
         if not storage_path:
             return None
         try:
-            workspace = Path(storage_path).parent / "workspace"
+            agent_data = Path(storage_path).parent
+            workspace = agent_data / "workspace"
             workspace.mkdir(parents=True, exist_ok=True)
-            return str(workspace)
+            # Codex review P0: refuse if the path is a symlink at any
+            # point (the target leaf or any ancestor up to agent_data).
+            if workspace.is_symlink():
+                logger.warning(
+                    "codex_adapter: workspace dir %s is a symlink — "
+                    "refusing (potential sandbox escape)", workspace,
+                )
+                return None
+            # Verify the resolved real path is still under agent_data.
+            real_workspace = workspace.resolve()
+            real_agent_data = agent_data.resolve()
+            try:
+                real_workspace.relative_to(real_agent_data)
+            except ValueError:
+                logger.warning(
+                    "codex_adapter: workspace dir %s resolves outside "
+                    "agent_data (%s → %s) — refusing (potential "
+                    "sandbox escape)",
+                    workspace, real_workspace, real_agent_data,
+                )
+                return None
+            return str(real_workspace)
         except Exception as exc:  # noqa: BLE001
             logger.debug(
-                "codex_adapter: workspace dir resolution failed (%s) — "
-                "falling back to process cwd", exc,
+                "codex_adapter: workspace dir resolution failed: %s", exc,
             )
             return None
+
+    def _resolve_thread_cwd(self) -> str:
+        """Single source of truth for the codex thread ``cwd`` (#1734).
+
+        Priority:
+
+        1. ``KESTREL_CODEX_CWD`` (operator/daemon override).
+        2. Per-agent workspace dir from
+           :meth:`_resolve_agent_workspace_dir` (auto-created,
+           symlink-rejected).
+        3. If an agent is attached but step 2 failed: a deterministic
+           per-agent tempdir under ``tempfile.gettempdir()``. The
+           workspace-write sandbox already allows ``/tmp`` so this
+           dir is safe; the agent name makes it stable across
+           restarts. This is the codex review P0 fix — without it,
+           an attached agent could fall through to ``Path.cwd()`` and
+           inherit the host process cwd as its sandbox boundary.
+        4. ``Path.cwd()`` only when NO agent is attached (headless
+           tests, adapter-direct callers).
+        """
+        override = os.environ.get("KESTREL_CODEX_CWD")
+        if override:
+            return override
+        workspace = self._resolve_agent_workspace_dir()
+        if workspace:
+            return workspace
+        agent = self._agent_for_audit
+        if agent is not None:
+            # Attached but workspace resolution failed (missing
+            # storage_path, mkdir denied, symlink, etc.). Fail closed:
+            # NEVER inherit Path.cwd() with an attached agent — that's
+            # the host-repo-as-sandbox-root risk codex review caught.
+            import tempfile
+            agent_name = (
+                getattr(agent, "_agent_name", None)
+                or getattr(agent, "did", None)
+                or "anonymous"
+            )
+            # Sanitize to a safe path component.
+            safe_name = "".join(
+                c if c.isalnum() or c in "-_." else "_" for c in str(agent_name)
+            )[:64]
+            fallback = (
+                Path(tempfile.gettempdir())
+                / "kestrel-codex"
+                / safe_name
+            )
+            try:
+                fallback.mkdir(parents=True, exist_ok=True)
+                if not fallback.is_symlink():
+                    logger.warning(
+                        "codex_adapter: per-agent workspace unavailable; "
+                        "using fallback tempdir %s (sandbox boundary)",
+                        fallback,
+                    )
+                    return str(fallback.resolve())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "codex_adapter: fallback tempdir failed: %s — last "
+                    "resort: refusing workspace cwd to Path.cwd() and "
+                    "using tempdir root", exc,
+                )
+            # Last resort when even tempdir is unusable: the tempdir
+            # root itself. Still safer than Path.cwd() (host repo).
+            return tempfile.gettempdir()
+        return str(Path.cwd())
 
     def _teardown_codex_approval_bridge(self) -> None:
         """Drop bridge handlers registered against a prior (agent, app)."""
@@ -711,11 +810,24 @@ class CodexAdapter(LLMAdapter):
     def _thread_fingerprint(
         model_param: Optional[str], instructions: Optional[str],
         dynamic_tools: Optional[List[Dict[str, Any]]],
+        *,
+        cwd: Optional[str] = None,
+        sandbox: Optional[str] = None,
+        approval_policy: Optional[str] = None,
     ) -> str:
         """Stable hash of every thread-scoped setting the app-server
-        only consumes at thread/start. Used to invalidate a cached
-        thread when the caller asks for different model/instructions/
-        tools — those changes are otherwise silently ignored."""
+        only consumes at ``thread/start``. Used to invalidate a cached
+        thread when the caller asks for different model / instructions
+        / tools / cwd / sandbox / approval_policy — those changes are
+        otherwise silently ignored.
+
+        #1734 codex review folds ``cwd`` + ``sandbox`` +
+        ``approval_policy`` into the fingerprint. Without them, a
+        session that initially started without an attached agent
+        (cwd → process cwd fallback) would silently keep that cwd
+        when the agent attached later — codex never replays
+        ``thread/start`` for an existing thread.
+        """
         import hashlib
 
         payload = json.dumps(
@@ -723,6 +835,9 @@ class CodexAdapter(LLMAdapter):
                 "m": model_param or "",
                 "i": instructions or "",
                 "t": dynamic_tools or [],
+                "c": cwd or "",
+                "s": sandbox or "",
+                "a": approval_policy or "",
             },
             sort_keys=True, separators=(",", ":"), default=str,
         )
@@ -749,7 +864,20 @@ class CodexAdapter(LLMAdapter):
         reset behaviour.
         """
         m = self._model_param(model)
-        fingerprint = self._thread_fingerprint(m, instructions, dynamic_tools)
+        # #1734 codex review: cwd + sandbox + approval_policy are
+        # thread-scoped settings codex only consumes at thread/start,
+        # so they MUST be in the fingerprint. Without that, a session
+        # that initially started without an attached agent (cwd fell
+        # back to tempdir / Path.cwd()) would keep that cwd silently
+        # when the agent attached later — codex never replays
+        # thread/start for an existing thread.
+        thread_cwd = self._resolve_thread_cwd()
+        fingerprint = self._thread_fingerprint(
+            m, instructions, dynamic_tools,
+            cwd=thread_cwd,
+            sandbox=_CODEX_SANDBOX,
+            approval_policy=_CODEX_APPROVAL_POLICY,
+        )
 
         # Per-session lock; bare path for session-less calls (each
         # ephemeral thread is independent — no race possible).
@@ -770,27 +898,11 @@ class CodexAdapter(LLMAdapter):
                 )
                 # Cached thread no longer matches; drop it.
                 self._session_threads.pop(session_id, None)
-            # cwd: codex's native shell tool runs ``cd`` and resolves
-            # relative paths against the thread cwd, not the process cwd.
-            # It is ALSO the workspace boundary under
-            # ``sandbox=workspace-write`` (#1734) — the sandbox allows
-            # writes inside ``cwd`` + subdirs (plus ``/tmp`` and
-            # ``$TMPDIR``) and blocks everywhere else.
-            #
-            # Resolution order:
-            #   1. ``KESTREL_CODEX_CWD`` env var (operator/daemon override)
-            #   2. Per-agent workspace dir under the agent's data dir
-            #      (``<agent_data>/workspace/``), auto-created. Scopes
-            #      ``workspace-write`` to a safe per-agent scratch area
-            #      so the agent can't silently edit her own host source
-            #      / bootstrap / kestrel.toml.
-            #   3. Process cwd (legacy fallback; only fires when no
-            #      agent is attached, e.g. headless tests).
-            cwd = (
-                os.environ.get("KESTREL_CODEX_CWD")
-                or self._resolve_agent_workspace_dir()
-                or str(Path.cwd())
-            )
+            # cwd is already resolved (and locked into the fingerprint)
+            # at the top of _ensure_thread — reuse it so the value sent
+            # to thread/start matches the value in the fingerprint
+            # entry.
+            cwd = thread_cwd
             # Parity with kestrel-claw's thread-lifecycle.ts:599-619:
             # ``experimentalRawEvents`` flips codex's notification stream from
             # the legacy aggregated shape (which our adapter never wired up)
@@ -818,7 +930,7 @@ class CodexAdapter(LLMAdapter):
                 # host process cwd, so an agent can't silently edit
                 # her own host source / kestrel.toml / bootstrap
                 # files.
-                "sandbox": "workspace-write",
+                "sandbox": _CODEX_SANDBOX,
                 # #1734 (also #1707): use ``on-request`` — codex 0.138's
                 # current recommendation. The deprecated ``on-failure``
                 # value still works in 0.138 but is silently mapped
@@ -827,7 +939,7 @@ class CodexAdapter(LLMAdapter):
                 # ``unless-trusted`` is cyber-policy-specific
                 # (``TrustedAccessForCyber``); ``never`` disables
                 # elevation entirely.
-                "approval_policy": "on-request",
+                "approval_policy": _CODEX_APPROVAL_POLICY,
                 "cwd": cwd,
                 "experimentalRawEvents": True,
                 "persistExtendedHistory": True,
@@ -1873,11 +1985,7 @@ class CodexAdapter(LLMAdapter):
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
                 "input": [{"type": "text", "text": turn_input}],
-                "cwd": (
-                    os.environ.get("KESTREL_CODEX_CWD")
-                    or self._resolve_agent_workspace_dir()
-                    or str(Path.cwd())
-                ),
+                "cwd": self._resolve_thread_cwd(),
             }
             # Reuse _model_param's sentinel filter — "auto"/"default" are
             # kestrel-side route placeholders, not real model ids; the
