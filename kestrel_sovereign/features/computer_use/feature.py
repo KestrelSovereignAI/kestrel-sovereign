@@ -272,9 +272,25 @@ class ComputerUseFeature(Feature):
             if grants:
                 return frozenset(grants)
 
-        text = getattr(self.agent, "constitution_text", None)
-        if not text:
-            text = self._read_constitution_text()
+        # The per-agent overlay (self.agent.constitution_text) may grant DANGEROUS
+        # capabilities via Amendment IX — but ONLY honor it when the overlay has
+        # been integrity-verified against its anchor (#1722). An unanchored or
+        # tampered overlay (e.g. one an attacker wrote next to the agent DB to
+        # self-grant shell) is ignored; we fall through to the packaged
+        # constitution. ``constitution_overlay_verified`` defaults False until
+        # verify_constitution_overlay() runs in initialize()/audit.
+        overlay_text = getattr(self.agent, "constitution_text", None)
+        if overlay_text and getattr(self.agent, "constitution_overlay_verified", False):
+            grants = parse_amendment_ix_grants(overlay_text)
+            if grants:
+                return grants
+        elif overlay_text:
+            logger.warning(
+                "Ignoring Amendment IX grants from an UNVERIFIED constitution "
+                "overlay (not anchored). Run `kestrel constitution anchor-overlay`."
+            )
+
+        text = self._read_constitution_text()
         if text:
             grants = parse_amendment_ix_grants(text)
             if grants:

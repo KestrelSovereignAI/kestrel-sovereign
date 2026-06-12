@@ -2,6 +2,7 @@ import logging
 import json
 import os
 import asyncio
+import hashlib
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -210,14 +211,30 @@ class KestrelAgent(
         # parser scopes to. Absent file → ``constitution_text`` stays None
         # and the package fallback is used (existing behavior).
         self.constitution_text: Optional[str] = None
+        # sha256 of the overlay bytes as loaded, and whether that hash matches
+        # the anchor stored in the agent's identity node. Until verified against
+        # the anchor (in initialize()/audit), the overlay is treated as
+        # UNTRUSTED — its Amendment IX capability grants are NOT honored (#1722).
+        # This closes the self-grant: writing a CONSTITUTION.md next to the agent
+        # DB no longer grants host shell, because an unanchored overlay's grants
+        # are ignored and the integrity audit fails closed on it.
+        self._constitution_overlay_path: Optional[Path] = None
+        self._constitution_overlay_sha: Optional[str] = None
+        self.constitution_overlay_verified: bool = False
         if storage_path:
             overlay = Path(storage_path).parent / "CONSTITUTION.md"
+            self._constitution_overlay_path = overlay
             if overlay.exists():
                 try:
-                    self.constitution_text = overlay.read_text(encoding="utf-8")
+                    overlay_bytes = overlay.read_bytes()
+                    self.constitution_text = overlay_bytes.decode("utf-8")
+                    self._constitution_overlay_sha = hashlib.sha256(
+                        overlay_bytes
+                    ).hexdigest()
                     logging.info(
-                        "Loaded per-agent constitution overlay from %s",
-                        overlay,
+                        "Loaded per-agent constitution overlay from %s "
+                        "(sha256=%s, pending anchor verification)",
+                        overlay, self._constitution_overlay_sha[:16],
                     )
                 except OSError as exc:
                     logging.warning(
@@ -1006,6 +1023,19 @@ class KestrelAgent(
                 )
                 await self.storage.add_node(agent_node)
                 logging.info("Agent node created")
+
+            # Verify the per-agent constitution overlay against its anchor so the
+            # capability gate knows whether to honor its Amendment IX grants
+            # (#1722). An unanchored/tampered overlay leaves
+            # ``constitution_overlay_verified`` False (grants ignored); the
+            # periodic audit additionally fails closed on it.
+            try:
+                ok, msg = await self.verify_constitution_overlay()
+                if not ok:
+                    logging.warning("Constitution overlay not trusted: %s", msg)
+            except Exception as e:  # noqa: BLE001 - never block init on this
+                logging.warning("Constitution overlay verification errored: %s", e)
+                self.constitution_overlay_verified = False
 
             # Load prompts from external files (fallback to embedded defaults)
             self.prompt_template = _load_prompt_file(
