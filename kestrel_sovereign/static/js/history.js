@@ -9,6 +9,7 @@ import {
     updateContextStatus,
     wipeAgentChatPane,
     renderAgentContentHtml,
+    messageAttachmentsHtml,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -361,6 +362,9 @@ window.loadConversation = async function(sessionId) {
                 toolHtml,
                 '',
                 bodyHtml,
+                // #1662: user-turn attachment refs (persisted on metadata) so
+                // their thumbnails survive a reload.
+                msg.role === 'user' ? (msg.metadata?.attachments || null) : null,
             );
         });
 
@@ -495,6 +499,7 @@ function addMessageToChat(
     toolActivityHtml = '',
     preludeContent = '',
     bodyHtml = null,
+    attachments = null,
 ) {
     // Append into the visible (mounted) agent's pane element — the
     // viewport (#chat-container) is now the scroll host and panes are
@@ -609,6 +614,13 @@ function addMessageToChat(
             contentDiv.textContent = content;
         }
         messageDiv.appendChild(contentDiv);
+
+        // #1662: re-render the user turn's attachment thumbnails from the
+        // persisted metadata refs, so they survive reload.
+        if (attachments && attachments.length) {
+            const stripHtml = messageAttachmentsHtml(attachments);
+            if (stripHtml) messageDiv.insertAdjacentHTML('beforeend', stripHtml);
+        }
     }
 
     target.appendChild(messageDiv);
