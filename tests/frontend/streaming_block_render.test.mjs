@@ -130,6 +130,19 @@ test('does NOT count ** delimiters that live inside an inline code span', () => 
     assert.equal(_completeStreamingInline('text `code with **'), 'text `code with **`');
 });
 
+test('does NOT count delimiters inside a CLOSED fenced code block', () => {
+    const { _completeStreamingInline } = load();
+    // `**/*.py` and a lone backtick inside the fence must not draw a synthetic
+    // closer after the fence.
+    assert.equal(
+        _completeStreamingInline('```txt\n**/*.py\n```'),
+        '```txt\n**/*.py\n```');
+    // a real unclosed ** AFTER a closed fence still completes
+    assert.equal(
+        _completeStreamingInline('```\nx **y** z\n```\nthen **open'),
+        '```\nx **y** z\n```\nthen **open**');
+});
+
 test('does NOT complete ambiguous single-* or bare $ (the #1547 trap)', () => {
     const { _completeStreamingInline } = load();
     assert.equal(_completeStreamingInline('* a list item'), '* a list item');

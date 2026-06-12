@@ -290,10 +290,32 @@ function _openFence(text) {
     return _walkFences(text, null);
 }
 
-// Drop code regions so inline-delimiter counts ignore markdown that lives
-// inside code (a `**` in `` `**` `` can't open emphasis). Removes closed inline
-// code spans; an UNCLOSED span swallows to end-of-line (its tail is code).
-function _stripCodeSpans(text) {
+// Remove CLOSED fenced code regions (opener line through closer line). Callers
+// run this only after confirming there is no still-OPEN fence, so every fence
+// here is balanced. Code contents (which may contain `, **, [], $) must not
+// count as inline markdown.
+function _stripFences(text) {
+    const lines = text.split('\n');
+    const kept = [];
+    let open = null;
+    for (const line of lines) {
+        if (open === null) {
+            const m = line.match(_FENCE_RE);
+            if (m) { open = { char: m[1][0], len: m[1].length }; continue; }
+            kept.push(line);
+        } else {
+            const m = line.match(_FENCE_CLOSE_RE);
+            if (m && m[1][0] === open.char && m[1].length >= open.len) open = null;
+            // drop the line (fenced code body or the closer)
+        }
+    }
+    return kept.join('\n');
+}
+
+// Drop inline code spans so their delimiters (a `**` in `` `**` `` can't open
+// emphasis) don't count. Removes closed spans; an UNCLOSED span swallows to
+// end-of-line (its tail is code).
+function _stripInlineCode(text) {
     let s = text.replace(/(`+)[^\n]*?\1/g, '');
     const tick = s.lastIndexOf('`');
     if (tick !== -1) {
@@ -348,12 +370,13 @@ function _completeStreamingInline(tail) {
     if (openFence) {
         return t + '\n' + openFence;
     }
-    // Inline code: odd backtick count → open span; close it. (Fences are
-    // balanced here, and a closed fence contributes an even backtick count.)
-    if (((t.match(/`/g) || []).length) % 2 !== 0) t += '`';
-    // The remaining inline constructs must ignore delimiters that live inside
-    // code spans (e.g. `**` in `` `**` `` can't open emphasis).
-    const code = _stripCodeSpans(t);
+    // Strip CLOSED fenced regions first so code bodies (which may contain
+    // backticks, **, [], $) never count as inline markdown.
+    const noFence = _stripFences(t);
+    // Inline code: odd backtick count (outside fences) → open span; close it.
+    if (((noFence.match(/`/g) || []).length) % 2 !== 0) t += '`';
+    // The remaining inline constructs must also ignore inline code spans.
+    const code = _stripInlineCode(noFence);
     // Unclosed link/image target: `[text](url` / `![alt](url` with no `)`.
     if (/!?\[[^\]\n]*\]\([^)\n]*$/.test(code)) t += ')';
     // Bold ** (rarely a bullet/operator) → close if unbalanced.
