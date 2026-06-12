@@ -185,3 +185,23 @@ test('renderStreamingMarkdown concatenates stable + completed tail', () => {
     assert.match(html, /intro para/);
     assert.match(html, /start \*\*bo\*\*/);  // tail bold completed
 });
+
+test('streaming math delimiters survive marked (protected like finalize)', () => {
+    // A marked stub that mimics marked eating \( \) [ ] backslashes — without
+    // _protectMath the delimiters would be destroyed mid-stream and the render
+    // would disagree with finalize.
+    const marked = {
+        use() {},
+        parse(md) { return `<p>${md.replace(/\\([()\[\]])/g, '$1')}</p>`; },
+    };
+    const DOMPurify = {
+        sanitize: (h) => h, addHook() {}, removeHook() {}, removeAllHooks() {},
+    };
+    const factory = new Function(
+        'marked', 'DOMPurify',
+        `${parseSrc}\nreturn { renderStreamingMarkdown };`,
+    );
+    const { renderStreamingMarkdown } = factory(marked, DOMPurify);
+    const html = renderStreamingMarkdown('see \\(x + y');
+    assert.match(html, /\\\(x \+ y\\\)/);  // completed AND protected
+});

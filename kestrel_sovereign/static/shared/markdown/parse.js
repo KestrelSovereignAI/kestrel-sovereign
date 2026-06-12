@@ -230,9 +230,16 @@ const _STREAM_STABLE_CACHE = new Map();
 const _STREAM_STABLE_CACHE_CAP = 64;
 
 function _streamMarkedParse(text) {
-    return sanitizeHtml(marked.parse(text, {
+    // Mirror the finalize path (renderMarkdown): protect balanced math spans
+    // from marked (which would consume `\(`/`\[` backslashes), restore them
+    // HTML-escaped, then sanitize. Completing the tail's math closers (above)
+    // is what makes a mid-stream span balanced enough for _protectMath to catch
+    // it, so streaming and finalize agree on the delimiters the KaTeX pass reads.
+    const { out, spans } = _protectMath(text);
+    const parsed = marked.parse(out, {
         breaks: true, gfm: true, headerIds: false, mangle: false,
-    }));
+    });
+    return sanitizeHtml(_restoreMath(parsed, spans));
 }
 
 // Render (and memoize) the stable prefix. Keyed by the exact prefix string, so
