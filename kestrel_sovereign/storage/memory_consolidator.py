@@ -877,7 +877,12 @@ class MemoryConsolidator:
         returns up to ``limit`` genuinely-NEW matches — otherwise a query that
         the vector path already satisfied would consume the whole LIMIT with
         rows already surfaced, starving keyword-only legacy episodes."""
-        like = f"%{query}%"
+        # Case-insensitive via LOWER() on both sides — portable across SQLite
+        # (LIKE is ASCII-case-insensitive) AND Postgres (LIKE is case-SENSITIVE).
+        # On PG the kNN path is gated off, so this keyword fallback is the only
+        # recall; a case-sensitive match there would miss "sailing" vs
+        # "Sailing trip" and record no access heat.
+        like = f"%{query.lower()}%"
         exclude_ids = exclude_ids or []
         exclude_clause = ""
         params: list = [self.agent_id, like, like]
@@ -890,7 +895,8 @@ class MemoryConsolidator:
         try:
             rows = await self._db.fetchall(
                 f"""SELECT id FROM memory_episodes
-                    WHERE agent_id = ? AND (title LIKE ? OR summary LIKE ?)
+                    WHERE agent_id = ?
+                      AND (LOWER(title) LIKE ? OR LOWER(summary) LIKE ?)
                     {exclude_clause}
                     ORDER BY created_at DESC
                     LIMIT ?""",

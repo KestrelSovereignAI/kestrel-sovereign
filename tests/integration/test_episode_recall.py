@@ -148,11 +148,11 @@ async def test_recall_scoped_to_agent(db):
 # Ollama-gated semantic smoke — real embeddings, cosine recall of old episode
 # --------------------------------------------------------------------------
 
-ollama = pytest.importorskip("ollama")
-
-
 @pytest.fixture
 def skip_if_no_ollama():
+    # Optional dependency — import here (not module-level) so the deterministic
+    # keyword/access tests above still run on CI without the ollama client.
+    ollama = pytest.importorskip("ollama")
     try:
         client = ollama.Client()
         models = client.list()
@@ -176,6 +176,7 @@ class _OllamaEmbeddingService:
     embedding_dim = 768
 
     def __init__(self):
+        import ollama  # optional dep; only constructed in the gated smoke
         self._client = ollama.AsyncClient()
 
     async def aembed(self, text):
