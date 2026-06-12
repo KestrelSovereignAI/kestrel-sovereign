@@ -18,11 +18,19 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
                              past their per-agent retention window (#764)
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
     morning_signal        -- produce the daily briefing artifact
-    reflect               -- run a reflection workflow (ReflectionFeature)
-    memory_consolidate    -- consolidate short-term memory into episodes;
-                             also runs the forgetting deletion tier that prunes
-                             decayed memory_episodes (+ paired KG nodes) when
-                             [forgetting].enabled (#1674)
+    sleep                 -- THE nightly memory-maintenance cycle (#1674 P3):
+                             reflection (via the subscribed reflection_hook) +
+                             consolidation + the forgetting deletion tier, all
+                             through MemorySystem.consolidate(). Activity-gated;
+                             skip_export=True (backups own DR). Supersedes the
+                             auto-seeded memory_consolidate + reflect crons.
+    reflect               -- reflection workflow tool (ReflectionFeature). Still
+                             schedulable, but no longer auto-seeded — reflection
+                             subscribes to `sleep` via reflection_hook.
+    memory_consolidate    -- consolidate short-term memory into episodes + run
+                             the [forgetting] deletion tier. Still schedulable,
+                             but no longer auto-seeded — `sleep` runs the same
+                             MemorySystem.consolidate() flow nightly (#1674).
     talon_monitor         -- poll Talon jobs, wake on completion (#1510)
     restart_coordinator   -- execute pending restart requests (#1512)
     github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
@@ -61,6 +69,15 @@ logger = logging.getLogger(__name__)
 _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "cognition_retention",  # #1674 — superseded by [forgetting] in memory_consolidate
 })
+
+# Crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3). These names are also
+# valid TOOLS a user could schedule, so they are NOT blanket-retired; only rows
+# matching the exact prior core auto-seed (cron + args) are removed on startup,
+# mapped name -> (cron_expression, parsed_args). See post_all_features_loaded.
+_SUPERSEDED_AUTOSEEDS = {
+    "memory_consolidate": ("0 4 * * *", {}),
+    "reflect": ("0 */4 * * *", {"scope": "all", "depth": "normal"}),
+}
 
 
 class SchedulerFeature(Feature):
@@ -116,6 +133,7 @@ class SchedulerFeature(Feature):
                     "backup_snapshot": self._handle_backup_snapshot,
                     "trash_retention": self._run_trash_retention,
                     "github_pr_watch": self._run_github_pr_watch,
+                    "sleep": self._handle_sleep,
                 },
             )
             for reg in cron_registrations:
@@ -235,6 +253,25 @@ class SchedulerFeature(Feature):
                 )
         existing_names -= retired
 
+        # Cutover for crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3):
+        # memory_consolidate + reflect are still valid TOOLS (a user may schedule
+        # them), so we can't blanket-retire by name. Instead remove ONLY rows
+        # that exactly match what core used to AUTO-SEED (name + cron + args) —
+        # leaving any user-customized schedule intact. Without this, an upgraded
+        # agent would run both the old crons AND `sleep`, double-touching memory.
+        for task in existing_tasks:
+            seed = _SUPERSEDED_AUTOSEEDS.get(task["task_name"])
+            if seed is None:
+                continue
+            cron, args = seed
+            if task.get("cron_expression") == cron and task.get("args") == args:
+                await self.schedule_remove(task["id"])
+                existing_names.discard(task["task_name"])
+                logger.info(
+                    "Removed auto-seeded '%s' (superseded by nightly sleep, "
+                    "id=%s)", task["task_name"], str(task["id"])[:8],
+                )
+
         # Reflection-dependent schedules only if ReflectionFeature is loaded
         has_reflection = "ReflectionFeature" in agent.features
 
@@ -253,17 +290,27 @@ class SchedulerFeature(Feature):
             ("trash_retention", DEFAULT_RETENTION_CRON, "{}"),
         ]
 
-        # Memory consolidation only if MemoryFeature is loaded (it owns the tool)
+        # Nightly sleep cycle (#1674 P3) — the ONE built-in memory-maintenance
+        # cron. sleep() runs reflection (via the subscribed reflection_hook),
+        # consolidation, and the forgetting deletion tier through the single
+        # MemorySystem.consolidate() chokepoint. skip_export=True: backups stay
+        # on their own 4h disaster-recovery cadence (backup_snapshot), so sleep
+        # doesn't double-snapshot. Replaces the old memory_consolidate + reflect
+        # crons (retired below) so we don't have several crons each touching
+        # memory. Seeded when MemoryFeature is present (there's memory to tend).
         if "MemoryFeature" in agent.features:
             defaults.append(
-                ("memory_consolidate", "0 4 * * *", "{}"),  # nightly at 4am
+                ('sleep', "0 4 * * *", '{"skip_export": true}'),  # nightly at 4am
             )
 
         if has_reflection:
-            defaults.extend([
-                ("reflect", "0 */4 * * *", '{"scope":"all","depth":"normal"}'),
+            # Reflection no longer has its own cron — it subscribes to the sleep
+            # cycle via agent.reflection_hook (on_pre_sleep / on_post_
+            # consolidation). LoRA training stays a separate nightly job (it's
+            # model training, not memory maintenance).
+            defaults.append(
                 ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
-            ])
+            )
 
         # Talon-job monitor (#1510) — installs only if the Talon
         # coordinator feature is loaded. Cheap (no LLM, just file/PID
@@ -503,15 +550,93 @@ class SchedulerFeature(Feature):
     async def _handle_backup_snapshot(self, args: dict) -> str:
         """ACTION handler for the `backup_snapshot` cron source. Hits
         the agent's sync service directly — there is no feature tool
-        for this, so it can't go through the generic tool lookup."""
+        for this, so it can't go through the generic tool lookup.
+
+        Uses ``snapshot_if_changed`` (#1674 P3) so a scheduled backup on an
+        idle agent skips re-dumping an unchanged DB (notably the full S3
+        upload). Explicit ``!backup`` / shutdown still call ``force_snapshot``."""
         sync = getattr(self.agent, "_sync_service", None)
         if sync:
-            results = await sync.force_snapshot()
+            snap = getattr(sync, "snapshot_if_changed", None) or sync.force_snapshot
+            results = await snap()
             return json.dumps(
                 {t: {"success": r.success, "bytes": r.bytes_synced} for t, r in results.items()},
                 default=str,
             )
         return json.dumps({"error": "no sync service configured"})
+
+    async def _handle_sleep(self, args: dict) -> str:
+        """Built-in handler for the nightly ``sleep`` cron (#1674 P3).
+
+        Runs the agent's single memory-maintenance cycle: reflection (via the
+        subscribed ``reflection_hook``), consolidation, and the forgetting
+        deletion tier — all through ``MemorySystem.consolidate()``. Backups keep
+        their own 4h disaster-recovery cadence, so this defaults to
+        ``skip_export=True`` (override via the schedule's args JSON).
+
+        Activity-gated: on an idle agent (no new messages since the last
+        episode) the expensive reflection pass is skipped — directly addressing
+        the "reflection every cycle even with no activity" waste. Consolidation
+        still runs (cheap, and the time/decay-based forgetting tier rides it).
+        """
+        agent = self.agent
+        if not hasattr(agent, "sleep"):
+            return json.dumps({"skipped": True, "reason": "agent has no sleep()"})
+
+        skip_export = bool(args.get("skip_export", True))
+        skip_consolidation = bool(args.get("skip_consolidation", False))
+        # Caller can force reflection on/off; otherwise gate it on activity.
+        if "skip_reflection" in args:
+            skip_reflection = bool(args["skip_reflection"])
+        else:
+            skip_reflection = not await self._sleep_had_activity()
+
+        try:
+            report = await agent.sleep(
+                skip_export=skip_export,
+                skip_consolidation=skip_consolidation,
+                skip_reflection=skip_reflection,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[sleep] agent=%s cycle failed: %s", self._agent_id, e)
+            return json.dumps({"error": str(e)})
+
+        data = report.to_dict() if hasattr(report, "to_dict") else {}
+        data["skip_reflection"] = skip_reflection
+        return json.dumps(data, default=str)
+
+    async def _sleep_had_activity(self) -> bool:
+        """Best-effort: has anything happened since the last episode?
+
+        Returns True (don't skip) on ANY uncertainty so reflection is never
+        wrongly skipped — the gate may only ever skip when confidently idle.
+        Uses the agent's canonical conversation/episode store so timestamp
+        formats match (both written via the same code path)."""
+        storage = getattr(self.agent, "storage", None)
+        db = getattr(storage, "db", None)
+        if db is None:
+            return True
+        try:
+            last_ep = await db.fetchval(
+                "SELECT MAX(created_at) FROM memory_episodes WHERE agent_id = ?",
+                (self._agent_id,),
+            )
+            if last_ep is None:
+                # No episodes yet — any message at all counts as activity.
+                n = await db.fetchval(
+                    "SELECT COUNT(*) FROM conversation_history WHERE agent_id = ?",
+                    (self._agent_id,),
+                )
+                return (n or 0) > 0
+            n = await db.fetchval(
+                "SELECT COUNT(*) FROM conversation_history "
+                "WHERE agent_id = ? AND created_at > ?",
+                (self._agent_id, last_ep),
+            )
+            return (n or 0) > 0
+        except Exception as e:  # noqa: BLE001 - never wrongly skip on error
+            logger.debug("[sleep] activity check failed (assuming active): %s", e)
+            return True
 
     async def _run_trash_retention(self, args: dict) -> str:
         """Built-in handler for the ``trash_retention`` scheduled task (#764).

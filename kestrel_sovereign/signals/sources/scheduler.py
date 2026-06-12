@@ -85,7 +85,16 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     ("reflect", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
     # Consolidation writes episodes/patterns into memory storage.
     # Owner confirmed ARTIFACT (#893): no follow-up cognition triggered.
+    # Still a schedulable tool, but no longer auto-seeded — the nightly `sleep`
+    # cycle (below) now owns memory maintenance (#1674 P3).
     ("memory_consolidate", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
+    # Nightly `sleep` cycle (#1674 P3) — the single memory-maintenance cron:
+    # reflection (via reflection_hook), consolidation, and the forgetting
+    # deletion tier through MemorySystem.consolidate(). Holds MEMORY (writes
+    # episodes + deletes decayed ones); ARTIFACT — returns a report, no
+    # follow-up cognition. Supersedes the auto-seeded memory_consolidate +
+    # reflect crons.
+    ("sleep", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
     # Talon CLI-background job monitor (#1510). ACTION — no LLM cost.
     # Polls the durable jobs.json registry, detects state transitions,
     # and ENQUEUES one talon.job_complete COGNITION signal per

@@ -499,6 +499,54 @@ class TestCrashRecovery:
 # 2. Partial Sync Tests
 # =============================================================================
 
+class TestChangeAwareSnapshot:
+    """#1674 P3: snapshot_if_changed skips re-dumping an unchanged DB so idle
+    agents don't full-upload every backup cycle; force_snapshot stays
+    unconditional for explicit !backup / shutdown."""
+
+    @pytest.mark.asyncio
+    async def test_skips_when_unchanged_then_runs_after_change(self, temp_db, mock_target, tmp_path):
+        sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
+        sync.add_target(mock_target)
+        await sync.start()
+
+        # First change-aware snapshot actually uploads.
+        first = await sync.snapshot_if_changed()
+        assert first[mock_target.name].success
+        uploads_after_first = len(mock_target._state.uploads)
+        assert uploads_after_first > 0
+
+        # Second on the UNCHANGED db skips — no new upload.
+        second = await sync.snapshot_if_changed()
+        assert "__unchanged__" in second
+        assert mock_target.name not in second
+        assert len(mock_target._state.uploads) == uploads_after_first
+
+        # Mutate the DB → fingerprint changes → next snapshot runs again.
+        conn = sqlite3.connect(str(temp_db))
+        conn.execute("INSERT INTO test (value) VALUES ('new')")
+        conn.commit()
+        conn.close()
+        third = await sync.snapshot_if_changed()
+        assert third[mock_target.name].success
+        assert len(mock_target._state.uploads) > uploads_after_first
+        await sync.stop()
+
+    @pytest.mark.asyncio
+    async def test_force_snapshot_always_runs(self, temp_db, mock_target, tmp_path):
+        """force_snapshot keeps its unconditional contract (explicit backups)."""
+        sync = SyncService(db_path=str(temp_db), state_file=str(tmp_path / "sync.state"))
+        sync.add_target(mock_target)
+        await sync.start()
+        await sync.snapshot_if_changed()
+        n = len(mock_target._state.uploads)
+        # Unchanged DB, but force_snapshot ignores the fingerprint.
+        result = await sync.force_snapshot()
+        assert result[mock_target.name].success
+        assert len(mock_target._state.uploads) > n
+        await sync.stop()
+
+
 class TestPartialSync:
     """Test handling of incomplete uploads."""
 

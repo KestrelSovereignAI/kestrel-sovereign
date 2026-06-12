@@ -31,6 +31,7 @@ class SleepReport:
     episodes_created: int = 0
     patterns_found: int = 0
     messages_archived: int = 0
+    episodes_deleted: int = 0  # forgetting deletion tier (#1674)
     total_messages: int = 0
 
     # Export stats
@@ -65,6 +66,7 @@ class SleepReport:
                 "episodes_created": self.episodes_created,
                 "patterns_found": self.patterns_found,
                 "messages_archived": self.messages_archived,
+                "episodes_deleted": self.episodes_deleted,
                 "total_messages": self.total_messages,
                 "duration_ms": self.consolidation_ms,
             },
@@ -198,10 +200,12 @@ class SleepMixin:
                 report.episodes_created = consolidation_result.get("episodes_created", 0)
                 report.patterns_found = consolidation_result.get("patterns_found", 0)
                 report.messages_archived = consolidation_result.get("messages_archived", 0)
+                report.episodes_deleted = consolidation_result.get("episodes_deleted", 0)
                 report.total_messages = consolidation_result.get("total_messages_processed", 0)
                 logger.info(
                     f"Consolidation complete: {report.episodes_created} episodes, "
-                    f"{report.messages_archived} archived"
+                    f"{report.messages_archived} archived, "
+                    f"{report.episodes_deleted} forgotten"
                 )
             except Exception as e:
                 logger.error(f"Consolidation failed: {e}")
@@ -264,13 +268,19 @@ class SleepMixin:
 
     async def _consolidate_memories(self) -> Dict[str, Any]:
         """
-        Run memory consolidation.
+        Run memory consolidation through the single MemorySystem chokepoint.
 
-        Uses MemoryConsolidator to:
-        - Create narrative episodes from message clusters
-        - Detect temporal patterns
-        - Archive fully decayed memories
+        Routes through ``MemorySystem.consolidate()`` (not the lower-level
+        ``MemoryConsolidator.run_consolidation()``) so the sleep cycle inherits
+        the SAME flow the manual tool uses: episode creation, pattern
+        detection, decay-archival, AND the forgetting deletion tier (#1674).
+        This is the point of P3 — one consolidation path, not a per-cron copy.
+        Falls back to the raw consolidator only when no MemorySystem is wired.
         """
+        memory_system = getattr(self, "memory_system", None)
+        if memory_system is not None:
+            return await memory_system.consolidate()
+
         if not hasattr(self, 'memory_consolidator') or not self.memory_consolidator:
             logger.warning("MemoryConsolidator not available, skipping consolidation")
             return {"error": "MemoryConsolidator not initialized"}

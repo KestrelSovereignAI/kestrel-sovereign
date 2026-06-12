@@ -1169,6 +1169,74 @@ class TestMemoryConsolidatorEpisodeCreation:
         assert "below_min_after_dedup" in reasons
 
 
+class TestConsolidateForgetting:
+    """MemorySystem.consolidate() is the single chokepoint that runs the
+    forgetting deletion tier (#1674 P3) — so both the tool and the nightly
+    sleep cycle forget identically. Tests target it directly."""
+
+    @staticmethod
+    def _make_ms(monkeypatch, *, run_result, enabled=True,
+                 delete_threshold=0.02, grace_days=90):
+        from kestrel_sovereign.storage import MemorySystem
+        import kestrel_sovereign.storage.retention as retention_mod
+
+        monkeypatch.setattr(
+            retention_mod, "load_forgetting_config",
+            lambda: {"enabled": enabled, "delete_threshold": delete_threshold,
+                     "grace_days": grace_days},
+        )
+        ms = MemorySystem(storage=MagicMock(), agent_id="did:test:fgt")
+        ms.consolidator = MagicMock()
+        ms.consolidator.run_consolidation = AsyncMock(return_value=run_result)
+        ms.storage.purge_decayed_episodes = AsyncMock(return_value=3)
+        return ms
+
+    @pytest.mark.asyncio
+    async def test_runs_forgetting_when_enabled(self, monkeypatch):
+        ms = self._make_ms(
+            monkeypatch,
+            run_result={"episodes_created": 2, "messages_archived": 0},
+            enabled=True, delete_threshold=0.05, grace_days=45,
+        )
+        report = await ms.consolidate()
+        ms.storage.purge_decayed_episodes.assert_awaited_once_with(
+            delete_threshold=0.05, grace_days=45, reason="forgetting",
+        )
+        assert report["episodes_deleted"] == 3
+        assert report["episodes_created"] == 2
+
+    @pytest.mark.asyncio
+    async def test_skips_forgetting_when_disabled(self, monkeypatch):
+        ms = self._make_ms(
+            monkeypatch, run_result={"episodes_created": 1}, enabled=False,
+        )
+        report = await ms.consolidate()
+        ms.storage.purge_decayed_episodes.assert_not_awaited()
+        assert report["episodes_deleted"] == 0
+
+    @pytest.mark.asyncio
+    async def test_skips_forgetting_when_consolidation_errored(self, monkeypatch):
+        ms = self._make_ms(
+            monkeypatch, run_result={"error": "salvage unavailable"}, enabled=True,
+        )
+        report = await ms.consolidate()
+        ms.storage.purge_decayed_episodes.assert_not_awaited()
+        assert report["episodes_deleted"] == 0
+        assert "error" in report
+
+    @pytest.mark.asyncio
+    async def test_forgetting_failure_does_not_fail_consolidation(self, monkeypatch):
+        ms = self._make_ms(
+            monkeypatch, run_result={"episodes_created": 1}, enabled=True,
+        )
+        ms.storage.purge_decayed_episodes = AsyncMock(
+            side_effect=RuntimeError("graph store down"))
+        report = await ms.consolidate()
+        assert report["episodes_deleted"] == 0
+        assert report["episodes_created"] == 1
+        assert "error" not in report
+
+
 # Run tests
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
