@@ -517,12 +517,48 @@ class StreamingMixin:
 
     @staticmethod
     def _adapter_supports_vision(adapter: Any) -> bool:
-        """True when the resolved adapter can accept image input this turn."""
+        """True when the adapter *family* can accept image input."""
         try:
             caps = adapter.provider_capabilities()
         except Exception:
             return False
         return bool(getattr(caps, "supports_vision", False))
+
+    @staticmethod
+    def _discovered_model_supports_vision(provider_name: str, model: str):
+        """Per-model vision support from discovery, or ``None`` if unknown.
+
+        The adapter-family flag is too coarse: an Ollama/OpenAI/OpenRouter
+        route reports ``supports_vision=True`` at the adapter level even when
+        the *configured* model is text-only (vision is in ``model_dependent``).
+        Discovery already computes per-model ``supports_vision``; consult it so
+        an image isn't shipped to a model that will reject it.
+        """
+        try:
+            from .model_cache import get_shared_model_cache
+            models = get_shared_model_cache().get_any() or []
+        except Exception:
+            return None
+        for info in models:
+            if getattr(info, "id", None) != model:
+                continue
+            prov = getattr(info, "provider", None)
+            # Guard against id collisions across providers.
+            if prov in (None, provider_name):
+                return bool(getattr(info, "supports_vision", False))
+        return None
+
+    def _turn_can_see_images(self, adapter: Any, provider_name: str, model: str) -> bool:
+        """Whether this concrete provider+model can accept image input.
+
+        Concrete-model metadata wins when discovery knows the model; otherwise
+        fall back to the adapter-family capability (the conservative default
+        for models discovery hasn't catalogued).
+        """
+        model_vision = self._discovered_model_supports_vision(provider_name, model)
+        if model_vision is not None:
+            return model_vision
+        return self._adapter_supports_vision(adapter)
 
     def _apply_eager_vision(
         self,
@@ -543,7 +579,7 @@ class StreamingMixin:
         """
         if not images:
             return messages
-        if not self._adapter_supports_vision(adapter):
+        if not self._turn_can_see_images(adapter, provider_name, model):
             logger.warning(
                 "Eager vision: %s/%s is not vision-capable; %d image "
                 "attachment(s) were NOT sent to the model this turn. Switch to "

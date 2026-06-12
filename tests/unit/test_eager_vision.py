@@ -223,6 +223,42 @@ def test_apply_eager_vision_noop_without_images():
     assert svc._apply_eager_vision(_BlindAdapter(), msgs, None, "codex", "gpt-5") is msgs
 
 
+def test_apply_eager_vision_respects_model_level_capability(monkeypatch, caplog):
+    """A vision-capable adapter family (OpenAI/Ollama/...) running a concrete
+    model discovery knows is text-only must NOT get images — warn, pass through."""
+    from types import SimpleNamespace
+    from kestrel_sovereign.llm.streaming import StreamingMixin
+    from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    svc = StreamingMixin.__new__(StreamingMixin)
+    adapter = OpenAIAdapter()  # adapter-family supports_vision is True
+    cache = SimpleNamespace(get_any=lambda: [
+        SimpleNamespace(id="text-only-x", provider="openai", supports_vision=False)])
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_cache.get_shared_model_cache", lambda: cache)
+    msgs = [{"role": "user", "content": "hi"}]
+    with caplog.at_level(logging.WARNING):
+        out = svc._apply_eager_vision(adapter, msgs, [b"img"], "openai", "text-only-x")
+    assert out is msgs
+    assert "not vision-capable" in caplog.text
+
+
+def test_apply_eager_vision_model_known_vision_folds(monkeypatch):
+    """When discovery confirms the concrete model is vision-capable, fold it."""
+    from types import SimpleNamespace
+    from kestrel_sovereign.llm.streaming import StreamingMixin
+    from kestrel_sovereign.llm.openai_adapter import OpenAIAdapter
+    svc = StreamingMixin.__new__(StreamingMixin)
+    adapter = OpenAIAdapter()
+    cache = SimpleNamespace(get_any=lambda: [
+        SimpleNamespace(id="gpt-4o", provider="openai", supports_vision=True)])
+    monkeypatch.setattr(
+        "kestrel_sovereign.llm.model_cache.get_shared_model_cache", lambda: cache)
+    out = svc._apply_eager_vision(
+        adapter, [{"role": "user", "content": "x"}], [_PNG], "openai", "gpt-4o")
+    assert isinstance(out[0]["content"], list)
+    assert any(p.get("type") == "image_url" for p in out[0]["content"])
+
+
 @pytest.mark.asyncio
 async def test_remote_gpu_shortcut_skipped_for_image_turn(monkeypatch):
     """An image-bearing turn must NOT take the remote-GPU first-try shortcut
