@@ -76,35 +76,47 @@ async def test_sqlite_owner_sees_own_uncommitted_writes(tmp_path):
 # ---------------------------------------------------------------------------
 # Postgres: transaction connection is per-task (ContextVar)
 # ---------------------------------------------------------------------------
-def test_postgres_txn_conn_is_per_task_contextvar():
-    """A PostgresBackend's transaction connection lives in a ContextVar, so it is
-    scoped per asyncio task — not a shared instance attribute that concurrent
-    tasks would cross-route onto (#1726)."""
+def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():
+    """A PostgresBackend's transaction connection is keyed to the OWNING task
+    (#1726). A SIBLING task never sees it, and — critically — a CHILD task
+    created inside the transaction does NOT inherit it (ContextVars are copied
+    into child tasks; the owner-task check prevents cross-routing onto the
+    parent's connection)."""
     import contextvars
     from kestrel_sovereign.storage.db.postgres import PostgresBackend
 
     backend = PostgresBackend.__new__(PostgresBackend)
     backend._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
 
-    # Default is None (no open transaction).
-    assert backend._txn_conn_var.get() is None
+    assert backend._current_txn_conn() is None  # no open transaction
 
     async def main():
-        # Setting in one task does not leak into a sibling task's context.
-        async def task_a():
-            token = backend._txn_conn_var.set("conn-A")
-            await asyncio.sleep(0.01)
-            seen = backend._txn_conn_var.get()
-            backend._txn_conn_var.reset(token)
-            return seen
+        results = {}
 
-        async def task_b():
-            # Never set anything → must observe the default, not task_a's value.
+        async def owner():
+            token = backend._txn_conn_var.set((asyncio.current_task(), "conn-OWNER"))
+            try:
+                results["owner_sees"] = backend._current_txn_conn()
+                # A CHILD task spawned inside the "transaction" inherits the
+                # ContextVar but must NOT treat the parent's conn as its own.
+                child = asyncio.create_task(_child())
+                results["child_sees"] = await child
+            finally:
+                backend._txn_conn_var.reset(token)
+
+        async def _child():
+            return backend._current_txn_conn()
+
+        async def sibling():
             await asyncio.sleep(0.005)
-            return backend._txn_conn_var.get()
+            return backend._current_txn_conn()
 
-        return await asyncio.gather(task_a(), task_b())
+        sib = asyncio.create_task(sibling())
+        await owner()
+        results["sibling_sees"] = await sib
+        return results
 
-    a_seen, b_seen = asyncio.run(main())
-    assert a_seen == "conn-A"
-    assert b_seen is None  # task B never saw task A's transaction connection
+    r = asyncio.run(main())
+    assert r["owner_sees"] == "conn-OWNER"   # owner uses its connection
+    assert r["child_sees"] is None           # child does NOT inherit it
+    assert r["sibling_sees"] is None         # sibling never saw it

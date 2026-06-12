@@ -22,6 +22,7 @@ ADVANCED MODE:
         full deliberation transcript.
 """
 
+import asyncio
 import contextvars
 import logging
 from contextlib import asynccontextmanager
@@ -115,12 +116,14 @@ class PostgresBackend(DatabaseBackend):
         # PER-TASK transaction connection (#1726). Previously a single shared
         # instance attribute, which meant a concurrent task's execute()/fetch()
         # routed onto WHOEVER's transaction was open — cross-contaminating
-        # transactions on the very backend built for multi-tenant concurrency. A
-        # ContextVar is per-asyncio-task: Task A's open transaction connection is
-        # invisible to Task B, so a stray execute() in B uses the pool and a
-        # concurrent transaction() in B acquires its own connection.
-        self._txn_conn_var: "contextvars.ContextVar[Optional[asyncpg.Connection]]" = (
-            contextvars.ContextVar("pg_txn_conn", default=None)
+        # transactions on the very backend built for multi-tenant concurrency.
+        # The ContextVar stores ``(owner_task, conn)``: a ContextVar is COPIED
+        # into child tasks created with asyncio.create_task(), so we must verify
+        # the current task IS the owner before treating the connection as ours —
+        # otherwise a child task spawned inside a transaction would route onto
+        # the parent's uncommitted connection (codex r2).
+        self._txn_conn_var: "contextvars.ContextVar" = contextvars.ContextVar(
+            "pg_txn_conn", default=None
         )
         self._owns_pool = True  # We own pools we create
     
@@ -153,6 +156,22 @@ class PostgresBackend(DatabaseBackend):
         instance._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
         instance._owns_pool = False  # Mark that we don't own the pool
         return instance
+
+    def _current_txn_conn(self):
+        """This task's open transaction connection, or None (#1726).
+
+        The ContextVar holds ``(owner_task, conn)``. A child task inherits a COPY
+        of the parent's context, so the entry may belong to a PARENT task — we
+        return the connection ONLY when the current task is the owner, so a child
+        spawned inside a transaction does NOT route onto the parent's connection.
+        """
+        entry = self._txn_conn_var.get()
+        if entry is None:
+            return None
+        owner, conn = entry
+        if owner is asyncio.current_task():
+            return conn
+        return None
 
     @property
     def backend_type(self) -> str:
@@ -238,7 +257,7 @@ class PostgresBackend(DatabaseBackend):
 
         try:
             # Use this task's transaction connection if one is open (#1726).
-            txn = self._txn_conn_var.get()
+            txn = self._current_txn_conn()
             if txn is not None:
                 result = await txn.execute(pg_query, *params)
             else:
@@ -264,7 +283,7 @@ class PostgresBackend(DatabaseBackend):
         params_list = [self._strip_tz(p) for p in params_list]
 
         try:
-            txn = self._txn_conn_var.get()
+            txn = self._current_txn_conn()
             if txn is not None:
                 await txn.executemany(pg_query, params_list)
             else:
@@ -283,7 +302,7 @@ class PostgresBackend(DatabaseBackend):
         params = self._strip_tz(params)
 
         try:
-            txn = self._txn_conn_var.get()
+            txn = self._current_txn_conn()
             if txn is not None:
                 row = await txn.fetchrow(pg_query, *params)
             else:
@@ -304,7 +323,7 @@ class PostgresBackend(DatabaseBackend):
         params = self._strip_tz(params)
 
         try:
-            txn = self._txn_conn_var.get()
+            txn = self._current_txn_conn()
             if txn is not None:
                 rows = await txn.fetch(pg_query, *params)
             else:
@@ -323,7 +342,7 @@ class PostgresBackend(DatabaseBackend):
         params = self._strip_tz(params)
 
         try:
-            txn = self._txn_conn_var.get()
+            txn = self._current_txn_conn()
             if txn is not None:
                 return await txn.fetchval(pg_query, *params)
             else:
@@ -338,7 +357,7 @@ class PostgresBackend(DatabaseBackend):
         pool = self._ensure_connected()
         
         try:
-            txn = self._txn_conn_var.get()
+            txn = self._current_txn_conn()
             if txn is not None:
                 await txn.execute(script)
             else:
@@ -360,7 +379,7 @@ class PostgresBackend(DatabaseBackend):
         """
         pool = self._ensure_connected()
 
-        existing = self._txn_conn_var.get()
+        existing = self._current_txn_conn()
         if existing is not None:
             # Nested transaction (same task) - use savepoint on this task's conn.
             async with existing.transaction():
@@ -368,7 +387,7 @@ class PostgresBackend(DatabaseBackend):
             return
 
         async with pool.acquire() as conn:
-            token = self._txn_conn_var.set(conn)
+            token = self._txn_conn_var.set((asyncio.current_task(), conn))
             try:
                 async with conn.transaction():
                     yield
