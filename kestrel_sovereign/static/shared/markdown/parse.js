@@ -382,14 +382,25 @@ function _completeStreamingInline(tail) {
     // Strip CLOSED fenced regions first so code bodies (which may contain
     // backticks, **, [], $) never count as inline markdown.
     const noFence = _stripFences(t);
-    // Inline code: odd backtick count (outside fences) → open span; close it.
-    if (((noFence.match(/`/g) || []).length) % 2 !== 0) t += '`';
+    // Inline code: remove BALANCED spans (delimiter-run aware, so a multi-
+    // backtick span like `` ` `` that contains a literal backtick is balanced),
+    // then any remaining backtick run is an unclosed opener — close it with a
+    // matching run.
+    const balanced = noFence.replace(/(`+)[^\n]*?\1/g, '');
+    const openTick = balanced.match(/`+/);
+    if (openTick) t += openTick[0];
     // The remaining inline constructs must also ignore inline code spans.
     const code = _stripInlineCode(noFence);
     // Unclosed link/image target: `[text](url` / `![alt](url` with no `)`.
     if (/!?\[[^\]\n]*\]\([^)\n]*$/.test(code)) t += ')';
-    // Bold ** (rarely a bullet/operator) → close if unbalanced.
-    if (((code.match(/\*\*/g) || []).length) % 2 !== 0) t += '**';
+    // Bold **: complete only a genuine emphasis opener — odd ** count AND the
+    // last ** immediately followed by a word char. Globs/operators (**/*.py),
+    // a trailing **, or ** before punctuation are left literal, matching what
+    // the finalized markdown render would do.
+    if (((code.match(/\*\*/g) || []).length) % 2 !== 0) {
+        const after = code[code.lastIndexOf('**') + 2];
+        if (after && /\w/.test(after)) t += '**';
+    }
     // Display math $$ and bracket/paren math \[ \] , \( \) — close if open.
     if (((code.match(/\$\$/g) || []).length) % 2 !== 0) t += '$$';
     if (((code.match(/\\\[/g) || []).length) > ((code.match(/\\\]/g) || []).length)) t += '\\]';

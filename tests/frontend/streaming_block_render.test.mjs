@@ -156,6 +156,21 @@ test('leaves already-balanced / plain text untouched', () => {
     assert.equal(_completeStreamingInline('**done** and `ok`'), '**done** and `ok`');
 });
 
+test('does not bold a literal ** glob/operator (only genuine emphasis)', () => {
+    const { _completeStreamingInline } = load();
+    assert.equal(_completeStreamingInline('Use **/*.py to match'), 'Use **/*.py to match');
+    assert.equal(_completeStreamingInline('a trailing **'), 'a trailing **');
+    assert.equal(_completeStreamingInline('really **important'), 'really **important**');
+});
+
+test('balanced multi-backtick code span is not treated as unclosed', () => {
+    const { _completeStreamingInline } = load();
+    // `` ` `` is a valid 2-backtick span containing a literal backtick.
+    assert.equal(_completeStreamingInline('Use `` ` `` here'), 'Use `` ` `` here');
+    // a genuinely open span still closes
+    assert.equal(_completeStreamingInline('run `git'), 'run `git`');
+});
+
 // --- stable-prefix memoization ----------------------------------------------
 
 test('the stable prefix is parsed once across growing chunks', () => {
