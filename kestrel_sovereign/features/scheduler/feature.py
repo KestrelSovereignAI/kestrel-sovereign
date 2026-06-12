@@ -226,10 +226,12 @@ class SchedulerFeature(Feature):
         retired = _RETIRED_BUILTIN_CRON_TASKS & existing_names
         for task in existing_tasks:
             if task["task_name"] in retired:
-                await self.schedule_remove(task["task_id"])
+                # schedule_list() exposes the row identifier as "id".
+                task_id = task["id"]
+                await self.schedule_remove(task_id)
                 logger.info(
                     "Removed retired built-in schedule '%s' (id=%s)",
-                    task["task_name"], str(task["task_id"])[:8],
+                    task["task_name"], str(task_id)[:8],
                 )
         existing_names -= retired
 

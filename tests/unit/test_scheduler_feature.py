@@ -182,11 +182,12 @@ class TestRetiredCronCleanup:
         with patch.object(SchedulerRunner, "start", new_callable=AsyncMock):
             await f.initialize()
 
+        # Mirror schedule_list's real envelope: the row id is under "id".
         f.schedule_list = AsyncMock(return_value=ToolResult.ok(
             confirmation="ok",
             data={"tasks": [
-                {"task_name": "cognition_retention", "task_id": "orphan-1"},
-                {"task_name": "backup_snapshot", "task_id": "keep-1"},
+                {"task_name": "cognition_retention", "id": "orphan-1"},
+                {"task_name": "backup_snapshot", "id": "keep-1"},
             ]},
         ))
         f.schedule_remove = AsyncMock(return_value=ToolResult.ok(confirmation="removed"))
