@@ -54,6 +54,14 @@ from kestrel_sovereign.features.storage_access import resolve_feature_database
 
 logger = logging.getLogger(__name__)
 
+# Built-in cron tasks that were seeded by a prior version but no longer have a
+# handler/source. Their persisted scheduled_tasks rows are deleted once on
+# startup so they don't fire forever as "Unknown task". Add a name here when a
+# built-in cron is retired; never list user-schedulable feature tools.
+_RETIRED_BUILTIN_CRON_TASKS = frozenset({
+    "cognition_retention",  # #1674 — superseded by [forgetting] in memory_consolidate
+})
+
 
 class SchedulerFeature(Feature):
     """
@@ -207,6 +215,23 @@ class SchedulerFeature(Feature):
         existing = await self.schedule_list()
         existing_tasks = (existing.data or {}).get("tasks", []) if existing.data else []
         existing_names = {t["task_name"] for t in existing_tasks}
+
+        # One-time cutover cleanup: drop persisted schedule rows for built-in
+        # cron tasks that no longer exist. An agent that booted on a prior
+        # version had `cognition_retention` (#1715) seeded into scheduled_tasks;
+        # after #1674 removed its handler+source, that orphan row would fire
+        # every tick with no CRON registration and fail tool lookup as an
+        # "Unknown task". Delete such rows so the cutover is clean rather than
+        # noisy. (Built-in only — user-scheduled feature tools are never touched.)
+        retired = _RETIRED_BUILTIN_CRON_TASKS & existing_names
+        for task in existing_tasks:
+            if task["task_name"] in retired:
+                await self.schedule_remove(task["task_id"])
+                logger.info(
+                    "Removed retired built-in schedule '%s' (id=%s)",
+                    task["task_name"], str(task["task_id"])[:8],
+                )
+        existing_names -= retired
 
         # Reflection-dependent schedules only if ReflectionFeature is loaded
         has_reflection = "ReflectionFeature" in agent.features
