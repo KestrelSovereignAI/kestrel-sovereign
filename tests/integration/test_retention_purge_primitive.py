@@ -260,7 +260,7 @@ from kestrel_sovereign.storage.async_graph_store import GraphNode
 
 async def _add_episode(
     storage, episode_id: str, created_at: datetime, *,
-    importance: float = 0.5, agent_id=AGENT_ID,
+    importance: float = 0.5, access_count: int = 0, agent_id=AGENT_ID,
 ):
     """Insert a memory_episodes row + its paired KG node (node_id == episode id),
     matching what memory_consolidator writes."""
@@ -268,9 +268,10 @@ async def _add_episode(
     iso = created_at.isoformat()
     await storage.db.execute(
         """INSERT INTO memory_episodes
-           (id, agent_id, title, summary, created_at, importance)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (episode_id, agent_id, f"title-{episode_id}", "summary", iso, importance),
+           (id, agent_id, title, summary, created_at, importance, access_count)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (episode_id, agent_id, f"title-{episode_id}", "summary", iso,
+         importance, access_count),
     )
     await storage.add_node(GraphNode(
         node_id=episode_id,
@@ -326,6 +327,32 @@ async def test_purge_decayed_is_importance_aware_not_age_based(tmp_path):
         assert purged == 1
         remaining = {r[0] for r in await storage.db.fetchall("SELECT id FROM memory_episodes")}
         assert remaining == {"load-bearing"}  # high-importance episode outlives same-age throwaway
+
+
+@pytest.mark.asyncio
+async def test_purge_decayed_access_heat_protects_consulted_episode(tmp_path):
+    """#1674 P2: two episodes of identical age + importance — the one that has
+    been genuinely recalled (high access_count) has an extended half-life and
+    survives, while the never-consulted one is forgotten. Proves access_count
+    feeds the deletion-tier decay."""
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        now = datetime.now(timezone.utc)
+        # Same age (400d) + importance (0.1). Without access heat both decay
+        # below 0.02. The consulted one (access_count=200) extends its
+        # half-life enough to clear the threshold.
+        await _add_episode(storage, "ignored", now - timedelta(days=400),
+                           importance=0.1, access_count=0)
+        await _add_episode(storage, "consulted", now - timedelta(days=400),
+                           importance=0.1, access_count=500)
+
+        purged = await storage.purge_decayed_episodes(
+            delete_threshold=0.02, grace_days=90,
+        )
+
+        assert purged == 1
+        remaining = {r[0] for r in await storage.db.fetchall("SELECT id FROM memory_episodes")}
+        assert remaining == {"consulted"}  # rehearsed episode resists deletion
 
 
 @pytest.mark.asyncio

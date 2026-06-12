@@ -134,7 +134,10 @@ CREATE TABLE IF NOT EXISTS memory_episodes (
     key_message_ids TEXT,
     emotional_arc TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    importance REAL DEFAULT 0.5
+    importance REAL DEFAULT 0.5,
+    access_count INTEGER DEFAULT 0,
+    embedding_vec BLOB,
+    embedding_profile_id TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_episodes_agent ON memory_episodes(agent_id);
@@ -612,6 +615,27 @@ class AsyncDatabase:
         # to 0.5 (neutral) so they decay on the median half-life until rewritten.
         await self._migrate_add_column(
             "memory_episodes", "importance", "REAL DEFAULT 0.5"
+        )
+        # Relevance-based episode recall + access tracking (#1674 P2): episodes
+        # carry an embedding of their title+summary (reusing the shared vector
+        # backend, same path as saved_items) so genuinely-relevant past episodes
+        # can resurface; access_count is the rehearsal signal fed into decay so
+        # consulted episodes resist the deletion tier. Legacy episodes get NULL
+        # embeddings (recall falls back to keyword) and access_count 0.
+        await self._migrate_add_column(
+            "memory_episodes", "access_count", "INTEGER DEFAULT 0"
+        )
+        # embedding_vec is BLOB on SQLite, BYTEA on Postgres (a native pgvector
+        # column is a later phase, mirroring saved_items #1447; the SQLite
+        # PurePythonBackend and the keyword fallback both work today).
+        _episode_blob_type = (
+            "BYTEA" if self.backend_type == "postgres" else "BLOB"
+        )
+        await self._migrate_add_column(
+            "memory_episodes", "embedding_vec", _episode_blob_type
+        )
+        await self._migrate_add_column(
+            "memory_episodes", "embedding_profile_id", "TEXT DEFAULT NULL"
         )
         if await self._column_exists("conversation_history", "deleted_at"):
             await self._backend.execute(

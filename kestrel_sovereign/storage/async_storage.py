@@ -443,7 +443,7 @@ class AsyncStorage:
         while len(episode_ids) < max_rows:
             page = await self.db.fetchall(
                 """
-                SELECT id, created_at, importance FROM memory_episodes
+                SELECT id, created_at, importance, access_count FROM memory_episodes
                 WHERE agent_id = ? AND created_at < ?
                 ORDER BY created_at ASC
                 LIMIT ? OFFSET ?
@@ -452,10 +452,14 @@ class AsyncStorage:
             )
             if not page:
                 break
-            for ep_id, created_at, importance in page:
+            for ep_id, created_at, importance, access_count in page:
+                # access_count is the rehearsal signal (#1674 P2): episodes the
+                # agent genuinely recalled extend their half-life and resist
+                # deletion, exactly as messages do.
                 strength = calculate_decay(
                     created_at,
                     importance=importance if importance is not None else 0.5,
+                    access_count=access_count if access_count is not None else 0,
                     half_life_days=half_life_days,
                 )
                 if strength < delete_threshold:

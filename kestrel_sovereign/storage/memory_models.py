@@ -232,6 +232,10 @@ class MemoryEpisode:
     # episode's constituent messages, used by the forgetting curve to decide
     # when a faded episode becomes deletion-eligible. 0.5 = neutral default.
     importance: float = 0.5
+    # Rehearsal signal (#1674 P2): incremented each time the episode is
+    # genuinely recalled (semantic recall via search_episodes). Fed into the
+    # decay half-life so consulted episodes resist the deletion tier.
+    access_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dict for database storage."""
@@ -246,22 +250,38 @@ class MemoryEpisode:
             "emotional_arc": self.emotional_arc,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "importance": self.importance,
+            "access_count": self.access_count,
         }
 
     @classmethod
     def from_row(cls, row: tuple) -> "MemoryEpisode":
         """Create from database row."""
         import json
+
+        def _dt(value):
+            # SQLite returns ISO strings; asyncpg (Postgres) returns native
+            # datetime objects. Tolerate both (and None) so callers on either
+            # backend can materialize episodes via from_row.
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                return value
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+
         return cls(
             id=row[0],
             agent_id=row[1],
             title=row[2],
             summary=row[3],
-            timespan_start=datetime.fromisoformat(row[4]) if row[4] else None,
-            timespan_end=datetime.fromisoformat(row[5]) if row[5] else None,
+            timespan_start=_dt(row[4]),
+            timespan_end=_dt(row[5]),
             key_message_ids=json.loads(row[6]) if row[6] else [],
             emotional_arc=row[7] or "",
-            created_at=datetime.fromisoformat(row[8]) if row[8] else None,
-            # Tolerate legacy rows / shorter SELECTs that pre-date the column.
+            created_at=_dt(row[8]),
+            # Tolerate legacy rows / shorter SELECTs that pre-date the columns.
             importance=row[9] if len(row) > 9 and row[9] is not None else 0.5,
+            access_count=row[10] if len(row) > 10 and row[10] is not None else 0,
         )

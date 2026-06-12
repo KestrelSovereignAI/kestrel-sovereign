@@ -31,6 +31,11 @@ from .conversation_message import (
     build_conversation_message_spec,
 )
 from .document_chunk import DocumentChunk, build_document_chunk_spec
+from .episode import (
+    EPISODE_EMBEDDING_DIM,
+    MemoryEpisodeRow,
+    build_episode_spec,
+)
 from .saved_item import SavedItem, build_saved_item_spec
 from .session import SovereignSqlaSessionFactory, make_session_factory
 
@@ -40,6 +45,9 @@ __all__ = [
     "build_saved_item_spec",
     "DocumentChunk",
     "build_document_chunk_spec",
+    "MemoryEpisodeRow",
+    "build_episode_spec",
+    "EPISODE_EMBEDDING_DIM",
     "ConversationMessage",
     "build_conversation_message_spec",
     "CONVERSATION_MESSAGE_EMBEDDING_DIM",

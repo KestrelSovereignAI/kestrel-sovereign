@@ -62,7 +62,8 @@ class MemoryConsolidator:
         from kestrel_sdk.config.constants import SESSION_GAP_MINUTES as _GAP
         return _GAP
 
-    def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None):
+    def __init__(self, db: AsyncDatabase, agent_id: str, graph_store=None,
+                 llm_service=None):
         """
         Initialize consolidator.
 
@@ -70,10 +71,56 @@ class MemoryConsolidator:
             db: AsyncDatabase instance
             agent_id: Agent ID to consolidate memories for
             graph_store: Optional AsyncGraphStore for writing episodes to the KG
+            llm_service: Optional agent-scoped LLM service used to resolve the
+                provider embedding service for episode embeddings + semantic
+                recall (#1674 P2). When absent (or no embedding provider is
+                configured), episode recall degrades to keyword search and no
+                embeddings are written — both paths stay functional.
         """
         self._db = db
         self.agent_id = agent_id
         self._graph_store = graph_store
+        self._llm_service = llm_service
+        # Lazily-built SQLAlchemy session factory for the shared vector
+        # backend (mirrors SavedItemsStore). None when unavailable.
+        self._sqla_factory = None
+        self._sqla_factory_unavailable = False
+
+    def _get_embedding_service(self):
+        """Resolve the active provider's embedding service (reused infra).
+
+        Returns None when no LLM service / embedding provider is available —
+        callers then fall back to keyword recall and skip embedding writes.
+        """
+        if self._llm_service is None:
+            return None
+        try:
+            from kestrel_sovereign.llm.embedding_service import (
+                get_provider_embedding_service,
+            )
+            return get_provider_embedding_service(self._llm_service)
+        except Exception as e:  # noqa: BLE001 - embeddings are best-effort
+            logger.debug("episode embedding service unavailable: %s", e)
+            return None
+
+    def _get_vector_session_factory(self):
+        """Lazy-build a SQLAlchemy session factory for the shared vector
+        backend, pointed at the same DB as ``self._db`` (mirrors
+        ``SavedItemsStore._get_vector_session_factory``). Returns None when
+        construction fails (in-memory SQLite, bare pool, etc.) — callers then
+        fall back to keyword recall."""
+        if self._sqla_factory is not None:
+            return self._sqla_factory
+        if self._sqla_factory_unavailable:
+            return None
+        try:
+            from kestrel_sovereign.storage.sqla import make_session_factory
+            self._sqla_factory = make_session_factory(self._db)
+            return self._sqla_factory
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode vector session factory unavailable: %s", e)
+            self._sqla_factory_unavailable = True
+            return None
 
     async def run_consolidation(self) -> Dict[str, Any]:
         """
@@ -116,6 +163,12 @@ class MemoryConsolidator:
             # 3. Archive decayed messages
             archived = await self._archive_decayed()
             report["messages_archived"] = archived
+
+            # 3b. Backfill embeddings for a bounded batch of pre-P2 episodes
+            # (#1674 P2) so older episodes become semantically recallable —
+            # and thus eligible for access-heat protection — over successive
+            # nights. Best-effort; no-op when no embedding provider is wired.
+            report["episodes_embedded"] = await self._backfill_episode_embeddings()
 
             # Get total message count
             count = await self._db.fetchval(
@@ -558,6 +611,12 @@ class MemoryConsolidator:
             )
         )
 
+        # Embed the episode so it's discoverable by relevance later (#1674 P2).
+        # Best-effort and reuses the shared embedding service + vector column
+        # (same path as saved_items); a missing provider just leaves NULL and
+        # recall falls back to keyword search.
+        await self._embed_episode(episode.id, episode.title, episode.summary)
+
         # Write episode as a KG node so it appears in the Memories panel
         if self._graph_store:
             try:
@@ -589,6 +648,281 @@ class MemoryConsolidator:
             except Exception as e:
                 # KG write is best-effort — don't fail episode creation
                 logger.warning("Failed to write episode to KG: %s", e)
+
+    # ------------------------------------------------------------------
+    # Relevance-based episode recall + access tracking (#1674 P2)
+    #
+    # Thin glue over the SHARED semantic infra — no new embedding/kNN
+    # machinery. Reuses get_provider_embedding_service, _serialize_embedding,
+    # the vector backend (build_episode_spec + get_vector_backend), and the
+    # embedding_profile_id filter, exactly as SavedItemsStore does.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _episode_embed_text(title: Optional[str], summary: Optional[str]) -> str:
+        """The text embedded/searched for an episode: title + summary."""
+        return "\n".join(p for p in (title, summary) if p).strip()
+
+    async def _embed_episode(
+        self, episode_id: str, title: Optional[str], summary: Optional[str]
+    ) -> None:
+        """Embed an episode's title+summary and store it in ``embedding_vec``
+        (+ the active ``embedding_profile_id``). Best-effort: any failure
+        (no provider, missing column) leaves the row NULL and recall falls
+        back to keyword search."""
+        text = self._episode_embed_text(title, summary)
+        if not text:
+            return
+        service = self._get_embedding_service()
+        if service is None:
+            return
+        try:
+            embedding = await service.aembed(text)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode embed failed for %s: %s", episode_id, e)
+            return
+        if not embedding:
+            return
+        profile_id = None
+        if hasattr(service, "current_profile_id"):
+            try:
+                profile_id = service.current_profile_id()
+            except Exception:  # noqa: BLE001 - defensive
+                profile_id = None
+        from .saved_items_store import _serialize_embedding
+        # Store float32 bytes on BOTH backends — episode embedding_vec is BLOB
+        # (SQLite) / BYTEA (PG), not a native pgvector column yet. The SQLite
+        # PurePythonBackend reads these bytes for cosine; PG semantic recall
+        # awaits a pgvector episode migration (keyword recall works meanwhile),
+        # mirroring saved_items' staged #1447 rollout. Writing ``?::vector``
+        # here would fail against a BYTEA column.
+        try:
+            await self._db.execute(
+                "UPDATE memory_episodes SET embedding_vec = ?, "
+                "embedding_profile_id = ? WHERE id = ? AND agent_id = ?",
+                (_serialize_embedding(embedding), profile_id,
+                 episode_id, self.agent_id),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode embedding_vec write failed for %s: %s",
+                         episode_id, e)
+
+    async def _backfill_episode_embeddings(self, limit: int = 50) -> int:
+        """Embed up to ``limit`` episodes that still lack an embedding (pre-P2
+        rows). Bounded per consolidation pass so the corpus drains over nights
+        without a heavy one-shot migration. Best-effort: returns the count
+        embedded, 0 when no provider is available."""
+        if self._get_embedding_service() is None:
+            return 0
+        try:
+            rows = await self._db.fetchall(
+                """SELECT id, title, summary FROM memory_episodes
+                   WHERE agent_id = ? AND embedding_vec IS NULL
+                   ORDER BY created_at DESC
+                   LIMIT ?""",
+                (self.agent_id, limit),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode embedding backfill query failed: %s", e)
+            return 0
+        embedded = 0
+        for ep_id, title, summary in rows or []:
+            before = await self._db.fetchone(
+                "SELECT embedding_vec FROM memory_episodes WHERE id = ?",
+                (ep_id,),
+            )
+            await self._embed_episode(ep_id, title, summary)
+            after = await self._db.fetchone(
+                "SELECT embedding_vec FROM memory_episodes WHERE id = ?",
+                (ep_id,),
+            )
+            if after and after[0] is not None and (not before or before[0] is None):
+                embedded += 1
+        return embedded
+
+    async def _increment_episode_access(self, episode_ids: List[str]) -> None:
+        """Bump ``access_count`` for genuinely-recalled episodes (rehearsal
+        signal feeding the decay half-life). Best-effort — bookkeeping must
+        never break recall."""
+        if not episode_ids:
+            return
+        placeholders = ",".join("?" for _ in episode_ids)
+        try:
+            await self._db.execute(
+                f"UPDATE memory_episodes SET access_count = access_count + 1 "
+                f"WHERE agent_id = ? AND id IN ({placeholders})",
+                (self.agent_id, *episode_ids),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode access increment failed: %s", e)
+
+    async def search_episodes(
+        self, query: str, limit: int = 5
+    ) -> List[MemoryEpisode]:
+        """Recall episodes RELEVANT to ``query`` (not just recent), and stamp
+        the surfaced episodes as accessed so they resist the deletion tier.
+
+        Reuses the shared vector backend (SQLite PurePythonBackend) via
+        ``build_episode_spec``, MERGED with a keyword LIKE scan over
+        title+summary. The merge matters: semantic kNN only sees embedded
+        rows, so legacy / not-yet-backfilled episodes (``embedding_vec IS
+        NULL``) would otherwise be unrecallable even on an exact title match —
+        and would never accrue the access-heat that protects them from the
+        deletion tier. Vector hits rank first (relevance), keyword hits fill
+        in behind, deduped and capped at ``limit``.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        # Always run BOTH and merge, so un-embedded episodes stay recallable by
+        # keyword. _knn returns None when the vector path can't run at all (no
+        # provider / non-SQLite / error) — treat as empty.
+        vec_ids = await self._knn_episode_ids(query, limit) or []
+        # Exclude vector hits in SQL so keyword returns up to `limit` NEW matches
+        # (legacy / un-embedded rows), not ones the vector path already covered.
+        kw_only = await self._keyword_episode_ids(
+            query, limit, exclude_ids=vec_ids
+        )
+
+        # Interleave (vector-first) rather than concatenate: a pure
+        # vector-then-keyword merge lets `limit` embedded hits fill every slot
+        # and starve an exact keyword match from a legacy NULL-embedding
+        # episode — which then also never gets its access-heat protection. Round-
+        # robin guarantees keyword-only hits get slots while the top relevance
+        # hit still ranks first.
+        ordered: List[str] = []
+        seen: set = set()
+        vi = ki = 0
+        while len(ordered) < limit and (vi < len(vec_ids) or ki < len(kw_only)):
+            if vi < len(vec_ids):
+                eid = vec_ids[vi]
+                vi += 1
+                if eid not in seen:
+                    seen.add(eid)
+                    ordered.append(eid)
+                if len(ordered) >= limit:
+                    break
+            if ki < len(kw_only):
+                eid = kw_only[ki]
+                ki += 1
+                if eid not in seen:
+                    seen.add(eid)
+                    ordered.append(eid)
+
+        episodes = await self._episodes_by_ids(ordered)
+        await self._increment_episode_access([ep.id for ep in episodes])
+        return episodes
+
+    async def _knn_episode_ids(
+        self, query: str, limit: int
+    ) -> Optional[List[str]]:
+        """Vector recall → ordered episode ids, or None when the vector path
+        can't run (no provider / non-SQLite backend / no session factory /
+        backend error / no embedded rows); the caller then relies on keyword
+        recall.
+
+        Gated to SQLite: episode ``embedding_vec`` is BYTEA on Postgres (not a
+        native pgvector column yet), so the pgvector backend can't operate on
+        it. PG semantic episode recall awaits a pgvector migration — keyword
+        recall covers PG meanwhile. This mirrors saved_items' staged rollout."""
+        if getattr(self._db, "backend_type", None) == "postgres":
+            return None
+        service = self._get_embedding_service()
+        if service is None:
+            return None
+        try:
+            query_embedding = await service.aembed(query)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode query embed failed: %s", e)
+            return None
+        if not query_embedding:
+            return None
+        sf = self._get_vector_session_factory()
+        if sf is None:
+            return None
+        try:
+            from .saved_items_store import _serialize_embedding
+            from kestrel_sovereign.storage.sqla import build_episode_spec
+            from kestrel_sovereign.storage.vector import get_vector_backend
+
+            spec = build_episode_spec(dimension=len(query_embedding))
+            filter_kwargs: Dict[str, Any] = {"agent_id": self.agent_id}
+            if hasattr(service, "current_profile_id"):
+                try:
+                    pid = service.current_profile_id()
+                    if pid is not None:
+                        filter_kwargs["embedding_profile_id"] = pid
+                except Exception:  # noqa: BLE001
+                    pass
+            backend = get_vector_backend(sf, spec)
+            top_k = await backend.knn(
+                _serialize_embedding(query_embedding), k=limit,
+                filter=filter_kwargs,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode kNN failed (%s); using keyword fallback", e)
+            return None
+        if not top_k:
+            # No embedded rows for this scope yet → let keyword fallback run.
+            return None
+        return [episode_id for episode_id, _score in top_k]
+
+    async def _keyword_episode_ids(
+        self, query: str, limit: int, exclude_ids: Optional[List[str]] = None
+    ) -> List[str]:
+        """Keyword LIKE recall over title+summary, ranked by recency.
+
+        ``exclude_ids`` (the vector hits) are filtered out IN SQL so the LIMIT
+        returns up to ``limit`` genuinely-NEW matches — otherwise a query that
+        the vector path already satisfied would consume the whole LIMIT with
+        rows already surfaced, starving keyword-only legacy episodes."""
+        # Case-insensitive via LOWER() on both sides — portable across SQLite
+        # (LIKE is ASCII-case-insensitive) AND Postgres (LIKE is case-SENSITIVE).
+        # On PG the kNN path is gated off, so this keyword fallback is the only
+        # recall; a case-sensitive match there would miss "sailing" vs
+        # "Sailing trip" and record no access heat.
+        like = f"%{query.lower()}%"
+        exclude_ids = exclude_ids or []
+        exclude_clause = ""
+        params: list = [self.agent_id, like, like]
+        if exclude_ids:
+            exclude_clause = (
+                " AND id NOT IN (" + ",".join("?" for _ in exclude_ids) + ")"
+            )
+            params.extend(exclude_ids)
+        params.append(limit)
+        try:
+            rows = await self._db.fetchall(
+                f"""SELECT id FROM memory_episodes
+                    WHERE agent_id = ?
+                      AND (LOWER(title) LIKE ? OR LOWER(summary) LIKE ?)
+                    {exclude_clause}
+                    ORDER BY created_at DESC
+                    LIMIT ?""",
+                tuple(params),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("episode keyword recall failed: %s", e)
+            return []
+        return [r[0] for r in rows or []]
+
+    async def _episodes_by_ids(self, ids: List[str]) -> List[MemoryEpisode]:
+        """Materialize MemoryEpisode rows by id, preserving the given order."""
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = await self._db.fetchall(
+            f"""SELECT id, agent_id, title, summary, timespan_start, timespan_end,
+                       key_message_ids, emotional_arc, created_at, importance,
+                       access_count
+                FROM memory_episodes
+                WHERE agent_id = ? AND id IN ({placeholders})""",
+            (self.agent_id, *ids),
+        )
+        by_id = {r[0]: MemoryEpisode.from_row(r) for r in rows or []}
+        # Preserve relevance order from the recall step.
+        return [by_id[i] for i in ids if i in by_id]
 
     async def _detect_patterns(self) -> List[TemporalPattern]:
         """
@@ -919,7 +1253,8 @@ class MemoryConsolidator:
         """
         rows = await self._db.fetchall(
             """SELECT id, agent_id, title, summary, timespan_start, timespan_end,
-                      key_message_ids, emotional_arc, created_at, importance
+                      key_message_ids, emotional_arc, created_at, importance,
+                      access_count
                FROM memory_episodes
                WHERE agent_id = ?
                ORDER BY created_at DESC
@@ -930,7 +1265,8 @@ class MemoryConsolidator:
         episodes = []
         for row in rows:
             (ep_id, agent_id, title, summary, timespan_start, timespan_end,
-             key_message_ids, emotional_arc, created_at, importance) = row
+             key_message_ids, emotional_arc, created_at, importance,
+             access_count) = row
 
             # Parse JSON fields
             if isinstance(key_message_ids, str):
@@ -972,6 +1308,7 @@ class MemoryConsolidator:
                 emotional_arc=emotional_arc,
                 created_at=created_at,
                 importance=importance if importance is not None else 0.5,
+                access_count=access_count if access_count is not None else 0,
             ))
 
         return episodes

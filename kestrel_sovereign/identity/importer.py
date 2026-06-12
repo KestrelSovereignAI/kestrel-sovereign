@@ -344,8 +344,9 @@ class IdentityImporter:
                 await self.db.execute(
                     """INSERT OR REPLACE INTO memory_episodes
                        (id, agent_id, title, summary, timespan_start, timespan_end,
-                        key_message_ids, emotional_arc, created_at, importance)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        key_message_ids, emotional_arc, created_at, importance,
+                        access_count)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         new_id,
                         agent_id,
@@ -357,6 +358,7 @@ class IdentityImporter:
                         ep.get("emotional_arc"),
                         ep.get("created_at"),
                         ep.get("importance", 0.5),
+                        ep.get("access_count", 0),
                     )
                 )
                 count += 1
