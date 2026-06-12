@@ -1268,7 +1268,10 @@ async def send_task(request: Request):
         task_id=params.id,
         message=signed_message_text,
         session_id=params.sessionId,
-        artifacts=getattr(params, "artifacts", None),
+        # Bind the RAW wire artifacts (the same dicts the signer bound as
+        # ``payload["artifacts"]``); ``TaskSendParams`` has no artifacts field —
+        # they are parsed separately into ``sender_artifacts`` (#1721).
+        artifacts=raw_artifacts,
         resolver=_a2a_did_resolver(agent),
         require_signed=require_signed,
     )

@@ -57,6 +57,12 @@ class SpawnMandate:
         holder could move ``created_at`` forward to refresh the TTL on an
         otherwise-valid mandate. ``created_at`` is assigned at construction
         (``default_factory``), so it is always present by signing time.
+
+        Format note: mandates are ephemeral — signed at spawn and held in the
+        AgentManager's in-memory ``_child_mandates`` map, never persisted or
+        re-verified across restarts (a restart re-spawns and re-signs). So
+        adding ``created_at`` to the signed bytes is a clean cutover: there are
+        no stored old-format signatures to invalidate.
         """
         payload = {
             "parent_did": self.parent_did,
