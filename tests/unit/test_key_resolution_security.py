@@ -94,6 +94,26 @@ class TestQuotaCheckRetryBehavior:
         assert mock.call_count == 3  # Should stop at 3, not continue
 
     @pytest.mark.asyncio
+    async def test_no_storage_allows_by_default(self, monkeypatch):
+        """No quota storage = quota not configured → allow (opt-in enforcement)."""
+        from kestrel_sovereign.services.key_resolution import KeyResolutionService
+
+        monkeypatch.delenv("KESTREL_QUOTA_ENFORCE", raising=False)
+        service = KeyResolutionService()
+        service._storage = None
+        assert await service.check_quota("openai", units=1) is True
+
+    @pytest.mark.asyncio
+    async def test_no_storage_denies_when_enforce_set(self, monkeypatch):
+        """#1723: KESTREL_QUOTA_ENFORCE=1 + no storage → fail CLOSED (deny)."""
+        from kestrel_sovereign.services.key_resolution import KeyResolutionService
+
+        monkeypatch.setenv("KESTREL_QUOTA_ENFORCE", "1")
+        service = KeyResolutionService()
+        service._storage = None
+        assert await service.check_quota("openai", units=1) is False
+
+    @pytest.mark.asyncio
     async def test_quota_check_allows_when_no_storage(self):
         """When no storage is configured, quota enforcement is disabled."""
         from kestrel_sovereign.services.key_resolution import KeyResolutionService

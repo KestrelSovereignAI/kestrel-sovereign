@@ -82,6 +82,30 @@ class TestResponseAuditHook:
         assert hook.last_risk_level == 3
 
     @pytest.mark.asyncio
+    async def test_hook_strict_fails_closed_when_audit_did_not_run(self):
+        """#1723: when the audit could not run (audited=False, e.g. no providers)
+        strict mode must DENY — an un-run audit must not pass with risk 1."""
+        agent = _make_agent({
+            "risk_level": 1, "reasoning": "Audit skipped - no providers available.",
+            "audited": False,
+        })
+        hook = ResponseAuditHook(agent=agent, mode="strict", risk_threshold=3)
+        output = await hook.execute(_make_hook_input())
+        assert output.permission_decision == PermissionDecision.DENY
+        assert output.continue_execution is False
+
+    @pytest.mark.asyncio
+    async def test_hook_warn_does_not_hard_block_when_audit_did_not_run(self):
+        """In non-strict modes an un-run audit does not hard-block (no deny)."""
+        agent = _make_agent({
+            "risk_level": 1, "reasoning": "Audit skipped - no providers available.",
+            "audited": False,
+        })
+        hook = ResponseAuditHook(agent=agent, mode="warn", risk_threshold=3)
+        output = await hook.execute(_make_hook_input())
+        assert output.permission_decision != PermissionDecision.DENY
+
+    @pytest.mark.asyncio
     async def test_hook_warn_high_risk(self):
         """Warn mode with high risk should MODIFY the response with a warning."""
         agent = _make_agent({"risk_level": 3, "reasoning": "Potentially misleading"})

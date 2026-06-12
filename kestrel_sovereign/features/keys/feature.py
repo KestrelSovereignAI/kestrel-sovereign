@@ -15,6 +15,7 @@ Security:
 """
 
 import logging
+import os
 from typing import Any, Dict, Optional
 
 from kestrel_sdk.tools.base import ToolCategory
@@ -445,7 +446,30 @@ class KeyManagementFeature(Feature):
                         data={"provider": provider},
                     )
             except Exception as e:
-                logger.warning(f"Approval request failed: {e}, proceeding without approval")
+                # FAIL CLOSED (#1723): if the constitutional approval queue
+                # raises, do NOT rotate by default — a broken approval pipeline
+                # must not silently downgrade rotation to "no review". An
+                # operator can opt into the legacy proceed-with-PARTIAL behavior
+                # with KESTREL_KEYS_ROTATE_WITHOUT_APPROVAL=1.
+                allow_unreviewed = os.environ.get(
+                    "KESTREL_KEYS_ROTATE_WITHOUT_APPROVAL", ""
+                ).lower() in ("1", "true", "yes")
+                if not allow_unreviewed:
+                    logger.error(
+                        f"Approval request failed: {e}; refusing to rotate "
+                        f"(fail closed). Set KESTREL_KEYS_ROTATE_WITHOUT_APPROVAL=1 "
+                        f"to override."
+                    )
+                    return ToolResult.failed(
+                        "Key rotation blocked: constitutional approval queue "
+                        f"raised ({e}). Rotation was NOT performed (fail-closed). "
+                        "Investigate the approval pipeline.",
+                        data={"provider": provider, "approval_error": str(e)},
+                    )
+                logger.warning(
+                    f"Approval request failed: {e}, proceeding without approval "
+                    f"(KESTREL_KEYS_ROTATE_WITHOUT_APPROVAL override)."
+                )
                 approval_bypassed_reason = str(e)
 
         try:

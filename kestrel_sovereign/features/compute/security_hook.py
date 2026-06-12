@@ -66,6 +66,9 @@ class ComputeSecurityHook(Hook):
             matcher=r"^run_script$",  # Match run_script tool only
             priority=priority,
         )
+        # Deny-capable gate: if this hook errors/times out, the manager must
+        # fail CLOSED (deny the script) rather than let it through (#1723).
+        self.fail_closed = True
         self.script_store = script_store
         self.signer = signer
         self.analyzer = ScriptAnalyzer()
