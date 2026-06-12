@@ -10,7 +10,7 @@ common metadata endpoints, e.g. 169.254.169.254 and IPv6 ULAs).
 
 It blocks the literal-private-IP and metadata-hostname cases. A determined
 DNS-rebinding attacker can still race resolution vs. connection (TOCTOU); pinning
-the validated IP into the connection is tracked as a follow-up — this guard
+the validated IP into the connection is tracked as follow-up #1746 — this guard
 closes the directly-exploitable holes the review flagged.
 """
 from __future__ import annotations
