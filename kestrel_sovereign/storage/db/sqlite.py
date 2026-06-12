@@ -172,28 +172,39 @@ class SQLiteBackend(DatabaseBackend):
                 raise
 
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
-        """Fetch a single row."""
+        """Fetch a single row.
+
+        Reads run under ``_write_guard`` too (#1726): all tasks share ONE
+        aiosqlite connection, so an unguarded read could observe ANOTHER task's
+        UNCOMMITTED writes (a dirty read) while that task held the write lock
+        mid-transaction. The guard is re-entrant for the transaction owner — a
+        task still sees its OWN in-flight writes — but a different task's read
+        waits until the open write unit commits/rolls back, giving read-committed
+        isolation.
+        """
         record_write_query(query)
         conn = self._ensure_connected()
-        try:
-            cursor = await conn.execute(query, params)
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            return tuple(row)
-        except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
-    
+        async with self._write_guard():
+            try:
+                cursor = await conn.execute(query, params)
+                row = await cursor.fetchone()
+                if row is None:
+                    return None
+                return tuple(row)
+            except Exception as e:
+                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
-        """Fetch all rows."""
+        """Fetch all rows. Guarded against dirty reads — see ``fetch_one`` (#1726)."""
         record_write_query(query)
         conn = self._ensure_connected()
-        try:
-            cursor = await conn.execute(query, params)
-            rows = await cursor.fetchall()
-            return [tuple(row) for row in rows]
-        except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
+        async with self._write_guard():
+            try:
+                cursor = await conn.execute(query, params)
+                rows = await cursor.fetchall()
+                return [tuple(row) for row in rows]
+            except Exception as e:
+                raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
     
     async def fetch_val(self, query: str, params: Params = ()) -> Optional[Any]:
         """Fetch a single value."""

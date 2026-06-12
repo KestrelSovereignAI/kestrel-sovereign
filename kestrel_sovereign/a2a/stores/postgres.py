@@ -69,8 +69,10 @@ class PoolBackendAdapter(PostgresBackend):
         """
         # Don't call super().__init__() - we're wrapping an existing pool
         # Set the pool directly (PostgresBackend checks self._pool)
+        import contextvars
         self._pool = pool
-        self._transaction_conn = None  # Required by PostgresBackend
+        # Per-task transaction connection, matching PostgresBackend (#1726).
+        self._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
 
     async def connect(self) -> None:
         """No-op since pool is already connected."""
