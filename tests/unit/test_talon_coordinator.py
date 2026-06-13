@@ -625,6 +625,80 @@ class TestTalonVerify:
         assert (workspace / "marker.txt").exists()
 
     @pytest.mark.asyncio
+    async def test_verify_branch_ref_resets_stale_local_branch_to_remote(self, tmp_path):
+        """Branch refs verify the fetched remote branch, not a stale local one."""
+        import subprocess as _sp
+        from pathlib import Path
+
+        origin = tmp_path / "origin.git"
+        seed = tmp_path / "seed"
+        workspace = tmp_path / "workspace"
+
+        def git(cwd, *args):
+            _sp.run(
+                ["git", *args],
+                cwd=str(cwd),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        _sp.run(["git", "init", "--bare", str(origin)], check=True)
+        seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "t@example.com")
+        git(seed, "config", "user.name", "Test")
+        (seed / "base.txt").write_text("base\n")
+        git(seed, "add", "base.txt")
+        git(seed, "commit", "-m", "base")
+        git(seed, "remote", "add", "origin", str(origin))
+        git(seed, "push", "-u", "origin", "main")
+
+        git(seed, "checkout", "-b", "pr-branch")
+        (seed / "marker.txt").write_text("stale\n")
+        git(seed, "add", "marker.txt")
+        git(seed, "commit", "-m", "stale marker")
+        git(seed, "push", "-u", "origin", "pr-branch")
+
+        _sp.run(["git", "clone", str(origin), str(workspace)], check=True)
+        git(workspace, "checkout", "pr-branch")
+        git(workspace, "checkout", "main")
+
+        (seed / "marker.txt").write_text("fresh\n")
+        git(seed, "add", "marker.txt")
+        git(seed, "commit", "-m", "fresh marker")
+        git(seed, "push", "origin", "pr-branch")
+
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        def make_exec(run_cwd):
+            async def _exec(command, *, timeout=600):
+                marker = Path(run_cwd) / "marker.txt"
+                if marker.read_text() == "fresh\n":
+                    return CommandExecution(ran=True, returncode=0, stdout="fresh")
+                return CommandExecution(
+                    ran=True,
+                    returncode=4,
+                    stderr=f"verified stale branch content: {marker.read_text()!r}",
+                )
+
+            return _exec
+
+        with patch.object(
+            feature, "_make_verify_executor", side_effect=make_exec
+        ):
+            result = await feature.talon_verify(
+                commands="pytest marker.txt",
+                cwd=str(workspace),
+                ref="pr-branch",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["overall_state"] == "passed"
+        assert result.data["checked_out_ref"] == "pr-branch"
+        assert (workspace / "marker.txt").read_text() == "fresh\n"
+
+    @pytest.mark.asyncio
     async def test_verify_unknown_ref_is_tooling_error_not_failure(self, tmp_path):
         """A ref that can't be checked out yields tooling_error, not a code failure.
 

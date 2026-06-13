@@ -1320,22 +1320,44 @@ class TalonCoordinatorFeature(Feature):
                 }
         else:
             # Branch or SHA. Fetch the remote so newly-pushed branches
-            # and commits are available locally, then check out the ref.
-            await self._git_run(
+            # and commits are available locally. If a remote branch exists,
+            # make origin/<branch> the source of truth so a stale local
+            # branch cannot be verified accidentally.
+            fetch = await self._git_run(
                 ["fetch", "--all", "--prune"], cwd=workspace, timeout=120
             )
-            checkout = await self._git_run(
-                ["checkout", "--force", value], cwd=workspace, timeout=60
+            if not fetch.get("ok"):
+                return {
+                    "ok": False,
+                    "error": (
+                        f"git fetch before checking out ref {value!r} failed: "
+                        f"{fetch.get('error') or 'unknown error'}"
+                    ),
+                }
+            remote_branch = await self._git_run(
+                ["rev-parse", "--verify", f"refs/remotes/origin/{value}"],
+                cwd=workspace,
+                timeout=30,
             )
-            if not checkout.get("ok"):
-                # A remote-only branch that git won't auto-track, or a SHA:
-                # fall back to a detached checkout of the remote ref.
-                detached = await self._git_run(
-                    ["checkout", "--force", "--detach", f"origin/{value}"],
+            if remote_branch.get("ok"):
+                checkout = await self._git_run(
+                    ["checkout", "--force", "-B", value, f"origin/{value}"],
                     cwd=workspace,
                     timeout=60,
                 )
-                if not detached.get("ok"):
+                if not checkout.get("ok"):
+                    return {
+                        "ok": False,
+                        "error": (
+                            f"git checkout of remote branch {value!r} failed: "
+                            f"{checkout.get('error') or 'unknown error'}"
+                        ),
+                    }
+            else:
+                checkout = await self._git_run(
+                    ["checkout", "--force", value], cwd=workspace, timeout=60
+                )
+                if not checkout.get("ok"):
                     return {
                         "ok": False,
                         "error": (
