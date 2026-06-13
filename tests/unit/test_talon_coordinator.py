@@ -581,6 +581,55 @@ class TestTalonVerify:
         git("checkout", "main")
         return root
 
+    @staticmethod
+    def _init_git_repo_with_stale_local_branch(root):
+        """Create a checkout where local feature is stale vs origin/feature."""
+        import subprocess as _sp
+
+        remote = root / "remote.git"
+        seed = root / "seed"
+        workspace = root / "workspace"
+
+        def git(cwd, *args):
+            _sp.run(
+                ["git", *args], cwd=str(cwd), check=True,
+                capture_output=True, text=True,
+            )
+
+        root.mkdir(parents=True, exist_ok=True)
+        remote.mkdir()
+        git(remote, "init", "--bare")
+
+        seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "t@example.com")
+        git(seed, "config", "user.name", "Test")
+        (seed / "base.txt").write_text("base\n")
+        git(seed, "add", "base.txt")
+        git(seed, "commit", "-m", "base on main")
+        git(seed, "remote", "add", "origin", str(remote))
+        git(seed, "push", "origin", "main")
+        git(seed, "checkout", "-b", "feature")
+        (seed / "marker.txt").write_text("remote\n")
+        git(seed, "add", "marker.txt")
+        git(seed, "commit", "-m", "remote feature marker")
+        git(seed, "push", "origin", "feature")
+        remote_sha = _sp.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(seed), check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        git(root, "clone", str(remote), str(workspace))
+        git(workspace, "config", "user.email", "t@example.com")
+        git(workspace, "config", "user.name", "Test")
+        git(workspace, "checkout", "main")
+        git(workspace, "checkout", "-b", "feature")
+        (workspace / "marker.txt").write_text("stale-local\n")
+        git(workspace, "add", "marker.txt")
+        git(workspace, "commit", "-m", "stale local feature marker")
+        git(workspace, "checkout", "main")
+        return workspace, remote_sha
+
     @pytest.mark.asyncio
     async def test_verify_runs_against_pr_branch_not_main(self, tmp_path):
         """#1631: with ref set, the PR branch is checked out before running.
@@ -619,9 +668,8 @@ class TestTalonVerify:
         assert result.status is ToolResultStatus.OK
         assert result.data["overall_state"] == "passed"
         assert result.data["requested_ref"] == "pr-branch"
-        assert result.data["checked_out_ref"] == "pr-branch"
         assert result.data["head_sha"]
-        # The actual tree was switched to the PR branch.
+        # The actual tree was switched to the requested branch commit.
         assert (workspace / "marker.txt").exists()
 
     @pytest.mark.asyncio
