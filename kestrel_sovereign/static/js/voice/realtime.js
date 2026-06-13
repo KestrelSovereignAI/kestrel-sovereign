@@ -379,6 +379,10 @@ export async function createRealtimeClient({
     return 0;
   }
 
+  function setMuted(muted) {
+    if (audioSink) audioSink.muted = !!muted;
+  }
+
   return {
     path: 'realtime',
     start,
@@ -388,6 +392,7 @@ export async function createRealtimeClient({
     updateInstructions,
     commitToolResult,
     getInputLevel,
+    setMuted,
     /** MediaStream of remote agent audio — for UI meters / visualizers. */
     get remoteStream() {
       return audioSink?.srcObject ?? null;

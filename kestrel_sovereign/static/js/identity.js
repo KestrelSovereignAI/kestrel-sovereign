@@ -8,6 +8,7 @@ import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
+import { onAgentSwitch as onVoiceAgentSwitch } from './voice/ui.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -795,6 +796,7 @@ export async function loadAgents() {
 }
 
 window.selectAgent = async function(agentName) {
+    const previousAgentName = selectedAgentName;
     selectedAgentName = agentName;
 
     // Set host agent routing in API layer
@@ -807,6 +809,7 @@ window.selectAgent = async function(agentName) {
     // bump any generation; only within-agent context changes
     // (clear/new chat, conversation switch, delete) do.
     mountChatPane(agentName);
+    onVoiceAgentSwitch(previousAgentName, agentName);
 
     // Refresh the chat-input "Thinking…" indicator + send/input disabled
     // state from the new agent's waiting status. If the previous agent

@@ -269,6 +269,10 @@ export async function createPipelineClient({
     return capture ? capture.getLevel() : 0;
   }
 
+  function setMuted(muted) {
+    try { playback?.setMuted?.(muted); } catch (_) {}
+  }
+
   return {
     path: 'pipeline',
     start,
@@ -277,6 +281,7 @@ export async function createPipelineClient({
     updateInstructions,
     commitToolResult,
     getInputLevel,
+    setMuted,
     /** Live mic stream — lets the UI attach an AnalyserNode for the meter. */
     get micStream() {
       return capture?.micStream ?? null;

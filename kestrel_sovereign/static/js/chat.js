@@ -788,6 +788,9 @@ export function mountChatPane(agentName) {
     // Detach the currently-mounted pane (if any), saving its scroll.
     if (deps().state.mountedChatAgent !== undefined) {
         const current = deps().state.chatPanes.get(deps().state.mountedChatAgent);
+        if (current && messageInput) {
+            current.draftText = messageInput.value;
+        }
         if (current && current.element.parentNode === container) {
             current.scrollPos = container.scrollTop;
             current.element.remove();
@@ -803,6 +806,9 @@ export function mountChatPane(agentName) {
 
     // Restore scroll to where the user left this agent's conversation.
     container.scrollTop = target.scrollPos;
+    if (messageInput) {
+        messageInput.value = target.draftText || '';
+    }
 
     // Mermaid finalization was deferred while the pane was detached —
     // some renderers refuse to operate on disconnected nodes. Render
