@@ -25,6 +25,7 @@
 
 import API from '../api.js';
 import { addMessage, addMessageStreaming, finalizeStreamingMessage } from '../chat.js';
+import { getOrCreateChatPane } from '../ui.js';
 import { Events } from './events.js';
 import { createRealtimeClient } from './realtime.js';
 import { createPipelineClient } from './pipeline.js';
@@ -67,22 +68,54 @@ const STATE_GLYPH = {
 
 
 // ---------------------------------------------------------------------------
-// Module-level handles to rendered DOM + active client
+// Module-level handles to rendered DOM + per-agent sessions
 // ---------------------------------------------------------------------------
 
 let buttonEl = null;
-// `agentMsgDiv` holds the in-flight agent chat message during a voice turn so
-// AGENT_TEXT_DELTA events can stream into it. Reset to null when finalized.
-let agentMsgDiv = null;
-let agentTextBuffer = '';
-let userMsgDiv = null;
-let userTranscriptBuffer = '';
 let pathBadgeEl = null;
 let pickerModalEl = null;
 let privacyBannerEl = null;
 
-let client = null;       // active createRealtimeClient or createPipelineClient
-let currentState = State.IDLE;
+const sessionByAgent = new Map();
+
+function createSession(agent) {
+  return {
+    agent,
+    client: null,
+    state: State.IDLE,
+    agentMsgDiv: null,
+    agentTextBuffer: '',
+    userMsgDiv: null,
+    userTranscriptBuffer: '',
+    pathLabel: '',
+    pathTooltip: '',
+    realtimeModel: '',
+    ownsSelector: false,
+    startSeq: 0,
+  };
+}
+
+function sessionForAgent(agent) {
+  const key = agent === undefined ? currentAgentKey() : agent;
+  let session = sessionByAgent.get(key);
+  if (!session) {
+    session = createSession(key);
+    sessionByAgent.set(key, session);
+  }
+  return session;
+}
+
+function activeSession() {
+  return sessionForAgent(currentAgentKey());
+}
+
+function paneForSession(session) {
+  return getOrCreateChatPane(session.agent);
+}
+
+function isActiveSession(session) {
+  return session.agent === currentAgentKey();
+}
 
 // User-overridable session settings, persisted to localStorage so they survive
 // page reloads.  Voice is picked from the provider's list; instructions is the
@@ -137,6 +170,11 @@ function currentAgentKey() {
   try { return API.getHostAgent() || null; } catch (_) { return null; }
 }
 
+function buildAgentUrlForAgent(path, agent) {
+  if (!agent) return path;
+  return `/api/agents/${encodeURIComponent(agent)}${path}`;
+}
+
 function settings() {
   // Lazy accessor — always resolves against the CURRENT host agent.
   // Caches by agent so repeated reads in a single render don't re-parse
@@ -170,7 +208,7 @@ export function initVoiceUI() {
   mountButton(header);
   mountStatusIndicator();
   mountPickerModal();
-  setState(State.IDLE);
+  applyActiveSessionState();
 
   // Push-to-talk: hold spacebar (when not in a text input) to start voice.
   bindGlobalShortcuts();
@@ -180,11 +218,49 @@ export function initVoiceUI() {
   // chat-model selector lock so the next page load isn't stuck on the
   // Realtime model.  See #1371.  ``pagehide`` is the bfcache-safe spelling
   // of unload; ``visibilitychange``→hidden catches mobile background.
-  const onLeave = () => releaseSelectorOwnership();
+  const onLeave = () => releaseSelectorOwnership(activeSession());
   window.addEventListener('pagehide', onLeave);
   window.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'hidden') onLeave();
   });
+}
+
+export function onAgentSwitch(prevAgent, nextAgent) {
+  // No-op until the voice UI is actually mounted. When chat/voice capability
+  // is disabled, initVoiceUI() returns before creating `buttonEl`, but
+  // selectAgent() still fires this hook — and applyActiveSessionState() →
+  // setState() would dereference the null `buttonEl` and crash the switch.
+  if (!buttonEl) return;
+  const prevSession = sessionForAgent(prevAgent);
+  const nextSession = sessionForAgent(nextAgent);
+  const prevPane = getOrCreateChatPane(prevAgent);
+  prevPane.micArmed = prevSession.state !== State.IDLE && prevSession.state !== State.ERROR;
+  if (prevSession.ownsSelector) releaseSelectorOwnership(prevSession);
+
+  applyActiveSessionPolicy();
+  applyActiveSessionState();
+
+  const nextPane = getOrCreateChatPane(nextAgent);
+  if (nextPane.micArmed && nextSession.client && nextSession.realtimeModel) {
+    acquireSelectorOwnership(nextSession.realtimeModel, nextSession);
+  }
+}
+
+// Re-lock the chat-model selector to the active agent's live Realtime session.
+// `selectAgent()` calls `loadModels()` AFTER `onAgentSwitch()`, and loadModels
+// rebuilds `window._sharedModelSelector` from scratch — discarding any lock
+// onAgentSwitch just acquired. Without re-locking, switching back to an agent
+// with a running Realtime session leaves the mic live but the selector
+// editable, letting the user swap the chat model out from under voice. Call
+// this once the model list (and its selector) has been rebuilt.
+export function reapplyActiveSelectorLock() {
+  if (!buttonEl) return;  // voice UI not mounted — nothing can hold the lock
+  const session = activeSession();
+  // Pipeline sessions don't own the selector (no realtimeModel), so this is a
+  // no-op for them — only a live Realtime session re-locks.
+  if (session.client && session.realtimeModel) {
+    acquireSelectorOwnership(session.realtimeModel, session);
+  }
 }
 
 
@@ -308,14 +384,36 @@ function mountPickerModal() {
 // ---------------------------------------------------------------------------
 
 
-function setState(next) {
-  currentState = next;
+function setState(next, session = activeSession()) {
+  session.state = next;
+  if (!isActiveSession(session)) return;
   buttonEl.textContent = STATE_GLYPH[next];
   buttonEl.title = STATE_LABELS[next];
   buttonEl.setAttribute('aria-label', STATE_LABELS[next]);
   buttonEl.dataset.state = next;
   // Path/privacy badge visible whenever a session is in progress.
   if (pathBadgeEl) pathBadgeEl.hidden = next === State.IDLE;
+}
+
+function applyActiveSessionState() {
+  const session = activeSession();
+  setState(session.state, session);
+  setPathBadge(session.pathLabel, session.pathTooltip);
+}
+
+// Enforce the single-active-agent policy across every live session: only the
+// agent on screen is audible (output) AND heard (input). Backgrounded sessions
+// stay connected but are muted both ways, so the user's speech is never routed
+// to — nor hidden turns created under — an agent they've switched away from.
+// Input gating is the load-bearing half: muting only output would leave a
+// background agent silently transcribing the user.
+function applyActiveSessionPolicy() {
+  const active = currentAgentKey();
+  for (const [agent, session] of sessionByAgent.entries()) {
+    const background = agent !== active;
+    try { session.client?.setMuted?.(background); } catch (_) {}
+    try { session.client?.setInputMuted?.(background); } catch (_) {}
+  }
 }
 
 
@@ -325,7 +423,8 @@ function setState(next) {
 
 
 async function toggleSession() {
-  if (currentState === State.IDLE || currentState === State.ERROR) {
+  const session = activeSession();
+  if (session.state === State.IDLE || session.state === State.ERROR) {
     await startSession();
   } else {
     await stopSession();
@@ -356,7 +455,8 @@ function _chatModelSelector() {
 }
 
 
-function acquireSelectorOwnership(realtimeModelId) {
+function acquireSelectorOwnership(realtimeModelId, session = activeSession()) {
+  if (!isActiveSession(session)) return;
   const sel = _chatModelSelector();
   if (!sel || typeof sel.lockToVoiceModel !== 'function') return;
   // OpenAI is the only Realtime vendor today; if that ever changes the
@@ -365,25 +465,46 @@ function acquireSelectorOwnership(realtimeModelId) {
     { vendor: 'openai', model: realtimeModelId },
     '🎙 voice owns this — stop voice to change',
   );
+  session.realtimeModel = realtimeModelId;
+  session.ownsSelector = true;
 }
 
 
-function releaseSelectorOwnership() {
+function releaseSelectorOwnership(session = activeSession()) {
+  if (!session.ownsSelector) return;
   const sel = _chatModelSelector();
-  if (!sel || typeof sel.unlockToPrior !== 'function') return;
-  sel.unlockToPrior();
+  if (sel && typeof sel.unlockToPrior === 'function') {
+    sel.unlockToPrior();
+  }
+  session.ownsSelector = false;
 }
 
 
 async function startSession() {
-  setState(State.CONNECTING);
-  resetTurnState();
+  const session = activeSession();
+  const agent = session.agent;
+  // Pin the initiating agent's settings NOW. settings() resolves against the
+  // CURRENT host agent, and the route/mint work below has awaits — if the user
+  // switches agents mid-startup, a bare settings() call would resolve against
+  // the new agent and we'd mint agent A's session with agent B's voice/config.
+  const pinnedSettings = settings();
+  // Monotonic start token: lets late events from a superseded same-agent client
+  // (notably an old client's async-teardown SESSION_CLOSED) be ignored so they
+  // can't clobber a newer session. Bumped per start, captured in `onEvent`.
+  session.startSeq = (session.startSeq || 0) + 1;
+  const startSeq = session.startSeq;
+  setState(State.CONNECTING, session);
+  resetTurnState(session);
   setPathBadge('', '');
+  session.pathLabel = '';
+  session.pathTooltip = '';
+  session.realtimeModel = '';
+  getOrCreateChatPane(agent).micArmed = true;
 
-  const onEvent = handleClientEvent;
+  const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
 
   // Apply user picker overrides (mode + TTS) to drive routing.
-  const overrides = pickerOverridesFromUI(settings().mode || 'auto', settings().preferred_tts || '');
+  const overrides = pickerOverridesFromUI(pinnedSettings.mode || 'auto', pinnedSettings.preferred_tts || '');
 
   // If the user explicitly picked Pipeline, skip Realtime entirely. The
   // previous flow round-tripped to /voice/realtime/session, ate a 409,
@@ -392,28 +513,37 @@ async function startSession() {
   // Mode selection is the user's contract — honor it.
   if (overrides.prefer_realtime !== false) {
     try {
-      client = await createRealtimeClient({
+      session.client = await createRealtimeClient({
         onEvent,
         // Rewrite to /api/agents/<host>/voice/realtime/session in multi_agent
         // mode; identity in standalone mode.
-        endpoint: API.buildAgentUrl('/voice/realtime/session'),
+        endpoint: buildAgentUrlForAgent('/voice/realtime/session', agent),
         getAuthHeaders: voiceAuthHeaders,
         sessionRequestBody: {
-          voice: settings().voice || '',
-          user_instructions: settings().instructions || '',
+          voice: pinnedSettings.voice || '',
+          user_instructions: pinnedSettings.instructions || '',
           prefer_realtime: overrides.prefer_realtime,
           preferred_tts: overrides.preferred_tts || '',
         },
       });
-      await client.start();
-      const realtimeModel = client.session?.model || 'gpt-realtime';
+      await session.client.start();
+      session.client.setMuted?.(!isActiveSession(session));
+      session.client.setInputMuted?.(!isActiveSession(session));
+      applyActiveSessionPolicy();
+      const realtimeModel = session.client.session?.model || 'gpt-realtime';
+      session.realtimeModel = realtimeModel;
       // Take ownership of the chat-model selector for the lifetime of this
       // session.  Acquired AFTER ``start()`` so a failed mint doesn't strand
       // the selector locked.  See #1371.
-      acquireSelectorOwnership(realtimeModel);
-      setPathBadge(
-        `Realtime · ${realtimeModel}`,
-        `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`,
+      acquireSelectorOwnership(realtimeModel, session);
+      const label = `Realtime · ${realtimeModel}`;
+      const tooltip =
+        `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`;
+      session.pathLabel = label;
+      session.pathTooltip = tooltip;
+      if (isActiveSession(session)) setPathBadge(
+        label,
+        tooltip,
       );
       return;
     } catch (err) {
@@ -424,13 +554,13 @@ async function startSession() {
           fallback.fallback_tts &&
           fallback.fallback_stt;
         if (!canUsePipeline) {
-          surfaceFatalError(new Error(fallback.reason || err.message || 'Voice unavailable'));
+          surfaceFatalError(new Error(fallback.reason || err.message || 'Voice unavailable'), session);
           return;
         }
         console.info('[voice/ui] Realtime declined, falling back to Pipeline:', fallback.reason);
-        client = null;
+        session.client = null;
       } else {
-        surfaceFatalError(err);
+        surfaceFatalError(err, session);
         return;
       }
     }
@@ -440,51 +570,64 @@ async function startSession() {
 
   // Pipeline path.
   try {
-    client = await createPipelineClient({
+    session.client = await createPipelineClient({
       onEvent,
       apiKey: API.getApiKey() || '',
-      wsPath: API.buildAgentUrl('/voice/chat'),
+      wsPath: buildAgentUrlForAgent('/voice/chat', agent),
       // Honor the picker's voice + provider choice. Without these the server
       // falls back to its config-file voice and the picker is decorative.
-      voiceId: settings().voice || '',
-      preferredTts: (overrides && overrides.preferred_tts) || settings().preferred_tts || '',
+      voiceId: pinnedSettings.voice || '',
+      preferredTts: (overrides && overrides.preferred_tts) || pinnedSettings.preferred_tts || '',
       // Pin STT to the browser's primary language tag (e.g. "en-US" → "en")
       // so Whisper doesn't hallucinate language switches mid-utterance.
       language: (navigator.language || 'en').split('-')[0],
     });
-    await client.start();
-    setPathBadge('Pipeline', 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.');
+    await session.client.start();
+    session.client.setMuted?.(!isActiveSession(session));
+    session.client.setInputMuted?.(!isActiveSession(session));
+    applyActiveSessionPolicy();
+    session.pathLabel = 'Pipeline';
+    session.pathTooltip = 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.';
+    if (isActiveSession(session)) setPathBadge(session.pathLabel, session.pathTooltip);
   } catch (err) {
-    surfaceFatalError(err);
+    surfaceFatalError(err, session);
   }
 }
 
 
-async function stopSession() {
-  const c = client;
-  client = null;
-  setState(State.IDLE);
+async function stopSession(session = activeSession()) {
+  const c = session.client;
+  session.client = null;
+  session.pathLabel = '';
+  session.pathTooltip = '';
+  getOrCreateChatPane(session.agent).micArmed = false;
+  setState(State.IDLE, session);
+  if (isActiveSession(session)) setPathBadge('', '');
   // Release the chat-model selector lock BEFORE awaiting close so the user
   // sees their text model restored immediately, even if the WebRTC teardown
   // hangs.  Release is idempotent: the SESSION_CLOSED handler below will be
   // a noop if this already restored.
-  releaseSelectorOwnership();
+  releaseSelectorOwnership(session);
   if (c) {
     try { await c.close(); } catch (_) {}
   }
 }
 
 
-function surfaceFatalError(err) {
+function surfaceFatalError(err, session = activeSession()) {
   console.error('[voice/ui] fatal voice error:', err);
-  setState(State.ERROR);
+  setState(State.ERROR, session);
   // Surface as an agent message so the user sees it inline with the chat.
-  addMessage('agent', `⚠ Voice error: ${formatVoiceError(err)}`);
-  client = null;
+  addMessage('agent', `⚠ Voice error: ${formatVoiceError(err)}`, paneForSession(session).element);
+  session.client = null;
+  session.pathLabel = '';
+  session.pathTooltip = '';
+  getOrCreateChatPane(session.agent).micArmed = false;
+  if (isActiveSession(session)) setPathBadge('', '');
   // Restore the chat-model selector — fatal errors take a different code
   // path than stopSession() but the lock still needs releasing or the user
   // is stranded on the Realtime model for the next text turn.  See #1371.
-  releaseSelectorOwnership();
+  releaseSelectorOwnership(session);
 }
 
 
@@ -512,21 +655,28 @@ function formatVoiceError(err) {
 // ---------------------------------------------------------------------------
 
 
-function handleClientEvent(ev) {
+function handleClientEvent(agent, ev, startSeq) {
+  const session = sessionForAgent(agent);
+  // Drop events from a superseded client: a newer startSession() on this agent
+  // bumped `session.startSeq`, so a stale client's late events — especially an
+  // async-teardown SESSION_CLOSED — must not clear the newer session's client,
+  // path state, or selector lock. `startSeq` is always set by the start-bound
+  // `onEvent`; the undefined guard is belt-and-suspenders for any other caller.
+  if (startSeq !== undefined && session.startSeq !== startSeq) return;
   // Apply the pure state transition first so the mic-button visual updates
   // before any DOM mutation below.
-  const nextState = nextStateForEvent(currentState, ev.kind, ev);
-  if (nextState !== null) setState(nextState);
+  const nextState = nextStateForEvent(session.state, ev.kind, ev);
+  if (nextState !== null) setState(nextState, session);
 
   switch (ev.kind) {
     // User-side transcript: reserve/update one user bubble per voice turn.
     // Realtime can start the agent answer before final transcription arrives;
     // the reserved bubble keeps the visual order as user -> agent.
     case Events.USER_TRANSCRIPT_DELTA:
-      updateUserTurn(ev.text || '');
+      updateUserTurn(session, ev.text || '');
       break;
     case Events.USER_TRANSCRIPT_FINAL:
-      finalizeUserTurn(ev.text || userTranscriptBuffer);
+      finalizeUserTurn(session, ev.text || session.userTranscriptBuffer);
       break;
 
     // SPEAKING_STARTED marks the start of a NEW agent response (mapped
@@ -536,19 +686,19 @@ function handleClientEvent(ev) {
     // close it now. Without this, AGENT_TEXT_DELTA for the new turn
     // appends to the old bubble forever.
     case Events.SPEAKING_STARTED:
-      if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
-      ensureUserTurn();
+      if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
+      ensureUserTurn(session);
       break;
 
     // LISTENING_STARTED (user begins speaking) is also an unambiguous
     // "current agent turn is over" signal. Same defensive close.
     case Events.LISTENING_STARTED:
-      if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
-      if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
+      if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
+      if (session.userMsgDiv) finalizeUserTurn(session, session.userTranscriptBuffer);
       break;
 
     case Events.LISTENING_STOPPED:
-      ensureUserTurn();
+      ensureUserTurn(session);
       break;
 
     // Agent reply streams into a single message bubble. AGENT_TEXT_DELTA
@@ -556,25 +706,25 @@ function handleClientEvent(ev) {
     // the next turn.
     case Events.AGENT_TEXT_DELTA:
       if (ev.text) {
-        if (!agentMsgDiv) {
-          agentMsgDiv = addMessageStreaming('agent');
-          agentTextBuffer = '';
+        if (!session.agentMsgDiv) {
+          session.agentMsgDiv = addMessageStreaming('agent', paneForSession(session).element);
+          session.agentTextBuffer = '';
         }
-        agentTextBuffer += ev.text;
-        const contentDiv = agentMsgDiv.querySelector('.message-content');
-        if (contentDiv) contentDiv.textContent = agentTextBuffer;
+        session.agentTextBuffer += ev.text;
+        const contentDiv = session.agentMsgDiv.querySelector('.message-content');
+        if (contentDiv) contentDiv.textContent = session.agentTextBuffer;
       }
       break;
     case Events.AGENT_TEXT_FINAL:
-      finalizeAgentTurn(ev.text || agentTextBuffer);
+      finalizeAgentTurn(session, ev.text || session.agentTextBuffer);
       break;
     case Events.RESPONSE_DONE:
-      if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
-      finalizeAgentTurn(agentTextBuffer);
+      if (session.userMsgDiv) finalizeUserTurn(session, session.userTranscriptBuffer);
+      finalizeAgentTurn(session, session.agentTextBuffer);
       break;
 
     case Events.TOOL_CALL_REQUESTED:
-      handleToolCall(ev).catch((err) => {
+      handleToolCall(session, ev).catch((err) => {
         console.error('[voice/ui] tool dispatch failed:', err);
       });
       break;
@@ -582,19 +732,24 @@ function handleClientEvent(ev) {
     case Events.SESSION_CLOSED:
       // Drop any in-flight agent message back into the chat so the user
       // sees what they got even if the session ended mid-response.
-      if (userMsgDiv) finalizeUserTurn(userTranscriptBuffer);
-      if (agentMsgDiv) finalizeAgentTurn(agentTextBuffer);
+      if (session.userMsgDiv) finalizeUserTurn(session, session.userTranscriptBuffer);
+      if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
+      session.client = null;
+      session.pathLabel = '';
+      session.pathTooltip = '';
+      getOrCreateChatPane(session.agent).micArmed = false;
+      if (isActiveSession(session)) setPathBadge('', '');
       // Belt-and-suspenders selector restore.  ``stopSession`` and
       // ``surfaceFatalError`` already release, but events like
       // ``data_channel_closed`` (network drop, server-side close) reach us
       // through here without going through either site.  Idempotent — see
       // #1371.
-      releaseSelectorOwnership();
+      releaseSelectorOwnership(session);
       break;
 
     case Events.ERROR:
       if (ev.fatal) {
-        surfaceFatalError(new Error(ev.message));
+        surfaceFatalError(new Error(ev.message), session);
       } else {
         // Non-fatal: log to console; don't pollute chat history.
         console.warn('[voice/ui]', ev.message);
@@ -609,49 +764,52 @@ function handleClientEvent(ev) {
 }
 
 
-function finalizeAgentTurn(text) {
-  const div = agentMsgDiv;
+function finalizeAgentTurn(session, text) {
+  const div = session.agentMsgDiv;
   const buf = text || '';
-  agentMsgDiv = null;
-  agentTextBuffer = '';
+  session.agentMsgDiv = null;
+  session.agentTextBuffer = '';
   if (!div) {
-    if (buf.trim()) addMessage('agent', buf);
+    if (buf.trim()) addMessage('agent', buf, paneForSession(session).element);
     return;
   }
-  // Use the chat module's finalizer so markdown / code blocks / mermaid
-  // get the same treatment as text-chat agent messages.
-  finalizeStreamingMessage(div, buf).catch((err) =>
+  // Use the chat module's finalizer so markdown / code blocks / mermaid get
+  // the same treatment as text-chat agent messages. Pass the full pane so
+  // pane targeting AND deferred-mermaid-on-mount work for a detached pane,
+  // but with includePaneArtifacts:false so this pane's text-chat thinking
+  // bubbles / tool cards aren't prepended onto the voice bubble.
+  finalizeStreamingMessage(div, buf, paneForSession(session), { includePaneArtifacts: false }).catch((err) =>
     console.error('[voice/ui] finalize failed:', err),
   );
 }
 
 
-function ensureUserTurn() {
-  if (userMsgDiv) return;
-  userMsgDiv = addMessageStreaming('user');
-  userTranscriptBuffer = '';
-  const contentDiv = userMsgDiv.querySelector('.message-content');
+function ensureUserTurn(session) {
+  if (session.userMsgDiv) return;
+  session.userMsgDiv = addMessageStreaming('user', paneForSession(session).element);
+  session.userTranscriptBuffer = '';
+  const contentDiv = session.userMsgDiv.querySelector('.message-content');
   if (contentDiv) contentDiv.textContent = 'Transcribing...';
 }
 
 
-function updateUserTurn(text) {
-  ensureUserTurn();
-  userTranscriptBuffer = text || userTranscriptBuffer;
-  const contentDiv = userMsgDiv?.querySelector('.message-content');
-  if (contentDiv && userTranscriptBuffer.trim()) {
-    contentDiv.textContent = userTranscriptBuffer;
+function updateUserTurn(session, text) {
+  ensureUserTurn(session);
+  session.userTranscriptBuffer = text || session.userTranscriptBuffer;
+  const contentDiv = session.userMsgDiv?.querySelector('.message-content');
+  if (contentDiv && session.userTranscriptBuffer.trim()) {
+    contentDiv.textContent = session.userTranscriptBuffer;
   }
 }
 
 
-function finalizeUserTurn(text) {
-  const div = userMsgDiv;
+function finalizeUserTurn(session, text) {
+  const div = session.userMsgDiv;
   const buf = (text || '').trim();
-  userMsgDiv = null;
-  userTranscriptBuffer = '';
+  session.userMsgDiv = null;
+  session.userTranscriptBuffer = '';
   if (!div) {
-    if (buf) addMessage('user', buf);
+    if (buf) addMessage('user', buf, paneForSession(session).element);
     return;
   }
 
@@ -667,11 +825,11 @@ function finalizeUserTurn(text) {
 }
 
 
-function resetTurnState() {
-  agentMsgDiv = null;
-  agentTextBuffer = '';
-  userMsgDiv = null;
-  userTranscriptBuffer = '';
+function resetTurnState(session = activeSession()) {
+  session.agentMsgDiv = null;
+  session.agentTextBuffer = '';
+  session.userMsgDiv = null;
+  session.userTranscriptBuffer = '';
 }
 
 
@@ -682,18 +840,21 @@ function resetTurnState() {
 // ---------------------------------------------------------------------------
 
 
-async function handleToolCall(ev) {
-  // Capture the client at function entry. The module-level `client` can be
+async function handleToolCall(session, ev) {
+  // Capture the client at function entry. The per-agent session client can be
   // nulled by stopSession()/surfaceFatalError() during the await on the
-  // tool-dispatch fetch — without this snapshot, commitToolResult below
-  // crashes with `Cannot read properties of null (reading 'commitToolResult')`.
-  const sessionClient = client;
+  // tool-dispatch fetch; without this snapshot, commitToolResult below would
+  // crash on a closed session.
+  const sessionClient = session.client;
   if (!sessionClient || !sessionClient.session?.session_id) {
     console.warn('[voice/ui] tool call before session ready:', ev);
     return;
   }
   const sessionId = sessionClient.session.session_id;
-  const url = API.buildAgentUrl(`/voice/realtime/tools/${encodeURIComponent(sessionId)}`);
+  const url = buildAgentUrlForAgent(
+    `/voice/realtime/tools/${encodeURIComponent(sessionId)}`,
+    session.agent,
+  );
   let body;
   try {
     const resp = await fetch(url, {
@@ -716,7 +877,7 @@ async function handleToolCall(ev) {
   // If the session ended while we were awaiting the dispatch, the model is
   // gone and there's nowhere to commit. Drop silently — the model already
   // closed.
-  if (sessionClient !== client) {
+  if (sessionClient !== session.client) {
     console.info('[voice/ui] session ended before tool result; dropping commit');
     return;
   }
@@ -1114,8 +1275,9 @@ function savePicker() {
   // If a session is active, push the new instructions immediately —
   // Realtime accepts session.update mid-call. Voice/path change requires a
   // new session (OpenAI Realtime can't hot-swap voice or model).
-  if (client && instructions) {
-    try { client.updateInstructions(instructions); } catch (_) {}
+  const session = sessionForAgent(agent);
+  if (session.client && instructions) {
+    try { session.client.updateInstructions(instructions); } catch (_) {}
   }
   closePicker();
 }
@@ -1195,18 +1357,24 @@ async function fetchProviderReason(providerName) {
 
 function bindGlobalShortcuts() {
   let spaceHeld = false;
+  // The session push-to-talk started on. The user can switch agents while
+  // holding Space, so keyup must stop the SAME session it started — not
+  // whatever happens to be active on release — or A's session leaks.
+  let pttSession = null;
   document.addEventListener('keydown', (ev) => {
+    const session = activeSession();
     // Esc: stop active session from anywhere.
-    if (ev.key === 'Escape' && currentState !== State.IDLE) {
+    if (ev.key === 'Escape' && session.state !== State.IDLE) {
       ev.preventDefault();
-      stopSession();
+      stopSession(session);
       return;
     }
     // Space: only when focus isn't in a text input — avoids stealing
     // typing on the message input.
     if (ev.code === 'Space' && !isTypingTarget(ev.target) && !ev.repeat) {
-      if (currentState === State.IDLE && !spaceHeld) {
+      if (session.state === State.IDLE && !spaceHeld) {
         spaceHeld = true;
+        pttSession = session;
         ev.preventDefault();
         startSession();
       }
@@ -1215,9 +1383,12 @@ function bindGlobalShortcuts() {
   document.addEventListener('keyup', (ev) => {
     if (ev.code === 'Space' && spaceHeld) {
       spaceHeld = false;
-      // Push-to-talk release stops the session. Users who prefer a
-      // long-running session can click the button instead.
-      if (currentState !== State.IDLE) stopSession();
+      // Push-to-talk release stops the session it started, even if the user
+      // switched agents while holding Space. Users who prefer a long-running
+      // session can click the button instead.
+      const target = pttSession;
+      pttSession = null;
+      if (target && target.state !== State.IDLE) stopSession(target);
     }
   });
 }

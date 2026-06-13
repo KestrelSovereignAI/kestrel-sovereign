@@ -194,6 +194,8 @@ export function getOrCreateChatPane(agentName) {
         thinkingItems: [],
         sessionId: null,
         scrollPos: 0,
+        draftText: '',
+        micArmed: false,
         hasUnrenderedMermaid: false,
         pendingRevise: false,
         reviseConsumedRequestId: null,

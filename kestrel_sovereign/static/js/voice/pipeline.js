@@ -75,6 +75,10 @@ export async function createPipelineClient({
   let playback = null;
   let closed = false;
   let sessionReady = false;
+  // When true, captured mic frames are dropped instead of sent — used to
+  // disarm a backgrounded agent's input so the user's speech isn't routed to
+  // an agent they've switched away from.
+  let inputMuted = false;
 
   /** Translate a server control message to a Kestrel voice event. */
   function handleControl(msg) {
@@ -155,6 +159,7 @@ export async function createPipelineClient({
     playback = await createVoicePlayback({ sampleRate });
 
     capture.onchunk((pcm) => {
+      if (inputMuted) return;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       try {
         ws.send(encodeAudioFrame(pcm));
@@ -269,6 +274,16 @@ export async function createPipelineClient({
     return capture ? capture.getLevel() : 0;
   }
 
+  function setMuted(muted) {
+    try { playback?.setMuted?.(muted); } catch (_) {}
+  }
+
+  // Gate the OUTGOING mic path: dropped frames never reach the server, so a
+  // backgrounded agent stops transcribing the user without closing the socket.
+  function setInputMuted(muted) {
+    inputMuted = !!muted;
+  }
+
   return {
     path: 'pipeline',
     start,
@@ -277,6 +292,8 @@ export async function createPipelineClient({
     updateInstructions,
     commitToolResult,
     getInputLevel,
+    setMuted,
+    setInputMuted,
     /** Live mic stream — lets the UI attach an AnalyserNode for the meter. */
     get micStream() {
       return capture?.micStream ?? null;

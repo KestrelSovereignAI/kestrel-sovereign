@@ -379,6 +379,19 @@ export async function createRealtimeClient({
     return 0;
   }
 
+  function setMuted(muted) {
+    if (audioSink) audioSink.muted = !!muted;
+  }
+
+  // Gate the OUTGOING mic path. Disabling the local audio track makes WebRTC
+  // transmit silence, so a backgrounded agent stops hearing the user (no
+  // hidden turns under its pane/privacy mode) without tearing down the peer
+  // connection — re-enabling resumes instantly on return.
+  function setInputMuted(muted) {
+    if (!micStream) return;
+    for (const t of micStream.getAudioTracks()) t.enabled = !muted;
+  }
+
   return {
     path: 'realtime',
     start,
@@ -388,6 +401,8 @@ export async function createRealtimeClient({
     updateInstructions,
     commitToolResult,
     getInputLevel,
+    setMuted,
+    setInputMuted,
     /** MediaStream of remote agent audio — for UI meters / visualizers. */
     get remoteStream() {
       return audioSink?.srcObject ?? null;

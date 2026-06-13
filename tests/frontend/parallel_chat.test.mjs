@@ -175,6 +175,25 @@ test('mid-stream return: chunks dispatched to A keep landing in A\'s pane while 
         "B's pane must remain untouched by A's stream");
 });
 
+test('message drafts are preserved per mounted agent pane', () => {
+    apiModule.default.setHostAgent('draft-A');
+    mountChatPane('draft-A');
+    messageInput.value = 'half-written A';
+
+    apiModule.default.setHostAgent('draft-B');
+    mountChatPane('draft-B');
+    assert.equal(messageInput.value, '');
+    messageInput.value = 'separate B';
+
+    apiModule.default.setHostAgent('draft-A');
+    mountChatPane('draft-A');
+    assert.equal(messageInput.value, 'half-written A');
+
+    apiModule.default.setHostAgent('draft-B');
+    mountChatPane('draft-B');
+    assert.equal(messageInput.value, 'separate B');
+});
+
 test('background completion fires a Toast when the dispatch agent is no longer visible', async () => {
     getOrCreateChatPane('toast-A');
     getOrCreateChatPane('toast-B');

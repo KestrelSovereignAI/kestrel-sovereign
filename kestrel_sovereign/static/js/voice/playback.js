@@ -35,7 +35,9 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     numberOfOutputs: 1,
     outputChannelCount: [1],
   });
-  node.connect(ctx.destination);
+  const gain = ctx.createGain();
+  node.connect(gain);
+  gain.connect(ctx.destination);
 
   // Pre-roll: hold the first N ms of audio before connecting so short initial
   // chunks don't stutter. We implement this by buffering on main until
@@ -92,8 +94,12 @@ export async function createVoicePlayback({ sampleRate = 24000, preRollMs = 400 
     underflowCount() {
       return underflowCount;
     },
+    setMuted(muted) {
+      gain.gain.value = muted ? 0 : 1;
+    },
     async destroy() {
       try { node.disconnect(); } catch (_) {}
+      try { gain.disconnect(); } catch (_) {}
       try { await ctx.close(); } catch (_) {}
     },
   };

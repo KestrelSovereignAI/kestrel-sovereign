@@ -788,6 +788,9 @@ export function mountChatPane(agentName) {
     // Detach the currently-mounted pane (if any), saving its scroll.
     if (deps().state.mountedChatAgent !== undefined) {
         const current = deps().state.chatPanes.get(deps().state.mountedChatAgent);
+        if (current && messageInput) {
+            current.draftText = messageInput.value;
+        }
         if (current && current.element.parentNode === container) {
             current.scrollPos = container.scrollTop;
             current.element.remove();
@@ -803,6 +806,9 @@ export function mountChatPane(agentName) {
 
     // Restore scroll to where the user left this agent's conversation.
     container.scrollTop = target.scrollPos;
+    if (messageInput) {
+        messageInput.value = target.draftText || '';
+    }
 
     // Mermaid finalization was deferred while the pane was detached —
     // some renderers refuse to operate on disconnected nodes. Render
@@ -2995,7 +3001,13 @@ export function updateStreamingMessage(msgDiv, content, paneElement = null, thin
  * background-pane finalize would corrupt the visible agent's UI.
  * sendMessage gates that call on isCurrentVisible() instead.
  */
-export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = null) {
+export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = null, opts = {}) {
+    // `includePaneArtifacts`: whether to prepend THIS pane's accumulated
+    // text-chat stream artifacts (thinking bubbles, tool cards) onto the
+    // finalized bubble. Text-chat turns want this; voice turns pass the pane
+    // for targeting + mermaid deferral but set this false so a prior text
+    // turn's thinking/tool cards don't bleed into the voice reply. #1771.
+    const includePaneArtifacts = opts.includePaneArtifacts !== false;
     const contentDiv = msgDiv.querySelector('.message-content');
     if (!contentDiv) return;
 
@@ -3023,9 +3035,9 @@ export async function finalizeStreamingMessage(msgDiv, content, paneOrElement = 
     // #1659: tool cards come from the pane's accumulated structured events,
     // sliced to the same stream-baseline as ``content`` (#1560) and skipping
     // any already shown in a pre-restart bubble.
-    const toolEvents = pane ? paneStreamToolEvents(pane) : null;
+    const toolEvents = (pane && includePaneArtifacts) ? paneStreamToolEvents(pane) : null;
     await finalizeAgentContent(contentDiv, content, toolEvents);
-    const thinkingItems = pane && pane.thinkingItems ? pane.thinkingItems : [];
+    const thinkingItems = (pane && includePaneArtifacts && pane.thinkingItems) ? pane.thinkingItems : [];
     if (thinkingItems.length) {
         contentDiv.innerHTML = `${renderThinkingBubbles(thinkingItems)}${contentDiv.innerHTML}`;
         deps().markdown.highlightCodeBlocks(contentDiv, true);
