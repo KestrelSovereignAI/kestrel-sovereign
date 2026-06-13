@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import runpy
+import sys
+import types
 from pathlib import Path
 
 
@@ -50,6 +53,41 @@ def test_container_entrypoint_initializes_db_inside_agent_data_dir():
 def test_init_agent_identity_uses_db_path_as_target_directory():
     text = _read("scripts/init_agent_identity.py")
 
-    assert 'os.environ.get("KESTREL_DB_PATH", "/app/agent_data")' in text
+    assert 'os.environ.get("KESTREL_DB_PATH") or "/app/agent_data"' in text
     assert 'create_kestrel_identity(str(target_dir))' in text
     assert "target_dir = '/app'" not in text
+
+
+def test_init_agent_identity_honors_absolute_db_path_with_missing_parent(
+    monkeypatch,
+    tmp_path,
+):
+    custom_target = tmp_path / "missing-parent" / "custom-agent-data"
+    cwd = tmp_path / "cwd"
+    calls: list[str] = []
+
+    fake_inception = types.ModuleType("kestrel_sovereign.inception_service")
+
+    def fake_create_kestrel_identity(target_dir: str):
+        calls.append(target_dir)
+        return types.SimpleNamespace(
+            agent_did="did:example:test",
+            db_path=str(Path(target_dir) / "kestrel_prime.db"),
+        )
+
+    fake_inception.create_kestrel_identity = fake_create_kestrel_identity
+
+    cwd.mkdir()
+    monkeypatch.setenv("KESTREL_DB_PATH", str(custom_target))
+    monkeypatch.chdir(cwd)
+    monkeypatch.setitem(
+        sys.modules,
+        "kestrel_sovereign.inception_service",
+        fake_inception,
+    )
+
+    runpy.run_path(str(REPO_ROOT / "scripts/init_agent_identity.py"))
+
+    assert calls == [str(custom_target)]
+    assert custom_target.is_dir()
+    assert not (cwd / "agent_data").exists()

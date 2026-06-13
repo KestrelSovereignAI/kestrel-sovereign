@@ -8,10 +8,7 @@ sys.path.insert(0, '/app')
 try:
     from kestrel_sovereign.inception_service import create_kestrel_identity
     
-    target_dir = Path(os.environ.get("KESTREL_DB_PATH", "/app/agent_data"))
-    if target_dir.is_absolute() and not target_dir.parent.exists():
-        # Fallback for local testing if /app doesn't exist.
-        target_dir = Path.cwd() / "agent_data"
+    target_dir = Path(os.environ.get("KESTREL_DB_PATH") or "/app/agent_data")
     target_dir.mkdir(parents=True, exist_ok=True)
         
     creds = create_kestrel_identity(str(target_dir))
