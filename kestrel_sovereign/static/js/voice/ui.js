@@ -91,6 +91,7 @@ function createSession(agent) {
     pathTooltip: '',
     realtimeModel: '',
     ownsSelector: false,
+    startSeq: 0,
   };
 }
 
@@ -225,18 +226,40 @@ export function initVoiceUI() {
 }
 
 export function onAgentSwitch(prevAgent, nextAgent) {
+  // No-op until the voice UI is actually mounted. When chat/voice capability
+  // is disabled, initVoiceUI() returns before creating `buttonEl`, but
+  // selectAgent() still fires this hook — and applyActiveSessionState() →
+  // setState() would dereference the null `buttonEl` and crash the switch.
+  if (!buttonEl) return;
   const prevSession = sessionForAgent(prevAgent);
   const nextSession = sessionForAgent(nextAgent);
   const prevPane = getOrCreateChatPane(prevAgent);
   prevPane.micArmed = prevSession.state !== State.IDLE && prevSession.state !== State.ERROR;
   if (prevSession.ownsSelector) releaseSelectorOwnership(prevSession);
 
-  applyOutputPolicy();
+  applyActiveSessionPolicy();
   applyActiveSessionState();
 
   const nextPane = getOrCreateChatPane(nextAgent);
   if (nextPane.micArmed && nextSession.client && nextSession.realtimeModel) {
     acquireSelectorOwnership(nextSession.realtimeModel, nextSession);
+  }
+}
+
+// Re-lock the chat-model selector to the active agent's live Realtime session.
+// `selectAgent()` calls `loadModels()` AFTER `onAgentSwitch()`, and loadModels
+// rebuilds `window._sharedModelSelector` from scratch — discarding any lock
+// onAgentSwitch just acquired. Without re-locking, switching back to an agent
+// with a running Realtime session leaves the mic live but the selector
+// editable, letting the user swap the chat model out from under voice. Call
+// this once the model list (and its selector) has been rebuilt.
+export function reapplyActiveSelectorLock() {
+  if (!buttonEl) return;  // voice UI not mounted — nothing can hold the lock
+  const session = activeSession();
+  // Pipeline sessions don't own the selector (no realtimeModel), so this is a
+  // no-op for them — only a live Realtime session re-locks.
+  if (session.client && session.realtimeModel) {
+    acquireSelectorOwnership(session.realtimeModel, session);
   }
 }
 
@@ -378,10 +401,18 @@ function applyActiveSessionState() {
   setPathBadge(session.pathLabel, session.pathTooltip);
 }
 
-function applyOutputPolicy() {
+// Enforce the single-active-agent policy across every live session: only the
+// agent on screen is audible (output) AND heard (input). Backgrounded sessions
+// stay connected but are muted both ways, so the user's speech is never routed
+// to — nor hidden turns created under — an agent they've switched away from.
+// Input gating is the load-bearing half: muting only output would leave a
+// background agent silently transcribing the user.
+function applyActiveSessionPolicy() {
   const active = currentAgentKey();
   for (const [agent, session] of sessionByAgent.entries()) {
-    try { session.client?.setMuted?.(agent !== active); } catch (_) {}
+    const background = agent !== active;
+    try { session.client?.setMuted?.(background); } catch (_) {}
+    try { session.client?.setInputMuted?.(background); } catch (_) {}
   }
 }
 
@@ -452,6 +483,16 @@ function releaseSelectorOwnership(session = activeSession()) {
 async function startSession() {
   const session = activeSession();
   const agent = session.agent;
+  // Pin the initiating agent's settings NOW. settings() resolves against the
+  // CURRENT host agent, and the route/mint work below has awaits — if the user
+  // switches agents mid-startup, a bare settings() call would resolve against
+  // the new agent and we'd mint agent A's session with agent B's voice/config.
+  const pinnedSettings = settings();
+  // Monotonic start token: lets late events from a superseded same-agent client
+  // (notably an old client's async-teardown SESSION_CLOSED) be ignored so they
+  // can't clobber a newer session. Bumped per start, captured in `onEvent`.
+  session.startSeq = (session.startSeq || 0) + 1;
+  const startSeq = session.startSeq;
   setState(State.CONNECTING, session);
   resetTurnState(session);
   setPathBadge('', '');
@@ -460,10 +501,10 @@ async function startSession() {
   session.realtimeModel = '';
   getOrCreateChatPane(agent).micArmed = true;
 
-  const onEvent = (ev) => handleClientEvent(agent, ev);
+  const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
 
   // Apply user picker overrides (mode + TTS) to drive routing.
-  const overrides = pickerOverridesFromUI(settings().mode || 'auto', settings().preferred_tts || '');
+  const overrides = pickerOverridesFromUI(pinnedSettings.mode || 'auto', pinnedSettings.preferred_tts || '');
 
   // If the user explicitly picked Pipeline, skip Realtime entirely. The
   // previous flow round-tripped to /voice/realtime/session, ate a 409,
@@ -476,18 +517,19 @@ async function startSession() {
         onEvent,
         // Rewrite to /api/agents/<host>/voice/realtime/session in multi_agent
         // mode; identity in standalone mode.
-        endpoint: API.buildAgentUrl('/voice/realtime/session'),
+        endpoint: buildAgentUrlForAgent('/voice/realtime/session', agent),
         getAuthHeaders: voiceAuthHeaders,
         sessionRequestBody: {
-          voice: settings().voice || '',
-          user_instructions: settings().instructions || '',
+          voice: pinnedSettings.voice || '',
+          user_instructions: pinnedSettings.instructions || '',
           prefer_realtime: overrides.prefer_realtime,
           preferred_tts: overrides.preferred_tts || '',
         },
       });
       await session.client.start();
       session.client.setMuted?.(!isActiveSession(session));
-      applyOutputPolicy();
+      session.client.setInputMuted?.(!isActiveSession(session));
+      applyActiveSessionPolicy();
       const realtimeModel = session.client.session?.model || 'gpt-realtime';
       session.realtimeModel = realtimeModel;
       // Take ownership of the chat-model selector for the lifetime of this
@@ -531,18 +573,19 @@ async function startSession() {
     session.client = await createPipelineClient({
       onEvent,
       apiKey: API.getApiKey() || '',
-      wsPath: API.buildAgentUrl('/voice/chat'),
+      wsPath: buildAgentUrlForAgent('/voice/chat', agent),
       // Honor the picker's voice + provider choice. Without these the server
       // falls back to its config-file voice and the picker is decorative.
-      voiceId: settings().voice || '',
-      preferredTts: (overrides && overrides.preferred_tts) || settings().preferred_tts || '',
+      voiceId: pinnedSettings.voice || '',
+      preferredTts: (overrides && overrides.preferred_tts) || pinnedSettings.preferred_tts || '',
       // Pin STT to the browser's primary language tag (e.g. "en-US" → "en")
       // so Whisper doesn't hallucinate language switches mid-utterance.
       language: (navigator.language || 'en').split('-')[0],
     });
     await session.client.start();
     session.client.setMuted?.(!isActiveSession(session));
-    applyOutputPolicy();
+    session.client.setInputMuted?.(!isActiveSession(session));
+    applyActiveSessionPolicy();
     session.pathLabel = 'Pipeline';
     session.pathTooltip = 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.';
     if (isActiveSession(session)) setPathBadge(session.pathLabel, session.pathTooltip);
@@ -552,8 +595,7 @@ async function startSession() {
 }
 
 
-async function stopSession() {
-  const session = activeSession();
+async function stopSession(session = activeSession()) {
   const c = session.client;
   session.client = null;
   session.pathLabel = '';
@@ -613,8 +655,14 @@ function formatVoiceError(err) {
 // ---------------------------------------------------------------------------
 
 
-function handleClientEvent(agent, ev) {
+function handleClientEvent(agent, ev, startSeq) {
   const session = sessionForAgent(agent);
+  // Drop events from a superseded client: a newer startSession() on this agent
+  // bumped `session.startSeq`, so a stale client's late events — especially an
+  // async-teardown SESSION_CLOSED — must not clear the newer session's client,
+  // path state, or selector lock. `startSeq` is always set by the start-bound
+  // `onEvent`; the undefined guard is belt-and-suspenders for any other caller.
+  if (startSeq !== undefined && session.startSeq !== startSeq) return;
   // Apply the pure state transition first so the mic-button visual updates
   // before any DOM mutation below.
   const nextState = nextStateForEvent(session.state, ev.kind, ev);
@@ -725,9 +773,12 @@ function finalizeAgentTurn(session, text) {
     if (buf.trim()) addMessage('agent', buf, paneForSession(session).element);
     return;
   }
-  // Use the chat module's finalizer so markdown / code blocks / mermaid
-  // get the same treatment as text-chat agent messages.
-  finalizeStreamingMessage(div, buf, paneForSession(session)).catch((err) =>
+  // Use the chat module's finalizer so markdown / code blocks / mermaid get
+  // the same treatment as text-chat agent messages. Pass the full pane so
+  // pane targeting AND deferred-mermaid-on-mount work for a detached pane,
+  // but with includePaneArtifacts:false so this pane's text-chat thinking
+  // bubbles / tool cards aren't prepended onto the voice bubble.
+  finalizeStreamingMessage(div, buf, paneForSession(session), { includePaneArtifacts: false }).catch((err) =>
     console.error('[voice/ui] finalize failed:', err),
   );
 }
@@ -1306,12 +1357,16 @@ async function fetchProviderReason(providerName) {
 
 function bindGlobalShortcuts() {
   let spaceHeld = false;
+  // The session push-to-talk started on. The user can switch agents while
+  // holding Space, so keyup must stop the SAME session it started — not
+  // whatever happens to be active on release — or A's session leaks.
+  let pttSession = null;
   document.addEventListener('keydown', (ev) => {
     const session = activeSession();
     // Esc: stop active session from anywhere.
     if (ev.key === 'Escape' && session.state !== State.IDLE) {
       ev.preventDefault();
-      stopSession();
+      stopSession(session);
       return;
     }
     // Space: only when focus isn't in a text input — avoids stealing
@@ -1319,6 +1374,7 @@ function bindGlobalShortcuts() {
     if (ev.code === 'Space' && !isTypingTarget(ev.target) && !ev.repeat) {
       if (session.state === State.IDLE && !spaceHeld) {
         spaceHeld = true;
+        pttSession = session;
         ev.preventDefault();
         startSession();
       }
@@ -1327,9 +1383,12 @@ function bindGlobalShortcuts() {
   document.addEventListener('keyup', (ev) => {
     if (ev.code === 'Space' && spaceHeld) {
       spaceHeld = false;
-      // Push-to-talk release stops the session. Users who prefer a
-      // long-running session can click the button instead.
-      if (activeSession().state !== State.IDLE) stopSession();
+      // Push-to-talk release stops the session it started, even if the user
+      // switched agents while holding Space. Users who prefer a long-running
+      // session can click the button instead.
+      const target = pttSession;
+      pttSession = null;
+      if (target && target.state !== State.IDLE) stopSession(target);
     }
   });
 }

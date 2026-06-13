@@ -8,7 +8,7 @@ import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
-import { onAgentSwitch as onVoiceAgentSwitch } from './voice/ui.js';
+import { onAgentSwitch as onVoiceAgentSwitch, reapplyActiveSelectorLock } from './voice/ui.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -861,6 +861,11 @@ window.selectAgent = async function(agentName) {
         loadCommands(API),
         updateContextStatus(),
     ]);
+
+    // loadModels() above rebuilt the chat-model selector, discarding any lock
+    // onVoiceAgentSwitch() acquired. Re-lock to the now-active agent's live
+    // Realtime session (no-op otherwise) so voice keeps owning the model.
+    reapplyActiveSelectorLock();
 
     // Reload the currently active panel (its cached state was cleared above)
     const panel = state.currentPanel;
