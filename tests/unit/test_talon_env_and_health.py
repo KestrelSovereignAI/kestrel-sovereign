@@ -31,6 +31,9 @@ def test_build_subprocess_env_strips_anthropic_keys(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "tok-bad")
     monkeypatch.setenv("CLAUDE_API_KEY", "ck-bad")
     monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    # Clear any pre-existing GitHub token vars to isolate the test
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_PAT", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_test_token")
 
     env = TalonCoordinatorFeature._build_subprocess_env()
@@ -105,6 +108,9 @@ async def test_talon_health_runs_help_and_reports_success(monkeypatch, tmp_path)
     requiring kestrel-talon installed on the test runner.
     """
     monkeypatch.setenv("ANTHROPIC_API_KEY", "should-not-be-passed")
+    # Clear any pre-existing GitHub token vars to isolate the test
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_PAT", raising=False)
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
 
     fake_bin = tmp_path / "kestrel-talon"
