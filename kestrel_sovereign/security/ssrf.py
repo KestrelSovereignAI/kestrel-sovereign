@@ -8,21 +8,36 @@ services. This module resolves the target host and rejects any address that
 falls in a private / loopback / link-local / reserved range (which covers the
 common metadata endpoints, e.g. 169.254.169.254 and IPv6 ULAs).
 
-It blocks the literal-private-IP and metadata-hostname cases. A determined
-DNS-rebinding attacker can still race resolution vs. connection (TOCTOU); pinning
-the validated IP into the connection is tracked as follow-up #1746 — this guard
-closes the directly-exploitable holes the review flagged.
+Validation returns the exact public IP selected for the outbound connection.
+Callers that fetch the URL must use the pinned transport/opener helpers below
+so DNS is not repeated after validation (DNS-rebinding TOCTOU, #1746).
 """
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
+import errno
+import http.client
 import ipaddress
 import socket
+from typing import Any
 from urllib.parse import urlparse
+import urllib.request
 
 
 class SSRFError(ValueError):
     """Raised when an outbound URL targets a disallowed (non-public) address."""
+
+
+@dataclass(frozen=True)
+class ValidatedOutboundURL:
+    """URL validation result with the resolved IP that must be used to connect."""
+
+    url: str
+    scheme: str
+    host: str
+    port: int
+    ip_address: ipaddress._BaseAddress
 
 
 def _address_is_blocked(ip: ipaddress._BaseAddress) -> bool:
@@ -55,11 +70,15 @@ def _resolve_addresses(host: str, port: int) -> "list[ipaddress._BaseAddress]":
     return [ipaddress.ip_address(info[4][0]) for info in infos]
 
 
-def validate_outbound_url(url: str, *, allowed_schemes: "tuple[str, ...]" = ("http", "https")) -> None:
+def validate_outbound_url(
+    url: str, *, allowed_schemes: "tuple[str, ...]" = ("http", "https")
+) -> ValidatedOutboundURL:
     """Validate ``url`` for a server-side fetch; raise :class:`SSRFError` if unsafe.
 
     Synchronous (uses ``socket.getaddrinfo``). Prefer :func:`assert_safe_url` in
-    async code so DNS resolution doesn't block the event loop.
+    async code so DNS resolution doesn't block the event loop. The returned
+    :class:`ValidatedOutboundURL` contains the public IP that passed validation;
+    fetchers must connect to that IP instead of resolving the hostname again.
     """
     # Malformed URLs (bad port, invalid IPv6 literal, …) make urlparse/.port
     # raise ValueError; convert to SSRFError so callers get a clean rejection
@@ -84,19 +103,161 @@ def validate_outbound_url(url: str, *, allowed_schemes: "tuple[str, ...]" = ("ht
         ip = ipaddress.ip_address(host)
         if _address_is_blocked(ip):
             raise SSRFError(f"URL host {host} is a non-public address")
-        return
+        return ValidatedOutboundURL(
+            url=url, scheme=scheme, host=host, port=port, ip_address=ip
+        )
     except ValueError:
         pass  # not a literal IP — resolve it
 
-    for ip in _resolve_addresses(host, port):
+    resolved = _resolve_addresses(host, port)
+    if not resolved:
+        raise SSRFError(f"cannot resolve host {host!r}: no addresses returned")
+    for ip in resolved:
         if _address_is_blocked(ip):
             raise SSRFError(
                 f"URL host {host!r} resolves to a non-public address ({ip})"
             )
+    return ValidatedOutboundURL(
+        url=url, scheme=scheme, host=host, port=port, ip_address=resolved[0]
+    )
 
 
-async def assert_safe_url(url: str, *, allowed_schemes: "tuple[str, ...]" = ("http", "https")) -> None:
+async def assert_safe_url(
+    url: str, *, allowed_schemes: "tuple[str, ...]" = ("http", "https")
+) -> ValidatedOutboundURL:
     """Async wrapper: validate ``url`` off the event loop (DNS in a thread)."""
-    await asyncio.get_running_loop().run_in_executor(
+    return await asyncio.get_running_loop().run_in_executor(
         None, lambda: validate_outbound_url(url, allowed_schemes=allowed_schemes)
+    )
+
+
+class _PinnedAsyncNetworkBackend:
+    """httpcore network backend that dials the validated IP for one origin."""
+
+    def __init__(self, validated: ValidatedOutboundURL):
+        from httpcore._backends.anyio import AnyIOBackend
+
+        self._validated = validated
+        self._backend = AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ):
+        if host != self._validated.host or port != self._validated.port:
+            raise SSRFError(
+                f"pinned transport refused connection to unexpected origin {host}:{port}"
+            )
+        return await self._backend.connect_tcp(
+            host=str(self._validated.ip_address),
+            port=port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ):
+        raise SSRFError("pinned transport does not allow Unix-socket connections")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+def pinned_httpx_async_transport(validated: ValidatedOutboundURL):
+    """Build an httpx async transport that connects to ``validated.ip_address``.
+
+    The request URL remains unchanged, so httpcore still uses the original host
+    for the HTTP Host header, TLS SNI, and certificate hostname verification.
+    """
+    import httpcore
+    import httpx
+    from httpx._config import DEFAULT_LIMITS, create_ssl_context
+
+    class _PinnedAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+        def __init__(self) -> None:
+            ssl_context = create_ssl_context(verify=True, cert=None, trust_env=True)
+            self._pool = httpcore.AsyncConnectionPool(
+                ssl_context=ssl_context,
+                max_connections=DEFAULT_LIMITS.max_connections,
+                max_keepalive_connections=DEFAULT_LIMITS.max_keepalive_connections,
+                keepalive_expiry=DEFAULT_LIMITS.keepalive_expiry,
+                http1=True,
+                http2=False,
+                network_backend=_PinnedAsyncNetworkBackend(validated),
+            )
+
+    return _PinnedAsyncHTTPTransport()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection that dials a pinned IP but verifies the original host."""
+
+    def __init__(
+        self,
+        host: str,
+        *args: Any,
+        validated: ValidatedOutboundURL,
+        **kwargs: Any,
+    ) -> None:
+        self._validated = validated
+        super().__init__(host, *args, **kwargs)
+
+    def connect(self) -> None:
+        if self.host != self._validated.host or self.port != self._validated.port:
+            raise OSError(
+                f"pinned opener refused connection to unexpected origin "
+                f"{self.host}:{self.port}"
+            )
+
+        self.sock = self._create_connection(
+            (str(self._validated.ip_address), self.port),
+            self.timeout,
+            self.source_address,
+        )
+        try:
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError as e:
+            if e.errno != errno.ENOPROTOOPT:
+                raise
+
+        if self._tunnel_host:
+            self._tunnel()
+            server_hostname = self._tunnel_host
+        else:
+            server_hostname = self.host
+
+        self.sock = self._context.wrap_socket(
+            self.sock, server_hostname=server_hostname
+        )
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, validated: ValidatedOutboundURL):
+        super().__init__()
+        self._validated = validated
+
+    def https_open(self, req):
+        def connection_factory(host: str, *args: Any, **kwargs: Any):
+            return _PinnedHTTPSConnection(
+                host, *args, validated=self._validated, **kwargs
+            )
+
+        return self.do_open(connection_factory, req, context=self._context)
+
+
+def pinned_urllib_https_opener(validated: ValidatedOutboundURL, *handlers: Any):
+    """Build a direct urllib opener that pins HTTPS TCP dials to validated IP."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        *handlers,
+        _PinnedHTTPSHandler(validated),
     )

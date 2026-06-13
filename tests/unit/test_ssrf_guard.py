@@ -5,8 +5,11 @@ import pytest
 
 from kestrel_sovereign.security.ssrf import (
     SSRFError,
+    ValidatedOutboundURL,
     validate_outbound_url,
     _address_is_blocked,
+    _PinnedAsyncNetworkBackend,
+    _PinnedHTTPSConnection,
 )
 import ipaddress
 
@@ -72,6 +75,82 @@ class TestValidateOutboundUrl:
         # never an uncaught ValueError (→ 500).
         with pytest.raises(SSRFError):
             validate_outbound_url(bad)
+
+    def test_validation_returns_pinned_public_ip(self, monkeypatch):
+        def fake_getaddrinfo(host, port, proto=0):
+            assert host == "assets.example"
+            assert port == 443
+            return [
+                (None, None, None, None, ("93.184.216.34", port)),
+            ]
+
+        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+        validated = validate_outbound_url("https://assets.example/avatar.png")
+
+        assert validated.host == "assets.example"
+        assert validated.port == 443
+        assert str(validated.ip_address) == "93.184.216.34"
+
+
+class TestPinnedConnections:
+    @pytest.mark.asyncio
+    async def test_httpx_backend_dials_pinned_ip_not_hostname(self, monkeypatch):
+        calls = []
+
+        async def fake_connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            calls.append((host, port))
+            return object()
+
+        monkeypatch.setattr(
+            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+            fake_connect_tcp,
+        )
+        validated = validate_outbound_url("https://93.184.216.34/avatar.png")
+        backend = _PinnedAsyncNetworkBackend(validated)
+
+        await backend.connect_tcp(validated.host, validated.port)
+
+        assert calls == [("93.184.216.34", 443)]
+
+    def test_urllib_connection_dials_pinned_ip_with_original_sni(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/.well-known/did.json",
+            scheme="https",
+            host="example.test",
+            port=443,
+            ip_address=ipaddress.ip_address("93.184.216.34"),
+        )
+        conn = _PinnedHTTPSConnection("example.test", validated=validated)
+        dialed = []
+        wrapped = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+        class FakeContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        def fake_create_connection(address, timeout, source_address):
+            dialed.append(address)
+            return FakeSocket()
+
+        conn._create_connection = fake_create_connection
+        conn._context = FakeContext()
+
+        conn.connect()
+
+        assert dialed == [("93.184.216.34", 443)]
+        assert wrapped == ["example.test"]
 
 
 class TestDidWebSSRF:

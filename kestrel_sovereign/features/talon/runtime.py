@@ -256,8 +256,8 @@ def sanitize_env_for_backend(
             "kestrel-talon needs GITHUB_TOKEN, GH_TOKEN, or GITHUB_PAT "
             "in the kestrel-sovereign environment to access GitHub."
         )
-    env.setdefault("GITHUB_TOKEN", gh_token)
-    env.setdefault("GH_TOKEN", gh_token)
+    env["GITHUB_TOKEN"] = gh_token
+    env["GH_TOKEN"] = gh_token
     return env, tuple(stripped)
 
 
