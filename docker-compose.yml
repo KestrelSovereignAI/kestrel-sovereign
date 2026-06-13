@@ -13,8 +13,7 @@ services:
     environment:
       - KESTREL_ENV=test
       - IPFS_API_URL=${IPFS_API_URL:-http://ipfs:5001}
-      # KESTREL_DB_PATH path reconciliation tracked separately (see follow-up).
-      - KESTREL_DB_PATH=/usr/src/app/kestrel.db
+      - KESTREL_DB_PATH=/app/agent_data
       - KESTREL_IDENTITY_PATH=/usr/src/app/kestrel_did.json
     volumes:
       - ./agent_data:/app/agent_data
@@ -29,4 +28,4 @@ services:
       - ipfs_data:/data/ipfs
 
 volumes:
-  ipfs_data: 
+  ipfs_data:

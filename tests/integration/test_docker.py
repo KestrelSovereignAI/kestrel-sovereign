@@ -7,6 +7,7 @@ container starts up properly with health checks passing.
 Run with: pytest -m docker tests/integration/test_docker.py
 """
 import os
+import shutil
 import subprocess
 import time
 import tempfile
@@ -29,6 +30,34 @@ except ImportError:
 
 IMAGE_TAG = "kestrel:test"
 CONTAINER_NAME = "kestrel-docker-test"
+RUN_DOCKER_TESTS = os.environ.get("KESTREL_TEST_DOCKER", "").lower() in {
+    "1",
+    "true",
+    "yes",
+}
+
+
+def docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    result = subprocess.run(
+        ["docker", "info"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return result.returncode == 0
+
+
+def docker_compose_available() -> bool:
+    if not docker_available():
+        return False
+    result = subprocess.run(
+        ["docker", "compose", "version"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def wait_for_health(url: str, timeout: float = 30.0, interval: float = 1.0) -> bool:
@@ -49,7 +78,10 @@ def wait_for_health(url: str, timeout: float = 30.0, interval: float = 1.0) -> b
     return False
 
 
-@pytest.mark.skip(reason="Infrastructure test - takes too long for regular runs. Use pytest -m docker to run explicitly.")
+@pytest.mark.skipif(
+    not RUN_DOCKER_TESTS or not docker_available(),
+    reason="Docker e2e test; set KESTREL_TEST_DOCKER=1 and run pytest -m docker.",
+)
 @pytest.mark.docker
 @pytest.mark.integration
 def test_docker_healthcheck():
@@ -77,7 +109,7 @@ def test_docker_healthcheck():
             "docker", "run",
             "--cidfile", cidfile,
             "--name", CONTAINER_NAME,
-            "-p", "7777:7777",
+            "-p", "8888:8888",
             "-v", f"{agent_dir}:/app/agent_data",
             IMAGE_TAG
         ])
@@ -102,14 +134,15 @@ def test_docker_healthcheck():
                 print(f"📝 Registered container with ID: {resource_id}")
 
             # Wait for health check with condition-based wait
-            health_ok = wait_for_health("http://127.0.0.1:7777/health", timeout=30.0)
+            health_ok = wait_for_health("http://127.0.0.1:8888/health", timeout=30.0)
             assert health_ok, "Health check did not return 200 within timeout"
 
             # Verify health response content
-            resp = requests.get("http://127.0.0.1:7777/health", timeout=5)
+            resp = requests.get("http://127.0.0.1:8888/health", timeout=5)
             assert resp.status_code == 200
             data = resp.json()
             assert "status" in data
+            assert (Path(agent_dir) / "kestrel_prime.db").exists()
 
         finally:
             # Clean up container properly
@@ -141,8 +174,68 @@ def test_docker_healthcheck():
                 os.unlink(cidfile)
 
 
+@pytest.mark.skipif(
+    not RUN_DOCKER_TESTS or not docker_compose_available(),
+    reason="Docker Compose e2e test; set KESTREL_TEST_DOCKER=1 and run pytest -m docker.",
+)
+@pytest.mark.docker
+@pytest.mark.integration
+def test_docker_compose_fresh_boot_initializes_mounted_agent_data():
+    """Fresh compose boot writes the DB where the server later reads it."""
+    project_name = f"kestrel-dbpath-{os.getpid()}"
 
+    with tempfile.TemporaryDirectory() as temp_root:
+        temp_root_path = Path(temp_root)
+        agent_dir = temp_root_path / "agent_data"
+        agent_dir.mkdir()
+        override_path = temp_root_path / "compose.override.yml"
+        override_path.write_text(
+            "services:\n"
+            "  kestrel_app:\n"
+            "    volumes:\n"
+            f"      - {agent_dir}:/app/agent_data\n",
+            encoding="utf-8",
+        )
 
+        compose_cmd = [
+            "docker",
+            "compose",
+            "-p",
+            project_name,
+            "-f",
+            str(project_root / "docker-compose.yml"),
+            "-f",
+            str(override_path),
+        ]
 
+        up = subprocess.run(
+            [*compose_cmd, "up", "--build", "-d", "kestrel_app"],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+            timeout=300,
+        )
+        assert up.returncode == 0, f"docker compose up failed: {up.stderr}\n{up.stdout}"
 
-
+        try:
+            health_ok = wait_for_health("http://127.0.0.1:8888/health", timeout=180.0)
+            logs = subprocess.run(
+                [*compose_cmd, "logs", "--no-color", "kestrel_app"],
+                capture_output=True,
+                text=True,
+                cwd=project_root,
+                timeout=30,
+            )
+            assert health_ok, (
+                "Compose health check did not return 200 within timeout.\n"
+                f"Logs:\n{logs.stdout}\n{logs.stderr}"
+            )
+            assert (agent_dir / "kestrel_prime.db").exists()
+        finally:
+            subprocess.run(
+                [*compose_cmd, "down", "-v"],
+                capture_output=True,
+                text=True,
+                cwd=project_root,
+                timeout=60,
+            )

@@ -105,7 +105,7 @@ Once running, access the Kestrel agent at:
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `KESTREL_DB_PATH` | Path to agent database | `/app/kestrel.db` |
+| `KESTREL_DB_PATH` | Agent data directory containing `kestrel_prime.db` | `/app/agent_data` |
 | `OPENAI_API_KEY` | OpenAI API key | - |
 | `ANTHROPIC_API_KEY` | Anthropic API key | - |
 | `OLLAMA_HOST` | Ollama server address | `0.0.0.0:11434` |
