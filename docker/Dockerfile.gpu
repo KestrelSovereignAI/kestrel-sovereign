@@ -3,7 +3,7 @@
 FROM --platform=linux/amd64 nvidia/cuda:11.8.0-runtime-ubuntu20.04
 
 # Set environment variables
-ENV KESTREL_DB_PATH=/app/kestrel.db
+ENV KESTREL_DB_PATH=/app/agent_data
 ENV KESTREL_IDENTITY_PATH=/app/kestrel_did.json
 ENV KESTREL_ENV=production
 ENV PYTHONUNBUFFERED=1

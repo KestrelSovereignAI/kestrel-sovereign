@@ -2,8 +2,11 @@
 # Startup script for Kestrel Agent container
 # Runs the web server in background and provides terminal chat interface
 
+export KESTREL_DB_PATH="${KESTREL_DB_PATH:-/app/agent_data}"
+mkdir -p "$KESTREL_DB_PATH"
+
 # Check if agent database exists, if not create one
-if [ ! -f "/app/kestrel.db" ]; then
+if [ ! -f "$KESTREL_DB_PATH/kestrel_prime.db" ]; then
     echo "No agent database found. Creating new Kestrel agent..."
     /app/.venv/bin/python /app/scripts/init_agent_identity.py
 fi
@@ -23,9 +26,6 @@ if [ -t 0 ]; then
     echo "Web UI available at http://localhost:8888"
     echo "Terminal chat interface active. Type your messages below."
     echo "Type '!quit' to exit."
-
-    # Set database path for chat
-    export KESTREL_DB_PATH=/app/kestrel.db
 
     # Run the terminal chat interface
     /app/.venv/bin/python -m kestrel_sovereign.main
