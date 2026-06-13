@@ -237,15 +237,50 @@ class TestSQLiteBackend:
 
         await in_txn.wait()
         await asyncio.sleep(0.05)  # give the writer a chance to (wrongly) proceed
-        # The writer is blocked on the write lock: only the transaction's own
-        # uncommitted row is visible on this connection.
+        # The writer is blocked on the write lock, and this sibling read sees
+        # only committed rows rather than the transaction's uncommitted row.
         mid = await backend.fetch_all("SELECT id FROM t ORDER BY id")
-        assert mid == [(1,)]
+        assert mid == []
+        assert not t2.done()
 
         release.set()
         await asyncio.gather(t1, t2)
         final = await backend.fetch_all("SELECT id FROM t ORDER BY id")
         assert final == [(1,), (2,)]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_reader_does_not_see_uncommitted_transaction(self, backend):
+        """#1745: sibling reads must not observe another task's uncommitted
+        rows on SQLite's shared write connection."""
+        import asyncio
+
+        await backend.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        in_txn = asyncio.Event()
+        release = asyncio.Event()
+
+        async def txn_task():
+            async with backend.transaction():
+                await backend.execute("INSERT INTO t (id, v) VALUES (1, 'a')")
+                owner_mid = await backend.fetch_all("SELECT id FROM t ORDER BY id")
+                in_txn.set()
+                await release.wait()
+                return owner_mid
+
+        async def reader_task():
+            await in_txn.wait()
+            return await backend.fetch_all("SELECT id FROM t ORDER BY id")
+
+        t1 = asyncio.create_task(txn_task())
+        t2 = asyncio.create_task(reader_task())
+
+        sibling_mid = await t2
+        release.set()
+        owner_mid = await t1
+
+        assert owner_mid == [(1,)]
+        assert sibling_mid == []
+        final = await backend.fetch_all("SELECT id FROM t ORDER BY id")
+        assert final == [(1,)]
 
     @pytest.mark.asyncio
     async def test_canceled_transaction_rolls_back_and_frees_lock(self, backend):
