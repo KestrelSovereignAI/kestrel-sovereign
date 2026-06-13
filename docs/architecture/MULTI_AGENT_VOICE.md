@@ -1,6 +1,6 @@
 # Multi-Agent Voice — The Mixing Board
 
-**Status:** Draft v1 — design proposal, ready for epic creation
+**Status:** Draft v1 — design proposal. Epic: [#1767](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1767)
 **Date:** 2026-06-13
 **Author:** opus-4.8 (with @UncleSaurus)
 
