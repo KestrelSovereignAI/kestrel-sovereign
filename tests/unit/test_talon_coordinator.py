@@ -550,3 +550,257 @@ class TestTalonVerify:
             )
         assert result.status is ToolResultStatus.PARTIAL
         assert result.data["overall_state"] == "failed"
+
+    @staticmethod
+    def _init_git_repo_with_pr_branch(root):
+        """Create a git checkout whose ``pr-branch`` carries a file absent on main.
+
+        Returns the path. ``main`` has no ``marker.txt``; ``pr-branch``
+        adds it — the exact #1631 shape where a test file exists only on
+        the PR branch and not on the checked-out (main) tree.
+        """
+        import subprocess as _sp
+
+        def git(*args):
+            _sp.run(
+                ["git", *args], cwd=str(root), check=True,
+                capture_output=True, text=True,
+            )
+
+        root.mkdir(parents=True, exist_ok=True)
+        git("init", "-b", "main")
+        git("config", "user.email", "t@example.com")
+        git("config", "user.name", "Test")
+        (root / "base.txt").write_text("base\n")
+        git("add", "base.txt")
+        git("commit", "-m", "base on main")
+        git("checkout", "-b", "pr-branch")
+        (root / "marker.txt").write_text("only on pr branch\n")
+        git("add", "marker.txt")
+        git("commit", "-m", "add marker on pr-branch")
+        git("checkout", "main")
+        return root
+
+    @staticmethod
+    def _init_git_repo_with_stale_local_branch(root):
+        """Create a checkout where local feature is stale vs origin/feature."""
+        import subprocess as _sp
+
+        remote = root / "remote.git"
+        seed = root / "seed"
+        workspace = root / "workspace"
+
+        def git(cwd, *args):
+            _sp.run(
+                ["git", *args], cwd=str(cwd), check=True,
+                capture_output=True, text=True,
+            )
+
+        root.mkdir(parents=True, exist_ok=True)
+        remote.mkdir()
+        git(remote, "init", "--bare")
+
+        seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "t@example.com")
+        git(seed, "config", "user.name", "Test")
+        (seed / "base.txt").write_text("base\n")
+        git(seed, "add", "base.txt")
+        git(seed, "commit", "-m", "base on main")
+        git(seed, "remote", "add", "origin", str(remote))
+        git(seed, "push", "origin", "main")
+        git(seed, "checkout", "-b", "feature")
+        (seed / "marker.txt").write_text("remote\n")
+        git(seed, "add", "marker.txt")
+        git(seed, "commit", "-m", "remote feature marker")
+        git(seed, "push", "origin", "feature")
+        remote_sha = _sp.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(seed), check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        git(root, "clone", str(remote), str(workspace))
+        git(workspace, "config", "user.email", "t@example.com")
+        git(workspace, "config", "user.name", "Test")
+        git(workspace, "checkout", "main")
+        git(workspace, "checkout", "-b", "feature")
+        (workspace / "marker.txt").write_text("stale-local\n")
+        git(workspace, "add", "marker.txt")
+        git(workspace, "commit", "-m", "stale local feature marker")
+        git(workspace, "checkout", "main")
+        return workspace, remote_sha
+
+    @pytest.mark.asyncio
+    async def test_verify_runs_against_pr_branch_not_main(self, tmp_path):
+        """#1631: with ref set, the PR branch is checked out before running.
+
+        The executor inspects the real working tree; ``marker.txt`` exists
+        only on ``pr-branch``. Verification must run against that branch
+        (exit 0), not against the checked-out ``main`` (where the file is
+        absent and the issue's "file or directory not found" occurred).
+        """
+        from pathlib import Path
+
+        workspace = self._init_git_repo_with_pr_branch(tmp_path / "ws")
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        def make_exec(run_cwd):
+            async def _exec(command, *, timeout=600):
+                if (Path(run_cwd) / "marker.txt").exists():
+                    return CommandExecution(ran=True, returncode=0, stdout="1 passed")
+                return CommandExecution(
+                    ran=True,
+                    returncode=4,
+                    stderr="file or directory not found: marker.txt",
+                )
+
+            return _exec
+
+        with patch.object(
+            feature, "_make_verify_executor", side_effect=make_exec
+        ):
+            result = await feature.talon_verify(
+                commands="pytest marker.txt",
+                cwd=str(workspace),
+                ref="pr-branch",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["overall_state"] == "passed"
+        assert result.data["requested_ref"] == "pr-branch"
+        assert result.data["head_sha"]
+        # The actual tree was switched to the requested branch commit.
+        assert (workspace / "marker.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_verify_branch_ref_resets_stale_local_branch_to_remote(self, tmp_path):
+        """Branch refs verify the fetched remote branch, not a stale local one."""
+        import subprocess as _sp
+        from pathlib import Path
+
+        origin = tmp_path / "origin.git"
+        seed = tmp_path / "seed"
+        workspace = tmp_path / "workspace"
+
+        def git(cwd, *args):
+            _sp.run(
+                ["git", *args],
+                cwd=str(cwd),
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        _sp.run(["git", "init", "--bare", str(origin)], check=True)
+        seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "t@example.com")
+        git(seed, "config", "user.name", "Test")
+        (seed / "base.txt").write_text("base\n")
+        git(seed, "add", "base.txt")
+        git(seed, "commit", "-m", "base")
+        git(seed, "remote", "add", "origin", str(origin))
+        git(seed, "push", "-u", "origin", "main")
+
+        git(seed, "checkout", "-b", "pr-branch")
+        (seed / "marker.txt").write_text("stale\n")
+        git(seed, "add", "marker.txt")
+        git(seed, "commit", "-m", "stale marker")
+        git(seed, "push", "-u", "origin", "pr-branch")
+
+        _sp.run(["git", "clone", str(origin), str(workspace)], check=True)
+        git(workspace, "checkout", "pr-branch")
+        git(workspace, "checkout", "main")
+
+        (seed / "marker.txt").write_text("fresh\n")
+        git(seed, "add", "marker.txt")
+        git(seed, "commit", "-m", "fresh marker")
+        git(seed, "push", "origin", "pr-branch")
+
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        def make_exec(run_cwd):
+            async def _exec(command, *, timeout=600):
+                marker = Path(run_cwd) / "marker.txt"
+                if marker.read_text() == "fresh\n":
+                    return CommandExecution(ran=True, returncode=0, stdout="fresh")
+                return CommandExecution(
+                    ran=True,
+                    returncode=4,
+                    stderr=f"verified stale branch content: {marker.read_text()!r}",
+                )
+
+            return _exec
+
+        with patch.object(
+            feature, "_make_verify_executor", side_effect=make_exec
+        ):
+            result = await feature.talon_verify(
+                commands="pytest marker.txt",
+                cwd=str(workspace),
+                ref="pr-branch",
+            )
+
+        assert result.status is ToolResultStatus.OK
+        assert result.data["overall_state"] == "passed"
+        assert result.data["checked_out_ref"] == "pr-branch"
+        assert (workspace / "marker.txt").read_text() == "fresh\n"
+
+    @pytest.mark.asyncio
+    async def test_verify_unknown_ref_is_tooling_error_not_failure(self, tmp_path):
+        """A ref that can't be checked out yields tooling_error, not a code failure.
+
+        Crucially the commands must NOT run against the un-switched tree.
+        """
+        workspace = self._init_git_repo_with_pr_branch(tmp_path / "ws")
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        ran = {"called": False}
+
+        def make_exec(run_cwd):
+            async def _exec(command, *, timeout=600):
+                ran["called"] = True
+                return CommandExecution(ran=True, returncode=0)
+
+            return _exec
+
+        with patch.object(
+            feature, "_make_verify_executor", side_effect=make_exec
+        ):
+            result = await feature.talon_verify(
+                commands="uv run pytest tests/unit",
+                cwd=str(workspace),
+                ref="does-not-exist-branch",
+            )
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["overall_state"] == "tooling_error"
+        assert result.data["requested_ref"] == "does-not-exist-branch"
+        assert result.data["checked_out_ref"] is None
+        assert ran["called"] is False
+
+    @pytest.mark.asyncio
+    async def test_verify_ref_on_non_git_cwd_is_tooling_error(self, tmp_path):
+        """Requesting a ref in a non-git dir is a tooling error, not a pass."""
+        feature = TalonCoordinatorFeature(_make_agent())
+
+        async def fake_exec(command, *, timeout=600):
+            return CommandExecution(ran=True, returncode=0)
+
+        with patch.object(feature, "_make_verify_executor", return_value=fake_exec):
+            result = await feature.talon_verify(
+                commands="uv run pytest", cwd=str(tmp_path), ref="pr/1630"
+            )
+        assert result.status is ToolResultStatus.PARTIAL
+        assert result.data["overall_state"] == "tooling_error"
+
+    def test_parse_verify_ref_forms(self):
+        parse = TalonCoordinatorFeature._parse_verify_ref
+        assert parse("1630") == ("pr", "1630")
+        assert parse("#1630") == ("pr", "1630")
+        assert parse("pr/1630") == ("pr", "1630")
+        assert parse("PR-1630") == ("pr", "1630")
+        assert parse("issue-1626-restartcoordinator-busy-count") == (
+            "ref",
+            "issue-1626-restartcoordinator-busy-count",
+        )
