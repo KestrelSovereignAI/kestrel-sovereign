@@ -110,6 +110,44 @@ class SQLiteBackend(DatabaseBackend):
         if self._connection is None:
             raise ConnectionError("Not connected to database. Call connect() first.")
         return self._connection
+
+    async def _open_snapshot_read_connection(self) -> aiosqlite.Connection:
+        """Open a one-shot connection for committed reads during another task's txn."""
+        conn = await aiosqlite.connect(self.db_path, timeout=30)
+        try:
+            await conn.execute("PRAGMA busy_timeout=30000")
+            await conn.execute("PRAGMA foreign_keys=ON")
+            await conn.execute("PRAGMA query_only=ON")
+            conn.row_factory = aiosqlite.Row
+            return conn
+        except Exception:
+            await conn.close()
+            raise
+
+    @asynccontextmanager
+    async def _read_connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Return a connection with read-committed semantics for this task.
+
+        The shared aiosqlite connection must be used for normal reads and for
+        the transaction owner's reads. A different task reading that shared
+        connection while a transaction is open would see connection-local
+        uncommitted rows, so it gets a fresh connection and therefore SQLite's
+        last committed snapshot.
+        """
+        conn = self._ensure_connected()
+        if (
+            self.db_path != ":memory:"
+            and self._txn_owner is not None
+            and self._txn_owner is not asyncio.current_task()
+        ):
+            read_conn = await self._open_snapshot_read_connection()
+            try:
+                yield read_conn
+            finally:
+                await read_conn.close()
+            return
+
+        yield conn
     
     @asynccontextmanager
     async def _write_guard(self) -> AsyncIterator[None]:
@@ -174,10 +212,13 @@ class SQLiteBackend(DatabaseBackend):
     async def fetch_one(self, query: str, params: Params = ()) -> Optional[Row]:
         """Fetch a single row."""
         record_write_query(query)
-        conn = self._ensure_connected()
         try:
-            cursor = await conn.execute(query, params)
-            row = await cursor.fetchone()
+            async with self._read_connection() as conn:
+                cursor = await conn.execute(query, params)
+                try:
+                    row = await cursor.fetchone()
+                finally:
+                    await cursor.close()
             if row is None:
                 return None
             return tuple(row)
@@ -187,10 +228,13 @@ class SQLiteBackend(DatabaseBackend):
     async def fetch_all(self, query: str, params: Params = ()) -> List[Row]:
         """Fetch all rows."""
         record_write_query(query)
-        conn = self._ensure_connected()
         try:
-            cursor = await conn.execute(query, params)
-            rows = await cursor.fetchall()
+            async with self._read_connection() as conn:
+                cursor = await conn.execute(query, params)
+                try:
+                    rows = await cursor.fetchall()
+                finally:
+                    await cursor.close()
             return [tuple(row) for row in rows]
         except Exception as e:
             raise QueryError(f"Query failed: {e}\nQuery: {query}") from e
