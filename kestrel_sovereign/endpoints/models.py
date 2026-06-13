@@ -373,13 +373,21 @@ async def set_avatar(request: Request, file: Optional[UploadFile] = File(None)):
             source_url = url
             # SSRF guard (#1727): reject URLs whose host resolves to a private /
             # loopback / link-local / metadata address before fetching.
-            from kestrel_sovereign.security.ssrf import assert_safe_url, SSRFError
+            from kestrel_sovereign.security.ssrf import (
+                SSRFError,
+                assert_safe_url,
+                pinned_httpx_async_transport,
+            )
             try:
-                await assert_safe_url(url)
+                validated_url = await assert_safe_url(url)
             except SSRFError as e:
                 raise HTTPException(status_code=400, detail=f"Disallowed avatar URL: {e}")
             try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                transport = pinned_httpx_async_transport(validated_url)
+                async with httpx.AsyncClient(
+                    timeout=30.0,
+                    transport=transport,
+                ) as client:
                     resp = await client.get(url)
                     resp.raise_for_status()
                     image_data = resp.content

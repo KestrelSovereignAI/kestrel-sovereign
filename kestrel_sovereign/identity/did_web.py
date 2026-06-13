@@ -29,7 +29,7 @@ This module ships:
   and resolve each back to a ``(suite, public_key)`` pair via the
   multikey registry
 - ``resolve(did, *, fetcher)`` — pluggable fetcher for testability;
-  defaults to ``urllib.request.urlopen`` with strict HTTPS
+  defaults to urllib with strict HTTPS, no redirects, and SSRF IP pinning
 
 The resolver is intentionally library-light. Wave 2 sub-PR 4 wires
 ``inception_service`` to call ``build_did_document`` when a new agent
@@ -43,7 +43,7 @@ import json
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Tuple
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote
-from urllib.request import HTTPRedirectHandler, build_opener, urlopen
+from urllib.request import HTTPRedirectHandler
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -340,16 +340,20 @@ def _default_fetcher(url: str) -> bytes:
     # SSRF guard (#1727): the host comes from an attacker-controllable sender DID
     # (e.g. did:web:169.254.169.254 → cloud metadata). Reject non-public targets
     # before the request fires. HTTPS-only is enforced above.
-    from kestrel_sovereign.security.ssrf import validate_outbound_url, SSRFError
+    from kestrel_sovereign.security.ssrf import (
+        SSRFError,
+        pinned_urllib_https_opener,
+        validate_outbound_url,
+    )
     try:
-        validate_outbound_url(url, allowed_schemes=("https",))
+        validated_url = validate_outbound_url(url, allowed_schemes=("https",))
     except SSRFError as e:
         raise DidWebError(f"did:web resolver refused non-public URL {url!r}: {e}") from e
     # DISABLE redirects (#1727 codex r1): a public DID host could 30x-redirect to
-    # a private/metadata address, which urlopen would follow automatically —
+    # a private/metadata address, which urllib would follow automatically —
     # bypassing the guard above (only the original URL was validated). The
     # did.json must be served directly, so treat any 3xx as an error.
-    opener = build_opener(_NoRedirect)
+    opener = pinned_urllib_https_opener(validated_url, _NoRedirect)
     try:
         with opener.open(url, timeout=10) as resp:  # noqa: S310 (HTTPS + SSRF-checked)
             if resp.status != 200:

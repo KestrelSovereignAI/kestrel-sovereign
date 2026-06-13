@@ -29,7 +29,7 @@ import secrets
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Mapping, Optional, Union
+from typing import Any, Awaitable, Callable, Mapping, Optional, Protocol, Union
 
 from kestrel_sovereign.identity.hybrid_keypair import (
     HybridKeypair,
@@ -53,6 +53,21 @@ DEFAULT_MAX_AGE_SECONDS = 300
 # A resolver maps a sender DID -> its DID document (or None if unknown). It may
 # be sync or async; ``verify_inbound_envelope`` awaits awaitables.
 Resolver = Callable[[str], Union[Optional[Mapping[str, Any]], Awaitable[Optional[Mapping[str, Any]]]]]
+
+
+class ReplayNonceStore(Protocol):
+    """Shared replay-nonce reservation backend."""
+
+    async def reserve(
+        self,
+        sender: str,
+        nonce: str,
+        *,
+        now_ts: float,
+        ttl_seconds: int,
+    ) -> bool:
+        """Reserve ``(sender, nonce)``. Return False when already consumed."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -363,11 +378,10 @@ class ReplayGuard:
     timestamp — so this trades exact-body retryability for leak-free protection
     without requiring idempotent task creation.
 
-    Scope: this is a PER-PROCESS guard. It fully protects a single-process
-    deployment; in a multi-worker / multi-instance deployment a captured envelope
-    replayed to a *different* worker is not caught here. Shared cross-worker
-    replay state (a DB/Redis-backed nonce store) is tracked as follow-up
-    hardening (see epic #1720).
+    Scope: this is a PER-PROCESS guard. It is the fast path and degraded-mode
+    fallback for deployments where no shared :class:`ReplayNonceStore` is wired.
+    Multi-worker deployments should also pass a DB/Redis-backed store so every
+    recipient process shares one replay view.
     """
 
     def __init__(self, ttl_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> None:
@@ -436,6 +450,7 @@ async def verify_inbound_envelope(
     policy: VerifyPolicy = VerifyPolicy.HYBRID_REQUIRED,
     max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS,
     replay_guard: Optional[ReplayGuard] = _DEFAULT_REPLAY_GUARD,
+    replay_store: Optional[ReplayNonceStore] = None,
     now: Optional[datetime] = None,
 ) -> EnvelopeVerification:
     """Decide whether to accept an inbound A2A envelope based on its signature.
@@ -522,16 +537,42 @@ async def verify_inbound_envelope(
 
     # Signature is valid; ATOMICALLY reserve the (sender, nonce) to reject both
     # verbatim replays and concurrent duplicate submissions inside the freshness
-    # window. The reservation is the consume — deliberately no rollback (see
-    # ReplayGuard docstring): a retry after a downstream failure must be a
-    # freshly-signed envelope, which Kestrel peers produce automatically.
-    if replay_guard is not None and nonce:
+    # window. The local guard is the same-process fast path and fallback; the
+    # shared store closes the cross-worker gap when available. The reservation is
+    # the consume — deliberately no rollback (see ReplayGuard docstring).
+    if nonce:
         now_dt = now or datetime.now(timezone.utc)
-        if not replay_guard.reserve(sender, nonce, now_ts=now_dt.timestamp()):
+        now_ts = now_dt.timestamp()
+        if replay_guard is not None and not replay_guard.reserve(
+            sender, nonce, now_ts=now_ts
+        ):
             logger.warning("A2A: rejecting replayed envelope from %r (nonce reuse).", sender)
             return EnvelopeVerification(
                 ok=False, reason="replayed envelope (nonce already seen in window)"
             )
+        if replay_store is not None:
+            try:
+                reserved = await replay_store.reserve(
+                    sender,
+                    nonce,
+                    now_ts=now_ts,
+                    ttl_seconds=2 * max_age_seconds,
+                )
+            except Exception:  # noqa: BLE001 - local guard is the fallback path
+                logger.warning(
+                    "A2A: shared replay nonce store unavailable; using in-process guard only.",
+                    exc_info=True,
+                )
+            else:
+                if not reserved:
+                    logger.warning(
+                        "A2A: rejecting cross-worker replayed envelope from %r (nonce reuse).",
+                        sender,
+                    )
+                    return EnvelopeVerification(
+                        ok=False,
+                        reason="replayed envelope (nonce already seen in shared window)",
+                    )
     # Surface the verified sender+nonce on the verdict for observability/audit.
     return EnvelopeVerification(
         ok=verdict.ok, reason=verdict.reason, verified=verdict.verified,
