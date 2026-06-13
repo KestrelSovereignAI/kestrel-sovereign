@@ -46,6 +46,20 @@ def test_from_config_ignores_computer_access():
     assert privacy_config_to_mode(cfg) is PrivacyMode.NORMAL
 
 
+def test_from_deidentified_config_ignores_computer_access():
+    """Toggling computer_access must not collapse research/audit dimensions."""
+    base = privacy_mode_to_config(PrivacyMode.DEIDENTIFIED)
+    cfg = PrivacyConfig(
+        storage=base.storage,
+        processing=base.processing,
+        sharing=base.sharing,
+        assurance=base.assurance,
+        audit=base.audit,
+        computer_access=True,
+    )
+    assert privacy_config_to_mode(cfg) is PrivacyMode.DEIDENTIFIED
+
+
 def test_get_privacy_preset_unknown_raises():
     with pytest.raises(ValueError):
         get_privacy_preset("not-a-preset")

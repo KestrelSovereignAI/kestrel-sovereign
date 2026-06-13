@@ -80,7 +80,19 @@ class PrivacyPolicy:
         else:
             raise TypeError(f"Expected PrivacyMode, PrivacyConfig, or str, got {type(mode)}")
         
-        # Build policy from config flags
+        # Build policy from config flags. ``deidentified`` persistence is
+        # fail-closed until the Safe Harbor / Expert Determination evidence
+        # pipeline is in place; it must not silently degrade to full storage.
+        # When that pipeline enables writes, this branch must be replaced with
+        # evidence-backed de-identification rather than plain PII redaction.
+        if config.requires_deidentification():
+            return PrivacyPolicy(
+                allow_persistent_write=False,
+                allow_persistent_read=True,
+                require_anonymization=False,
+                use_session_storage=False,
+                allow_cloud_backup=False,
+            )
         return PrivacyPolicy(
             allow_persistent_write=config.allows_persistent_storage(),
             allow_persistent_read=True,  # Reading existing data is always allowed
@@ -92,6 +104,14 @@ class PrivacyPolicy:
     @staticmethod
     def from_config(config: PrivacyConfig) -> "PrivacyPolicy":
         """Build policy directly from PrivacyConfig."""
+        if config.requires_deidentification():
+            return PrivacyPolicy(
+                allow_persistent_write=False,
+                allow_persistent_read=True,
+                require_anonymization=False,
+                use_session_storage=False,
+                allow_cloud_backup=False,
+            )
         return PrivacyPolicy(
             allow_persistent_write=config.allows_persistent_storage(),
             allow_persistent_read=True,
@@ -357,6 +377,11 @@ class PrivacyEnforcingStorage:
             raise PrivacyViolationError(
                 "Cannot store conversations in ephemeral mode. "
                 "Use EphemeralSession for in-memory buffering."
+            )
+        if not self._policy.allow_persistent_write and not self._policy.use_session_storage:
+            raise PrivacyViolationError(
+                f"Cannot store conversations in current privacy config "
+                f"(storage={self._privacy_config.storage})."
             )
 
         processed_content = self._anonymize_if_required(content)

@@ -87,7 +87,7 @@ class TestEphemeralSession:
 
 
 class TestPrivacyModes:
-    """Test all 5 privacy modes"""
+    """Test privacy modes"""
 
     @pytest_asyncio.fixture
     async def temp_storage(self, temp_dir):
@@ -345,7 +345,7 @@ class TestPrivacyAgent:
         assert status["privacy_mode"] == "anonymous"
         assert status["pii_filtering"] is True
         assert status["backup_encryption"] == "required"
-        assert status["llm_providers"]["cloud_openai"] is True
+        assert status["llm_providers"]["cloud_openai"] is False
 
     @pytest.mark.asyncio
     async def test_ephemeral_mode_llm_restriction(self, temp_storage):

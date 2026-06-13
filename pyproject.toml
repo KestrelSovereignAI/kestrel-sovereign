@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.26.0"
+version = "0.27.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
@@ -44,8 +44,8 @@ dependencies = [
     # constitution_injection / system_prompt_budget_bytes) that chunks 1D,
     # 1F, and 1G consume. Defaults are backwards-compatible.
     #
-    # 0.19.0 floor: adds ProviderCapabilities.supports_inline_system.
-    "kestrel-sovereign-sdk>=0.20.0,<1",
+    # 0.20.1 floor: adds SDK database PrivacyMode.DEIDENTIFIED for privacy modes v2.
+    "kestrel-sovereign-sdk>=0.20.1,<1",
     # Core web framework
     "fastapi==0.136.3",
     "uvicorn==0.48.0",
@@ -184,7 +184,7 @@ observability = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-instrumentation-fastapi>=0.41b0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
-    "kestrel-sovereign-sdk[metrics]>=0.20,<1",
+    "kestrel-sovereign-sdk[metrics]>=0.20.1,<1",
 ]
 # Feature: Cloud GPU/serverless deployment (Azure only now)
 # Note: GCP Compute Engine, Vast.ai, and RunPod support are in the

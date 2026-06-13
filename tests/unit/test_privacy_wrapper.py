@@ -46,6 +46,14 @@ class TestPrivacyPolicy:
         assert policy.require_anonymization is False
         assert policy.allow_cloud_backup is True
 
+    def test_deidentified_policy_fails_closed_until_evidence_pipeline_exists(self):
+        """DEIDENTIFIED must not silently degrade to ordinary persistence."""
+        policy = PrivacyPolicy.for_mode(PrivacyMode.DEIDENTIFIED)
+        assert policy.allow_persistent_write is False
+        assert policy.require_anonymization is False
+        assert policy.use_session_storage is False
+        assert policy.allow_cloud_backup is False
+
 
 class TestEphemeralMode:
     """Tests for EPHEMERAL privacy mode enforcement."""
@@ -240,6 +248,39 @@ class TestNormalMode:
         """NORMAL mode should allow backups."""
         result = await normal_storage.create_backup_blob()
         assert result == b"backup"
+
+
+class TestDeidentifiedMode:
+    """Tests for DEIDENTIFIED fail-closed enforcement."""
+
+    @pytest.fixture
+    def mock_storage(self):
+        storage = Mock()
+        storage.add_conversation = AsyncMock()
+        storage.store_file = AsyncMock(return_value="hash123")
+        return storage
+
+    @pytest.fixture
+    def deidentified_storage(self, mock_storage):
+        return PrivacyEnforcingStorage(mock_storage, PrivacyMode.DEIDENTIFIED)
+
+    @pytest.mark.asyncio
+    async def test_blocks_conversation_until_evidence_pipeline_exists(
+        self, deidentified_storage, mock_storage
+    ):
+        with pytest.raises(PrivacyViolationError):
+            await deidentified_storage.add_conversation("user", "clinical note")
+
+        mock_storage.add_conversation.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_blocks_file_until_evidence_pipeline_exists(
+        self, deidentified_storage, mock_storage
+    ):
+        with pytest.raises(PrivacyViolationError):
+            await deidentified_storage.store_file(b"phi", "note.txt")
+
+        mock_storage.store_file.assert_not_called()
 
 
 class TestModeTransitions:

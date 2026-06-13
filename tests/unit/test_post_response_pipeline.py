@@ -16,6 +16,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 from kestrel_sovereign.agent.memory_manager import MemoryManager
+from kestrel_sovereign.privacy import PrivacyMode, privacy_mode_to_config
 from kestrel_sovereign.storage.emotional_tagger import EmotionalTagger
 from kestrel_sovereign.storage.memory_system import MemorySystem
 
@@ -340,6 +341,8 @@ class TestPostResponsePipeline:
         mm = MemoryManager(storage=MagicMock(), agent_id="did:pkh:test")
         agent.context_manager = MagicMock()
         agent.context_manager.memory_manager = mm
+        agent.privacy_agent = MagicMock()
+        agent.privacy_agent.privacy_config = privacy_mode_to_config(PrivacyMode.NORMAL)
 
         return agent
 
@@ -398,6 +401,33 @@ class TestPostResponsePipeline:
         agent._raw_storage.conversation = None
         # Should not raise
         await KestrelAgent._post_response_pipeline(agent, "hi", "hello")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mode",
+        [PrivacyMode.EPHEMERAL, PrivacyMode.ISOLATED, PrivacyMode.DEIDENTIFIED],
+    )
+    async def test_pipeline_skips_volatile_privacy_modes_before_raw_storage(
+        self, mock_agent, mode
+    ):
+        """EPHEMERAL/ISOLATED must not derive durable memory from raw turns."""
+        from kestrel_sovereign.kestrel_agent import KestrelAgent
+
+        mock_agent.privacy_agent.privacy_config = privacy_mode_to_config(mode)
+        mock_agent.memory_system.analyzer = AsyncMock()
+        mock_agent.memory_system.analyzer.detect_patterns = AsyncMock()
+        mock_agent.memory_system.linker = AsyncMock()
+        mock_agent.memory_system.linker.extract_and_link = AsyncMock()
+        mock_agent.context_manager.memory_manager.tag_exchange = AsyncMock()
+
+        await KestrelAgent._post_response_pipeline(
+            mock_agent, "private raw input", "private response", session_id="s1"
+        )
+
+        mock_agent._raw_storage.conversation.get_full_history_with_ids.assert_not_awaited()
+        mock_agent.context_manager.memory_manager.tag_exchange.assert_not_awaited()
+        mock_agent.memory_system.analyzer.detect_patterns.assert_not_awaited()
+        mock_agent.memory_system.linker.extract_and_link.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_pipeline_phase2_background_associative(self, mock_agent):

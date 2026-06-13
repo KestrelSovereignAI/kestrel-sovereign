@@ -19,8 +19,8 @@ class PrivacyAgent:
     """
     A Feature Agent that manages the Kestrel agent's privacy modes and conversation history.
     
-    Now uses PrivacyConfig with independent flags for storage, llm_location, and shareable.
-    Presets (ephemeral, isolated, anonymous, normal, public) provide named combinations.
+    Uses PrivacyConfig with independent flags for storage, processing, sharing,
+    assurance, audit, and computer access. Presets provide named combinations.
     """
 
     def __init__(self, storage: StorageProvider, initial_mode: Union[PrivacyMode, PrivacyConfig, str] = PrivacyMode.NORMAL):
@@ -88,9 +88,10 @@ class PrivacyAgent:
         mode_descriptions = {
             "ephemeral": "EPHEMERAL mode - nothing stored, local LLM only, no memory.",
             "isolated": "ISOLATED mode - temporary session storage, local LLM only.",
-            "anonymous": "ANONYMOUS mode - stored with PII removed, cloud LLM allowed.",
+            "anonymous": "ANONYMOUS mode - local LLM only, stored with PII removed.",
             "normal": "NORMAL mode - standard persistence with all features.",
-            "public": "PUBLIC mode - can be shared and exported publicly."
+            "public": "PUBLIC mode - can be shared and exported publicly.",
+            "deidentified": "DEIDENTIFIED mode - research sharing with Safe Harbor evidence required.",
         }
         
         description = mode_descriptions.get(preset_name, f"Custom config: {new_config}")
@@ -105,8 +106,10 @@ class PrivacyAgent:
         """Get the preset name for a config, or 'custom' if no match."""
         for name, preset in PRIVACY_PRESETS.items():
             if (config.storage == preset.storage and 
-                config.llm_location == preset.llm_location and
-                config.shareable == preset.shareable):
+                config.processing == preset.processing and
+                config.sharing == preset.sharing and
+                config.assurance == preset.assurance and
+                config.audit == preset.audit):
                 return name
         return "custom"
 
@@ -140,9 +143,13 @@ class PrivacyAgent:
                 message_count = stats['message_count']
             storage_location = "in-memory only"
             persistent = False
-        elif config.uses_temp_storage():
+        elif config.uses_temp_storage() or config.requires_deidentification():
             message_count = len(self.isolated_session)
-            storage_location = "temporary session"
+            storage_location = (
+                "deidentified evidence required (temporary session)"
+                if config.requires_deidentification()
+                else "temporary session"
+            )
             persistent = False
         else:
             # For persistent modes - query actual storage
@@ -162,15 +169,27 @@ class PrivacyAgent:
         }
 
         # Backup settings
-        backup_status = "disabled" if config.is_ephemeral() else "enabled"
-        backup_encryption = "required" if config.requires_anonymization() else "optional"
+        backup_status = (
+            "disabled"
+            if config.is_ephemeral() or config.requires_deidentification()
+            else "enabled"
+        )
+        backup_encryption = (
+            "required"
+            if config.requires_anonymization() or config.requires_deidentification()
+            else "optional"
+        )
 
         return {
             "privacy_mode": preset_name,
             "privacy_config": {
                 "storage": config.storage,
+                "processing": config.processing,
+                "sharing": config.sharing,
+                "assurance": config.assurance,
+                "audit": config.audit,
                 "llm_location": config.llm_location,
-                "shareable": config.shareable
+                "shareable": config.shareable,
             },
             "message_count": message_count,
             "storage_location": storage_location,
@@ -254,6 +273,13 @@ class PrivacyAgent:
             self.isolated_session.append(entry)
             return
 
+        if config.requires_deidentification():
+            entry = {"role": role, "content": content, "metadata": metadata}
+            if rendered_content is not None:
+                entry["rendered_content"] = rendered_content
+            self.isolated_session.append(entry)
+            return
+
         final_content = content
         final_rendered = rendered_content
         if config.requires_anonymization():
@@ -290,7 +316,7 @@ class PrivacyAgent:
                 return self.ephemeral_session.get_history(limit)
             return []
 
-        if config.uses_temp_storage():
+        if config.uses_temp_storage() or config.requires_deidentification():
             return self.isolated_session[-limit:] if len(self.isolated_session) > limit else self.isolated_session.copy()
 
         # For persistent modes - get from storage
@@ -329,7 +355,7 @@ class PrivacyAgent:
             return False
 
         # Isolated: only temp storage (not persistent)
-        if config.uses_temp_storage():
+        if config.uses_temp_storage() or config.requires_deidentification():
             return False
 
         # Backups have their own gate
@@ -355,7 +381,7 @@ class PrivacyAgent:
         """
         Get the current storage policy string.
 
-        Returns one of: "none", "temp", "scrubbed", "full".
+        Returns one of: "none", "temp", "pii_redacted", "deidentified", "full".
         Features use this to decide HOW to store (not IF — use can_store() for that).
         """
         return self._privacy_config.storage
@@ -378,9 +404,10 @@ class PrivacyAgent:
         mode_info = {
             PrivacyMode.EPHEMERAL: ("\U0001f512", "EPHEMERAL: Nothing stored, local LLM only"),
             PrivacyMode.ISOLATED: ("\U0001f510", "ISOLATED: Temporary session storage, local LLM only"),
-            PrivacyMode.ANONYMOUS: ("\U0001f3ad", "ANONYMOUS: Stored with PII removed, cloud LLM allowed"),
+            PrivacyMode.ANONYMOUS: ("\U0001f3ad", "ANONYMOUS: Local LLM only, stored with PII removed"),
             PrivacyMode.NORMAL: ("\U0001f4dd", "NORMAL: Standard persistent storage"),
             PrivacyMode.PUBLIC: ("\U0001f310", "PUBLIC: Shareable and exportable"),
+            PrivacyMode.DEIDENTIFIED: ("\U0001f52c", "DEIDENTIFIED: Research sharing with Safe Harbor evidence"),
         }
         icon, description = mode_info.get(mode, ("", f"Current mode: {mode.value}"))
         return f"{icon} {description}"

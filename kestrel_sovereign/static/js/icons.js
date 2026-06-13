@@ -91,6 +91,7 @@
         'explosion': '<polygon points="12 2 14 9 21 9 15 13 17 21 12 16 7 21 9 13 3 9 10 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
         'briefcase': '<rect x="2" y="7" width="20" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 7V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v2" fill="none" stroke="currentColor" stroke-width="2"/>',
         'mask': '<path d="M12 4C8 4 4 7 4 12s4 8 8 8 8-5 8-8-4-8-8-8z" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="9" cy="11" r="1.5" fill="currentColor"/><circle cx="15" cy="11" r="1.5" fill="currentColor"/><path d="M9 16c1.5 1 4.5 1 6 0" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
+        'beaker': '<path d="M9 3h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M10 3v5.5l-4.4 7.6A3 3 0 0 0 8.2 21h7.6a3 3 0 0 0 2.6-4.5L14 8.5V3" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M7.5 16h9" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>',
         'document': '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><polyline points="14 2 14 8 20 8" fill="none" stroke="currentColor" stroke-width="2"/>',
         'factory': '<path d="M2 20h20M4 20V10l5-4v4l5-4v4l5-4v14" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>',
         'feather': '<path d="M20.24 12.24a6 6 0 0 0-8.49-8.49L5 10.5V19h8.5z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><line x1="16" y1="8" x2="2" y2="22" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17.5" y1="15" x2="9" y2="15" stroke="currentColor" stroke-width="1.5"/>',
@@ -136,6 +137,7 @@
     PATHS['privacy-ephemeral'] = PATHS['lock'];
     PATHS['privacy-isolated'] = PATHS['lock-key'];
     PATHS['privacy-anonymous'] = PATHS['mask'];
+    PATHS['privacy-deidentified'] = PATHS['beaker'];
     PATHS['privacy-normal'] = PATHS['document'];
     PATHS['privacy-public'] = PATHS['globe'];
 

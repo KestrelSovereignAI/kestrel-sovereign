@@ -38,9 +38,10 @@ document.head.appendChild(styleSheet);
 export const PRIVACY_MODES = {
     ephemeral: { icon: kicon('lock'), label: 'EPHEMERAL', color: '#dc2626', description: 'Nothing stored, local LLM only' },
     isolated: { icon: kicon('lock-key'), label: 'ISOLATED', color: '#ea580c', description: 'Temporary storage, deleted on session end' },
-    anonymous: { icon: kicon('mask'), label: 'ANONYMOUS', color: '#ca8a04', description: 'Stored without PII, encrypted backups' },
+    anonymous: { icon: kicon('mask'), label: 'ANONYMOUS', color: '#ca8a04', description: 'Local only, stored with PII redacted' },
     normal: { icon: kicon('document'), label: 'NORMAL', color: '#16a34a', description: 'Standard persistence with all features' },
     public: { icon: kicon('globe'), label: 'PUBLIC', color: '#2563eb', description: 'Can be shared and exported publicly' },
+    deidentified: { icon: kicon('beaker'), label: 'DEIDENTIFIED', color: '#7c3aed', description: 'Research sharing with Safe Harbor evidence' },
 };
 
 // Commands are loaded dynamically from /api/commands
