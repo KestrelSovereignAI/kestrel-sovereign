@@ -30,6 +30,7 @@ except ImportError:
 
 IMAGE_TAG = "kestrel:test"
 CONTAINER_NAME = "kestrel-docker-test"
+DOCKER_SERVER_STARTUP_TIMEOUT = 180.0
 RUN_DOCKER_TESTS = os.environ.get("KESTREL_TEST_DOCKER", "").lower() in {
     "1",
     "true",
@@ -111,7 +112,8 @@ def test_docker_healthcheck():
             "--name", CONTAINER_NAME,
             "-p", "8888:8888",
             "-v", f"{agent_dir}:/app/agent_data",
-            IMAGE_TAG
+            IMAGE_TAG,
+            "/app/docker_entrypoint.sh",
         ])
 
         container_id = None
@@ -133,9 +135,24 @@ def test_docker_healthcheck():
                 resource_id = registry.track_docker(container_id, "kestrel-docker-test")
                 print(f"📝 Registered container with ID: {resource_id}")
 
-            # Wait for health check with condition-based wait
-            health_ok = wait_for_health("http://127.0.0.1:8888/health", timeout=30.0)
-            assert health_ok, "Health check did not return 200 within timeout"
+            # Poll the server entrypoint directly. The image default command
+            # starts Ollama and pulls a model first, which is outside this
+            # DB-path/startup assertion and can exceed test timeouts.
+            health_ok = wait_for_health(
+                "http://127.0.0.1:8888/health",
+                timeout=DOCKER_SERVER_STARTUP_TIMEOUT,
+            )
+            if not health_ok:
+                logs = subprocess.run(
+                    ["docker", "logs", container_id],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                pytest.fail(
+                    "Health check did not return 200 within timeout.\n"
+                    f"Logs:\n{logs.stdout}\n{logs.stderr}"
+                )
 
             # Verify health response content
             resp = requests.get("http://127.0.0.1:8888/health", timeout=5)
@@ -192,6 +209,7 @@ def test_docker_compose_fresh_boot_initializes_mounted_agent_data():
         override_path.write_text(
             "services:\n"
             "  kestrel_app:\n"
+            '    command: ["/app/docker_entrypoint.sh"]\n'
             "    volumes:\n"
             f"      - {agent_dir}:/app/agent_data\n",
             encoding="utf-8",
@@ -218,7 +236,10 @@ def test_docker_compose_fresh_boot_initializes_mounted_agent_data():
         assert up.returncode == 0, f"docker compose up failed: {up.stderr}\n{up.stdout}"
 
         try:
-            health_ok = wait_for_health("http://127.0.0.1:8888/health", timeout=180.0)
+            health_ok = wait_for_health(
+                "http://127.0.0.1:8888/health",
+                timeout=DOCKER_SERVER_STARTUP_TIMEOUT,
+            )
             logs = subprocess.run(
                 [*compose_cmd, "logs", "--no-color", "kestrel_app"],
                 capture_output=True,
