@@ -8,7 +8,7 @@ services. This module resolves the target host and rejects any address that
 falls in a private / loopback / link-local / reserved range (which covers the
 common metadata endpoints, e.g. 169.254.169.254 and IPv6 ULAs).
 
-Validation returns the exact public IP selected for the outbound connection.
+Validation returns the full list of public IPs selected for the outbound connection.
 Callers that fetch the URL must use the pinned transport/opener helpers below
 so DNS is not repeated after validation (DNS-rebinding TOCTOU, #1746).
 """
@@ -29,15 +29,42 @@ class SSRFError(ValueError):
     """Raised when an outbound URL targets a disallowed (non-public) address."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class ValidatedOutboundURL:
-    """URL validation result with the resolved IP that must be used to connect."""
+    """URL validation result with resolved IPs that must be used to connect."""
 
     url: str
     scheme: str
     host: str
     port: int
-    ip_address: ipaddress._BaseAddress
+    ip_addresses: tuple[ipaddress._BaseAddress, ...]
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        scheme: str,
+        host: str,
+        port: int,
+        ip_addresses: tuple[ipaddress._BaseAddress, ...] | None = None,
+        ip_address: ipaddress._BaseAddress | None = None,
+    ) -> None:
+        if ip_addresses is None:
+            if ip_address is None:
+                raise TypeError("ip_addresses or ip_address is required")
+            ip_addresses = (ip_address,)
+        elif ip_address is not None:
+            raise TypeError("pass either ip_addresses or ip_address, not both")
+        object.__setattr__(self, "url", url)
+        object.__setattr__(self, "scheme", scheme)
+        object.__setattr__(self, "host", host)
+        object.__setattr__(self, "port", port)
+        object.__setattr__(self, "ip_addresses", ip_addresses)
+
+    @property
+    def ip_address(self) -> ipaddress._BaseAddress:
+        """First validated address, retained for compatibility."""
+        return self.ip_addresses[0]
 
 
 def _address_is_blocked(ip: ipaddress._BaseAddress) -> bool:
@@ -77,8 +104,8 @@ def validate_outbound_url(
 
     Synchronous (uses ``socket.getaddrinfo``). Prefer :func:`assert_safe_url` in
     async code so DNS resolution doesn't block the event loop. The returned
-    :class:`ValidatedOutboundURL` contains the public IP that passed validation;
-    fetchers must connect to that IP instead of resolving the hostname again.
+    :class:`ValidatedOutboundURL` contains only public IPs that passed validation;
+    fetchers must connect to those IPs instead of resolving the hostname again.
     """
     # Malformed URLs (bad port, invalid IPv6 literal, …) make urlparse/.port
     # raise ValueError; convert to SSRFError so callers get a clean rejection
@@ -104,7 +131,7 @@ def validate_outbound_url(
         if _address_is_blocked(ip):
             raise SSRFError(f"URL host {host} is a non-public address")
         return ValidatedOutboundURL(
-            url=url, scheme=scheme, host=host, port=port, ip_address=ip
+            url=url, scheme=scheme, host=host, port=port, ip_addresses=(ip,)
         )
     except ValueError:
         pass  # not a literal IP — resolve it
@@ -118,7 +145,7 @@ def validate_outbound_url(
                 f"URL host {host!r} resolves to a non-public address ({ip})"
             )
     return ValidatedOutboundURL(
-        url=url, scheme=scheme, host=host, port=port, ip_address=resolved[0]
+        url=url, scheme=scheme, host=host, port=port, ip_addresses=tuple(resolved)
     )
 
 
@@ -132,7 +159,7 @@ async def assert_safe_url(
 
 
 class _PinnedAsyncNetworkBackend:
-    """httpcore network backend that dials the validated IP for one origin."""
+    """httpcore network backend that dials validated IPs for one origin."""
 
     def __init__(self, validated: ValidatedOutboundURL):
         from httpcore._backends.anyio import AnyIOBackend
@@ -152,13 +179,21 @@ class _PinnedAsyncNetworkBackend:
             raise SSRFError(
                 f"pinned transport refused connection to unexpected origin {host}:{port}"
             )
-        return await self._backend.connect_tcp(
-            host=str(self._validated.ip_address),
-            port=port,
-            timeout=timeout,
-            local_address=local_address,
-            socket_options=socket_options,
-        )
+        last_error: Exception | None = None
+        for ip in self._validated.ip_addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    host=str(ip),
+                    port=port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as e:
+                last_error = e
+        if last_error is not None:
+            raise last_error
+        raise SSRFError("pinned transport has no validated addresses")
 
     async def connect_unix_socket(
         self,
@@ -173,7 +208,7 @@ class _PinnedAsyncNetworkBackend:
 
 
 def pinned_httpx_async_transport(validated: ValidatedOutboundURL):
-    """Build an httpx async transport that connects to ``validated.ip_address``.
+    """Build an httpx async transport that connects to validated IPs.
 
     The request URL remains unchanged, so httpcore still uses the original host
     for the HTTP Host header, TLS SNI, and certificate hostname verification.
@@ -199,7 +234,7 @@ def pinned_httpx_async_transport(validated: ValidatedOutboundURL):
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPSConnection that dials a pinned IP but verifies the original host."""
+    """HTTPSConnection that dials pinned IPs but verifies the original host."""
 
     def __init__(
         self,
@@ -218,26 +253,44 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                 f"{self.host}:{self.port}"
             )
 
-        self.sock = self._create_connection(
-            (str(self._validated.ip_address), self.port),
-            self.timeout,
-            self.source_address,
-        )
-        try:
-            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except OSError as e:
-            if e.errno != errno.ENOPROTOOPT:
-                raise
-
         if self._tunnel_host:
-            self._tunnel()
             server_hostname = self._tunnel_host
         else:
             server_hostname = self.host
 
-        self.sock = self._context.wrap_socket(
-            self.sock, server_hostname=server_hostname
-        )
+        last_error: Exception | None = None
+        for ip in self._validated.ip_addresses:
+            sock = None
+            try:
+                sock = self._create_connection(
+                    (str(ip), self.port),
+                    self.timeout,
+                    self.source_address,
+                )
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError as e:
+                    if e.errno != errno.ENOPROTOOPT:
+                        raise
+
+                self.sock = sock
+                if self._tunnel_host:
+                    self._tunnel()
+                self.sock = self._context.wrap_socket(
+                    self.sock, server_hostname=server_hostname
+                )
+                return
+            except Exception as e:
+                last_error = e
+                if sock is not None:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                self.sock = None
+        if last_error is not None:
+            raise last_error
+        raise OSError("pinned opener has no validated addresses")
 
 
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):

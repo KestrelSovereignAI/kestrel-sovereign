@@ -247,6 +247,63 @@ def test_replay_of_same_envelope_rejected():
     assert "repla" in second.reason.lower()
 
 
+def test_shared_replay_store_rejects_replay_across_process_guards(tmp_path):
+    """A replay landing on a different worker has a fresh in-process guard, so
+    the shared DB reservation must reject it (#1733)."""
+    from kestrel_sovereign.a2a.envelope_signing import ReplayGuard
+    from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    async def run():
+        db = await AsyncDatabase.sqlite(str(tmp_path / "shared.db"))
+        try:
+            store = SharedReplayNonceStore(db)
+            kp, doc = _keypair_and_doc()
+            meta = _signed_metadata(kp)
+
+            first = await verify_inbound_envelope(
+                meta,
+                task_id="t",
+                message="m",
+                resolver=lambda did: doc,
+                replay_guard=ReplayGuard(),
+                replay_store=store,
+            )
+            assert first.ok is True and first.verified is True
+
+            replay_on_other_worker = await verify_inbound_envelope(
+                meta,
+                task_id="t",
+                message="m",
+                resolver=lambda did: doc,
+                replay_guard=ReplayGuard(),
+                replay_store=store,
+            )
+            assert replay_on_other_worker.ok is False
+            assert "shared" in replay_on_other_worker.reason
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+def test_shared_replay_store_expiry_allows_nonce_after_ttl(tmp_path):
+    from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    async def run():
+        db = await AsyncDatabase.sqlite(str(tmp_path / "shared.db"))
+        try:
+            store = SharedReplayNonceStore(db)
+            assert await store.reserve("sender", "nonce", now_ts=1000.0, ttl_seconds=10)
+            assert not await store.reserve("sender", "nonce", now_ts=1005.0, ttl_seconds=10)
+            assert await store.reserve("sender", "nonce", now_ts=1011.0, ttl_seconds=10)
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
 def test_nonce_is_consumed_on_verify_no_rollback():
     """A verified nonce is spent on receipt (no rollback): the SAME signed body
     can't be re-verified, but a freshly-signed envelope (new nonce) from the same

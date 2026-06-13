@@ -1230,12 +1230,31 @@ def _a2a_did_resolver(agent):
     agents' on-disk DID documents — no network), with federated ``did:web`` as
     an optional fetcher; neither is ever required. Until a host wires one,
     ``None`` means signatures can't be resolved, so a signed envelope is
-    treated as unsigned unless ``KESTREL_A2A_REQUIRE_SIGNED`` is set — the
-    remaining infrastructure (a same-host DID registry of peer documents) is
-    tracked as follow-up; this endpoint activates verification with no change
-    once that resolver is attached.
+    rejected. Unsigned envelopes still pass by default under the same-host
+    shared-API-key boundary unless ``KESTREL_A2A_REQUIRE_SIGNED`` is set.
     """
     return getattr(agent, "a2a_did_resolver", None)
+
+
+def _a2a_replay_store(agent):
+    """Return a cached shared replay-nonce store for signed A2A envelopes."""
+    existing = getattr(agent, "_a2a_replay_nonce_store", None)
+    if existing is not None:
+        return existing
+
+    raw_storage = getattr(agent, "_raw_storage", None)
+    db = getattr(raw_storage, "db", None)
+    if db is None:
+        return None
+
+    from kestrel_sovereign.a2a.replay_store import SharedReplayNonceStore
+
+    store = SharedReplayNonceStore(db)
+    try:
+        setattr(agent, "_a2a_replay_nonce_store", store)
+    except Exception:
+        return store
+    return store
 
 
 @router.post("/tasks/send")
@@ -1289,9 +1308,10 @@ async def send_task(request: Request):
     (``agent.a2a_did_resolver``) — a same-host registry of peer agents' DID
     documents (local-first; federated ``did:web`` optional) — and sign-on-send,
     which needs the sending agent's runtime keypair. Until the resolver is
-    attached, signed envelopes from unresolvable senders are treated as
-    unsigned. The richer identity-injection middleware (a system-context note
-    "verified message from agent X") builds on ``sender_verified``.
+    attached, signed envelopes from unresolvable senders are rejected because a
+    present signature is a verification claim, not an unsigned fallback. The
+    richer identity-injection middleware (a system-context note "verified
+    message from agent X") builds on ``sender_verified``.
     """
     agent = get_agent(request)
     body = await _parse_json_body(request)
@@ -1399,6 +1419,7 @@ async def send_task(request: Request):
         artifacts=raw_artifacts,
         resolver=_a2a_did_resolver(agent),
         require_signed=require_signed,
+        replay_store=_a2a_replay_store(agent),
     )
     if not sender_verdict.ok:
         raise HTTPException(
