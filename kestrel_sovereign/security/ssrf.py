@@ -97,6 +97,19 @@ def _resolve_addresses(host: str, port: int) -> "list[ipaddress._BaseAddress]":
     return [ipaddress.ip_address(info[4][0]) for info in infos]
 
 
+def _canonical_origin_host(host: str) -> str:
+    """Return the comparable origin host form used by connection backends."""
+    host = host.strip("[]")
+    try:
+        return host.encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        return host.casefold()
+
+
+def _origin_hosts_match(candidate: str, validated: str) -> bool:
+    return _canonical_origin_host(candidate) == _canonical_origin_host(validated)
+
+
 def validate_outbound_url(
     url: str, *, allowed_schemes: "tuple[str, ...]" = ("http", "https")
 ) -> ValidatedOutboundURL:
@@ -175,7 +188,10 @@ class _PinnedAsyncNetworkBackend:
         local_address: str | None = None,
         socket_options: Any = None,
     ):
-        if host != self._validated.host or port != self._validated.port:
+        if (
+            not _origin_hosts_match(host, self._validated.host)
+            or port != self._validated.port
+        ):
             raise SSRFError(
                 f"pinned transport refused connection to unexpected origin {host}:{port}"
             )
@@ -247,7 +263,10 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         super().__init__(host, *args, **kwargs)
 
     def connect(self) -> None:
-        if self.host != self._validated.host or self.port != self._validated.port:
+        if (
+            not _origin_hosts_match(self.host, self._validated.host)
+            or self.port != self._validated.port
+        ):
             raise OSError(
                 f"pinned opener refused connection to unexpected origin "
                 f"{self.host}:{self.port}"

@@ -152,6 +152,44 @@ class TestPinnedConnections:
         assert calls == [("93.184.216.34", 443)]
 
     @pytest.mark.asyncio
+    async def test_httpx_backend_accepts_punycode_connect_host_for_validated_idn(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        def fake_getaddrinfo(host, port, proto=0):
+            assert host == "bücher.example"
+            return [
+                (None, None, None, None, ("93.184.216.34", port)),
+            ]
+
+        async def fake_connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            calls.append((host, port))
+            return object()
+
+        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(
+            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+            fake_connect_tcp,
+        )
+        validated = validate_outbound_url("https://bücher.example/avatar.png")
+        backend = _PinnedAsyncNetworkBackend(validated)
+
+        await backend.connect_tcp("xn--bcher-kva.example", validated.port)
+
+        assert validated.host == "bücher.example"
+        assert str(validated.ip_address) == "93.184.216.34"
+        assert calls == [("93.184.216.34", 443)]
+
+    @pytest.mark.asyncio
     async def test_httpx_backend_falls_back_to_second_validated_ip(
         self,
         monkeypatch,
@@ -228,6 +266,42 @@ class TestPinnedConnections:
 
         assert dialed == [("93.184.216.34", 443)]
         assert wrapped == ["example.test"]
+
+    def test_urllib_connection_accepts_punycode_host_for_validated_idn(self):
+        validated = ValidatedOutboundURL(
+            url="https://bücher.example/.well-known/did.json",
+            scheme="https",
+            host="bücher.example",
+            port=443,
+            ip_addresses=(ipaddress.ip_address("93.184.216.34"),),
+        )
+        conn = _PinnedHTTPSConnection("xn--bcher-kva.example", validated=validated)
+        dialed = []
+        wrapped = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        def fake_create_connection(address, timeout, source_address):
+            dialed.append(address)
+            return FakeSocket()
+
+        conn._create_connection = fake_create_connection
+        conn._context = FakeContext()
+
+        conn.connect()
+
+        assert dialed == [("93.184.216.34", 443)]
+        assert wrapped == ["xn--bcher-kva.example"]
 
     def test_urllib_connection_falls_back_to_second_validated_ip(self):
         validated = ValidatedOutboundURL(
