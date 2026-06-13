@@ -143,8 +143,10 @@ class TestPrivacyConfigProperty:
             base_cfg = privacy_mode_to_config(agent._privacy_mode)
             opted_in = PrivacyConfig(
                 storage=base_cfg.storage,
-                llm_location=base_cfg.llm_location,
-                shareable=base_cfg.shareable,
+                processing=base_cfg.processing,
+                sharing=base_cfg.sharing,
+                assurance=base_cfg.assurance,
+                audit=base_cfg.audit,
                 computer_access=True,
             )
             agent.privacy_agent = PrivacyAgent(agent._raw_storage, opted_in)

@@ -1,12 +1,9 @@
-"""Privacy modes — sovereign-side configuration with SDK-canonical enum.
+"""Privacy modes — sovereign-side presets and configuration.
 
-`PrivacyMode` is re-exported from `kestrel_sdk.storage.database` so feature
-packages and sovereign share **one** enum identity (no parallel copies, no
-broken `isinstance` checks at the seam).
-
-`PrivacyConfig` and the preset dict stay sovereign-private — they carry
-sovereign-specific flags (`computer_access`, `llm_location`) that the SDK
-deliberately doesn't model.
+The SDK has a database privacy enum for storage-engine routing. Sovereign keeps
+its own chat/agent privacy enum because these presets carry sovereign-specific
+policy dimensions (`processing`, `sharing`, `assurance`, `audit`,
+`computer_access`) that the SDK deliberately doesn't model.
 
 The `to_config` / `from_config` instance/class methods that lived on the
 old enum are now module-level functions: `privacy_mode_to_config()` and
@@ -14,9 +11,8 @@ old enum are now module-level functions: `privacy_mode_to_config()` and
 """
 
 from dataclasses import dataclass
-from typing import Dict, Literal, Union
-
-from kestrel_sdk.storage.database import PrivacyMode
+from enum import Enum
+from typing import Dict, Literal, Optional, Union
 
 __all__ = [
     "PrivacyMode",
@@ -28,6 +24,17 @@ __all__ = [
 ]
 
 
+class PrivacyMode(Enum):
+    """Named sovereign privacy presets."""
+
+    EPHEMERAL = "ephemeral"
+    ISOLATED = "isolated"
+    ANONYMOUS = "anonymous"
+    NORMAL = "normal"
+    PUBLIC = "public"
+    DEIDENTIFIED = "deidentified"
+
+
 @dataclass
 class PrivacyConfig:
     """
@@ -35,28 +42,68 @@ class PrivacyConfig:
 
     Orthogonal concerns:
     - storage: How/whether data is persisted
-    - llm_location: Whether cloud LLMs are allowed
-    - shareable: Whether content can be exported/shared
+    - processing: Where inference/processing may happen
+    - sharing: Whether content remains private or may be shared/exported
+    - assurance: The privacy assurance level backing the preset
+    - audit: Whether an audit/evidence artifact is required
     - computer_access: Whether the agent may touch the host machine
       (read/write files, run shell). Always defaults False; never inherited
       from a preset. The ComputerUseFeature checks this flag on every call.
+
+    `llm_location` and `shareable` are legacy aliases retained for older
+    callers. New code should use `processing` and `sharing`.
     """
-    storage: Literal["none", "temp", "scrubbed", "full"] = "full"
-    llm_location: Literal["local", "cloud"] = "cloud"
-    shareable: bool = False
+    storage: Literal[
+        "none", "temp", "pii_redacted", "deidentified", "full", "scrubbed"
+    ] = "full"
+    processing: Literal["local", "trusted", "cloud"] = "cloud"
+    sharing: Literal["private", "research", "public"] = "private"
+    assurance: Literal[
+        "none", "pii_redacted", "safe_harbor", "expert_determination"
+    ] = "none"
+    audit: Literal["optional", "required"] = "optional"
     computer_access: bool = False
+    llm_location: Optional[Literal["local", "cloud"]] = None
+    shareable: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        if self.storage == "scrubbed":
+            self.storage = "pii_redacted"
+        if self.storage == "pii_redacted" and self.assurance == "none":
+            self.assurance = "pii_redacted"
+        if self.llm_location is not None:
+            self.processing = self.llm_location
+        else:
+            self.llm_location = "cloud" if self.processing == "cloud" else "local"
+        if self.shareable is not None:
+            self.sharing = "public" if self.shareable else "private"
+        else:
+            self.shareable = self.sharing == "public"
+        if self.storage == "deidentified":
+            self.processing = "trusted"
+            self.sharing = "research"
+            self.llm_location = "local"
+            self.shareable = False
+            if self.assurance == "none":
+                self.assurance = "safe_harbor"
+            if self.audit == "optional":
+                self.audit = "required"
 
     def allows_cloud_llm(self) -> bool:
         """Check if cloud LLM providers are allowed."""
-        return self.llm_location == "cloud"
+        return self.processing == "cloud"
 
     def allows_persistent_storage(self) -> bool:
         """Check if persistent storage is allowed."""
-        return self.storage in ("scrubbed", "full")
+        return self.storage in ("pii_redacted", "deidentified", "full")
 
     def requires_anonymization(self) -> bool:
-        """Check if PII scrubbing is required."""
-        return self.storage == "scrubbed"
+        """Check if PII redaction is required before persistence."""
+        return self.storage == "pii_redacted"
+
+    def requires_deidentification(self) -> bool:
+        """Check if HIPAA-style de-identification is required."""
+        return self.storage == "deidentified"
 
     def uses_temp_storage(self) -> bool:
         """Check if using temporary session storage."""
@@ -70,14 +117,34 @@ class PrivacyConfig:
         """Check if the agent is permitted to touch the host machine."""
         return self.computer_access
 
+    def requires_audit(self) -> bool:
+        """Check if writes/exports require an audit or evidence artifact."""
+        return self.audit == "required"
+
 
 # Named presets for common privacy configurations
 PRIVACY_PRESETS: Dict[str, PrivacyConfig] = {
-    "ephemeral": PrivacyConfig(storage="none", llm_location="local", shareable=False),
-    "isolated": PrivacyConfig(storage="temp", llm_location="local", shareable=False),
-    "anonymous": PrivacyConfig(storage="scrubbed", llm_location="cloud", shareable=False),
-    "normal": PrivacyConfig(storage="full", llm_location="cloud", shareable=False),
-    "public": PrivacyConfig(storage="full", llm_location="cloud", shareable=True),
+    "ephemeral": PrivacyConfig(
+        storage="none", processing="local", sharing="private"
+    ),
+    "isolated": PrivacyConfig(
+        storage="temp", processing="local", sharing="private"
+    ),
+    "anonymous": PrivacyConfig(
+        storage="pii_redacted",
+        processing="local",
+        sharing="private",
+        assurance="pii_redacted",
+    ),
+    "normal": PrivacyConfig(storage="full", processing="cloud", sharing="private"),
+    "public": PrivacyConfig(storage="full", processing="cloud", sharing="public"),
+    "deidentified": PrivacyConfig(
+        storage="deidentified",
+        processing="trusted",
+        sharing="research",
+        assurance="safe_harbor",
+        audit="required",
+    ),
 }
 
 
@@ -91,18 +158,16 @@ def get_privacy_preset(name: str) -> PrivacyConfig:
     preset = PRIVACY_PRESETS[name]
     return PrivacyConfig(
         storage=preset.storage,
-        llm_location=preset.llm_location,
-        shareable=preset.shareable,
+        processing=preset.processing,
+        sharing=preset.sharing,
+        assurance=preset.assurance,
+        audit=preset.audit,
         computer_access=preset.computer_access,
     )
 
 
 def privacy_mode_to_config(mode: Union[PrivacyMode, str]) -> PrivacyConfig:
     """Convert a `PrivacyMode` (or its string value) to `PrivacyConfig`.
-
-    Replaces the `PrivacyMode.to_config()` instance method that lived on
-    the old sovereign-local enum. The SDK enum carries values only; this
-    helper handles the sovereign-specific config fan-out.
     """
     if isinstance(mode, PrivacyMode):
         return get_privacy_preset(mode.value)
@@ -114,14 +179,15 @@ def privacy_mode_to_config(mode: Union[PrivacyMode, str]) -> PrivacyConfig:
 def privacy_config_to_mode(config: PrivacyConfig) -> PrivacyMode:
     """Find the closest matching mode for a `PrivacyConfig`.
 
-    Replaces the `PrivacyMode.from_config()` classmethod. ``computer_access``
-    is intentionally excluded from the match — it is an orthogonal capability
-    flag, not part of preset identity. Falls back to ``NORMAL`` when no
-    preset matches exactly.
+    ``computer_access`` is intentionally excluded from the match — it is an
+    orthogonal capability flag, not part of preset identity. Falls back to
+    ``NORMAL`` when no preset matches exactly.
     """
     for name, preset in PRIVACY_PRESETS.items():
         if (config.storage == preset.storage and
-            config.llm_location == preset.llm_location and
-            config.shareable == preset.shareable):
+            config.processing == preset.processing and
+            config.sharing == preset.sharing and
+            config.assurance == preset.assurance and
+            config.audit == preset.audit):
             return PrivacyMode(name)
     return PrivacyMode.NORMAL

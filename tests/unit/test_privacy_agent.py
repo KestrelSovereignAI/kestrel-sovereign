@@ -104,4 +104,25 @@ async def test_anonymous_mode(tmp_path):
     assert "[EMAIL_REDACTED]" in stored_message
     assert "[PHONE_REDACTED]" in stored_message
 
-    await storage.close() 
+    await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_deidentified_mode_buffers_until_evidence_pipeline_exists(tmp_path):
+    """DEIDENTIFIED should not crash chat turns or persist without evidence."""
+    db_path = tmp_path / "test_deidentified.db"
+    storage = AsyncStorage(str(db_path))
+    await storage.initialize()
+    privacy_agent = PrivacyAgent(storage)
+
+    privacy_agent.set_mode(PrivacyMode.DEIDENTIFIED)
+    await privacy_agent.add_conversation("user", "Patient Jane Doe has MRN 123")
+
+    history = await privacy_agent.get_conversation_history()
+    assert len(history) == 1
+    assert history[0]["content"] == "Patient Jane Doe has MRN 123"
+
+    permanent_history = await storage.get_conversation_history()
+    assert permanent_history == []
+
+    await storage.close()

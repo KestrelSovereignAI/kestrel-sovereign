@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 from kestrel_sovereign.command_handler import CommandHandler
+from kestrel_sovereign.features.privacy import PrivacyAgent
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 from kestrel_sovereign.privacy import PrivacyMode
 
@@ -122,6 +123,28 @@ def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()
         _restore_app(app, original)
 
 
+def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed():
+    privacy_agent = PrivacyAgent(MagicMock(), initial_mode=PrivacyMode.DEIDENTIFIED)
+    agent = MagicMock(privacy_agent=privacy_agent)
+    agent.privacy_mode = PrivacyMode.DEIDENTIFIED
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/agent/privacy-mode",
+                    headers={"X-API-Key": "test-key"},
+                )
+
+        assert response.status_code == 200
+        assert response.json()["privacy_mode"] == "deidentified"
+        assert response.json()["allows_storage"] is False
+        assert response.json()["allows_cloud_llm"] is False
+    finally:
+        _restore_app(app, original)
+
+
 def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition():
     llm_service = _FakeLLMService()
     llm_service._pref = {"vendor": "anthropic", "model": "claude-sonnet-4-5", "route": "api"}
@@ -175,6 +198,23 @@ def test_agent_level_privacy_transition_switches_to_local_model():
         "route": "api",
         "model": "gpt-5-mini",
     }
+
+
+def test_agent_level_anonymous_transition_switches_to_local_model():
+    llm_service = _FakeLLMService()
+    agent = _make_agent_with_privacy_transition(llm_service)
+
+    import asyncio
+
+    result = asyncio.run(agent.set_privacy_mode_with_effects(PrivacyMode.ANONYMOUS))
+
+    assert result.allows_cloud_llm is False
+    assert result.model_switched == {
+        "vendor": "ollama",
+        "route": "local",
+        "model": "llama3.2:3b",
+    }
+    assert llm_service.calls == [("llama3.2:3b", "ollama", "local")]
 
 
 def test_privacy_command_path_uses_agent_level_model_transition():

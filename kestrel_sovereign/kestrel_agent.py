@@ -168,7 +168,7 @@ class KestrelAgent(
             did: The agent's own DID (e.g., 'did:pkh:...'), used for self-discovery.
             storage_path: Path to the database file for SQLite storage.
             llm_service: The service that provides access to foundational models.
-            privacy_mode: Privacy mode for this session (EPHEMERAL, ISOLATED, ANONYMOUS, NORMAL, PUBLIC).
+            privacy_mode: Privacy mode for this session.
             pg_pool: Optional PostgreSQL pool for feedback feature.
             database_url: PostgreSQL connection string (for postgres backend).
             db_backend: Database backend type ('sqlite' or 'postgres').
@@ -657,8 +657,10 @@ class KestrelAgent(
                 base_cfg = privacy_mode_to_config(self._privacy_mode)
                 opted_in = PrivacyConfig(
                     storage=base_cfg.storage,
-                    llm_location=base_cfg.llm_location,
-                    shareable=base_cfg.shareable,
+                    processing=base_cfg.processing,
+                    sharing=base_cfg.sharing,
+                    assurance=base_cfg.assurance,
+                    audit=base_cfg.audit,
                     computer_access=True,
                 )
                 self.privacy_agent = PrivacyAgent(self._raw_storage, opted_in)
@@ -2590,6 +2592,19 @@ Expected Duration: {expected_duration}
         AssociativeLinker concept graph updates. These involve DB/graph writes
         and are fired as a background task so they never block the response.
         """
+        privacy_agent = getattr(self, "privacy_agent", None)
+        privacy_config = getattr(privacy_agent, "privacy_config", None)
+        if privacy_config and (
+            privacy_config.is_ephemeral() or privacy_config.uses_temp_storage()
+            or privacy_config.requires_deidentification()
+        ):
+            logging.debug(
+                "Post-response memory pipeline skipped in private volatile mode "
+                "(storage=%s)",
+                privacy_config.storage,
+            )
+            return
+
         if not hasattr(self, 'memory_system') or not self.memory_system:
             return
 

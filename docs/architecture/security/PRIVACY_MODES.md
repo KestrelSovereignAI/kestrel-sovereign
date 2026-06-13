@@ -8,23 +8,28 @@ Kestrel provides unprecedented control over data privacy through **independent p
 
 ## 2. Privacy Architecture: Flags + Presets
 
-Privacy is controlled by three independent flags:
+Privacy is controlled by generic independent flags. Named modes are presets
+over these flags; they are not separate enforcement systems.
 
 | Flag | Options | Controls |
 |------|---------|----------|
-| `storage` | none, temp, scrubbed, full | How/whether data is persisted |
-| `llm_location` | local, cloud | Whether cloud LLMs are allowed |
-| `shareable` | true, false | Whether content can be exported |
+| `storage` | none, temp, pii_redacted, deidentified, full | How/whether data is persisted |
+| `processing` | local, trusted, cloud | Where inference/processing may happen |
+| `sharing` | private, research, public | Whether content can be shared/exported |
+| `assurance` | none, pii_redacted, safe_harbor, expert_determination | Privacy assurance backing the preset |
+| `audit` | optional, required | Whether evidence/audit artifacts are required |
+| `computer_access` | true, false | Whether tools may touch the host computer; always explicit and orthogonal |
 
 **Named presets** are convenient combinations of these flags:
 
 ```python
 PRIVACY_PRESETS = {
-    "ephemeral": PrivacyConfig(storage="none", llm_location="local", shareable=False),
-    "isolated": PrivacyConfig(storage="temp", llm_location="local", shareable=False),
-    "anonymous": PrivacyConfig(storage="scrubbed", llm_location="cloud", shareable=False),
-    "normal": PrivacyConfig(storage="full", llm_location="cloud", shareable=False),
-    "public": PrivacyConfig(storage="full", llm_location="cloud", shareable=True),
+    "ephemeral": PrivacyConfig(storage="none", processing="local", sharing="private"),
+    "isolated": PrivacyConfig(storage="temp", processing="local", sharing="private"),
+    "anonymous": PrivacyConfig(storage="pii_redacted", processing="local", sharing="private", assurance="pii_redacted"),
+    "normal": PrivacyConfig(storage="full", processing="cloud", sharing="private"),
+    "public": PrivacyConfig(storage="full", processing="cloud", sharing="public"),
+    "deidentified": PrivacyConfig(storage="deidentified", processing="trusted", sharing="research", assurance="safe_harbor", audit="required"),
 }
 ```
 
@@ -35,10 +40,12 @@ graph TD
     B -->|storage=full| C[Persistent Storage]
     B -->|storage=none| D[No Storage]
     B -->|storage=temp| E[Temporary Session]
-    B -->|storage=scrubbed| F[PII-Scrubbed Storage]
+    B -->|storage=pii_redacted| F[PII-Redacted Storage]
+    B -->|storage=deidentified| J[Deidentified Research Storage]
     
-    B --> G{llm_location}
+    B --> G{processing}
     G -->|local| H[Ollama Only]
+    G -->|trusted| K[Trusted/BAA-Capable Route]
     G -->|cloud| I[Any Provider]
     
     style D fill:#ff9999,stroke:#333,stroke-width:2px
@@ -48,9 +55,9 @@ graph TD
 
 ## 3. Preset Specifications
 
-### 🔄 Normal Mode (`!normal`)
+### Normal Mode (`!privacy normal`)
 
-**Config**: `storage=full, llm_location=cloud, shareable=false`
+**Config**: `storage=full, processing=cloud, sharing=private, assurance=none, audit=optional`
 
 **Use Case**: Standard operation for most interactions
 **Storage**: Persistent SQLite database
@@ -64,9 +71,9 @@ graph TD
 - Professional work that benefits from context
 - For human-led elderly storytelling preservation.
 
-### 👻 Ephemeral Mode (`!ephemeral`)
+### Ephemeral Mode (`!privacy ephemeral`)
 
-**Config**: `storage=none, llm_location=local, shareable=false`
+**Config**: `storage=none, processing=local, sharing=private, assurance=none, audit=optional`
 
 **Use Case**: Sensitive topics requiring zero digital footprint
 **Storage**: Nothing stored anywhere
@@ -90,9 +97,9 @@ def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = N
         return  # Do NOT persist
 ```
 
-### 🏝️ Isolated Mode (`!isolated`)
+### Isolated Mode (`!privacy isolated`)
 
-**Config**: `storage=temp, llm_location=local, shareable=false`
+**Config**: `storage=temp, processing=local, sharing=private, assurance=none, audit=optional`
 
 **Use Case**: Complex analysis where you want to control what becomes permanent
 **Storage**: Temporary session buffer only
@@ -109,30 +116,34 @@ def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = N
 - Trying different approaches before committing
 - Working with third-party data that may not belong in permanent memory
 
-### 🎭 Anonymous Mode (`!anonymous`)
+### Anonymous Mode (`!privacy anonymous`)
 
-**Config**: `storage=scrubbed, llm_location=cloud, shareable=false`
+**Config**: `storage=pii_redacted, processing=local, sharing=private, assurance=pii_redacted, audit=optional`
 
 **Use Case**: Learning from interactions while protecting identity
-**Storage**: PII-scrubbed persistent storage
-**Processing**: Full multi-model access (cloud allowed)
+**Storage**: PII-redacted persistent storage
+**Processing**: Local LLM only
 **Memory Anchoring**: Available (preserves integrity)
 **Learning**: Agent learns patterns but not personal details
 
-**PII Scrubbing**:
+**PII Redaction**:
 - Email addresses → `[EMAIL_REDACTED]`
 - Phone numbers → `[PHONE_REDACTED]`
 - SSNs → `[SSN_REDACTED]`
 - Names → `[NAME_REDACTED]`
+
+Anonymous is not HIPAA de-identification. It is PII redaction plus local
+processing. Use Deidentified mode for research workflows that require
+Safe Harbor or Expert Determination assurance.
 
 **Example Scenarios**:
 - Contributing to agent training without personal exposure
 - Discussing sensitive topics while preserving learning value
 - Interactions that have educational value but contain personal information
 
-### 📖 Public Mode (`!public`)
+### Public Mode (`!privacy public`)
 
-**Config**: `storage=full, llm_location=cloud, shareable=true`
+**Config**: `storage=full, processing=cloud, sharing=public, assurance=none, audit=optional`
 
 **Use Case**: Fully transparent and auditable agents
 **Storage**: Full persistent storage
@@ -146,6 +157,23 @@ def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = N
 - Agents where trust requires visibility
 - Public-facing services
 
+### Deidentified Mode (`!privacy deidentified`)
+
+**Config**: `storage=deidentified, processing=trusted, sharing=research, assurance=safe_harbor, audit=required`
+
+**Use Case**: Clinical/research data that may be saved or exported only after
+de-identification.
+**Storage**: Deidentified persistent storage with evidence artifact required
+**Processing**: Trusted route only; generic cloud routing is not sufficient
+**Memory Anchoring**: Available for deidentified artifacts
+**Learning**: Research use without direct identifiers
+
+Deidentified mode is distinct from anonymous/PII-redacted mode. HIPAA Safe
+Harbor requires removal of the Safe Harbor identifier set and no actual
+knowledge that remaining information can identify the individual. Expert
+Determination is a separate path requiring a qualified expert's documented
+determination; Kestrel must not claim it without that evidence artifact.
+
 ## 4. Custom Configurations
 
 Beyond presets, you can set flags directly for custom configurations:
@@ -157,8 +185,8 @@ from privacy import PrivacyConfig
 # (Not a preset, but perfectly valid)
 agent.set_privacy(PrivacyConfig(
     storage="full",
-    llm_location="local",
-    shareable=False
+    processing="local",
+    sharing="private",
 ))
 ```
 
@@ -169,15 +197,16 @@ agent.set_privacy(PrivacyConfig(
 ```bash
 # Status and control
 !status         # Show current privacy mode and session status
-!normal         # Switch to standard mode
-!ephemeral      # Switch to ephemeral (off-the-record) mode
-!isolated       # Switch to isolated session mode
-!anonymous      # Switch to anonymous mode (PII removed)
-!public         # Switch to public mode (shareable)
+!privacy normal
+!privacy ephemeral
+!privacy isolated
+!privacy anonymous
+!privacy public
+!privacy deidentified
 
 # Session management (isolated mode only)
-!save-session   # Save isolated session to permanent storage
-!discard-session # Discard isolated session without saving
+!privacy-save     # Save isolated session to permanent storage
+!privacy-discard  # Discard isolated session without saving
 ```
 
 ### Programmatic API
@@ -192,13 +221,13 @@ agent.privacy_agent.set_mode("ephemeral")  # String also works
 # Using custom config
 agent.privacy_agent.set_mode(PrivacyConfig(
     storage="full",
-    llm_location="local",
-    shareable=False
+    processing="local",
+    sharing="private",
 ))
 
 # Check current config
 config = agent.privacy_agent.privacy_config
-print(f"Storage: {config.storage}, LLM: {config.llm_location}")
+print(f"Storage: {config.storage}, processing: {config.processing}")
 
 # Check if cloud is allowed
 if config.allows_cloud_llm():

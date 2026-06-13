@@ -410,10 +410,11 @@ async def get_privacy_mode(request: Request):
     try:
         agent = get_agent(request)
         mode = agent.privacy_mode
+        privacy_agent = getattr(agent, "privacy_agent", None)
         return {
             "privacy_mode": mode.value if hasattr(mode, 'value') else str(mode),
-            "allows_cloud_llm": agent.privacy_agent.privacy_config.allows_cloud_llm() if hasattr(agent, 'privacy_agent') else True,
-            "allows_storage": agent.privacy_agent.privacy_config.allows_persistent_storage() if hasattr(agent, 'privacy_agent') else True,
+            "allows_cloud_llm": privacy_agent.privacy_config.allows_cloud_llm() if privacy_agent else True,
+            "allows_storage": privacy_agent.can_store("conversation") if privacy_agent else True,
         }
     except Exception as e:
         logger.error(f"Error getting privacy mode: {e}", exc_info=True)
