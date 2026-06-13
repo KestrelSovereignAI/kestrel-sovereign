@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-12
-**Scope:** 1704 tracked files (1102 `.py`, 302 `.md`, 300 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-13
+**Scope:** 1725 tracked files (1119 `.py`, 303 `.md`, 303 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -55,7 +55,7 @@ Repo entry points and standard project files.
 - **server.py** — Backward-compat shim for ``uvicorn server:app`` from a source clone.
 - **test_llm_providers.py** — Test LLM providers: OpenAI, Anthropic, and Vertex AI (Gemini).
   - `async def test_providers()`
-- **test_rasa_shim_integration.py** — Rasa Shim Integration Test Suite — SMS-over-Rasa healthcare validation. Simulates what a Rasa-protocol SMS client sends to Kestrel via the Rasa shim.
+- **test_rasa_shim_integration.py** — Rasa Shim Integration Test Suite — SMS-over-Rasa healthcare validation.
   - `class RasaShimIntegrationTester`; `async def main()`
 - **uv.lock** — —
 
@@ -69,7 +69,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/did_registry.py** — Host-level DID resolver for A2A sender verification (#1705).
   - `class HostA2ADidResolver`; `def install_a2a_did_resolver(manager)`
 - **kestrel_sovereign/a2a/envelope_signing.py** — Cryptographic sender authentication for A2A task envelopes (#1673).
-  - `class EnvelopeVerification`; `def canonical_message(part_texts)`; `def canonical_signing_bytes()`; `def kids_from_verification_methods(verification_methods)`; `def sign_envelope(keypair)`; `def verify_envelope(did_document, signature_block)`; `async def verify_inbound_envelope(metadata)`
+  - `class EnvelopeVerification`; `def canonical_message(part_texts)`; `def bound_envelope_fields(metadata)`; `def canonical_signing_bytes()`; `def kids_from_verification_methods(verification_methods)`; `def sign_envelope(keypair)`; `def verify_envelope(did_document, signature_block)`; `class ReplayGuard`; `…`
 - **kestrel_sovereign/a2a/outbound_store.py** — Sender-side outbound A2A task store (#1576).
   - `class OutboundTask`; `async def ensure_a2a_outbound_tasks_table(db)`; `async def record_outbound_dispatch(db)`; `async def update_outbound_terminal_state(db)`; `async def list_outbound_tasks(db)`
 - **kestrel_sovereign/a2a/stores/__init__.py** — A2A Datastores - Unified Backend-Agnostic Stores.
@@ -210,11 +210,11 @@ Repo entry points and standard project files.
   - `class DoctorReport`; `def diagnose(project_dir)`; `def format_report(report)`
 - **kestrel_sovereign/endpoints/__init__.py** — —
 - **kestrel_sovereign/endpoints/agent.py** — Agent invoke and streaming endpoints.
-  - `async def invoke_agent(request)`; `async def stream_agent_response(request)`; `async def stop_agent_request(request)`; `async def get_agent_info(request)`; `async def get_privacy_mode(request)`; `async def set_privacy_mode(request)`; `async def get_notifications(request)`; `async def notifications_sse(request)`; `…`
+  - `async def invoke_agent(request)`; `async def upload_attachment(request, file)`; `async def stream_agent_response(request)`; `async def stop_agent_request(request)`; `async def get_agent_info(request)`; `async def get_privacy_mode(request)`; `async def set_privacy_mode(request)`; `async def get_notifications(request)`; `…`
 - **kestrel_sovereign/endpoints/agent_helpers.py** — Shared helpers for endpoint modules.
   - `def get_caller(request)`; `def get_agent(request)`
 - **kestrel_sovereign/endpoints/auth_oauth.py** — Authentication endpoints: Google OAuth2, JWT email/password, API key info.
-  - `def register_oauth(app)`; `async def login(request)`; `async def callback(request)`; `async def logout(request)`; `async def me(request)`; `class LoginRequest`; `async def login_token(body)`; `async def verify_token(request)`
+  - `def register_oauth(app)`; `async def login(request)`; `async def callback(request)`; `async def logout(request)`; `async def me(request)`; `class LoginRequest`; `async def login_token(request, body)`; `async def verify_token(request)`
 - **kestrel_sovereign/endpoints/commands.py** — Commands discovery endpoint - exposes available commands to UI.
   - `async def get_commands(request)`
 - **kestrel_sovereign/endpoints/conversations.py** — Conversation and session endpoints.
@@ -234,7 +234,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/endpoints/observability.py** — Observability endpoint - query A2A observability events for debugging.
   - `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def get_observability_summary(request, minutes)`
 - **kestrel_sovereign/endpoints/rasa_shim.py** — Rasa-compatible webhook shim for Kestrel AI.
-  - `class RasaWebhookRequest`; `class RasaWebhookResponse`; `async def rasa_webhook(payload, request)`
+  - `class RasaWebhookRequest`; `class RasaWebhookResponse`; `async def rasa_webhook(request, payload)`
 - **kestrel_sovereign/endpoints/saved_items.py** — Saved Items API endpoints.
   - `class SaveItemRequest`; `class SaveStructuredItemRequest`; `class UpdateItemRequest`; `class SearchRequest`; `async def list_items(request, item_type, limit)`; `async def get_stats(request)`; `async def list_schemas(request)`; `async def get_all_tags(request)`; `…`
 - **kestrel_sovereign/endpoints/security.py** — Kestrel Security API Endpoints.
@@ -258,6 +258,10 @@ Repo entry points and standard project files.
   - `class FeatureStatus`; `class SkillInfo`; `class FeaturePackageInfo`; `def load_registry(path)`; `def resolve_status(registry, enabled_class_names)`; `def get_registry(enabled_class_names, path)`; `def get_package_for_feature(feature_class_name, path)`; `def get_all_skills(path)`; `…`
 - **kestrel_sovereign/features/__init__.py** — Feature Discovery for Kestrel Agent.
   - `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `def discover_entrypoint_feature_classes()`; `def discover_feature_class_by_name(name)`; `def discover_features(agent, allowed_features)`; `def get_feature_by_name(features, name)`
+- **kestrel_sovereign/features/attachments/__init__.py** — Chat attachments feature (#1662): a lazy ``read_attachment`` tool so an agent can read a file the user attached (non-inline) on demand.
+- **kestrel_sovereign/features/attachments/component.yaml** — (configuration)
+- **kestrel_sovereign/features/attachments/feature.py** — Lazy attachment reading (#1662 PR C).
+  - `class AttachmentsFeature`
 - **kestrel_sovereign/features/audit_anchor/__init__.py** — —
 - **kestrel_sovereign/features/audit_anchor/feature.py** — Audit Trail Anchoring Feature - Cryptographic proof of verifiable history.
   - `class AuditAnchorFeature`
@@ -713,6 +717,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/agent_encryption.py** — Backward-compatible agent encryption re-exports.
 - **kestrel_sovereign/security/auto_approve.py** — Scoped auto-approve policy for gated tool invocations.
   - `class AutoApproveRule`; `class AutoApproveMatch`; `def derive_command(feature_name, tool_name, tool_args)`; `def suggest_rule_from_command(command)`; `class AutoApprovePolicy`
+- **kestrel_sovereign/security/bootstrap_access.py** — Source-host gating for the bootstrap API-key endpoint (#1724).
+  - `def bootstrap_allowed_hosts()`; `def is_bootstrap_host_allowed(client_host)`
 - **kestrel_sovereign/security/crypto_suite.py** — CryptoSuite — pluggable signature suites for Kestrel.
   - `class Keypair`; `class CryptoSuite`; `class CryptoSuiteError`; `def register_suite(suite)`; `def get_suite(alg_id)`; `def list_registered()`; `class Secp256k1Suite`; `class Ed25519Suite`; `…`
 - **kestrel_sovereign/security/demo_isolation.py** — Server-side demo-mode isolation (#766).
@@ -749,6 +755,8 @@ Repo entry points and standard project files.
   - `class ServiceKeyInfo`; `class UsageRecord`; `class ServiceKeyStorage`
 - **kestrel_sovereign/security/sponsor_key_storage.py** — Sponsor Master Key Storage + beneficiary roster for Kestrel.
   - `class SponsorKeyInfo`; `class SponsorKeyStorage`; `class SponsorBeneficiaryStore`
+- **kestrel_sovereign/security/ssrf.py** — SSRF guard for server-side outbound fetches (#1727).
+  - `class SSRFError`; `def validate_outbound_url(url)`; `async def assert_safe_url(url)`
 - **kestrel_sovereign/security/user_master_key_storage.py** — User Master Key Storage for Kestrel.
   - `class UserMasterKeyInfo`; `class UserMasterKeyStorage`
 - **kestrel_sovereign/security/verify_policy.py** — Verify-policy modes for signed identity artifacts.
@@ -769,6 +777,8 @@ Repo entry points and standard project files.
   - `class EnvWriteResult`; `def read_env(path)`; `def write_env(path, updates)`
 - **kestrel_sovereign/setup/migrate_llm_config.py** — One-shot migration: ``llm_config.toml`` -> ``kestrel.toml [llm]``.
   - `class MigrationResult`; `def migrate_llm_config(project_dir)`
+- **kestrel_sovereign/setup/overlay_anchor.py** — Anchor a per-agent constitution overlay (#1722).
+  - `class OverlayAnchorResult`; `async def anchor_overlay()`
 - **kestrel_sovereign/setup/prompts.py** — Thin wrapper over ``questionary`` with a non-TTY fallback.
   - `def is_tty()`; `class Prompter`; `class QuestionaryPrompter`; `class NonInteractivePrompter`; `class StubPrompter`
 - **kestrel_sovereign/setup/steps/__init__.py** — Wizard steps.
@@ -955,7 +965,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/storage/providers/lighthouse_rest.py** — Async REST client for Lighthouse storage API.
   - `class LighthouseRestClient`
 - **kestrel_sovereign/storage/retention.py** — Retention helpers for the soft-delete migration (#764).
-  - `def load_trash_config()`; `def resolve_retention_days()`; `def load_cognition_config()`; `def resolve_cognition_retention_days()`; `def agent_privacy_mode(agent)`
+  - `def load_trash_config()`; `def resolve_retention_days()`; `def load_forgetting_config()`; `def agent_privacy_mode(agent)`
 - **kestrel_sovereign/storage/saved_items_store.py** — Saved Items Store for Kestrel.
   - `class SavedItemType`; `class SourceType`; `def get_schema(schema_id)`; `def list_schemas()`; `def validate_structured_content(content, schema_id)`; `class SavedItem`; `class SavedItemsStore`
 - **kestrel_sovereign/storage/schema_router.py** — Schema-aware routing: promote extracted structure to typed storage.
@@ -973,6 +983,8 @@ Repo entry points and standard project files.
   - `class DocumentChunk`; `def build_document_chunk_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/embedding_profile.py** — SQLAlchemy mapping for the ``embedding_profiles`` registry (#1477).
   - `async def upsert_embedding_profile(db, embedding_service, profile_id)`; `class EmbeddingProfileRow`
+- **kestrel_sovereign/storage/sqla/episode.py** — SQLAlchemy mapping of the ``memory_episodes`` table.
+  - `class MemoryEpisodeRow`; `def build_episode_spec(dimension)`
 - **kestrel_sovereign/storage/sqla/migrations.py** — One-time data migrations for sovereign-core SQLAlchemy entities.
   - `async def migrate_saved_items_add_embedding_vec(db)`; `async def migrate_document_chunks_add_embedding_vec(db)`; `async def migrate_conversation_history_add_embedding_vec(db)`; `async def migrate_add_embedding_profile_id(db)`; `async def migrate_create_embedding_profiles(db)`; `async def migrate_compaction_terminology(db)`
 - **kestrel_sovereign/storage/sqla/saved_item.py** — SQLAlchemy mapping of the ``saved_items`` table.
@@ -1225,6 +1237,7 @@ Repo entry points and standard project files.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
 - **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
 - **docs/architecture/MEMORY_SYSTEM.md** — Kestrel Memory System — > The difference between a search engine and a friend is that a friend *actually remembers*.
+- **docs/architecture/NIGHTLY_FORGETTING.md** — Nightly Forgetting — Unified Cognition Maintenance — > **Status (2026-06-12): Active for P1–P3; Aspirational for P4.** This consolidates Kestrel's scattered nightly-maintenance crons and the unbounded-cognition-table problem (#1674) under one orchestra…
 - **docs/architecture/PAYER_POLICY_FOUNDATION.md** — Payer Policy Foundation — **Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped locally **Branch (foundation):** `feat/payer-policy` **Branch (sdk):** `feat/payer-policy` (in `kestrel-sovereign-sdk`) **Last upda…
 - **docs/architecture/PLAN_RUNPOD_INTEGRATION.md** — Plan: Sovereign GPU Integration (RunPod) — > **Implementation status (last verified 2026-04-25):** RunPod is **experimental**, not production-stable.
 - **docs/architecture/PROVIDER_ECONOMICS.md** — Provider Economics: Middleman Architecture & Revenue Strategy — **Version:** 1.0 **Drafted:** December 2025 **Last verified:** 2026-04-25 (referral-program details still accurate; revenue projections are illustrative, not date-stamped financials) **Status:** Stra…
@@ -1547,6 +1560,7 @@ Repo entry points and standard project files.
 - **tests/frontend/api_client_dispatch_pinning.test.mjs** — (mjs asset)
 - **tests/frontend/api_client_stop.test.mjs** — (mjs asset)
 - **tests/frontend/app_init_order.test.mjs** — (mjs asset)
+- **tests/frontend/attachment_composer.test.mjs** — (mjs asset)
 - **tests/frontend/auto_load_most_recent.test.mjs** — (mjs asset)
 - **tests/frontend/autoload_race.test.mjs** — (mjs asset)
 - **tests/frontend/capabilities.test.mjs** — (mjs asset)
@@ -1576,6 +1590,7 @@ Repo entry points and standard project files.
 - **tests/frontend/sendmessage_interrupts_when_busy.test.mjs** — (mjs asset)
 - **tests/frontend/session_id_property.test.mjs** — (mjs asset)
 - **tests/frontend/signal_completed_wake.test.mjs** — (mjs asset)
+- **tests/frontend/streaming_block_render.test.mjs** — (mjs asset)
 - **tests/frontend/tool_activity_expandable.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
 - **tests/frontend/trash_grouping.test.mjs** — (mjs asset)
@@ -1668,6 +1683,8 @@ Repo entry points and standard project files.
   - `async def test_purge_clean_ephemeral_session_destroys_nothing(tmp_path)`; `async def test_purge_destroys_conversation_history_leak(tmp_path)`; `async def test_purge_destroys_soft_deleted_leak_too(tmp_path)`; `async def test_purge_destroys_leaked_graph_nodes(tmp_path)`; `async def test_purge_does_not_touch_other_agents_data(tmp_path)`; `async def test_purge_warns_and_returns_breakdown_on_leak(tmp_path, caplog)`; `async def test_purge_clears_isolated_session_buffer(tmp_path)`; `async def test_purge_with_empty_agent_id_is_a_safe_noop(tmp_path)`
 - **tests/integration/test_ephemeral_purge_scoped.py** — Integration tests for the scoped EPHEMERAL leak-purge (#867).
   - `async def test_no_writes_during_ephemeral_destroys_nothing(tmp_path)`; `async def test_only_in_window_rows_are_purged(tmp_path)`; `async def test_purge_without_watermark_refuses(tmp_path)`; `async def test_watermark_refreshes_on_re_entry(tmp_path)`; `async def test_graph_nodes_with_iso_timestamps_are_scoped_correctly(tmp_path)`; `async def test_graph_nodes_without_created_at_are_skipped_with_warning(tmp_path, caplog)`; `async def test_other_agents_data_untouched(tmp_path)`
+- **tests/integration/test_episode_recall.py** — Relevance-based episode recall + access tracking (#1674 P2).
+  - `async def db()`; `async def test_keyword_recall_when_no_embedding_provider(db)`; `async def test_recall_increments_access_count(db)`; `async def test_from_row_tolerates_native_datetimes()`; `async def test_recall_empty_query_returns_nothing(db)`; `async def test_recall_merges_vector_and_keyword(db)`; `async def test_recall_keyword_not_starved_when_vector_fills_limit(db)`; `async def test_recall_scoped_to_agent(db)`; `…`
 - **tests/integration/test_feature_install_discover_e2e.py** — E2E tests for the feature install/discover lifecycle (Issue #495).
   - `class ExternalGPUFeature`; `class ExternalStorageFeature`; `class ExternalMonitorFeature`; `async def core_only_agent(temp_db, monkeypatch)`; `async def agent_with_ext_features(temp_db, monkeypatch)`; `class TestCoreOnlyAgent`; `class TestEntryPointDiscovery`; `class TestFeaturesAppearInAgent`; `…`
 - **tests/integration/test_feature_lifecycle_e2e.py** — E2E tests for feature lifecycle: enable/disable/remove cycle with hook management.
@@ -1801,7 +1818,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_a2a_did_registry.py** — Host-level A2A DID resolver (#1705).
   - `def test_resolves_known_hybrid_agent_to_doc_with_vms()`; `def test_unknown_did_resolves_none()`; `def test_legacy_non_hybrid_agent_not_resolvable()`; `def test_install_injects_resolver_into_every_agent()`; `def test_federated_fallback_off_by_default_returns_none()`; `def test_resolver_composes_with_1673_verifier_end_to_end()`; `def test_tampered_envelope_rejected_through_resolver()`
 - **tests/unit/test_a2a_envelope_signing.py** — A2A signed-sender envelope contract (#1673).
-  - `def test_canonical_bytes_are_deterministic_and_order_independent()`; `def test_sign_then_verify_roundtrip_ok()`; `def test_tampered_message_fails()`; `def test_stripped_pq_signature_fails_hybrid_required()`; `def test_stale_timestamp_fails()`; `def test_future_timestamp_fails()`; `def test_did_document_binding_mismatch_fails()`; `def test_wrong_key_fails()`; `…`
+  - `def test_canonical_bytes_are_deterministic_and_order_independent()`; `def test_sign_then_verify_roundtrip_ok()`; `def test_sign_then_verify_roundtrip_with_bound_fields_ok()`; `def test_tampered_bound_field_fails()`; `def test_tampered_message_fails()`; `def test_stripped_pq_signature_fails_hybrid_required()`; `def test_stale_timestamp_fails()`; `def test_future_timestamp_fails()`; `…`
 - **tests/unit/test_a2a_outbound_store.py** — Tests for the sender-side outbound A2A audit store (#1576).
   - `async def test_ensure_table_idempotent(tmp_path)`; `async def test_record_outbound_dispatch_returns_full_row(tmp_path)`; `async def test_record_with_error_stamps_dispatch_failed_terminal(tmp_path)`; `async def test_message_summary_truncates_at_200_chars(tmp_path)`; `async def test_update_terminal_state_idempotent(tmp_path)`; `async def test_list_outbound_filters_by_recipient(tmp_path)`; `async def test_list_outbound_clamps_limit(tmp_path)`; `async def test_send_a2a_task_writes_outbound_audit_row(tmp_path)`; `…`
 - **tests/unit/test_a2a_question_answered_signal.py** — ``a2a.question_answered`` signal source (#1444 step 4).
@@ -1848,10 +1865,14 @@ Repo entry points and standard project files.
   - `class TestExtractAndLinkTypedReturn`; `class TestPersonNameCategorization`
 - **tests/unit/test_async_storage_conversation_delegators.py** — Regression test: ``AsyncStorage`` exposes delegator methods for every conversation-session write path the privacy wrapper calls through it.
   - `async def storage()`; `async def test_async_storage_exposes_conversation_session_delegators(storage, method, kwargs, description)`; `async def test_delete_conversation_session_returns_zero_for_unknown_session(storage)`; `async def test_set_conversation_name_roundtrips_through_facade(storage)`
+- **tests/unit/test_attachments.py** — Chat attachments (#1662) — upload-ref sanitization + user-turn persistence.
+  - `def test_sanitize_attachments_keeps_only_valid_refs()`; `def test_sanitize_attachments_drops_malformed_and_bounds_count()`; `def test_sanitize_attachments_non_list_is_empty()`; `async def test_attachments_persist_on_user_turn_metadata()`; `async def test_no_attachments_means_no_attachments_key()`
 - **tests/unit/test_audit_anchor_feature.py** — Unit tests for the Audit Trail Anchoring feature.
   - `class TestAuditHasher`; `async def feature_no_entries(tmp_path)`; `async def feature_with_entries(tmp_path)`; `class TestAuditAnchorFeature`
 - **tests/unit/test_auth_decision_table.py** — Decision-table tests for auth classes in server.py.
   - `def test_root_html_is_public_when_oauth_not_required()`; `def test_root_html_redirects_when_oauth_required()`; `def test_bootstrap_key_is_localhost_only_when_enabled()`; `def test_auth_me_rejects_api_key_without_session()`; `def test_auth_me_returns_session_payload_when_session_present()`; `def test_sse_query_param_auth_reaches_stream_endpoint_and_preserves_400()`; `def test_non_sse_query_param_auth_is_rejected()`; `def test_protected_agent_route_accepts_api_key_and_multi_agent_rewrite_matches()`
+- **tests/unit/test_auth_hardening.py** — Auth hardening (#1724): fail-closed allowlist, JWT/API-key decoupling, /auth/token rate limit, and narrowed bootstrap-key host gating.
+  - `class TestEmailAuthorized`; `class TestJwtSecret`; `class TestBootstrapHostGating`; `async def test_auth_token_is_rate_limited(monkeypatch)`
 - **tests/unit/test_auth_oauth.py** — Unit tests for Google OAuth authentication endpoints and middleware.
   - `def oauth_env()`; `def app(oauth_env)`; `def client(app)`; `class TestOAuthEndpoints`; `class TestEmailAllowlist`; `class TestAuthMiddleware`; `class TestOAuthDisabled`
 - **tests/unit/test_auto_model_selection_contracts.py** — Contracts for auto model selection from config, cache, and discovery.
@@ -2039,6 +2060,10 @@ Repo entry points and standard project files.
   - `def test_secp256k1_suite_registered_at_import()`; `def test_unknown_alg_id_raises()`; `def test_register_same_instance_is_idempotent()`; `def test_register_competing_instance_raises()`; `def test_list_registered_includes_default()`; `def test_cryptosuite_is_abstract()`; `def suite()`; `def keypair(suite)`; `…`
 - **tests/unit/test_current_model_selection_seams.py** — Current-model selection seam contracts across API, feature, and agent paths.
   - `def test_llm_service_exposes_canonical_current_model_selection_for_vendor_preference()`; `def test_llm_service_exposes_canonical_current_model_selection_for_vendor_route_preference()`; `def test_llm_service_exposes_auto_when_no_preference_or_providers()`; `def test_current_model_paths_agree_for_model_only_preference()`
+- **tests/unit/test_data_loss_hardening.py** — Data-loss hardening (#1725): inception --force, retirement scoping, filecoin tier-aware cleanup + CID integrity verification.
+  - `class TestFilecoinCleanup`; `class TestFilecoinIntegrity`; `class TestInceptionForce`; `class TestRetirementScoping`; `class TestImportTimestampPreservation`; `class TestRetirementScopingPeerKeys`
+- **tests/unit/test_db_backend_concurrency.py** — Postgres backend concurrency hardening (#1726).
+  - `def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children()`
 - **tests/unit/test_decryption_failure.py** — Tests for decryption failure behavior.
   - `class TestDecryptionFailure`; `class TestDecryptionErrorMessage`; `class TestNoSilentFailures`
 - **tests/unit/test_delegated_wallet.py** — Tests for DelegatedWallet budget delegation and ceiling enforcement.
@@ -2089,6 +2114,8 @@ Repo entry points and standard project files.
   - `def feature()`; `async def test_ok_serializes_to_dict_and_keeps_success_true(feature)`; `async def test_ok_wire_payload_is_json_clean(feature)`; `async def test_failed_flips_wrapper_success_to_false(feature)`; `async def test_failed_wire_payload_is_json_clean(feature)`; `async def test_partial_keeps_success_true_and_surfaces_error(feature)`; `async def test_partial_wire_payload_is_json_clean(feature)`; `async def test_legacy_dict_return_keeps_original_wrapper(feature)`; `…`
 - **tests/unit/test_dynamic_tool_loading.py** — Unit tests for dynamic tool loading.
   - `class ToolOnlyFeature`; `def agent()`; `class TestDynamicToolLoadingInit`; `class TestRegisterExploredFeatureTools`; `class TestNameCollision`; `class TestBuildAllTools`; `class TestDirectToolExecution`; `class TestEviction`; `…`
+- **tests/unit/test_eager_vision.py** — Eager vision (#1662 PR B) — pasted/dropped images folded into the model turn.
+  - `def test_extract_user_text_handles_all_shapes()`; `def test_openai_adapter_injects_image_url_block()`; `def test_anthropic_adapter_injects_content_block()`; `def test_ollama_adapter_injects_images_key()`; `def test_attach_targets_last_user_turn_only()`; `def test_attach_noop_without_images()`; `def test_google_adapter_injects_inline_data_parts()`; `def test_attach_skips_tool_result_turn_and_welds_to_prompt()`; `…`
 - **tests/unit/test_ed25519_suite.py** — Ed25519Suite tests — Wave 2 sub-PR 1 (#917).
   - `def test_ed25519_suite_self_registers_at_import()`; `def test_ed25519_suite_listed_alongside_secp256k1()`; `def test_ed25519_classified_as_classical()`; `def suite()`; `def keypair(suite)`; `def test_keypair_carries_correct_suite_id(keypair)`; `def test_sign_verify_round_trip(suite, keypair)`; `def test_sign_verify_round_trip_empty(suite, keypair)`; `…`
 - **tests/unit/test_elastic_budget_integration.py** — Integration tests for the elastic budget (#1309) wired into the production assembly path.
@@ -2158,7 +2185,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_github_processor.py** — Tests for Kestrel Talon (GitHub/ADO issue processor).
   - `class TestTalonConfig`; `class TestIssueContext`; `class TestProcessingResult`; `class TestCIStatus`; `class TestGitHubClientExtraction`; `class TestTalonE2E`
 - **tests/unit/test_gpt5_overlay.py** — Unit tests for the GPT-5 system-prompt overlay (#807 / #806).
-  - `class TestIsGpt5ModelId`; `class TestPrependGpt5Overlay`
+  - `class TestIsGpt5ModelId`; `class TestPrependGpt5Overlay`; `class TestProactiveElevationDiscipline`
 - **tests/unit/test_graceful_degradation.py** — Unit tests for the Graceful Degradation module.
   - `class TestSeverityLevel`; `class TestCapabilityLoss`; `class TestDegradationReport`; `class TestGracefulDegradationHandler`; `class TestConvenienceFunctions`; `class TestCapabilityImpacts`
 - **tests/unit/test_graduate_service.py** — Regression tests for ``kestrel_sovereign.graduate_service``.
@@ -2185,6 +2212,8 @@ Repo entry points and standard project files.
   - `def hybrid_kp()`; `def test_default_pair_is_x25519_plus_mlkem768(hybrid_kp)`; `def test_distinct_keypairs()`; `def test_refuses_two_classical_pair()`; `def test_refuses_two_pq_pair()`; `def test_unregistered_alg_raises()`; `def test_encapsulate_decapsulate_round_trip(hybrid_kp)`; `def test_default_secret_is_32_bytes(hybrid_kp)`; `…`
 - **tests/unit/test_hybrid_keypair.py** — HybridKeypair tests — Wave 2 sub-PR 4 (#917).
   - `def hybrid()`; `def test_default_pair_is_ed25519_plus_mldsa65(hybrid)`; `def test_independent_generations_produce_distinct_keypairs()`; `def test_refuses_two_classical_pair()`; `def test_refuses_two_pq_pair()`; `def test_unregistered_suite_raises()`; `def test_public_keys_classical_first_then_pq(hybrid)`; `def test_sign_hybrid_emits_two_signature_entries(hybrid)`; `…`
+- **tests/unit/test_hygiene_bundle.py** — Medium hygiene bundle (#1729): boundary-marker neutralization, env perms, LIKE-wildcard escaping, Rasa webhook auth, spawn caps, subprocess imports.
+  - `class TestBoundaryNeutralization`; `class TestEnvFilePerms`; `class TestLikeEscape`; `class TestRasaWebhookAuth`; `class TestSpawnCaps`; `class TestSubprocessImports`
 - **tests/unit/test_identity_constitution_endpoint_contracts.py** — Focused contract tests for identity and constitution endpoints.
   - `def test_identity_endpoint_returns_avatar_and_constitution_fields()`; `def test_constitution_endpoint_returns_text_hash_and_metadata()`
 - **tests/unit/test_identity_endpoints.py** — Unit tests for the identity profile endpoints.
@@ -2217,6 +2246,8 @@ Repo entry points and standard project files.
   - `class TestKeyRotationTaskLifecycle`; `class TestRotationEndToEnd`
 - **tests/unit/test_key_storage.py** — Unit tests for SecureKeyStorage.
   - `def master_key()`; `def test_private_key()`; `def storage(master_key, temp_dir, monkeypatch)`; `class TestSecureKeyStorageInit`; `class TestKeyEncryption`; `class TestKeyMigration`; `class TestEncryptedKeyBundle`; `class TestEdgeCases`; `…`
+- **tests/unit/test_keys_rotation_fail_closed.py** — Key rotation fails CLOSED when the approval queue raises (#1723).
+  - `async def test_rotation_fails_closed_when_approval_queue_raises(monkeypatch)`; `async def test_rotation_proceeds_with_partial_under_override(monkeypatch)`
 - **tests/unit/test_legacy_decrypt_fallback.py** — Regression tests for ``decrypt_with_legacy_fallback`` (#1458).
   - `class TestCurrentV2Passthrough`; `class TestPreV2RawAESGCMRecovery`; `class TestRejectionShape`
 - **tests/unit/test_lifecycle_checks.py** — Tests for the startup lifecycle hardening rails (#377, #381, #406).
@@ -2248,7 +2279,9 @@ Repo entry points and standard project files.
 - **tests/unit/test_memory_agency_feature.py** — Tests for the MemoryAgencyFeature.
   - `class FakeDB`; `class FakeGraphStore`; `class PrivacyWrappedStorage`; `async def test_initialize_uses_raw_storage_without_touching_wrapper_db()`; `async def test_memory_pin_refuses_privacy_hidden_mode_without_db_access()`; `async def test_sovereign_override_still_clears_pins_in_privacy_hidden_mode()`; `async def test_sovereign_override_ensures_pin_table_after_privacy_first_init()`; `async def test_pin_memory_sets_decay_protected()`; `…`
 - **tests/unit/test_memory_consolidate_lock.py** — #round3: the manual `!memory consolidate` tool must serialize against the scheduled cron run by holding ResourceLock.MEMORY (the same lock the dispatcher holds for the cron tick).
-  - `async def test_manual_consolidate_holds_memory_lock()`; `async def test_manual_consolidate_runs_without_dispatcher_lock()`
+  - `async def test_manual_consolidate_holds_memory_lock()`; `async def test_manual_consolidate_runs_without_dispatcher_lock()`; `async def test_tool_surfaces_episodes_deleted_from_consolidate()`; `async def test_tool_no_forgotten_clause_when_none_deleted()`
+- **tests/unit/test_memory_feature_episode_recall.py** — get_episodes tool: relevance (query) vs recency (#1674 P2).
+  - `async def test_get_episodes_query_uses_semantic_recall(monkeypatch)`; `async def test_get_episodes_no_query_uses_recency(monkeypatch)`; `async def test_get_episodes_blank_query_is_recency(monkeypatch)`
 - **tests/unit/test_memory_feature_strips_sent_form.py** — Regression: memory recall must strip sent-form wrappers from user rows.
   - `def test_strip_helper_pulls_raw_text_from_user_rows_only()`; `def test_strip_helper_leaves_metadata_untouched()`; `def test_strip_helper_does_not_mutate_input()`; `async def test_search_memory_returns_raw_user_text_to_llm()`; `async def test_recall_recent_returns_raw_user_text_to_llm()`; `async def test_search_memory_does_not_match_wrapper_only_terms()`; `async def test_search_memory_preserves_broad_token_fallback()`; `async def test_search_memory_ignores_bare_memory_block_wrappers(wrapper_phrase)`; `…`
 - **tests/unit/test_memory_manager.py** — Unit tests for MemoryManager.
@@ -2322,7 +2355,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_pending_a2a_question_store.py** — CRUD tests for ``PendingA2AQuestionStore`` (#1444 step 2).
   - `async def test_insert_and_get(tmp_path)`; `async def test_insert_is_idempotent_on_duplicate_task_id(tmp_path)`; `async def test_mark_resolved_transitions_waiting_only(tmp_path)`; `async def test_mark_resolved_returns_false_for_unknown_task(tmp_path)`; `async def test_mark_waiting_for_retry_restores_terminal_row(tmp_path)`; `async def test_mark_waiting_for_retry_preserves_terminal_payload(tmp_path)`; `async def test_list_waiting_excludes_terminal_rows(tmp_path)`; `async def test_list_waiting_past_deadline_for_expiry_sweep(tmp_path)`; `…`
 - **tests/unit/test_per_agent_constitution_overlay.py** — Per-agent CONSTITUTION.md overlay loading (#898).
-  - `class TestPerAgentOverlayLoading`; `class TestComputerUseFeaturePicksUpOverlay`
+  - `class TestPerAgentOverlayLoading`; `class TestComputerUseFeaturePicksUpOverlay`; `class TestOverlayAnchorVerification`
 - **tests/unit/test_permission_seam_contracts.py** — Permission seam contracts across command, A2A, and tool execution paths.
   - `async def test_a2a_skill_uses_feature_class_name_for_permission_hooks()`; `async def test_command_routing_uses_same_permission_identity_as_a2a_skill()`
 - **tests/unit/test_permission_store_dual_casing.py** — ``PermissionStore.get_permission`` resolves rows under both PascalCase and snake_case forms, picking the more permissive of any duplicates.
@@ -2371,6 +2404,8 @@ Repo entry points and standard project files.
   - `def test_rasa_webhook_does_not_force_hardcoded_model_override()`
 - **tests/unit/test_raw_user_strip_in_consumers.py** — Regression: raw-user content consumers (personality calibration, wellness depth metrics) must strip the sent-form wrappers from user-role rows before measuring/exporting.
   - `async def test_personality_calibration_strips_sent_form_from_user_input()`; `async def test_wellness_depth_metric_strips_user_sent_form_for_length()`; `async def test_wellness_depth_metric_does_not_strip_assistant_content()`
+- **tests/unit/test_read_attachment.py** — Lazy attachment reading (#1662 PR C) — read_attachment tool + context hint.
+  - `async def test_read_attachment_rejects_hash_not_in_this_conversation()`; `async def test_read_attachment_scopes_to_agents_active_session()`; `async def test_read_attachment_rejects_malformed_id()`; `async def test_read_attachment_returns_text_document()`; `async def test_read_attachment_truncates_long_text()`; `async def test_read_attachment_parses_pdf()`; `async def test_read_attachment_image_directs_to_paste()`; `def test_lazy_attachment_hint_lists_only_lazy()`; `…`
 - **tests/unit/test_reanchor_constitution.py** — Unit tests for !reanchor-constitution command.
   - `async def test_reanchor_rejects_missing_hash()`; `async def test_reanchor_rejects_short_hash()`; `async def test_reanchor_rejects_wrong_hash()`; `async def test_reanchor_succeeds_with_correct_hash()`; `async def test_reanchor_accepts_full_hash()`; `async def test_reanchor_does_not_exit_safe_mode()`; `async def test_reanchor_noop_when_already_current()`; `async def test_reanchor_fails_when_no_identity_node()`; `…`
 - **tests/unit/test_release_manifest.py** — Release manifest tests — Wave 5 sub-PR 1 (#920).
@@ -2411,10 +2446,8 @@ Repo entry points and standard project files.
   - `def test_portable_vector_rejects_non_positive_dimension()`; `def test_portable_vector_uses_largebinary_on_sqlite()`; `def test_portable_vector_uses_pgvector_on_postgresql()`; `def test_portable_vector_packs_list_to_bytes_on_sqlite()`; `def test_portable_vector_passes_bytes_through_on_sqlite()`; `def test_portable_vector_unpacks_bytes_to_list_for_pg_path()`; `def test_portable_vector_raises_on_dimension_mismatch()`; `def test_portable_vector_none_passes_through()`; `…`
 - **tests/unit/test_saved_items_sqla.py** — Tests for the SQLA-backed search path in :mod:`saved_items_store` and the supporting :mod:`kestrel_sovereign.storage.sqla` module.
   - `def test_build_saved_item_spec_matches_entity_columns()`; `def test_build_saved_item_spec_accepts_any_positive_dimension()`; `def test_build_saved_item_spec_rejects_non_positive_dimension()`; `def test_make_session_factory_rejects_memory_sqlite()`; `def test_make_session_factory_returns_factory_for_sqlite_file()`; `def test_make_session_factory_rejects_pg_from_pool_no_dsn()`; `def test_make_session_factory_rewrites_postgres_scheme()`; `def test_make_session_factory_unknown_backend_type()`; `…`
-- **tests/unit/test_scheduler_cognition_retention.py** — Unit tests for the ``cognition_retention`` built-in scheduler task (#1674).
-  - `async def test_skips_when_no_window_configured()`; `async def test_purges_with_configured_window()`; `async def test_honors_max_rows_override()`; `async def test_skips_when_storage_lacks_primitive()`; `async def test_tolerates_storage_failure()`
 - **tests/unit/test_scheduler_feature.py** — Unit tests for the SchedulerFeature and SchedulerRunner.
-  - `async def feature()`; `async def feature_no_db()`; `class TestSchedulerTools`; `class TestScheduleList`; `class TestScheduleAdd`; `class TestScheduleRemove`; `class TestSchedulePause`; `class TestScheduleResume`; `…`
+  - `async def feature()`; `async def feature_no_db()`; `class TestSchedulerTools`; `class TestScheduleList`; `class TestRetiredCronCleanup`; `class TestSleepCronHandler`; `class TestScheduleAdd`; `class TestScheduleRemove`; `…`
 - **tests/unit/test_scheduler_trash_retention.py** — Unit tests for the ``trash_retention`` built-in scheduler task (#764).
   - `async def test_trash_retention_passes_privacy_aware_cutoff_to_storage()`; `async def test_trash_retention_honors_per_privacy_override()`; `async def test_trash_retention_skips_on_zero_or_negative_window()`; `async def test_trash_retention_accepts_max_rows_override_via_args()`; `async def test_trash_retention_swallows_storage_exception()`; `async def test_trash_retention_skips_when_storage_lacks_primitive()`; `async def test_trash_retention_falls_back_to_default_when_no_config()`
 - **tests/unit/test_schema_recall_tools.py** — Unit tests for the schema-aware recall tools on MemoryFeature.
@@ -2442,7 +2475,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_send_a2a_question_supervisor.py** — Unit tests for the sender-side subscription supervisor (#1444 step 3+5+7).
   - `class TestSSEParsing`; `class TestSupervisorHappyPath`; `class TestSupervisor404HardCut`; `class TestSupervisorDeadlineAccurateExpiry`; `class TestSupervisorDeadlineInsideStreamLoop`; `class TestSupervisorStalledStream`; `class TestSupervisorDedupSignal`
 - **tests/unit/test_send_task_endpoint.py** — ``POST /api/agent/tasks/send`` — send-side artifact ingress (#1525).
-  - `def app_with_send(monkeypatch)`; `def test_send_task_persists_sender_artifacts(app_with_send)`; `def test_send_task_without_artifacts_passes_none(app_with_send)`; `def test_send_task_rejects_non_list_artifacts(app_with_send)`; `def test_send_task_rejects_malformed_artifact(app_with_send)`; `def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send)`; `def test_valid_signed_envelope_verifies(app_with_send)`; `def test_tampered_signed_envelope_rejected_403(app_with_send)`; `…`
+  - `def app_with_send(monkeypatch)`; `def test_send_task_persists_sender_artifacts(app_with_send)`; `def test_send_task_without_artifacts_passes_none(app_with_send)`; `def test_send_task_rejects_non_list_artifacts(app_with_send)`; `def test_send_task_rejects_malformed_artifact(app_with_send)`; `def test_unsigned_envelope_accepted_and_marked_unverified(app_with_send)`; `def test_valid_signed_envelope_verifies(app_with_send)`; `def test_valid_signed_envelope_with_artifacts_verifies(app_with_send)`; `…`
 - **tests/unit/test_server_health.py** — Focused tests for server health endpoint behavior.
   - `def test_health_returns_503_when_agent_missing()`; `def test_health_detailed_uses_health_feature_from_feature_dict()`
 - **tests/unit/test_session_id_in_hooks.py** — Verify session_id is correctly threaded to hook calls during tool dispatch (#885).
@@ -2488,7 +2521,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_signals_channel_source.py** — Source registration tests for inbound channel messages.
   - `def test_registration_is_untrusted_cognition_source()`; `def test_sanitizer_caps_content_and_metadata()`; `def test_sanitizer_preserves_invalid_required_fields_for_schema_rejection()`; `def test_build_signal_for_channel_message()`; `def test_build_signal_rejects_outbound_messages()`
 - **tests/unit/test_signals_dispatcher.py** — Unit tests for the SignalDispatcher pipeline.
-  - `def db_path(tmp_path)`; `async def dispatcher_components(db_path)`; `async def test_unknown_source_drops_validation(dispatcher_components)`; `async def test_mode_not_in_allowed_drops_validation(dispatcher_components)`; `async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp_path)`; `async def test_schema_failure_drops_validation(dispatcher_components)`; `async def test_schema_normalization_replaces_payload(dispatcher_components)`; `async def test_schema_runs_after_sanitizer(dispatcher_components, tmp_path)`; `…`
+  - `def db_path(tmp_path)`; `async def dispatcher_components(db_path)`; `async def test_unknown_source_drops_validation(dispatcher_components)`; `async def test_mode_not_in_allowed_drops_validation(dispatcher_components)`; `async def test_sanitizer_runs_on_untrusted_non_action(dispatcher_components, tmp_path)`; `async def test_trusted_registration_honors_per_signal_downgrade(dispatcher_components, tmp_path)`; `async def test_caller_cannot_raise_trust_above_registration(dispatcher_components, tmp_path)`; `async def test_schema_failure_drops_validation(dispatcher_components)`; `…`
 - **tests/unit/test_signals_dispatcher_constitution_injection.py** — Dispatcher integration tests for constitutional injection.
   - `def template_path(tmp_path)`; `async def test_legacy_cognition_signals_skip_audit_entirely(tmp_path, template_path)`; `async def test_full_injection_records_hashes_when_no_drift(tmp_path, template_path)`; `async def test_full_injection_drift_returns_dropped_validation(tmp_path, template_path)`; `async def test_full_injection_no_drift_when_only_one_hash_resolvable(tmp_path, template_path)`; `async def test_echo_required_verified_status_succeeds(tmp_path, template_path)`; `async def test_canary_injected_pre_dispatch_matches_verifier_input(tmp_path, template_path)`; `async def test_echo_required_missing_status_fails_dispatch(tmp_path, template_path)`; `…`
 - **tests/unit/test_signals_github_pr_watch_source.py** — Tests for the github.pr_activity signal source and the change-detection core that backs the github_pr_watch cron task (#1618).
@@ -2513,6 +2546,8 @@ Repo entry points and standard project files.
   - `async def components(tmp_path)`; `async def test_internal_signal_does_not_emit_ui_event(components)`; `async def test_user_visible_signal_emits_signal_completed(components)`; `async def test_admin_visible_signal_also_emits(components)`; `async def test_payload_carries_routing_fields(components)`; `async def test_payload_excludes_raw_artifact_and_action_result(components)`; `async def test_payload_includes_result_summary_when_source_sets_callback(components)`; `async def test_payload_result_summary_is_none_when_source_omits_callback(tmp_path)`; `…`
 - **tests/unit/test_skills_feature.py** — Unit tests for SkillsFeature and Skill serialization.
   - `class TestSkillModel`; `class TestHelpers`; `async def feature(tmp_path)`; `class TestToolRegistration`; `class TestExtractCandidates`; `class TestSkillSave`; `class TestListShowDelete`; `class TestModuleConstants`; `…`
+- **tests/unit/test_sleep_consolidation_routing.py** — #1674 P3: the sleep cycle consolidates through the single MemorySystem.consolidate() chokepoint (so it inherits the forgetting deletion tier), not the lower-level MemoryConsolidator.run_consolidation…
+  - `async def test_consolidate_routes_through_memory_system()`; `async def test_consolidate_falls_back_to_raw_consolidator()`
 - **tests/unit/test_sleep_wake_resilience.py** — Unit tests for host sleep/wake (suspend/resume) resilience (#1545).
   - `class TestSuspendGap`; `class TestResumeMonitor`; `class TestResumeMonitorConfig`; `class TestDispatcherReanchor`; `class TestSchedulerMisfireGrace`; `class TestHeartbeatGapAwareness`
 - **tests/unit/test_slhdsa_suite.py** — SLHDSASHA2128sSuite tests — Wave 3 sub-PR 1 (#918).
@@ -2547,6 +2582,8 @@ Repo entry points and standard project files.
   - `def clean_sse_connections()`; `async def test_approval_request_event_is_forwarded_to_sse_stream()`; `async def test_listener_is_registered_and_cleaned_up()`; `async def test_agent_without_event_bus_does_not_crash()`
 - **tests/unit/test_sse_connection_limits.py** — Unit tests for SSE connection limits (issue #145).
   - `def clean_sse_connections()`; `def app_with_mock_agent()`; `class TestSSEConnectionLimits`; `class TestSSEConnectionTrackerModule`
+- **tests/unit/test_ssrf_guard.py** — SSRF guard (#1727): block server-side fetches to non-public addresses.
+  - `class TestAddressClassification`; `class TestValidateOutboundUrl`; `class TestDidWebSSRF`
 - **tests/unit/test_state_of_mind_feature.py** — Direct contracts for the StateOfMind feature.
   - `async def test_state_of_mind_requires_llm_service()`; `async def test_state_of_mind_formats_via_profile_service()`
 - **tests/unit/test_stop_hook_payload.py** — STOP HookInput enrichment for #1238.
