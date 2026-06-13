@@ -8,7 +8,10 @@ sys.path.insert(0, '/app')
 try:
     from kestrel_sovereign.inception_service import create_kestrel_identity
     
-    target_dir = Path(os.environ.get("KESTREL_DB_PATH") or "/app/agent_data")
+    # Honor KESTREL_DB_PATH verbatim when set (the Docker entrypoint exports
+    # /app/agent_data); fall back to a writable cwd-relative dir for local runs
+    # so this script doesn't try to create /app on developer machines.
+    target_dir = Path(os.environ.get("KESTREL_DB_PATH") or (Path.cwd() / "agent_data"))
     target_dir.mkdir(parents=True, exist_ok=True)
         
     creds = create_kestrel_identity(str(target_dir))
