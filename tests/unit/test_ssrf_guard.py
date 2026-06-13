@@ -5,8 +5,11 @@ import pytest
 
 from kestrel_sovereign.security.ssrf import (
     SSRFError,
+    ValidatedOutboundURL,
     validate_outbound_url,
     _address_is_blocked,
+    _PinnedAsyncNetworkBackend,
+    _PinnedHTTPSConnection,
 )
 import ipaddress
 
@@ -72,6 +75,277 @@ class TestValidateOutboundUrl:
         # never an uncaught ValueError (→ 500).
         with pytest.raises(SSRFError):
             validate_outbound_url(bad)
+
+    def test_validation_returns_pinned_public_ip(self, monkeypatch):
+        def fake_getaddrinfo(host, port, proto=0):
+            assert host == "assets.example"
+            assert port == 443
+            return [
+                (None, None, None, None, ("2001:4860:4860::8888", port)),
+                (None, None, None, None, ("93.184.216.34", port)),
+            ]
+
+        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+        validated = validate_outbound_url("https://assets.example/avatar.png")
+
+        assert validated.host == "assets.example"
+        assert validated.port == 443
+        assert [str(ip) for ip in validated.ip_addresses] == [
+            "2001:4860:4860::8888",
+            "93.184.216.34",
+        ]
+        assert str(validated.ip_address) == "2001:4860:4860::8888"
+
+    def test_validation_rejects_mixed_public_private_dns_before_connect(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        def fake_getaddrinfo(host, port, proto=0):
+            return [
+                (None, None, None, None, ("93.184.216.34", port)),
+                (None, None, None, None, ("127.0.0.1", port)),
+            ]
+
+        async def fake_connect_tcp(self, host, port, **kwargs):
+            calls.append((host, port))
+            return object()
+
+        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(
+            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+            fake_connect_tcp,
+        )
+
+        with pytest.raises(SSRFError):
+            validate_outbound_url("https://mixed.example/avatar.png")
+
+        assert calls == []
+
+
+class TestPinnedConnections:
+    @pytest.mark.asyncio
+    async def test_httpx_backend_dials_pinned_ip_not_hostname(self, monkeypatch):
+        calls = []
+
+        async def fake_connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            calls.append((host, port))
+            return object()
+
+        monkeypatch.setattr(
+            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+            fake_connect_tcp,
+        )
+        validated = validate_outbound_url("https://93.184.216.34/avatar.png")
+        backend = _PinnedAsyncNetworkBackend(validated)
+
+        await backend.connect_tcp(validated.host, validated.port)
+
+        assert calls == [("93.184.216.34", 443)]
+
+    @pytest.mark.asyncio
+    async def test_httpx_backend_accepts_punycode_connect_host_for_validated_idn(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        def fake_getaddrinfo(host, port, proto=0):
+            assert host == "bücher.example"
+            return [
+                (None, None, None, None, ("93.184.216.34", port)),
+            ]
+
+        async def fake_connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            calls.append((host, port))
+            return object()
+
+        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(
+            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+            fake_connect_tcp,
+        )
+        validated = validate_outbound_url("https://bücher.example/avatar.png")
+        backend = _PinnedAsyncNetworkBackend(validated)
+
+        await backend.connect_tcp("xn--bcher-kva.example", validated.port)
+
+        assert validated.host == "bücher.example"
+        assert str(validated.ip_address) == "93.184.216.34"
+        assert calls == [("93.184.216.34", 443)]
+
+    @pytest.mark.asyncio
+    async def test_httpx_backend_falls_back_to_second_validated_ip(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        def fake_getaddrinfo(host, port, proto=0):
+            assert host == "dualstack.example"
+            return [
+                (None, None, None, None, ("2001:4860:4860::8888", port)),
+                (None, None, None, None, ("93.184.216.34", port)),
+            ]
+
+        async def fake_connect_tcp(
+            self,
+            host,
+            port,
+            timeout=None,
+            local_address=None,
+            socket_options=None,
+        ):
+            calls.append((host, port))
+            if host == "2001:4860:4860::8888":
+                raise OSError("IPv6 route unavailable")
+            return object()
+
+        monkeypatch.setattr("socket.getaddrinfo", fake_getaddrinfo)
+        monkeypatch.setattr(
+            "httpcore._backends.anyio.AnyIOBackend.connect_tcp",
+            fake_connect_tcp,
+        )
+        validated = validate_outbound_url("https://dualstack.example/avatar.png")
+        backend = _PinnedAsyncNetworkBackend(validated)
+
+        await backend.connect_tcp(validated.host, validated.port)
+
+        assert calls == [
+            ("2001:4860:4860::8888", 443),
+            ("93.184.216.34", 443),
+        ]
+
+    def test_urllib_connection_dials_pinned_ip_with_original_sni(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/.well-known/did.json",
+            scheme="https",
+            host="example.test",
+            port=443,
+            ip_addresses=(ipaddress.ip_address("93.184.216.34"),),
+        )
+        conn = _PinnedHTTPSConnection("example.test", validated=validated)
+        dialed = []
+        wrapped = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        def fake_create_connection(address, timeout, source_address):
+            dialed.append(address)
+            return FakeSocket()
+
+        conn._create_connection = fake_create_connection
+        conn._context = FakeContext()
+
+        conn.connect()
+
+        assert dialed == [("93.184.216.34", 443)]
+        assert wrapped == ["example.test"]
+
+    def test_urllib_connection_accepts_punycode_host_for_validated_idn(self):
+        validated = ValidatedOutboundURL(
+            url="https://bücher.example/.well-known/did.json",
+            scheme="https",
+            host="bücher.example",
+            port=443,
+            ip_addresses=(ipaddress.ip_address("93.184.216.34"),),
+        )
+        conn = _PinnedHTTPSConnection("xn--bcher-kva.example", validated=validated)
+        dialed = []
+        wrapped = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        def fake_create_connection(address, timeout, source_address):
+            dialed.append(address)
+            return FakeSocket()
+
+        conn._create_connection = fake_create_connection
+        conn._context = FakeContext()
+
+        conn.connect()
+
+        assert dialed == [("93.184.216.34", 443)]
+        assert wrapped == ["xn--bcher-kva.example"]
+
+    def test_urllib_connection_falls_back_to_second_validated_ip(self):
+        validated = ValidatedOutboundURL(
+            url="https://example.test/.well-known/did.json",
+            scheme="https",
+            host="example.test",
+            port=443,
+            ip_addresses=(
+                ipaddress.ip_address("2001:4860:4860::8888"),
+                ipaddress.ip_address("93.184.216.34"),
+            ),
+        )
+        conn = _PinnedHTTPSConnection("example.test", validated=validated)
+        dialed = []
+        wrapped = []
+
+        class FakeSocket:
+            def setsockopt(self, *args):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeContext:
+            def wrap_socket(self, sock, server_hostname=None):
+                wrapped.append(server_hostname)
+                return sock
+
+        def fake_create_connection(address, timeout, source_address):
+            dialed.append(address)
+            if address[0] == "2001:4860:4860::8888":
+                raise OSError("IPv6 route unavailable")
+            return FakeSocket()
+
+        conn._create_connection = fake_create_connection
+        conn._context = FakeContext()
+
+        conn.connect()
+
+        assert dialed == [
+            ("2001:4860:4860::8888", 443),
+            ("93.184.216.34", 443),
+        ]
+        assert wrapped == ["example.test"]
 
 
 class TestDidWebSSRF:
