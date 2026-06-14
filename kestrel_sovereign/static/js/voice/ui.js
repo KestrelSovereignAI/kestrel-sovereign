@@ -77,8 +77,13 @@ let pickerModalEl = null;
 let privacyBannerEl = null;
 
 const sessionByAgent = new Map();
-let soloAgent = null;
-let armedAgent = null;
+// Sentinel for "no agent soloed/armed". A plain `null` can't serve here because
+// `null` IS the valid host-agent key in standalone mode — conflating the two
+// makes the standalone row read as soloed/armed by default and impossible to
+// toggle off. A Symbol never equals any real agent key (string or null).
+const NO_AGENT = Symbol('no-agent');
+let soloAgent = NO_AGENT;
+let armedAgent = NO_AGENT;
 
 function createSession(agent) {
   return {
@@ -113,7 +118,7 @@ function activeSession() {
 }
 
 function controlSession() {
-  return armedAgent !== null ? sessionForAgent(armedAgent) : activeSession();
+  return armedAgent !== NO_AGENT ? sessionForAgent(armedAgent) : activeSession();
 }
 
 function paneForSession(session) {
@@ -262,6 +267,11 @@ export function onAgentSwitch(prevAgent, nextAgent) {
 
 export function mountAgentVoiceControls(item, agentName) {
   if (!item) return;
+  // Voice cards are located by their OWN attribute, NOT `data-agent-name`.
+  // The voice session key for standalone mode is `null` (≠ the real agent name
+  // the row still carries in `data-agent-name` for thinking-dot / stop-button
+  // lookups), so the two identities genuinely differ and must not share a key.
+  item.dataset.voiceAgentKey = voiceKeyToAttr(agentName);
   const controls = document.createElement('div');
   controls.className = 'agent-voice-controls';
   controls.innerHTML = `
@@ -286,15 +296,22 @@ export function mountAgentVoiceControls(item, agentName) {
   refreshAgentVoiceCard(agentName);
 }
 
+// Map a voice session key (string agent name, or `null` for standalone) to/from
+// the stable DOM attribute used to locate that agent's card.
+function voiceKeyToAttr(agent) {
+  return agent === null || agent === undefined ? '__standalone__' : String(agent);
+}
+function attrToVoiceKey(attr) {
+  return attr === '__standalone__' || attr === undefined ? null : attr;
+}
+function cssEscape(s) {
+  return (typeof CSS !== 'undefined' && typeof CSS.escape === 'function')
+    ? CSS.escape(s)
+    : String(s).replace(/["\\]/g, '\\$&');
+}
+
 export function refreshAgentVoiceCard(agentName) {
-  const escapedAgentName = agentName === null || agentName === undefined
-    ? ''
-    : (typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-      ? CSS.escape(String(agentName))
-      : String(agentName).replace(/["\\]/g, '\\$&'));
-  const selector = agentName === null || agentName === undefined
-    ? '.agent-item:not([data-agent-name])'
-    : `.agent-item[data-agent-name="${escapedAgentName}"]`;
+  const selector = `.agent-item[data-voice-agent-key="${cssEscape(voiceKeyToAttr(agentName))}"]`;
   const row = document.querySelector(selector);
   if (!row) return;
   const session = sessionForAgent(agentName);
@@ -331,9 +348,8 @@ export function refreshAgentVoiceCard(agentName) {
 }
 
 function refreshAllAgentVoiceCards() {
-  document.querySelectorAll('.agent-item').forEach((row) => {
-    const agentName = row.dataset.agentName === undefined ? null : row.dataset.agentName;
-    refreshAgentVoiceCard(agentName);
+  document.querySelectorAll('.agent-item[data-voice-agent-key]').forEach((row) => {
+    refreshAgentVoiceCard(attrToVoiceKey(row.dataset.voiceAgentKey));
   });
 }
 
@@ -349,12 +365,12 @@ function toggleAgentMute(agentName) {
 }
 
 function toggleAgentSolo(agentName) {
-  soloAgent = soloAgent === agentName ? null : agentName;
+  soloAgent = soloAgent === agentName ? NO_AGENT : agentName;
   applyActiveSessionPolicy();
 }
 
 function toggleAgentArm(agentName) {
-  setArmedAgent(armedAgent === agentName ? null : agentName);
+  setArmedAgent(armedAgent === agentName ? NO_AGENT : agentName);
 }
 
 function setArmedAgent(agentName) {
@@ -362,8 +378,8 @@ function setArmedAgent(agentName) {
   for (const [agent] of sessionByAgent.entries()) {
     getOrCreateChatPane(agent).micArmed = agent === armedAgent;
   }
-  for (const row of document.querySelectorAll('.agent-item')) {
-    const agent = row.dataset.agentName === undefined ? null : row.dataset.agentName;
+  for (const row of document.querySelectorAll('.agent-item[data-voice-agent-key]')) {
+    const agent = attrToVoiceKey(row.dataset.voiceAgentKey);
     getOrCreateChatPane(agent).micArmed = agent === armedAgent;
   }
   applyActiveSessionPolicy();
@@ -544,7 +560,7 @@ function applyActiveSessionPolicy() {
 }
 
 function isOutputMuted(agent, session = sessionForAgent(agent)) {
-  if (soloAgent !== null) return agent !== soloAgent;
+  if (soloAgent !== NO_AGENT) return agent !== soloAgent;
   if (session.explicitMuted !== null) return !!session.explicitMuted;
   return agent !== currentAgentKey();
 }
@@ -729,7 +745,7 @@ async function stopSession(session = activeSession()) {
   session.pathLabel = '';
   session.pathTooltip = '';
   const wasControlSession = session === controlSession();
-  if (armedAgent === session.agent) setArmedAgent(null);
+  if (armedAgent === session.agent) setArmedAgent(NO_AGENT);
   setState(State.IDLE, session);
   if (wasControlSession) applyActiveSessionState();
   // Release the chat-model selector lock BEFORE awaiting close so the user
@@ -752,7 +768,7 @@ function surfaceFatalError(err, session = activeSession()) {
   session.pathLabel = '';
   session.pathTooltip = '';
   const wasControlSession = session === controlSession();
-  if (armedAgent === session.agent) setArmedAgent(null);
+  if (armedAgent === session.agent) setArmedAgent(NO_AGENT);
   if (wasControlSession) applyActiveSessionState();
   // Restore the chat-model selector — fatal errors take a different code
   // path than stopSession() but the lock still needs releasing or the user
@@ -868,7 +884,7 @@ function handleClientEvent(agent, ev, startSeq) {
       session.pathLabel = '';
       session.pathTooltip = '';
       const wasControlSession = session === controlSession();
-      if (armedAgent === session.agent) setArmedAgent(null);
+      if (armedAgent === session.agent) setArmedAgent(NO_AGENT);
       if (wasControlSession) applyActiveSessionState();
       // Belt-and-suspenders selector restore.  ``stopSession`` and
       // ``surfaceFatalError`` already release, but events like

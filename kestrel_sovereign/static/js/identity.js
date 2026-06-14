@@ -721,7 +721,10 @@ export async function loadAgents() {
             const voiceAgentKey = isStandalone ? null : agent.name;
             const item = document.createElement('div');
             item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}${isThinking ? ' agent-thinking' : ''}`;
-            if (!isStandalone) item.dataset.agentName = agent.name;
+            // Always carry the real agent name — thinking-dot / stop-button
+            // lookups (refreshAgentThinkingDot, etc.) depend on it in every mode.
+            // The voice controls key off a separate data-voice-agent-key.
+            item.dataset.agentName = agent.name;
 
             // Only enable multi_agent agent selection in non-standalone mode
             if (isOnline && !isStandalone) {
