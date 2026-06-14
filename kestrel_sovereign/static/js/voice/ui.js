@@ -275,7 +275,6 @@ export function mountAgentVoiceControls(item, agentName) {
   const controls = document.createElement('div');
   controls.className = 'agent-voice-controls';
   controls.innerHTML = `
-    <span class="agent-voice-state" title="Voice state"></span>
     <button type="button" class="agent-voice-control agent-voice-mute" title="Mute playback" aria-label="Mute playback">🔇</button>
     <button type="button" class="agent-voice-control agent-voice-solo" title="Listen / add to mix — Shift-click to solo" aria-label="Listen / add to mix; Shift-click to solo">🎧</button>
     <button type="button" class="agent-voice-control agent-voice-arm" title="Arm microphone" aria-label="Arm microphone">●</button>
@@ -333,11 +332,6 @@ export function refreshAgentVoiceCard(agentName) {
   row.classList.toggle('agent-voice-soloed', soloAgent === agentName);
   row.classList.toggle('agent-voice-armed', armedAgent === agentName);
 
-  const stateEl = row.querySelector('.agent-voice-state');
-  if (stateEl) {
-    stateEl.textContent = stateLabel(session.state);
-    stateEl.title = `Voice: ${stateLabel(session.state)}`;
-  }
   const muteBtn = row.querySelector('.agent-voice-mute');
   if (muteBtn) {
     muteBtn.classList.toggle('active', session.explicitMuted === true);
@@ -370,10 +364,6 @@ function refreshAllAgentVoiceCards() {
   });
 }
 
-function stateLabel(state) {
-  if (state === State.CONNECTING) return 'connecting';
-  return state || State.IDLE;
-}
 
 // explicitMuted is a per-agent tri-state: true = forced silent, false = pinned
 // audible (in the additive mix), null = follow focus (v0 default).
@@ -1820,32 +1810,31 @@ function injectStyles() {
       font-size: 0.7rem;
     }
 
+    /* Just the three buttons — no reserved text column. The old
+       minmax(4.6rem,1fr) state-label column + flex-shrink:0 hogged ~160px of a
+       narrow sidebar and truncated agent names to "Meri…". Session state is
+       conveyed by the button lights + the speaking cue below, not text. */
     .agent-voice-controls {
       display: grid;
-      grid-template-columns: minmax(4.6rem, 1fr) repeat(3, 1.55rem);
+      grid-template-columns: repeat(3, 1.55rem);
       gap: 0.25rem;
       align-items: center;
       flex-shrink: 0;
     }
-    .agent-voice-state {
-      color: var(--text-tertiary, #9ca3af);
-      font-size: 0.68rem;
-      line-height: 1;
-      min-width: 0;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      text-align: right;
-    }
-    .agent-item.selected .agent-voice-state {
-      color: rgba(255, 255, 255, 0.78);
-    }
-    .agent-item.agent-voice-live .agent-voice-state {
+    /* Live voice session: tint the 🎧 so an active agent reads at a glance.
+       Speaking: gentle pulse on the same control. Replaces the dropped text.
+       Scoped to :not(.active):not(.soloed) so it never overrides the white-on-
+       accent active style or the solo ring (those already signal strongly). */
+    .agent-item.agent-voice-live .agent-voice-solo:not(.active):not(.soloed) {
+      border-color: #16a34a;
       color: #16a34a;
-      font-weight: 700;
     }
-    .agent-item.agent-voice-speaking .agent-voice-state {
-      color: var(--accent-color, #3b82f6);
+    .agent-item.agent-voice-speaking .agent-voice-solo:not(.soloed) {
+      animation: agentVoiceSpeak 1s ease-in-out infinite;
+    }
+    @keyframes agentVoiceSpeak {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.0); }
+      50% { box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.45); }
     }
     .agent-voice-control {
       width: 1.55rem;
