@@ -904,6 +904,82 @@ def cmd_migrate_llm_config(args) -> int:
     return 0
 
 
+def cmd_migrate_config(args) -> int:
+    """Merge legacy model config files into unified ``kestrel.toml``."""
+    from kestrel_sovereign.setup.migrate_config import migrate_config
+
+    project_dir = (
+        Path(args.project_dir).resolve()
+        if args.project_dir
+        else _get_project_dir()
+    )
+
+    result = migrate_config(project_dir)
+
+    if result.action == "parse_error":
+        errors = [
+            f"  {source.source_path.name} -> [{source.section_path}]: {source.error}"
+            for source in result.sources
+            if source.action == "parse_error"
+        ]
+        print(
+            "error: one or more legacy model config files are not valid TOML.\n"
+            + "\n".join(errors)
+            + "\n\nNo files were changed. Fix the syntax error and re-run "
+            "`kestrel migrate-config`.",
+            file=sys.stderr,
+        )
+        return 1
+
+    migrated = [
+        source for source in result.sources if source.action == "migrated"
+    ]
+    already_clean = [
+        source for source in result.sources if source.action == "already_clean"
+    ]
+    missing = [
+        source for source in result.sources if source.action == "no_source"
+    ]
+
+    if result.action == "migrated":
+        lines = [
+            f"Migrated legacy model config into {result.kestrel_toml_path.name}:"
+        ]
+        lines.extend(
+            f"  {source.source_path.name} -> [{source.section_path}]"
+            for source in migrated
+        )
+        lines.extend(
+            f"  skipped [{source.section_path}] (already present)"
+            for source in already_clean
+        )
+        lines.extend(
+            f"  skipped {source.source_path.name} (not found)"
+            for source in missing
+        )
+        lines.append(
+            f"  Backup of prior kestrel.toml: {result.backup_path.name}"
+            if result.backup_path
+            else "  (no prior kestrel.toml; created fresh)"
+        )
+        print("\n".join(lines))
+        return 0
+
+    if result.action == "already_clean":
+        print(
+            f"{result.kestrel_toml_path.name} already has the unified model "
+            "config sections; nothing to migrate."
+        )
+        return 0
+
+    print(
+        "Nothing to migrate: model_mandate.toml and model_catalog.toml were "
+        f"not found. Configure them in {result.kestrel_toml_path.name} under "
+        "[llm.mandate] and [llm.catalog]."
+    )
+    return 0
+
+
 def cmd_migrate_encryption(args) -> int:
     """One-shot: encrypt pre-migration plaintext rows at rest (#1401).
 
@@ -1433,6 +1509,18 @@ def build_parser() -> argparse.ArgumentParser:
              "(defaults to the Kestrel repo root).",
     )
 
+    # kestrel migrate-config
+    migrate_config_p = subparsers.add_parser(
+        "migrate-config",
+        help="One-shot: merge legacy model_mandate.toml/model_catalog.toml "
+             "into kestrel.toml [llm.mandate]/[llm.catalog]",
+    )
+    migrate_config_p.add_argument(
+        "--project-dir", default=None,
+        help="Project root containing legacy model config files and "
+             "kestrel.toml (defaults to the Kestrel repo root).",
+    )
+
     # kestrel constitution {reanchor}
     constitution_p = subparsers.add_parser(
         "constitution",
@@ -1605,6 +1693,7 @@ def main() -> int:
         "setup": cmd_setup,
         "constitution": cmd_constitution,
         "migrate-llm-config": cmd_migrate_llm_config,
+        "migrate-config": cmd_migrate_config,
         "migrate-encryption": cmd_migrate_encryption,
         "config": cmd_config,
         "feature": cmd_feature,

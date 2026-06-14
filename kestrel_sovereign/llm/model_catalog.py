@@ -183,6 +183,7 @@ class ModelCatalogService:
             config_path: Path to model_catalog.toml (default: project root)
             cache_path: Path to model_discovery_cache.json (default: alongside catalog)
         """
+        self._use_unified_config = config_path is None
         self.config_path = config_path or DEFAULT_CATALOG_PATH
         self.cache_path = cache_path or DEFAULT_CACHE_PATH
         self._config: Dict = {}
@@ -231,7 +232,20 @@ class ModelCatalogService:
         # missing-catalog early return below; env overrides further
         # down get a chance to layer on top later if load() proceeds.
         kestrel_toml_caps = _read_kestrel_toml_route_caps()
-        if not self.config_path.exists():
+        if self._use_unified_config:
+            from kestrel_sovereign.config import load_config
+
+            self._config = load_config("model_catalog.toml")
+        elif self.config_path.exists():
+            try:
+                with open(self.config_path, "rb") as f:
+                    self._config = tomllib.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load model catalog: {e}")
+                self._loaded = True  # Mark as loaded to avoid retry loops
+                return
+
+        if not self._config:
             logger.warning(
                 f"Model catalog not found at {self.config_path}, using defaults"
             )
@@ -243,9 +257,6 @@ class ModelCatalogService:
             return
 
         try:
-            with open(self.config_path, "rb") as f:
-                self._config = tomllib.load(f)
-
             # Parse hidden models
             hidden = self._config.get("hidden", {})
             for provider, models in hidden.items():

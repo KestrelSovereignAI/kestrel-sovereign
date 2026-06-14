@@ -68,12 +68,10 @@ def test_get_model_for_prompt_normalizes_provider_selectors():
 
 
 def test_shipped_mandate_configs_use_discovery_backed_cheap_policy():
-    root_config = tomllib.loads((PROJECT_ROOT / "model_mandate.toml").read_text(encoding="utf-8"))
     example_config = tomllib.loads((PROJECT_ROOT / "model_mandate.toml.example").read_text(encoding="utf-8"))
     unified_config = tomllib.loads((PROJECT_ROOT / "kestrel.toml.example").read_text(encoding="utf-8"))
 
     for config in [
-        root_config["defaults"],
         example_config["defaults"],
         unified_config["llm"]["mandate"]["defaults"],
     ]:

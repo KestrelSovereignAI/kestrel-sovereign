@@ -4,10 +4,26 @@ Unit tests for ModelCatalogService in model_catalog.py
 import json
 import pytest
 import tempfile
+import toml
+import tomllib
 from pathlib import Path
 
 from kestrel_sovereign.llm.model_catalog import ModelCatalogService, get_catalog_service
 from kestrel_sovereign.llm.model_metadata import ModelInfo, ModelCategory
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _service_with_shipped_unified_catalog() -> ModelCatalogService:
+    config = tomllib.loads(
+        (PROJECT_ROOT / "kestrel.toml.example").read_text(encoding="utf-8")
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(toml.dumps(config["llm"]["catalog"]))
+        f.flush()
+        service = ModelCatalogService(config_path=Path(f.name))
+        service.load()
+        return service
 
 
 class TestModelCatalogServiceInit:
@@ -287,8 +303,7 @@ class TestCatalogWithRealConfig:
 
     def test_load_real_config(self):
         """Test loading the actual config file"""
-        service = ModelCatalogService()
-        service.load()
+        service = _service_with_shipped_unified_catalog()
 
         assert service._loaded
 
@@ -301,8 +316,7 @@ class TestCatalogWithRealConfig:
         """
         from kestrel_sovereign.llm.model_catalog import ModelCategory
 
-        service = ModelCatalogService()
-        service.load()
+        service = _service_with_shipped_unified_catalog()
 
         assert service.get_category("openai", "babbage-002") == ModelCategory.COMPLETION
         assert service.get_category("openai", "davinci-002") == ModelCategory.COMPLETION
@@ -312,8 +326,7 @@ class TestCatalogWithRealConfig:
 
     def test_real_config_embedding_models_explicit_only(self):
         """Test that catalog only matches explicitly listed embedding models."""
-        service = ModelCatalogService()
-        service.load()
+        service = _service_with_shipped_unified_catalog()
 
         assert service.get_category("ollama", "nomic-embed-text") == ModelCategory.EMBEDDING
         assert service.get_category("ollama", "mxbai-embed-large") == ModelCategory.EMBEDDING
@@ -376,8 +389,7 @@ class TestContextLimits:
 
     def test_real_config_has_context_limits(self):
         """Test that real config file has context limit overrides."""
-        service = ModelCatalogService()
-        service.load()
+        service = _service_with_shipped_unified_catalog()
 
         assert service.get_context_limit("claude-opus-4-5-20251101") == 1000000
         assert service.get_context_limit("gemma2:9b") == 8192
