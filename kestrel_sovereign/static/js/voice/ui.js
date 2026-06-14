@@ -77,6 +77,13 @@ let pickerModalEl = null;
 let privacyBannerEl = null;
 
 const sessionByAgent = new Map();
+// Sentinel for "no agent soloed/armed". A plain `null` can't serve here because
+// `null` IS the valid host-agent key in standalone mode — conflating the two
+// makes the standalone row read as soloed/armed by default and impossible to
+// toggle off. A Symbol never equals any real agent key (string or null).
+const NO_AGENT = Symbol('no-agent');
+let soloAgent = NO_AGENT;
+let armedAgent = NO_AGENT;
 
 function createSession(agent) {
   return {
@@ -92,6 +99,7 @@ function createSession(agent) {
     realtimeModel: '',
     ownsSelector: false,
     startSeq: 0,
+    explicitMuted: null,
   };
 }
 
@@ -107,6 +115,10 @@ function sessionForAgent(agent) {
 
 function activeSession() {
   return sessionForAgent(currentAgentKey());
+}
+
+function controlSession() {
+  return armedAgent !== NO_AGENT ? sessionForAgent(armedAgent) : activeSession();
 }
 
 function paneForSession(session) {
@@ -189,6 +201,15 @@ function settings() {
   return s;
 }
 
+function settingsForAgent(agent) {
+  let s = _settingsByAgent.get(agent);
+  if (!s) {
+    s = loadSettings(agent);
+    _settingsByAgent.set(agent, s);
+  }
+  return s;
+}
+
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -231,11 +252,9 @@ export function onAgentSwitch(prevAgent, nextAgent) {
   // selectAgent() still fires this hook — and applyActiveSessionState() →
   // setState() would dereference the null `buttonEl` and crash the switch.
   if (!buttonEl) return;
-  const prevSession = sessionForAgent(prevAgent);
+  const prevSession = prevAgent === undefined ? null : sessionForAgent(prevAgent);
   const nextSession = sessionForAgent(nextAgent);
-  const prevPane = getOrCreateChatPane(prevAgent);
-  prevPane.micArmed = prevSession.state !== State.IDLE && prevSession.state !== State.ERROR;
-  if (prevSession.ownsSelector) releaseSelectorOwnership(prevSession);
+  if (prevSession?.ownsSelector) releaseSelectorOwnership(prevSession);
 
   applyActiveSessionPolicy();
   applyActiveSessionState();
@@ -244,6 +263,127 @@ export function onAgentSwitch(prevAgent, nextAgent) {
   if (nextPane.micArmed && nextSession.client && nextSession.realtimeModel) {
     acquireSelectorOwnership(nextSession.realtimeModel, nextSession);
   }
+}
+
+export function mountAgentVoiceControls(item, agentName) {
+  if (!item) return;
+  // Voice cards are located by their OWN attribute, NOT `data-agent-name`.
+  // The voice session key for standalone mode is `null` (≠ the real agent name
+  // the row still carries in `data-agent-name` for thinking-dot / stop-button
+  // lookups), so the two identities genuinely differ and must not share a key.
+  item.dataset.voiceAgentKey = voiceKeyToAttr(agentName);
+  const controls = document.createElement('div');
+  controls.className = 'agent-voice-controls';
+  controls.innerHTML = `
+    <span class="agent-voice-state" title="Voice state"></span>
+    <button type="button" class="agent-voice-control agent-voice-mute" title="Mute playback" aria-label="Mute playback">🔇</button>
+    <button type="button" class="agent-voice-control agent-voice-solo" title="Solo playback" aria-label="Solo playback">🎧</button>
+    <button type="button" class="agent-voice-control agent-voice-arm" title="Arm microphone" aria-label="Arm microphone">●</button>
+  `;
+  controls.querySelector('.agent-voice-mute')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleAgentMute(agentName);
+  });
+  controls.querySelector('.agent-voice-solo')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleAgentSolo(agentName);
+  });
+  controls.querySelector('.agent-voice-arm')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleAgentArm(agentName);
+  });
+  item.appendChild(controls);
+  refreshAgentVoiceCard(agentName);
+}
+
+// Map a voice session key (string agent name, or `null` for standalone) to/from
+// the stable DOM attribute used to locate that agent's card.
+function voiceKeyToAttr(agent) {
+  return agent === null || agent === undefined ? '__standalone__' : String(agent);
+}
+function attrToVoiceKey(attr) {
+  return attr === '__standalone__' || attr === undefined ? null : attr;
+}
+function cssEscape(s) {
+  return (typeof CSS !== 'undefined' && typeof CSS.escape === 'function')
+    ? CSS.escape(s)
+    : String(s).replace(/["\\]/g, '\\$&');
+}
+
+export function refreshAgentVoiceCard(agentName) {
+  const selector = `.agent-item[data-voice-agent-key="${cssEscape(voiceKeyToAttr(agentName))}"]`;
+  const row = document.querySelector(selector);
+  if (!row) return;
+  const session = sessionForAgent(agentName);
+  const pane = getOrCreateChatPane(agentName);
+  const outputMuted = isOutputMuted(agentName, session);
+  row.dataset.voiceState = session.state;
+  row.classList.toggle('agent-voice-live', session.state !== State.IDLE && session.state !== State.ERROR);
+  row.classList.toggle('agent-voice-speaking', session.state === State.SPEAKING);
+  row.classList.toggle('agent-voice-muted', outputMuted);
+  row.classList.toggle('agent-voice-soloed', soloAgent === agentName);
+  row.classList.toggle('agent-voice-armed', armedAgent === agentName);
+
+  const stateEl = row.querySelector('.agent-voice-state');
+  if (stateEl) {
+    stateEl.textContent = stateLabel(session.state);
+    stateEl.title = `Voice: ${stateLabel(session.state)}`;
+  }
+  const muteBtn = row.querySelector('.agent-voice-mute');
+  if (muteBtn) {
+    muteBtn.classList.toggle('active', session.explicitMuted === true);
+    muteBtn.setAttribute('aria-pressed', session.explicitMuted === true ? 'true' : 'false');
+    muteBtn.title = session.explicitMuted === true ? 'Unmute playback' : 'Mute playback';
+  }
+  const soloBtn = row.querySelector('.agent-voice-solo');
+  if (soloBtn) {
+    soloBtn.classList.toggle('active', soloAgent === agentName);
+    soloBtn.setAttribute('aria-pressed', soloAgent === agentName ? 'true' : 'false');
+  }
+  const armBtn = row.querySelector('.agent-voice-arm');
+  if (armBtn) {
+    armBtn.classList.toggle('active', pane.micArmed);
+    armBtn.setAttribute('aria-pressed', pane.micArmed ? 'true' : 'false');
+  }
+}
+
+function refreshAllAgentVoiceCards() {
+  document.querySelectorAll('.agent-item[data-voice-agent-key]').forEach((row) => {
+    refreshAgentVoiceCard(attrToVoiceKey(row.dataset.voiceAgentKey));
+  });
+}
+
+function stateLabel(state) {
+  if (state === State.CONNECTING) return 'connecting';
+  return state || State.IDLE;
+}
+
+function toggleAgentMute(agentName) {
+  const session = sessionForAgent(agentName);
+  session.explicitMuted = session.explicitMuted === true ? false : true;
+  applyActiveSessionPolicy();
+}
+
+function toggleAgentSolo(agentName) {
+  soloAgent = soloAgent === agentName ? NO_AGENT : agentName;
+  applyActiveSessionPolicy();
+}
+
+function toggleAgentArm(agentName) {
+  setArmedAgent(armedAgent === agentName ? NO_AGENT : agentName);
+}
+
+function setArmedAgent(agentName) {
+  armedAgent = agentName;
+  for (const [agent] of sessionByAgent.entries()) {
+    getOrCreateChatPane(agent).micArmed = agent === armedAgent;
+  }
+  for (const row of document.querySelectorAll('.agent-item[data-voice-agent-key]')) {
+    const agent = attrToVoiceKey(row.dataset.voiceAgentKey);
+    getOrCreateChatPane(agent).micArmed = agent === armedAgent;
+  }
+  applyActiveSessionPolicy();
+  if (buttonEl) applyActiveSessionState();
 }
 
 // Re-lock the chat-model selector to the active agent's live Realtime session.
@@ -386,34 +526,43 @@ function mountPickerModal() {
 
 function setState(next, session = activeSession()) {
   session.state = next;
-  if (!isActiveSession(session)) return;
-  buttonEl.textContent = STATE_GLYPH[next];
-  buttonEl.title = STATE_LABELS[next];
-  buttonEl.setAttribute('aria-label', STATE_LABELS[next]);
-  buttonEl.dataset.state = next;
-  // Path/privacy badge visible whenever a session is in progress.
-  if (pathBadgeEl) pathBadgeEl.hidden = next === State.IDLE;
+  refreshAgentVoiceCard(session.agent);
+  if (session === controlSession()) {
+    buttonEl.textContent = STATE_GLYPH[next];
+    buttonEl.title = STATE_LABELS[next];
+    buttonEl.setAttribute('aria-label', STATE_LABELS[next]);
+    buttonEl.dataset.state = next;
+    // Path/privacy badge visible whenever a session is in progress.
+    if (pathBadgeEl) pathBadgeEl.hidden = next === State.IDLE;
+  }
 }
 
 function applyActiveSessionState() {
-  const session = activeSession();
+  const session = controlSession();
   setState(session.state, session);
   setPathBadge(session.pathLabel, session.pathTooltip);
 }
 
-// Enforce the single-active-agent policy across every live session: only the
-// agent on screen is audible (output) AND heard (input). Backgrounded sessions
-// stay connected but are muted both ways, so the user's speech is never routed
-// to — nor hidden turns created under — an agent they've switched away from.
-// Input gating is the load-bearing half: muting only output would leave a
-// background agent silently transcribing the user.
+// Mixing-board policy:
+// - Output defaults to v0 behavior: with no explicit mute/solo choice, the
+//   active agent is audible and background agents are muted.
+// - A per-agent mute toggle is explicit state and wins over focus changes:
+//   explicit unmute keeps a background agent audible; explicit mute keeps the
+//   active agent silent. Solo is exclusive and temporarily mutes every other
+//   output without erasing their mute choices.
+// - Input is a single armed target. Focus changes never move it.
 function applyActiveSessionPolicy() {
-  const active = currentAgentKey();
   for (const [agent, session] of sessionByAgent.entries()) {
-    const background = agent !== active;
-    try { session.client?.setMuted?.(background); } catch (_) {}
-    try { session.client?.setInputMuted?.(background); } catch (_) {}
+    try { session.client?.setMuted?.(isOutputMuted(agent, session)); } catch (_) {}
+    try { session.client?.setInputMuted?.(agent !== armedAgent); } catch (_) {}
   }
+  refreshAllAgentVoiceCards();
+}
+
+function isOutputMuted(agent, session = sessionForAgent(agent)) {
+  if (soloAgent !== NO_AGENT) return agent !== soloAgent;
+  if (session.explicitMuted !== null) return !!session.explicitMuted;
+  return agent !== currentAgentKey();
 }
 
 
@@ -423,11 +572,11 @@ function applyActiveSessionPolicy() {
 
 
 async function toggleSession() {
-  const session = activeSession();
+  const session = controlSession();
   if (session.state === State.IDLE || session.state === State.ERROR) {
-    await startSession();
+    await startSession(session);
   } else {
-    await stopSession();
+    await stopSession(session);
   }
 }
 
@@ -480,14 +629,13 @@ function releaseSelectorOwnership(session = activeSession()) {
 }
 
 
-async function startSession() {
-  const session = activeSession();
+async function startSession(session = activeSession()) {
   const agent = session.agent;
   // Pin the initiating agent's settings NOW. settings() resolves against the
   // CURRENT host agent, and the route/mint work below has awaits — if the user
   // switches agents mid-startup, a bare settings() call would resolve against
   // the new agent and we'd mint agent A's session with agent B's voice/config.
-  const pinnedSettings = settings();
+  const pinnedSettings = settingsForAgent(agent);
   // Monotonic start token: lets late events from a superseded same-agent client
   // (notably an old client's async-teardown SESSION_CLOSED) be ignored so they
   // can't clobber a newer session. Bumped per start, captured in `onEvent`.
@@ -495,11 +643,11 @@ async function startSession() {
   const startSeq = session.startSeq;
   setState(State.CONNECTING, session);
   resetTurnState(session);
-  setPathBadge('', '');
+  if (session === controlSession()) setPathBadge('', '');
   session.pathLabel = '';
   session.pathTooltip = '';
   session.realtimeModel = '';
-  getOrCreateChatPane(agent).micArmed = true;
+  setArmedAgent(agent);
 
   const onEvent = (ev) => handleClientEvent(agent, ev, startSeq);
 
@@ -527,8 +675,6 @@ async function startSession() {
         },
       });
       await session.client.start();
-      session.client.setMuted?.(!isActiveSession(session));
-      session.client.setInputMuted?.(!isActiveSession(session));
       applyActiveSessionPolicy();
       const realtimeModel = session.client.session?.model || 'gpt-realtime';
       session.realtimeModel = realtimeModel;
@@ -541,7 +687,7 @@ async function startSession() {
         `OpenAI Realtime: voice + reasoning answered by ${realtimeModel}, NOT your selected chat LLM. Switch to Pipeline in voice settings (right-click 🎙) to keep your chat LLM as the brain.`;
       session.pathLabel = label;
       session.pathTooltip = tooltip;
-      if (isActiveSession(session)) setPathBadge(
+      if (session === controlSession()) setPathBadge(
         label,
         tooltip,
       );
@@ -583,12 +729,10 @@ async function startSession() {
       language: (navigator.language || 'en').split('-')[0],
     });
     await session.client.start();
-    session.client.setMuted?.(!isActiveSession(session));
-    session.client.setInputMuted?.(!isActiveSession(session));
     applyActiveSessionPolicy();
     session.pathLabel = 'Pipeline';
     session.pathTooltip = 'Cascaded STT → your LLM → TTS. Slower than Realtime, preserves your model choice.';
-    if (isActiveSession(session)) setPathBadge(session.pathLabel, session.pathTooltip);
+    if (session === controlSession()) setPathBadge(session.pathLabel, session.pathTooltip);
   } catch (err) {
     surfaceFatalError(err, session);
   }
@@ -600,9 +744,10 @@ async function stopSession(session = activeSession()) {
   session.client = null;
   session.pathLabel = '';
   session.pathTooltip = '';
-  getOrCreateChatPane(session.agent).micArmed = false;
+  const wasControlSession = session === controlSession();
+  if (armedAgent === session.agent) setArmedAgent(NO_AGENT);
   setState(State.IDLE, session);
-  if (isActiveSession(session)) setPathBadge('', '');
+  if (wasControlSession) applyActiveSessionState();
   // Release the chat-model selector lock BEFORE awaiting close so the user
   // sees their text model restored immediately, even if the WebRTC teardown
   // hangs.  Release is idempotent: the SESSION_CLOSED handler below will be
@@ -622,8 +767,9 @@ function surfaceFatalError(err, session = activeSession()) {
   session.client = null;
   session.pathLabel = '';
   session.pathTooltip = '';
-  getOrCreateChatPane(session.agent).micArmed = false;
-  if (isActiveSession(session)) setPathBadge('', '');
+  const wasControlSession = session === controlSession();
+  if (armedAgent === session.agent) setArmedAgent(NO_AGENT);
+  if (wasControlSession) applyActiveSessionState();
   // Restore the chat-model selector — fatal errors take a different code
   // path than stopSession() but the lock still needs releasing or the user
   // is stranded on the Realtime model for the next text turn.  See #1371.
@@ -737,8 +883,9 @@ function handleClientEvent(agent, ev, startSeq) {
       session.client = null;
       session.pathLabel = '';
       session.pathTooltip = '';
-      getOrCreateChatPane(session.agent).micArmed = false;
-      if (isActiveSession(session)) setPathBadge('', '');
+      const wasControlSession = session === controlSession();
+      if (armedAgent === session.agent) setArmedAgent(NO_AGENT);
+      if (wasControlSession) applyActiveSessionState();
       // Belt-and-suspenders selector restore.  ``stopSession`` and
       // ``surfaceFatalError`` already release, but events like
       // ``data_channel_closed`` (network drop, server-side close) reach us
@@ -1362,7 +1509,7 @@ function bindGlobalShortcuts() {
   // whatever happens to be active on release — or A's session leaks.
   let pttSession = null;
   document.addEventListener('keydown', (ev) => {
-    const session = activeSession();
+    const session = controlSession();
     // Esc: stop active session from anywhere.
     if (ev.key === 'Escape' && session.state !== State.IDLE) {
       ev.preventDefault();
@@ -1376,7 +1523,7 @@ function bindGlobalShortcuts() {
         spaceHeld = true;
         pttSession = session;
         ev.preventDefault();
-        startSession();
+        startSession(session);
       }
     }
   });
@@ -1634,6 +1781,74 @@ function injectStyles() {
       margin-right: 0.5rem;
       border-radius: 999px;
       font-size: 0.7rem;
+    }
+
+    .agent-voice-controls {
+      display: grid;
+      grid-template-columns: minmax(4.6rem, 1fr) repeat(3, 1.55rem);
+      gap: 0.25rem;
+      align-items: center;
+      flex-shrink: 0;
+    }
+    .agent-voice-state {
+      color: var(--text-tertiary, #9ca3af);
+      font-size: 0.68rem;
+      line-height: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .agent-item.selected .agent-voice-state {
+      color: rgba(255, 255, 255, 0.78);
+    }
+    .agent-item.agent-voice-live .agent-voice-state {
+      color: #16a34a;
+      font-weight: 700;
+    }
+    .agent-item.agent-voice-speaking .agent-voice-state {
+      color: var(--accent-color, #3b82f6);
+    }
+    .agent-voice-control {
+      width: 1.55rem;
+      height: 1.55rem;
+      border: 1px solid var(--border-color, #2d3748);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-secondary, #d1d5db);
+      cursor: pointer;
+      font-size: 0.78rem;
+      line-height: 1;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+    }
+    .agent-voice-control:hover {
+      background: var(--bg-tertiary, #1f2937);
+      color: var(--text-primary, #e5e7eb);
+    }
+    .agent-voice-control.active {
+      background: var(--accent-color, #3b82f6);
+      border-color: var(--accent-color, #3b82f6);
+      color: #fff;
+    }
+    .agent-voice-mute.active {
+      background: var(--error-color, #ef4444);
+      border-color: var(--error-color, #ef4444);
+    }
+    .agent-voice-arm {
+      color: #ef4444;
+    }
+    .agent-voice-arm.active {
+      background: #ef4444;
+      border-color: #ef4444;
+      color: #fff;
+    }
+    .agent-item.offline .agent-voice-controls {
+      pointer-events: none;
+      opacity: 0.5;
     }
 
     .kestrel-voice-modal {
