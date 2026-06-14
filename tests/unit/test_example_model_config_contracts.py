@@ -69,10 +69,9 @@ def test_unified_example_priorities_match_declared_vendors():
 
 
 def test_root_model_catalog_is_manual_overrides_only():
-    catalog_text = (PROJECT_ROOT / "model_catalog.toml").read_text(encoding="utf-8")
-    catalog = tomllib.loads(catalog_text)
+    config_text = (PROJECT_ROOT / "kestrel.toml.example").read_text(encoding="utf-8")
+    catalog = tomllib.loads(config_text)["llm"]["catalog"]
 
-    assert "Manual Overrides Only" in catalog_text
     assert "featured" not in catalog
     assert "display_name_overrides" in catalog
     assert "context_limits_override" in catalog

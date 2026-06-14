@@ -69,7 +69,9 @@ _UNIFIED_CONFIG_MAPPING = {
     # reads it directly via tomllib, never through load_config(), so a
     # mapping entry was dead. (That manager reimplements the unified-config
     # fallback instead of reusing this module — a separate consolidation.)
-    "council_config.toml": "council",
+    # NOTE: council_config.toml is intentionally NOT mapped here. Core does
+    # not call load_config("council_config.toml"); council configuration is
+    # owned by the out-of-tree council feature package and helper scripts.
 }
 
 def _project_root_for_config() -> Path:
@@ -81,6 +83,17 @@ def _project_root_for_config() -> Path:
     from kestrel_sovereign.paths import project_dir
 
     return project_dir()
+
+
+def _get_nested_config(data: Dict[str, Any], section_path: str) -> Dict[str, Any]:
+    config_data: Any = data
+    for key in section_path.split('.'):
+        if not isinstance(config_data, dict):
+            return {}
+        config_data = config_data.get(key, {})
+        if not config_data:
+            return {}
+    return config_data if isinstance(config_data, dict) else {}
 
 
 def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]:
@@ -111,15 +124,8 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
             with open(unified_path, 'r', encoding='utf-8') as f:
                 unified_data = toml.load(f)
 
-            # Navigate to the mapped section in unified config
             section_path = _UNIFIED_CONFIG_MAPPING[file_name]
-            config_data = unified_data
-
-            # Handle nested sections (e.g., "llm.catalog" -> llm -> catalog)
-            for key in section_path.split('.'):
-                config_data = config_data.get(key, {})
-                if not config_data:
-                    break
+            config_data = _get_nested_config(unified_data, section_path)
 
             # If we found the config in unified file, return it
             if config_data:
@@ -136,8 +142,35 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
     # Fall back to individual config file (backward compatibility)
     config_path = project_root / file_name
 
-    # Create the config file from the example if it doesn't exist
+    # Create the config file from the example if it doesn't exist. Deprecated
+    # unified-config files are the exception: a missing standalone file means
+    # "not migrated yet", not "recreate a live legacy file from documentation".
     if not config_path.exists():
+        if file_name in _UNIFIED_CONFIG_MAPPING:
+            example_unified_path = project_root / "kestrel.toml.example"
+            if example_unified_path.exists():
+                try:
+                    with open(example_unified_path, 'r', encoding='utf-8') as f:
+                        example_unified_data = toml.load(f)
+                    config_data = _get_nested_config(
+                        example_unified_data,
+                        _UNIFIED_CONFIG_MAPPING[file_name],
+                    )
+                    if config_data:
+                        return config_data.get(section, {}) if section else config_data
+                except Exception as e:
+                    logger.debug(
+                        "Error loading '%s' defaults from kestrel.toml.example: %s",
+                        file_name,
+                        e,
+                    )
+            logger.debug(
+                "'%s' not found and no unified defaults are available; "
+                "returning empty config instead of recreating a deprecated "
+                "standalone file.",
+                file_name,
+            )
+            return {}
         example_path = project_root / f"{file_name}.example"
         if example_path.exists():
             logger.info(f"'{file_name}' not found. Copying from '{example_path}'.")
@@ -250,4 +283,4 @@ CONSTITUTION_PATH = os.path.join(_PACKAGE_DIR, 'data', 'KESTREL_CONSTITUTION.md'
 
 # --- Inception Service ---
 # Ensure the directory for trusted agents' keys exists
-os.makedirs(TRUSTED_AGENTS_DIR, exist_ok=True) 
+os.makedirs(TRUSTED_AGENTS_DIR, exist_ok=True)
