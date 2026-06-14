@@ -277,16 +277,25 @@ export function mountAgentVoiceControls(item, agentName) {
   controls.innerHTML = `
     <span class="agent-voice-state" title="Voice state"></span>
     <button type="button" class="agent-voice-control agent-voice-mute" title="Mute playback" aria-label="Mute playback">🔇</button>
-    <button type="button" class="agent-voice-control agent-voice-solo" title="Solo playback" aria-label="Solo playback">🎧</button>
+    <button type="button" class="agent-voice-control agent-voice-solo" title="Listen / add to mix — Shift-click to solo" aria-label="Listen / add to mix; Shift-click to solo">🎧</button>
     <button type="button" class="agent-voice-control agent-voice-arm" title="Arm microphone" aria-label="Arm microphone">●</button>
   `;
   controls.querySelector('.agent-voice-mute')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
     toggleAgentMute(agentName);
   });
+  // 🎧 plain click = toggle this agent into the additive listen mix.
+  // Shift/Alt-click = solo (exclusive). A modifier-click is synchronous and
+  // unambiguous — unlike click-vs-double-click, which races the OS double-click
+  // interval (click always precedes dblclick and the threshold isn't knowable
+  // to JS), so a slow double-click would fire the listen toggle first.
   controls.querySelector('.agent-voice-solo')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    toggleAgentSolo(agentName);
+    if (ev.shiftKey || ev.altKey) {
+      toggleAgentSolo(agentName);
+    } else {
+      toggleAgentListen(agentName);
+    }
   });
   controls.querySelector('.agent-voice-arm')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
@@ -337,8 +346,16 @@ export function refreshAgentVoiceCard(agentName) {
   }
   const soloBtn = row.querySelector('.agent-voice-solo');
   if (soloBtn) {
-    soloBtn.classList.toggle('active', soloAgent === agentName);
-    soloBtn.setAttribute('aria-pressed', soloAgent === agentName ? 'true' : 'false');
+    const listening = session.explicitMuted === false;
+    const soloed = soloAgent === agentName;
+    soloBtn.classList.toggle('active', listening || soloed);
+    soloBtn.classList.toggle('soloed', soloed);
+    soloBtn.setAttribute('aria-pressed', (listening || soloed) ? 'true' : 'false');
+    soloBtn.title = soloed
+      ? 'Soloed — Shift-click to release'
+      : (listening
+        ? 'In the mix — click to stop, Shift-click to solo'
+        : 'Listen / add to mix — Shift-click to solo');
   }
   const armBtn = row.querySelector('.agent-voice-arm');
   if (armBtn) {
@@ -358,12 +375,32 @@ function stateLabel(state) {
   return state || State.IDLE;
 }
 
+// explicitMuted is a per-agent tri-state: true = forced silent, false = pinned
+// audible (in the additive mix), null = follow focus (v0 default).
+// 🔇 toggles silenced(true) ↔ audible(false): clicking unmute must make the
+// agent actually audible even when it isn't the focused one, so it lands on
+// false, NOT null (null would fall back to focus and leave it muted). 🎧 toggles
+// audible(false) ↔ auto(null). Both controls converge on the same `false`
+// "in the mix" state, and the lit button always reflects the resulting state.
 function toggleAgentMute(agentName) {
   const session = sessionForAgent(agentName);
   session.explicitMuted = session.explicitMuted === true ? false : true;
   applyActiveSessionPolicy();
 }
 
+// 🎧 single-click: pin this agent audible (add to the mix). Additive — any
+// number of agents can be pinned and their speech mixes. Exits solo mode,
+// since soloing is the exclusive opposite of building a mix.
+function toggleAgentListen(agentName) {
+  if (soloAgent !== NO_AGENT) soloAgent = NO_AGENT;
+  const session = sessionForAgent(agentName);
+  session.explicitMuted = session.explicitMuted === false ? null : false;
+  applyActiveSessionPolicy();
+}
+
+// 🎧 double-click: solo this agent (exclusive — every other output is silenced
+// while a solo is held). Double-clicking the soloed agent releases solo and
+// restores each agent's own listen/mute/focus state.
 function toggleAgentSolo(agentName) {
   soloAgent = soloAgent === agentName ? NO_AGENT : agentName;
   applyActiveSessionPolicy();
@@ -1837,6 +1874,14 @@ function injectStyles() {
     .agent-voice-mute.active {
       background: var(--error-color, #ef4444);
       border-color: var(--error-color, #ef4444);
+    }
+    /* 🎧 in the mix (additive) uses the accent .active style; soloed (exclusive)
+       gets a distinct ring so it reads differently from a plain mix-in. */
+    .agent-voice-solo.soloed {
+      background: var(--accent-color, #3b82f6);
+      border-color: #fff;
+      box-shadow: 0 0 0 2px var(--accent-color, #3b82f6);
+      color: #fff;
     }
     .agent-voice-arm {
       color: #ef4444;
