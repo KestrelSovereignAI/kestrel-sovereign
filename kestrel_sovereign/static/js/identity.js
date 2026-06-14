@@ -8,7 +8,7 @@ import { state, PRIVACY_MODES, Toast, loadCommands } from './ui.js';
 import { disconnectNotifications, connectNotifications, loadModels, updateContextStatus, updateThinkingIndicator, mountChatPane, wipeAgentChatPane, refreshAgentThinkingDot, stopAgent } from './chat.js';
 import { generateIdenticon } from './identicon.js';
 import { trashGroupKey, groupTrashBySession } from './trash_grouping.js';
-import { onAgentSwitch as onVoiceAgentSwitch, reapplyActiveSelectorLock } from './voice/ui.js';
+import { mountAgentVoiceControls, onAgentSwitch as onVoiceAgentSwitch, reapplyActiveSelectorLock } from './voice/ui.js';
 
 // ============================================================================
 // Agent Selection (Multi-Agent Support)
@@ -718,9 +718,10 @@ export async function loadAgents() {
         for (const agent of agents) {
             const isOnline = agent.status !== 'offline';
             const isThinking = state.waitingAgents.has(agent.name);
+            const voiceAgentKey = isStandalone ? null : agent.name;
             const item = document.createElement('div');
             item.className = `agent-item${selectedAgentName === agent.name ? ' selected' : ''}${!isOnline ? ' offline' : ''}${isThinking ? ' agent-thinking' : ''}`;
-            item.dataset.agentName = agent.name;
+            if (!isStandalone) item.dataset.agentName = agent.name;
 
             // Only enable multi_agent agent selection in non-standalone mode
             if (isOnline && !isStandalone) {
@@ -751,6 +752,7 @@ export async function loadAgents() {
                 });
             }
             container.appendChild(item);
+            mountAgentVoiceControls(item, voiceAgentKey);
         }
 
         // Demo-server misconfig (#868): a server in demo_mode that mounted
