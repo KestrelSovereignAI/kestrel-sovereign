@@ -918,12 +918,19 @@ def cmd_migrate_config(args) -> int:
 
     if result.action == "parse_error":
         errors = [
-            f"  {source.source_path.name} -> [{source.section_path}]: {source.error}"
+            (
+                f"  {source.source_path.name}: {source.error}"
+                if source.section_path == "destination"
+                else (
+                    f"  {source.source_path.name} -> "
+                    f"[{source.section_path}]: {source.error}"
+                )
+            )
             for source in result.sources
             if source.action == "parse_error"
         ]
         print(
-            "error: one or more legacy model config files are not valid TOML.\n"
+            "error: one or more model config files are not valid TOML.\n"
             + "\n".join(errors)
             + "\n\nNo files were changed. Fix the syntax error and re-run "
             "`kestrel migrate-config`.",

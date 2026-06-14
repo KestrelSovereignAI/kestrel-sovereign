@@ -50,6 +50,7 @@ def write_toml(
     *,
     deep_merge: bool = True,
     backup: bool = True,
+    existing_data: Mapping[str, Any] | None = None,
 ) -> TomlWriteResult:
     """Merge ``updates`` into the toml file at ``path``.
 
@@ -60,7 +61,9 @@ def write_toml(
     With ``deep_merge=False``, top-level keys in ``updates`` replace
     their counterparts wholesale.
     """
-    existing = read_toml(path)
+    existing = (
+        deepcopy(existing_data) if existing_data is not None else read_toml(path)
+    )
     merged = (
         _deep_merge(existing, updates) if deep_merge else {**existing, **updates}
     )

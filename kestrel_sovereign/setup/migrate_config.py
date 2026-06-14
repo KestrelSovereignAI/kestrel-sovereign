@@ -12,12 +12,13 @@ writer takes a backup before changing an existing file.
 
 from __future__ import annotations
 
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from .migrate_llm_config import _SourceParseError, _read_source_strict
-from .toml_file import read_toml, write_toml
+from .toml_file import write_toml
 
 Action = Literal["migrated", "already_clean", "no_source", "parse_error"]
 
@@ -52,7 +53,22 @@ def migrate_config(project_dir: Path) -> ConfigMigrationResult:
     user's hand-edited unified config with stale standalone content.
     """
     kestrel_toml = project_dir / "kestrel.toml"
-    existing = read_toml(kestrel_toml)
+    try:
+        existing = _read_destination_strict(kestrel_toml)
+    except _DestinationParseError as exc:
+        return ConfigMigrationResult(
+            action="parse_error",
+            kestrel_toml_path=kestrel_toml,
+            sources=[
+                SourceMigration(
+                    kestrel_toml,
+                    "destination",
+                    "parse_error",
+                    error=str(exc),
+                )
+            ],
+        )
+
     updates: dict[str, Any] = {}
     sources: list[SourceMigration] = []
 
@@ -98,7 +114,7 @@ def migrate_config(project_dir: Path) -> ConfigMigrationResult:
             sources=sources,
         )
 
-    write_result = write_toml(kestrel_toml, updates)
+    write_result = write_toml(kestrel_toml, updates, existing_data=existing)
     return ConfigMigrationResult(
         action="migrated",
         kestrel_toml_path=kestrel_toml,
@@ -127,3 +143,20 @@ def _set_nested(
     for part in section_parts[:-1]:
         current = current.setdefault(part, {})
     current[section_parts[-1]] = value
+
+
+class _DestinationParseError(Exception):
+    """Raised when the destination kestrel.toml cannot be parsed."""
+
+
+def _read_destination_strict(path: Path) -> dict[str, Any]:
+    """Parse the existing destination TOML without masking syntax errors."""
+    if not path.exists():
+        return {}
+    try:
+        with path.open("rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as exc:
+        raise _DestinationParseError(str(exc)) from exc
+    except OSError as exc:
+        raise _DestinationParseError(f"cannot read {path}: {exc}") from exc

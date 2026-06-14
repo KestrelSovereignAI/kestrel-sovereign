@@ -65,3 +65,26 @@ def test_parse_error_exits_one_and_preserves_files(tmp_path, capsys):
     assert "No files were changed" in err
     assert (tmp_path / "kestrel.toml").read_text() == original_kestrel
     assert (tmp_path / "model_mandate.toml").read_text() == original_mandate
+
+
+def test_destination_parse_error_exits_one_and_preserves_kestrel_toml(
+    tmp_path,
+    capsys,
+):
+    original_kestrel = b"[agent\nname = 'Existing'\n"
+    (tmp_path / "kestrel.toml").write_bytes(original_kestrel)
+    (tmp_path / "model_mandate.toml").write_text(toml.dumps({
+        "defaults": {"preferred": "", "cheap_model": "auto"},
+        "mandates": {},
+    }))
+    args = _parse(["migrate-config", "--project-dir", str(tmp_path)])
+
+    rc = cmd_migrate_config(args)
+
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "not valid TOML" in err
+    assert "kestrel.toml" in err
+    assert "No files were changed" in err
+    assert (tmp_path / "kestrel.toml").read_bytes() == original_kestrel
+    assert not list(tmp_path.glob("kestrel.toml.backup-*"))
