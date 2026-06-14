@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-13
-**Scope:** 1725 tracked files (1119 `.py`, 303 `.md`, 303 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-14
+**Scope:** 1728 tracked files (1121 `.py`, 304 `.md`, 303 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -69,9 +69,11 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/a2a/did_registry.py** — Host-level DID resolver for A2A sender verification (#1705).
   - `class HostA2ADidResolver`; `def install_a2a_did_resolver(manager)`
 - **kestrel_sovereign/a2a/envelope_signing.py** — Cryptographic sender authentication for A2A task envelopes (#1673).
-  - `class EnvelopeVerification`; `def canonical_message(part_texts)`; `def bound_envelope_fields(metadata)`; `def canonical_signing_bytes()`; `def kids_from_verification_methods(verification_methods)`; `def sign_envelope(keypair)`; `def verify_envelope(did_document, signature_block)`; `class ReplayGuard`; `…`
+  - `class ReplayNonceStore`; `class EnvelopeVerification`; `def canonical_message(part_texts)`; `def bound_envelope_fields(metadata)`; `def canonical_signing_bytes()`; `def kids_from_verification_methods(verification_methods)`; `def sign_envelope(keypair)`; `def verify_envelope(did_document, signature_block)`; `…`
 - **kestrel_sovereign/a2a/outbound_store.py** — Sender-side outbound A2A task store (#1576).
   - `class OutboundTask`; `async def ensure_a2a_outbound_tasks_table(db)`; `async def record_outbound_dispatch(db)`; `async def update_outbound_terminal_state(db)`; `async def list_outbound_tasks(db)`
+- **kestrel_sovereign/a2a/replay_store.py** — Shared replay-nonce reservation for A2A signed envelopes.
+  - `class SharedReplayNonceStore`
 - **kestrel_sovereign/a2a/stores/__init__.py** — A2A Datastores - Unified Backend-Agnostic Stores.
 - **kestrel_sovereign/a2a/stores/base.py** — Shared utilities for A2A datastores.
   - `def generate_id()`; `def now_utc()`; `def datetime_to_iso(dt)`; `def iso_to_datetime(iso_str)`; `def json_dumps(obj)`; `def json_loads(s)`
@@ -691,8 +693,8 @@ Repo entry points and standard project files.
   - `def get_agent_base_url(agent_config)`; `def resolve_agent(agent_id, config)`; `def build_proxy_headers(request)`; `async def proxy_request_streaming(request, agent_id, path, config, …)`
 - **kestrel_sovereign/paths.py** — Project-root and package-root resolution.
   - `def package_dir()`; `def project_dir()`; `def reset_cache()`
-- **kestrel_sovereign/privacy.py** — Privacy modes — sovereign-side configuration with SDK-canonical enum.
-  - `class PrivacyConfig`; `def get_privacy_preset(name)`; `def privacy_mode_to_config(mode)`; `def privacy_config_to_mode(config)`
+- **kestrel_sovereign/privacy.py** — Privacy modes — sovereign-side presets and configuration.
+  - `class PrivacyMode`; `class PrivacyConfig`; `def get_privacy_preset(name)`; `def privacy_mode_to_config(mode)`; `def privacy_config_to_mode(config)`
 - **kestrel_sovereign/prompts/companion_system_prompt.md** — Companion System Prompt — ## Platform Awareness
 - **kestrel_sovereign/prompts/discovery_prompt.md** — Discovery Mode Prompt — You are a Kestrel agent meeting your Sovereign for the very first time.
 - **kestrel_sovereign/prompts/signals/a2a_question_answered.md** — [A2A_QUESTION_ANSWERED] An earlier `send_a2a_question` of yours to `{payload[recipient]}` has been answered.
@@ -756,7 +758,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/security/sponsor_key_storage.py** — Sponsor Master Key Storage + beneficiary roster for Kestrel.
   - `class SponsorKeyInfo`; `class SponsorKeyStorage`; `class SponsorBeneficiaryStore`
 - **kestrel_sovereign/security/ssrf.py** — SSRF guard for server-side outbound fetches (#1727).
-  - `class SSRFError`; `def validate_outbound_url(url)`; `async def assert_safe_url(url)`
+  - `class SSRFError`; `class ValidatedOutboundURL`; `def validate_outbound_url(url)`; `async def assert_safe_url(url)`; `def pinned_httpx_async_transport(validated)`; `def pinned_urllib_https_opener(validated)`
 - **kestrel_sovereign/security/user_master_key_storage.py** — User Master Key Storage for Kestrel.
   - `class UserMasterKeyInfo`; `class UserMasterKeyStorage`
 - **kestrel_sovereign/security/verify_policy.py** — Verify-policy modes for signed identity artifacts.
@@ -1237,6 +1239,7 @@ Repo entry points and standard project files.
 - **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
 - **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
 - **docs/architecture/MEMORY_SYSTEM.md** — Kestrel Memory System — > The difference between a search engine and a friend is that a friend *actually remembers*.
+- **docs/architecture/MULTI_AGENT_VOICE.md** — Multi-Agent Voice — The Mixing Board — **Status:** Draft v1 — design proposal.
 - **docs/architecture/NIGHTLY_FORGETTING.md** — Nightly Forgetting — Unified Cognition Maintenance — > **Status (2026-06-12): Active for P1–P3; Aspirational for P4.** This consolidates Kestrel's scattered nightly-maintenance crons and the unbounded-cognition-table problem (#1674) under one orchestra…
 - **docs/architecture/PAYER_POLICY_FOUNDATION.md** — Payer Policy Foundation — **Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped locally **Branch (foundation):** `feat/payer-policy` **Branch (sdk):** `feat/payer-policy` (in `kestrel-sovereign-sdk`) **Last upda…
 - **docs/architecture/PLAN_RUNPOD_INTEGRATION.md** — Plan: Sovereign GPU Integration (RunPod) — > **Implementation status (last verified 2026-04-25):** RunPod is **experimental**, not production-stable.
@@ -1672,7 +1675,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_deploy_e2e.py** — Integration tests for Deploy Feature - Real Cloud Run deployments.
   - `class TestDeployModelsUnit`; `class TestDeployManagerCoreUnit`; `class TestAzureProviderStub`; `class TestCloudRunDeployE2E`; `class TestDeployFeature`
 - **tests/integration/test_docker.py** — Docker integration tests for Kestrel.
-  - `def wait_for_health(url, timeout, interval)`; `def test_docker_healthcheck()`
+  - `def docker_available()`; `def docker_compose_available()`; `def wait_for_health(url, timeout, interval)`; `def test_docker_healthcheck()`; `def test_docker_compose_fresh_boot_initializes_mounted_agent_data()`
 - **tests/integration/test_dynamic_features.py** — —
   - `async def kestrel_agent(temp_db)`; `async def test_feature_registration(kestrel_agent)`; `async def test_sovereignty_feature_execution(kestrel_agent)`; `async def test_mcp_feature_execution(kestrel_agent)`; `async def test_model_feature_execution(kestrel_agent)`
 - **tests/integration/test_dynamic_tool_loading_e2e.py** — Integration tests for dynamic tool loading.
@@ -2100,6 +2103,8 @@ Repo entry points and standard project files.
   - `class TestSecurityFeatureNameForTool`; `class TestDirectToolDispatchUsesPascalcaseFeatureName`
 - **tests/unit/test_discovery_hang_regression.py** — Regression tests for the post-#1110 discovery wedge.
   - `async def test_generate_with_messages_lazy_resolves_auto_models()`; `async def test_process_discovery_message_times_out_on_llm_hang()`; `def test_constitution_feature_finds_package_shipped_constitution(tmp_path, monkeypatch)`; `def test_constitution_feature_prefers_source_clone_path(tmp_path, monkeypatch)`; `def test_constitution_feature_reports_path_when_neither_exists(tmp_path, monkeypatch)`
+- **tests/unit/test_docker_db_path_reconciliation.py** — Drift guards for Docker ``KESTREL_DB_PATH`` directory semantics.
+  - `def test_single_agent_dockerfiles_use_agent_data_dir_for_db_path()`; `def test_compose_mount_and_env_point_to_same_agent_data_dir()`; `def test_container_entrypoint_initializes_db_inside_agent_data_dir()`; `def test_init_agent_identity_uses_db_path_as_target_directory()`; `def test_init_agent_identity_falls_back_to_cwd_when_db_path_unset(monkeypatch, tmp_path)`; `def test_init_agent_identity_honors_absolute_db_path_with_missing_parent(monkeypatch, tmp_path)`
 - **tests/unit/test_docker_network_check.py** — Tests for the _is_docker_network helper in server.py.
   - `class TestIsDockerNetwork`
 - **tests/unit/test_docstring_parser.py** — Unit tests for docstring parameter parsing in features/base.py.
@@ -2373,19 +2378,19 @@ Repo entry points and standard project files.
 - **tests/unit/test_privacy_active_session_contracts.py** — Active-session privacy transition contracts.
   - `async def test_privacy_transition_waits_for_active_stream_before_switching_modes()`
 - **tests/unit/test_privacy_agent.py** — —
-  - `def test_initial_mode_sync()`; `def test_set_mode_sync()`; `async def test_isolated_mode_flow(tmp_path)`; `async def test_ephemeral_mode(tmp_path)`; `async def test_anonymous_mode(tmp_path)`
+  - `def test_initial_mode_sync()`; `def test_set_mode_sync()`; `async def test_isolated_mode_flow(tmp_path)`; `async def test_ephemeral_mode(tmp_path)`; `async def test_anonymous_mode(tmp_path)`; `async def test_deidentified_mode_buffers_until_evidence_pipeline_exists(tmp_path)`
 - **tests/unit/test_privacy_computer_access.py** — Tests for the ``computer_access`` flag on ``PrivacyConfig`` (#832).
-  - `def test_default_is_false()`; `def test_allows_helper()`; `def test_all_presets_default_false(name)`; `def test_get_privacy_preset_returns_copy_with_flag_false(name)`; `def test_privacy_mode_to_config_defaults_false()`; `def test_from_config_ignores_computer_access()`; `def test_get_privacy_preset_unknown_raises()`
+  - `def test_default_is_false()`; `def test_allows_helper()`; `def test_all_presets_default_false(name)`; `def test_get_privacy_preset_returns_copy_with_flag_false(name)`; `def test_privacy_mode_to_config_defaults_false()`; `def test_from_config_ignores_computer_access()`; `def test_from_deidentified_config_ignores_computer_access()`; `def test_get_privacy_preset_unknown_raises()`
 - **tests/unit/test_privacy_computer_access_toml.py** — Per-agent ``[privacy] computer_access`` opt-in via kestrel.toml (#956).
   - `class TestTomlOptInRead`; `class TestPrivacyConfigProperty`
 - **tests/unit/test_privacy_mode_endpoint_rail.py** — Unit tests for the rail-gate on POST /agent/privacy-mode (#867-A).
   - `async def test_rail_refuses_privacy_mode_flip_on_live_agent_without_header()`; `async def test_rail_allows_privacy_mode_flip_on_live_agent_with_header()`; `async def test_rail_allows_privacy_mode_flip_on_demo_agent_without_header()`; `def test_endpoint_module_declares_rail_dependency()`
 - **tests/unit/test_privacy_mode_model_restore_contracts.py** — Contracts for model preservation across privacy-mode transitions.
-  - `def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()`; `def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition()`; `def test_agent_level_privacy_transition_switches_to_local_model()`; `def test_privacy_command_path_uses_agent_level_model_transition()`
+  - `def test_privacy_mode_restores_default_cloud_model_after_local_only_transition()`; `def test_privacy_mode_endpoint_reports_deidentified_storage_fail_closed()`; `def test_privacy_mode_restores_explicit_cloud_preference_after_local_only_transition()`; `def test_agent_level_privacy_transition_switches_to_local_model()`; `def test_agent_level_anonymous_transition_switches_to_local_model()`; `def test_privacy_command_path_uses_agent_level_model_transition()`
 - **tests/unit/test_privacy_preset_consistency.py** — Consistency tests for canonical privacy presets.
-  - `def test_privacy_presets_match_canonical_flag_combinations()`; `def test_privacy_mode_round_trips_to_named_presets()`; `def test_privacy_agent_set_mode_reports_canonical_meanings()`; `def test_privacy_agent_handle_get_privacy_mode_matches_canonical_descriptions()`; `def test_command_handler_delegates_get_privacy_mode_to_privacy_agent()`
+  - `def test_privacy_presets_match_canonical_flag_combinations()`; `def test_scrubbed_storage_is_legacy_alias_for_pii_redacted()`; `def test_legacy_deidentified_aliases_do_not_downgrade_to_normal()`; `def test_privacy_mode_round_trips_to_named_presets()`; `def test_privacy_agent_set_mode_reports_canonical_meanings()`; `def test_privacy_agent_handle_get_privacy_mode_matches_canonical_descriptions()`; `def test_command_handler_delegates_get_privacy_mode_to_privacy_agent()`; `def test_deidentified_status_reports_evidence_required_not_persistent()`
 - **tests/unit/test_privacy_wrapper.py** — Tests for the Privacy-Enforcing Storage Wrapper.
-  - `class TestPrivacyPolicy`; `class TestEphemeralMode`; `class TestIsolatedMode`; `class TestAnonymousMode`; `class TestNormalMode`; `class TestModeTransitions`; `class TestWrapperFactory`; `class TestDeprecationWarnings`; `…`
+  - `class TestPrivacyPolicy`; `class TestEphemeralMode`; `class TestIsolatedMode`; `class TestAnonymousMode`; `class TestNormalMode`; `class TestDeidentifiedMode`; `class TestModeTransitions`; `class TestWrapperFactory`; `…`
 - **tests/unit/test_process_manager.py** — Unit tests for the Kestrel ProcessManager.
   - `def project_dir(tmp_path)`; `def multi_agent_config()`; `def pm(project_dir)`; `class TestProcessManagerInit`; `class TestStaticHelpers`; `class TestRegisterAgent`; `class TestStartAgent`; `class TestStopAgent`; `…`
 - **tests/unit/test_prometheus_metrics.py** — Tests for Prometheus metrics endpoint and instrumentation.
@@ -2583,7 +2588,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_sse_connection_limits.py** — Unit tests for SSE connection limits (issue #145).
   - `def clean_sse_connections()`; `def app_with_mock_agent()`; `class TestSSEConnectionLimits`; `class TestSSEConnectionTrackerModule`
 - **tests/unit/test_ssrf_guard.py** — SSRF guard (#1727): block server-side fetches to non-public addresses.
-  - `class TestAddressClassification`; `class TestValidateOutboundUrl`; `class TestDidWebSSRF`
+  - `class TestAddressClassification`; `class TestValidateOutboundUrl`; `class TestPinnedConnections`; `class TestDidWebSSRF`
 - **tests/unit/test_state_of_mind_feature.py** — Direct contracts for the StateOfMind feature.
   - `async def test_state_of_mind_requires_llm_service()`; `async def test_state_of_mind_formats_via_profile_service()`
 - **tests/unit/test_stop_hook_payload.py** — STOP HookInput enrichment for #1238.
