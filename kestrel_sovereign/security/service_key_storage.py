@@ -12,7 +12,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from kestrel_sovereign.security.agent_encryption import encrypt
@@ -30,6 +30,23 @@ if TYPE_CHECKING:
     from kestrel_sovereign.storage.async_database import AsyncDatabase
 
 logger = logging.getLogger(__name__)
+
+
+def _as_datetime(value: Any) -> datetime:
+    """Coerce a DB timestamp value to a ``datetime``.
+
+    Backend-portable: PostgreSQL (asyncpg) returns native ``datetime`` objects
+    for TIMESTAMP columns, while SQLite returns ISO-format strings. Accept
+    either, falling back to ``utcnow()`` for NULLs. Previously this code called
+    ``datetime.fromisoformat()`` unconditionally, which raises
+    ``TypeError: fromisoformat: argument must be str`` on Postgres.
+    """
+    if value is None:
+        return datetime.utcnow()
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(value)
+
 
 # Exception classes imported from kestrel_sovereign.security.exceptions
 # KeyStorageError, KeyNotFoundError, KeyNotConfiguredError, DecryptionError
@@ -241,7 +258,7 @@ class ServiceKeyStorage:
                 id=row[0],
                 provider_id=row[1],
                 is_active=bool(row[2]),
-                created_at=datetime.fromisoformat(row[3]) if row[3] else datetime.utcnow(),
+                created_at=_as_datetime(row[3]),
                 quota_limit=row[4],
                 quota_used=row[5] or 0,
             )
@@ -368,16 +385,22 @@ class ServiceKeyStorage:
 
         key_id = key_rows[0][0]
 
+        # Compute the lookback cutoff in Python rather than with SQLite's
+        # ``datetime('now', ?)`` modifier, which does not exist in PostgreSQL
+        # (``function datetime(unknown, unknown) does not exist``). A datetime
+        # parameter compares correctly against TIMESTAMP (PG) and the ISO-string
+        # ``recorded_at`` written via CURRENT_TIMESTAMP (SQLite).
+        cutoff = datetime.utcnow() - timedelta(days=days)
         rows = await self._db.fetchall(
             """
             SELECT id, key_id, provider_id, operation, units_consumed,
                    cost_estimate_usd, recorded_at
             FROM service_key_usage
             WHERE key_id = ?
-            AND recorded_at >= datetime('now', ?)
+            AND recorded_at >= ?
             ORDER BY recorded_at DESC
             """,
-            (key_id, f'-{days} days')
+            (key_id, cutoff)
         )
 
         return [
@@ -388,7 +411,7 @@ class ServiceKeyStorage:
                 operation=row[3],
                 units_consumed=row[4],
                 cost_estimate_usd=row[5],
-                recorded_at=datetime.fromisoformat(row[6]) if row[6] else datetime.utcnow(),
+                recorded_at=_as_datetime(row[6]),
             )
             for row in rows
         ]
