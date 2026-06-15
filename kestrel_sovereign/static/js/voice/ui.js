@@ -275,25 +275,21 @@ export function mountAgentVoiceControls(item, agentName) {
   const controls = document.createElement('div');
   controls.className = 'agent-voice-controls';
   controls.innerHTML = `
-    <button type="button" class="agent-voice-control agent-voice-mute" title="Mute playback" aria-label="Mute playback">🔇</button>
-    <button type="button" class="agent-voice-control agent-voice-solo" title="Listen / add to mix — Shift-click to solo" aria-label="Listen / add to mix; Shift-click to solo">🎧</button>
+    <button type="button" class="agent-voice-control agent-voice-solo" title="Listen — click to mute/unmute, Shift-click to solo" aria-label="Listen; click to mute or unmute, Shift-click to solo">🎧</button>
     <button type="button" class="agent-voice-control agent-voice-arm" title="Arm microphone" aria-label="Arm microphone">●</button>
   `;
-  controls.querySelector('.agent-voice-mute')?.addEventListener('click', (ev) => {
-    ev.stopPropagation();
-    toggleAgentMute(agentName);
-  });
-  // 🎧 plain click = toggle this agent into the additive listen mix.
-  // Shift/Alt-click = solo (exclusive). A modifier-click is synchronous and
-  // unambiguous — unlike click-vs-double-click, which races the OS double-click
-  // interval (click always precedes dblclick and the threshold isn't knowable
-  // to JS), so a slow double-click would fire the listen toggle first.
+  // 🎧 is the single per-agent OUTPUT control (audible ↔ muted). Plain click
+  // flips whether you hear this agent — additive, so several can be audible and
+  // their speech mixes. Shift/Alt-click solos (exclusive). A modifier-click is
+  // synchronous and unambiguous — unlike click-vs-double-click, which races the
+  // OS double-click interval (click always precedes dblclick and the threshold
+  // isn't knowable to JS).
   controls.querySelector('.agent-voice-solo')?.addEventListener('click', (ev) => {
     ev.stopPropagation();
     if (ev.shiftKey || ev.altKey) {
       toggleAgentSolo(agentName);
     } else {
-      toggleAgentListen(agentName);
+      toggleAgentOutput(agentName);
     }
   });
   controls.querySelector('.agent-voice-arm')?.addEventListener('click', (ev) => {
@@ -332,24 +328,18 @@ export function refreshAgentVoiceCard(agentName) {
   row.classList.toggle('agent-voice-soloed', soloAgent === agentName);
   row.classList.toggle('agent-voice-armed', armedAgent === agentName);
 
-  const muteBtn = row.querySelector('.agent-voice-mute');
-  if (muteBtn) {
-    muteBtn.classList.toggle('active', session.explicitMuted === true);
-    muteBtn.setAttribute('aria-pressed', session.explicitMuted === true ? 'true' : 'false');
-    muteBtn.title = session.explicitMuted === true ? 'Unmute playback' : 'Mute playback';
-  }
   const soloBtn = row.querySelector('.agent-voice-solo');
   if (soloBtn) {
-    const listening = session.explicitMuted === false;
+    const audible = !outputMuted;        // are you actually hearing this agent?
     const soloed = soloAgent === agentName;
-    soloBtn.classList.toggle('active', listening || soloed);
+    soloBtn.classList.toggle('muted', outputMuted); // dim when muted; accent when audible (CSS)
     soloBtn.classList.toggle('soloed', soloed);
-    soloBtn.setAttribute('aria-pressed', (listening || soloed) ? 'true' : 'false');
+    soloBtn.setAttribute('aria-pressed', audible ? 'true' : 'false');
     soloBtn.title = soloed
       ? 'Soloed — Shift-click to release'
-      : (listening
-        ? 'In the mix — click to stop, Shift-click to solo'
-        : 'Listen / add to mix — Shift-click to solo');
+      : (audible
+        ? 'You hear this agent — click to mute, Shift-click to solo'
+        : 'Muted — click to add to the mix, Shift-click to solo');
   }
   const armBtn = row.querySelector('.agent-voice-arm');
   if (armBtn) {
@@ -367,30 +357,25 @@ function refreshAllAgentVoiceCards() {
 
 // explicitMuted is a per-agent tri-state: true = forced silent, false = pinned
 // audible (in the additive mix), null = follow focus (v0 default).
-// 🔇 toggles silenced(true) ↔ audible(false): clicking unmute must make the
-// agent actually audible even when it isn't the focused one, so it lands on
-// false, NOT null (null would fall back to focus and leave it muted). 🎧 toggles
-// audible(false) ↔ auto(null). Both controls converge on the same `false`
-// "in the mix" state, and the lit button always reflects the resulting state.
-function toggleAgentMute(agentName) {
+//
+// 🎧 plain click flips whether you currently HEAR this agent. It reads the
+// agent's effective audibility (isOutputMuted, which accounts for solo/explicit/
+// focus) and sets the opposite as an explicit choice: audible → mute (true),
+// muted → audible (false). Landing on `false` (not `null`) guarantees a
+// background agent actually becomes audible rather than falling back to focus.
+// A plain click also exits solo — soloing is the exclusive opposite of building
+// a mix, so touching any agent's output returns to mix mode.
+function toggleAgentOutput(agentName) {
   const session = sessionForAgent(agentName);
-  session.explicitMuted = session.explicitMuted === true ? false : true;
-  applyActiveSessionPolicy();
-}
-
-// 🎧 single-click: pin this agent audible (add to the mix). Additive — any
-// number of agents can be pinned and their speech mixes. Exits solo mode,
-// since soloing is the exclusive opposite of building a mix.
-function toggleAgentListen(agentName) {
+  const wasAudible = !isOutputMuted(agentName, session);
   if (soloAgent !== NO_AGENT) soloAgent = NO_AGENT;
-  const session = sessionForAgent(agentName);
-  session.explicitMuted = session.explicitMuted === false ? null : false;
+  session.explicitMuted = wasAudible ? true : false;
   applyActiveSessionPolicy();
 }
 
-// 🎧 double-click: solo this agent (exclusive — every other output is silenced
-// while a solo is held). Double-clicking the soloed agent releases solo and
-// restores each agent's own listen/mute/focus state.
+// 🎧 Shift/Alt-click: solo this agent (exclusive — every other output is
+// silenced while a solo is held). Shift-clicking the soloed agent releases solo
+// and restores each agent's own explicit/focus output state.
 function toggleAgentSolo(agentName) {
   soloAgent = soloAgent === agentName ? NO_AGENT : agentName;
   applyActiveSessionPolicy();
@@ -1816,19 +1801,13 @@ function injectStyles() {
        conveyed by the button lights + the speaking cue below, not text. */
     .agent-voice-controls {
       display: grid;
-      grid-template-columns: repeat(3, 1.55rem);
+      grid-template-columns: repeat(2, 1.55rem);
       gap: 0.25rem;
       align-items: center;
       flex-shrink: 0;
     }
-    /* Live voice session: tint the 🎧 so an active agent reads at a glance.
-       Speaking: gentle pulse on the same control. Replaces the dropped text.
-       Scoped to :not(.active):not(.soloed) so it never overrides the white-on-
-       accent active style or the solo ring (those already signal strongly). */
-    .agent-item.agent-voice-live .agent-voice-solo:not(.active):not(.soloed) {
-      border-color: #16a34a;
-      color: #16a34a;
-    }
+    /* Speaking: gentle pulse on the 🎧 so a talking agent reads at a glance.
+       Scoped :not(.soloed) so it never fights the static solo ring. */
     .agent-item.agent-voice-speaking .agent-voice-solo:not(.soloed) {
       animation: agentVoiceSpeak 1s ease-in-out infinite;
     }
@@ -1860,12 +1839,20 @@ function injectStyles() {
       border-color: var(--accent-color, #3b82f6);
       color: #fff;
     }
-    .agent-voice-mute.active {
-      background: var(--error-color, #ef4444);
-      border-color: var(--error-color, #ef4444);
+    /* 🎧 output state, encoded row-agnostically (a filled accent bg would blend
+       into the accent-colored selected row): audible = accent glyph, muted =
+       dimmed, soloed = ring. On the selected row the audible glyph goes white. */
+    .agent-voice-solo:not(.muted):not(.soloed) {
+      color: var(--accent-color, #3b82f6);
+      border-color: var(--accent-color, #3b82f6);
     }
-    /* 🎧 in the mix (additive) uses the accent .active style; soloed (exclusive)
-       gets a distinct ring so it reads differently from a plain mix-in. */
+    .agent-item.selected .agent-voice-solo:not(.muted) {
+      color: #fff;
+      border-color: rgba(255, 255, 255, 0.85);
+    }
+    .agent-voice-solo.muted {
+      opacity: 0.4;
+    }
     .agent-voice-solo.soloed {
       background: var(--accent-color, #3b82f6);
       border-color: #fff;
