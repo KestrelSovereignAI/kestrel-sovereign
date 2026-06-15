@@ -276,7 +276,7 @@ export function mountAgentVoiceControls(item, agentName) {
   controls.className = 'agent-voice-controls';
   controls.innerHTML = `
     <button type="button" class="agent-voice-control agent-voice-solo" title="Listen — click to mute/unmute, Shift-click to solo" aria-label="Listen; click to mute or unmute, Shift-click to solo">🎧</button>
-    <button type="button" class="agent-voice-control agent-voice-arm" title="Arm microphone" aria-label="Arm microphone">●</button>
+    <button type="button" class="agent-voice-control agent-voice-arm" title="Talk to this agent — click to arm/disarm your mic" aria-label="Talk to this agent; arm or disarm your microphone">🎤</button>
   `;
   // 🎧 is the single per-agent OUTPUT control (audible ↔ muted). Plain click
   // flips whether you hear this agent — additive, so several can be audible and
