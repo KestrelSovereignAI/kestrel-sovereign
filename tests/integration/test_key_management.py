@@ -509,5 +509,88 @@ class TestMasterKeyNotConfigured:
             assert "not available" in result.error
 
 
+@pytest.fixture(params=["sqlite", "postgres"])
+async def dual_backend_db(request, tmp_path):
+    """An ``AsyncDatabase`` on SQLite and (when available) PostgreSQL.
+
+    Regression coverage for #1779: ``ServiceKeyStorage.list_keys`` /
+    ``get_usage`` previously used SQLite-only SQL and value handling, so they
+    500'd on Postgres. The original suite only ran on SQLite, hiding the bug.
+    PostgreSQL is skipped when no test DSN is configured.
+    """
+    from kestrel_sovereign.storage.async_database import AsyncDatabase
+
+    if request.param == "sqlite":
+        db = await AsyncDatabase.sqlite(str(tmp_path / "keys.db"))
+        try:
+            yield db
+        finally:
+            await db.close()
+    else:
+        dsn = (
+            os.environ.get("TEST_POSTGRES_URL")
+            or os.environ.get("KESTREL_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+        )
+        if not dsn:
+            pytest.skip("TEST_POSTGRES_URL/KESTREL_DATABASE_URL/DATABASE_URL required for PostgreSQL")
+        try:
+            db = await AsyncDatabase.postgres(dsn)
+        except Exception as e:  # pragma: no cover - infra dependent
+            pytest.skip(f"PostgreSQL not available: {e}")
+        # PG (unlike the per-test SQLite tmpfile) may be a shared DB, so clear
+        # only THIS synthetic test agent's rows — never truncate the tables.
+        await db.execute(
+            "DELETE FROM service_key_usage WHERE key_id IN "
+            "(SELECT id FROM agent_service_keys WHERE agent_did = ?)",
+            (TEST_AGENT_DID,),
+        )
+        await db.execute("DELETE FROM agent_service_keys WHERE agent_did = ?", (TEST_AGENT_DID,))
+        try:
+            yield db
+        finally:
+            await db.close()
+
+
+@pytest.mark.integration
+@pytest.mark.dual_backend
+class TestServiceKeyStorageBackendCompat:
+    """list_keys/get_usage must work on both SQLite and PostgreSQL (#1779)."""
+
+    @pytest.mark.asyncio
+    async def test_list_keys_returns_datetimes(self, dual_backend_db, data_key):
+        from datetime import datetime
+        from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            storage = ServiceKeyStorage(dual_backend_db, TEST_AGENT_DID)
+            await storage.store_key("runpod", "sk-test-runpod-123")
+
+            # On PG this raised TypeError: fromisoformat: argument must be str
+            keys = await storage.list_keys()
+
+        assert len(keys) == 1
+        assert keys[0].provider_id == "runpod"
+        assert isinstance(keys[0].created_at, datetime)
+
+    @pytest.mark.asyncio
+    async def test_get_usage_window(self, dual_backend_db, data_key):
+        from datetime import datetime
+        from kestrel_sovereign.security.service_key_storage import ServiceKeyStorage
+
+        with patch.dict(os.environ, {"KESTREL_DATA_KEY": data_key}):
+            storage = ServiceKeyStorage(dual_backend_db, TEST_AGENT_DID)
+            await storage.store_key("runpod", "sk-test-runpod-123")
+            await storage.record_usage("runpod", "inference", units=3, cost_estimate=0.01)
+
+            # On PG this raised: function datetime(unknown, unknown) does not exist
+            usage = await storage.get_usage("runpod", days=30)
+
+        assert len(usage) == 1
+        assert usage[0].operation == "inference"
+        assert usage[0].units_consumed == 3
+        assert isinstance(usage[0].recorded_at, datetime)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])
