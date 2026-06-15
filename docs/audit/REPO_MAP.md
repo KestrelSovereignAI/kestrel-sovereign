@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-14
-**Scope:** 1728 tracked files (1121 `.py`, 304 `.md`, 303 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-15
+**Scope:** 1729 tracked files (1124 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -43,8 +43,6 @@ Repo entry points and standard project files.
 - **host.py** — Backward-compat shim for ``uvicorn host:app`` from a source clone.
 - **kestrel.toml.example** — —
 - **main.py** — Backward-compat shim for ``python main.py`` from a source clone.
-- **model_catalog.toml** — (configuration)
-- **model_mandate.toml** — (configuration)
 - **model_mandate.toml.example** — —
 - **multi_agent.toml.example** — —
 - **package-lock.json** — (configuration)
@@ -777,6 +775,8 @@ Repo entry points and standard project files.
   - `class Flow`; `class SetupContext`
 - **kestrel_sovereign/setup/env_file.py** — Read-merge-write helpers for ``.env`` files.
   - `class EnvWriteResult`; `def read_env(path)`; `def write_env(path, updates)`
+- **kestrel_sovereign/setup/migrate_config.py** — Migrate legacy model config files into ``kestrel.toml``.
+  - `class SourceMigration`; `class ConfigMigrationResult`; `def migrate_config(project_dir)`
 - **kestrel_sovereign/setup/migrate_llm_config.py** — One-shot migration: ``llm_config.toml`` -> ``kestrel.toml [llm]``.
   - `class MigrationResult`; `def migrate_llm_config(project_dir)`
 - **kestrel_sovereign/setup/overlay_anchor.py** — Anchor a per-agent constitution overlay (#1722).
@@ -1957,6 +1957,8 @@ Repo entry points and standard project files.
   - `def test_first_run_returns_none_when_env_exists(tmp_path)`; `def test_first_run_returns_none_when_agent_already_registered(tmp_path)`; `def test_first_run_fires_when_multi_agent_has_no_agents(tmp_path)`; `def test_first_run_tolerates_corrupt_multi_agent(tmp_path)`; `def test_first_run_returns_none_when_skip_env_set(tmp_path, monkeypatch)`; `def test_first_run_skipped_inside_git_worktree(tmp_path, monkeypatch)`; `def test_first_run_still_fires_when_git_is_directory(tmp_path, monkeypatch)`; `def test_first_run_non_tty_exits_with_hint(tmp_path, capsys, monkeypatch)`; `…`
 - **tests/unit/test_cli_ipfs.py** — ``kestrel ipfs`` CLI tests — sub-PR 4 of epic #1050 (bash-to-Python port of ``scripts/ipfs/{build,deploy,pin_agents}.sh``).
   - `def test_argparse_build_defaults()`; `def test_argparse_build_tag_override()`; `def test_argparse_deploy_action()`; `def test_argparse_deploy_zone_override()`; `def test_argparse_deploy_invalid_action_rejected()`; `def test_argparse_pin_defaults()`; `def test_argparse_pin_overrides()`; `def test_kestrel_cli_registers_ipfs()`; `…`
+- **tests/unit/test_cli_migrate_config.py** — —
+  - `def test_parser_defaults()`; `def test_parser_accepts_project_dir(tmp_path)`; `def test_clean_migrate_exits_zero_and_is_idempotent(tmp_path, capsys)`; `def test_parse_error_exits_one_and_preserves_files(tmp_path, capsys)`; `def test_destination_parse_error_exits_one_and_preserves_kestrel_toml(tmp_path, capsys)`
 - **tests/unit/test_cli_migrate_llm_config.py** — Unit tests for the ``kestrel migrate-llm-config`` CLI surface (#939).
   - `def test_parser_defaults()`; `def test_parser_accepts_force_and_project_dir(tmp_path)`; `def test_no_source_exits_zero_with_helpful_message(tmp_path, capsys)`; `def test_diverged_exits_one_with_diff(tmp_path, capsys)`; `def test_clean_migrate_exits_zero_and_reports_paths(tmp_path, capsys)`; `def test_already_clean_exits_zero(tmp_path, capsys)`; `def test_parse_error_exits_one_and_preserves_source(tmp_path, capsys)`; `def test_force_overrides_divergence(tmp_path, capsys)`
 - **tests/unit/test_cli_release.py** — ``kestrel release {sign,verify}`` CLI tests — Wave 5 sub-PR 2 (#920).
@@ -2009,6 +2011,8 @@ Repo entry points and standard project files.
   - `def test_path_policy_deny_wins()`; `def test_path_policy_allow_read_auto_approve()`; `def test_path_policy_allow_write_requires_approval()`; `def test_path_policy_no_match_requires_approval()`; `def test_path_policy_auto_approve_off()`; `def test_binary_policy_denied()`; `def test_binary_policy_allow_listed_short_circuits_to_allow()`; `def test_binary_policy_unknown_requires_approval()`; `…`
 - **tests/unit/test_config_resolves_via_project_dir.py** — Regression tests: ``config.load_section`` and ``config.load_config`` must consult :func:`kestrel_sovereign.paths.project_dir` when resolving ``kestrel.toml`` and the legacy individual config files.
   - `def test_load_section_reads_kestrel_toml_under_kestrel_home(tmp_path, monkeypatch)`; `def test_load_section_returns_empty_when_no_kestrel_toml(tmp_path, monkeypatch)`; `def test_load_section_walks_up_from_cwd_to_find_marker(tmp_path, monkeypatch)`; `def test_load_config_legacy_file_lookup_uses_project_dir(tmp_path, monkeypatch)`; `def test_load_config_does_not_read_cwd_when_no_marker_in_path(tmp_path, monkeypatch)`
+- **tests/unit/test_config_unified_model_migration.py** — —
+  - `def test_model_mandate_legacy_and_migrated_unified_load_identically(tmp_path, monkeypatch)`; `def test_model_catalog_legacy_and_migrated_unified_load_identically(tmp_path, monkeypatch)`; `def test_unified_model_config_emits_no_deprecation_and_does_not_recreate(tmp_path, monkeypatch, caplog)`; `def test_missing_mapped_legacy_file_is_not_recreated_when_kestrel_toml_exists(tmp_path, monkeypatch)`; `def test_migrate_config_is_idempotent_and_preserves_existing_kestrel_content(tmp_path)`
 - **tests/unit/test_consent_caller_contracts.py** — Contract tests for consent integration at feature call sites.
   - `class TestPrivacyConsentCaller`; `class TestModelConsentCaller`; `class TestSafeModeConsentCaller`
 - **tests/unit/test_consent_feature.py** — Unit Tests for Agent Consent Protocol Feature.
