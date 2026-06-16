@@ -327,6 +327,23 @@ def test_sync_present_when_installed_satisfies_pypi_spec(monkeypatch, fake_regis
     assert "present" in capsys.readouterr().out
 
 
+def test_sync_pinned_pypi_no_git_fallback(monkeypatch, fake_registry, tmp_path, capsys):
+    """A pinned pypi entry that fails pip must not silently install unpinned
+    git HEAD (codex round 7 P2)."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {})  # missing
+    spy = _InstallSpy(returncode=1, stderr="no matching distribution")
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 1
+    # one constrained attempt, NO git fallback
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+    assert "FAILED" in capsys.readouterr().out
+
+
 def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')

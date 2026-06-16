@@ -650,10 +650,17 @@ def cmd_feature_sync(args) -> int:
 
         result = cli._extension_install_run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
-        # `feature install`). Editable installs have no remote fallback. Carry
-        # extras across via PEP 508 form (``pkg[extra] @ git+url``) so a git
-        # fallback doesn't silently drop the local-pipeline deps.
-        if result.returncode != 0 and not editable_want and git_urls.get(target):
+        # `feature install`). Editable installs have no remote fallback. A
+        # PyPI-pinned entry is excluded too: the git URL installs repo HEAD
+        # with no version constraint, which would silently violate the pin.
+        # Carry extras across via PEP 508 form (``pkg[extra] @ git+url``) so a
+        # git fallback doesn't silently drop the local-pipeline deps.
+        if (
+            result.returncode != 0
+            and not editable_want
+            and not pypi_want
+            and git_urls.get(target)
+        ):
             git_ref = f"git+{git_urls[target]}"
             git_spec = f"{_pip_spec(target, extras)} @ {git_ref}" if extras else git_ref
             result = cli._extension_install_run([git_spec])

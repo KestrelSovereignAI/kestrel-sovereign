@@ -187,6 +187,22 @@ def test_execute_pypi_update_runs_upgrade():
     assert install.call_args[0][0] == ["--upgrade", "kestrel-feature-voice>=0.3,<0.4"]
 
 
+def test_execute_pinned_pypi_does_not_fall_back_to_unpinned_git():
+    """A pinned entry that fails pip must NOT install the unpinned git HEAD —
+    that would violate the operator's declared pin (codex round 7 P2)."""
+    action = fr.ReconcileAction(
+        package="kestrel-feature-voice", op="update", mode="pypi",
+        source="kestrel-feature-voice>=0.3,<0.4", pinned=True,
+    )
+    with patch.object(cli, "_extension_install_run", return_value=_ok(rc=1, stderr="no match")) as install:
+        ok, _ = cli_lifecycle._execute_reconcile_action(
+            action, {"kestrel-feature-voice": "https://example/voice.git"},
+            allow_dirty=False,
+        )
+    assert ok is False
+    assert install.call_count == 1  # NO git fallback for a pinned entry
+
+
 def test_execute_pypi_falls_back_to_git_url():
     action = fr.ReconcileAction(
         package="kestrel-feature-voice", op="install", mode="pypi",

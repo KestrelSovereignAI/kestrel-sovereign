@@ -784,7 +784,10 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
     spec = action.source
     pip_args = (["--upgrade", spec] if action.op == "update" else [spec])
     result = cli._extension_install_run(pip_args)
-    if result.returncode != 0 and git_urls.get(action.package):
+    # The git-URL fallback installs the repo HEAD with NO version constraint, so
+    # it must NOT be used for a pinned entry — that would silently move the
+    # feature outside the operator's declared pin (codex round 7 P2).
+    if result.returncode != 0 and not action.pinned and git_urls.get(action.package):
         git_ref = f"git+{git_urls[action.package]}"
         git_spec = (
             f"{_pip_spec(action.package, action.extras)} @ {git_ref}"

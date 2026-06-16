@@ -71,6 +71,10 @@ class ReconcileAction:
     # the package is absent OR currently linked to a different checkout (or to a
     # non-editable PyPI build). A git pull alone would leave the venv stale.
     relink: bool = False
+    # PyPI only: the source carries an explicit version pin, so the executor
+    # must NOT fall back to an unpinned git URL on failure (that would silently
+    # move the feature outside the operator's declared pin).
+    pinned: bool = False
     note: str = ""
 
 
@@ -314,6 +318,7 @@ def plan_reconcile(
             mode = "pypi"
 
         relink = False
+        pinned = False
         op = "update" if current is not None else "install"
         if mode == "editable":
             if not editable_path:
@@ -336,6 +341,8 @@ def plan_reconcile(
             # reverse.
             if pypi_spec is not None:
                 source = _pypi_requirement(package, pypi_spec, extras)
+                # A non-empty spec is a real pin (``""`` means "any version").
+                pinned = bool(pypi_spec)
             elif info.git:
                 source = _pypi_requirement(package, None, extras)
             elif current is not None:
@@ -360,6 +367,7 @@ def plan_reconcile(
                 current_version=current,
                 extras=extras,
                 relink=relink,
+                pinned=pinned,
             )
         )
 
