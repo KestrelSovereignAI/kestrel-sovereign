@@ -158,6 +158,7 @@ def test_discover_none_when_nothing(monkeypatch, tmp_path):
 
 def test_from_sources_static_token_beats_discovery(monkeypatch):
     _fake_security(monkeypatch)  # keychain available
+    monkeypatch.setattr(oa.sys, "platform", "darwin")
     mgr = ClaudeOAuthTokenManager.from_sources(
         static_token="sk-ant-oat-static", credentials_path=None, delegate=True
     )
@@ -167,6 +168,7 @@ def test_from_sources_static_token_beats_discovery(monkeypatch):
 
 def test_from_sources_delegates_when_no_static_token(monkeypatch):
     _fake_security(monkeypatch)
+    monkeypatch.setattr(oa.sys, "platform", "darwin")
     mgr = ClaudeOAuthTokenManager.from_sources(
         static_token=None, credentials_path=None, delegate=True
     )
@@ -176,6 +178,7 @@ def test_from_sources_delegates_when_no_static_token(monkeypatch):
 
 def test_from_sources_no_delegation_for_api_route(monkeypatch):
     _fake_security(monkeypatch)  # keychain present but delegate=False
+    monkeypatch.setattr(oa.sys, "platform", "darwin")
     mgr = ClaudeOAuthTokenManager.from_sources(
         static_token=None, credentials_path=None, delegate=False
     )
@@ -184,6 +187,7 @@ def test_from_sources_no_delegation_for_api_route(monkeypatch):
 
 def test_from_sources_delegate_env_disable(monkeypatch):
     _fake_security(monkeypatch)
+    monkeypatch.setattr(oa.sys, "platform", "darwin")
     monkeypatch.setenv("KESTREL_ANTHROPIC_OAUTH_DELEGATE", "0")
     mgr = ClaudeOAuthTokenManager.from_sources(static_token=None, credentials_path=None)
     assert mgr is None
@@ -193,6 +197,7 @@ def test_env_disable_overrides_explicit_delegate_true(monkeypatch):
     """The operator escape hatch must win even when the caller (plan route)
     passes delegate=True."""
     _fake_security(monkeypatch)
+    monkeypatch.setattr(oa.sys, "platform", "darwin")
     monkeypatch.setenv("KESTREL_ANTHROPIC_OAUTH_DELEGATE", "false")
     mgr = ClaudeOAuthTokenManager.from_sources(
         static_token=None, credentials_path=None, delegate=True
