@@ -770,8 +770,11 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
                 return False, (result.stderr or result.stdout or "").strip()
         return True, detail
 
-    # PyPI mode.
-    spec = _pip_spec(action.source, action.extras)
+    # PyPI mode. action.source is ALREADY a full pip requirement with extras
+    # rendered before the version spec (``pkg[extra]>=x``) by plan_reconcile,
+    # so it is passed verbatim — re-applying _pip_spec here would misplace the
+    # extras after the spec and break pip.
+    spec = action.source
     pip_args = (["--upgrade", spec] if action.op == "update" else [spec])
     result = cli._extension_install_run(pip_args)
     if result.returncode != 0 and git_urls.get(action.package):

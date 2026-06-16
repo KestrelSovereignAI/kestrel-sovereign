@@ -280,6 +280,22 @@ def test_sync_installs_pinned_pypi_spec(monkeypatch, fake_registry, tmp_path):
     assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
 
 
+def test_sync_pypi_spec_with_extras_orders_extras_first(monkeypatch, fake_registry, tmp_path):
+    """pip requires ``pkg[extra]>=x``; never ``pkg>=x[extra]``."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\nextras = ["local"]\n'
+    )
+    _versions(monkeypatch, {})  # missing
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == [["kestrel-feature-voice[local]>=0.3,<0.4"]]
+
+
 def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')

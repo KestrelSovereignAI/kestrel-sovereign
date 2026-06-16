@@ -213,6 +213,21 @@ def test_plan_updates_present_pypi_package():
     assert a.source == "kestrel-feature-voice>=0.3,<0.4"
 
 
+def test_plan_pypi_renders_extras_before_version_spec():
+    """pip requires ``pkg[extra]>=x`` — extras must NOT trail the spec."""
+    pkg_infos = {"kestrel-feature-voice": _voice_info()}
+    idx = {"kestrel-feature-voice": fr.SourceEntry(
+        package="kestrel-feature-voice", pypi=">=0.3,<0.4", extras=["local"])}
+    actions, _ = fr.plan_reconcile(
+        pkg_infos, idx,
+        installed_versions={"kestrel-feature-voice": None},
+        editable_paths={"kestrel-feature-voice": None},
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+    (a,) = actions
+    assert a.source == "kestrel-feature-voice[local]>=0.3,<0.4"
+
+
 def test_plan_detects_editable_install_without_manifest_entry():
     """A package already installed editable must be updated via git pull, not
     clobbered with a PyPI build, even when the manifest is silent."""

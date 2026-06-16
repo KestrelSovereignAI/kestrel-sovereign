@@ -609,7 +609,10 @@ def cmd_feature_sync(args) -> int:
 
         # A declared PyPI version spec pins the install (``pkg>=0.3,<0.4``);
         # an empty spec means "any version", same as the legacy bare form.
-        install_target = f"{target}{pypi_want}" if pypi_want else target
+        # Extras go BEFORE the version spec (``pkg[local]>=0.3``) — pip rejects
+        # ``pkg>=0.3[local]``.
+        install_target = f"{_pip_spec(target, extras)}{pypi_want}" if pypi_want \
+            else _pip_spec(target, extras)
 
         if dry_run:
             how = f"-e {editable_want}" if editable_want else f"pip {install_target}"
@@ -619,7 +622,7 @@ def cmd_feature_sync(args) -> int:
         if editable_want:
             pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
         else:
-            pip_args = [_pip_spec(install_target, extras)]
+            pip_args = [install_target]
 
         result = cli._extension_install_run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors

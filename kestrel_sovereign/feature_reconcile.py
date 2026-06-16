@@ -195,6 +195,16 @@ def build_source_index(manifest_entries, registry) -> Dict[str, SourceEntry]:
     return index
 
 
+def _pypi_requirement(package: str, spec: Optional[str], extras: List[str]) -> str:
+    """Render a pip requirement with extras BEFORE the version spec.
+
+    pip requires ``pkg[extra]>=x,<y`` — ``pkg>=x,<y[extra]`` is rejected. Used
+    for the PyPI source form so a pinned-with-extras feature installs cleanly.
+    """
+    base = f"{package}[{','.join(extras)}]" if extras else package
+    return f"{base}{spec}" if spec else base
+
+
 def _entry_package(entry: dict, registry) -> str:
     """Resolve a manifest entry's ``name`` to its package (dist) name."""
     label = entry["name"]
@@ -287,10 +297,10 @@ def plan_reconcile(
         else:
             # PyPI: a declared spec wins; otherwise install the registry package
             # at its latest (floor pins live in the package's own metadata).
-            if pypi_spec:
-                source = f"{package}{pypi_spec}"
-            elif info.package:
-                source = package
+            # Render as a full pip requirement with extras BEFORE the version
+            # spec (``pkg[extra]>=x,<y``) — pip rejects ``pkg>=x[extra]``.
+            if pypi_spec is not None or info.package:
+                source = _pypi_requirement(package, pypi_spec, extras)
             else:
                 no_source.append(package)
                 continue
