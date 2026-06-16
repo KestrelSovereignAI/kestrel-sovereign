@@ -20,9 +20,11 @@ Credential sources, in precedence order (see ``from_sources``):
   3. auto-discovered Claude Code store (Keychain / file) — refreshable delegation
 """
 import asyncio
+import getpass
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -46,8 +48,10 @@ _TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _REFRESH_SKEW_SECONDS = 300
 
 # Claude Code CLI credential store locations (mirrors OpenClaw cli-credentials.ts).
+# NOTE: the Keychain item's ACCOUNT is the macOS username (e.g. "jasonschulz"),
+# not a fixed string — it is discovered from the existing item, see
+# KeychainCredentialSource._resolve_account.
 _CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
-_CLAUDE_KEYCHAIN_ACCOUNT = "Claude Code"
 _CLAUDE_CREDENTIALS_RELATIVE_PATH = ".claude/.credentials.json"
 
 # Env overrides (parity with codex's KESTREL_CODEX_* / CODEX_REFRESH_TOKEN_URL_OVERRIDE).
@@ -258,23 +262,43 @@ class KeychainCredentialSource(CredentialSource):
     def __init__(
         self,
         service: str = _CLAUDE_KEYCHAIN_SERVICE,
-        account: str = _CLAUDE_KEYCHAIN_ACCOUNT,
+        account: Optional[str] = None,
     ) -> None:
         self.service = service
-        self.account = account
+        self._account = account  # None → discovered from the existing item
 
-    def _read_raw(self) -> Optional[Dict[str, Any]]:
+    def _run(self, args) -> Optional[subprocess.CompletedProcess]:
         try:
-            result = subprocess.run(
-                ["security", "find-generic-password", "-s", self.service, "-w"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            return subprocess.run(
+                ["security", *args], capture_output=True, text=True, timeout=5
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            logger.debug("security find-generic-password failed: %s", exc)
+            logger.debug("security %s failed: %s", args[0] if args else "", exc)
             return None
-        if result.returncode != 0:
+
+    def _resolve_account(self) -> str:
+        """The account of the Claude Code item, so read and write target the
+        SAME entry. Claude Code stores it under the macOS username, not a fixed
+        string — discover it (attributes only, no secret) and cache it. Falls
+        back to the current username."""
+        if self._account:
+            return self._account
+        result = self._run(["find-generic-password", "-s", self.service])
+        if result is not None and result.returncode == 0:
+            text = (result.stdout or "") + (result.stderr or "")
+            m = re.search(r'"acct"<blob>="([^"]*)"', text)
+            if m and m.group(1):
+                self._account = m.group(1)
+                return self._account
+        self._account = getpass.getuser()
+        return self._account
+
+    def _read_raw(self) -> Optional[Dict[str, Any]]:
+        account = self._resolve_account()
+        result = self._run(
+            ["find-generic-password", "-s", self.service, "-a", account, "-w"]
+        )
+        if result is None or result.returncode != 0:
             return None
         try:
             raw = json.loads(result.stdout.strip())
@@ -287,26 +311,22 @@ class KeychainCredentialSource(CredentialSource):
         return parse_credentials(raw) if raw is not None else None
 
     def write(self, creds: OAuthCredentials) -> bool:
-        # Merge into the existing item so scopes/subscriptionType/etc. survive.
+        # Merge into the existing item so scopes/subscriptionType/etc. survive,
+        # and target the SAME account we read from.
         raw = self._read_raw()
         if raw is None:
             return False
         _merge_credentials_into(raw, creds)
-        try:
-            result = subprocess.run(
-                [
-                    "security", "add-generic-password", "-U",
-                    "-s", self.service, "-a", self.account, "-w", json.dumps(raw),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning("Could not write refreshed credentials to Claude Code keychain: %s", exc)
-            return False
-        if result.returncode != 0:
-            logger.warning("security add-generic-password failed (rc=%s)", result.returncode)
+        account = self._resolve_account()
+        result = self._run(
+            [
+                "add-generic-password", "-U",
+                "-s", self.service, "-a", account, "-w", json.dumps(raw),
+            ]
+        )
+        if result is None or result.returncode != 0:
+            rc = "exception" if result is None else result.returncode
+            logger.warning("Could not write refreshed credentials to Claude Code keychain (rc=%s)", rc)
             return False
         return True
 

@@ -31,16 +31,35 @@ KEYCHAIN_JSON = {
 }
 
 
-def _fake_security(monkeypatch, read_payload=KEYCHAIN_JSON, read_rc=0, captured=None):
-    """Patch subprocess.run to emulate the `security` CLI."""
+def _fake_security(monkeypatch, read_payload=KEYCHAIN_JSON, read_rc=0, captured=None, account="testuser"):
+    """Patch subprocess.run to emulate the `security` CLI.
+
+    Models both calls the source makes: account discovery
+    (``find-generic-password -s SERVICE`` → attributes incl. ``acct``) and the
+    secret read (``... -a ACCOUNT -w`` → the JSON password).
+    """
 
     def fake_run(argv, **kw):
         if argv[:2] == ["security", "find-generic-password"]:
+            if "-w" not in argv:  # account discovery (attributes only)
+                if read_rc != 0:
+                    return SimpleNamespace(returncode=read_rc, stdout="", stderr="")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=f'    "acct"<blob>="{account}"\n    "svce"<blob>="{oa._CLAUDE_KEYCHAIN_SERVICE}"\n',
+                    stderr="",
+                )
+            # secret read — must target the discovered account (when discovery
+            # succeeded; on a missing item the account falls back to getuser()).
+            assert "-a" in argv
+            if read_rc == 0:
+                assert argv[argv.index("-a") + 1] == account
             out = json.dumps(read_payload) if read_payload is not None else ""
             return SimpleNamespace(returncode=read_rc, stdout=out, stderr="")
         if argv[:2] == ["security", "add-generic-password"]:
             if captured is not None:
-                # -w is the last arg
+                captured["argv"] = argv
+                captured["account"] = argv[argv.index("-a") + 1]
                 captured["written"] = json.loads(argv[-1])
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected argv {argv}")
@@ -87,6 +106,8 @@ def test_keychain_write_merges_and_preserves_fields(monkeypatch):
     assert block["expiresAt"] == 1_700_000_000_000  # written back in ms
     assert block["scopes"] == ["user:inference"]  # preserved
     assert block["subscriptionType"] == "max"  # preserved
+    # Write targets the SAME account discovered for the read (not a constant).
+    assert captured["account"] == "testuser"
 
 
 def test_keychain_write_false_when_item_absent(monkeypatch):
