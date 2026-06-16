@@ -122,9 +122,9 @@ GITHUB_HUMAN_REVIEWER=username    # Human for blocked issues (optional)
 After someone else lands a PR you need locally — or after your own PR merges and you want the agents to pick it up — run a single verb:
 
 ```bash
-kestrel update                    # git pull + install + feature sync + restart all agents
+kestrel update                    # git pull + install + reconcile + feature sync + restart all agents
 kestrel update Emma               # restart only one named agent
-kestrel update --dry-run          # preview; mutate nothing
+kestrel update --dry-run          # preview (incl. the reconcile plan); mutate nothing
 ```
 
 What it actually does:
@@ -134,8 +134,9 @@ What it actually does:
    - With `uv.lock` → `uv sync --active` (refreshes deps from lock + prunes anything not in it).
    - Without `uv.lock` → `uv pip install --python sys.executable -e .`.
    - Targets the venv that owns the running `kestrel` binary even under systemd/cron (`VIRTUAL_ENV` force-set from `sys.prefix`).
-3. `kestrel feature sync` restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` pruned.
-4. `kestrel restart` brings agents back so they see the new install.
+3. **Reconcile** the host venv against `union(all [agents.*].features) + the mandatory features`. The per-agent allowlist is a *filter*, not an *installer*, so reconcile installs any feature class an agent names but the venv lacks, and updates the rest. Update mode per feature comes from the `.kestrel-host-features.toml` source map: `editable = "/path"` → `git pull --ff-only` the checkout; `pypi = ">=x,<y"` → `pip install --upgrade` within the pin. A class no installed package, bundled feature, or registry entry provides is a hard error (no blind fallback). `--no-features` skips this step (and `feature sync`); `--prefer-source` / `--prefer-pypi` bulk-override the mode.
+4. `kestrel feature sync` restores any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` pruned.
+5. `kestrel restart` brings agents back so they see the new install.
 
 Any step's failure short-circuits the rest — a half-applied update never reaches the restart phase. Full reference in [`README.md` § Pulling in upstream changes](README.md#pulling-in-upstream-changes-kestrel-update).
 
