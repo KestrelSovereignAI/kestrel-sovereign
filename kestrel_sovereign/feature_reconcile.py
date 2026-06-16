@@ -67,6 +67,10 @@ class ReconcileAction:
     required_by: List[str] = field(default_factory=list)
     current_version: Optional[str] = None
     extras: List[str] = field(default_factory=list)
+    # Editable only: the venv must be (re)linked via ``pip install -e`` because
+    # the package is absent OR currently linked to a different checkout (or to a
+    # non-editable PyPI build). A git pull alone would leave the venv stale.
+    relink: bool = False
     note: str = ""
 
 
@@ -195,6 +199,18 @@ def build_source_index(manifest_entries, registry) -> Dict[str, SourceEntry]:
     return index
 
 
+def _same_path(a: Optional[str], b: Optional[str]) -> bool:
+    """True only when both are non-empty paths that resolve to the same place."""
+    if not a or not b:
+        return False
+    try:
+        from pathlib import Path as _Path
+
+        return _Path(a).expanduser().resolve() == _Path(b).expanduser().resolve()
+    except Exception:  # noqa: BLE001
+        return a == b
+
+
 def _pypi_requirement(package: str, spec: Optional[str], extras: List[str]) -> str:
     """Render a pip requirement with extras BEFORE the version spec.
 
@@ -288,12 +304,19 @@ def plan_reconcile(
         else:
             mode = "pypi"
 
+        relink = False
         if mode == "editable":
             if not editable_path:
                 # prefer=source asked for editable but no checkout is known.
                 no_source.append(package)
                 continue
             source = editable_path
+            # The venv must be re-linked via ``pip install -e`` (not just
+            # git-pulled) when the package is absent, is installed from a
+            # non-editable PyPI build, or is linked to a DIFFERENT checkout
+            # than the source map now wants. Otherwise a git pull would leave
+            # the venv pointing at the stale install (codex round 3 P2).
+            relink = current is None or not _same_path(detected_editable, editable_path)
         else:
             # PyPI: a declared spec wins; otherwise install the registry package
             # at its latest (floor pins live in the package's own metadata).
@@ -315,6 +338,7 @@ def plan_reconcile(
                 required_by=sorted(required_by.get(package, [])),
                 current_version=current,
                 extras=extras,
+                relink=relink,
             )
         )
 

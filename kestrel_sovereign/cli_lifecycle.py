@@ -760,9 +760,11 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
         if rc != 0:
             return False, out
         detail = out.strip()
-        # A fresh editable feature has to be linked into the venv once; an
-        # already-present one is updated by the pull alone.
-        if action.op == "install":
+        # Re-link into the venv when the package is absent or currently linked
+        # elsewhere (a non-editable PyPI build, or a different checkout). When
+        # it is already editable-linked to this checkout, the pull alone is the
+        # update. `relink` is decided by plan_reconcile (codex round 3 P2).
+        if action.relink:
             result = cli._extension_install_run(
                 ["-e", _pip_spec(str(checkout), action.extras)]
             )

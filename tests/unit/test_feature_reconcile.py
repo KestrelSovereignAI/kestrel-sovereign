@@ -241,6 +241,53 @@ def test_plan_detects_editable_install_without_manifest_entry():
     assert no_source == []
     (a,) = actions
     assert a.mode == "editable" and a.source == "/dev/voice" and a.op == "update"
+    # Already linked to the same checkout -> git pull alone, no relink.
+    assert a.relink is False
+
+
+def test_plan_relinks_editable_when_installed_from_pypi():
+    """Source map says editable but the package is a non-editable PyPI install
+    -> must relink (pip install -e), not just git pull (codex round 3 P2)."""
+    pkg_infos = {"kestrel-feature-voice": _voice_info()}
+    idx = {"kestrel-feature-voice": fr.SourceEntry(
+        package="kestrel-feature-voice", editable="/co/voice")}
+    actions, _ = fr.plan_reconcile(
+        pkg_infos, idx,
+        installed_versions={"kestrel-feature-voice": "0.3.1"},  # installed...
+        editable_paths={"kestrel-feature-voice": None},          # ...but NOT editable
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+    (a,) = actions
+    assert a.mode == "editable" and a.op == "update" and a.relink is True
+
+
+def test_plan_relinks_editable_when_checkout_path_differs():
+    """Editable but linked to a DIFFERENT checkout than the source map wants."""
+    pkg_infos = {"kestrel-feature-voice": _voice_info()}
+    idx = {"kestrel-feature-voice": fr.SourceEntry(
+        package="kestrel-feature-voice", editable="/co/voice")}
+    actions, _ = fr.plan_reconcile(
+        pkg_infos, idx,
+        installed_versions={"kestrel-feature-voice": "0.3.1"},
+        editable_paths={"kestrel-feature-voice": "/old/voice"},  # different path
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+    (a,) = actions
+    assert a.source == "/co/voice" and a.relink is True
+
+
+def test_plan_no_relink_when_editable_path_matches():
+    pkg_infos = {"kestrel-feature-voice": _voice_info()}
+    idx = {"kestrel-feature-voice": fr.SourceEntry(
+        package="kestrel-feature-voice", editable="/co/voice")}
+    actions, _ = fr.plan_reconcile(
+        pkg_infos, idx,
+        installed_versions={"kestrel-feature-voice": "0.3.1"},
+        editable_paths={"kestrel-feature-voice": "/co/voice"},  # same path
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+    (a,) = actions
+    assert a.relink is False
 
 
 def test_plan_falls_back_to_registry_pypi_when_no_source():

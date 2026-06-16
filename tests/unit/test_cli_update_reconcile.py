@@ -135,7 +135,7 @@ def test_execute_editable_update_runs_git_pull_only():
 def test_execute_editable_install_pulls_then_links():
     action = fr.ReconcileAction(
         package="kestrel-feature-voice", op="install", mode="editable",
-        source="/co/voice",
+        source="/co/voice", relink=True,
     )
     with patch.object(cli_lifecycle, "_editable_git_pull", return_value=(0, "")) as pull, \
          patch.object(cli, "_extension_install_run", return_value=_ok()) as install:
@@ -146,12 +146,27 @@ def test_execute_editable_install_pulls_then_links():
     assert install.call_args[0][0][0] == "-e"
 
 
+def test_execute_editable_relink_switches_from_pypi_install():
+    """A package installed from PyPI but now declared editable must be
+    re-linked via pip install -e, not just git-pulled (codex round 3 P2)."""
+    action = fr.ReconcileAction(
+        package="kestrel-feature-voice", op="update", mode="editable",
+        source="/co/voice", current_version="0.3.0", relink=True,
+    )
+    with patch.object(cli_lifecycle, "_editable_git_pull", return_value=(0, "")) as pull, \
+         patch.object(cli, "_extension_install_run", return_value=_ok()) as install:
+        ok, _ = cli_lifecycle._execute_reconcile_action(action, {}, allow_dirty=False)
+    assert ok is True
+    pull.assert_called_once()
+    install.assert_called_once()  # relink despite op == "update"
+
+
 def test_execute_editable_pull_failure_reports_and_skips_link():
     """A non-fast-forward / dirty collision from the pull is reported and the
     pip link is NOT attempted."""
     action = fr.ReconcileAction(
         package="kestrel-feature-voice", op="install", mode="editable",
-        source="/co/voice",
+        source="/co/voice", relink=True,
     )
     with patch.object(cli_lifecycle, "_editable_git_pull", return_value=(2, "REFUSED — dirty")) as pull, \
          patch.object(cli, "_extension_install_run") as install:
