@@ -357,6 +357,36 @@ def test_plan_uncatalogued_missing_feature_is_no_source():
     assert no_source == ["kestrel-feature-private"]
 
 
+def test_plan_force_reinstall_when_switching_editable_to_pypi():
+    """Source map declares pypi but the install is editable -> force reinstall
+    so the wheel replaces the checkout link (codex round 9 P2)."""
+    pkg_infos = {"kestrel-feature-voice": _voice_info()}
+    idx = {"kestrel-feature-voice": fr.SourceEntry(
+        package="kestrel-feature-voice", pypi=">=0.3,<0.4")}
+    actions, _ = fr.plan_reconcile(
+        pkg_infos, idx,
+        installed_versions={"kestrel-feature-voice": "0.3.1"},  # satisfies spec...
+        editable_paths={"kestrel-feature-voice": "/dev/voice"},  # ...but editable
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+    (a,) = actions
+    assert a.mode == "pypi" and a.force_reinstall is True
+
+
+def test_plan_no_force_reinstall_for_normal_pypi_update():
+    pkg_infos = {"kestrel-feature-voice": _voice_info()}
+    idx = {"kestrel-feature-voice": fr.SourceEntry(
+        package="kestrel-feature-voice", pypi=">=0.3,<0.4")}
+    actions, _ = fr.plan_reconcile(
+        pkg_infos, idx,
+        installed_versions={"kestrel-feature-voice": "0.3.1"},
+        editable_paths={"kestrel-feature-voice": None},  # not editable
+        class_to_pkg={"VoiceFeature": "kestrel-feature-voice"},
+    )
+    (a,) = actions
+    assert a.force_reinstall is False
+
+
 def test_plan_prefer_pypi_overrides_editable():
     pkg_infos = {"kestrel-feature-voice": _voice_info()}
     idx = {"kestrel-feature-voice": fr.SourceEntry(

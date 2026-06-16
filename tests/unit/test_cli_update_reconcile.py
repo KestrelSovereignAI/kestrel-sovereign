@@ -203,6 +203,20 @@ def test_execute_pinned_pypi_does_not_fall_back_to_unpinned_git():
     assert install.call_count == 1  # NO git fallback for a pinned entry
 
 
+def test_execute_pypi_force_reinstall_switches_off_editable():
+    """A force-reinstall pypi action passes --force-reinstall so the wheel
+    replaces an editable link (codex round 9 P2)."""
+    action = fr.ReconcileAction(
+        package="kestrel-feature-voice", op="update", mode="pypi",
+        source="kestrel-feature-voice>=0.3,<0.4", force_reinstall=True,
+    )
+    with patch.object(cli, "_extension_install_run", return_value=_ok()) as install:
+        ok, _ = cli_lifecycle._execute_reconcile_action(action, {}, allow_dirty=False)
+    assert ok is True
+    args = install.call_args[0][0]
+    assert "--force-reinstall" in args and "--upgrade" in args
+
+
 def test_execute_pypi_falls_back_to_git_url():
     action = fr.ReconcileAction(
         package="kestrel-feature-voice", op="install", mode="pypi",

@@ -75,6 +75,11 @@ class ReconcileAction:
     # must NOT fall back to an unpinned git URL on failure (that would silently
     # move the feature outside the operator's declared pin).
     pinned: bool = False
+    # PyPI only: the package is CURRENTLY installed editable but the source map
+    # now declares PyPI, so the executor must ``--force-reinstall`` to replace
+    # the editable link with the wheel — a plain ``--upgrade`` is a no-op when
+    # the editable version already satisfies the spec, leaving it linked.
+    force_reinstall: bool = False
     note: str = ""
 
 
@@ -319,6 +324,7 @@ def plan_reconcile(
 
         relink = False
         pinned = False
+        force_reinstall = False
         op = "update" if current is not None else "install"
         if mode == "editable":
             if not editable_path:
@@ -339,6 +345,11 @@ def plan_reconcile(
             # entry; synthesized live-only infos have it empty). Render extras
             # BEFORE the version spec (``pkg[extra]>=x``) — pip rejects the
             # reverse.
+            # Switching a currently-editable install to PyPI requires a force
+            # reinstall: a plain --upgrade is a no-op when the editable version
+            # already satisfies the spec, leaving the checkout linked (codex
+            # round 9 P2).
+            force_reinstall = bool(detected_editable)
             if pypi_spec is not None:
                 source = _pypi_requirement(package, pypi_spec, extras)
                 # A non-empty spec is a real pin (``""`` means "any version").
@@ -368,6 +379,7 @@ def plan_reconcile(
                 extras=extras,
                 relink=relink,
                 pinned=pinned,
+                force_reinstall=force_reinstall and op != "present",
             )
         )
 

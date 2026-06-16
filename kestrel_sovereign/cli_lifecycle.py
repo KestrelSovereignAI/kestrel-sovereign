@@ -782,7 +782,15 @@ def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
     # so it is passed verbatim — re-applying _pip_spec here would misplace the
     # extras after the spec and break pip.
     spec = action.source
-    pip_args = (["--upgrade", spec] if action.op == "update" else [spec])
+    pip_args = []
+    if action.op == "update":
+        pip_args.append("--upgrade")
+    # Replacing an editable link with the PyPI wheel needs --force-reinstall;
+    # otherwise pip treats an already-satisfying editable version as done and
+    # leaves the checkout linked (codex round 9 P2).
+    if action.force_reinstall:
+        pip_args.append("--force-reinstall")
+    pip_args.append(spec)
     result = cli._extension_install_run(pip_args)
     # The git-URL fallback installs the repo HEAD with NO version constraint, so
     # it must NOT be used for a pinned entry — that would silently move the
