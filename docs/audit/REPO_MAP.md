@@ -3,7 +3,7 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-15
+**Generated:** 2026-06-16
 **Scope:** 1729 tracked files (1124 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
@@ -1705,7 +1705,7 @@ Repo entry points and standard project files.
 - **tests/integration/test_kestrel_feature_github_create_issue.py** — Integration: create_issue via kestrel-feature-github (#1579).
   - `def stub_agent()`; `def scrub_github_tokens(monkeypatch)`; `async def test_create_issue_returns_ok_against_stub_github(stub_agent)`; `async def test_create_issue_bypasses_shell_subprocess(stub_agent)`
 - **tests/integration/test_key_management.py** — Integration Tests for API Key Management System.
-  - `async def temp_db()`; `def data_key()`; `async def key_storage(temp_db, data_key)`; `class TestServiceKeyStorage`; `class TestKeyResolutionService`; `class TestKeyManagementFeature`; `class TestKnownProviders`; `class TestMasterKeyNotConfigured`
+  - `async def temp_db()`; `def data_key()`; `async def key_storage(temp_db, data_key)`; `class TestServiceKeyStorage`; `class TestKeyResolutionService`; `class TestKeyManagementFeature`; `class TestKnownProviders`; `class TestMasterKeyNotConfigured`; `…`
 - **tests/integration/test_lighthouse_rest_e2e.py** — —
   - `async def client()`; `class TestUploadDownload`; `class TestCARUpload`; `class TestAccountQueries`; `class TestDealStatus`; `class TestClientLifecycle`; `class TestLighthouseProvider`
 - **tests/integration/test_lighthouse_sync.py** — Unit tests for Lighthouse sync target — state persistence for ephemeral environments.
