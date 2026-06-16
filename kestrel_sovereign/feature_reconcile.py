@@ -305,6 +305,7 @@ def plan_reconcile(
             mode = "pypi"
 
         relink = False
+        op = "update" if current is not None else "install"
         if mode == "editable":
             if not editable_path:
                 # prefer=source asked for editable but no checkout is known.
@@ -318,17 +319,28 @@ def plan_reconcile(
             # the venv pointing at the stale install (codex round 3 P2).
             relink = current is None or not _same_path(detected_editable, editable_path)
         else:
-            # PyPI: a declared spec wins; otherwise install the registry package
-            # at its latest (floor pins live in the package's own metadata).
-            # Render as a full pip requirement with extras BEFORE the version
-            # spec (``pkg[extra]>=x,<y``) — pip rejects ``pkg>=x[extra]``.
-            if pypi_spec is not None or info.package:
+            # PyPI mode. A declared spec always wins. Otherwise we can only pip
+            # from PyPI when the package has a known remote source — i.e. it is
+            # catalogued in the registry (``info.git`` is set for every catalog
+            # entry; synthesized live-only infos have it empty). Render extras
+            # BEFORE the version spec (``pkg[extra]>=x``) — pip rejects the
+            # reverse.
+            if pypi_spec is not None:
                 source = _pypi_requirement(package, pypi_spec, extras)
+            elif info.git:
+                source = _pypi_requirement(package, None, extras)
+            elif current is not None:
+                # Installed and loadable but no known remote source (a local /
+                # private / direct-URL install with no source-map entry). Leave
+                # it untouched — the allowlist requirement is already satisfied;
+                # fabricating a PyPI upgrade would fail and abort the update
+                # (codex round 4 P2). Add a source-map entry to manage it.
+                op = "present"
+                source = None
             else:
                 no_source.append(package)
                 continue
 
-        op = "update" if current is not None else "install"
         actions.append(
             ReconcileAction(
                 package=package,

@@ -305,6 +305,43 @@ def test_plan_falls_back_to_registry_pypi_when_no_source():
     assert a.mode == "pypi" and a.source == "kestrel-feature-voice"
 
 
+def test_plan_uncatalogued_installed_feature_is_present_not_pypi():
+    """A live-discovered, uncatalogued, non-editable installed feature (local /
+    private / direct-URL) has no remote source — leave it `present`, don't
+    fabricate a PyPI upgrade that would fail (codex round 4 P2)."""
+    # Synthesized info: no git URL (the catalog signal).
+    synth = FeaturePackageInfo(
+        name="kestrel-feature-private", package="kestrel-feature-private",
+        git="", features=["PrivateFeature"], description="", core=False,
+    )
+    actions, no_source = fr.plan_reconcile(
+        {"kestrel-feature-private": synth}, source_index={},
+        installed_versions={"kestrel-feature-private": "1.0.0"},
+        editable_paths={"kestrel-feature-private": None},
+        class_to_pkg={"PrivateFeature": "kestrel-feature-private"},
+    )
+    assert no_source == []
+    (a,) = actions
+    assert a.op == "present" and a.source is None
+
+
+def test_plan_uncatalogued_missing_feature_is_no_source():
+    """The same uncatalogued package, but NOT installed, has no source at all
+    -> hard error rather than a fabricated PyPI install."""
+    synth = FeaturePackageInfo(
+        name="kestrel-feature-private", package="kestrel-feature-private",
+        git="", features=["PrivateFeature"], description="", core=False,
+    )
+    actions, no_source = fr.plan_reconcile(
+        {"kestrel-feature-private": synth}, source_index={},
+        installed_versions={"kestrel-feature-private": None},
+        editable_paths={"kestrel-feature-private": None},
+        class_to_pkg={"PrivateFeature": "kestrel-feature-private"},
+    )
+    assert actions == []
+    assert no_source == ["kestrel-feature-private"]
+
+
 def test_plan_prefer_pypi_overrides_editable():
     pkg_infos = {"kestrel-feature-voice": _voice_info()}
     idx = {"kestrel-feature-voice": fr.SourceEntry(

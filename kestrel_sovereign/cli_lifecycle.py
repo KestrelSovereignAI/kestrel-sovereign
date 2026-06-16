@@ -715,6 +715,11 @@ def _run_feature_reconcile(
     for action in actions:
         label = action.package
         current = action.current_version or "-"
+        # A `present` action is installed + loadable with no managed source —
+        # nothing to do, just report it (never executed).
+        if action.op == "present":
+            print(f"  {label:<34} {current:<10} present (no managed source)")
+            continue
         how = (
             f"-e {action.source}" if action.mode == "editable"
             else f"pip {action.source}"
