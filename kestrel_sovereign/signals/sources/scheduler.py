@@ -89,7 +89,7 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # cycle (below) now owns memory maintenance (#1674 P3).
     ("memory_consolidate", SignalMode.ARTIFACT, frozenset({ResourceLock.MEMORY})),
     # Nightly `sleep` cycle (#1674 P3) — the single memory-maintenance cron:
-    # reflection (via reflection_hook), consolidation, and the forgetting
+    # reflection (via sleep_hooks), consolidation, and the forgetting
     # deletion tier through MemorySystem.consolidate(). Holds MEMORY (writes
     # episodes + deletes decayed ones). ACTION (NOT artifact): sleep has a
     # built-in handler (SchedulerFeature._handle_sleep) and no feature tool, and

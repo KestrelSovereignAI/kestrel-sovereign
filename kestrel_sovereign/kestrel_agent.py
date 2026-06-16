@@ -362,7 +362,7 @@ class KestrelAgent(
         self.privacy_agent = None  # Will be initialized after storage
         self.lighthouse_provider = None  # Will be initialized after storage if API key available
         self.wallet = None  # Set by WalletFeature.initialize()
-        self.reflection_hook = None  # Set by ReflectionFeature.post_all_features_loaded()
+        self.sleep_hooks = []  # *SleepHook instances; features append in post_all_features_loaded()
         # Bootstrap service is constructed in initialize(); default it here so
         # any code path that runs before/without full initialization (e.g. a
         # COGNITION signal dispatch reaching process_input's bootstrap check)

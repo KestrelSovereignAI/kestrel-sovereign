@@ -19,14 +19,14 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
     training_cycle        -- run a LoRA training cycle (ReflectionFeature)
     morning_signal        -- produce the daily briefing artifact
     sleep                 -- THE nightly memory-maintenance cycle (#1674 P3):
-                             reflection (via the subscribed reflection_hook) +
+                             reflection (via the subscribed sleep hook) +
                              consolidation + the forgetting deletion tier, all
                              through MemorySystem.consolidate(). Activity-gated;
                              skip_export=True (backups own DR). Supersedes the
                              auto-seeded memory_consolidate + reflect crons.
     reflect               -- reflection workflow tool (ReflectionFeature). Still
                              schedulable, but no longer auto-seeded — reflection
-                             subscribes to `sleep` via reflection_hook.
+                             subscribes to `sleep` via sleep_hooks.
     memory_consolidate    -- consolidate short-term memory into episodes + run
                              the [forgetting] deletion tier. Still schedulable,
                              but no longer auto-seeded — `sleep` runs the same
@@ -291,7 +291,7 @@ class SchedulerFeature(Feature):
         ]
 
         # Nightly sleep cycle (#1674 P3) — the ONE built-in memory-maintenance
-        # cron. sleep() runs reflection (via the subscribed reflection_hook),
+        # cron. sleep() runs reflection (via the subscribed sleep hook),
         # consolidation, and the forgetting deletion tier through the single
         # MemorySystem.consolidate() chokepoint. skip_export=True: backups stay
         # on their own 4h disaster-recovery cadence (backup_snapshot), so sleep
@@ -305,7 +305,7 @@ class SchedulerFeature(Feature):
 
         if has_reflection:
             # Reflection no longer has its own cron — it subscribes to the sleep
-            # cycle via agent.reflection_hook (on_pre_sleep / on_post_
+            # cycle via agent.sleep_hooks (on_pre_sleep / on_post_
             # consolidation). LoRA training stays a separate nightly job (it's
             # model training, not memory maintenance).
             defaults.append(
@@ -569,7 +569,7 @@ class SchedulerFeature(Feature):
         """Built-in handler for the nightly ``sleep`` cron (#1674 P3).
 
         Runs the agent's single memory-maintenance cycle: reflection (via the
-        subscribed ``reflection_hook``), consolidation, and the forgetting
+        subscribed ``sleep_hooks``), consolidation, and the forgetting
         deletion tier — all through ``MemorySystem.consolidate()``. Backups keep
         their own 4h disaster-recovery cadence, so this defaults to
         ``skip_export=True`` (override via the schedule's args JSON).

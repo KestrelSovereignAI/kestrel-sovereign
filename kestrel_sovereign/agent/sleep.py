@@ -14,9 +14,9 @@ This is inspired by how human memory consolidation occurs during sleep:
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Callable
+from typing import Optional, Dict, Any, Callable, List
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +39,11 @@ class SleepReport:
     total_size_bytes: int = 0
     storage_tier: str = "local"
 
-    # Reflection stats (NEW)
-    pre_reflection: Optional[Dict[str, Any]] = None
-    post_reflection: Optional[Dict[str, Any]] = None
+    # Sleep-hook stats: one result dict per registered sleep hook (reflection,
+    # parametric-self, ...). Lists rather than a single dict now that the sleep
+    # cycle dispatches a list of hooks.
+    pre_reflection: List[Dict[str, Any]] = field(default_factory=list)
+    post_reflection: List[Dict[str, Any]] = field(default_factory=list)
     insights_generated: int = 0
 
     # Timing
@@ -129,9 +131,12 @@ class SleepMixin:
     # Set this to an async function: async def callback(cid: str, report: SleepReport)
     on_sleep_complete: Optional[Callable] = None
 
-    # Optional reflection hook for self-improvement during sleep
-    # Set this to a ReflectionSleepHook instance
-    reflection_hook: Optional[Any] = None
+    # Sleep hooks: features register ``*SleepHook`` instances here to run
+    # pre-sleep / post-consolidation work during sleep (reflection,
+    # parametric-self, ...). A hook may implement ``on_pre_sleep(agent)`` and/or
+    # ``on_post_consolidation(agent, consolidation_result)``. Initialized
+    # per-instance in KestrelAgent; iterated by ``sleep()``.
+    sleep_hooks: Optional[List[Any]] = None
 
     async def sleep(
         self,
@@ -178,19 +183,23 @@ class SleepMixin:
         storage_tier = tier_map.get(tier.lower(), StorageTier.LOCAL_ONLY)
         report.storage_tier = tier
 
-        # 0. Pre-sleep reflection (analyze current session before consolidation)
-        if not skip_reflection and self.reflection_hook:
-            try:
-                pre_result = await self.reflection_hook.on_pre_sleep(self)
-                report.pre_reflection = pre_result
-                if pre_result.get("success"):
-                    report.insights_generated += pre_result.get("insights_generated", 0)
-                    logger.info(
-                        f"Pre-sleep reflection: {pre_result.get('insights_generated', 0)} insights"
-                    )
-            except Exception as e:
-                logger.warning(f"Pre-sleep reflection failed: {e}")
-                # Continue - reflection failure shouldn't block sleep
+        # 0. Pre-sleep hooks (analyze current session before consolidation)
+        if not skip_reflection and self.sleep_hooks:
+            for hook in self.sleep_hooks:
+                if not hasattr(hook, "on_pre_sleep"):
+                    continue
+                try:
+                    pre_result = await hook.on_pre_sleep(self)
+                    report.pre_reflection.append(pre_result)
+                    if pre_result.get("success"):
+                        report.insights_generated += pre_result.get("insights_generated", 0)
+                        logger.info(
+                            f"Pre-sleep hook {type(hook).__name__}: "
+                            f"{pre_result.get('insights_generated', 0)} insights"
+                        )
+                except Exception as e:
+                    logger.warning(f"Pre-sleep hook {type(hook).__name__} failed: {e}")
+                    # Continue - one hook's failure shouldn't block sleep
 
         # 1. Memory Consolidation
         if not skip_consolidation:
@@ -213,22 +222,27 @@ class SleepMixin:
                 # Continue to export anyway - partial sleep is better than none
             report.consolidation_ms = int((time.time() - start) * 1000)
 
-            # 1.5 Post-consolidation reflection (uses new episodes for deeper analysis)
-            if not skip_reflection and self.reflection_hook:
-                try:
-                    post_result = await self.reflection_hook.on_post_consolidation(
-                        self, consolidation_result
-                    )
-                    report.post_reflection = post_result
-                    if post_result.get("success") and not post_result.get("skipped"):
-                        report.insights_generated += post_result.get("insights_generated", 0)
-                        logger.info(
-                            f"Post-consolidation reflection: "
-                            f"{post_result.get('insights_generated', 0)} insights"
+            # 1.5 Post-consolidation hooks (use new episodes for deeper work)
+            if not skip_reflection and self.sleep_hooks:
+                for hook in self.sleep_hooks:
+                    if not hasattr(hook, "on_post_consolidation"):
+                        continue
+                    try:
+                        post_result = await hook.on_post_consolidation(
+                            self, consolidation_result
                         )
-                except Exception as e:
-                    logger.warning(f"Post-consolidation reflection failed: {e}")
-                    # Continue - reflection failure shouldn't block sleep
+                        report.post_reflection.append(post_result)
+                        if post_result.get("success") and not post_result.get("skipped"):
+                            report.insights_generated += post_result.get("insights_generated", 0)
+                            logger.info(
+                                f"Post-consolidation hook {type(hook).__name__}: "
+                                f"{post_result.get('insights_generated', 0)} insights"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"Post-consolidation hook {type(hook).__name__} failed: {e}"
+                        )
+                        # Continue - one hook's failure shouldn't block sleep
 
         # Record total reflection time
         report.reflection_ms = int((time.time() - reflection_start) * 1000) - report.consolidation_ms

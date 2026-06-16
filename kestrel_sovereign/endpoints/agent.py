@@ -1097,7 +1097,7 @@ async def reflection_status(request: Request):
     agent = get_agent(request)
 
     result = {
-        "reflection_hook_active": getattr(agent, "reflection_hook", None) is not None,
+        "sleep_hooks_active": bool(getattr(agent, "sleep_hooks", None)),
         "scheduled_tasks": [],
         "recent_executions": [],
     }
