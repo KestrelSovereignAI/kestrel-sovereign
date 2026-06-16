@@ -631,7 +631,7 @@ def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_hist
         ]
     )
     agent = MagicMock()
-    agent.reflection_hook = object()
+    agent.sleep_hooks = [object()]
     agent.features = {"SchedulerFeature": scheduler}
     agent._raw_storage = SimpleNamespace(db=db)
     agent.agent_id = "did:test:agent"
@@ -643,7 +643,7 @@ def test_reflection_status_filters_scheduler_tasks_and_serializes_execution_hist
                 response = client.get("/api/agent/reflection/status", headers=_api_headers())
         assert response.status_code == 200
         payload = response.json()
-        assert payload["reflection_hook_active"] is True
+        assert payload["sleep_hooks_active"] is True
         assert [task["task_name"] for task in payload["scheduled_tasks"]] == ["reflect", "training_cycle"]
         assert payload["recent_executions"][0]["task_id"] == "task-1"
         assert payload["recent_executions"][1]["task_name"] == "training_cycle"
