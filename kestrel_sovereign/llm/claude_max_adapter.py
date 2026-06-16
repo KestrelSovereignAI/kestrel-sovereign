@@ -36,6 +36,12 @@ class ClaudeMaxAdapter(AnthropicAdapter):
     and structured output are inherited from AnthropicAdapter.
     """
 
+    def _uses_claude_code_identity(self) -> bool:
+        """The plan route's ``sk-ant-oat`` token is rejected by Anthropic's
+        subscription endpoint unless the request is shaped like Claude Code.
+        See ``AnthropicAdapter._apply_oauth_request_shaping``."""
+        return True
+
     async def list_models(self, client=None):
         """Claude plan uses Anthropic discovery; this execution wrapper has no catalog.
 

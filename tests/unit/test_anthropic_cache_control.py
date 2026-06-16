@@ -12,6 +12,7 @@ import pytest
 
 from kestrel_sovereign.llm.anthropic_adapter import (
     CACHE_CONTROL_EPHEMERAL,
+    CLAUDE_CODE_IDENTITY,
     AnthropicAdapter,
     _attach_cache_control,
     _messages_with_penultimate_cache_marker,
@@ -464,8 +465,13 @@ async def _call_claude_max_and_capture(messages):
 
 @pytest.mark.asyncio
 async def test_claude_max_inherits_cache_control_behavior():
-    """ClaudeMaxAdapter subclasses AnthropicAdapter — cache_control
-    markers must apply to the OAuth route identically to the API route.
+    """ClaudeMaxAdapter subclasses AnthropicAdapter and inherits the cache
+    markers. The OAuth route additionally prepends the Claude Code identity
+    block (required by Anthropic's subscription endpoint), so the cache
+    breakpoint lands on the TRAILING real-system block — which still covers
+    the whole system prefix, identity included. History markers are unchanged.
+    See tests/unit/test_anthropic_oauth_shaping.py for the identity-shaping
+    assertions.
     """
     messages = [
         {"role": "system", "content": "Be helpful."},
@@ -475,7 +481,9 @@ async def test_claude_max_inherits_cache_control_behavior():
     ]
     captured = await _call_claude_max_and_capture(messages)
     assert isinstance(captured["system"], list)
-    assert captured["system"][0]["cache_control"] == CACHE_CONTROL_EPHEMERAL
+    # Identity prepended first (no marker); real system trailing (marked).
+    assert captured["system"][0]["text"] == CLAUDE_CODE_IDENTITY
+    assert captured["system"][-1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
     penult_content = captured["messages"][-2]["content"]
     assert isinstance(penult_content, list)
     assert penult_content[-1]["cache_control"] == CACHE_CONTROL_EPHEMERAL
