@@ -131,6 +131,21 @@ def test_resolve_packages_uses_live_entrypoint_dist():
     assert class_to_pkg["ParametricSelfFeature"] == "kestrel-feature-parametric-self"
 
 
+def test_resolve_packages_bundled_class_wins_over_duplicate_entrypoint():
+    """When a class is BOTH bundled and shipped by an installed package, the
+    loader loads the bundled one — reconcile must resolve to core, not the
+    external dist (codex round 6 P2)."""
+    reg = {}
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        {"DupeFeature"}, reg,
+        entrypoint_dists={"DupeFeature": "kestrel-feature-dupe"},
+        local_core_classes={"DupeFeature"},
+    )
+    assert unresolved == []
+    assert pkg_infos == {}  # NOT the external package
+    assert class_to_pkg["DupeFeature"] == fr.CORE_DISTRIBUTION
+
+
 def test_resolve_packages_local_core_class_needs_no_install():
     """An in-tree bundled class resolves (no error) but is NOT a reconcile
     target — core reinstall provisions it."""

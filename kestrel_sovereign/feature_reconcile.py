@@ -105,16 +105,20 @@ def resolve_packages(
 ) -> Tuple[Dict, Dict, List[str]]:
     """Resolve feature *class* names to *packages*.
 
-    Allowlists name classes; install works on packages. Resolution consults,
-    in order, the most authoritative source first — **live discovery is the
-    source of truth**, the static catalog is only a fallback / metadata source:
+    Allowlists name classes; install works on packages. Resolution consults, in
+    order, the most authoritative source first — **live discovery is the source
+    of truth**, the static catalog is only a fallback / metadata source. The
+    order also mirrors the runtime loader's precedence (local features win over
+    duplicate-named entry points):
 
-      1. ``entrypoint_dists`` — installed external feature packages, mapped
+      1. ``local_core_classes`` — in-tree bundled Feature classes. Checked
+         first: the loader discovers them before entry-point features and skips
+         duplicates, so a bundled class is what the agent actually loads.
+         Provisioned by ``kestrel update`` step 1 (core reinstall) — no
+         separate extension install.
+      2. ``entrypoint_dists`` — installed external feature packages, mapped
          class → distribution from live entry-point metadata. The truth for
          what's actually loadable from a pip package right now.
-      2. ``local_core_classes`` — in-tree bundled Feature classes. Provisioned
-         by ``kestrel update`` step 1 (core reinstall), so they need no
-         separate extension install.
       3. The static registry catalog — an external package that's *catalogued*
          but not yet installed (the legitimate "install the missing feature"
          case).
@@ -144,7 +148,17 @@ def resolve_packages(
     unresolved: List[str] = []
 
     for cls in sorted(required_classes):
-        # 1. Installed external package (live entry-point truth).
+        # 1. Bundled in-tree class — no separate extension to provision. Checked
+        #    FIRST to match the runtime loader, which discovers local features
+        #    before entry-point ones and skips a duplicate-named entry point;
+        #    so when a class is both bundled AND shipped by an installed
+        #    package, the agent loads the bundled one and reconcile must not
+        #    touch the external package (codex round 6 P2).
+        if cls in local_core_classes:
+            class_to_pkg[cls] = CORE_DISTRIBUTION
+            continue
+
+        # 2. Installed external package (live entry-point truth).
         dist = entrypoint_dists.get(cls)
         if dist:
             class_to_pkg[cls] = dist
@@ -155,11 +169,6 @@ def resolve_packages(
                     name=dist, package=dist, git="", features=[cls],
                     description="", core=False,
                 )
-            continue
-
-        # 2. Bundled in-tree class — no separate extension to provision.
-        if cls in local_core_classes:
-            class_to_pkg[cls] = CORE_DISTRIBUTION
             continue
 
         # 3. Catalogued external package (maybe not yet installed → install).
