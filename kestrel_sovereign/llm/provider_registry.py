@@ -281,16 +281,19 @@ class ProviderRegistry:
                 raise ImportError("anthropic package not installed.")
             api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
             auth_token = self._resolve_secret(route_cfg, "auth_token_env", "auth_token")
-            # The codex:plan route delegates token refresh to the codex binary;
-            # anthropic:plan owns its SDK client, so it owns the OAuth lifecycle
-            # too. A static auth_token OR an explicit credentials file both
-            # initialize the OAuth route — the file alone is enough (and is the
-            # only source that enables proactive refresh).
+            # The codex:plan route delegates its OAuth lifecycle to the codex
+            # binary; anthropic:plan owns its SDK client, so it owns the
+            # equivalent. A static auth_token, an explicit credentials file, or
+            # (plan route only) the auto-discovered Claude Code CLI store all
+            # initialize the OAuth route. Delegation/discovery is gated to the
+            # plan adapter so the metered API-key route never reaches for the
+            # subscription store.
             from .anthropic_oauth import ClaudeOAuthTokenManager
 
             oauth_manager = ClaudeOAuthTokenManager.from_sources(
                 static_token=auth_token,
                 credentials_path=route_cfg.get("oauth_credentials_file"),
+                delegate=(adapter_cls is ClaudeMaxAdapter),
             )
             if oauth_manager is not None:
                 client = anthropic.AsyncAnthropic(

@@ -148,8 +148,14 @@ def test_needs_refresh_requires_refresh_and_expiry():
 
 
 def test_from_sources_static_only_and_empty():
-    assert ClaudeOAuthTokenManager.from_sources(static_token="sk-ant-oat-s", credentials_path=None) is not None
-    assert ClaudeOAuthTokenManager.from_sources(static_token=None, credentials_path=None) is None
+    # delegate=False isolates this from any Claude Code store on the host;
+    # delegation/discovery is covered in test_anthropic_oauth_delegation.py.
+    assert ClaudeOAuthTokenManager.from_sources(
+        static_token="sk-ant-oat-s", credentials_path=None, delegate=False
+    ) is not None
+    assert ClaudeOAuthTokenManager.from_sources(
+        static_token=None, credentials_path=None, delegate=False
+    ) is None
 
 
 @pytest.mark.asyncio
