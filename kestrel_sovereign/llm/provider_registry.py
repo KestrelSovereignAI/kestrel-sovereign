@@ -301,7 +301,22 @@ class ProviderRegistry:
                     f"{vendor}:{route} requires api_key_env or auth_token_env "
                     "(ANTHROPIC_API_KEY for API-key routes, ANTHROPIC_AUTH_TOKEN for OAuth)"
                 )
-            return client, adapter_cls()
+            adapter = adapter_cls()
+            if auth_token:
+                # The codex:plan route delegates token refresh to the codex
+                # binary; anthropic:plan owns its SDK client, so it owns refresh
+                # too. Attach a manager only when there is something to manage
+                # (a refreshable credentials file, or the static token). Bare
+                # static tokens (setup-tokens) are returned unchanged.
+                from .anthropic_oauth import ClaudeOAuthTokenManager
+
+                manager = ClaudeOAuthTokenManager.from_sources(
+                    static_token=auth_token,
+                    credentials_path=route_cfg.get("oauth_credentials_file"),
+                )
+                if manager is not None:
+                    adapter._oauth_token_manager = manager
+            return client, adapter
 
         # --- Codex / ChatGPT subscription via the official codex app-server ---
         # Auth is delegated entirely to the codex binary (~/.codex/auth.json,

@@ -53,6 +53,20 @@ _EXTENDED_CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral", "ttl": _DEFAULT_CACHE_TTL}
 
 
+# --------------------------------------------------------------------------
+# Claude subscription (OAuth / plan route) request shaping
+# --------------------------------------------------------------------------
+# Anthropic's subscription endpoint rejects ``sk-ant-oat`` OAuth tokens with a
+# (misleading) ``rate_limit_error`` unless the request is shaped like Claude
+# Code: the FIRST system block must be exactly this identity string, as its
+# own discrete block. Verified live — identity in a later block, or merged
+# into the system string, still 429s. Applies to the plan/OAuth route ONLY,
+# never the metered API-key route (which authenticates by x-api-key).
+CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+_CLAUDE_CODE_BETA = "claude-code-20250219"
+_OAUTH_BETA = "oauth-2025-04-20"
+
+
 def _ensure_anthropic_beta_header(api_params: Dict[str, Any], beta: str) -> None:
     """Merge ``beta`` into ``api_params['extra_headers']['anthropic-beta']``.
 
@@ -549,6 +563,13 @@ class AnthropicAdapter(LLMAdapter):
         system = updated.get("system")
         if isinstance(system, str) and system:
             updated["system"] = _system_as_cacheable_array(system)
+        elif isinstance(system, list) and system:
+            # Already block-form (e.g. the OAuth identity prepend builds an
+            # array). Mark the final text block so the breakpoint still covers
+            # the whole system prefix.
+            last = system[-1]
+            if isinstance(last, dict) and last.get("type") == "text" and last.get("text"):
+                updated["system"] = [*system[:-1], _attach_cache_control(last)]
 
         tools = updated.get("tools")
         if isinstance(tools, list) and tools:
@@ -565,6 +586,66 @@ class AnthropicAdapter(LLMAdapter):
             )
 
         return updated
+
+    # ---- Claude subscription (OAuth / plan route) shaping ------------------
+
+    def _uses_claude_code_identity(self) -> bool:
+        """Whether requests must carry the Claude Code identity shaping.
+
+        ``False`` for the metered API-key route. ``ClaudeMaxAdapter`` (the
+        ``anthropic:plan`` OAuth route) overrides this to ``True`` — its
+        ``sk-ant-oat`` token is rejected by Anthropic's subscription endpoint
+        unless the request is shaped like Claude Code. See ``CLAUDE_CODE_IDENTITY``.
+        """
+        return False
+
+    def _apply_oauth_request_shaping(self, api_params: Dict[str, Any]) -> Dict[str, Any]:
+        """Prepend the Claude Code identity system block and add the
+        Claude-Code/OAuth beta headers, for the OAuth/plan route only.
+
+        Runs AFTER :meth:`_apply_cache_control`, so ``system`` is already a
+        cache-marked block array (or absent). The identity block goes first
+        (required by Anthropic); the cache breakpoint stays on the trailing
+        real-system block and therefore covers the identity prefix too.
+        """
+        if not self._uses_claude_code_identity():
+            return api_params
+
+        updated = dict(api_params)
+        identity = {"type": "text", "text": CLAUDE_CODE_IDENTITY}
+        system = updated.get("system")
+        if isinstance(system, list) and system:
+            updated["system"] = [identity, *system]
+        elif isinstance(system, str) and system:
+            updated["system"] = [
+                identity,
+                {"type": "text", "text": system, "cache_control": CACHE_CONTROL_EPHEMERAL},
+            ]
+        else:
+            # No system prompt — identity alone, cache-marked as a stable anchor.
+            updated["system"] = [{**identity, "cache_control": CACHE_CONTROL_EPHEMERAL}]
+
+        _ensure_anthropic_beta_header(updated, _CLAUDE_CODE_BETA)
+        _ensure_anthropic_beta_header(updated, _OAUTH_BETA)
+        return updated
+
+    async def _ensure_fresh_oauth_token(self, client: Any) -> None:
+        """Refresh the OAuth access token before a request when it is near
+        expiry, mutating the live SDK client.
+
+        No-ops unless a refreshable credential manager was attached for the
+        plan route (see ``provider_registry``). The SDK reads ``auth_token``
+        per request, so updating the attribute is sufficient. ``api_key`` stays
+        ``None`` so only the Bearer header is sent (see the OAuth note in
+        ``provider_registry``).
+        """
+        manager = getattr(self, "_oauth_token_manager", None)
+        if manager is None:
+            return
+        token = await manager.access_token()
+        if token:
+            client.auth_token = token
+            client.api_key = None
 
     def create_messages(
         self,
@@ -721,6 +802,11 @@ class AnthropicAdapter(LLMAdapter):
             # Anthropic only honors when this beta header is present. Without
             # it the cache silently falls back to the 5-minute default.
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
+            # OAuth/plan route only: shape the request like Claude Code and
+            # refresh the access token if it is near expiry. No-ops on the
+            # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
+            api_params = self._apply_oauth_request_shaping(api_params)
+            await self._ensure_fresh_oauth_token(client)
 
             response = await with_retry(client.messages.create, **api_params)
 
@@ -835,6 +921,11 @@ class AnthropicAdapter(LLMAdapter):
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
+            # OAuth/plan route only: shape the request like Claude Code and
+            # refresh the access token if it is near expiry. No-ops on the
+            # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
+            api_params = self._apply_oauth_request_shaping(api_params)
+            await self._ensure_fresh_oauth_token(client)
             splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with client.messages.stream(**api_params) as stream:
@@ -946,6 +1037,11 @@ class AnthropicAdapter(LLMAdapter):
             # Attach cache_control markers — see issue #705 and _apply_cache_control.
             api_params = self._apply_cache_control(api_params)
             _ensure_anthropic_beta_header(api_params, _EXTENDED_CACHE_TTL_BETA)
+            # OAuth/plan route only: shape the request like Claude Code and
+            # refresh the access token if it is near expiry. No-ops on the
+            # API-key route. See _apply_oauth_request_shaping / CLAUDE_CODE_IDENTITY.
+            api_params = self._apply_oauth_request_shaping(api_params)
+            await self._ensure_fresh_oauth_token(client)
 
             logger.info(f"Starting Anthropic stream with tools for model: {model}")
 
