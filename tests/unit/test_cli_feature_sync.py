@@ -271,6 +271,7 @@ def test_sync_installs_pinned_pypi_spec(monkeypatch, fake_registry, tmp_path):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
     _versions(monkeypatch, {})  # missing
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
     spy = _InstallSpy()
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 
@@ -287,6 +288,7 @@ def test_sync_pypi_spec_with_extras_orders_extras_first(monkeypatch, fake_regist
         '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\nextras = ["local"]\n'
     )
     _versions(monkeypatch, {})  # missing
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
     spy = _InstallSpy()
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 
@@ -302,13 +304,14 @@ def test_sync_repins_installed_version_violating_pypi_spec(monkeypatch, fake_reg
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
     _versions(monkeypatch, {"kestrel-feature-voice": "0.2.1"})  # below the pin
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # non-editable
     spy = _InstallSpy()
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 
     rc = cli.cmd_feature_sync(_args(manifest))
 
     assert rc == 0
-    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]  # plain reinstall, no force
     assert "reinstalled" in capsys.readouterr().out
 
 
@@ -342,7 +345,8 @@ def test_sync_switches_editable_install_to_pypi(monkeypatch, fake_registry, tmp_
     rc = cli.cmd_feature_sync(_args(manifest))
 
     assert rc == 0
-    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]  # reinstalled from PyPI
+    # force-reinstall so the wheel replaces the editable link (round 10 P2)
+    assert spy.calls == [["--force-reinstall", "kestrel-feature-voice>=0.3,<0.4"]]
     assert "reinstalled" in capsys.readouterr().out
 
 
@@ -352,6 +356,7 @@ def test_sync_pinned_pypi_no_git_fallback(monkeypatch, fake_registry, tmp_path, 
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
     _versions(monkeypatch, {})  # missing
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
     spy = _InstallSpy(returncode=1, stderr="no matching distribution")
     monkeypatch.setattr(cli, "_extension_install_run", spy)
 

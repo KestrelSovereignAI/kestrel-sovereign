@@ -653,6 +653,12 @@ def cmd_feature_sync(args) -> int:
 
         if editable_want:
             pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
+        elif pypi_want is not None and cli._editable_install_path(target):
+            # Switching a currently-editable install to a PyPI source needs a
+            # force reinstall; a plain pip install leaves the satisfying
+            # editable link in place, so the source switch never takes effect
+            # (codex round 10 P2).
+            pip_args = ["--force-reinstall", install_target]
         else:
             pip_args = [install_target]
 
