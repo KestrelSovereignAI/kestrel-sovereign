@@ -573,10 +573,18 @@ def _resolve_manifest_action(entry: dict, registry: dict):
             Path(have).resolve() == Path(editable_want).expanduser().resolve()
         )
         action = "reinstall" if not matched else ("ensure" if extras else "present")
-    elif pypi_want and not _version_satisfies(current, pypi_want):
-        # Installed, but the declared PyPI pin is violated — re-pin it rather
-        # than falsely reporting `present` and leaving an out-of-range version.
-        action = "reinstall"
+    elif pypi_want is not None:
+        # The source map declares a PyPI source. Re-install (switch source)
+        # when the installed copy is editable — otherwise sync/status would
+        # leave the venv pointed at a local checkout the manifest no longer
+        # declares (codex round 8 P2) — or when a non-empty pin is violated
+        # (codex round 2 P2). Both rather than a false `present`.
+        if cli._editable_install_path(target) or not _version_satisfies(current, pypi_want):
+            action = "reinstall"
+        elif extras:
+            action = "ensure"
+        else:
+            action = "present"
     elif extras:
         action = "ensure"
     else:
