@@ -526,13 +526,32 @@ def _registry_info_for(label: str, registry: dict):
     return None
 
 
+def _version_satisfies(version: str, spec: str) -> bool:
+    """Does *version* satisfy the PEP 440 *spec* (e.g. ``>=0.3,<0.4``)?
+
+    An empty spec means "any version". When the spec can't be evaluated
+    (``packaging`` missing or a malformed value) we conservatively return True
+    so sync doesn't churn-reinstall on an unparseable pin.
+    """
+    if not spec:
+        return True
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        return Version(version) in SpecifierSet(spec)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _resolve_manifest_action(entry: dict, registry: dict):
     """Resolve a manifest entry to ``(target_package, current_version, action)``.
 
     ``action`` is exactly what ``kestrel feature sync`` would do:
-    ``install`` (not present), ``reinstall`` (editable path mismatch),
-    ``ensure`` (present but declared extras can't be probed), or ``present``.
-    Shared by ``sync`` and ``status`` so the two never report different drift.
+    ``install`` (not present), ``reinstall`` (editable path mismatch, or a
+    ``pypi`` pin the installed version violates), ``ensure`` (present but
+    declared extras can't be probed), or ``present``. Shared by ``sync`` and
+    ``status`` so the two never report different drift.
     """
     import importlib.metadata as md
 
@@ -540,6 +559,7 @@ def _resolve_manifest_action(entry: dict, registry: dict):
     target = info.package if info else entry["name"]
     extras = entry["extras"]
     editable_want = entry["editable"]
+    pypi_want = entry.get("pypi")
     try:
         current = md.version(target)
     except md.PackageNotFoundError:
@@ -553,6 +573,10 @@ def _resolve_manifest_action(entry: dict, registry: dict):
             Path(have).resolve() == Path(editable_want).expanduser().resolve()
         )
         action = "reinstall" if not matched else ("ensure" if extras else "present")
+    elif pypi_want and not _version_satisfies(current, pypi_want):
+        # Installed, but the declared PyPI pin is violated — re-pin it rather
+        # than falsely reporting `present` and leaving an out-of-range version.
+        action = "reinstall"
     elif extras:
         action = "ensure"
     else:
