@@ -2,22 +2,29 @@
 Claude subscription (Claude Pro/Max) OAuth token lifecycle.
 
 The ``openai:plan`` route delegates its entire OAuth lifecycle — token
-refresh and request shaping — to the ``codex`` binary (see
-``codex_app_server.py``). The ``anthropic:plan`` route talks to the Anthropic
-SDK directly, so it must own the equivalent itself. This module is the refresh
-half: it exchanges a refresh token for a fresh ``sk-ant-oat`` access token
-against Anthropic's OAuth endpoint, using Claude Code's public client id —
-mirroring ``codex_app_server``'s ``grant_type=refresh_token`` flow.
+refresh and request shaping — to the ``codex`` binary (which reads/refreshes
+``~/.codex/auth.json``). The ``anthropic:plan`` route talks to the Anthropic
+SDK directly, so it must own the equivalent itself.
 
-Credentials are read from an EXPLICIT, operator-configured source only (a JSON
-file path or the static env token). This module never scans another
-application's credential store. The static-token path (no refresh token) is
-the steady state today and simply returns the token unchanged.
+This module delegates to the **Claude Code CLI's own credential store**, the
+same way codex delegates to the codex binary's store (and mirroring OpenClaw's
+``cli-credentials.ts``): it reads the ``Claude Code-credentials`` macOS Keychain
+item, or ``~/.claude/.credentials.json`` on Linux, refreshes the ``sk-ant-oat``
+access token with the stored refresh token when near expiry, and writes the
+rotated tokens back so Claude Code and Kestrel stay in sync. An explicit
+operator-configured file or a static env token are also supported.
+
+Credential sources, in precedence order (see ``from_sources``):
+  1. explicit credentials file (``oauth_credentials_file`` / env) — refreshable
+  2. static env token (``ANTHROPIC_AUTH_TOKEN``) — used as-is, not refreshed
+  3. auto-discovered Claude Code store (Keychain / file) — refreshable delegation
 """
 import asyncio
 import json
 import logging
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,10 +45,17 @@ _TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 # token that lapses mid-flight. Matches OpenClaw's 5-minute skew.
 _REFRESH_SKEW_SECONDS = 300
 
+# Claude Code CLI credential store locations (mirrors OpenClaw cli-credentials.ts).
+_CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+_CLAUDE_KEYCHAIN_ACCOUNT = "Claude Code"
+_CLAUDE_CREDENTIALS_RELATIVE_PATH = ".claude/.credentials.json"
+
 # Env overrides (parity with codex's KESTREL_CODEX_* / CODEX_REFRESH_TOKEN_URL_OVERRIDE).
 _ENV_CREDENTIALS_FILE = "KESTREL_ANTHROPIC_OAUTH_CREDENTIALS_FILE"
 _ENV_TOKEN_URL_OVERRIDE = "KESTREL_ANTHROPIC_OAUTH_TOKEN_URL"
 _ENV_CLIENT_ID_OVERRIDE = "KESTREL_ANTHROPIC_OAUTH_CLIENT_ID"
+# Set to "0"/"false" to disable auto-discovery of the Claude Code store.
+_ENV_DELEGATE = "KESTREL_ANTHROPIC_OAUTH_DELEGATE"
 
 
 @dataclass
@@ -166,26 +180,182 @@ async def refresh_anthropic_token(
     )
 
 
+def _merge_credentials_into(raw: Dict[str, Any], creds: OAuthCredentials) -> Dict[str, Any]:
+    """Update ``raw`` IN PLACE with ``creds``, matching the shape it already
+    uses — the Claude Code ``{"claudeAiOauth": {...}}`` wrapper, the key casing
+    (camelCase vs snake_case), the expiry unit (ms vs s), and any unrelated
+    sibling fields all survive. Returns ``raw`` for convenience."""
+    wrapped = isinstance(raw.get("claudeAiOauth"), dict)
+    block = raw["claudeAiOauth"] if wrapped else raw
+    camel = wrapped or "accessToken" in block or "refreshToken" in block
+
+    block["accessToken" if camel else "access_token"] = creds.access
+    if creds.refresh is not None:
+        block["refreshToken" if camel else "refresh_token"] = creds.refresh
+    if creds.expires_at is not None:
+        # Claude Code's camelCase store keeps expiresAt in milliseconds.
+        block["expiresAt" if camel else "expires_at"] = (
+            int(creds.expires_at * 1000) if camel else creds.expires_at
+        )
+    return raw
+
+
+class CredentialSource:
+    """A readable/writable Claude OAuth credential store. ``read`` seeds the
+    initial credentials; ``write`` persists rotated tokens after a refresh so
+    the shared store (and other clients like Claude Code) stay in sync."""
+
+    def read(self) -> Optional[OAuthCredentials]:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def write(self, creds: OAuthCredentials) -> bool:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class FileCredentialSource(CredentialSource):
+    """A JSON credentials file (explicit path or ``~/.claude/.credentials.json``)."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def read(self) -> Optional[OAuthCredentials]:
+        try:
+            raw = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Anthropic OAuth credentials file unreadable (%s): %s", self.path, exc)
+            return None
+        return parse_credentials(raw) if isinstance(raw, dict) else None
+
+    def write(self, creds: OAuthCredentials) -> bool:
+        try:
+            try:
+                existing = json.loads(self.path.read_text())
+                raw = existing if isinstance(existing, dict) else {}
+            except (OSError, json.JSONDecodeError):
+                raw = {}
+            _merge_credentials_into(raw, creds)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(json.dumps(raw, indent=2))
+            os.replace(tmp, self.path)
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+            return True
+        except OSError as exc:
+            logger.warning("Could not persist refreshed Claude OAuth credentials to %s: %s", self.path, exc)
+            return False
+
+
+class KeychainCredentialSource(CredentialSource):
+    """The macOS Keychain item Claude Code stores its OAuth login under
+    (``Claude Code-credentials``). Reads/writes via the ``security`` CLI with an
+    argument vector (never a shell string) so token material can't be
+    interpreted. Mirrors OpenClaw's cli-credentials.ts."""
+
+    def __init__(
+        self,
+        service: str = _CLAUDE_KEYCHAIN_SERVICE,
+        account: str = _CLAUDE_KEYCHAIN_ACCOUNT,
+    ) -> None:
+        self.service = service
+        self.account = account
+
+    def _read_raw(self) -> Optional[Dict[str, Any]]:
+        try:
+            result = subprocess.run(
+                ["security", "find-generic-password", "-s", self.service, "-w"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("security find-generic-password failed: %s", exc)
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            raw = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            return None
+        return raw if isinstance(raw, dict) else None
+
+    def read(self) -> Optional[OAuthCredentials]:
+        raw = self._read_raw()
+        return parse_credentials(raw) if raw is not None else None
+
+    def write(self, creds: OAuthCredentials) -> bool:
+        # Merge into the existing item so scopes/subscriptionType/etc. survive.
+        raw = self._read_raw()
+        if raw is None:
+            return False
+        _merge_credentials_into(raw, creds)
+        try:
+            result = subprocess.run(
+                [
+                    "security", "add-generic-password", "-U",
+                    "-s", self.service, "-a", self.account, "-w", json.dumps(raw),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not write refreshed credentials to Claude Code keychain: %s", exc)
+            return False
+        if result.returncode != 0:
+            logger.warning("security add-generic-password failed (rc=%s)", result.returncode)
+            return False
+        return True
+
+
+def discover_claude_code_source(
+    *,
+    platform: Optional[str] = None,
+    home: Optional[Path] = None,
+) -> Optional[CredentialSource]:
+    """Locate the Claude Code CLI credential store, if the user has logged in.
+
+    macOS: the ``Claude Code-credentials`` Keychain item (preferred).
+    Otherwise / Linux: ``~/.claude/.credentials.json``.
+    Returns a source only when it actually yields parseable credentials, so a
+    missing/empty store falls through cleanly.
+    """
+    plat = platform or sys.platform
+    if plat == "darwin":
+        kc = KeychainCredentialSource()
+        if kc.read() is not None:
+            return kc
+    base = home or Path.home()
+    file_path = base / _CLAUDE_CREDENTIALS_RELATIVE_PATH
+    if file_path.exists():
+        fs = FileCredentialSource(file_path)
+        if fs.read() is not None:
+            return fs
+    return None
+
+
 class ClaudeOAuthTokenManager:
     """Holds the live Claude OAuth credentials for the plan route and refreshes
-    them before expiry.
+    them before expiry, writing rotations back to the credential source.
 
     One instance per route (built in ``provider_registry``). ``access_token()``
-    is the only entry point: it returns a currently-valid access token,
-    refreshing under a lock when within the skew window. A static token with no
-    refresh token (the ``setup-token`` case) is returned unchanged.
+    is the only entry point: it returns a currently-valid access token. A static
+    token with no refresh token (the ``setup-token`` case) is returned unchanged.
     """
 
     def __init__(
         self,
         credentials: OAuthCredentials,
         *,
-        credentials_path: Optional[Path] = None,
+        source: Optional[CredentialSource] = None,
         client_id: Optional[str] = None,
         token_url: Optional[str] = None,
     ) -> None:
         self._creds = credentials
-        self._path = credentials_path
+        self._source = source
         self._client_id = client_id
         self._token_url = token_url
         self._lock = asyncio.Lock()
@@ -202,39 +372,50 @@ class ClaudeOAuthTokenManager:
         *,
         static_token: Optional[str],
         credentials_path: Optional[str],
+        delegate: Optional[bool] = None,
     ) -> Optional["ClaudeOAuthTokenManager"]:
-        """Build a manager from an explicit credentials file and/or a static
-        token. Returns ``None`` when there is nothing to manage.
+        """Build a manager from the first available credential source.
 
-        A credentials file (with a refresh token) takes precedence and enables
-        proactive refresh. A bare static token yields a manager that simply
-        returns it unchanged — harmless, and keeps the call path uniform.
+        Precedence: explicit file (config/env) → static env token → auto-
+        discovered Claude Code store. Returns ``None`` when nothing is found.
+        Auto-discovery is on unless ``delegate`` (or ``KESTREL_ANTHROPIC_OAUTH_DELEGATE``)
+        is false.
         """
+        # 1. Explicit credentials file (operator-configured).
         path = credentials_path or os.environ.get(_ENV_CREDENTIALS_FILE)
         if path:
-            p = Path(path).expanduser()
-            try:
-                raw = json.loads(p.read_text())
-            except FileNotFoundError:
-                logger.warning("Anthropic OAuth credentials file not found: %s", p)
-                raw = None
-            except (OSError, json.JSONDecodeError) as exc:
-                logger.warning("Anthropic OAuth credentials file unreadable (%s): %s", p, exc)
-                raw = None
-            if raw is not None:
-                creds = parse_credentials(raw)
-                if creds is not None:
-                    return cls(creds, credentials_path=p)
+            src = FileCredentialSource(Path(path).expanduser())
+            creds = src.read()
+            if creds is not None:
+                return cls(creds, source=src)
+            logger.warning("Anthropic OAuth credentials file yielded no token: %s", path)
+
+        # 2. Static env token (used as-is; setup-tokens carry no refresh token).
         if static_token:
             return cls(OAuthCredentials(access=static_token))
+
+        # 3. Delegate to the Claude Code CLI store (like codex:plan → codex binary).
+        if delegate is None:
+            delegate = os.environ.get(_ENV_DELEGATE, "1").lower() not in ("0", "false", "no")
+        if delegate:
+            src = discover_claude_code_source()
+            if src is not None:
+                creds = src.read()
+                if creds is not None:
+                    logger.info("anthropic:plan delegating to Claude Code credential store")
+                    return cls(creds, source=src)
         return None
 
     async def access_token(self) -> str:
-        creds = self._creds
-        if not creds.needs_refresh(now=time.time()):
-            return creds.access
+        if not self._creds.needs_refresh(now=time.time()):
+            return self._creds.access
         async with self._lock:
-            # Re-check under the lock; a concurrent caller may have refreshed.
+            # Another client (e.g. Claude Code itself) may have already
+            # refreshed the shared store — adopt that before minting our own.
+            if self._source is not None:
+                fresh = self._source.read()
+                if fresh is not None:
+                    self._creds = fresh
             if not self._creds.needs_refresh(now=time.time()):
                 return self._creds.access
             assert self._creds.refresh is not None  # guarded by needs_refresh
@@ -245,54 +426,6 @@ class ClaudeOAuthTokenManager:
                 token_url=self._token_url,
             )
             self._creds = new_creds
-            self._persist(new_creds)
+            if self._source is not None:
+                self._source.write(new_creds)
             return new_creds.access
-
-    def _persist(self, creds: OAuthCredentials) -> None:
-        """Write refreshed credentials back to the source file so the next
-        process start (and the rotated refresh token) survives. Best-effort —
-        a failure to persist must not break the in-memory refresh.
-
-        Updates the existing file IN PLACE so the original structure is kept:
-        the Claude Code ``{"claudeAiOauth": {...}}`` wrapper, the key casing,
-        the expiry unit, and any unrelated fields all survive. A new/unreadable
-        file falls back to the simple flat shape this module also parses.
-        """
-        if self._path is None:
-            return
-        try:
-            raw = self._read_existing_for_merge()
-            self._merge_credentials(raw, creds)
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(raw, indent=2))
-            os.replace(tmp, self._path)
-            try:
-                os.chmod(self._path, 0o600)
-            except OSError:
-                pass
-        except OSError as exc:
-            logger.warning("Could not persist refreshed Claude OAuth credentials: %s", exc)
-
-    def _read_existing_for_merge(self) -> Dict[str, Any]:
-        try:
-            raw = json.loads(self._path.read_text())
-        except (OSError, json.JSONDecodeError):
-            return {}
-        return raw if isinstance(raw, dict) else {}
-
-    @staticmethod
-    def _merge_credentials(raw: Dict[str, Any], creds: OAuthCredentials) -> None:
-        """Update ``raw`` in place, matching whatever shape it already uses."""
-        wrapped = isinstance(raw.get("claudeAiOauth"), dict)
-        block = raw["claudeAiOauth"] if wrapped else raw
-        camel = wrapped or "accessToken" in block or "refreshToken" in block
-
-        block["accessToken" if camel else "access_token"] = creds.access
-        if creds.refresh is not None:
-            block["refreshToken" if camel else "refresh_token"] = creds.refresh
-        if creds.expires_at is not None:
-            if camel:
-                # Claude Code stores expiresAt in milliseconds.
-                block["expiresAt"] = int(creds.expires_at * 1000)
-            else:
-                block["expires_at"] = creds.expires_at
