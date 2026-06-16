@@ -185,6 +185,12 @@ class ClaudeOAuthTokenManager:
         self._token_url = token_url
         self._lock = asyncio.Lock()
 
+    @property
+    def initial_access_token(self) -> str:
+        """The access token to build the SDK client with at startup. Refresh
+        (if any) then happens lazily before requests via ``access_token()``."""
+        return self._creds.access
+
     @classmethod
     def from_sources(
         cls,
@@ -240,17 +246,20 @@ class ClaudeOAuthTokenManager:
     def _persist(self, creds: OAuthCredentials) -> None:
         """Write refreshed credentials back to the source file so the next
         process start (and the rotated refresh token) survives. Best-effort —
-        a failure to persist must not break the in-memory refresh."""
+        a failure to persist must not break the in-memory refresh.
+
+        Updates the existing file IN PLACE so the original structure is kept:
+        the Claude Code ``{"claudeAiOauth": {...}}`` wrapper, the key casing,
+        the expiry unit, and any unrelated fields all survive. A new/unreadable
+        file falls back to the simple flat shape this module also parses.
+        """
         if self._path is None:
             return
         try:
-            payload = {
-                "access_token": creds.access,
-                "refresh_token": creds.refresh,
-                "expires_at": creds.expires_at,
-            }
+            raw = self._read_existing_for_merge()
+            self._merge_credentials(raw, creds)
             tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(payload, indent=2))
+            tmp.write_text(json.dumps(raw, indent=2))
             os.replace(tmp, self._path)
             try:
                 os.chmod(self._path, 0o600)
@@ -258,3 +267,27 @@ class ClaudeOAuthTokenManager:
                 pass
         except OSError as exc:
             logger.warning("Could not persist refreshed Claude OAuth credentials: %s", exc)
+
+    def _read_existing_for_merge(self) -> Dict[str, Any]:
+        try:
+            raw = json.loads(self._path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    @staticmethod
+    def _merge_credentials(raw: Dict[str, Any], creds: OAuthCredentials) -> None:
+        """Update ``raw`` in place, matching whatever shape it already uses."""
+        wrapped = isinstance(raw.get("claudeAiOauth"), dict)
+        block = raw["claudeAiOauth"] if wrapped else raw
+        camel = wrapped or "accessToken" in block or "refreshToken" in block
+
+        block["accessToken" if camel else "access_token"] = creds.access
+        if creds.refresh is not None:
+            block["refreshToken" if camel else "refresh_token"] = creds.refresh
+        if creds.expires_at is not None:
+            if camel:
+                # Claude Code stores expiresAt in milliseconds.
+                block["expiresAt"] = int(creds.expires_at * 1000)
+            else:
+                block["expires_at"] = creds.expires_at

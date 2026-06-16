@@ -178,6 +178,57 @@ async def test_access_token_refreshes_when_near_expiry(monkeypatch):
     assert await mgr.access_token() == "new"
 
 
+def test_from_sources_bootstraps_from_credentials_file(tmp_path):
+    """A credentials file ALONE (no static token) must build a manager — the
+    OAuth route can be configured by file only."""
+    import json
+
+    f = tmp_path / "creds.json"
+    f.write_text(json.dumps({"claudeAiOauth": {"accessToken": "sk-ant-oat-file", "refreshToken": "r"}}))
+    mgr = ClaudeOAuthTokenManager.from_sources(static_token=None, credentials_path=str(f))
+    assert mgr is not None
+    assert mgr.initial_access_token == "sk-ant-oat-file"
+
+
+@pytest.mark.asyncio
+async def test_persist_preserves_claude_code_wrapper_shape(tmp_path, monkeypatch):
+    """Refreshing a Claude Code ``{"claudeAiOauth": ...}`` file must keep the
+    wrapper, camelCase keys, ms expiry, and unrelated fields — not flatten it."""
+    import json
+
+    f = tmp_path / "creds.json"
+    f.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "old",
+                    "refreshToken": "refresh-1",
+                    "expiresAt": 1000_000,
+                    "scopes": ["user:inference"],
+                },
+                "otherTool": {"keep": "me"},
+            }
+        )
+    )
+    mgr = ClaudeOAuthTokenManager.from_sources(static_token=None, credentials_path=str(f))
+    monkeypatch.setattr("kestrel_sovereign.llm.anthropic_oauth.time.time", lambda: 2_000_000.0)
+
+    async def fake_refresh(refresh_token, **kw):
+        return OAuthCredentials(access="new", refresh="refresh-2", expires_at=1_700_000_000.0)
+
+    monkeypatch.setattr("kestrel_sovereign.llm.anthropic_oauth.refresh_anthropic_token", fake_refresh)
+    assert await mgr.access_token() == "new"
+
+    written = json.loads(f.read_text())
+    assert "claudeAiOauth" in written  # wrapper preserved
+    block = written["claudeAiOauth"]
+    assert block["accessToken"] == "new"  # camelCase kept
+    assert block["refreshToken"] == "refresh-2"
+    assert block["expiresAt"] == 1_700_000_000_000  # written back in ms
+    assert block["scopes"] == ["user:inference"]  # unrelated field kept
+    assert written["otherTool"] == {"keep": "me"}  # sibling field kept
+
+
 @pytest.mark.asyncio
 async def test_refresh_anthropic_token_posts_grant(monkeypatch):
     calls = {}

@@ -281,8 +281,21 @@ class ProviderRegistry:
                 raise ImportError("anthropic package not installed.")
             api_key = self._resolve_secret(route_cfg, "api_key_env", "api_key")
             auth_token = self._resolve_secret(route_cfg, "auth_token_env", "auth_token")
-            if auth_token:
-                client = anthropic.AsyncAnthropic(auth_token=auth_token)
+            # The codex:plan route delegates token refresh to the codex binary;
+            # anthropic:plan owns its SDK client, so it owns the OAuth lifecycle
+            # too. A static auth_token OR an explicit credentials file both
+            # initialize the OAuth route — the file alone is enough (and is the
+            # only source that enables proactive refresh).
+            from .anthropic_oauth import ClaudeOAuthTokenManager
+
+            oauth_manager = ClaudeOAuthTokenManager.from_sources(
+                static_token=auth_token,
+                credentials_path=route_cfg.get("oauth_credentials_file"),
+            )
+            if oauth_manager is not None:
+                client = anthropic.AsyncAnthropic(
+                    auth_token=oauth_manager.initial_access_token
+                )
                 # The Anthropic SDK back-fills ``api_key`` from
                 # ``ANTHROPIC_API_KEY`` in the environment whenever the
                 # constructor arg is None (which it is here — we only
@@ -298,24 +311,13 @@ class ProviderRegistry:
                 client = anthropic.AsyncAnthropic(api_key=api_key)
             else:
                 raise ValueError(
-                    f"{vendor}:{route} requires api_key_env or auth_token_env "
-                    "(ANTHROPIC_API_KEY for API-key routes, ANTHROPIC_AUTH_TOKEN for OAuth)"
+                    f"{vendor}:{route} requires api_key_env, auth_token_env, or "
+                    "oauth_credentials_file (ANTHROPIC_API_KEY for API-key routes; "
+                    "ANTHROPIC_AUTH_TOKEN or a credentials file for OAuth)"
                 )
             adapter = adapter_cls()
-            if auth_token:
-                # The codex:plan route delegates token refresh to the codex
-                # binary; anthropic:plan owns its SDK client, so it owns refresh
-                # too. Attach a manager only when there is something to manage
-                # (a refreshable credentials file, or the static token). Bare
-                # static tokens (setup-tokens) are returned unchanged.
-                from .anthropic_oauth import ClaudeOAuthTokenManager
-
-                manager = ClaudeOAuthTokenManager.from_sources(
-                    static_token=auth_token,
-                    credentials_path=route_cfg.get("oauth_credentials_file"),
-                )
-                if manager is not None:
-                    adapter._oauth_token_manager = manager
+            if oauth_manager is not None:
+                adapter._oauth_token_manager = oauth_manager
             return client, adapter
 
         # --- Codex / ChatGPT subscription via the official codex app-server ---
