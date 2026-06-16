@@ -168,6 +168,17 @@ def test_from_sources_delegate_env_disable(monkeypatch):
     assert mgr is None
 
 
+def test_env_disable_overrides_explicit_delegate_true(monkeypatch):
+    """The operator escape hatch must win even when the caller (plan route)
+    passes delegate=True."""
+    _fake_security(monkeypatch)
+    monkeypatch.setenv("KESTREL_ANTHROPIC_OAUTH_DELEGATE", "false")
+    mgr = ClaudeOAuthTokenManager.from_sources(
+        static_token=None, credentials_path=None, delegate=True
+    )
+    assert mgr is None
+
+
 # ---------------------------------------------------------------------------
 # access_token: adopt-then-refresh + write-back
 # ---------------------------------------------------------------------------

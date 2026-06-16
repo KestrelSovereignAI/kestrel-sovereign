@@ -395,9 +395,11 @@ class ClaudeOAuthTokenManager:
             return cls(OAuthCredentials(access=static_token))
 
         # 3. Delegate to the Claude Code CLI store (like codex:plan → codex binary).
-        if delegate is None:
-            delegate = os.environ.get(_ENV_DELEGATE, "1").lower() not in ("0", "false", "no")
-        if delegate:
+        # Requires BOTH the caller's opt-in (route gating; ``delegate`` is False
+        # for the metered API-key route) AND the operator env escape hatch.
+        env_allows = os.environ.get(_ENV_DELEGATE, "1").lower() not in ("0", "false", "no")
+        allow_delegate = (True if delegate is None else delegate) and env_allows
+        if allow_delegate:
             src = discover_claude_code_source()
             if src is not None:
                 creds = src.read()
