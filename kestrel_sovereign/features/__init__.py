@@ -223,14 +223,33 @@ def discover_local_feature_class_names() -> Set[str]:
     return names
 
 
-def discover_entrypoint_feature_dists() -> Dict[str, str]:
-    """Map each entry-point Feature class name to its owning distribution.
+def _entrypoint_class_name(ep_value: str, ep_name: str) -> str:
+    """The Feature CLASS name an entry point resolves to.
 
-    Lightweight: reads entry-point *metadata* (``ep.name`` / ``ep.dist.name``)
-    without importing the feature modules. This is the live, authoritative
-    class → package map for installed external feature packages, used by host
-    reconcile (issue #1788) to resolve allowlist classes to the packages that
-    must be updated.
+    Allowlists and the agent loader key features by ``cls.__name__``, but an
+    entry point may be registered under an alias
+    (``github = "kestrel_feature_github.feature:GitHubFeature"``). The class
+    name is the attribute after ``:`` (its innermost segment), which equals the
+    loaded ``cls.__name__``; fall back to the entry-point name when the value
+    has no attribute part. (issue #1788, codex round 5)
+    """
+    if ep_value and ":" in ep_value:
+        attr = ep_value.split(":", 1)[1].strip()
+        if attr:
+            return attr.split(".")[-1]
+    return ep_name
+
+
+def discover_entrypoint_feature_dists() -> Dict[str, str]:
+    """Map each entry-point Feature CLASS name to its owning distribution.
+
+    Lightweight: reads entry-point *metadata* (``ep.value`` / ``ep.dist.name``)
+    without importing the feature modules. The class name is derived from
+    ``ep.value`` so it matches the allowlist namespace even when the entry
+    point uses an alias (see :func:`_entrypoint_class_name`). This is the live,
+    authoritative class → package map for installed external feature packages,
+    used by host reconcile (issue #1788) to resolve allowlist classes to the
+    packages that must be updated.
     """
     dist_by_class: Dict[str, str] = {}
     try:
@@ -245,8 +264,11 @@ def discover_entrypoint_feature_dists() -> Dict[str, str]:
 
     for ep in feature_eps:
         dist = getattr(ep, "dist", None)
-        if dist is not None:
-            dist_by_class[ep.name] = dist.name
+        if dist is None:
+            continue
+        class_name = _entrypoint_class_name(getattr(ep, "value", "") or "", ep.name)
+        if class_name:
+            dist_by_class[class_name] = dist.name
     return dist_by_class
 
 

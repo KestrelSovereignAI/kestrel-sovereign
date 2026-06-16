@@ -448,3 +448,48 @@ class TestEntryPointDiscovery:
     def test_entrypoint_group_constant(self):
         """Test that the entry_point group constant is correct."""
         assert FEATURE_ENTRY_POINT_GROUP == "kestrel_sovereign.features"
+
+
+class TestEntrypointClassName:
+    """`_entrypoint_class_name` derives the CLASS name (matching the allowlist
+    namespace) from an entry point's value, even under an alias (#1788)."""
+
+    def test_alias_entry_point_resolves_to_class_name(self):
+        from kestrel_sovereign.features import _entrypoint_class_name
+        # alias name differs from the class the value points at
+        assert _entrypoint_class_name(
+            "kestrel_feature_github.feature:GitHubFeature", "github"
+        ) == "GitHubFeature"
+
+    def test_class_named_entry_point_unchanged(self):
+        from kestrel_sovereign.features import _entrypoint_class_name
+        assert _entrypoint_class_name(
+            "kestrel_feature_voice:VoiceFeature", "VoiceFeature"
+        ) == "VoiceFeature"
+
+    def test_nested_attribute_uses_innermost_name(self):
+        from kestrel_sovereign.features import _entrypoint_class_name
+        assert _entrypoint_class_name("mod:Outer.Inner", "x") == "Inner"
+
+    def test_no_attribute_falls_back_to_entry_point_name(self):
+        from kestrel_sovereign.features import _entrypoint_class_name
+        assert _entrypoint_class_name("", "FallbackFeature") == "FallbackFeature"
+
+    def test_dist_map_uses_value_derived_class_name(self):
+        """discover_entrypoint_feature_dists keys by the class from ep.value."""
+        from kestrel_sovereign.features import discover_entrypoint_feature_dists
+
+        ep = MagicMock()
+        ep.name = "github"  # alias, NOT the class name
+        ep.value = "kestrel_feature_github.feature:GitHubFeature"
+        ep.dist.name = "kestrel-feature-github"
+        mock_eps = MagicMock()
+        mock_eps.select.return_value = [ep]
+
+        with patch(
+            "kestrel_sovereign.features.importlib.metadata.entry_points",
+            return_value=mock_eps,
+        ):
+            dist_map = discover_entrypoint_feature_dists()
+
+        assert dist_map == {"GitHubFeature": "kestrel-feature-github"}
