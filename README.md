@@ -158,16 +158,23 @@ kestrel restart                        # bring agents back so they see the new i
 `kestrel update` collapses that into one verb:
 
 ```bash
-kestrel update                       # pull + install + feature sync + restart all agents
+kestrel update                       # pull + install + reconcile + feature sync + restart all agents
 kestrel update Emma                  # same, but only restart the named agent
-kestrel update --dry-run             # preview the steps without mutating anything
-kestrel update --no-pull --no-install # only feature sync + restart (e.g. after a manual checkout)
-kestrel update --allow-dirty         # pull even with modified TRACKED files in the working tree
+kestrel update --dry-run             # preview the steps (incl. the reconcile plan) without mutating
+kestrel update --no-pull --no-install # only reconcile + feature sync + restart (e.g. after a manual checkout)
+kestrel update --no-features         # skip BOTH the reconcile and `feature sync` steps
+kestrel update --allow-dirty         # pull even with modified TRACKED files (also relaxes editable reconcile pulls)
+kestrel update --prefer-source       # reconcile: git-pull every feature with a known checkout
+kestrel update --prefer-pypi         # reconcile: pip --upgrade every feature (no editable git pulls)
 kestrel update --uv-sync             # force `uv sync` for the install step
 kestrel update --no-uv-sync          # force `uv pip install -e .` for the install step
 kestrel update --no-deps             # pass --no-deps to `uv pip install` for the fast path
-kestrel update --continue-on-error   # restart even if `feature sync` reports an error
+kestrel update --continue-on-error   # proceed past a reconcile/sync error to the restart
 ```
+
+**Reconcile step — host venv ⇆ agent allowlists.** Between the install and `feature sync` steps, `kestrel update` reconciles the host venv against `union(all [agents.*].features) + the mandatory features`. The per-agent `features` allowlist is a *filter*, not an *installer*: naming a feature class an agent doesn't have installed just makes it silently never load. Reconcile closes that gap — it resolves each required class to its package (live entry-points + in-tree bundled classes first, the static feature registry as fallback), then **installs** any that are missing and **updates** the rest. A class that no installed package, bundled feature, or catalogued package provides is a hard error (no blind fallback) — fix the allowlist or add the package to the registry.
+
+Update mode is per-feature, read from the `.kestrel-host-features.toml` **source map** (each entry records where a package comes from — `editable = "/path"` *or* `pypi = ">=x,<y"`): editable features are `git pull --ff-only`'d in their checkout (that checkout IS the running code); PyPI features are `pip install --upgrade`'d (respecting floor pins). A non-fast-forward or a dirty checkout is reported, never auto-merged. `--prefer-source` / `--prefer-pypi` bulk-override the mode.
 
 **Install step auto-detect.** When `uv.lock` exists at the source checkout root, the install step runs `uv sync --active` against the venv that owns the running `kestrel` binary (detected via `sys.prefix != sys.base_prefix`, so systemd / cron / direct-path invocations work too). That refreshes deps from the lockfile AND prunes packages not in it — which is precisely why `kestrel feature sync` runs immediately after, to restore any out-of-tree feature packages (`kestrel-feature-*`) that `uv sync` just pruned. Without `uv.lock` present, the step falls back to `uv pip install --python sys.executable -e .` which only reinstalls the project package. Force either branch with `--uv-sync` / `--no-uv-sync`.
 
@@ -222,16 +229,20 @@ kestrel feature sync --dry-run          # Preview without installing
 kestrel feature sync --manifest PATH    # Use a non-default manifest location
 ```
 
-A manifest entry names a package (by registry name or raw dist name) and may pin an editable checkout and extras:
+A manifest entry names a package (by registry name or raw dist name) and records **one** source — an `editable` checkout *or* a `pypi` version spec (mutually exclusive) — plus optional extras. This is the **source map** the `kestrel update` reconcile step reads to decide each feature's update mode (git pull vs `pip --upgrade`):
 
 ```toml
 [[feature]]
 name = "voice"
-extras = ["local"]                      # also pull the on-device pipeline (Piper / faster-whisper)
+editable = "/path/to/kestrel-feature-voice" # dev checkout: git pull --ff-only on update
+extras = ["local"]                          # also pull the on-device pipeline (Piper / faster-whisper)
 
 [[feature]]
 name = "github"
-editable = "/path/to/kestrel-feature-github"
+pypi = ">=0.2,<0.3"                          # from PyPI: pip install --upgrade within the pin
+
+[[feature]]
+name = "reflection"                         # neither form = "install latest from PyPI" (back-compat)
 ```
 
 This never touches `pyproject.toml`, so installing `kestrel-sovereign` itself still pulls zero feature packages. The typical recovery after a prune is `kestrel feature sync` followed by a host/agent restart so the restored entry-points load.

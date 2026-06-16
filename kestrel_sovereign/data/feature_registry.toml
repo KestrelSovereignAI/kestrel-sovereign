@@ -496,6 +496,15 @@ tags = ["devtools", "code", "editing", "sovereign"]
 icon = "code"
 core = false
 
+[parametric_self]
+package = "kestrel-feature-parametric-self"
+git = "https://github.com/KestrelSovereignAI/kestrel-feature-parametric-self.git"
+features = ["ParametricSelfFeature"]
+description = "Per-agent owned local model, nightly-finetuned on the agent's own experience (sovereign-only)"
+tags = ["llm", "finetune", "self-improvement", "sovereign"]
+icon = "brain"
+core = false
+
 [delivery]
 package = "kestrel-feature-delivery"
 git = "https://github.com/KestrelSovereignAI/kestrel-feature-delivery.git"

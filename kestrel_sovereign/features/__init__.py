@@ -203,6 +203,53 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
     return classes
 
 
+def discover_local_feature_class_names() -> Set[str]:
+    """Class names of the in-tree (bundled) Feature subclasses.
+
+    The authoritative "ships with core, needs no install" set used by host
+    reconcile (issue #1788) to distinguish a bundled class that needs no
+    provisioning from an allowlist entry that names a feature the venv does not
+    actually provide (the motivating silent-no-load bug).
+    """
+    names: Set[str] = set()
+    for module_path in discover_feature_modules():
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        feature_class = find_feature_class(module)
+        if feature_class is not None:
+            names.add(feature_class.__name__)
+    return names
+
+
+def discover_entrypoint_feature_dists() -> Dict[str, str]:
+    """Map each entry-point Feature class name to its owning distribution.
+
+    Lightweight: reads entry-point *metadata* (``ep.name`` / ``ep.dist.name``)
+    without importing the feature modules. This is the live, authoritative
+    class → package map for installed external feature packages, used by host
+    reconcile (issue #1788) to resolve allowlist classes to the packages that
+    must be updated.
+    """
+    dist_by_class: Dict[str, str] = {}
+    try:
+        eps = importlib.metadata.entry_points()
+    except Exception:  # noqa: BLE001
+        return dist_by_class
+
+    if hasattr(eps, "select"):
+        feature_eps = eps.select(group=FEATURE_ENTRY_POINT_GROUP)
+    else:
+        feature_eps = eps.get(FEATURE_ENTRY_POINT_GROUP, [])
+
+    for ep in feature_eps:
+        dist = getattr(ep, "dist", None)
+        if dist is not None:
+            dist_by_class[ep.name] = dist.name
+    return dist_by_class
+
+
 def discover_feature_class_by_name(name: str) -> Optional[Type[Feature]]:
     """Resolve a discoverable feature class by class name, module name, or shorthand.
 

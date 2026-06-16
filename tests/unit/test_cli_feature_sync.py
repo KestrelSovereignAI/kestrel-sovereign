@@ -239,6 +239,47 @@ def test_sync_dry_run_changes_nothing(monkeypatch, fake_registry, tmp_path, caps
     assert "would install" in capsys.readouterr().out
 
 
+# --- pypi source form (#1788) ----------------------------------------------
+
+
+def test_manifest_parses_pypi_source_form(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    (entry,) = cli._load_host_manifest(manifest)
+    assert entry["pypi"] == ">=0.3,<0.4"
+    assert entry["editable"] is None
+
+
+def test_manifest_rejects_editable_and_pypi_together(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "voice"\neditable = "/src/voice"\npypi = ">=0.3"\n'
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cli._load_host_manifest(manifest)
+
+
+def test_manifest_rejects_non_string_pypi(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = 3\n')
+    with pytest.raises(ValueError, match="version spec"):
+        cli._load_host_manifest(manifest)
+
+
+def test_sync_installs_pinned_pypi_spec(monkeypatch, fake_registry, tmp_path):
+    """A pypi version spec pins the installed package (``pkg>=0.3,<0.4``)."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {})  # missing
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+
+
 def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')

@@ -384,8 +384,15 @@ def _load_host_manifest(path: Path) -> list:
 
         [[feature]]
         name = "voice"                 # registry name or raw dist/package name
-        editable = "/path/to/checkout" # optional: install -e from here
+        editable = "/path/to/checkout" # editable source: install -e + git pull
+        # --- OR ---
+        pypi = ">=0.3,<0.4"            # PyPI source: pip --upgrade (spec/floor)
         extras = ["local"]             # optional extras
+
+    ``editable`` and ``pypi`` are the two source forms (#1788) and are mutually
+    exclusive: an entry records *one* place a package comes from. ``pypi = ""``
+    means "from PyPI, any version". An entry with neither is the legacy
+    "present / install latest from PyPI" form, preserved for back-compat.
 
     Raises ``ValueError`` on a malformed entry so the caller can report it.
     """
@@ -409,12 +416,28 @@ def _load_host_manifest(path: Path) -> list:
         editable = entry.get("editable")
         if editable is not None and not isinstance(editable, str):
             raise ValueError(f"manifest '{label}': 'editable' must be a string path")
+        pypi = entry.get("pypi")
+        if pypi is not None and not isinstance(pypi, str):
+            raise ValueError(
+                f"manifest '{label}': 'pypi' must be a string version spec "
+                "(e.g. \">=0.3,<0.4\" or \"\" for any)"
+            )
+        if editable is not None and pypi is not None:
+            raise ValueError(
+                f"manifest '{label}': 'editable' and 'pypi' are mutually "
+                "exclusive — a feature has one source"
+            )
         extras = entry.get("extras", []) or []
         # A bare string ("local") would silently iterate into characters
         # (['l','o','c','a','l']); require an explicit array.
         if not isinstance(extras, list) or not all(isinstance(x, str) for x in extras):
             raise ValueError(f"manifest '{label}': 'extras' must be an array of strings")
-        cleaned.append({"name": str(label), "editable": editable, "extras": list(extras)})
+        cleaned.append({
+            "name": str(label),
+            "editable": editable,
+            "pypi": pypi,
+            "extras": list(extras),
+        })
     return cleaned
 
 
@@ -578,20 +601,25 @@ def cmd_feature_sync(args) -> int:
         target, current, action = _resolve_manifest_action(entry, registry)
         extras = entry["extras"]
         editable_want = entry["editable"]
+        pypi_want = entry.get("pypi")
 
         if action == "present":
             print(f"  {target:<34} {current or '-':<10} present")
             continue
 
+        # A declared PyPI version spec pins the install (``pkg>=0.3,<0.4``);
+        # an empty spec means "any version", same as the legacy bare form.
+        install_target = f"{target}{pypi_want}" if pypi_want else target
+
         if dry_run:
-            how = f"-e {editable_want}" if editable_want else "pip"
+            how = f"-e {editable_want}" if editable_want else f"pip {install_target}"
             print(f"  {target:<34} {current or '-':<10} would {action} ({how})")
             continue
 
         if editable_want:
             pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
         else:
-            pip_args = [_pip_spec(target, extras)]
+            pip_args = [_pip_spec(install_target, extras)]
 
         result = cli._extension_install_run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
