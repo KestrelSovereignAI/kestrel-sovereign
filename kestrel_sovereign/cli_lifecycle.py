@@ -546,6 +546,270 @@ def _run_uv_pip_install_editable(project_dir: Path, no_deps: bool) -> Tuple[int,
     return result.returncode, out
 
 
+def _editable_git_pull(checkout: Path, allow_dirty: bool) -> Tuple[int, str]:
+    """``git pull --ff-only`` an editable feature checkout (issue #1788).
+
+    The checkout IS the running code for an editable install, so pulling it
+    updates the feature. A non-fast-forward or a dirty tracked tree is REPORTED
+    clearly (returncode 2) rather than auto-merged or silently skipped — the
+    operator must resolve it. A directory that isn't a git checkout is a no-op
+    (returncode 0): an editable install from a plain source dir has nothing to
+    pull.
+    """
+    if not checkout.exists():
+        return 1, f"editable checkout does not exist: {checkout}"
+    if not _project_dir_is_git(checkout):
+        return 0, f"(not a git checkout — nothing to pull: {checkout})"
+    try:
+        dirty, summary = _git_working_tree_dirty(checkout)
+    except _GitFailedError as exc:
+        return 1, f"git status errored: {exc}"
+    if dirty and not allow_dirty:
+        msg = (
+            "REFUSED — checkout has modified tracked files; commit/stash or "
+            "pass --allow-dirty"
+        )
+        if summary:
+            msg += "\n" + summary
+        return 2, msg
+    return _run_git_pull(checkout)
+
+
+def _run_feature_reconcile(
+    project_dir: Path,
+    *,
+    manifest_override: Optional[str],
+    dry_run: bool,
+    allow_dirty: bool,
+    continue_on_error: bool,
+    prefer: Optional[str],
+) -> int:
+    """Reconcile the host venv against ``union(per-agent feature allowlists)``.
+
+    Implements the provisioning half of the per-agent allowlist mechanism
+    (issue #1788): the allowlist is a *filter*, this makes the host hold the
+    *set of features the agents actually need*.
+
+      required = union(all [agents.*].features) + MANDATORY_FEATURES
+      for each required class -> package (via the registry):
+        - missing  -> install from its source-map entry
+        - present  -> update (git pull --ff-only if editable; pip --upgrade if pypi)
+      - a required class with no resolvable package -> ERROR (no blind fallback)
+
+    Returns 0 on success, non-zero on any hard error or per-package failure
+    (unless ``continue_on_error`` downgrades package failures to warnings).
+    """
+    from kestrel_sovereign import feature_reconcile as fr
+    from kestrel_sovereign.feature_registry import load_registry
+    import importlib.metadata as md
+
+    # 1. Derive WHAT the host needs from multi_agent.toml.
+    ma_path = project_dir / MULTI_AGENT_CONFIG_FILENAME
+    multi_agent = cli.MultiAgentConfig.load(ma_path)
+    required_classes, load_all = fr.compute_required_classes(multi_agent)
+
+    registry = load_registry()
+    # Live discovery is the source of truth: resolve allowlist classes against
+    # what the venv ACTUALLY provides (installed entry-point packages + in-tree
+    # bundled classes) before falling back to the static catalog. Otherwise a
+    # real, loadable feature the catalog simply hasn't listed yet would be
+    # mis-reported as an unresolvable error (issue #1788).
+    try:
+        from kestrel_sovereign.features import (
+            discover_entrypoint_feature_dists,
+            discover_local_feature_class_names,
+        )
+        entrypoint_dists = discover_entrypoint_feature_dists()
+        local_core_classes = discover_local_feature_class_names()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"  note: live feature discovery failed ({exc}); "
+            "resolving against the static registry only"
+        )
+        entrypoint_dists, local_core_classes = {}, set()
+
+    pkg_infos, class_to_pkg, unresolved = fr.resolve_packages(
+        required_classes, registry,
+        entrypoint_dists=entrypoint_dists,
+        local_core_classes=local_core_classes,
+    )
+
+    if unresolved:
+        print(
+            "• reconcile: ERROR — feature class(es) in an agent allowlist have "
+            "no resolvable package in the registry:",
+            file=sys.stderr,
+        )
+        for cls in unresolved:
+            print(f"    {cls}", file=sys.stderr)
+        print(
+            "    Add the owning package to the feature registry, or fix the "
+            "allowlist. (No blind fallback — aborting.)",
+            file=sys.stderr,
+        )
+        return 1
+
+    if load_all:
+        print(
+            "  note: agent(s) with no `features` allowlist load every installed "
+            f"feature; reconcile only guarantees the named union: {', '.join(load_all)}"
+        )
+
+    # 2. WHERE each comes from — the source map.
+    manifest_path = cli._host_manifest_path(
+        argparse.Namespace(manifest=manifest_override)
+    )
+    manifest_entries = []
+    if manifest_path.exists():
+        try:
+            manifest_entries = cli._load_host_manifest(manifest_path)
+        except (ValueError, OSError) as exc:
+            print(
+                f"• reconcile: ERROR — bad source map {manifest_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    source_index = fr.build_source_index(manifest_entries, registry)
+
+    # 3. Current state of each required package in this venv.
+    installed_versions = {}
+    editable_paths = {}
+    for pkg in pkg_infos:
+        try:
+            installed_versions[pkg] = md.version(pkg)
+        except md.PackageNotFoundError:
+            installed_versions[pkg] = None
+        editable_paths[pkg] = cli._editable_install_path(pkg)
+
+    actions, no_source = fr.plan_reconcile(
+        pkg_infos,
+        source_index,
+        installed_versions,
+        editable_paths,
+        class_to_pkg,
+        prefer=prefer,
+    )
+
+    if no_source:
+        print(
+            "• reconcile: ERROR — required feature package(s) have no known "
+            "install source (no source-map entry and not resolvable):",
+            file=sys.stderr,
+        )
+        for pkg in no_source:
+            print(f"    {pkg}", file=sys.stderr)
+        return 1
+
+    if not actions:
+        print("• reconcile: host venv already satisfies the agent allowlists.")
+        return 0
+
+    git_urls = {
+        info.package: info.git for info in registry.values() if info.package
+    }
+
+    print(f"  {'PACKAGE':<34} {'CURRENT':<10} {'ACTION'}")
+    print(f"  {'-' * 62}")
+
+    rc = 0
+    for action in actions:
+        label = action.package
+        current = action.current_version or "-"
+        # A `present` action is installed + loadable with no managed source —
+        # nothing to do, just report it (never executed).
+        if action.op == "present":
+            print(f"  {label:<34} {current:<10} present (no managed source)")
+            continue
+        how = (
+            f"-e {action.source}" if action.mode == "editable"
+            else f"pip {action.source}"
+        )
+        if dry_run:
+            print(f"  {label:<34} {current:<10} would {action.op} ({how})")
+            continue
+
+        ok, detail = _execute_reconcile_action(action, git_urls, allow_dirty)
+        if ok:
+            print(f"  {label:<34} {current:<10} {action.op}d ({how})")
+            if detail:
+                for line in detail.splitlines():
+                    print(f"      {line}")
+        else:
+            rc = 1
+            print(f"  {label:<34} {current:<10} FAILED")
+            for line in (detail or "").splitlines()[-5:]:
+                print(f"      {line}")
+            if not continue_on_error:
+                print(
+                    "• reconcile: FAILED — aborting before feature sync. "
+                    "Re-run with --continue-on-error to proceed anyway.",
+                    file=sys.stderr,
+                )
+                return rc
+
+    return rc
+
+
+def _execute_reconcile_action(action, git_urls: dict, allow_dirty: bool):
+    """Execute one :class:`ReconcileAction`. Returns ``(ok, detail)``.
+
+    Editable -> ``git pull --ff-only`` the checkout (plus ``pip install -e`` when
+    not yet installed). PyPI -> ``pip install [--upgrade] spec`` with a git-URL
+    fallback (mirrors ``feature sync``/``upgrade``).
+    """
+    from kestrel_sovereign.cli_features import _pip_spec
+
+    if action.mode == "editable":
+        checkout = Path(action.source).expanduser()
+        rc, out = _editable_git_pull(checkout, allow_dirty)
+        if rc != 0:
+            return False, out
+        detail = out.strip()
+        # Re-link into the venv when the package is absent or currently linked
+        # elsewhere (a non-editable PyPI build, or a different checkout). When
+        # it is already editable-linked to this checkout, the pull alone is the
+        # update. `relink` is decided by plan_reconcile (codex round 3 P2).
+        if action.relink:
+            result = cli._extension_install_run(
+                ["-e", _pip_spec(str(checkout), action.extras)]
+            )
+            if result.returncode != 0:
+                return False, (result.stderr or result.stdout or "").strip()
+        return True, detail
+
+    # PyPI mode. action.source is ALREADY a full pip requirement with extras
+    # rendered before the version spec (``pkg[extra]>=x``) by plan_reconcile,
+    # so it is passed verbatim — re-applying _pip_spec here would misplace the
+    # extras after the spec and break pip.
+    spec = action.source
+    pip_args = []
+    if action.op == "update":
+        pip_args.append("--upgrade")
+    # Replacing an editable link with the PyPI wheel needs --force-reinstall;
+    # otherwise pip treats an already-satisfying editable version as done and
+    # leaves the checkout linked (codex round 9 P2).
+    if action.force_reinstall:
+        pip_args.append("--force-reinstall")
+    pip_args.append(spec)
+    result = cli._extension_install_run(pip_args)
+    # The git-URL fallback installs the repo HEAD with NO version constraint, so
+    # it must NOT be used for a pinned entry — that would silently move the
+    # feature outside the operator's declared pin (codex round 7 P2).
+    if result.returncode != 0 and not action.pinned and git_urls.get(action.package):
+        git_ref = f"git+{git_urls[action.package]}"
+        git_spec = (
+            f"{_pip_spec(action.package, action.extras)} @ {git_ref}"
+            if action.extras else git_ref
+        )
+        fallback = (
+            ["--upgrade", git_spec] if action.op == "update" else [git_spec]
+        )
+        result = cli._extension_install_run(fallback)
+    if result.returncode != 0:
+        return False, (result.stderr or result.stdout or "").strip()
+    return True, ""
+
+
 def cmd_update(args) -> int:
     """One-shot ``git pull`` + ``uv pip install -e .`` +
     ``kestrel feature sync`` + ``kestrel restart``.
@@ -578,6 +842,13 @@ def cmd_update(args) -> int:
     allow_dirty = bool(getattr(args, "allow_dirty", False))
     no_deps = bool(getattr(args, "no_deps", False))
     continue_on_error = bool(getattr(args, "continue_on_error", False))
+    # --prefer-source / --prefer-pypi bulk-override the per-feature reconcile
+    # update mode (issue #1788). Mutually exclusive at the parser level.
+    prefer = None
+    if bool(getattr(args, "prefer_source", False)):
+        prefer = "source"
+    elif bool(getattr(args, "prefer_pypi", False)):
+        prefer = "pypi"
 
     target = getattr(args, "name", None)
     target_label = target if target else "all agents"
@@ -742,6 +1013,39 @@ def cmd_update(args) -> int:
                         print(f"    {line}")
     else:
         print("• install: skipped (--no-install)")
+
+    # Step 2.5: reconcile the host venv against union(agent allowlists).
+    #
+    # The per-agent `features` allowlist is a FILTER, not an INSTALLER: a class
+    # named in an allowlist but missing from the venv silently never loads.
+    # Reconcile installs the missing union members and updates the present ones
+    # (git pull editable checkouts; pip --upgrade PyPI packages) so the venv
+    # holds exactly what the agents need. Gated by the same `features` flag as
+    # the sync below — together they are the feature-provisioning half of the
+    # update. Runs BEFORE sync so newly-required packages are linked before
+    # sync refreshes entry-points (issue #1788).
+    if features:
+        if dry_run:
+            print("• reconcile: union(agent allowlists) → host venv [preview]")
+        else:
+            print("• reconcile: union(agent allowlists) → host venv")
+        rc = _run_feature_reconcile(
+            project_dir,
+            manifest_override=getattr(args, "manifest", None),
+            dry_run=dry_run,
+            allow_dirty=allow_dirty,
+            continue_on_error=continue_on_error,
+            prefer=prefer,
+        )
+        if rc != 0 and not continue_on_error:
+            print(
+                "• reconcile: FAILED — aborting before sync/restart. "
+                "Re-run with --continue-on-error to proceed anyway.",
+                file=sys.stderr,
+            )
+            return rc
+    else:
+        print("• reconcile: skipped (--no-features)")
 
     # Step 3: kestrel feature sync.
     if features:
@@ -957,7 +1261,25 @@ def add_lifecycle_subparsers(subparsers) -> None:
     )
     update_p.add_argument(
         "--no-features", dest="features", action="store_false",
-        help="Skip the `kestrel feature sync` step",
+        help=(
+            "Skip the feature-provisioning steps "
+            "(reconcile against agent allowlists + `kestrel feature sync`)"
+        ),
+    )
+    prefer_grp = update_p.add_mutually_exclusive_group()
+    prefer_grp.add_argument(
+        "--prefer-source", action="store_true",
+        help=(
+            "Reconcile: update every feature with a known checkout via "
+            "`git pull` (editable), overriding its source-map mode"
+        ),
+    )
+    prefer_grp.add_argument(
+        "--prefer-pypi", action="store_true",
+        help=(
+            "Reconcile: update every feature via `pip install --upgrade`, "
+            "overriding its source-map mode (no editable git pulls)"
+        ),
     )
     update_p.add_argument(
         "--no-restart", dest="restart", action="store_false",

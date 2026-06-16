@@ -239,6 +239,135 @@ def test_sync_dry_run_changes_nothing(monkeypatch, fake_registry, tmp_path, caps
     assert "would install" in capsys.readouterr().out
 
 
+# --- pypi source form (#1788) ----------------------------------------------
+
+
+def test_manifest_parses_pypi_source_form(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    (entry,) = cli._load_host_manifest(manifest)
+    assert entry["pypi"] == ">=0.3,<0.4"
+    assert entry["editable"] is None
+
+
+def test_manifest_rejects_editable_and_pypi_together(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "voice"\neditable = "/src/voice"\npypi = ">=0.3"\n'
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        cli._load_host_manifest(manifest)
+
+
+def test_manifest_rejects_non_string_pypi(tmp_path):
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = 3\n')
+    with pytest.raises(ValueError, match="version spec"):
+        cli._load_host_manifest(manifest)
+
+
+def test_sync_installs_pinned_pypi_spec(monkeypatch, fake_registry, tmp_path):
+    """A pypi version spec pins the installed package (``pkg>=0.3,<0.4``)."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {})  # missing
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+
+
+def test_sync_pypi_spec_with_extras_orders_extras_first(monkeypatch, fake_registry, tmp_path):
+    """pip requires ``pkg[extra]>=x``; never ``pkg>=x[extra]``."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text(
+        '[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\nextras = ["local"]\n'
+    )
+    _versions(monkeypatch, {})  # missing
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == [["kestrel-feature-voice[local]>=0.3,<0.4"]]
+
+
+def test_sync_repins_installed_version_violating_pypi_spec(monkeypatch, fake_registry, tmp_path, capsys):
+    """An installed-but-out-of-range package must be re-pinned, not reported
+    `present` (codex round 2 P2)."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.2.1"})  # below the pin
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # non-editable
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]  # plain reinstall, no force
+    assert "reinstalled" in capsys.readouterr().out
+
+
+def test_sync_present_when_installed_satisfies_pypi_spec(monkeypatch, fake_registry, tmp_path, capsys):
+    """An installed version already within the pin needs no action."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.3.2"})  # in range
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)  # non-editable
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    assert spy.calls == []
+    assert "present" in capsys.readouterr().out
+
+
+def test_sync_switches_editable_install_to_pypi(monkeypatch, fake_registry, tmp_path, capsys):
+    """Manifest changed editable->pypi: an installed editable package must be
+    reinstalled from PyPI, not reported `present` (codex round 8 P2)."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {"kestrel-feature-voice": "0.3.1"})  # in-range version...
+    # ...but currently installed EDITABLE from a checkout
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: "/src/voice")
+    spy = _InstallSpy()
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 0
+    # force-reinstall so the wheel replaces the editable link (round 10 P2)
+    assert spy.calls == [["--force-reinstall", "kestrel-feature-voice>=0.3,<0.4"]]
+    assert "reinstalled" in capsys.readouterr().out
+
+
+def test_sync_pinned_pypi_no_git_fallback(monkeypatch, fake_registry, tmp_path, capsys):
+    """A pinned pypi entry that fails pip must not silently install unpinned
+    git HEAD (codex round 7 P2)."""
+    manifest = tmp_path / "m.toml"
+    manifest.write_text('[[feature]]\nname = "voice"\npypi = ">=0.3,<0.4"\n')
+    _versions(monkeypatch, {})  # missing
+    monkeypatch.setattr(cli, "_editable_install_path", lambda dist: None)
+    spy = _InstallSpy(returncode=1, stderr="no matching distribution")
+    monkeypatch.setattr(cli, "_extension_install_run", spy)
+
+    rc = cli.cmd_feature_sync(_args(manifest))
+
+    assert rc == 1
+    # one constrained attempt, NO git fallback
+    assert spy.calls == [["kestrel-feature-voice>=0.3,<0.4"]]
+    assert "FAILED" in capsys.readouterr().out
+
+
 def test_sync_git_fallback_when_pip_fails(monkeypatch, fake_registry, tmp_path):
     manifest = tmp_path / "m.toml"
     manifest.write_text('[[feature]]\nname = "voice"\n')

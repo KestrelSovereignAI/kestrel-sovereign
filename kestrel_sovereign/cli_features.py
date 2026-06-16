@@ -384,8 +384,15 @@ def _load_host_manifest(path: Path) -> list:
 
         [[feature]]
         name = "voice"                 # registry name or raw dist/package name
-        editable = "/path/to/checkout" # optional: install -e from here
+        editable = "/path/to/checkout" # editable source: install -e + git pull
+        # --- OR ---
+        pypi = ">=0.3,<0.4"            # PyPI source: pip --upgrade (spec/floor)
         extras = ["local"]             # optional extras
+
+    ``editable`` and ``pypi`` are the two source forms (#1788) and are mutually
+    exclusive: an entry records *one* place a package comes from. ``pypi = ""``
+    means "from PyPI, any version". An entry with neither is the legacy
+    "present / install latest from PyPI" form, preserved for back-compat.
 
     Raises ``ValueError`` on a malformed entry so the caller can report it.
     """
@@ -409,12 +416,28 @@ def _load_host_manifest(path: Path) -> list:
         editable = entry.get("editable")
         if editable is not None and not isinstance(editable, str):
             raise ValueError(f"manifest '{label}': 'editable' must be a string path")
+        pypi = entry.get("pypi")
+        if pypi is not None and not isinstance(pypi, str):
+            raise ValueError(
+                f"manifest '{label}': 'pypi' must be a string version spec "
+                "(e.g. \">=0.3,<0.4\" or \"\" for any)"
+            )
+        if editable is not None and pypi is not None:
+            raise ValueError(
+                f"manifest '{label}': 'editable' and 'pypi' are mutually "
+                "exclusive — a feature has one source"
+            )
         extras = entry.get("extras", []) or []
         # A bare string ("local") would silently iterate into characters
         # (['l','o','c','a','l']); require an explicit array.
         if not isinstance(extras, list) or not all(isinstance(x, str) for x in extras):
             raise ValueError(f"manifest '{label}': 'extras' must be an array of strings")
-        cleaned.append({"name": str(label), "editable": editable, "extras": list(extras)})
+        cleaned.append({
+            "name": str(label),
+            "editable": editable,
+            "pypi": pypi,
+            "extras": list(extras),
+        })
     return cleaned
 
 
@@ -503,13 +526,32 @@ def _registry_info_for(label: str, registry: dict):
     return None
 
 
+def _version_satisfies(version: str, spec: str) -> bool:
+    """Does *version* satisfy the PEP 440 *spec* (e.g. ``>=0.3,<0.4``)?
+
+    An empty spec means "any version". When the spec can't be evaluated
+    (``packaging`` missing or a malformed value) we conservatively return True
+    so sync doesn't churn-reinstall on an unparseable pin.
+    """
+    if not spec:
+        return True
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        return Version(version) in SpecifierSet(spec)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def _resolve_manifest_action(entry: dict, registry: dict):
     """Resolve a manifest entry to ``(target_package, current_version, action)``.
 
     ``action`` is exactly what ``kestrel feature sync`` would do:
-    ``install`` (not present), ``reinstall`` (editable path mismatch),
-    ``ensure`` (present but declared extras can't be probed), or ``present``.
-    Shared by ``sync`` and ``status`` so the two never report different drift.
+    ``install`` (not present), ``reinstall`` (editable path mismatch, or a
+    ``pypi`` pin the installed version violates), ``ensure`` (present but
+    declared extras can't be probed), or ``present``. Shared by ``sync`` and
+    ``status`` so the two never report different drift.
     """
     import importlib.metadata as md
 
@@ -517,6 +559,7 @@ def _resolve_manifest_action(entry: dict, registry: dict):
     target = info.package if info else entry["name"]
     extras = entry["extras"]
     editable_want = entry["editable"]
+    pypi_want = entry.get("pypi")
     try:
         current = md.version(target)
     except md.PackageNotFoundError:
@@ -530,6 +573,18 @@ def _resolve_manifest_action(entry: dict, registry: dict):
             Path(have).resolve() == Path(editable_want).expanduser().resolve()
         )
         action = "reinstall" if not matched else ("ensure" if extras else "present")
+    elif pypi_want is not None:
+        # The source map declares a PyPI source. Re-install (switch source)
+        # when the installed copy is editable — otherwise sync/status would
+        # leave the venv pointed at a local checkout the manifest no longer
+        # declares (codex round 8 P2) — or when a non-empty pin is violated
+        # (codex round 2 P2). Both rather than a false `present`.
+        if cli._editable_install_path(target) or not _version_satisfies(current, pypi_want):
+            action = "reinstall"
+        elif extras:
+            action = "ensure"
+        else:
+            action = "present"
     elif extras:
         action = "ensure"
     else:
@@ -578,27 +633,48 @@ def cmd_feature_sync(args) -> int:
         target, current, action = _resolve_manifest_action(entry, registry)
         extras = entry["extras"]
         editable_want = entry["editable"]
+        pypi_want = entry.get("pypi")
 
         if action == "present":
             print(f"  {target:<34} {current or '-':<10} present")
             continue
 
+        # A declared PyPI version spec pins the install (``pkg>=0.3,<0.4``);
+        # an empty spec means "any version", same as the legacy bare form.
+        # Extras go BEFORE the version spec (``pkg[local]>=0.3``) — pip rejects
+        # ``pkg>=0.3[local]``.
+        install_target = f"{_pip_spec(target, extras)}{pypi_want}" if pypi_want \
+            else _pip_spec(target, extras)
+
         if dry_run:
-            how = f"-e {editable_want}" if editable_want else "pip"
+            how = f"-e {editable_want}" if editable_want else f"pip {install_target}"
             print(f"  {target:<34} {current or '-':<10} would {action} ({how})")
             continue
 
         if editable_want:
             pip_args = ["-e", _pip_spec(str(Path(editable_want).expanduser()), extras)]
+        elif pypi_want is not None and cli._editable_install_path(target):
+            # Switching a currently-editable install to a PyPI source needs a
+            # force reinstall; a plain pip install leaves the satisfying
+            # editable link in place, so the source switch never takes effect
+            # (codex round 10 P2).
+            pip_args = ["--force-reinstall", install_target]
         else:
-            pip_args = [_pip_spec(target, extras)]
+            pip_args = [install_target]
 
         result = cli._extension_install_run(pip_args)
         # Registry-backed packages can fall back to their git URL (mirrors
-        # `feature install`). Editable installs have no remote fallback. Carry
-        # extras across via PEP 508 form (``pkg[extra] @ git+url``) so a git
-        # fallback doesn't silently drop the local-pipeline deps.
-        if result.returncode != 0 and not editable_want and git_urls.get(target):
+        # `feature install`). Editable installs have no remote fallback. A
+        # PyPI-pinned entry is excluded too: the git URL installs repo HEAD
+        # with no version constraint, which would silently violate the pin.
+        # Carry extras across via PEP 508 form (``pkg[extra] @ git+url``) so a
+        # git fallback doesn't silently drop the local-pipeline deps.
+        if (
+            result.returncode != 0
+            and not editable_want
+            and not pypi_want
+            and git_urls.get(target)
+        ):
             git_ref = f"git+{git_urls[target]}"
             git_spec = f"{_pip_spec(target, extras)} @ {git_ref}" if extras else git_ref
             result = cli._extension_install_run([git_spec])

@@ -17,6 +17,13 @@
 #     kestrel feature sync --capture
 #
 # Copy this file to `.kestrel-host-features.toml` (gitignored) and edit.
+#
+# This file is also the SOURCE MAP the `kestrel update` reconcile step reads to
+# decide each feature's update mode. Each entry records ONE source:
+#   - `editable = "/path"`  -> git pull --ff-only the checkout on update
+#   - `pypi = ">=x,<y"`     -> pip install --upgrade within the pin on update
+#   - neither               -> install latest from PyPI (back-compat)
+# `editable` and `pypi` are mutually exclusive — a feature has one source.
 
 # Install from PyPI/git via the feature registry (name resolves through
 # `kestrel feature list`). A raw dist name like "kestrel-feature-voice" works
@@ -28,8 +35,15 @@ extras = ["local"]   # optional: pulls Piper / faster-whisper for the local pipe
 [[feature]]
 name = "voice_openai"   # OpenAI TTS/STT provider (Realtime path)
 
+# Pin a PyPI version range — reconcile upgrades within the spec, respecting the
+# package's own floor pins.
+[[feature]]
+name = "reflection"
+pypi = ">=0.3,<0.4"
+
 # Install editable from a local checkout instead of PyPI — keeps live-editing
-# the feature repo. `editable` and `extras` may be combined.
+# the feature repo, and reconcile keeps it fresh with `git pull`. `editable`
+# and `extras` may be combined.
 [[feature]]
 name = "github"
 editable = "/Volumes/data2/projects/kestrel-feature-github"

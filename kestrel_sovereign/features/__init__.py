@@ -203,6 +203,75 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
     return classes
 
 
+def discover_local_feature_class_names() -> Set[str]:
+    """Class names of the in-tree (bundled) Feature subclasses.
+
+    The authoritative "ships with core, needs no install" set used by host
+    reconcile (issue #1788) to distinguish a bundled class that needs no
+    provisioning from an allowlist entry that names a feature the venv does not
+    actually provide (the motivating silent-no-load bug).
+    """
+    names: Set[str] = set()
+    for module_path in discover_feature_modules():
+        try:
+            module = importlib.import_module(module_path)
+        except ImportError:
+            continue
+        feature_class = find_feature_class(module)
+        if feature_class is not None:
+            names.add(feature_class.__name__)
+    return names
+
+
+def _entrypoint_class_name(ep_value: str, ep_name: str) -> str:
+    """The Feature CLASS name an entry point resolves to.
+
+    Allowlists and the agent loader key features by ``cls.__name__``, but an
+    entry point may be registered under an alias
+    (``github = "kestrel_feature_github.feature:GitHubFeature"``). The class
+    name is the attribute after ``:`` (its innermost segment), which equals the
+    loaded ``cls.__name__``; fall back to the entry-point name when the value
+    has no attribute part. (issue #1788, codex round 5)
+    """
+    if ep_value and ":" in ep_value:
+        attr = ep_value.split(":", 1)[1].strip()
+        if attr:
+            return attr.split(".")[-1]
+    return ep_name
+
+
+def discover_entrypoint_feature_dists() -> Dict[str, str]:
+    """Map each entry-point Feature CLASS name to its owning distribution.
+
+    Lightweight: reads entry-point *metadata* (``ep.value`` / ``ep.dist.name``)
+    without importing the feature modules. The class name is derived from
+    ``ep.value`` so it matches the allowlist namespace even when the entry
+    point uses an alias (see :func:`_entrypoint_class_name`). This is the live,
+    authoritative class → package map for installed external feature packages,
+    used by host reconcile (issue #1788) to resolve allowlist classes to the
+    packages that must be updated.
+    """
+    dist_by_class: Dict[str, str] = {}
+    try:
+        eps = importlib.metadata.entry_points()
+    except Exception:  # noqa: BLE001
+        return dist_by_class
+
+    if hasattr(eps, "select"):
+        feature_eps = eps.select(group=FEATURE_ENTRY_POINT_GROUP)
+    else:
+        feature_eps = eps.get(FEATURE_ENTRY_POINT_GROUP, [])
+
+    for ep in feature_eps:
+        dist = getattr(ep, "dist", None)
+        if dist is None:
+            continue
+        class_name = _entrypoint_class_name(getattr(ep, "value", "") or "", ep.name)
+        if class_name:
+            dist_by_class[class_name] = dist.name
+    return dist_by_class
+
+
 def discover_feature_class_by_name(name: str) -> Optional[Type[Feature]]:
     """Resolve a discoverable feature class by class name, module name, or shorthand.
 
