@@ -126,6 +126,11 @@ async def refresh_anthropic_token(
     }
 
     async def _post(c: httpx.AsyncClient) -> httpx.Response:
+        # JSON body, NOT form-encoding. Anthropic's OAuth endpoint
+        # (platform.claude.com/v1/oauth/token) accepts JSON — this matches the
+        # official Claude Code client / OpenClaw's refreshAnthropicToken. (The
+        # codex/OpenAI refresh flow at auth.openai.com is form-encoded; that is
+        # a different endpoint and not the contract here.)
         return await c.post(
             url,
             json=payload,
