@@ -315,3 +315,21 @@ async def test_refresh_invalid_grant_is_actionable():
     assert "claude login" in msg           # recovery hint
     assert "dead-rt" not in msg            # token material never echoed
     assert "token dead-rt is invalid" not in msg  # description never surfaced
+
+
+@pytest.mark.asyncio
+async def test_refresh_non_conforming_error_falls_back_to_status():
+    """A non-conforming endpoint can't smuggle sensitive text via `error`:
+    only RFC-shaped codes are surfaced, else the HTTP status."""
+    import httpx
+    from kestrel_sovereign.llm.anthropic_oauth import refresh_anthropic_token
+
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(400, json={"error": "sk-ant-ort01-LEAKED-TOKEN-MATERIAL"})
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError) as exc:
+            await refresh_anthropic_token("rt", http_client=client)
+    msg = str(exc.value)
+    assert "HTTP 400" in msg
+    assert "LEAKED" not in msg and "sk-ant" not in msg

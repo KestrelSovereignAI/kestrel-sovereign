@@ -172,8 +172,12 @@ async def refresh_anthropic_token(
             err = resp.json().get("error")
         except (ValueError, AttributeError):
             pass
-        if not isinstance(err, str) or len(err) > 64:
-            err = None  # defensive: only a short, code-shaped value
+        # Only surface a value shaped like an RFC-6749 error code (lowercase
+        # snake_case identifier). This rejects token material — sk-ant-…
+        # tokens carry hyphens/uppercase and never match — so an overridden or
+        # non-conforming endpoint cannot smuggle sensitive text into the error.
+        if not (isinstance(err, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", err)):
+            err = None
         detail = err or f"HTTP {resp.status_code}"
         hint = ""
         if err == "invalid_grant":
