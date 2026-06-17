@@ -103,9 +103,16 @@ feature, instead of importing the class it instantiates a **proxy `Feature`**:
 A shared contract in `kestrel-sovereign-sdk` so every isolated feature (and,
 over time, Talon/MCP) uses one substrate:
 
-- **Transport**: line-delimited **JSON-RPC over a localhost Unix domain
-  socket** (path under the agent data dir; `0600` perms). Simple, no ports,
-  same-host only. (stdio is the fallback for non-persistent services.)
+- **Transport**: line-delimited **JSON-RPC over the child's stdio**. The
+  service is a supervised child process, so its stdin/stdout pipes are the
+  natural channel — **fully cross-platform (macOS/Linux/Windows)**, no port or
+  socket file, and inherently scoped to the parent (no other local process can
+  connect). This matches MCP's primary local transport. For services that must
+  be **shared across parents or outlive a single one** (the per-host scope,
+  §6), fall back to **loopback TCP (127.0.0.1, ephemeral port) + a per-launch
+  bearer token**. Unix domain sockets are intentionally **not** the baseline:
+  Python's asyncio has no UDS support on Windows (`create_unix_server` is
+  Unix-only), so a UDS baseline would break Windows hosts.
 - **Lifecycle**: `start` → `ready`/`health` → graceful `stop`; host supervises
   with restart-on-crash + backoff; readiness gate before tools are exposed.
 - **Surface**: the service advertises its tool/skill metadata; the proxy
@@ -163,9 +170,11 @@ send + receive via neonize):
 
 ## 6. Security & open questions
 
-- **Transport**: Unix socket JSON-RPC (recommended) vs stdio vs reusing A2A.
-  A2A is DID-signed/heavyweight — overkill for localhost; recommend Unix socket.
-  **Decision needed.**
+- **Transport**: ~~Unix socket~~ → **resolved: stdio JSON-RPC** for the default
+  child-process model (portable incl. Windows, parent-scoped, MCP-aligned);
+  **loopback TCP + token** for shared/standalone services. UDS rejected as
+  baseline (no asyncio UDS on Windows). A2A (DID-signed) is overkill for
+  same-host. **Resolved.**
 - **venv provisioning**: explicit/pre-created only (Talon-style, simple) vs
   on-demand `uv venv` auto-provision (better UX, more magic). Recommend
   supporting both, default to explicit. **Decision needed.**
