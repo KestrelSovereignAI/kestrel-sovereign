@@ -353,7 +353,11 @@ class TestIdleWatchdogInflightServerRequest:
         await asyncio.sleep(0.2)
         assert not task.done()
         # Tool callback returns → app-server resumes → completion arrives.
-        c._inflight_server_requests.pop("thr", None)
+        # Deliver the terminating event WITHOUT first clearing the
+        # in-flight count: a received event ends the loop regardless of
+        # in-flight state, and popping first would open a race where a
+        # 0.05s timeout fires in the gap (count now 0) and raises before
+        # the event lands — the spurious CI failure this guards against.
         q.put_nowait({"method": "turn/completed", "params": {}})
         got = await asyncio.wait_for(task, timeout=2)
         assert [e["method"] for e in got] == ["turn/completed"]
@@ -406,9 +410,11 @@ class TestIdleWatchdogInflightServerRequest:
         # Several intervals elapse while the request runs — re-armed.
         await asyncio.sleep(0.2)
         assert not task.done()
-        # Request completes late in a window: marker wakes the watchdog,
-        # the real next event arrives within the fresh budget.
-        c._inflight_server_requests.pop("thr", None)
+        # Request completes late in a window: the marker wakes the
+        # watchdog and the real next event follows. We inject both into
+        # the sink directly (this unit-tests iter_turn_events' marker
+        # handling, independent of in-flight bookkeeping), so no pop —
+        # which would otherwise race the 0.05s timeout.
         q.put_nowait({"__inflight_done__": True})
         q.put_nowait({"method": "turn/completed", "params": {}})
         got = await asyncio.wait_for(task, timeout=2)
@@ -437,7 +443,9 @@ class TestIdleWatchdogInflightServerRequest:
         task = asyncio.create_task(drive())
         await asyncio.sleep(0.2)
         assert not task.done()
-        c._inflight_server_requests.pop(None, None)
+        # Terminating event ends the loop regardless of in-flight state;
+        # no pop first (avoids racing the 0.05s timeout — see
+        # test_idle_rearms_while_request_in_flight_then_completes).
         q.put_nowait({"method": "turn/completed", "params": {}})
         got = await asyncio.wait_for(task, timeout=2)
         assert [e["method"] for e in got] == ["turn/completed"]
