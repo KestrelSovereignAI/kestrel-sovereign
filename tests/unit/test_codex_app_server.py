@@ -71,6 +71,7 @@ class TestDispatchLogic:
         c._pending = {}
         c._turn_sinks = {}
         c._server_request_handlers = {}
+        c._inflight_server_requests = {}
         c._closed_error = None
         c._sent = []
         c._send = lambda obj: c._sent.append(obj)
@@ -136,6 +137,7 @@ class TestServerRequestHandlerRegistration:
         c._pending = {}
         c._turn_sinks = {}
         c._server_request_handlers = {}
+        c._inflight_server_requests = {}
         c._closed_error = None
         c._sent = []
         c._send = lambda obj: c._sent.append(obj)
@@ -277,6 +279,187 @@ class TestTurnIteration:
         q.put_nowait({"__closed__": True})
         with pytest.raises(CodexAppServerError, match="gone"):
             async for _ in c.iter_turn_events(q, idle_timeout=2):
+                pass
+
+
+@pytest.mark.asyncio
+class TestIdleWatchdogInflightServerRequest:
+    """A long-running server→client request (a Talon tool callback that
+    runs for minutes, an approval parked on a human) must not trip the
+    idle watchdog: the app-server is correctly silent while it awaits
+    OUR reply, not stalled upstream. See ``_inflight_server_requests``.
+    """
+
+    def _client(self):
+        c = CodexAppServerClient.__new__(CodexAppServerClient)
+        c._server_request_handlers = {}
+        c._inflight_server_requests = {}
+        c._turn_sinks = {}
+        c._closed_error = None
+        # Idle-raise diagnostics tails — empty/absent on this bare client.
+        c._stderr_tail = []
+        c._codex_home = None
+        c._sent = []
+        c._send = lambda obj: c._sent.append(obj)
+        return c
+
+    async def test_handler_tracks_inflight_count(self):
+        """Counter is positive while the handler runs and released after,
+        including when the handler raises."""
+        c = self._client()
+        observed = {}
+
+        async def slow(params):
+            observed["mid_run"] = c._inflight_server_requests.get("thr", 0)
+            return {"ok": True}
+
+        c.register_server_request_handler(
+            "item/tool/call", slow, thread_id="thr"
+        )
+        await c._handle_server_request(1, "item/tool/call",
+                                       {"threadId": "thr"})
+        assert observed["mid_run"] == 1
+        # Released (key dropped) once the handler completes.
+        assert c._inflight_server_requests.get("thr", 0) == 0
+
+        async def boom(params):
+            raise RuntimeError("tool blew up")
+
+        c.register_server_request_handler(
+            "item/tool/call", boom, thread_id="thr"
+        )
+        await c._handle_server_request(2, "item/tool/call",
+                                       {"threadId": "thr"})
+        assert c._inflight_server_requests.get("thr", 0) == 0
+
+    async def test_idle_rearms_while_request_in_flight_then_completes(self):
+        import asyncio
+
+        c = self._client()
+        q: asyncio.Queue = asyncio.Queue()
+        # App-server is blocked awaiting our reply on this thread.
+        c._inflight_server_requests = {"thr": 1}
+
+        async def drive():
+            return [
+                ev async for ev in c.iter_turn_events(
+                    q, idle_timeout=0.05, thread_id="thr"
+                )
+            ]
+
+        task = asyncio.create_task(drive())
+        # Let the watchdog time out and re-arm several times while the
+        # in-flight request is unresolved.
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        # Tool callback returns → app-server resumes → completion arrives.
+        # Deliver the terminating event WITHOUT first clearing the
+        # in-flight count: a received event ends the loop regardless of
+        # in-flight state, and popping first would open a race where a
+        # 0.05s timeout fires in the gap (count now 0) and raises before
+        # the event lands — the spurious CI failure this guards against.
+        q.put_nowait({"method": "turn/completed", "params": {}})
+        got = await asyncio.wait_for(task, timeout=2)
+        assert [e["method"] for e in got] == ["turn/completed"]
+
+    async def test_completion_pushes_wake_marker_to_thread_sink(self):
+        import asyncio
+
+        c = self._client()
+        q: asyncio.Queue = asyncio.Queue()
+        c._turn_sinks = {"thr": q}
+
+        async def ok(params):
+            return {"ok": True}
+
+        c.register_server_request_handler("item/tool/call", ok,
+                                          thread_id="thr")
+        await c._handle_server_request(1, "item/tool/call",
+                                       {"threadId": "thr"})
+        assert q.get_nowait() == {"__inflight_done__": True}
+
+    async def test_completion_broadcasts_wake_marker_when_threadless(self):
+        import asyncio
+
+        c = self._client()
+        qa: asyncio.Queue = asyncio.Queue()
+        qb: asyncio.Queue = asyncio.Queue()
+        c._turn_sinks = {"a": qa, "b": qb}
+        # Thread-less approval-style request: no handler, default reply.
+        await c._handle_server_request(1, "mcpServer/elicitation/request", {})
+        assert qa.get_nowait() == {"__inflight_done__": True}
+        assert qb.get_nowait() == {"__inflight_done__": True}
+
+    async def test_budget_restarts_on_completion_marker(self):
+        """A callback that finishes late in an idle window must not raise
+        at the next boundary: the wake marker restarts a full budget."""
+        import asyncio
+
+        c = self._client()
+        q: asyncio.Queue = asyncio.Queue()
+        c._inflight_server_requests = {"thr": 1}
+
+        async def drive():
+            return [
+                ev async for ev in c.iter_turn_events(
+                    q, idle_timeout=0.05, thread_id="thr"
+                )
+            ]
+
+        task = asyncio.create_task(drive())
+        # Several intervals elapse while the request runs — re-armed.
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        # Request completes late in a window: the marker wakes the
+        # watchdog and the real next event follows. We inject both into
+        # the sink directly (this unit-tests iter_turn_events' marker
+        # handling, independent of in-flight bookkeeping), so no pop —
+        # which would otherwise race the 0.05s timeout.
+        q.put_nowait({"__inflight_done__": True})
+        q.put_nowait({"method": "turn/completed", "params": {}})
+        got = await asyncio.wait_for(task, timeout=2)
+        # Marker skipped, not yielded; completion delivered.
+        assert [e["method"] for e in got] == ["turn/completed"]
+
+    async def test_idle_rearms_for_threadless_request(self):
+        """Sandbox-approval RPCs arrive without ``threadId`` and are
+        tracked under the ``None`` key. A turn watcher must still treat
+        them as in-flight, or a long human approval trips the watchdog.
+        """
+        import asyncio
+
+        c = self._client()
+        q: asyncio.Queue = asyncio.Queue()
+        # Approval in flight, recorded thread-less.
+        c._inflight_server_requests = {None: 1}
+
+        async def drive():
+            return [
+                ev async for ev in c.iter_turn_events(
+                    q, idle_timeout=0.05, thread_id="thr"
+                )
+            ]
+
+        task = asyncio.create_task(drive())
+        await asyncio.sleep(0.2)
+        assert not task.done()
+        # Terminating event ends the loop regardless of in-flight state;
+        # no pop first (avoids racing the 0.05s timeout — see
+        # test_idle_rearms_while_request_in_flight_then_completes).
+        q.put_nowait({"method": "turn/completed", "params": {}})
+        got = await asyncio.wait_for(task, timeout=2)
+        assert [e["method"] for e in got] == ["turn/completed"]
+
+    async def test_idle_still_raises_when_nothing_in_flight(self):
+        import asyncio
+
+        c = self._client()
+        q: asyncio.Queue = asyncio.Queue()
+        # No in-flight request → a silent app-server IS an upstream stall.
+        with pytest.raises(CodexAppServerError, match="idle for"):
+            async for _ in c.iter_turn_events(
+                q, idle_timeout=0.05, thread_id="thr"
+            ):
                 pass
 
 

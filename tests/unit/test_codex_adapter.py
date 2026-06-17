@@ -221,7 +221,7 @@ class _FakeAppServer:
     def close_turn_sink(self, key):
         pass
 
-    async def iter_turn_events(self, sink, *, idle_timeout=120):
+    async def iter_turn_events(self, sink, *, idle_timeout=120, thread_id=None):
         for ev in self._events:
             yield ev
 
@@ -1037,10 +1037,12 @@ class TestToolExecutorBridge:
         release = asyncio.Event()
         original_iter = a._client.iter_turn_events
 
-        async def gated_iter(sink, *, idle_timeout=120):
+        async def gated_iter(sink, *, idle_timeout=120, thread_id=None):
             in_turn.set()
             await release.wait()
-            async for ev in original_iter(sink, idle_timeout=idle_timeout):
+            async for ev in original_iter(
+                sink, idle_timeout=idle_timeout, thread_id=thread_id
+            ):
                 yield ev
 
         a._client.iter_turn_events = gated_iter
@@ -1169,7 +1171,7 @@ class TestToolExecutorBridge:
             def close_turn_sink(self, key):
                 pass
 
-            async def iter_turn_events(self, sink, *, idle_timeout=120):
+            async def iter_turn_events(self, sink, *, idle_timeout=120, thread_id=None):
                 for ev in [
                     {"method": "item/completed",
                      "params": {"item": {

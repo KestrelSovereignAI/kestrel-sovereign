@@ -263,7 +263,7 @@ class TestOverflowHintBranchesOnPayloadVsCap:
 
         # Stub app.iter_turn_events to raise the base idle-timeout error
         class _StubApp:
-            async def iter_turn_events(self, sink, *, idle_timeout=300):
+            async def iter_turn_events(self, sink, *, idle_timeout=300, thread_id=None):
                 raise CodexAppServerError(
                     "codex turn idle for 300s with no completion"
                 )

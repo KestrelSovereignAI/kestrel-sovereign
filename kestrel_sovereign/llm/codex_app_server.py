@@ -198,6 +198,16 @@ class CodexAppServerClient:
         self._server_request_handlers: Dict[
             Tuple[str, Optional[str]], ServerRequestHandler
         ] = {}
+        # Per-thread count of in-flight server→client requests
+        # (``item/tool/call``, sandbox-approval RPCs, token refresh).
+        # While one is in flight the app-server is *correctly* silent —
+        # it is blocked awaiting OUR reply, not stalled upstream. The
+        # idle watchdog (``iter_turn_events``) consults this so a
+        # legitimately long tool callback (e.g. a Talon job that runs
+        # for minutes, or an approval queued on a human) doesn't trip
+        # the 300s local watchdog. Keyed by ``threadId`` (None for
+        # global/thread-less requests). See ``iter_turn_events``.
+        self._inflight_server_requests: Dict[Optional[str], int] = {}
         # #1581: agent reference for typed-event audit on default
         # declines (``_DEFAULT_APPROVAL_REPLIES`` path). Set via
         # ``attach_audit_agent`` from the adapter's
@@ -834,8 +844,16 @@ class CodexAppServerClient:
     async def _handle_server_request(
         self, mid: Any, method: str, params: dict
     ) -> None:
+        tid = (params or {}).get("threadId")
+        # Mark this thread as awaiting our reply for the whole lifetime
+        # of the handler. The idle watchdog treats a positive count as
+        # "not an upstream stall" and keeps waiting rather than tripping
+        # at 300s. Decremented in the ``finally`` so a raised handler,
+        # an unknown-method default, or a send failure all release it.
+        self._inflight_server_requests[tid] = (
+            self._inflight_server_requests.get(tid, 0) + 1
+        )
         try:
-            tid = (params or {}).get("threadId")
             # Prefer a handler scoped to the owning thread; fall back to
             # a global (None) registration; then to safe defaults.
             handler = self._server_request_handlers.get((method, tid))
@@ -920,6 +938,28 @@ class CodexAppServerClient:
                 self._send({"id": mid, "error": {"message": str(e)}})
             except Exception:
                 pass
+        finally:
+            n = self._inflight_server_requests.get(tid, 0) - 1
+            if n > 0:
+                self._inflight_server_requests[tid] = n
+            else:
+                # Drop the key at zero so the map doesn't accumulate one
+                # entry per finished thread over a long-lived connection.
+                self._inflight_server_requests.pop(tid, None)
+            # Wake any idle watchdog so the app-server gets a fresh full
+            # idle budget for its NEXT event now that we've replied — a
+            # callback that finished late in its window must not raise at
+            # the next boundary (see ``iter_turn_events``). Thread-scoped
+            # request → that turn's sink; thread-less (approvals omit
+            # threadId) → broadcast to every turn, same as notifications.
+            marker = {"__inflight_done__": True}
+            if tid is not None:
+                q = self._turn_sinks.get(tid)
+                if q is not None:
+                    q.put_nowait(marker)
+            else:
+                for q in list(self._turn_sinks.values()):
+                    q.put_nowait(marker)
 
     def attach_audit_agent(self, agent: Any) -> None:
         """Bind the agent so default-decline RPCs (the
@@ -1139,14 +1179,35 @@ class CodexAppServerClient:
         return lines
 
     async def iter_turn_events(
-        self, sink: "asyncio.Queue[dict]", *, idle_timeout: float = 300
+        self,
+        sink: "asyncio.Queue[dict]",
+        *,
+        idle_timeout: float = 300,
+        thread_id: Optional[str] = None,
     ) -> "asyncio.AsyncIterator[dict]":
         """Yield notifications until ``turn/completed`` / failure / close.
 
-        ``idle_timeout`` defaults to 300s so a long-running synchronous
-        tool callback (e.g. one waiting on kestrel's approval queue)
-        doesn't trip the local watchdog before the app-server's own
-        server-request timeout fires.
+        ``idle_timeout`` (default 300s) bounds how long we wait for the
+        app-server to produce the NEXT event. It exists to catch an
+        upstream codex / ChatGPT stall — the app-server opened the
+        websocket but nothing comes back.
+
+        It must NOT fire while the app-server is legitimately blocked
+        awaiting a reply to a server→client request it sent us
+        (``item/tool/call``, a sandbox-approval RPC, a token refresh).
+        During such a call the app-server is *supposed* to be silent,
+        and the callback may run far longer than 300s — e.g. a Talon
+        coordinator job that dispatches a feature-workspace build and
+        waits minutes for the terminal result, or an approval parked on
+        a human. ``thread_id`` lets us consult
+        ``_inflight_server_requests``: while a request is in flight for
+        this turn's thread — or any thread-less (``None``-keyed) request,
+        e.g. a sandbox approval whose params omit ``threadId`` — the
+        watchdog re-arms instead of raising, deferring the "tool took
+        too long" decision to the app-server's own server-request
+        timeout (the correct owner of that bound).
+        Callers that don't pass ``thread_id`` keep the legacy
+        unconditional-watchdog behavior (tests, thread-less turns).
 
         On idle-timeout (#1410) codex-rs stderr + the internal sqlite
         log tail are logged at ERROR level for server-side diagnosis,
@@ -1162,6 +1223,30 @@ class CodexAppServerClient:
             try:
                 msg = await asyncio.wait_for(sink.get(), timeout=idle_timeout)
             except asyncio.TimeoutError as e:
+                # Not a stall if the app-server is blocked awaiting our
+                # reply to a server-request it sent (long tool callback,
+                # approval, token refresh). Re-arm and keep waiting; the
+                # app-server's own server-request timeout bounds a truly
+                # stuck callback.
+                #
+                # Count thread-less (``None``-keyed) requests too:
+                # sandbox-approval RPCs don't carry ``threadId`` (see
+                # ``_make_codex_approval_handler``), so a long human
+                # approval would otherwise still trip the watchdog. A
+                # global request can't be attributed to a specific turn,
+                # so every active turn re-arms on it — re-arming is the
+                # safe direction (worst case we wait for codex's own
+                # server-request timeout instead of raising falsely).
+                if thread_id is not None and (
+                    self._inflight_server_requests.get(thread_id, 0) > 0
+                    or self._inflight_server_requests.get(None, 0) > 0
+                ):
+                    logger.debug(
+                        "codex idle %ss elapsed but a server-request is "
+                        "in flight for thread %s — re-arming watchdog",
+                        idle_timeout, thread_id,
+                    )
+                    continue
                 base = f"codex turn idle for {idle_timeout}s with no completion"
                 # Log diagnostic tails server-side so operators can see
                 # codex-side root cause via ``kestrel logs``; do not
@@ -1179,6 +1264,17 @@ class CodexAppServerClient:
                         " | ".join(log_tail),
                     )
                 raise CodexAppServerTransportError(base) from e
+            if msg.get("__inflight_done__"):
+                # A server-request just finished and woke us (pushed by
+                # ``_handle_server_request``). The ``get()`` returning
+                # restarts the idle budget for the next iteration, so the
+                # app-server gets a FULL fresh window to emit its next
+                # event after our reply — not just whatever was left of
+                # the in-flight interval. Without this, a callback that
+                # finishes late in a window (t=599 under a 300s budget)
+                # would raise almost immediately at the next boundary
+                # even though the app-server only just regained control.
+                continue
             if msg.get("__closed__"):
                 raise self._closed_error or CodexAppServerConnectionClosed(
                     "codex app-server closed mid-turn"
