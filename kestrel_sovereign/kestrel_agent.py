@@ -368,6 +368,13 @@ class KestrelAgent(
         # COGNITION signal dispatch reaching process_input's bootstrap check)
         # sees None instead of raising AttributeError (#1632).
         self.bootstrap_service: Optional[BootstrapService] = None
+        # Context manager is likewise constructed in initialize(). Default it
+        # here so a COGNITION signal dispatch (e.g. the restart.completed wake)
+        # reaching process_input before initialize() finishes sees None and
+        # defers for retry, instead of crashing the turn with an opaque
+        # AttributeError on a half-built agent. Same race class as #1632; the
+        # restart wake is the path that surfaced it (#1796/#1797).
+        self.context_manager: Optional[ContextManager] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
@@ -2042,6 +2049,22 @@ Expected Duration: {expected_duration}
                     response = await self.command_handler.handle(user_input, caller=caller)
                     if response:
                         return response
+
+            # The remainder of the turn (build_context, the LLM call, episode
+            # bookkeeping) requires the context manager. A COGNITION signal
+            # dispatch — notably the restart.completed wake fired from
+            # RestartCoordinatorFeature.initialize() — can reach here before
+            # initialize() has constructed it. Defer with a clear, retryable
+            # error rather than crash on a half-built agent: the dispatcher
+            # records this as Status.FAILED (not delivered), so the restart row
+            # stays ``executing`` and the #1797 sweep retries the wake once init
+            # completes. Bootstrap / safe-mode / !command paths above do not need
+            # the context manager and still run pre-init.
+            if self.context_manager is None:
+                raise RuntimeError(
+                    "agent not fully initialized: context_manager unavailable; "
+                    "deferring turn for retry until initialize() completes"
+                )
 
             # --- OpenTelemetry span for the full request lifecycle ---
             with optional_span("agent.process_input", {
