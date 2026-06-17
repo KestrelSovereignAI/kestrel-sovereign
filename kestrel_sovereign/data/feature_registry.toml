@@ -316,6 +316,15 @@ core = true
 send_channel_message = { description = "Send a message to a channel", category = "communication", tags = ["channels", "messaging"] }
 list_channels = { description = "List configured channels", category = "communication", tags = ["channels"] }
 
+[channel_whatsapp]
+package = "kestrel-channel-whatsapp"
+git = "https://github.com/KestrelSovereignAI/kestrel-channel-whatsapp.git"
+features = ["WhatsAppFeature"]
+description = "WhatsApp transport (Twilio-backed) for the channels feature"
+tags = ["communication", "messaging", "whatsapp", "channels"]
+icon = "message-square"
+core = false
+
 [spawn]
 package = "kestrel-sovereign"
 git = "https://github.com/KestrelSovereignAI/kestrel-sovereign.git"
