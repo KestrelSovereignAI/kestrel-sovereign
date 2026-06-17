@@ -901,6 +901,20 @@ class TestTaskExecutor:
         with pytest.raises(ValueError, match="Unknown task"):
             await feature._lookup_and_run_tool("nonexistent_task", {})
 
+    @pytest.mark.asyncio
+    async def test_builtin_cron_task_skipped_when_feature_not_loaded(
+        self, feature,
+    ):
+        """A persisted built-in cron task (e.g. restart_coordinator) can
+        fire on the first scheduler tick after a restart before its owning
+        feature has registered the tool — a transient startup-order race
+        (#1796). It must skip benignly, NOT raise 'Unknown task' (which
+        would record a spurious one-time failure)."""
+        feature.agent.features = {}
+        result = await feature._lookup_and_run_tool("restart_coordinator", {})
+        assert result.startswith("skipped:")
+        assert "restart_coordinator" in result
+
 
 class TestTranslateSignalResult:
     """Regression for #904 review P1: misconfiguration drops

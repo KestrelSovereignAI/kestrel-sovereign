@@ -496,6 +496,28 @@ class SchedulerFeature(Feature):
                     return result
                 return json.dumps(result, default=str)
 
+        # A persisted built-in cron task (e.g. restart_coordinator) can
+        # fire on the first scheduler tick after a restart BEFORE its
+        # owning feature has finished loading and registered the tool —
+        # the runner starts polling in initialize() while feature load
+        # order is not guaranteed (#1796). That is a transient startup-
+        # order race, not a misconfiguration: a later tick (once the
+        # feature is loaded) runs the task normally. Skip it benignly
+        # this tick instead of raising "Unknown task", which would record
+        # a spurious one-time failure in the execution log.
+        from kestrel_sovereign.signals.sources.scheduler import CRON_TASKS
+
+        if task_name in {name for name, _mode, _res in CRON_TASKS}:
+            logger.info(
+                "Scheduler: built-in cron task %r not yet resolvable "
+                "(owning feature still loading); skipping this tick",
+                task_name,
+            )
+            return (
+                f"skipped: {task_name} owning feature not loaded yet "
+                "(transient startup-order race)"
+            )
+
         raise ValueError(f"Unknown task: {task_name}")
 
     def _scheduler_executable_task_names(self) -> set:

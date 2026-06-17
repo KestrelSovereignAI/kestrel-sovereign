@@ -63,6 +63,7 @@ _ADDED_COLUMNS = (
     ("update_allow_migrations", "INTEGER DEFAULT 0"),
     ("update_log", "TEXT DEFAULT ''"),
     ("requester_request_id", "TEXT DEFAULT ''"),
+    ("executing_boot_id", "TEXT DEFAULT ''"),
 )
 
 # Canonical column order shared by every SELECT below and ``from_row``.
@@ -70,7 +71,8 @@ _COLUMNS = (
     "id, requested_by_agent, reason, requested_at, desired_window, "
     "urgency, policy, status, status_reason, completed_at, operation, "
     "update_repo_path, update_target_ref, update_profile, "
-    "update_allow_migrations, update_log, requester_request_id"
+    "update_allow_migrations, update_log, requester_request_id, "
+    "executing_boot_id"
 )
 
 
@@ -93,6 +95,14 @@ class RestartRequest:
     update_allow_migrations: bool = False
     update_log: str = ""
     requester_request_id: str = ""
+    # Identifier of the host process that crossed this row into
+    # ``executing`` (#1796). The post-restart sweep only wakes a row whose
+    # stamp differs from the CURRENT process's id — i.e. a row left
+    # ``executing`` by a PRIOR process, which provably means the restart
+    # already happened. A row stamped by the live process (restart still
+    # in flight, or a detached restart that failed to kill the parent)
+    # must NOT be falsely terminalized as ``completed``.
+    executing_boot_id: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -119,6 +129,7 @@ class RestartRequest:
             update_allow_migrations=bool(int(g(14) or 0)),
             update_log=str(g(15) or ""),
             requester_request_id=str(g(16) or ""),
+            executing_boot_id=str(g(17) or ""),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -150,6 +161,7 @@ class RestartRequest:
             "update_allow_migrations": self.update_allow_migrations,
             "update": self.update_log_dict(),
             "requester_request_id": self.requester_request_id,
+            "executing_boot_id": self.executing_boot_id,
         }
 
 
@@ -174,7 +186,8 @@ async def ensure_restart_requests_table(db) -> None:
             update_profile TEXT DEFAULT '',
             update_allow_migrations INTEGER DEFAULT 0,
             update_log TEXT DEFAULT '',
-            requester_request_id TEXT DEFAULT ''
+            requester_request_id TEXT DEFAULT '',
+            executing_boot_id TEXT DEFAULT ''
         )
         """
     )
@@ -308,6 +321,7 @@ async def update_status(
     status_reason: str = "",
     completed_at: Optional[str] = None,
     expected_current_status: Optional[str] = None,
+    executing_boot_id: Optional[str] = None,
 ) -> bool:
     """Atomic status transition. Returns True if a row was updated.
 
@@ -315,20 +329,24 @@ async def update_status(
     on the row currently having that status — protects against
     racing coordinators (or a concurrent cancel) overwriting an
     in-flight ``executing`` row.
+
+    When ``executing_boot_id`` is provided, it is stamped onto the row
+    alongside the status (#1796) — the caller passes the current host
+    process's id when crossing a row into ``executing`` so the
+    post-restart sweep can tell a prior-process restart (real) from a
+    live-process one (still in flight / failed).
     """
-    sql_parts = ["UPDATE restart_requests SET status = ?", "status_reason = ?"]
-    params: List[Any] = [status, status_reason]
-    if completed_at is not None:
-        sql_parts.append("completed_at = ?")
-        params.append(completed_at)
     sql = (
         "UPDATE restart_requests SET status = ?, status_reason = ?"
         + (", completed_at = ?" if completed_at is not None else "")
+        + (", executing_boot_id = ?" if executing_boot_id is not None else "")
         + " WHERE id = ?"
     )
     params_final: List[Any] = [status, status_reason]
     if completed_at is not None:
         params_final.append(completed_at)
+    if executing_boot_id is not None:
+        params_final.append(executing_boot_id)
     params_final.append(request_id)
     if expected_current_status is not None:
         sql += " AND status = ?"
