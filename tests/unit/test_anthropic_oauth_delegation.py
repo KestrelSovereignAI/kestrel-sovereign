@@ -300,16 +300,18 @@ async def test_refresh_invalid_grant_is_actionable():
     import httpx
     from kestrel_sovereign.llm.anthropic_oauth import refresh_anthropic_token
 
+    # The free-text error_description could echo the submitted token, so it is
+    # NEVER surfaced — only the standardized error code + a recovery hint.
     transport = httpx.MockTransport(
         lambda req: httpx.Response(
-            400, json={"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}
+            400, json={"error": "invalid_grant", "error_description": "token dead-rt is invalid"}
         )
     )
     async with httpx.AsyncClient(transport=transport) as client:
         with pytest.raises(RuntimeError) as exc:
             await refresh_anthropic_token("dead-rt", http_client=client)
     msg = str(exc.value)
-    assert "invalid_grant" in msg
-    assert "Refresh token not found or invalid" in msg
-    assert "claude login" in msg  # recovery hint
-    assert "dead-rt" not in msg  # never echo token material
+    assert "invalid_grant" in msg          # safe code surfaced
+    assert "claude login" in msg           # recovery hint
+    assert "dead-rt" not in msg            # token material never echoed
+    assert "token dead-rt is invalid" not in msg  # description never surfaced

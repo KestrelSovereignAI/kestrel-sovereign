@@ -163,17 +163,18 @@ async def refresh_anthropic_token(
             resp = await _post(c)
 
     if resp.status_code >= 400:
-        # Surface the OAuth error code/description (safe — these are error
-        # strings, not token material) and an actionable recovery hint. The
-        # access/refresh tokens are never in an error body.
-        err = desc = None
+        # Surface ONLY the standardized OAuth `error` CODE (a fixed RFC-6749
+        # enum: invalid_grant, invalid_client, …) plus the HTTP status — never
+        # the free-text `error_description` or body, which can echo the
+        # submitted token. Add an actionable recovery hint by code.
+        err = None
         try:
-            body = resp.json()
-            err = body.get("error")
-            desc = body.get("error_description")
+            err = resp.json().get("error")
         except (ValueError, AttributeError):
             pass
-        detail = ": ".join(p for p in (err, desc) if p) or f"HTTP {resp.status_code}"
+        if not isinstance(err, str) or len(err) > 64:
+            err = None  # defensive: only a short, code-shaped value
+        detail = err or f"HTTP {resp.status_code}"
         hint = ""
         if err == "invalid_grant":
             # The stored Claude Code credential is expired/revoked and cannot
