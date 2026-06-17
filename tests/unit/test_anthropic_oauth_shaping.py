@@ -256,7 +256,8 @@ async def test_refresh_anthropic_token_posts_grant(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_refresh_anthropic_token_raises_on_http_error():
+    # Surfaces the OAuth error code; no HTTP-status-only opaque message.
     transport = httpx.MockTransport(lambda req: httpx.Response(401, json={"error": "bad"}))
     async with httpx.AsyncClient(transport=transport) as client:
-        with pytest.raises(RuntimeError, match="HTTP 401"):
+        with pytest.raises(RuntimeError, match="bad"):
             await refresh_anthropic_token("rt", http_client=client)

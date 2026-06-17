@@ -163,10 +163,28 @@ async def refresh_anthropic_token(
             resp = await _post(c)
 
     if resp.status_code >= 400:
-        # Do not log the body verbatim — it can echo token material.
-        raise RuntimeError(
-            f"Anthropic OAuth token refresh failed: HTTP {resp.status_code} (url={url})"
-        )
+        # Surface ONLY the standardized OAuth `error` CODE (a fixed RFC-6749
+        # enum: invalid_grant, invalid_client, …) plus the HTTP status — never
+        # the free-text `error_description` or body, which can echo the
+        # submitted token. Add an actionable recovery hint by code.
+        err = None
+        try:
+            err = resp.json().get("error")
+        except (ValueError, AttributeError):
+            pass
+        # Only surface a value shaped like an RFC-6749 error code (lowercase
+        # snake_case identifier). This rejects token material — sk-ant-…
+        # tokens carry hyphens/uppercase and never match — so an overridden or
+        # non-conforming endpoint cannot smuggle sensitive text into the error.
+        if not (isinstance(err, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", err)):
+            err = None
+        detail = err or f"HTTP {resp.status_code}"
+        hint = ""
+        if err == "invalid_grant":
+            # The stored Claude Code credential is expired/revoked and cannot
+            # be refreshed — re-auth or fall back to a static token.
+            hint = " — the Claude Code credential is expired or revoked; run `claude login` (or `claude setup-token` and set ANTHROPIC_AUTH_TOKEN)"
+        raise RuntimeError(f"Anthropic OAuth token refresh failed ({detail}){hint}")
     body = resp.json()
     access = body.get("access_token")
     if not access:
@@ -276,13 +294,65 @@ class KeychainCredentialSource(CredentialSource):
             logger.debug("security %s failed: %s", args[0] if args else "", exc)
             return None
 
+    def _list_service_accounts(self) -> list:
+        """All accounts holding an item for this service, via attribute-only
+        ``dump-keychain`` (no secrets). The keychain can hold several items for
+        ``Claude Code-credentials`` (a stale login plus the live one); a plain
+        ``find-generic-password -s SERVICE`` returns an arbitrary one, so we
+        must enumerate to find the freshest. Returns [] if unavailable."""
+        result = self._run(["dump-keychain"])
+        if result is None or result.returncode != 0:
+            return []
+        accounts = []
+        for block in re.split(r"(?m)^keychain:", result.stdout or ""):
+            svce = re.search(r'"svce"<blob>="([^"]*)"', block)
+            if not svce or svce.group(1) != self.service:
+                continue
+            acct = re.search(r'"acct"<blob>="([^"]*)"', block)
+            if acct and acct.group(1):
+                accounts.append(acct.group(1))
+        return list(dict.fromkeys(accounts))  # dedupe, preserve order
+
+    def _read_account_raw(self, account: str) -> Optional[Dict[str, Any]]:
+        result = self._run(
+            ["find-generic-password", "-s", self.service, "-a", account, "-w"]
+        )
+        if result is None or result.returncode != 0:
+            return None
+        try:
+            raw = json.loads(result.stdout.strip())
+        except json.JSONDecodeError:
+            return None
+        return raw if isinstance(raw, dict) else None
+
     def _resolve_account(self) -> str:
-        """The account of the Claude Code item, so read and write target the
-        SAME entry. Claude Code stores it under the macOS username, not a fixed
-        string — discover it (attributes only, no secret) and cache it. Falls
-        back to the current username."""
+        """Pick the account whose stored credential is valid and freshest.
+
+        Read and write must target the SAME item. Claude Code keys its item by
+        an opaque per-login account (often the short username), and the
+        keychain may also contain a STALE item under another account — picking
+        the wrong one means refreshing a dead token. So enumerate the service's
+        accounts, read each, and keep the one with a parseable credential and
+        the latest ``expires_at``. Falls back to the default lookup, then the
+        current username."""
         if self._account:
             return self._account
+        best_account = None
+        best_expires = None
+        for account in self._list_service_accounts():
+            raw = self._read_account_raw(account)
+            if raw is None:
+                continue
+            creds = parse_credentials(raw)
+            if creds is None:
+                continue
+            expires = creds.expires_at if creds.expires_at is not None else 0.0
+            if best_account is None or expires > best_expires:
+                best_account, best_expires = account, expires
+        if best_account is not None:
+            self._account = best_account
+            return best_account
+        # Fallbacks: the default item's account attribute, then the OS user.
         result = self._run(["find-generic-password", "-s", self.service])
         if result is not None and result.returncode == 0:
             text = (result.stdout or "") + (result.stderr or "")
@@ -294,17 +364,7 @@ class KeychainCredentialSource(CredentialSource):
         return self._account
 
     def _read_raw(self) -> Optional[Dict[str, Any]]:
-        account = self._resolve_account()
-        result = self._run(
-            ["find-generic-password", "-s", self.service, "-a", account, "-w"]
-        )
-        if result is None or result.returncode != 0:
-            return None
-        try:
-            raw = json.loads(result.stdout.strip())
-        except json.JSONDecodeError:
-            return None
-        return raw if isinstance(raw, dict) else None
+        return self._read_account_raw(self._resolve_account())
 
     def read(self) -> Optional[OAuthCredentials]:
         raw = self._read_raw()
