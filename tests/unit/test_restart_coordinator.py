@@ -746,6 +746,237 @@ async def test_post_restart_sweep_retries_when_dispatcher_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Post-restart wake reaches the REAL durable/resumption path (#1796)
+# ---------------------------------------------------------------------------
+
+
+class _RealDispatchAgent:
+    """Minimal agent wired to a REAL SignalDispatcher so a swept
+    ``restart.completed`` signal travels the same pipeline every other
+    COGNITION signal uses — registry validation → dispatch → the agent's
+    ``process_input`` (the resuming turn) — instead of being captured by
+    a stub (#1796).
+    """
+
+    def __init__(self, backend, did="did:test:agent"):
+        self.did = did
+        self.agent_id = did
+        self._raw_storage = SimpleNamespace(db=backend)
+        self.storage = None
+        self.signal_registry = None  # set after the feature registers
+        self.dispatcher = None       # set by the test wiring
+        self._active_request_ids = set()
+        self._background_tasks = set()
+        self.features = {"RestartCoordinatorFeature": True}
+        self.background_tasks: list[asyncio.Task] = []
+        self.process_input_calls: list[str] = []
+        # When set, process_input raises to model a wake that failed
+        # inside the resuming turn (dispatcher records Status.FAILED).
+        self.process_input_should_raise = False
+
+    async def process_input(self, prompt: str):
+        if self.process_input_should_raise:
+            raise RuntimeError("simulated cognition failure")
+        self.process_input_calls.append(prompt)
+        return "resumed"
+
+    def _track_background_task(self, coro, *, name: str):
+        task = asyncio.create_task(coro, name=name)
+        self.background_tasks.append(task)
+        return task
+
+    async def drain_background_tasks(self):
+        """Await every supervised task (dispatch, ack supervisor, and the
+        signal_log writes they spawn) until the queue is quiescent."""
+        while True:
+            pending = [t for t in self.background_tasks if not t.done()]
+            if not pending:
+                break
+            await asyncio.gather(*pending, return_exceptions=True)
+
+
+async def _real_dispatch_feature(tmp_path, **kwargs):
+    """Build a RestartCoordinatorFeature wired to a real SignalDispatcher.
+
+    Returns ``(feature, backend, agent)``. The feature's ``initialize``
+    registers the ``restart.completed`` source into the same registry the
+    dispatcher routes against, so the post-restart sweep's wake is
+    delivered for real.
+    """
+    from kestrel_sovereign.signals import (
+        OrderedLockManager,
+        SignalDispatcher,
+        SignalLogStore,
+        SourceRegistry,
+    )
+
+    backend = await _backend(tmp_path)
+    agent = _RealDispatchAgent(backend, **kwargs)
+
+    store = SignalLogStore(backend)
+    await store.initialize()
+    registry = SourceRegistry()
+    dispatcher = SignalDispatcher(
+        agent=agent,
+        registry=registry,
+        lock_manager=OrderedLockManager(),
+        store=store,
+    )
+    agent.signal_registry = registry
+    agent.dispatcher = dispatcher
+
+    feat = RestartCoordinatorFeature(agent)
+    return feat, backend, agent
+
+
+@pytest.mark.asyncio
+async def test_post_restart_wake_reaches_process_input_and_then_completes(
+    tmp_path,
+):
+    """The swept ``restart.completed`` wake must reach the agent's
+    ``process_input`` (the real resumption path), and the row must be
+    terminalized to ``completed`` only AFTER that delivery lands — not
+    merely because ``enqueue_signal`` returned (#1796).
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+
+    await feat.initialize()
+    # The wake runs as a supervised background task; the row is still
+    # executing until that dispatch lands.
+    row_mid = await get_request(backend, req.id)
+    assert row_mid.status == "executing"
+
+    await agent.drain_background_tasks()
+
+    # The wake reached the agent's resuming turn...
+    assert len(agent.process_input_calls) == 1
+    assert req.id in agent.process_input_calls[0]
+    # ...and ONLY THEN did the row terminalize.
+    row = await get_request(backend, req.id)
+    assert row.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_post_restart_wake_failure_leaves_row_retryable(tmp_path):
+    """If the wake's resuming turn fails (dispatch returns FAILED), the
+    row must STAY executing so a later sweep retries it — the pre-#1796
+    code terminalized on enqueue success and lost the wake forever.
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    agent.process_input_should_raise = True
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+
+    await feat.initialize()
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req.id)
+    assert row.status == "executing", (
+        f"a failed wake must stay retryable; got {row.status!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_coordinator_cron_retries_undelivered_wake(tmp_path):
+    """The ``restart_coordinator`` cron tick is the retry backstop: an
+    ``executing`` row whose wake failed on the init sweep must be re-woken
+    on a later tick (without waiting for a full reboot), and once the
+    resuming turn succeeds the row terminalizes (#1796).
+    """
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    agent.process_input_should_raise = True
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+
+    # Init sweep: wake fails, row stays executing.
+    await feat.initialize()
+    await agent.drain_background_tasks()
+    assert (await get_request(backend, req.id)).status == "executing"
+    assert agent.process_input_calls == []
+
+    # The resuming turn now succeeds; a cron tick must re-wake and complete.
+    # Re-anchor the dispatcher's coalescing window to model the >30s gap
+    # between the init sweep and a production 1/min cron tick (a fast
+    # in-test retry would otherwise coalesce against the failed wake).
+    agent.dispatcher.notify_resume(60.0)
+    agent.process_input_should_raise = False
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    assert len(agent.process_input_calls) == 1
+    assert (await get_request(backend, req.id)).status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_cron_does_not_complete_same_process_executing_row(tmp_path):
+    """A row this SAME process just crossed to ``executing`` (the detached
+    restart is still in flight, or failed to kill the parent) must NOT be
+    falsely terminalized as ``completed`` by a later cron tick — the reap
+    backstop only wakes rows left ``executing`` by a PRIOR process (#1796).
+
+    Without the per-process boot stamp, the live-process cron reap would
+    fire a ``restart.completed`` wake and complete a restart that never
+    happened, masking a failed restart as success.
+    """
+    from kestrel_sovereign.features.restart_coordinator.feature import (
+        _PROCESS_BOOT_ID,
+    )
+
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    await feat.initialize()
+    created = await feat.request_restart(reason="ship")
+    req_id = created.data["request"]["id"]
+
+    # First tick: cross the row to executing and (mock-)spawn the restart.
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    row = await get_request(backend, req_id)
+    assert row.status == "executing"
+    # The row carries THIS process's boot stamp — the restart is in flight.
+    assert row.executing_boot_id == _PROCESS_BOOT_ID
+    assert agent.process_input_calls == []
+
+    # A later cron tick in the SAME process must NOT wake/complete it (the
+    # detached restart has not replaced this process).
+    with patch.object(
+        RestartCoordinatorFeature, "_spawn_restart_subprocess",
+    ):
+        await feat.restart_coordinator()
+    await agent.drain_background_tasks()
+
+    assert agent.process_input_calls == []
+    row = await get_request(backend, req_id)
+    assert row.status == "executing", (
+        "a same-process in-flight restart must stay visibly executing, "
+        f"not be falsely completed; got {row.status!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # update_then_restart — audited update-and-restart (#1539)
 # ---------------------------------------------------------------------------
 

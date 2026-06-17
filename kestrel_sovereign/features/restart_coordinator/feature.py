@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -70,6 +71,17 @@ _OUTPUT_TAIL_CHARS = 2000
 # any real turn yet breaks the deadlock well inside the ~20 min window
 # observed in #1558.
 STALE_ACTIVE_REQUEST_SECONDS = 900
+
+# Per-process boot identifier (#1796). Generated once at import, so it is
+# stable for the lifetime of THIS host process and differs from any prior
+# process. It is stamped onto a restart row at the moment the row crosses
+# into ``executing`` and read by the post-restart sweep: a row whose stamp
+# differs from this id was left ``executing`` by a PRIOR process — proof
+# the restart already happened, so wake the requester. A row stamped with
+# THIS id is a restart still in flight (or a detached restart that failed
+# to kill the parent) within the live process and must NOT be falsely
+# terminalized as ``completed``; it stays visibly ``executing``.
+_PROCESS_BOOT_ID = uuid.uuid4().hex
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +140,11 @@ class RestartCoordinatorFeature(Feature):
         )
 
     async def initialize(self):
+        # Request ids whose restart.completed wake is currently being
+        # supervised by a background ack task in THIS process. Guards the
+        # cron-tick retry from re-enqueuing a duplicate wake while a long
+        # cognition turn is still in flight (#1796).
+        self._inflight_restart_acks: set = set()
         self._db = resolve_feature_database(self.agent)
         if self._db is not None:
             try:
@@ -464,6 +481,15 @@ class RestartCoordinatorFeature(Feature):
                 data={"executed": False, "pending": 0},
             )
 
+        # Retry backstop (#1796): re-sweep any ``executing`` row whose
+        # post-restart wake was not delivered on the init sweep (or whose
+        # supervising ack task was lost to a later restart). The init
+        # sweep alone leaves such a row stranded until the NEXT reboot;
+        # re-running it here makes an undelivered wake retry on the normal
+        # 1/min cron cadence. The in-flight guard + signal coalescing keep
+        # this from re-waking a row whose turn is already running.
+        await self._reap_post_restart_rows()
+
         pending = await list_requests(self._db, status="pending")
         approved = await list_requests(self._db, status="approved")
         candidates = pending + approved
@@ -535,6 +561,12 @@ class RestartCoordinatorFeature(Feature):
                     else "dispatched to detached restart subprocess"
                 ),
                 expected_current_status=req.status,
+                # Stamp the live process only when crossing straight to
+                # ``executing`` (#1796); an ``updating`` row has not yet
+                # reached the restart, so it carries no boot stamp.
+                executing_boot_id=(
+                    _PROCESS_BOOT_ID if initial_state == "executing" else None
+                ),
             )
             if not moved:
                 deferred.append({
@@ -609,6 +641,7 @@ class RestartCoordinatorFeature(Feature):
                     status="executing",
                     status_reason="update complete; dispatching restart",
                     expected_current_status="updating",
+                    executing_boot_id=_PROCESS_BOOT_ID,
                 )
                 if not moved:
                     deferred.append({
@@ -1187,8 +1220,33 @@ class RestartCoordinatorFeature(Feature):
             )
 
     async def _reap_post_restart_rows(self) -> None:
-        """Sweep ``executing`` rows this agent filed, mark complete,
-        and emit one ``restart.completed`` COGNITION signal per row.
+        """Sweep ``executing`` rows this agent filed and wake the
+        requesting agent with one ``restart.completed`` COGNITION signal
+        per row.
+
+        A row is terminalized to ``completed`` only once its wake has
+        actually been DELIVERED (the COGNITION dispatch returned
+        ``Status.OK``) — not merely enqueued, and NOT on ``COALESCED``
+        (#1796). ``enqueue_signal`` is fire-and-forget: it returns a
+        handle as soon as the dispatch background task is scheduled, long
+        before ``process_input`` has produced the resuming turn. The
+        pre-#1796 code terminalized on enqueue NOT raising, so a wake that
+        the dispatcher later dropped or that failed inside
+        ``process_input`` left the row ``completed`` with no turn and no
+        retry. Now the terminalization is gated on the dispatch result via
+        a supervised ack task; an undelivered wake leaves the row
+        ``executing`` so the next sweep (the ``restart_coordinator`` cron
+        tick, or the next boot) retries it.
+
+        This sweep runs both at ``initialize`` (post-reboot) AND on every
+        live ``restart_coordinator`` cron tick (the retry backstop). To
+        keep the cron tick from falsely completing a restart that has NOT
+        happened — a row this same process just crossed to ``executing``
+        whose detached ``kestrel restart`` is still in flight or failed to
+        kill the parent — only rows stamped by a DIFFERENT process are
+        woken. A row stamped with the current ``_PROCESS_BOOT_ID`` stays
+        visibly ``executing`` (a real restart would have replaced this
+        process and given it a fresh id).
         """
         if self._db is None:
             return
@@ -1207,49 +1265,131 @@ class RestartCoordinatorFeature(Feature):
             and hasattr(dispatcher, "enqueue_signal")
         )
         for row in executing:
-            now = datetime.now(timezone.utc).isoformat()
-            signal_delivered: Optional[bool] = None  # True/False if attempted
-
-            if dispatcher_usable:
-                try:
-                    from kestrel_sovereign.signals.sources.restart import (
-                        build_signal_for_restart_completed,
-                    )
-                    signal = build_signal_for_restart_completed(
-                        row, target_agent=str(agent_id), completed_at=now,
-                    )
-                    enq = dispatcher.enqueue_signal(signal)
-                    if asyncio.iscoroutine(enq):
-                        await enq
-                    signal_delivered = True
-                except Exception as e:
-                    signal_delivered = False
-                    logger.warning(
-                        "restart sweep: failed to enqueue signal for "
-                        "%s: %s; row stays executing for next-boot retry",
-                        row.id, e,
-                    )
-
-            # Only terminalize when EITHER the signal delivered, OR
-            # there is no dispatcher to deliver to (a headless/test
-            # agent — nothing to wake, no point looping). If the
-            # dispatcher was present but enqueue raised, leave the
-            # row in executing so the next boot's sweep retries
-            # (codex P2 on PR #1512 round 1).
-            if signal_delivered is False:
+            # A row stamped by THIS process is a restart still in flight
+            # (or a detached restart that failed to kill the parent), not
+            # one that already completed — skip it so a failed restart is
+            # not silently masked as success (#1796).
+            if row.executing_boot_id == _PROCESS_BOOT_ID:
                 continue
-            await update_status(
-                self._db, row.id,
-                status="completed",
-                status_reason="post-restart sweep observed agent re-init",
-                completed_at=now,
-                expected_current_status="executing",
+            await self._deliver_restart_completed(
+                row, str(agent_id), dispatcher, dispatcher_usable,
             )
-            # Mirror the COGNITION wake with a chat-visible status event so
-            # the completed restart shows in chat, not only as an agent
-            # turn (#1551).
-            row.completed_at = now
-            await self._emit_status_event(
-                row, state="completed",
-                status_reason="post-restart sweep observed agent re-init",
+
+    async def _deliver_restart_completed(
+        self, row, agent_id: str, dispatcher, dispatcher_usable: bool,
+    ) -> None:
+        """Enqueue one ``restart.completed`` wake for ``row`` and gate the
+        row's terminalization on the wake actually being delivered (#1796).
+        """
+        now = datetime.now(timezone.utc).isoformat()
+
+        # No dispatcher to wake (headless host, test stub): there is
+        # nothing to deliver to and no point looping forever, so
+        # terminalize the row now.
+        if not dispatcher_usable:
+            await self._terminalize_completed(row, now)
+            return
+
+        # A supervisor from this process is already awaiting this row's
+        # wake — don't enqueue a duplicate (avoids a wake storm while a
+        # long cognition turn is still running).
+        if row.id in self._inflight_restart_acks:
+            return
+
+        try:
+            from kestrel_sovereign.signals.sources.restart import (
+                build_signal_for_restart_completed,
             )
+            signal = build_signal_for_restart_completed(
+                row, target_agent=str(agent_id), completed_at=now,
+            )
+            handle = dispatcher.enqueue_signal(signal)
+            if asyncio.iscoroutine(handle):
+                handle = await handle
+        except Exception as e:
+            # Enqueue raised synchronously — leave the row executing so a
+            # later sweep retries (codex P2 on PR #1512 round 1).
+            logger.warning(
+                "restart sweep: failed to enqueue signal for %s: %s; "
+                "row stays executing for next-sweep retry", row.id, e,
+            )
+            return
+
+        waiter = getattr(handle, "wait", None)
+        if not callable(waiter):
+            # Legacy/stub dispatcher whose enqueue_signal returns no
+            # awaitable handle — preserve the historical behaviour: the
+            # signal was accepted onto the queue, so terminalize now.
+            await self._terminalize_completed(row, now)
+            return
+
+        # Delivery-gated terminalization: supervise the wake and only
+        # terminalize once the COGNITION dispatch actually lands.
+        self._inflight_restart_acks.add(row.id)
+        self._spawn_ack_supervisor(row, handle)
+
+    def _spawn_ack_supervisor(self, row, handle) -> None:
+        """Await the ``restart.completed`` dispatch and terminalize the row
+        only once the wake has actually been DELIVERED (``Status.OK``). A
+        failed or dropped wake leaves the row ``executing`` so a later
+        sweep retries it (#1796).
+
+        ``COALESCED`` is deliberately NOT treated as delivered: the
+        coalescing key is recorded BEFORE ``process_input`` runs, so a
+        wake that fails inside the resuming turn still suppresses a fast
+        retry as ``COALESCED``. Terminalizing on that would falsely ack a
+        wake that never produced a turn — so a coalesced retry just leaves
+        the row executing until the coalescing window elapses and a real
+        re-dispatch lands ``OK``.
+        """
+
+        async def _await_and_ack() -> None:
+            from kestrel_sdk.signals import Status
+
+            try:
+                result = await handle.wait()
+            except Exception as e:
+                logger.warning(
+                    "restart sweep: restart.completed wake for %s raised "
+                    "(%s); row stays executing for retry", row.id, e,
+                )
+                return
+            finally:
+                self._inflight_restart_acks.discard(row.id)
+
+            status = getattr(result, "status", None)
+            if status is not Status.OK:
+                logger.warning(
+                    "restart sweep: restart.completed wake for %s did not "
+                    "land (status=%s); row stays executing for retry",
+                    row.id, getattr(status, "value", status),
+                )
+                return
+            await self._terminalize_completed(
+                row, datetime.now(timezone.utc).isoformat(),
+            )
+
+        tracker = getattr(self.agent, "_track_background_task", None)
+        if callable(tracker):
+            tracker(
+                _await_and_ack(), name=f"restart_completed_ack:{row.id}",
+            )
+        else:  # pragma: no cover - production agents always expose tracker
+            asyncio.ensure_future(_await_and_ack())
+
+    async def _terminalize_completed(self, row, now: str) -> None:
+        """Mark a swept restart row ``completed`` and mirror the COGNITION
+        wake with a chat-visible status event (#1551).
+        """
+        await update_status(
+            self._db, row.id,
+            status="completed",
+            status_reason="post-restart sweep observed agent re-init",
+            completed_at=now,
+            expected_current_status="executing",
+        )
+        row.completed_at = now
+        await self._emit_status_event(
+            row, state="completed",
+            status_reason="post-restart sweep observed agent re-init",
+        )
