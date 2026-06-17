@@ -40,6 +40,16 @@ def _fake_security(monkeypatch, read_payload=KEYCHAIN_JSON, read_rc=0, captured=
     """
 
     def fake_run(argv, **kw):
+        if argv[:2] == ["security", "dump-keychain"]:
+            # Enumeration: one item for the service under `account`.
+            if read_rc != 0:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            block = (
+                f'keychain: "login.keychain-db"\n'
+                f'    "acct"<blob>="{account}"\n'
+                f'    "svce"<blob>="{oa._CLAUDE_KEYCHAIN_SERVICE}"\n'
+            )
+            return SimpleNamespace(returncode=0, stdout=block, stderr="")
         if argv[:2] == ["security", "find-generic-password"]:
             if "-w" not in argv:  # account discovery (attributes only)
                 if read_rc != 0:
@@ -83,6 +93,33 @@ def test_keychain_read_parses_claude_oauth(monkeypatch):
 def test_keychain_read_none_on_missing_item(monkeypatch):
     _fake_security(monkeypatch, read_rc=44, read_payload=None)
     assert KeychainCredentialSource().read() is None
+
+
+def test_resolve_account_picks_freshest_valid(monkeypatch):
+    """The keychain holds a STALE item and the LIVE one under different
+    accounts. find-generic-password -s SERVICE returns an arbitrary (here:
+    stale) one, so the source must enumerate and pick the freshest valid
+    credential. Regression for the jasonschulz(stale)/jason(live) bug."""
+    STALE = {"claudeAiOauth": {"accessToken": "old", "refreshToken": "r0", "expiresAt": 1_700_000_000_000}}
+    LIVE = {"claudeAiOauth": {"accessToken": "new", "refreshToken": "r1", "expiresAt": 1_781_000_000_000}}
+    items = {"stale-acct": STALE, "live-acct": LIVE}
+
+    def fake_run(argv, **kw):
+        if argv[:2] == ["security", "dump-keychain"]:
+            blocks = "".join(
+                f'keychain: "k"\n    "acct"<blob>="{a}"\n    "svce"<blob>="{oa._CLAUDE_KEYCHAIN_SERVICE}"\n'
+                for a in items
+            )
+            return SimpleNamespace(returncode=0, stdout=blocks, stderr="")
+        if argv[:2] == ["security", "find-generic-password"] and "-w" in argv:
+            acct = argv[argv.index("-a") + 1]
+            return SimpleNamespace(returncode=0, stdout=json.dumps(items[acct]), stderr="")
+        raise AssertionError(f"unexpected argv {argv}")
+
+    monkeypatch.setattr(oa.subprocess, "run", fake_run)
+    src = KeychainCredentialSource()
+    assert src._resolve_account() == "live-acct"
+    assert src.read().access == "new"
 
 
 def test_keychain_read_none_on_oserror(monkeypatch):
@@ -254,3 +291,25 @@ async def test_access_token_adopts_concurrent_refresh_without_minting(monkeypatc
 
     monkeypatch.setattr(oa, "refresh_anthropic_token", boom)
     assert await mgr.access_token() == "sk-ant-oat-FROM-CLAUDE-CODE"
+
+
+@pytest.mark.asyncio
+async def test_refresh_invalid_grant_is_actionable():
+    """A dead/expired credential (invalid_grant) must surface an actionable
+    error — the OAuth error + a recovery hint — not an opaque HTTP 400."""
+    import httpx
+    from kestrel_sovereign.llm.anthropic_oauth import refresh_anthropic_token
+
+    transport = httpx.MockTransport(
+        lambda req: httpx.Response(
+            400, json={"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}
+        )
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError) as exc:
+            await refresh_anthropic_token("dead-rt", http_client=client)
+    msg = str(exc.value)
+    assert "invalid_grant" in msg
+    assert "Refresh token not found or invalid" in msg
+    assert "claude login" in msg  # recovery hint
+    assert "dead-rt" not in msg  # never echo token material
