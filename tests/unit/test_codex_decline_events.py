@@ -262,6 +262,8 @@ async def test_app_server_default_decline_records_event(tmp_path):
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
     client._server_request_handlers = {}
+    client._inflight_server_requests = {}
+    client._turn_sinks = {}
     client._audit_agent = None
     client.attach_audit_agent(agent)
 
@@ -291,6 +293,8 @@ async def test_app_server_records_action_shape_decline(tmp_path):
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
     client._server_request_handlers = {}
+    client._inflight_server_requests = {}
+    client._turn_sinks = {}
     client._audit_agent = None
     client.attach_audit_agent(agent)
 
@@ -316,6 +320,8 @@ async def test_app_server_no_audit_agent_no_event(tmp_path):
 
     client = CodexAppServerClient.__new__(CodexAppServerClient)
     client._server_request_handlers = {}
+    client._inflight_server_requests = {}
+    client._turn_sinks = {}
     client._audit_agent = None
     sent = []
     client._send = lambda msg: sent.append(msg)

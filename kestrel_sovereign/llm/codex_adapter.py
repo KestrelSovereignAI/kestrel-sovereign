@@ -1782,6 +1782,7 @@ class CodexAdapter(LLMAdapter):
         app: Any,
         sink: "asyncio.Queue[dict]",
         est_payload_tokens: int,
+        thread_id: Optional[str] = None,
     ) -> AsyncIterator[dict]:
         """Stream turn events; rewrite the idle-timeout error with a
         route-cap hint so the operator can act on it.
@@ -1797,7 +1798,7 @@ class CodexAdapter(LLMAdapter):
         knob so the operator can raise the cap or shorten the turn.
         """
         try:
-            async for ev in app.iter_turn_events(sink):
+            async for ev in app.iter_turn_events(sink, thread_id=thread_id):
                 yield ev
         except CodexAppServerError as e:
             msg = str(e)
@@ -2050,7 +2051,7 @@ class CodexAdapter(LLMAdapter):
             ) // 4
 
             async for ev in self._iter_with_overflow_hint(
-                app, sink, est_payload_tokens
+                app, sink, est_payload_tokens, thread_id=thread_id
             ):
                 method = ev.get("method")
                 p = ev.get("params") or {}
