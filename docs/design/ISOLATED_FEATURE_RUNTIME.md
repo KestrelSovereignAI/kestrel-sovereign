@@ -175,12 +175,14 @@ send + receive via neonize):
   **loopback TCP + token** for shared/standalone services. UDS rejected as
   baseline (no asyncio UDS on Windows). A2A (DID-signed) is overkill for
   same-host. **Resolved.**
-- **venv provisioning**: explicit/pre-created only (Talon-style, simple) vs
-  on-demand `uv venv` auto-provision (better UX, more magic). Recommend
-  supporting both, default to explicit. **Decision needed.**
-- **Supervision ownership**: per-agent vs per-host service instances (one
-  WhatsApp service shared across agents on a host, or one each?). **Decision
-  needed** — affects session-DB ownership.
+- **venv provisioning** → **resolved: per-agent, auto-provisioned**. Each agent
+  gets its **own copy** of the feature venv, created on demand (`uv venv` +
+  `uv pip install` of the service project) under the agent data dir
+  (`<agent_data>/feature_venvs/<feature>/`). An explicit path override stays as
+  a dev convenience, but production provisions per agent. **Resolved.**
+- **Service scope** → **resolved: per-agent**. One service instance per agent
+  (each owns its venv copy and its session DB, e.g. its own WhatsApp link).
+  Per-host sharing is explicitly out for now. **Resolved.**
 - Socket perms `0600`, service runs as the same user, no network listener.
 
 ## 7. Phasing → issues → Talon
@@ -200,3 +202,19 @@ Each phase becomes an issue in the named repo; Talon implements in chunks.
 5. **(Optional, later)** Migrate/align Talon & MCP onto the shared substrate.
 
 Phases 1→3 deliver WhatsApp on the generic runtime; 4–5 are follow-ups.
+
+## 8. Future direction: toward per-agent venvs
+
+Today all agents on a host share one venv and one process. The per-agent,
+auto-provisioned venv model adopted here (§6) points at a larger trajectory:
+**each agent eventually getting its own venv** (and potentially its own
+process) for full per-agent dependency and runtime isolation.
+
+The isolated-feature runtime is a deliberate **stepping stone** toward that:
+the machinery it introduces — per-agent venv provisioning under the agent data
+dir, supervised child processes, and a portable stdio IPC/lifecycle contract —
+is the same substrate per-agent process isolation would need. This design does
+not commit to per-agent processes, but is intentionally compatible with it:
+nothing here assumes a single shared host venv, and the provisioning path is
+already agent-scoped. Treat full per-agent-venv isolation as a separate future
+proposal that can build on this one.
