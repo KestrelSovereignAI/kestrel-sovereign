@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-16
-**Scope:** 1729 tracked files (1124 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-17
+**Scope:** 1735 tracked files (1130 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -254,10 +254,12 @@ Repo entry points and standard project files.
   - `class AppExtension`
 - **kestrel_sovereign/extensions/elderly_extension.py** — Elderly Companion App Extension for the Kestrel Agent.
   - `class ElderlyExtension`
+- **kestrel_sovereign/feature_reconcile.py** — Reconcile the host venv against the union of per-agent feature allowlists.
+  - `class SourceEntry`; `class ReconcileAction`; `def compute_required_classes(multi_agent)`; `def resolve_packages(required_classes, registry, entrypoint_dists, local_core_classes)`; `def build_source_index(manifest_entries, registry)`; `def plan_reconcile(pkg_infos, source_index, installed_versions, editable_paths, …)`
 - **kestrel_sovereign/feature_registry.py** — Feature Registry — catalog loader and status resolver.
   - `class FeatureStatus`; `class SkillInfo`; `class FeaturePackageInfo`; `def load_registry(path)`; `def resolve_status(registry, enabled_class_names)`; `def get_registry(enabled_class_names, path)`; `def get_package_for_feature(feature_class_name, path)`; `def get_all_skills(path)`; `…`
 - **kestrel_sovereign/features/__init__.py** — Feature Discovery for Kestrel Agent.
-  - `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `def discover_entrypoint_feature_classes()`; `def discover_feature_class_by_name(name)`; `def discover_features(agent, allowed_features)`; `def get_feature_by_name(features, name)`
+  - `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `def discover_entrypoint_feature_classes()`; `def discover_local_feature_class_names()`; `def discover_entrypoint_feature_dists()`; `def discover_feature_class_by_name(name)`; `def discover_features(agent, allowed_features)`; `…`
 - **kestrel_sovereign/features/attachments/__init__.py** — Chat attachments feature (#1662): a lazy ``read_attachment`` tool so an agent can read a file the user attached (non-inline) on demand.
 - **kestrel_sovereign/features/attachments/component.yaml** — (configuration)
 - **kestrel_sovereign/features/attachments/feature.py** — Lazy attachment reading (#1662 PR C).
@@ -617,6 +619,8 @@ Repo entry points and standard project files.
   - `class ThinkingDelta`; `def split_thinking_from_content(content, reasoning_content)`; `class ThinkingContentSplitter`; `def build_messages(user_prompt, system_prompt)`; `def messages_for(adapter)`; `class LLMAdapter`
 - **kestrel_sovereign/llm/anthropic_adapter.py** — Anthropic Claude Adapter
   - `class AnthropicAdapter`
+- **kestrel_sovereign/llm/anthropic_oauth.py** — Claude subscription (Claude Pro/Max) OAuth token lifecycle.
+  - `class OAuthCredentials`; `def parse_credentials(raw)`; `async def refresh_anthropic_token(refresh_token)`; `class CredentialSource`; `class FileCredentialSource`; `class KeychainCredentialSource`; `def discover_claude_code_source()`; `class ClaudeOAuthTokenManager`
 - **kestrel_sovereign/llm/claude_max_adapter.py** — Claude Max Subscription Adapter
   - `class ClaudeMaxAdapter`
 - **kestrel_sovereign/llm/codex_adapter.py** — Codex Provider Adapter — OpenAI ChatGPT subscription via the official ``@openai/codex`` app-server.
@@ -1860,6 +1864,10 @@ Repo entry points and standard project files.
   - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch)`; `def test_context_status_route_cap_absent_when_no_cap(monkeypatch)`; `def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch)`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
+- **tests/unit/test_anthropic_oauth_delegation.py** — Unit tests for Claude Code credential delegation (anthropic:plan).
+  - `def test_keychain_read_parses_claude_oauth(monkeypatch)`; `def test_keychain_read_none_on_missing_item(monkeypatch)`; `def test_keychain_read_none_on_oserror(monkeypatch)`; `def test_keychain_write_merges_and_preserves_fields(monkeypatch)`; `def test_keychain_write_false_when_item_absent(monkeypatch)`; `def test_file_source_roundtrip_preserves_wrapper(tmp_path)`; `def test_discover_prefers_keychain_on_darwin(monkeypatch, tmp_path)`; `def test_discover_falls_back_to_file_off_darwin(monkeypatch, tmp_path)`; `…`
+- **tests/unit/test_anthropic_oauth_shaping.py** — Unit tests for the Claude subscription (OAuth/plan route) request shaping and OAuth token-refresh lifecycle.
+  - `async def test_api_route_does_not_inject_identity()`; `async def test_plan_route_prepends_identity_as_first_block()`; `async def test_plan_route_identity_when_no_system_prompt()`; `async def test_plan_route_identity_first_with_tools_and_history()`; `def test_coerce_expires_at_ms_vs_seconds()`; `def test_parse_credentials_claude_code_wrapper()`; `def test_parse_credentials_snake_case_and_missing_access()`; `def test_needs_refresh_requires_refresh_and_expiry()`; `…`
 - **tests/unit/test_anthropic_wire_model_id.py** — Unit tests for AnthropicAdapter wire model-id normalization (#1420).
   - `def test_resolve_wire_model_id_strips_anthropic_prefix()`; `def test_resolve_wire_model_id_is_case_insensitive()`; `def test_resolve_wire_model_id_passes_through_bare_id()`; `def test_resolve_wire_model_id_passes_through_other_vendor_prefix()`; `def test_resolve_wire_model_id_handles_empty_and_none_gracefully()`; `def test_resolve_wire_model_id_does_not_strip_prefix_inside_id()`; `def test_resolve_wire_model_id_inherited_by_claude_max()`; `async def test_get_response_sends_bare_model_id_when_prefixed()`; `…`
 - **tests/unit/test_api_key_query_param.py** — Unit tests for API key query parameter restriction (GitHub issue #149).
@@ -1967,6 +1975,8 @@ Repo entry points and standard project files.
   - `def test_argparse_deploy_defaults()`; `def test_argparse_deploy_overrides()`; `def test_argparse_deploy_unknown_target_rejected()`; `def test_argparse_status_stop_kill()`; `def test_kestrel_cli_registers_runpod()`; `def test_cmd_runpod_no_subverb_prints_usage(capsys)`; `def test_deploy_without_api_key_errors_with_hint(monkeypatch, capsys)`; `def test_status_without_api_key_errors(monkeypatch, capsys)`; `…`
 - **tests/unit/test_cli_update.py** — Tests for ``kestrel update`` — one-shot pull + install + sync + restart.
   - `def stub_project_dir(tmp_path, monkeypatch)`; `def test_update_full_pipeline_calls_each_step_in_order(stub_project_dir)`; `def test_update_short_circuits_when_pull_fails(stub_project_dir)`; `def test_update_short_circuits_when_install_fails(stub_project_dir)`; `def test_dirty_working_tree_refuses_pull(stub_project_dir, capsys)`; `def test_allow_dirty_lets_pull_proceed(stub_project_dir)`; `def test_dry_run_invokes_no_shell_commands(stub_project_dir, capsys)`; `def test_no_flag_skips_individual_step(stub_project_dir, skipped_flag, expected_absent)`; `…`
+- **tests/unit/test_cli_update_reconcile.py** — Tests for the ``kestrel update`` reconcile step (#1788).
+  - `def patched(monkeypatch, tmp_path)`; `def test_reconcile_installs_missing_allowlisted_feature(patched, capsys)`; `def test_reconcile_errors_on_unresolvable_class(monkeypatch, tmp_path, capsys)`; `def test_reconcile_dry_run_mutates_nothing(patched)`; `def test_execute_editable_update_runs_git_pull_only()`; `def test_execute_editable_install_pulls_then_links()`; `def test_execute_editable_relink_switches_from_pypi_install()`; `def test_execute_editable_pull_failure_reports_and_skips_link()`; `…`
 - **tests/unit/test_cli_verify_install.py** — ``kestrel verify-install`` CLI tests — sub-PR 2.2 of epic #1050 (bash-to-Python port of ``scripts/verify_clean_install.sh``).
   - `def test_argparse_no_tests_is_empty_list()`; `def test_argparse_single_test()`; `def test_argparse_multiple_tests_preserve_order()`; `def test_kestrel_cli_registers_verify_install()`; `def test_cmd_all_pass_exits_zero(monkeypatch)`; `def test_cmd_any_fail_exits_one(monkeypatch)`; `def test_cmd_selection_narrows_runs(monkeypatch)`; `def test_cmd_selection_preserves_user_order(monkeypatch)`; `…`
 - **tests/unit/test_codex_adapter.py** — Tests for the OpenAI plan adapter (app-server backed) and registry.
@@ -2168,13 +2178,15 @@ Repo entry points and standard project files.
 - **tests/unit/test_extracted_feature_boundary_contracts.py** — Contracts for optional/extracted feature boundaries in core.
   - `def test_feature_proof_matrix_marks_mcp_as_external_package_boundary()`; `def test_observability_feature_is_external_to_core()`; `def test_wallet_feature_is_external_to_core()`; `def test_github_feature_is_external_to_core()`; `def test_voice_feature_is_external_to_core()`; `def test_reflection_feature_is_external_to_core()`; `def test_council_feature_is_external_to_core()`
 - **tests/unit/test_feature_discovery.py** — Tests for the Feature Discovery module.
-  - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`
+  - `class TestGetDisabledFeatures`; `class TestDiscoverFeatureModules`; `class TestDiscoverFeatures`; `class TestGetFeatureByName`; `class TestFindFeatureClass`; `class TestFeatureProfiles`; `class TestEntryPointDiscovery`; `class TestEntrypointClassName`
 - **tests/unit/test_feature_doc_canonicality.py** — Guardrails for canonical feature-document structure.
   - `def test_canonical_feature_doc_declares_source_of_truth()`; `def test_canonical_feature_doc_distinguishes_core_and_package_features()`; `def test_canonical_feature_doc_lists_core_only_inventory()`; `def test_legacy_archive_is_marked_historical()`; `def test_generator_prompt_does_not_hardcode_stale_metrics()`; `def test_progress_review_script_uses_discovered_inventory_language()`; `def test_investor_generated_doc_does_not_invent_unverified_metrics()`
 - **tests/unit/test_feature_inventory_contracts.py** — Contract tests for the discoverable feature inventory.
   - `def test_every_discoverable_feature_module_exports_a_feature_class()`; `def test_discover_features_matches_unique_class_inventory()`; `def test_disabled_feature_env_filters_exact_class_names()`; `def test_get_feature_by_name_resolves_discovered_features_by_name_and_class()`; `def test_entrypoint_features_included_in_combined_inventory()`; `def test_combined_inventory_has_no_duplicates()`; `def test_combined_inventory_respects_disabled_env()`; `def test_core_only_inventory_stable_without_entrypoints()`; `…`
 - **tests/unit/test_feature_lifecycle.py** — Unit Tests for Feature Lifecycle Hooks.
   - `class SampleHook`; `class AnotherSampleHook`; `class SimpleFeature`; `class HookProvidingFeature`; `class RouterFeature`; `class ConfigFeature`; `class ToolFeature`; `def mock_agent()`; `…`
+- **tests/unit/test_feature_reconcile.py** — Tests for ``feature_reconcile`` — the pure planning half of #1788.
+  - `def test_required_classes_union_plus_mandatory()`; `def test_required_classes_flags_load_all_agents()`; `def test_required_classes_ignores_remote_agents()`; `def test_resolve_packages_maps_classes_and_skips_core()`; `def test_resolve_packages_unknown_class_is_unresolved()`; `def test_resolve_packages_mandatory_missing_from_registry_is_not_error()`; `def test_resolve_packages_uses_live_entrypoint_dist()`; `def test_resolve_packages_bundled_class_wins_over_duplicate_entrypoint()`; `…`
 - **tests/unit/test_feature_registry.py** — Tests for the Feature Registry catalog and loader.
   - `class TestLoadRegistry`; `class TestResolveStatus`; `class TestGetRegistry`; `class TestGetPackageForFeature`; `class TestSkills`
 - **tests/unit/test_feature_startup_promotion.py** — —
@@ -2556,7 +2568,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_skills_feature.py** — Unit tests for SkillsFeature and Skill serialization.
   - `class TestSkillModel`; `class TestHelpers`; `async def feature(tmp_path)`; `class TestToolRegistration`; `class TestExtractCandidates`; `class TestSkillSave`; `class TestListShowDelete`; `class TestModuleConstants`; `…`
 - **tests/unit/test_sleep_consolidation_routing.py** — #1674 P3: the sleep cycle consolidates through the single MemorySystem.consolidate() chokepoint (so it inherits the forgetting deletion tier), not the lower-level MemoryConsolidator.run_consolidation…
-  - `async def test_consolidate_routes_through_memory_system()`; `async def test_consolidate_falls_back_to_raw_consolidator()`
+  - `async def test_consolidate_routes_through_memory_system()`; `async def test_sleep_dispatches_all_registered_sleep_hooks()`; `async def test_sleep_tolerates_no_sleep_hooks()`; `async def test_consolidate_falls_back_to_raw_consolidator()`
 - **tests/unit/test_sleep_wake_resilience.py** — Unit tests for host sleep/wake (suspend/resume) resilience (#1545).
   - `class TestSuspendGap`; `class TestResumeMonitor`; `class TestResumeMonitorConfig`; `class TestDispatcherReanchor`; `class TestSchedulerMisfireGrace`; `class TestHeartbeatGapAwareness`
 - **tests/unit/test_slhdsa_suite.py** — SLHDSASHA2128sSuite tests — Wave 3 sub-PR 1 (#918).
