@@ -753,6 +753,10 @@ async function startSession(session = activeSession()) {
 
 async function stopSession(session = activeSession()) {
   const c = session.client;
+  // close() emits SESSION_CLOSED synchronously, by which point session.client
+  // is already null — stash the client so that handler can still await its
+  // pending transcript persistence before refreshing the sidebar.
+  session.closingClient = c;
   session.client = null;
   session.pathLabel = '';
   session.pathTooltip = '';
@@ -892,7 +896,37 @@ function handleClientEvent(agent, ev, startSeq) {
       // sees what they got even if the session ended mid-response.
       if (session.userMsgDiv) finalizeUserTurn(session, session.userTranscriptBuffer);
       if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
+      // The realtime path persists turns server-side out of band (the browser
+      // talks directly to OpenAI), so the conversation sidebar has no idea a
+      // new session was just written. Nudge it to refresh once the call ends,
+      // but only if real turns landed — a connect-fail close shouldn't refetch.
+      // Decoupled via a window event to avoid an import cycle with identity.js.
+      if (session.persistedAny) {
+        session.persistedAny = false;
+        const closingAgent = session.agent;
+        // Realtime persistence is fire-and-forget, so wait for the in-flight
+        // /transcript POSTs to settle before refreshing — otherwise the list
+        // refetch races ahead of the write and shows the stale (pre-call)
+        // history. Pipeline persists synchronously server-side and has no
+        // whenPersisted(), so fall back to an immediate refresh.
+        // stopSession() nulls session.client before close() emits this event,
+        // so prefer the stashed closing client; fall back to session.client
+        // for closes that bypass stopSession (e.g. network data_channel_closed).
+        const closingClient = session.closingClient || session.client;
+        const flush =
+          closingClient && typeof closingClient.whenPersisted === 'function'
+            ? closingClient.whenPersisted()
+            : Promise.resolve();
+        flush.finally(() => {
+          try {
+            window.dispatchEvent(new CustomEvent('kestrel:conversations-stale', {
+              detail: { agent: closingAgent },
+            }));
+          } catch (_) { /* non-DOM context — ignore */ }
+        });
+      }
       session.client = null;
+      session.closingClient = null;
       session.pathLabel = '';
       session.pathTooltip = '';
       const wasControlSession = session === controlSession();
@@ -928,6 +962,10 @@ function finalizeAgentTurn(session, text) {
   const buf = text || '';
   session.agentMsgDiv = null;
   session.agentTextBuffer = '';
+  // Track that this voice session produced a real, persisted turn so
+  // SESSION_CLOSED can refresh the conversation sidebar (#1808 follow-up).
+  // Backend persistence keys off the same finalized turns.
+  if (buf.trim()) session.persistedAny = true;
   if (!div) {
     if (buf.trim()) addMessage('agent', buf, paneForSession(session).element);
     return;
@@ -967,6 +1005,7 @@ function finalizeUserTurn(session, text) {
   const buf = (text || '').trim();
   session.userMsgDiv = null;
   session.userTranscriptBuffer = '';
+  if (buf) session.persistedAny = true;
   if (!div) {
     if (buf) addMessage('user', buf, paneForSession(session).element);
     return;

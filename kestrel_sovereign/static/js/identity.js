@@ -1707,6 +1707,17 @@ document.addEventListener('DOMContentLoaded', () => {
         collapseConversationsBtn.addEventListener('click', () => togglePane('conversations-pane'));
     }
 
+    // A realtime/pipeline voice session persists its turns server-side as a
+    // new conversation, but the sidebar never hears about it (the browser
+    // talks straight to OpenAI). voice/ui.js fires this when a call ends with
+    // real turns; reload the list so the new conversation shows up without a
+    // manual page refresh.
+    window.addEventListener('kestrel:conversations-stale', () => {
+        if (typeof loadConversations === 'function') {
+            loadConversations(selectedAgentName).catch(() => { /* best-effort */ });
+        }
+    });
+
     const newConversationSidebarBtn = document.getElementById('new-conversation-sidebar-btn');
     if (newConversationSidebarBtn) {
         newConversationSidebarBtn.addEventListener('click', async () => {
