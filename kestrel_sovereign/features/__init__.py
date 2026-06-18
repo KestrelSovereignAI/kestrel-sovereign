@@ -133,6 +133,7 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
     1. Is a subclass of Feature
     2. Is not Feature itself
     3. Is defined in this module OR is explicitly exported via __all__
+    4. Is not ProxyFeature (which is only created programmatically)
 
     The __all__ check allows features to be split across multiple files
     while still being discoverable.
@@ -143,6 +144,10 @@ def find_feature_class(module) -> Optional[Type[Feature]]:
         # Accept any subclass of the SDK Feature base (covers both sovereign
         # internal features and extracted package features)
         if not (issubclass(obj, _SdkFeature) and obj is not _SdkFeature and obj is not Feature):
+            continue
+
+        # Skip ProxyFeature - it's only created programmatically for isolated-runtime features
+        if name == "ProxyFeature":
             continue
 
         # Check if defined in this module
