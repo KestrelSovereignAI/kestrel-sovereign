@@ -163,6 +163,18 @@ class StreamingMixin:
             pass
         return set()
 
+    def _streamed_call_cost(self, response: Any) -> Optional[float]:
+        """Per-call cost for a streamed turn (#1806), if the composed service
+        exposes the extractor. Defensive so a StreamingMixin-only consumer
+        (e.g. a unit fake) doesn't break — returns None when unavailable."""
+        extractor = getattr(self, "_extract_provider_cost", None)
+        if extractor is None:
+            return None
+        try:
+            return extractor(response)
+        except Exception:  # noqa: BLE001 - cost is best-effort
+            return None
+
     async def _record_streamed_usage(
         self,
         response: Any,
@@ -210,6 +222,7 @@ class StreamingMixin:
                 ),
                 tools_used=bool(getattr(response, "tool_calls", None)),
                 metadata=metadata,
+                cost=self._streamed_call_cost(response),
             )
         except Exception as exc:  # noqa: BLE001 - metering must not break stream
             logger.warning("Failed to record streamed usage: %s", exc)

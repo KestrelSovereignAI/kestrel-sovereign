@@ -8,6 +8,7 @@ No real API calls are made.
 import asyncio
 import os
 import tempfile
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -551,6 +552,94 @@ class TestCoreGeneration:
         response = await llm_service.generate_with_messages(messages=messages)
 
         assert response is not None
+
+
+class TestMeteringAndCost:
+    """#1804 — generate_with_messages must meter (it previously bypassed the
+    metering callback). #1806 — the metering callback may receive the
+    provider-reported per-call cost (e.g. OpenRouter usage.cost)."""
+
+    @pytest.mark.asyncio
+    async def test_generate_with_messages_meters(self, llm_service):
+        """A callback set via set_metering_callback fires for the non-stream
+        message path with provider/model/token counts (#1804)."""
+        calls = []
+
+        async def _cb(**kwargs):
+            calls.append(kwargs)
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        out = await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert isinstance(out, str)
+        assert len(calls) == 1
+        assert calls[0]["provider"] == "openai:api"
+        assert calls[0]["prompt_tokens"] == 10
+        assert calls[0]["completion_tokens"] == 8
+
+    @pytest.mark.asyncio
+    async def test_cost_forwarded_to_callback(self, llm_service, mock_adapter):
+        """When the provider reports a per-call cost (OpenRouter usage.cost),
+        a cost-aware callback receives it (#1806)."""
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=8, cost=0.0042)
+        raw = SimpleNamespace(usage=usage)
+        mock_adapter.get_response = AsyncMock(return_value=LLMResponse(
+            content="hi", input_tokens=10, output_tokens=8, total_tokens=18, raw=raw,
+        ))
+        seen = []
+
+        async def _cb(*, companion_id, user_id, provider, model,
+                      prompt_tokens, completion_tokens, cost=None):
+            seen.append(cost)
+
+        llm_service.set_metering_callback(_cb)
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert seen == [0.0042]
+
+    @pytest.mark.asyncio
+    async def test_legacy_callback_without_cost_still_called(self, llm_service):
+        """A callback written against the original signature (no cost kwarg)
+        is not handed an unexpected kwarg — backward compatible (#1806)."""
+        calls = []
+
+        async def _legacy(*, companion_id, user_id, provider, model,
+                          prompt_tokens, completion_tokens):
+            calls.append((provider, prompt_tokens, completion_tokens))
+
+        llm_service.set_metering_callback(_legacy)
+        assert llm_service._metering_callback_accepts_cost is False
+        llm_service.set_observability_context(companion_id="c1", user_id="u1")
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "hi"}]
+        )
+
+        assert calls == [("openai:api", 10, 8)]
+
+    def test_extract_provider_cost_variants(self):
+        """_extract_provider_cost reads usage.cost, model_extra, and the
+        streaming raw dict; returns None when absent."""
+        f = LLMService._extract_provider_cost
+        # provider usage object
+        assert f(LLMResponse(raw=SimpleNamespace(
+            usage=SimpleNamespace(cost=0.01)))) == 0.01
+        # openai v2 model_extra fallback
+        assert f(LLMResponse(raw=SimpleNamespace(
+            usage=SimpleNamespace(model_extra={"cost": 0.02})))) == 0.02
+        # streaming raw dict
+        assert f(LLMResponse(raw={"cost": 0.03})) == 0.03
+        # absent
+        assert f(LLMResponse(raw=None)) is None
+        assert f(LLMResponse(raw=SimpleNamespace(usage=None))) is None
 
 
 class TestAutoRoutingSentinel:

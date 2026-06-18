@@ -42,6 +42,22 @@ from .write_audit import record_write_query, record_write_script
 
 logger = logging.getLogger(__name__)
 
+# Concurrent upserts of the same row (e.g. parallel agent-init writes to the
+# composite-PK ``agent_metadata`` rows) can surface a transient
+# "tuple concurrently updated" from Postgres even with ON CONFLICT DO UPDATE.
+# It clears on retry. We retry only autocommit (non-transaction) writes —
+# a single statement inside an explicit transaction can't be replayed in
+# isolation once the surrounding txn is poisoned. See kestrel #1805.
+_CONCURRENT_UPDATE_MARKER = "tuple concurrently updated"
+_CONCURRENT_WRITE_RETRIES = 4
+_CONCURRENT_WRITE_BACKOFF_S = 0.02
+
+
+def _is_concurrent_update_error(exc: BaseException) -> bool:
+    """True for the transient 'tuple concurrently updated' race (#1805)."""
+    return _CONCURRENT_UPDATE_MARKER in str(exc).lower()
+
+
 # asyncpg is optional - only required for PostgreSQL usage
 try:
     import asyncpg
@@ -255,23 +271,39 @@ class PostgresBackend(DatabaseBackend):
         pg_query = self._convert_query(query)
         params = self._strip_tz(params)
 
-        try:
-            # Use this task's transaction connection if one is open (#1726).
-            txn = self._current_txn_conn()
-            if txn is not None:
-                result = await txn.execute(pg_query, *params)
-            else:
-                result = await pool.execute(pg_query, *params)
-            
-            # Parse affected rows from result (e.g., "INSERT 0 1" or "UPDATE 5")
-            if result:
-                parts = result.split()
-                if len(parts) >= 2 and parts[-1].isdigit():
-                    return int(parts[-1])
-            return 0
-            
-        except Exception as e:
-            raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
+        # Use this task's transaction connection if one is open (#1726).
+        txn = self._current_txn_conn()
+        attempt = 0
+        while True:
+            try:
+                if txn is not None:
+                    result = await txn.execute(pg_query, *params)
+                else:
+                    result = await pool.execute(pg_query, *params)
+
+                # Parse affected rows from result (e.g., "INSERT 0 1" or "UPDATE 5")
+                if result:
+                    parts = result.split()
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        return int(parts[-1])
+                return 0
+
+            except Exception as e:
+                # Retry the transient concurrent-upsert race on the autocommit
+                # path only (a poisoned txn can't be salvaged statement-wise).
+                if (
+                    txn is None
+                    and _is_concurrent_update_error(e)
+                    and attempt < _CONCURRENT_WRITE_RETRIES
+                ):
+                    attempt += 1
+                    logger.warning(
+                        "Concurrent-update race on write (attempt %d/%d), retrying: %s",
+                        attempt, _CONCURRENT_WRITE_RETRIES, e,
+                    )
+                    await asyncio.sleep(_CONCURRENT_WRITE_BACKOFF_S * attempt)
+                    continue
+                raise QueryError(f"Query failed: {e}\nQuery: {pg_query}") from e
     
     async def execute_many(self, query: str, params_list: List[Params]) -> int:
         """Execute query with multiple parameter sets."""
