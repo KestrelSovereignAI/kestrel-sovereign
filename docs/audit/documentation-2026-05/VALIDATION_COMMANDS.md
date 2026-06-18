@@ -1,3 +1,21 @@
+---
+type: Runbook
+title: Validation Commands
+description: Validation commands used during the May 2026 documentation audit.
+resource: /docs/audit/documentation-2026-05/VALIDATION_COMMANDS.md
+tags:
+- audit
+- documentation
+- may-2026
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Validation Commands
 
 Commands for the May 2026 documentation audit.

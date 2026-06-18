@@ -1,3 +1,22 @@
+---
+type: Audit Ledger
+title: Stale Artifact Review
+description: Ledger of stale artifacts and revalidation candidates for the May 2026
+  documentation audit.
+resource: /docs/audit/documentation-2026-05/STALE_ARTIFACTS.md
+tags:
+- audit
+- documentation
+- may-2026
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Stale Artifact Review
 
 This file tracks prior audit/index/review artifacts that should not silently compete with the May 2026 documentation audit.

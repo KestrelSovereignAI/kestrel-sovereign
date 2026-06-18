@@ -1,3 +1,23 @@
+---
+type: Review Lane
+title: Memory Retrieval Storage
+description: Review prompt for the Memory Retrieval Storage lane of the May 2026 documentation
+  audit.
+resource: /docs/audit/documentation-2026-05/lanes/memory_retrieval_storage.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: Memory Retrieval Storage
 
 Goal: reconcile docs for memory ownership, retrieval, saved items, storage backends, encryption, export/import, and privacy-mode effects.

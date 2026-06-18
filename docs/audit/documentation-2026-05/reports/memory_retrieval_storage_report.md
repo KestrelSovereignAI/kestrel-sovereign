@@ -1,3 +1,23 @@
+---
+type: Audit Report
+title: Memory Retrieval Storage Report
+description: 'Lane report from the May 2026 documentation audit: Memory Retrieval
+  Storage Report.'
+resource: /docs/audit/documentation-2026-05/reports/memory_retrieval_storage_report.md
+tags:
+- audit
+- documentation
+- may-2026
+- report
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Memory Retrieval Storage Lane Report
 
 Source: subagent lane review, read-only, 2026-05-30.

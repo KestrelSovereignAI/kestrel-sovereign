@@ -1,6 +1,22 @@
-<!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually -->
-<!-- Audience: developer | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 -->
-<!-- Regenerate: uv run python scripts/generate_feature_docs.py --audience developer -->
+---
+type: Generated Reference
+title: Developer & AI Agent Reference
+description: Audience-specific developer view generated from the canonical Kestrel feature inventory.
+resource: /docs/generated/FEATURES_developer.md
+tags:
+- features
+- generated-docs
+- developer
+timestamp: 2026-04-13T00:00:00Z
+status: generated
+generated: true
+canonical: false
+source: /KESTREL_FEATURES.md
+audience: developer
+generator: scripts/generate_feature_docs.py
+model: anthropic/claude-sonnet-4-6
+regenerate: uv run python scripts/generate_feature_docs.py --audience developer
+---
 
 # Kestrel Sovereign — Developer Feature Reference
 

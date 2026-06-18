@@ -1,3 +1,21 @@
+---
+type: Documentation Index
+title: Report Index
+description: Index of reports captured during the May 2026 documentation audit.
+resource: /docs/audit/documentation-2026-05/REPORT_INDEX.md
+tags:
+- audit
+- documentation
+- may-2026
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Report Index
 
 Reports captured during the May 2026 documentation audit.

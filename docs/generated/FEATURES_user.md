@@ -1,6 +1,22 @@
-<!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually -->
-<!-- Audience: user | Generated: 2026-04-13 | Model: anthropic/claude-sonnet-4-6 -->
-<!-- Regenerate: uv run python scripts/generate_feature_docs.py --audience user -->
+---
+type: Generated Reference
+title: What Can Kestrel Do For You?
+description: Audience-specific user view generated from the canonical Kestrel feature inventory.
+resource: /docs/generated/FEATURES_user.md
+tags:
+- features
+- generated-docs
+- user
+timestamp: 2026-04-13T00:00:00Z
+status: generated
+generated: true
+canonical: false
+source: /KESTREL_FEATURES.md
+audience: user
+generator: scripts/generate_feature_docs.py
+model: anthropic/claude-sonnet-4-6
+regenerate: uv run python scripts/generate_feature_docs.py --audience user
+---
 
 # Kestrel — What It Can Do For You
 

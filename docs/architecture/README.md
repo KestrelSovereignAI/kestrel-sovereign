@@ -111,6 +111,7 @@ Wallet, solvency, and economic incentives.
 - **Engineering quality program:** [`/docs/audit/`](../audit/) — feature proof matrices, seam campaigns, sync/async audit. Actively maintained.
 - **Live feature inventory:** [`/KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md) (canonical, consumed by `scripts/generate_feature_docs.py`)
 - **Constitution:** [`/docs/principles/KESTREL_CONSTITUTION.md`](../principles/KESTREL_CONSTITUTION.md)
+- **OKF migration view:** [`index.md`](index.md) / [`log.md`](log.md) — generated inventory of architecture docs that still need OKF status metadata.
 
 ---
 

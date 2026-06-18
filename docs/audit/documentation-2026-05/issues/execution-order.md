@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: Execution Order
+description: 'Issue or execution-order artifact for the May 2026 documentation audit:
+  Execution Order.'
+resource: /docs/audit/documentation-2026-05/issues/execution-order.md
+tags:
+- audit
+- documentation
+- may-2026
+- issue
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Documentation Audit Execution Order - May 2026
 
 Parent ledger: `docs/audit/DOCUMENTATION_AUDIT_5_2026.md`

@@ -19,3 +19,14 @@ Current documentation audit:
 
 - [`DOCUMENTATION_AUDIT_5_2026.md`](DOCUMENTATION_AUDIT_5_2026.md) - May 2026 audit ledger for package extraction, context, memory, storage, LLM, signals, Talon, cloud, generated docs, and public-doc hygiene.
 - [`documentation-2026-05/`](documentation-2026-05/) - working audit workspace with shared context, lane briefs, subagent reports, stale-artifact review, and execution order.
+- [`OKF_MIGRATION_PLAN.md`](OKF_MIGRATION_PLAN.md) - plan and implementation ledger for converting Kestrel docs to OKF and wiring documentation freshness into Talon/Flight/Eye workflows.
+- [`index.md`](index.md) / [`log.md`](log.md) - generated OKF concept index and timestamp log for this audit tree.
+
+OKF checks:
+
+```bash
+uv run python scripts/docs_okf.py validate
+uv run python scripts/docs_okf.py validate --all docs/audit/documentation-2026-05
+uv run python scripts/docs_okf.py index --check
+uv run python scripts/docs_okf.py log --check
+```

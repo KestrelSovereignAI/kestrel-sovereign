@@ -1,3 +1,23 @@
+---
+type: Review Lane
+title: Llm Routing
+description: Review prompt for the Llm Routing lane of the May 2026 documentation
+  audit.
+resource: /docs/audit/documentation-2026-05/lanes/llm_routing.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: LLM Routing
 
 Goal: reconcile docs for LLM configuration, model preference, provider capability contracts, provider packages, streaming, honesty markers, and transport behavior.

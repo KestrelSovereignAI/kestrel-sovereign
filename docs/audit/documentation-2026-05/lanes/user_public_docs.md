@@ -1,3 +1,23 @@
+---
+type: Review Lane
+title: User Public Docs
+description: Review prompt for the User Public Docs lane of the May 2026 documentation
+  audit.
+resource: /docs/audit/documentation-2026-05/lanes/user_public_docs.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: User Public Docs
 
 Goal: audit user-facing docs, use cases, demos, and launch copy for stale availability claims and unclear optional-package requirements.

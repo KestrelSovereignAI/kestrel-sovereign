@@ -1,3 +1,22 @@
+---
+type: Audit Report
+title: Llm Routing Report
+description: 'Lane report from the May 2026 documentation audit: Llm Routing Report.'
+resource: /docs/audit/documentation-2026-05/reports/llm_routing_report.md
+tags:
+- audit
+- documentation
+- may-2026
+- report
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # LLM Routing Lane Report
 
 Source: subagent lane review, read-only, 2026-05-30.

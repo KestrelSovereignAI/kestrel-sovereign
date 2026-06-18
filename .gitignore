@@ -16,6 +16,7 @@ credentials/
 *.json
 !package.json
 !package-lock.json
+!docs/audit/issues/*-prd.json
 *.pem
 *.key
 
@@ -144,6 +145,8 @@ docs/architecture/economics/work_sessions/
 
 # Kestrel Talon progress tracking
 .kestreltalon/
+!.kestreltalon/
+!.kestreltalon/quality.yaml
 
 # Config files with real infrastructure IDs (use .example versions)
 runpod_config.toml

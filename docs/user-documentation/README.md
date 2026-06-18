@@ -20,6 +20,16 @@ End-user guides and non-technical explanations for Kestrel concepts.
 | [USER_EDUCATION_STRATEGY.md](USER_EDUCATION_STRATEGY.md) | Strategy for enabling users to understand Kestrel's value |
 | [USER_GUIDE_EXPLANATIONS.md](USER_GUIDE_EXPLANATIONS.md) | Non-technical explanations of Kestrel technology |
 
+## Executable Demo Evidence
+
+Some user-facing workflows are backed by executable demos and visual review configs. The generated evidence index is [../generated/DEMO_EVIDENCE.md](../generated/DEMO_EVIDENCE.md).
+
+| Workflow | Human doc | Demo script | Visual review |
+|---|---|---|---|
+| Sovereign Console technical walkthrough | [../demos/DEMO_SCRIPT.md](../demos/DEMO_SCRIPT.md) | [../../demos/technical/demo.cjs](../../demos/technical/demo.cjs) | [../../demos/technical/eye.toml](../../demos/technical/eye.toml) |
+| Privacy modes vignette | [KEY_CONCEPTS_EXPLAINED.md](KEY_CONCEPTS_EXPLAINED.md) | [../../demos/privacy-modes/demo.cjs](../../demos/privacy-modes/demo.cjs) | [../../demos/privacy-modes/eye.toml](../../demos/privacy-modes/eye.toml) |
+| Sovereignty/export controls | [SOVEREIGNTY_USER_GUIDE.md](SOVEREIGNTY_USER_GUIDE.md) | [../../demos/technical/demo.cjs](../../demos/technical/demo.cjs) | [../../demos/technical/eye.toml](../../demos/technical/eye.toml) |
+
 ## Audience
 
 These documents are written for:

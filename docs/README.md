@@ -43,8 +43,27 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 - **[`generated/FEATURES_developer.md`](generated/FEATURES_developer.md)** — auto-generated developer feature reference
 - **[`generated/FEATURES_user.md`](generated/FEATURES_user.md)** — user-facing feature reference
 - **[`generated/FEATURES_investor.md`](generated/FEATURES_investor.md)** — investor-facing feature reference
+- **[`generated/DEMO_EVIDENCE.md`](generated/DEMO_EVIDENCE.md)** — generated index of executable demos and visual-review configs
 
-Regenerate via `scripts/generate_feature_docs.py`.
+Regenerate feature audience docs via `scripts/generate_feature_docs.py`; regenerate demo evidence via `scripts/generate_demo_evidence_docs.py`.
+
+## OKF metadata
+
+Kestrel is migrating `docs/` toward Google Open Knowledge Format (OKF): Markdown plus YAML frontmatter. The migration plan is [`audit/OKF_MIGRATION_PLAN.md`](audit/OKF_MIGRATION_PLAN.md).
+
+Generated OKF views:
+
+- **[`audit/index.md`](audit/index.md)** / **[`audit/log.md`](audit/log.md)** — OKF concepts and pending docs in the audit tree
+- **[`generated/index.md`](generated/index.md)** / **[`generated/log.md`](generated/log.md)** — generated references and their timestamps
+- **[`architecture/index.md`](architecture/index.md)** / **[`architecture/log.md`](architecture/log.md)** — architecture docs pending OKF classification
+
+Validation:
+
+```bash
+uv run python scripts/docs_okf.py validate
+uv run python scripts/docs_okf.py index --check
+uv run python scripts/docs_okf.py log --check
+```
 
 ## Research & references
 

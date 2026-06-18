@@ -1,3 +1,25 @@
+---
+type: Demo Script
+title: Kestrel Sovereign Technical Demo Script
+description: Human narration and screenshot-linked walkthrough for the technical Sovereign Console demo.
+resource: /docs/demos/DEMO_SCRIPT.md
+tags:
+- demos
+- kestrel-flight
+- kestrel-eye
+- sovereign-console
+timestamp: 2026-06-18T00:00:00Z
+status: active
+owner: demo-system
+canonical: false
+generated: false
+source_test: /demos/technical/demo.cjs
+eye_config: /demos/technical/eye.toml
+evidence: /demos/technical/demo-output/
+last_verified: null
+privacy: public
+---
+
 # Kestrel Sovereign - Demo Script
 
 **Issue #133 — Track A: Technical Demo**
@@ -64,6 +86,17 @@ The runner internally does `scripts/setup_demo_agent.py` + `KESTREL_DB_PATH=agen
 Output lands in `demos/technical/demo-output/` — video (.webm), 20 screenshots, and `narration.md`.
 
 > **Never** run `npx playwright test --config=config.cjs` directly against your live server — the demo clears conversation history and toggles permissions, and will mutate real data if `KESTREL_URL` points at your working instance. `kestrel demo run` exists specifically to prevent this.
+
+### Evidence
+
+This walkthrough is backed by executable demo assets:
+
+| Artifact | Path |
+|---|---|
+| Kestrel Flight demo | [../../demos/technical/demo.cjs](../../demos/technical/demo.cjs) |
+| Playwright config | [../../demos/technical/config.cjs](../../demos/technical/config.cjs) |
+| Kestrel Eye expectations | [../../demos/technical/eye.toml](../../demos/technical/eye.toml) |
+| Generated demo evidence index | [../generated/DEMO_EVIDENCE.md](../generated/DEMO_EVIDENCE.md) |
 
 ### Live (with presenter)
 

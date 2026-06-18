@@ -1,0 +1,25 @@
+checks:
+  - name: OKF metadata validation
+    command: uv run python scripts/docs_okf.py validate
+
+  - name: Generated feature docs dry run
+    command: uv run python scripts/generate_feature_docs.py --all --dry-run
+
+  - name: Generated feature docs metadata
+    command: uv run python scripts/generate_feature_docs.py --check
+
+  - name: Demo evidence index
+    command: uv run python scripts/generate_demo_evidence_docs.py --check
+
+  - name: OKF generated indexes
+    command: uv run python scripts/docs_okf.py index --check
+
+  - name: OKF generated logs
+    command: uv run python scripts/docs_okf.py log --check
+
+  - name: OKF docs unit tests
+    command: uv run pytest tests/unit/test_docs_okf.py tests/unit/test_generate_feature_docs.py tests/unit/test_demo_evidence_docs.py tests/unit/test_feature_doc_canonicality.py -q
+
+eye:
+  config: demos/technical/eye.toml
+  screenshot_cmd: kestrel demo run technical

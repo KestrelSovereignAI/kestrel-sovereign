@@ -1,3 +1,23 @@
+---
+type: Review Lane
+title: Signals Workflows Talon
+description: Review prompt for the Signals Workflows Talon lane of the May 2026 documentation
+  audit.
+resource: /docs/audit/documentation-2026-05/lanes/signals_workflows_talon.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: Signals Workflows Talon
 
 Goal: reconcile wake-source docs, workflow ownership, and Talon standalone vs in-agent control-surface boundaries.

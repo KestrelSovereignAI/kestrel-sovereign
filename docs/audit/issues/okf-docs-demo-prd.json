@@ -1,0 +1,46 @@
+{
+  "stories": [
+    {
+      "id": "okf-0",
+      "title": "Add OKF validation and generated-doc metadata gates",
+      "description": "Create OKF validation tooling, add generated feature-doc metadata checks, add CI/Talon quality gates, and document the migration plan.",
+      "done": true
+    },
+    {
+      "id": "okf-1",
+      "title": "Add executable demo evidence index",
+      "description": "Generate a docs index from existing kestrel-flight demo scripts and kestrel-eye configs so UI walkthrough documentation has machine-checkable evidence links.",
+      "done": true
+    },
+    {
+      "id": "okf-2",
+      "title": "Convert active audit workspace to OKF",
+      "description": "Add OKF frontmatter to the May 2026 audit workspace, canonical source docs, report index, stale artifact ledger, and validation command docs.",
+      "done": true
+    },
+    {
+      "id": "okf-3",
+      "title": "Promote OKF indexes and logs",
+      "description": "Extend scripts/docs_okf.py with index/log generation and add generated index.md/log.md files for docs/audit, docs/generated, and docs/architecture.",
+      "done": true
+    },
+    {
+      "id": "okf-4",
+      "title": "Wire demo evidence into documented UI flows",
+      "description": "Link user-facing UI workflow docs to the matching kestrel-flight demo, kestrel-eye config, generated transcript, and review report.",
+      "done": true
+    },
+    {
+      "id": "okf-5",
+      "title": "Improve Talon demo/docs gates if needed",
+      "description": "If Talon quality config needs richer path-aware docs or demo gating, update the sibling kestrel-talon project in its own worktree and add contract tests there.",
+      "done": false
+    },
+    {
+      "id": "okf-6",
+      "title": "Improve Flight/Eye demo evidence outputs if needed",
+      "description": "If demo evidence needs better transcript/report metadata, update sibling kestrel-flight or kestrel-eye in their own worktrees and preserve compatibility with current demos.",
+      "done": false
+    }
+  ]
+}
