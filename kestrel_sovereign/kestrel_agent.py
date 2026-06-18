@@ -2220,6 +2220,14 @@ Expected Duration: {expected_duration}
         invoke this directly while the streaming generator already holds
         the lifecycle, avoiding a self-deadlock against a non-reentrant
         asyncio.Lock."""
+        # Record THIS turn's session so tools that must scope to the active
+        # conversation (read_attachment, request_restart's origin capture) have
+        # an authoritative value — the tool-call `session_id` arg is
+        # model-controlled and usually omitted. Mirrors the streaming path
+        # (streaming.py); the turn-lifecycle lock serializes turns per agent, so
+        # this plain attribute is safe per-turn (#1662 / #1809).
+        self._active_session_id = session_id
+
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 

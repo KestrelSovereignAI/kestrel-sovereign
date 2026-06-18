@@ -1677,6 +1677,25 @@ async def test_request_restart_captures_origin_session(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_request_restart_captures_active_session(tmp_path):
+    """The authoritative per-turn _active_session_id (set by the turn body from
+    the JSON-body session — the primary chat path) is captured and takes
+    precedence over the logging ContextVar."""
+    from kestrel_sovereign.logging_config import session_id_var
+
+    feat, backend = await _make_feature(tmp_path)
+    feat.agent._active_session_id = "body-session-9"
+    token = session_id_var.set("header-session-1")
+    try:
+        result = await feat.request_restart(reason="ship it")
+    finally:
+        session_id_var.reset(token)
+
+    row = await get_request(backend, result.data["request"]["id"])
+    assert row.origin_session_id == "body-session-9"  # active wins over header
+
+
+@pytest.mark.asyncio
 async def test_request_restart_no_session_is_blank(tmp_path):
     """With no chat session in context (CLI/system), origin_session_id is blank."""
     feat, backend = await _make_feature(tmp_path)

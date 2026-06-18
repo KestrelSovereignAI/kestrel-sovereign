@@ -321,16 +321,20 @@ class RestartCoordinatorFeature(Feature):
             getattr(self.agent, "_current_request_id", "") or ""
         )
         # Capture the chat session this request was filed from so the
-        # post-restart wake lands in the SAME window (#1809). The dispatcher
-        # sets ``session_id_var`` per HTTP turn (server.py); the tool call runs
-        # inside that turn's async context, so the ContextVar is visible here.
+        # post-restart wake lands in the SAME window (#1809). Prefer the agent's
+        # authoritative per-turn ``_active_session_id`` (set by both the
+        # streaming and non-streaming turn bodies from the effective session,
+        # incl. the JSON-body session the primary chat path uses). Fall back to
+        # the logging ``session_id_var`` (set only from a query param / header).
         # Empty for CLI/system-filed requests with no session — those wake
         # system-initiated, as before.
-        try:
-            from kestrel_sovereign.logging_config import session_id_var
-            origin_session_id = session_id_var.get() or ""
-        except Exception:
-            origin_session_id = ""
+        origin_session_id = getattr(self.agent, "_active_session_id", "") or ""
+        if not origin_session_id:
+            try:
+                from kestrel_sovereign.logging_config import session_id_var
+                origin_session_id = session_id_var.get() or ""
+            except Exception:
+                origin_session_id = ""
         req = await insert_request(
             self._db,
             requested_by_agent=str(agent_id),
