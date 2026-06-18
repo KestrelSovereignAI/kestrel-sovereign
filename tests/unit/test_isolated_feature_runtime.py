@@ -86,6 +86,92 @@ async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_p
     assert clients[0].stopped is True
 
 
+def test_service_command_console_script(tmp_path):
+    """`service` resolves to a console-script in the venv bin/, not `python -m`."""
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    runtime = InstalledFeatureRuntime(
+        class_name="WhatsAppWebFeature",
+        entry_point="wa.feature:WhatsAppWebFeature",
+        distribution="kestrel-channel-whatsapp",
+        runtime="isolated-venv",
+        service="kestrel-whatsapp-web",
+        project="service",
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    cmd = feature._service_command()
+    assert cmd == [str(feature._venv_path / "bin" / "kestrel-whatsapp-web")]
+    # the install target is `project`, never the `service` runnable
+    assert (runtime.project or runtime.distribution) == "service"
+
+
+def test_service_command_module_func(tmp_path):
+    """`service` of the form module:func runs via the venv python, not `-m`."""
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    runtime = InstalledFeatureRuntime(
+        class_name="SvcFeature",
+        entry_point="svc.feature:SvcFeature",
+        distribution="svc-pkg",
+        runtime="isolated-venv",
+        service="svc_pkg.service:main",
+    )
+    feature = ProxyFeature(agent, runtime, client_factory=FakeIsolatedClient)
+    feature._venv_path, feature._bin_path = feature.resolve_runtime_paths()
+    cmd = feature._service_command()
+    assert cmd[0] == str(feature._venv_path / "bin" / "python")
+    assert cmd[1] == "-c"
+    assert "from svc_pkg.service import main" in cmd[2]
+    assert "-m" not in cmd  # never `python -m <install-target>`
+
+
+@pytest.mark.asyncio
+async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path):
+    """Leak guard: supervision task registers with the agent's background-task
+    lifecycle, and cancelling it (agent shutdown path) stops the child."""
+    import asyncio
+
+    tracked = []
+
+    class FakeAgent:
+        storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+        features: dict = {}
+
+        def _track_background_task(self, coro, *, name):
+            task = asyncio.create_task(coro, name=name)
+            tracked.append(task)
+            return task
+
+    runtime = InstalledFeatureRuntime(
+        class_name="SvcFeature",
+        entry_point="svc.feature:SvcFeature",
+        distribution="svc-pkg",
+        runtime="isolated-venv",
+        service="svc",
+    )
+    feature = ProxyFeature(FakeAgent(), runtime, client_factory=FakeIsolatedClient)
+    feature._client_factory = lambda **kw: FakeIsolatedClient(**kw)
+    monkey_bin = tmp_path  # avoid real venv work
+    import os
+    os.environ["KESTREL_FEATURE_SVCFEATURE_BIN"] = str(monkey_bin / "svc-bin")
+    try:
+        await feature.initialize()
+        # registered through the agent's tracker, not a bare task
+        assert feature._supervision_task in tracked
+        client = feature._client
+        await asyncio.sleep(0.05)  # let the supervision loop enter its body
+        # simulate agent shutdown cancelling tracked background tasks
+        feature._supervision_task.cancel()
+        try:
+            await feature._supervision_task
+        except asyncio.CancelledError:
+            pass
+        assert client.stopped is True  # child torn down despite no shutdown() call
+    finally:
+        os.environ.pop("KESTREL_FEATURE_SVCFEATURE_BIN", None)
+
+
 def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
     agent = Mock()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")

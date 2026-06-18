@@ -1,4 +1,18 @@
-"""Isolated feature runtime proxy and per-agent venv provisioning."""
+"""Isolated feature runtime proxy and per-agent venv provisioning.
+
+A feature distribution opts into out-of-venv execution via its pyproject:
+
+    [tool.kestrel.feature]
+    runtime = "isolated-venv"
+    service = "kestrel-whatsapp-web"   # runnable: a console-script name, or "module:func"
+    project = "service"                # install target for the venv (path/dist); defaults to the distribution
+    # venv  = "/abs/path/.venv"        # optional explicit venv-path override
+
+`service` is the thing to RUN (resolved from the per-agent venv's bin/ as a
+console script, or executed as a "module:func" callable). `project` is the
+thing to INSTALL. They are deliberately distinct so the runnable is never
+mistaken for a pip target or a `python -m` module.
+"""
 
 import asyncio
 import inspect
@@ -28,6 +42,10 @@ def _agent_data_dir(agent: Any) -> Path:
     if storage_path:
         return Path(storage_path).expanduser().resolve().parent
     return (Path.cwd() / "agent_data" / "default").resolve()
+
+
+def _venv_bin_dir(venv_path: Path) -> Path:
+    return venv_path / ("Scripts" if os.name == "nt" else "bin")
 
 
 def _venv_python(venv_path: Path) -> Path:
@@ -129,7 +147,7 @@ class ProxyFeature(Feature):
         await self._register_event_handler()
         advertised_tools = await _maybe_await(self._client.list_tools())
         self._tools = [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
-        self._supervision_task = asyncio.create_task(self._supervise())
+        self._supervision_task = self._start_supervision()
 
     async def shutdown(self):
         self._stopping = True
@@ -203,10 +221,12 @@ class ProxyFeature(Feature):
         if not created:
             return
 
-        install_target = self.runtime.service or self.runtime.distribution
+        # Install the PROJECT (path/dist), never the `service` runnable — the
+        # latter is a console-script name or "module:func", not a pip target.
+        install_target = self.runtime.project or self.runtime.distribution
         if not install_target:
             raise RuntimeError(
-                f"Isolated feature {self.name} has no service project to install"
+                f"Isolated feature {self.name} has no project/distribution to install"
             )
         self._run(["uv", "pip", "install", "--python", str(python_path), install_target])
 
@@ -250,13 +270,38 @@ class ProxyFeature(Feature):
         except (TypeError, ValueError):
             pass
 
+        return factory(self._service_command())
+
+    def _service_command(self) -> List[str]:
+        """Build the argv to launch the isolated service.
+
+        Resolution order:
+          1. explicit BIN override (``self._bin_path``);
+          2. ``service`` of the form ``module:func`` -> ``<venv-python> -c ...``;
+          3. ``service`` as a console-script name -> ``<venv>/bin/<script>``.
+        The ``service`` runnable is NEVER treated as a ``python -m`` module
+        (it may be a path/dist), which is what previously broke startup.
+        """
         if self._bin_path is not None:
-            return factory([str(self._bin_path)])
+            return [str(self._bin_path)]
+
+        service = self.runtime.service
+        if not service:
+            raise RuntimeError(
+                f"Isolated feature {self.name} has no `service` runnable configured"
+            )
+
+        if ":" in service:  # module:func callable
+            module, _, func = service.partition(":")
+            python = (
+                str(_venv_python(self._venv_path)) if self._venv_path else "python"
+            )
+            return [python, "-c", f"from {module} import {func}; {func}()"]
+
+        # console-script installed into the venv's bin/Scripts dir
         if self._venv_path is not None:
-            python = _venv_python(self._venv_path)
-            service = self.runtime.service or self.runtime.distribution
-            return factory([str(python), "-m", str(service)])
-        return factory()
+            return [str(_venv_bin_dir(self._venv_path) / service)]
+        return [service]
 
     async def _register_event_handler(self) -> None:
         register = (
@@ -282,34 +327,62 @@ class ProxyFeature(Feature):
         if first_name in {"handler", "callback", "event_handler"}:
             await _maybe_await(on_event(self._handle_event))
 
-    async def _supervise(self) -> None:
-        backoff = 1.0
-        while not self._stopping:
-            await asyncio.sleep(backoff)
+    def _start_supervision(self) -> asyncio.Task:
+        """Start the supervision loop, registered with the agent's background-task
+        lifecycle when available so normal agent shutdown cancels it (otherwise
+        the child process + task leak — agent shutdown does not call every
+        feature's ``shutdown()``). Falls back to a bare task (e.g. under test
+        doubles whose ``_track_background_task`` doesn't return a real Task)."""
+        name = f"isolated-feature:{self.name}"
+        coro = self._supervise()
+        tracker = getattr(self.agent, "_track_background_task", None)
+        if callable(tracker):
             try:
-                health = await _maybe_await(self._client.health())
-                healthy = bool(health)
-                if isinstance(health, dict):
-                    healthy = bool(health.get("ok", health.get("healthy", True)))
-                if healthy:
-                    backoff = 1.0
-                    continue
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Isolated feature %s health check failed: %s", self.name, exc)
-
-            if self._stopping:
-                break
-            try:
-                await _maybe_await(self._client.stop())
+                task = tracker(coro, name=name)
             except Exception:  # noqa: BLE001
-                pass
-            await asyncio.sleep(backoff)
-            try:
-                await _maybe_await(self._client.start())
-                backoff = 1.0
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
-                backoff = min(backoff * 2, 30.0)
+                task = None
+            if isinstance(task, asyncio.Task):
+                return task
+        return asyncio.create_task(coro, name=name)
+
+    async def _supervise(self) -> None:
+        try:
+            backoff = 1.0
+            while not self._stopping:
+                await asyncio.sleep(backoff)
+                try:
+                    health = await _maybe_await(self._client.health())
+                    healthy = bool(health)
+                    if isinstance(health, dict):
+                        healthy = bool(health.get("ok", health.get("healthy", True)))
+                    if healthy:
+                        backoff = 1.0
+                        continue
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Isolated feature %s health check failed: %s", self.name, exc)
+
+                if self._stopping:
+                    break
+                try:
+                    await _maybe_await(self._client.stop())
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(backoff)
+                try:
+                    await _maybe_await(self._client.start())
+                    backoff = 1.0
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Isolated feature %s restart failed: %s", self.name, exc)
+                    backoff = min(backoff * 2, 30.0)
+        finally:
+            # If the task is cancelled (e.g. agent shutdown cancelling tracked
+            # background tasks) rather than stopped via shutdown(), make sure the
+            # child process is still torn down so it can't outlive the agent.
+            if not self._stopping and self._client is not None:
+                try:
+                    await _maybe_await(self._client.stop())
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def _handle_event(self, event: Any) -> None:
         kind = _meta_get(event, "type") or _meta_get(event, "event") or _meta_get(event, "kind")

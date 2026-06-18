@@ -73,7 +73,14 @@ class InstalledFeatureRuntime:
     entry_point: str
     distribution: str
     runtime: str = "in-process"
+    # `service`: the runnable in the isolated venv — a console-script name (from
+    # the service project's [project.scripts]) or a "module:func" callable.
     service: Optional[str] = None
+    # `project`: install target for the venv (path or distribution). Defaults to
+    # `distribution` when unset. Kept distinct from `service` so the runnable is
+    # never mistaken for a `python -m` module / pip-install target.
+    project: Optional[str] = None
+    # `venv`: optional explicit venv-path override.
     venv: Optional[str] = None
     description: str = ""
     config_schema: Optional[Dict[str, Any]] = None
@@ -233,6 +240,7 @@ def discover_installed_feature_runtimes() -> Dict[str, InstalledFeatureRuntime]:
 
         runtime = str(feature_meta.get("runtime") or "in-process").strip().lower()
         service = feature_meta.get("service")
+        project = feature_meta.get("project")
         venv = feature_meta.get("venv")
         description = str(feature_meta.get("description") or "")
         config_schema = feature_meta.get("config_schema")
@@ -245,6 +253,7 @@ def discover_installed_feature_runtimes() -> Dict[str, InstalledFeatureRuntime]:
             distribution=dist_name,
             runtime=runtime,
             service=str(service) if service else None,
+            project=str(project) if project else None,
             venv=str(venv) if venv else None,
             description=description,
             config_schema=config_schema,
