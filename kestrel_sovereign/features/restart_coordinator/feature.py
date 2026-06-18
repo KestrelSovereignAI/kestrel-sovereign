@@ -1333,7 +1333,14 @@ class RestartCoordinatorFeature(Feature):
         to 1 once the COGNITION dispatch returns ``Status.OK``; until then the
         row is re-swept and the wake retried.
         """
-        now = datetime.now(timezone.utc).isoformat()
+        # The wake must report when the restart actually COMPLETED, not when
+        # this (possibly retried) dispatch runs — otherwise a cron-retried wake
+        # would claim a later "landed at" time than the row/status event (#1819
+        # codex P3). The sweep terminalizes before dispatch, so completed_at is
+        # set; fall back to now only if it's somehow missing.
+        completed_at = getattr(row, "completed_at", None) or datetime.now(
+            timezone.utc
+        ).isoformat()
 
         # No dispatcher to wake (headless host, test stub): nothing to deliver
         # to and no point retrying forever, so mark the wake delivered.
@@ -1352,7 +1359,7 @@ class RestartCoordinatorFeature(Feature):
                 build_signal_for_restart_completed,
             )
             signal = build_signal_for_restart_completed(
-                row, target_agent=str(agent_id), completed_at=now,
+                row, target_agent=str(agent_id), completed_at=completed_at,
             )
             handle = dispatcher.enqueue_signal(signal)
             if asyncio.iscoroutine(handle):
