@@ -1798,3 +1798,34 @@ async def test_initialize_alone_does_not_wake_only_on_agent_ready(tmp_path):
     # now the wake fires and the row terminalizes.
     assert len(dispatcher.signals) == 1
     assert (await get_request(backend, req.id)).status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# #1809 follow-up: restart visible in chat (live wake + persisted bubble)
+# ---------------------------------------------------------------------------
+
+
+def test_restart_completed_signal_is_user_visible_with_summary():
+    """The wake signal must be USER_VISIBLE with a result_summary so the
+    dispatcher emits signal_completed and the frontend renders it live."""
+    from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign.features.restart_coordinator.store import RestartRequest
+    from kestrel_sovereign.signals.sources.restart import (
+        build_restart_completed_registration,
+        build_signal_for_restart_completed,
+    )
+
+    reg = build_restart_completed_registration()
+    assert reg.result_summary is not None
+    assert reg.result_summary("I'm back, booted d4e86bf.") == "I'm back, booted d4e86bf."
+    assert reg.result_summary(None) == ""
+
+    req = RestartRequest(
+        id="r1", requested_by_agent="did:a", reason="x", requested_at="t",
+        desired_window="", urgency="normal", policy="idle_agents_only",
+        status="executing", status_reason="", completed_at=None,
+        origin_session_id="1114",
+    )
+    sig = build_signal_for_restart_completed(req, target_agent="did:a", completed_at="now")
+    assert sig.visibility == Visibility.USER_VISIBLE
+    assert sig.session_id == "1114"
