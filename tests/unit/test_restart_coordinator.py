@@ -719,10 +719,10 @@ async def test_executor_defers_when_no_introspection_surface(tmp_path):
 
 @pytest.mark.asyncio
 async def test_post_restart_sweep_retries_when_dispatcher_raises(tmp_path):
-    """If the dispatcher is present but ``enqueue_signal`` raises,
-    the row must STAY in executing so a future agent boot's sweep
-    can retry. Pre-codex-P2-fix the row was already terminalized
-    so the wake was permanently lost.
+    """If the dispatcher is present but ``enqueue_signal`` raises, the restart
+    is still terminalized (it provably happened) but the wake stays UNDELIVERED
+    (wake_delivered=0) so a future sweep retries it (#1819; pre-#1819 the row
+    stayed executing).
     """
     backend = await _backend(tmp_path)
     req = await insert_request(
@@ -740,12 +740,11 @@ async def test_post_restart_sweep_retries_when_dispatcher_raises(tmp_path):
     agent = _make_agent(backend, dispatcher=_BrokenDispatcher())
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
-    await feat.on_agent_ready()  # sweep dispatches; broken dispatcher leaves it executing
+    await feat.on_agent_ready()  # terminalizes, then the broken dispatcher fails the wake
 
     row = await get_request(backend, req.id)
-    assert row.status == "executing", (
-        f"row must stay executing for retry; got {row.status!r}"
-    )
+    assert row.status == "completed"        # restart finished
+    assert row.wake_delivered is False      # wake undelivered → retried later
 
 
 # ---------------------------------------------------------------------------
@@ -841,9 +840,9 @@ async def test_post_restart_wake_reaches_process_input_and_then_completes(
     tmp_path,
 ):
     """The swept ``restart.completed`` wake must reach the agent's
-    ``process_input`` (the real resumption path), and the row must be
-    terminalized to ``completed`` only AFTER that delivery lands — not
-    merely because ``enqueue_signal`` returned (#1796).
+    ``process_input`` (the real resumption path). The row is terminalized to
+    ``completed`` up front (#1819), and ``wake_delivered`` flips only once that
+    dispatch lands Status.OK — not merely because ``enqueue_signal`` returned.
     """
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     req = await insert_request(
@@ -856,26 +855,29 @@ async def test_post_restart_wake_reaches_process_input_and_then_completes(
 
     await feat.initialize()
     await feat.on_agent_ready()  # fires the post-restart wake now the agent is ready
-    # The wake runs as a supervised background task; the row is still
-    # executing until that dispatch lands.
+    # The restart is terminalized immediately (it provably happened); the wake
+    # runs as a supervised background task, so wake_delivered is still 0.
     row_mid = await get_request(backend, req.id)
-    assert row_mid.status == "executing"
+    assert row_mid.status == "completed"
+    assert row_mid.wake_delivered is False
 
     await agent.drain_background_tasks()
 
     # The wake reached the agent's resuming turn...
     assert len(agent.process_input_calls) == 1
     assert req.id in agent.process_input_calls[0]
-    # ...and ONLY THEN did the row terminalize.
+    # ...and ONLY THEN was the wake flagged delivered.
     row = await get_request(backend, req.id)
     assert row.status == "completed"
+    assert row.wake_delivered is True
 
 
 @pytest.mark.asyncio
 async def test_post_restart_wake_failure_leaves_row_retryable(tmp_path):
-    """If the wake's resuming turn fails (dispatch returns FAILED), the
-    row must STAY executing so a later sweep retries it — the pre-#1796
-    code terminalized on enqueue success and lost the wake forever.
+    """If the wake's resuming turn fails (dispatch returns FAILED), the restart
+    is still terminalized (it provably happened) but ``wake_delivered`` stays 0
+    so a later sweep retries the wake (#1819; pre-#1819 the row stayed
+    executing).
     """
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     agent.process_input_should_raise = True
@@ -892,17 +894,16 @@ async def test_post_restart_wake_failure_leaves_row_retryable(tmp_path):
     await agent.drain_background_tasks()
 
     row = await get_request(backend, req.id)
-    assert row.status == "executing", (
-        f"a failed wake must stay retryable; got {row.status!r}"
-    )
+    assert row.status == "completed"        # restart finished
+    assert row.wake_delivered is False      # wake failed → retried later
 
 
 @pytest.mark.asyncio
 async def test_restart_coordinator_cron_retries_undelivered_wake(tmp_path):
-    """The ``restart_coordinator`` cron tick is the retry backstop: an
-    ``executing`` row whose wake failed on the init sweep must be re-woken
-    on a later tick (without waiting for a full reboot), and once the
-    resuming turn succeeds the row terminalizes (#1796).
+    """The ``restart_coordinator`` cron tick is the retry backstop: a
+    ``completed`` row whose wake failed (wake_delivered=0) on the ready sweep
+    must be re-woken on a later tick (without waiting for a full reboot), and
+    once the resuming turn succeeds wake_delivered flips to 1 (#1796/#1819).
     """
     feat, backend, agent = await _real_dispatch_feature(tmp_path)
     agent.process_input_should_raise = True
@@ -914,16 +915,18 @@ async def test_restart_coordinator_cron_retries_undelivered_wake(tmp_path):
         expected_current_status="pending",
     )
 
-    # Ready sweep: wake fails, row stays executing.
+    # Ready sweep: restart terminalizes, but the wake fails → undelivered.
     await feat.initialize()
     await feat.on_agent_ready()
     await agent.drain_background_tasks()
-    assert (await get_request(backend, req.id)).status == "executing"
+    row_after_first = await get_request(backend, req.id)
+    assert row_after_first.status == "completed"
+    assert row_after_first.wake_delivered is False
     assert agent.process_input_calls == []
 
-    # The resuming turn now succeeds; a cron tick must re-wake and complete.
+    # The resuming turn now succeeds; a cron tick must re-wake and deliver.
     # Re-anchor the dispatcher's coalescing window to model the >30s gap
-    # between the init sweep and a production 1/min cron tick (a fast
+    # between the ready sweep and a production 1/min cron tick (a fast
     # in-test retry would otherwise coalesce against the failed wake).
     agent.dispatcher.notify_resume(60.0)
     agent.process_input_should_raise = False
@@ -934,7 +937,9 @@ async def test_restart_coordinator_cron_retries_undelivered_wake(tmp_path):
     await agent.drain_background_tasks()
 
     assert len(agent.process_input_calls) == 1
-    assert (await get_request(backend, req.id)).status == "completed"
+    row_final = await get_request(backend, req.id)
+    assert row_final.status == "completed"
+    assert row_final.wake_delivered is True
 
 
 @pytest.mark.asyncio

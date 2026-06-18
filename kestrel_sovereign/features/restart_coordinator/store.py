@@ -67,6 +67,12 @@ _ADDED_COLUMNS = (
     # Session the request was filed from, so the post-restart wake can be
     # dispatched back into the SAME chat window the agent asked from (#1809).
     ("origin_session_id", "TEXT DEFAULT ''"),
+    # Whether the post-restart ``restart.completed`` wake has actually been
+    # DELIVERED (#1819). Decouples "restart finished" (status=completed, set as
+    # soon as a prior-boot row is swept) from "agent has been notified" (this
+    # flag, set once the COGNITION wake lands Status.OK). The sweep retries the
+    # wake while this is 0; it never re-terminalizes an already-completed row.
+    ("wake_delivered", "INTEGER DEFAULT 0"),
 )
 
 # Canonical column order shared by every SELECT below and ``from_row``.
@@ -75,7 +81,7 @@ _COLUMNS = (
     "urgency, policy, status, status_reason, completed_at, operation, "
     "update_repo_path, update_target_ref, update_profile, "
     "update_allow_migrations, update_log, requester_request_id, "
-    "executing_boot_id, origin_session_id"
+    "executing_boot_id, origin_session_id, wake_delivered"
 )
 
 
@@ -111,6 +117,10 @@ class RestartRequest:
     # restart.completed wake is dispatched into this session so it surfaces
     # in the same chat window the request came from.
     origin_session_id: str = ""
+    # Whether the post-restart wake has been delivered (#1819). A row can be
+    # ``completed`` (restart finished) with ``wake_delivered=False`` while the
+    # wake is still being retried.
+    wake_delivered: bool = False
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -139,6 +149,7 @@ class RestartRequest:
             requester_request_id=str(g(16) or ""),
             executing_boot_id=str(g(17) or ""),
             origin_session_id=str(g(18) or ""),
+            wake_delivered=bool(int(g(19) or 0)),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -172,6 +183,7 @@ class RestartRequest:
             "requester_request_id": self.requester_request_id,
             "executing_boot_id": self.executing_boot_id,
             "origin_session_id": self.origin_session_id,
+            "wake_delivered": self.wake_delivered,
         }
 
 
@@ -198,7 +210,8 @@ async def ensure_restart_requests_table(db) -> None:
             update_log TEXT DEFAULT '',
             requester_request_id TEXT DEFAULT '',
             executing_boot_id TEXT DEFAULT '',
-            origin_session_id TEXT DEFAULT ''
+            origin_session_id TEXT DEFAULT '',
+            wake_delivered INTEGER DEFAULT 0
         )
         """
     )
@@ -301,6 +314,39 @@ async def list_requests(
     sql += " ORDER BY requested_at DESC"
     rows = await db.fetchall(sql, tuple(params))
     return [RestartRequest.from_row(r) for r in rows]
+
+
+async def list_requests_needing_wake(
+    db, *, agent_id: Optional[str] = None,
+) -> List[RestartRequest]:
+    """Rows whose post-restart wake still has to be delivered (#1819).
+
+    Two shapes qualify: a still-``executing`` row from a prior boot (the
+    restart landed but the row hasn't been terminalized yet) and a
+    ``completed`` row whose ``wake_delivered`` is still 0 (terminalized, but
+    the wake hasn't landed Status.OK — a retry). The sweep terminalizes the
+    former before dispatching, and retries the wake for both until delivered.
+    """
+    where = ["(status = 'executing' OR (status = 'completed' AND wake_delivered = 0))"]
+    params: List[Any] = []
+    if agent_id:
+        where.append("requested_by_agent = ?")
+        params.append(agent_id)
+    sql = (
+        f"SELECT {_COLUMNS} FROM restart_requests WHERE "
+        + " AND ".join(where)
+        + " ORDER BY requested_at DESC"
+    )
+    rows = await db.fetchall(sql, tuple(params))
+    return [RestartRequest.from_row(r) for r in rows]
+
+
+async def mark_wake_delivered(db, request_id: str) -> None:
+    """Flag a request's post-restart wake as delivered (#1819)."""
+    await db.execute(
+        "UPDATE restart_requests SET wake_delivered = 1 WHERE id = ?",
+        (request_id,),
+    )
 
 
 async def get_request(db, request_id: str) -> Optional[RestartRequest]:
