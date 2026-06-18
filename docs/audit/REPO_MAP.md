@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-17
-**Scope:** 1735 tracked files (1130 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-18
+**Scope:** 1736 tracked files (1131 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -1865,7 +1865,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
 - **tests/unit/test_anthropic_oauth_delegation.py** — Unit tests for Claude Code credential delegation (anthropic:plan).
-  - `def test_keychain_read_parses_claude_oauth(monkeypatch)`; `def test_keychain_read_none_on_missing_item(monkeypatch)`; `def test_keychain_read_none_on_oserror(monkeypatch)`; `def test_keychain_write_merges_and_preserves_fields(monkeypatch)`; `def test_keychain_write_false_when_item_absent(monkeypatch)`; `def test_file_source_roundtrip_preserves_wrapper(tmp_path)`; `def test_discover_prefers_keychain_on_darwin(monkeypatch, tmp_path)`; `def test_discover_falls_back_to_file_off_darwin(monkeypatch, tmp_path)`; `…`
+  - `def test_keychain_read_parses_claude_oauth(monkeypatch)`; `def test_keychain_read_none_on_missing_item(monkeypatch)`; `def test_resolve_account_picks_freshest_valid(monkeypatch)`; `def test_keychain_read_none_on_oserror(monkeypatch)`; `def test_keychain_write_merges_and_preserves_fields(monkeypatch)`; `def test_keychain_write_false_when_item_absent(monkeypatch)`; `def test_file_source_roundtrip_preserves_wrapper(tmp_path)`; `def test_discover_prefers_keychain_on_darwin(monkeypatch, tmp_path)`; `…`
 - **tests/unit/test_anthropic_oauth_shaping.py** — Unit tests for the Claude subscription (OAuth/plan route) request shaping and OAuth token-refresh lifecycle.
   - `async def test_api_route_does_not_inject_identity()`; `async def test_plan_route_prepends_identity_as_first_block()`; `async def test_plan_route_identity_when_no_system_prompt()`; `async def test_plan_route_identity_first_with_tools_and_history()`; `def test_coerce_expires_at_ms_vs_seconds()`; `def test_parse_credentials_claude_code_wrapper()`; `def test_parse_credentials_snake_case_and_missing_access()`; `def test_needs_refresh_requires_refresh_and_expiry()`; `…`
 - **tests/unit/test_anthropic_wire_model_id.py** — Unit tests for AnthropicAdapter wire model-id normalization (#1420).
@@ -1986,7 +1986,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_codex_adapter_turn_failure_honesty.py** — Codex adapter must raise on upstream turn failures (#1438).
   - `async def test_standalone_error_event_with_no_retry_raises()`; `async def test_turn_completed_with_failed_status_raises()`
 - **tests/unit/test_codex_app_server.py** — Tests for the codex app-server JSON-RPC client.
-  - `class TestVersionGate`; `class TestBinaryResolution`; `class TestDispatchLogic`; `class TestServerRequestHandlerRegistration`; `class TestTurnIteration`; `class TestInvoluntaryExitRecovery`
+  - `class TestVersionGate`; `class TestBinaryResolution`; `class TestDispatchLogic`; `class TestServerRequestHandlerRegistration`; `class TestTurnIteration`; `class TestIdleWatchdogInflightServerRequest`; `class TestInvoluntaryExitRecovery`
 - **tests/unit/test_codex_app_server_cancel.py** — Cancellation cleanup for the codex app-server client (#1421).
   - `async def test_request_unguarded_drops_pending_on_cancel()`; `async def test_request_unguarded_preserves_cancellation_for_asyncio_timeout()`; `async def test_request_unguarded_timeout_still_raises_typed_error()`; `async def test_request_unguarded_normal_response_unaffected()`
 - **tests/unit/test_codex_app_server_streamreader_limit.py** — Codex app-server spawn must use a buffer ``limit`` large enough for typical JSON-RPC frames (#1438).
@@ -2407,6 +2407,8 @@ Repo entry points and standard project files.
   - `def test_privacy_presets_match_canonical_flag_combinations()`; `def test_scrubbed_storage_is_legacy_alias_for_pii_redacted()`; `def test_legacy_deidentified_aliases_do_not_downgrade_to_normal()`; `def test_privacy_mode_round_trips_to_named_presets()`; `def test_privacy_agent_set_mode_reports_canonical_meanings()`; `def test_privacy_agent_handle_get_privacy_mode_matches_canonical_descriptions()`; `def test_command_handler_delegates_get_privacy_mode_to_privacy_agent()`; `def test_deidentified_status_reports_evidence_required_not_persistent()`
 - **tests/unit/test_privacy_wrapper.py** — Tests for the Privacy-Enforcing Storage Wrapper.
   - `class TestPrivacyPolicy`; `class TestEphemeralMode`; `class TestIsolatedMode`; `class TestAnonymousMode`; `class TestNormalMode`; `class TestDeidentifiedMode`; `class TestModeTransitions`; `class TestWrapperFactory`; `…`
+- **tests/unit/test_process_input_preinit_defer.py** — Regression: a COGNITION dispatch reaching process_input before the agent finishes initialize() must DEFER (clean retryable error), not crash.
+  - `async def test_cognition_turn_before_init_defers_with_clear_error()`; `async def test_preinit_turn_does_not_raise_attributeerror()`
 - **tests/unit/test_process_manager.py** — Unit tests for the Kestrel ProcessManager.
   - `def project_dir(tmp_path)`; `def multi_agent_config()`; `def pm(project_dir)`; `class TestProcessManagerInit`; `class TestStaticHelpers`; `class TestRegisterAgent`; `class TestStartAgent`; `class TestStopAgent`; `…`
 - **tests/unit/test_prometheus_metrics.py** — Tests for Prometheus metrics endpoint and instrumentation.
