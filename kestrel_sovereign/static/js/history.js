@@ -328,17 +328,25 @@ window.loadConversation = async function(sessionId) {
         data.messages.forEach(msg => {
             // Persisted restart-status bubble (#1809): re-render the deployment
             // outcome on reload using the same builder the live SSE handler
-            // uses. Must run BEFORE the system-role skip below, since these are
-            // stored as system messages carrying the payload on metadata.
+            // uses. Must run BEFORE the system-role skip below (these are stored
+            // as system messages). The bubble payload lives in the ENCRYPTED
+            // content (not metadata, which is plaintext); parse it when the
+            // content is decrypted and skip silently when it isn't (ciphertext).
             if (msg.metadata && msg.metadata.type === 'restart_status') {
-                const payload = msg.metadata.restart_status || {};
-                const visibleAgent = state.mountedChatAgent;
-                const visiblePane = visibleAgent === undefined
-                    ? null : state.chatPanes.get(visibleAgent);
-                const target = visiblePane
-                    ? visiblePane.element
-                    : document.getElementById('chat-container');
-                if (target) target.appendChild(buildRestartStatusBubble(payload));
+                let payload = null;
+                try {
+                    const p = JSON.parse(msg.content);
+                    if (p && typeof p === 'object') payload = p;
+                } catch (e) { /* encrypted/unparseable — skip */ }
+                if (payload && payload.request_id) {
+                    const visibleAgent = state.mountedChatAgent;
+                    const visiblePane = visibleAgent === undefined
+                        ? null : state.chatPanes.get(visibleAgent);
+                    const target = visiblePane
+                        ? visiblePane.element
+                        : document.getElementById('chat-container');
+                    if (target) target.appendChild(buildRestartStatusBubble(payload));
+                }
                 return;
             }
             if (msg.role === 'system') return;

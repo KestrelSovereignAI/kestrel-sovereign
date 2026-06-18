@@ -829,14 +829,14 @@ class RestartCoordinatorFeature(Feature):
         add = getattr(getattr(self.agent, "privacy_agent", None), "add_conversation", None)
         if add is None:
             return
-        short_id = str(getattr(req, "id", ""))[:12]
-        op = ("update + restart"
-              if str(getattr(req, "operation", "")) == "update_then_restart"
-              else "restart")
-        content = f"{op} {short_id}: {state}"
-        # ``type`` drives the frontend's restart-bubble renderer on reload; the
-        # full payload lets it paint the same bubble the live SSE event does.
-        metadata = {"type": "restart_status", "restart_status": payload}
+        # Put the bubble payload in the message CONTENT (encrypted at rest by
+        # add_conversation under privacy/encryption modes) — NOT in metadata,
+        # which is stored as plaintext JSON and would leak the user-supplied
+        # ``reason`` outside the encryption boundary (codex P1). Metadata holds
+        # only the non-sensitive ``type`` flag that routes the frontend to its
+        # restart-bubble renderer, which parses the (decrypted) content payload.
+        content = json.dumps(payload, sort_keys=True)
+        metadata = {"type": "restart_status"}
         try:
             await add("system", content, metadata=metadata, session_id=origin_session_id)
         except Exception as e:  # pragma: no cover - defensive

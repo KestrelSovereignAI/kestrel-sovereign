@@ -1858,8 +1858,12 @@ async def test_terminal_status_persists_chat_bubble(tmp_path):
     call = pa.calls[0]
     assert call["role"] == "system"
     assert call["session_id"] == "1114"
-    assert call["metadata"]["type"] == "restart_status"
-    assert call["metadata"]["restart_status"]["request_id"] == req.id
+    # Non-sensitive flag only in (plaintext) metadata; the payload — which
+    # includes the user-supplied reason — rides in the ENCRYPTED content.
+    assert call["metadata"] == {"type": "restart_status"}
+    payload = json.loads(call["content"])
+    assert payload["request_id"] == req.id
+    assert payload.get("reason") == "r"
 
 
 @pytest.mark.asyncio
