@@ -1556,6 +1556,25 @@ export function handleRestartStatus(payload) {
         }
     }
 
+    const div = buildRestartStatusBubble(payload);
+    target.appendChild(div);
+    const c = getChatContainer();
+    if (c) c.scrollTop = c.scrollHeight;
+}
+
+
+/**
+ * Build a standalone restart-status bubble element from a payload.
+ *
+ * Pure (no DOM insertion, no dedupe, no stream-boundary handling) so it can be
+ * reused by the live SSE handler above AND by the history loader, which
+ * re-renders persisted restart bubbles on reload (#1809). The persisted message
+ * carries this same payload under ``metadata.restart_status``.
+ */
+export function buildRestartStatusBubble(payload) {
+    const requestId = String(payload.request_id || '');
+    const state = String(payload.status || 'pending');
+    const dedupeSig = String(payload.dedupe_signature || `${requestId}:${state}`);
     const div = document.createElement('div');
     div.className = 'message restart-status-message';
     div.dataset.requestId = requestId;
@@ -1567,9 +1586,7 @@ export function handleRestartStatus(payload) {
     const accent = RESTART_STATE_ACCENTS[state] || RESTART_STATE_ACCENTS.pending;
     div.style.borderLeftColor = accent;
     renderRestartStatusBody(div, payload);
-    target.appendChild(div);
-    const c = getChatContainer();
-    if (c) c.scrollTop = c.scrollHeight;
+    return div;
 }
 
 

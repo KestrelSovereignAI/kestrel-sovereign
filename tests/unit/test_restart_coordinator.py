@@ -1798,3 +1798,94 @@ async def test_initialize_alone_does_not_wake_only_on_agent_ready(tmp_path):
     # now the wake fires and the row terminalizes.
     assert len(dispatcher.signals) == 1
     assert (await get_request(backend, req.id)).status == "completed"
+
+
+# ---------------------------------------------------------------------------
+# #1809 follow-up: restart visible in chat (live wake + persisted bubble)
+# ---------------------------------------------------------------------------
+
+
+def test_restart_completed_signal_is_user_visible_with_summary():
+    """The wake signal must be USER_VISIBLE with a result_summary so the
+    dispatcher emits signal_completed and the frontend renders it live."""
+    from kestrel_sdk.signals import Visibility
+    from kestrel_sovereign.features.restart_coordinator.store import RestartRequest
+    from kestrel_sovereign.signals.sources.restart import (
+        build_restart_completed_registration,
+        build_signal_for_restart_completed,
+    )
+
+    reg = build_restart_completed_registration()
+    assert reg.result_summary is not None
+    assert reg.result_summary("I'm back, booted d4e86bf.") == "I'm back, booted d4e86bf."
+    assert reg.result_summary(None) == ""
+
+    req = RestartRequest(
+        id="r1", requested_by_agent="did:a", reason="x", requested_at="t",
+        desired_window="", urgency="normal", policy="idle_agents_only",
+        status="executing", status_reason="", completed_at=None,
+        origin_session_id="1114",
+    )
+    sig = build_signal_for_restart_completed(req, target_agent="did:a", completed_at="now")
+    assert sig.visibility == Visibility.USER_VISIBLE
+    assert sig.session_id == "1114"
+
+
+class _CapturingPrivacyAgent:
+    def __init__(self):
+        self.calls = []
+
+    async def add_conversation(self, role, content, metadata=None,
+                               session_id=None, rendered_content=None):
+        self.calls.append({"role": role, "content": content,
+                           "metadata": metadata, "session_id": session_id})
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_persists_chat_bubble(tmp_path):
+    """A terminal restart status persists one restart_status message into the
+    origin session so a chat reload re-renders the outcome."""
+    feat, backend = await _make_feature(tmp_path)
+    pa = _CapturingPrivacyAgent()
+    feat.agent.privacy_agent = pa
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+        origin_session_id="1114",
+    )
+    await feat._emit_status_event(req, state="completed")
+
+    assert len(pa.calls) == 1
+    call = pa.calls[0]
+    assert call["role"] == "system"
+    assert call["session_id"] == "1114"
+    assert call["metadata"]["type"] == "restart_status"
+    assert call["metadata"]["restart_status"]["request_id"] == req.id
+
+
+@pytest.mark.asyncio
+async def test_non_terminal_status_does_not_persist_bubble(tmp_path):
+    """Transient states (pending/executing) paint live via SSE only — they
+    must not leave durable chat bubbles."""
+    feat, backend = await _make_feature(tmp_path)
+    pa = _CapturingPrivacyAgent()
+    feat.agent.privacy_agent = pa
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+        origin_session_id="1114",
+    )
+    await feat._emit_status_event(req, state="pending")
+    await feat._emit_status_event(req, state="executing")
+    assert pa.calls == []
+
+
+@pytest.mark.asyncio
+async def test_no_origin_session_skips_chat_bubble(tmp_path):
+    """A CLI/system-filed request (no origin session) leaves no chat bubble."""
+    feat, backend = await _make_feature(tmp_path)
+    pa = _CapturingPrivacyAgent()
+    feat.agent.privacy_agent = pa
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+    )
+    await feat._emit_status_event(req, state="completed")
+    assert pa.calls == []
