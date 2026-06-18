@@ -2016,6 +2016,16 @@ Expected Duration: {expected_duration}
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
+        # Record THIS turn's session up front — BEFORE command handling — so
+        # tools invoked via an explicit ``!command`` (e.g. request_restart's
+        # origin-session capture) see the current turn's session, not a stale
+        # value from a previous turn. Set to ``session_id`` even when None so a
+        # session-less turn never inherits a prior turn's window (#1809). The
+        # turn-lifecycle lock serializes turns per agent, so this plain
+        # attribute is safe per-turn; the traced-locked bodies re-affirm it for
+        # the streaming-delegation path.
+        self._active_session_id = session_id
+
         # Reset context stats on session change
         if hasattr(self, 'context_stats') and session_id:
             self.context_stats.check_session(session_id)
