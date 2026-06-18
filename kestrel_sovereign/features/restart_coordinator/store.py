@@ -223,7 +223,22 @@ async def ensure_restart_requests_table(db) -> None:
             )
         except Exception:
             # Column already exists — expected on every non-first run.
-            pass
+            continue
+        # The ALTER succeeded → this column was just added on THIS run.
+        # One-time data backfill for the new column:
+        if col == "wake_delivered":
+            # Pre-#1819, a row only reached 'completed' AFTER its wake was
+            # delivered (terminalization was delivery-gated). The new
+            # ``list_requests_needing_wake`` selects ``completed AND
+            # wake_delivered = 0``, so without this backfill every historical
+            # completed restart would be re-woken on the first post-upgrade
+            # sweep. Mark them delivered. This runs exactly once — on later
+            # boots the ALTER raises (column exists) and we skip, so a
+            # genuinely-undelivered new-flow wake still retries across reboots.
+            await db.execute(
+                "UPDATE restart_requests SET wake_delivered = 1 "
+                "WHERE status = 'completed'"
+            )
     await db.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_restart_requests_status

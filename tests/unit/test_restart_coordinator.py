@@ -1834,3 +1834,59 @@ def test_restart_completed_signal_is_user_visible_with_summary():
     sig = build_signal_for_restart_completed(req, target_agent="did:a", completed_at="now")
     assert sig.visibility == Visibility.USER_VISIBLE
     assert sig.session_id == "1114"
+
+
+@pytest.mark.asyncio
+async def test_migration_backfills_wake_delivered_for_old_completed_rows(tmp_path):
+    """#1819 migration safety: a pre-existing 'completed' row (terminalized
+    under the old delivery-gated scheme) must be backfilled wake_delivered=1 so
+    the new sweep doesn't re-wake all restart history on first boot."""
+    raw = SQLiteBackend(str(tmp_path / "old.db"))
+    await raw.connect()
+    db = AsyncDatabase(raw)
+    # Pre-#1819 schema: every column EXCEPT wake_delivered.
+    await db.execute(
+        """
+        CREATE TABLE restart_requests (
+            id TEXT PRIMARY KEY, requested_by_agent TEXT NOT NULL,
+            reason TEXT NOT NULL, requested_at TEXT NOT NULL,
+            desired_window TEXT DEFAULT '', urgency TEXT DEFAULT 'normal',
+            policy TEXT DEFAULT 'idle_agents_only', status TEXT DEFAULT 'pending',
+            status_reason TEXT DEFAULT '', completed_at TEXT,
+            operation TEXT DEFAULT 'restart_only', update_repo_path TEXT DEFAULT '',
+            update_target_ref TEXT DEFAULT '', update_profile TEXT DEFAULT '',
+            update_allow_migrations INTEGER DEFAULT 0, update_log TEXT DEFAULT '',
+            requester_request_id TEXT DEFAULT '', executing_boot_id TEXT DEFAULT '',
+            origin_session_id TEXT DEFAULT ''
+        )
+        """
+    )
+    await db.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, completed_at) "
+        "VALUES ('old-done','did:a','r','t','completed','t')"
+    )
+    await db.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status) "
+        "VALUES ('old-exec','did:a','r','t','executing')"
+    )
+
+    # Migrate (adds wake_delivered + one-time backfill).
+    await ensure_restart_requests_table(db)
+
+    done = await get_request(db, "old-done")
+    assert done.wake_delivered is True  # old completed row → won't be re-woken
+    execu = await get_request(db, "old-exec")
+    assert execu.wake_delivered is False  # still-executing row is untouched
+
+    # Idempotent: a second ensure (column already exists) must NOT reset a
+    # legitimately-undelivered new-flow wake (completed + wake_delivered=0).
+    await db.execute(
+        "INSERT INTO restart_requests "
+        "(id, requested_by_agent, reason, requested_at, status, wake_delivered) "
+        "VALUES ('new-undelivered','did:a','r','t','completed',0)"
+    )
+    await ensure_restart_requests_table(db)
+    nu = await get_request(db, "new-undelivered")
+    assert nu.wake_delivered is False  # not clobbered by a re-run backfill
