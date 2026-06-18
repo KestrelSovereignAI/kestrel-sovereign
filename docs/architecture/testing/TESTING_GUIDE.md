@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Kestrel Test Strategy Guide
+description: A comprehensive guide to running and writing tests for Kestrel Sovereign.
+resource: /docs/architecture/testing/TESTING_GUIDE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Test Strategy Guide
 
 A comprehensive guide to running and writing tests for Kestrel Sovereign.

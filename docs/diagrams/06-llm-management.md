@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: 06 - LLM Management
+description: Multi-model fallback, GPU integration, streaming with tools, and the
+  constitutional honesty layer.
+resource: /docs/diagrams/06-llm-management.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 06 - LLM Management
 
 Multi-model fallback, GPU integration, streaming with tools, and the constitutional honesty layer.

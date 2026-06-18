@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: 273 Progress Update
+description: Audience-doc generation pipeline has been structurally verified against
+  the new canonical inventory.
+resource: /docs/audit/issues/273-progress-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 273 Progress Update
+
 Audience-doc generation pipeline has been structurally verified against the new canonical inventory.
 
 Completed:

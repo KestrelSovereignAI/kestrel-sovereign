@@ -1,3 +1,21 @@
+---
+type: Review Record
+title: Code Reviews
+description: Point-in-time code review notes that are still useful during active PR
+  or follow-up work.
+resource: /docs/code_reviews/README.md
+tags:
+- docs
+- code_reviews
+- review-record
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Code Reviews
 
 Point-in-time code review notes that are still useful during active PR or follow-up work.

@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 07 - Economics
+description: Agent wallet system, contracts, and the vending machine model.
+resource: /docs/diagrams/07-economics.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 07 - Economics
 
 Agent wallet system, contracts, and the vending machine model.

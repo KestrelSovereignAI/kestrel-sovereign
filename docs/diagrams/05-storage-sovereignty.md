@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 05 - Storage & Sovereignty
+description: Kestrel's multi-tier storage and the Sovereignty V2 backup system.
+resource: /docs/diagrams/05-storage-sovereignty.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 05 - Storage & Sovereignty
 
 Kestrel's multi-tier storage and the Sovereignty V2 backup system.

@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: 256 Selector Reuse Update
+description: Shared config-driven model selection is now reused beyond the core LLM
+  runtime.
+resource: /docs/audit/issues/256-selector-reuse-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Selector Reuse Update
+
 Shared config-driven model selection is now reused beyond the core LLM runtime.
 
 What changed:

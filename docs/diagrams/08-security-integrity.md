@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 08 - Security & Integrity
+description: Cryptographic anchoring, constitution verification, and tamper detection.
+resource: /docs/diagrams/08-security-integrity.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 08 - Security & Integrity
 
 Cryptographic anchoring, constitution verification, and tamper detection.

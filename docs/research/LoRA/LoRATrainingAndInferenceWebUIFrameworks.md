@@ -1,3 +1,22 @@
+---
+type: Research Note
+title: '**LoRA Training & Inference Web UI Frameworks**'
+description: Below are several **self-hosted web UI frameworks** that support **LoRA
+  training** on diffusion models and **text-to-image inference** with LoRA adapters,
+  meeting the criteria o...
+resource: /docs/research/LoRA/LoRATrainingAndInferenceWebUIFrameworks.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # **LoRA Training & Inference Web UI Frameworks**
 
 Below are several **self-hosted web UI frameworks** that support **LoRA training** on diffusion models and

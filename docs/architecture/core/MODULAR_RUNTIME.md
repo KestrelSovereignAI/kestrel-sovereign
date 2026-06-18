@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Modular Runtime Boundary
+description: '**Status:** Contract scaffold **Parent issues:** #413, #416, #419 **Last
+  updated:** 2026-05-14'
+resource: /docs/architecture/core/MODULAR_RUNTIME.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Modular Runtime Boundary
 
 **Status:** Contract scaffold

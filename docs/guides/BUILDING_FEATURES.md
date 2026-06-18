@@ -1,3 +1,22 @@
+---
+type: Guide
+title: Building Your First Kestrel Feature
+description: This guide walks you through creating a feature package for Kestrel Sovereign
+  from scratch. By the end, you will have a working feature with tools, hooks, HTTP
+  endpoints, config...
+resource: /docs/guides/BUILDING_FEATURES.md
+tags:
+- docs
+- guides
+- guide
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Building Your First Kestrel Feature
 
 This guide walks you through creating a feature package for Kestrel Sovereign from scratch. By the end, you will have a working feature with tools, hooks, HTTP endpoints, configuration, tests, and packaging.

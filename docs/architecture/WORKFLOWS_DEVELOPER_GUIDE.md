@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Workflows Developer Guide
+description: 'Workflow compensation has two operator-visible failure shapes. Keep
+  them separate in metrics, dashboards, and on-call routing:'
+resource: /docs/architecture/WORKFLOWS_DEVELOPER_GUIDE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Workflows Developer Guide
 
 ## Compensation Alert Tiering

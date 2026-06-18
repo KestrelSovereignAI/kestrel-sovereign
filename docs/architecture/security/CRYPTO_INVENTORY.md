@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Cryptographic Inventory
+description: '**Status:** Wave 0A deliverable. Authoritative inventory of every cryptographic
+  primitive in use, every call-site producing or consuming a signed/MAC''d/ciphertext
+  artifact, and...'
+resource: /docs/architecture/security/CRYPTO_INVENTORY.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Cryptographic Inventory
 
 **Status:** Wave 0A deliverable. Authoritative inventory of every cryptographic primitive in use, every call-site producing or consuming a signed/MAC'd/ciphertext artifact, and the on-disk format each produces.

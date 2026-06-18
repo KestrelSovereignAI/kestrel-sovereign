@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Computer Use & File System
+description: Optional capability that lets a sovereign agent read, list, write, and
+  edit files on the user's machine and run shell commands. Disabled by default. Enabling
+  it requires three i...
+resource: /docs/architecture/computer_use.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Computer Use & File System
 
 Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands. Disabled by default. Enabling it requires three independent actions — and even then, every tool call is gated.

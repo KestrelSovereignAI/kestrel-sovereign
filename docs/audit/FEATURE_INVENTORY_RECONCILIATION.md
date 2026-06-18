@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Feature Inventory Reconciliation
+description: The legacy catalog used fixed plugin counts that no longer matched the
+  implementation.
+resource: /docs/audit/FEATURE_INVENTORY_RECONCILIATION.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Feature Inventory Reconciliation
 
 The legacy catalog used fixed plugin counts that no longer matched the implementation.

@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: Spawn Lifecycle Guard
+description: Recent spawn lifecycle wiring made `delegate_task()` and `terminate_child()`
+  trust any truthy `manager._lifecycle` value. In practice that means partially wired
+  managers or loos...
+resource: /docs/audit/issues/spawn-lifecycle-guard.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# Spawn Lifecycle Guard
+
 ## Problem
 
 Recent spawn lifecycle wiring made `delegate_task()` and `terminate_child()` trust any truthy `manager._lifecycle` value. In practice that means partially wired managers or loose test doubles can be treated as the real lifecycle manager, and the feature will try to `await` methods on a non-lifecycle object.

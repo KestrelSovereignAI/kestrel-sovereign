@@ -1,3 +1,19 @@
+---
+type: Design Note
+title: Kestrel Sovereign Logo Concepts — Image Gen Prompts
+description: Kestrel Sovereign Logo Concepts — Image Gen Prompts.
+resource: /docs/logo-prompts.md
+tags:
+- docs
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Sovereign Logo Concepts — Image Gen Prompts
 
 ## Concept: Rook Castle with Kestrels Launching

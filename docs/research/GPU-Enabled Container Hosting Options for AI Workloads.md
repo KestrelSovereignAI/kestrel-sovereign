@@ -1,3 +1,21 @@
+---
+type: Research Note
+title: '**GPU-Enabled Container Hosting Options for AI** **Workloads**'
+description: Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
+  Below, we compare cloud
+resource: /docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # **GPU-Enabled Container Hosting Options for AI** **Workloads**
 
 Large AI models (like LLMs) demand powerful GPUs with substantial VRAM. Below, we compare cloud

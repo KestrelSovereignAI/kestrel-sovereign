@@ -1,3 +1,22 @@
+---
+type: Use Case
+title: 'PRD: Patient-Controlled Health Records'
+description: To empower every individual with absolute sovereignty over their personal
+  health records. This feature transforms fragmented, institution-controlled medical
+  data into a unified,...
+resource: /docs/use_cases/PATIENT_CONTROLLED_HEALTH_RECORDS.md
+tags:
+- docs
+- use_cases
+- use-case
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: Patient-Controlled Health Records
 
 ## 1. Vision

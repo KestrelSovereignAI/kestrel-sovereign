@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Post-Quantum Threat Model
+description: '**Status:** Wave 0A deliverable, threats now mitigated by waves 1–5
+  (May 2026). The threats below remain relevant — a threat model doesn''t expire when
+  defenses ship — but each i...'
+resource: /docs/architecture/security/PQ_THREAT_MODEL.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Post-Quantum Threat Model
 
 **Status:** Wave 0A deliverable, threats now mitigated by waves 1–5 (May 2026). The threats below remain relevant — a threat model doesn't expire when defenses ship — but each is now addressed by a specific control. See [`SECURITY_OVERVIEW.md`](SECURITY_OVERVIEW.md) for the operator-facing summary or [`POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md`](POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md) for the wave-by-wave map.

@@ -1,3 +1,22 @@
+---
+type: Research Note
+title: KV Cache Quantization Benchmark
+description: '**Date:** March 2026 **Model:** Kimi K2.5 (DeepSeek2 MLA architecture,
+  384x14B MoE, 1T total params) **Quantization:** Q2_K_XL GGUF (~375GB weights) **Server:**
+  llama.cpp via Me...'
+resource: /docs/research/KV_CACHE_QUANTIZATION.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # KV Cache Quantization Benchmark
 
 ## Mac Studio M3 Ultra 512GB — Kimi K2.5 (1T params, Q2_K_XL)

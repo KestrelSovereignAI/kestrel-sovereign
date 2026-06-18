@@ -1,3 +1,22 @@
+---
+type: Developer Note
+title: Big Brain
+description: Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
+resource: /docs/development/BIG_BRAIN.md
+tags:
+- docs
+- development
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
+# Big Brain
+
 Best Open-Weight LLMs for Agentic Chat (December 2025)
 Overview and Criteria
 

@@ -1,3 +1,20 @@
+---
+type: Vision Document
+title: Kestrel Project Vision
+description: This document outlines the high-level vision and core principles for
+  the Kestrel Agent and its ecosystem.
+resource: /docs/PROJECT_VISION.md
+tags:
+- docs
+- vision-document
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Project Vision
 
 This document outlines the high-level vision and core principles for the Kestrel Agent and its ecosystem.

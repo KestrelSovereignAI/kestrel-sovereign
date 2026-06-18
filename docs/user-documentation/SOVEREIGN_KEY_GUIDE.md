@@ -1,3 +1,20 @@
+---
+type: User Guide
+title: Keeping Your Keys Safe from Your Agent
+description: '**Your agent should never have unsupervised access to the master key.**'
+resource: /docs/user-documentation/SOVEREIGN_KEY_GUIDE.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Keeping Your Keys Safe from Your Agent
 
 ## The Golden Rule

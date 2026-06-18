@@ -1,3 +1,21 @@
+---
+type: Developer Note
+title: Dev Container Quick Start
+description: Get a complete Kestrel + Kestrel development environment running in Docker
+  Desktop with one click.
+resource: /docs/development/DEVCONTAINER_QUICKSTART.md
+tags:
+- docs
+- development
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Dev Container Quick Start
 
 Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.

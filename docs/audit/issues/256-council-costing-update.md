@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: 256 Council Costing Update
+description: Council convene/review scripts no longer duplicate stale model-specific
+  pricing tables.
+resource: /docs/audit/issues/256-council-costing-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Council Costing Update
+
 Council convene/review scripts no longer duplicate stale model-specific pricing tables.
 
 What changed:

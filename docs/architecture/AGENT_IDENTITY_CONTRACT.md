@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Agent Identity Contract
+description: 'Every Kestrel agent has a single canonical identity: its **DID** (`self.did`).'
+resource: /docs/architecture/AGENT_IDENTITY_CONTRACT.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Agent Identity Contract
 
 ## Summary

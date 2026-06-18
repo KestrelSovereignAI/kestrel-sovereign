@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-07: Cryostasis - Agent Dormancy'
+description: When agents can't afford to run, they sleep instead of dying.
+resource: /docs/diagrams/data-architecture/DA-07-cryostasis.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-07: Cryostasis - Agent Dormancy
 
 When agents can't afford to run, they sleep instead of dying.

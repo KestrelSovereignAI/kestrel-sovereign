@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 10 - Compute & Script Execution
+description: Secure script execution with constitutional separation of powers.
+resource: /docs/diagrams/10-compute-execution.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 10 - Compute & Script Execution
 
 Secure script execution with constitutional separation of powers.

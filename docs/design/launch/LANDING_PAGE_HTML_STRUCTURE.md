@@ -1,3 +1,21 @@
+---
+type: Design Note
+title: Kestrel Landing Page HTML Structure
+description: This document translates the landing-page copy into an implementation-ready
+  HTML structure for engineering.
+resource: /docs/design/launch/LANDING_PAGE_HTML_STRUCTURE.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Landing Page HTML Structure
 
 This document translates the landing-page copy into an implementation-ready HTML structure for engineering.

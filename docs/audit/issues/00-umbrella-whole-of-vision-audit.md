@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 00 Umbrella Whole Of Vision Audit
+description: '`KESTREL_FEATURES.md` makes a broad set of product, architectural, security,
+  privacy, and deployment claims, but the current test suite is organized primarily
+  by implementation...'
+resource: /docs/audit/issues/00-umbrella-whole-of-vision-audit.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 00 Umbrella Whole Of Vision Audit
+
 ## Problem
 
 `KESTREL_FEATURES.md` makes a broad set of product, architectural, security, privacy, and deployment claims, but the current test suite is organized primarily by implementation history. We have substantial coverage already, including unit, integration, e2e, real-LLM, load, and adversarial tests, but we do not yet have a single audit matrix proving every catalog claim and every high-risk seam.

@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: Data Architecture Deep Dive
+description: A comprehensive series on Kestrel's multi-layer storage system, data
+  sovereignty, and cryostasis.
+resource: /docs/diagrams/data-architecture/README.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Data Architecture Deep Dive
 
 A comprehensive series on Kestrel's multi-layer storage system, data sovereignty, and cryostasis.

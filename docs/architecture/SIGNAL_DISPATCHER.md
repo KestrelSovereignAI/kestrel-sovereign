@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Signal Dispatcher — Design
+description: '**Status:** Draft v3 — second-pass review incorporated, ready for epic
+  creation **Date:** 2026-05-01 **Author:** opus-4.7 (with @UncleSaurus, reviewed
+  by sonnet-4.6)'
+resource: /docs/architecture/SIGNAL_DISPATCHER.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Signal Dispatcher — Design
 
 **Status:** Draft v3 — second-pass review incorporated, ready for epic creation

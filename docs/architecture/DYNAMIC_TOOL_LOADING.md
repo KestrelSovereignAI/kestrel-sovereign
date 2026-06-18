@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Dynamic Tool Loading
+description: '**Status:** Implemented **Author:** Design review **Date:** 2026-02-16
+  **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`,
+  `kestrel_s...'
+resource: /docs/architecture/DYNAMIC_TOOL_LOADING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Dynamic Tool Loading
 
 **Status:** Implemented

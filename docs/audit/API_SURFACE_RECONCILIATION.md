@@ -1,3 +1,20 @@
+---
+type: Audit Ledger
+title: API Surface Reconciliation
+description: The legacy catalog under-described the live HTTP surface.
+resource: /docs/audit/API_SURFACE_RECONCILIATION.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # API Surface Reconciliation
 
 The legacy catalog under-described the live HTTP surface.

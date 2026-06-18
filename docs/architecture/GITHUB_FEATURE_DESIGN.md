@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: GitHub Feature Design
+description: '**Implementation status (last verified 2026-05-10):** the GitHub feature
+  ships as the optional `kestrel-feature-github` package and is discovered through
+  the `kestrel_sovereign....'
+resource: /docs/architecture/GITHUB_FEATURE_DESIGN.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # GitHub Feature Design
 
 > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-point registry. Roughly half of the design below is implemented — enough for "read a file, search code, get a definition, query issues" — but the deeper static-analysis surface is not.

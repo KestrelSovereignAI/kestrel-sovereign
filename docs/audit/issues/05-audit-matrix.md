@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 05 Audit Matrix
+description: Without a canonical matrix, feature claims remain narrative rather than
+  auditable. The test suite may be large and still leave blind spots because it is
+  not tied directly to the...
+resource: /docs/audit/issues/05-audit-matrix.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 05 Audit Matrix
+
 ## Problem
 
 Without a canonical matrix, feature claims remain narrative rather than auditable. The test suite may be large and still leave blind spots because it is not tied directly to the product catalog.

@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Serialization Compatibility Matrix
+description: '**Status:** Wave 0A deliverable. Catalogs every signed/encrypted artifact
+  format in the codebase, whether it carries a version/algorithm tag, what the v2
+  design must look like,...'
+resource: /docs/architecture/security/SERIALIZATION_COMPATIBILITY.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Serialization Compatibility Matrix
 
 **Status:** Wave 0A deliverable. Catalogs every signed/encrypted artifact format in the codebase, whether it carries a version/algorithm tag, what the v2 design must look like, and how to migrate v1 → v2 without orphaning data.

@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: 'Decentralized Storage Vision: IPFS & Filecoin Integration'
+description: '**Last Updated:** March 11, 2026'
+resource: /docs/architecture/storage/DECENTRALIZED_STORAGE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Decentralized Storage Vision: IPFS & Filecoin Integration
 
 **Last Updated:** March 11, 2026

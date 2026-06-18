@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: LoRA Training & Generation - Operational Guide
+description: '**Status:** Experimental — works on the happy path; not actively developed
+  since Q1 2026. **Document last updated:** 2026-01-04 (re-verified 2026-04-25; see
+  banner below) **Owne...'
+resource: /docs/architecture/RUNPOD_LORA_TRAINING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # LoRA Training & Generation - Operational Guide
 
 **Status:** Experimental — works on the happy path; not actively developed since Q1 2026.

@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Test Evidence Gates in the Agent/Talon Review Loop
+description: Where tests sit in the loop, and how their outcome is recorded as first-class
+  evidence rather than an informal habit. Filed for [#1542](https://github.com/KestrelSovereignAI/kes...
+resource: /docs/architecture/testing/TEST_EVIDENCE_GATES.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Test Evidence Gates in the Agent/Talon Review Loop
 
 > Where tests sit in the loop, and how their outcome is recorded as

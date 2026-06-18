@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 02 Runtime Domain
+description: The runtime layer is where user intent, LLM responses, tools, commands,
+  context, and background tasking meet. It is also where “small” inconsistencies become
+  user-visible regres...
+resource: /docs/audit/issues/02-runtime-domain.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 02 Runtime Domain
+
 ## Problem
 
 The runtime layer is where user intent, LLM responses, tools, commands, context, and background tasking meet. It is also where “small” inconsistencies become user-visible regressions. Kestrel already has substantial runtime tests, but the coverage is not yet organized around runtime invariants and whole-flow seam failures.

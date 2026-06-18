@@ -1,3 +1,21 @@
+---
+type: User Guide
+title: Constitutional AI Governance Framework - Simple Explanation
+description: '**Date:** November 11, 2025 **Purpose:** Non-technical explanation of
+  Kestrel''s AI governance system **Audience:** General users and stakeholders'
+resource: /docs/user-documentation/CONSTITUTIONAL_AI_EXPLANATION.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Constitutional AI Governance Framework - Simple Explanation
 
 **Date:** November 11, 2025

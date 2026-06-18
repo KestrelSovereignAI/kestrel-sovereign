@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Nightly Forgetting — Unified Cognition Maintenance
+description: '**Status (2026-06-12): Active for P1–P3; Aspirational for P4.** This
+  consolidates Kestrel''s scattered nightly-maintenance crons and the unbounded-cognition-table
+  problem (#1674)...'
+resource: /docs/architecture/NIGHTLY_FORGETTING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Nightly Forgetting — Unified Cognition Maintenance
 
 > **Status (2026-06-12): Active for P1–P3; Aspirational for P4.**

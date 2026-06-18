@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Define the modular runtime kernel boundary for `kestrel-sovereign`
+description: 'Parent epic: #413'
+resource: /docs/audit/issues/413-01-kernel-boundary.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Define the modular runtime kernel boundary for `kestrel-sovereign`
 
 Parent epic: #413

@@ -1,3 +1,20 @@
+---
+type: User Guide
+title: Understanding Ollama - Simple Explanation
+description: '**What Ollama Is and How It Compares to Cloud AI**'
+resource: /docs/user-documentation/OLLAMA_EXPLAINED.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Understanding Ollama - Simple Explanation
 
 **What Ollama Is and How It Compares to Cloud AI**

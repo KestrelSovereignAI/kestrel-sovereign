@@ -1,3 +1,22 @@
+---
+type: Principle Document
+title: The Constitution of the United States
+description: We the People of the United States, in Order to form a more perfect Union,
+  establish Justice, insure domestic Tranquility, provide for the common defence,
+  promote the general We...
+resource: /docs/principles/US_CONSTITUTION.md
+tags:
+- docs
+- principles
+- principle-document
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # The Constitution of the United States
 
 ## Preamble

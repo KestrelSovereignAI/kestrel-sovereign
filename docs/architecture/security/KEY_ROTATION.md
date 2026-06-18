@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Key Rotation Mechanism
+description: 'Key rotation allows the master encryption key (`KESTREL_DATA_KEY`) to
+  be changed without losing access to encrypted data. This is critical for:'
+resource: /docs/architecture/security/KEY_ROTATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Key Rotation Mechanism
 
 ## Overview

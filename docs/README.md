@@ -1,3 +1,21 @@
+---
+type: Documentation Index
+title: Kestrel Documentation Index
+description: This directory holds detailed documentation for kestrel-sovereign. The
+  top-level [`README.md`](../README.md) is the single best entry point; this index
+  links into the deeper mat...
+resource: /docs/README.md
+tags:
+- docs
+- documentation-index
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: true
+generated: false
+privacy: public
+---
+
 # Kestrel Documentation Index
 
 This directory holds detailed documentation for kestrel-sovereign. The top-level [`README.md`](../README.md) is the single best entry point; this index links into the deeper material.
@@ -49,18 +67,18 @@ Regenerate feature audience docs via `scripts/generate_feature_docs.py`; regener
 
 ## OKF metadata
 
-Kestrel is migrating `docs/` toward Google Open Knowledge Format (OKF): Markdown plus YAML frontmatter. The migration plan is [`audit/OKF_MIGRATION_PLAN.md`](audit/OKF_MIGRATION_PLAN.md).
+Kestrel `docs/` use Google Open Knowledge Format (OKF): Markdown plus YAML frontmatter. The migration plan and operating ledger are [`audit/OKF_MIGRATION_PLAN.md`](audit/OKF_MIGRATION_PLAN.md). All non-reserved Markdown files under `docs/` are now OKF-classified; the only skipped files are generated OKF `index.md` and `log.md` views.
 
 Generated OKF views:
 
-- **[`audit/index.md`](audit/index.md)** / **[`audit/log.md`](audit/log.md)** — OKF concepts and pending docs in the audit tree
+- **[`audit/index.md`](audit/index.md)** / **[`audit/log.md`](audit/log.md)** — OKF concepts and timestamped docs in the audit tree
 - **[`generated/index.md`](generated/index.md)** / **[`generated/log.md`](generated/log.md)** — generated references and their timestamps
-- **[`architecture/index.md`](architecture/index.md)** / **[`architecture/log.md`](architecture/log.md)** — architecture docs pending OKF classification
+- **[`architecture/index.md`](architecture/index.md)** / **[`architecture/log.md`](architecture/log.md)** — architecture concepts and timestamped docs
 
 Validation:
 
 ```bash
-uv run python scripts/docs_okf.py validate
+uv run python scripts/docs_okf.py validate --all docs
 uv run python scripts/docs_okf.py index --check
 uv run python scripts/docs_okf.py log --check
 ```

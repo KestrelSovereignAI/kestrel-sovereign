@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: 256 Auto Model Selection Update
+description: Reworked the default model-selection path so shipped config no longer
+  depends on pinned provider model IDs.
+resource: /docs/audit/issues/256-auto-model-selection-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Auto Model Selection Update
+
 Reworked the default model-selection path so shipped config no longer depends on pinned provider model IDs.
 
 What changed:

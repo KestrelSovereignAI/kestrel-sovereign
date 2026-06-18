@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Extract feature-specific startup wiring out of `KestrelAgent.initialize()`
+description: 'Parent epic: #413 Depends on: module descriptor groundwork'
+resource: /docs/audit/issues/413-03-extract-startup-wiring.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Extract feature-specific startup wiring out of `KestrelAgent.initialize()`
 
 Parent epic: #413

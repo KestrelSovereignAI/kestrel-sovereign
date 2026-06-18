@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Auth Surface Matrix
+description: The live auth model is enforced centrally in [`server.py`](../../server.py),
+  with endpoint semantics layered on top.
+resource: /docs/audit/AUTH_SURFACE_MATRIX.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Auth Surface Matrix
 
 The live auth model is enforced centrally in [`server.py`](../../server.py), with endpoint semantics layered on top.

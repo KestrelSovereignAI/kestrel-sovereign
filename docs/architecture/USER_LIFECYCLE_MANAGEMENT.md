@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: User Lifecycle Management Architecture
+description: This document defines the complete user lifecycle in Kestrel, including
+  account creation, data management, archival (cryo storage), and deletion with proper
+  cascade handling.
+resource: /docs/architecture/USER_LIFECYCLE_MANAGEMENT.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # User Lifecycle Management Architecture
 
 ## Overview

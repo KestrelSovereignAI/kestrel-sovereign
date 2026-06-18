@@ -1,3 +1,19 @@
+---
+type: Principle Document
+title: The Tortoise Doctrine
+description: '*"Slow is smooth, smooth is fast."*'
+resource: /docs/TORTOISE_DOCTRINE.md
+tags:
+- docs
+- principle-document
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # The Tortoise Doctrine
 
 > *"Slow is smooth, smooth is fast."*

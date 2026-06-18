@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 263 Complete
+description: Issue complete.
+resource: /docs/audit/issues/263-complete.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 263 Complete
+
 Issue complete.
 
 Deliverables now in the repo:

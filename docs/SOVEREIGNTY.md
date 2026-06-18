@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: The Kestrel Sovereignty Stack
+description: 'This document explains the three architectural pillars that give Kestrel
+  agents their sovereignty properties: **Identity**, **Constitution**, and **Memory**.
+  Read this if you wa...'
+resource: /docs/SOVEREIGNTY.md
+tags:
+- docs
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # The Kestrel Sovereignty Stack
 
 This document explains the three architectural pillars that give Kestrel agents their sovereignty properties: **Identity**, **Constitution**, and **Memory**. Read this if you want to understand how those properties are implemented, not just that they exist.

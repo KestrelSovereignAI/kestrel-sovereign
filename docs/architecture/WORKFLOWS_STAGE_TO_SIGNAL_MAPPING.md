@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Workflows — Stage-to-Signal Mapping Spec (Phase 0)
+description: Companion to [`WORKFLOWS_FEATURE_DESIGN.md`](WORKFLOWS_FEATURE_DESIGN.md)
+  v4.1. This document is the load-bearing contract that converts a `Stage` (closed-vocabulary
+  domain mode...
+resource: /docs/architecture/WORKFLOWS_STAGE_TO_SIGNAL_MAPPING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Workflows — Stage-to-Signal Mapping Spec (Phase 0)
 
 > Companion to [`WORKFLOWS_FEATURE_DESIGN.md`](WORKFLOWS_FEATURE_DESIGN.md) v4.1. This document is the load-bearing contract that converts a `Stage` (closed-vocabulary domain model from `kestrel_sovereign/features/workflows/models.py`) into a `Signal` the dispatcher fires (existing platform — see [`SIGNAL_DISPATCHER.md`](SIGNAL_DISPATCHER.md), [`SIGNAL_SOURCES_GUIDE.md`](SIGNAL_SOURCES_GUIDE.md)). Phase 1's `WorkflowRunner` consumes this mapping; agents authoring workflows reference it.

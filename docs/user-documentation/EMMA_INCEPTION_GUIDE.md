@@ -1,3 +1,21 @@
+---
+type: User Guide
+title: 'Creating Emma: The Genesis Agent'
+description: This guide documents the process for creating **Emma** - the first permanent
+  Kestrel agent - with proper key management and validation.
+resource: /docs/user-documentation/EMMA_INCEPTION_GUIDE.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Creating Emma: The Genesis Agent
 
 This guide documents the process for creating **Emma** - the first permanent Kestrel agent - with proper key management and validation.

@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-05: IPFS Sovereignty Export'
+description: Decentralized storage with convergent encryption and Merkle forest architecture.
+resource: /docs/diagrams/data-architecture/DA-05-ipfs-sovereignty.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-05: IPFS Sovereignty Export
 
 Decentralized storage with convergent encryption and Merkle forest architecture.

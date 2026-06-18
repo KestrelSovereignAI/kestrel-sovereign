@@ -1,3 +1,22 @@
+---
+type: User Guide
+title: 'Your Data is a Living Tree: Understanding Kestrel''s Storage'
+description: You might hear us talk about "Merkle Trees" or "Sharding" when we discuss
+  how Kestrel saves your memories. That sounds complicated, but the concept is actually
+  quite beautiful—a...
+resource: /docs/user-documentation/SOVEREIGNTY_USER_GUIDE.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Your Data is a Living Tree: Understanding Kestrel's Storage
 **For Kestrel Users**
 

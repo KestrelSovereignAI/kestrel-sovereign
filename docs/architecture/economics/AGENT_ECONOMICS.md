@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'Agent Economics: Autonomous Economic Entities'
+description: Kestrel agents operate as **sovereign economic entities** capable of
+  entering into and fulfilling contracts autonomously. Through the Agent Vending Machine
+  model, agents can pur...
+resource: /docs/architecture/economics/AGENT_ECONOMICS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Agent Economics: Autonomous Economic Entities
 
 ## 1. Vision

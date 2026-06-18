@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 03 Security Domain
+description: Security-sensitive behavior is distributed across auth, permissions,
+  privacy modes, key storage, hooks, compute controls, and public webhook entry points.
+  That distribution is n...
+resource: /docs/audit/issues/03-security-domain.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 03 Security Domain
+
 ## Problem
 
 Security-sensitive behavior is distributed across auth, permissions, privacy modes, key storage, hooks, compute controls, and public webhook entry points. That distribution is necessary, but it creates bypass risk if any layer assumes another one already enforced a rule.

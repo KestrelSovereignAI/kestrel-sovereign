@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-06: Filecoin & Lighthouse'
+description: Permanent storage for data sovereignty.
+resource: /docs/diagrams/data-architecture/DA-06-filecoin-lighthouse.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-06: Filecoin & Lighthouse
 
 Permanent storage for data sovereignty.

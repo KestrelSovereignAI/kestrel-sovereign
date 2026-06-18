@@ -175,6 +175,13 @@ def test_may_2026_audit_workspace_is_okf_opted_in():
     assert docs_okf.validate_files(paths, include_all=True) == 0
 
 
+def test_docs_tree_is_okf_complete():
+    paths = docs_okf.markdown_files(docs_okf.PROJECT_ROOT / "docs")
+
+    assert paths
+    assert docs_okf.validate_files(paths, include_all=True) == 0
+
+
 def test_human_indexes_link_okf_surfaces():
     project_root = docs_okf.PROJECT_ROOT
     docs_readme = (project_root / "docs" / "README.md").read_text()
@@ -201,7 +208,7 @@ def test_human_indexes_link_okf_surfaces():
     assert "OKF_MIGRATION_PLAN.md" in audit_readme
     assert "index.md" in audit_readme
     assert "log.md" in audit_readme
-    assert "35 markdown concepts" in inventory
-    assert "28/28 markdown files" in inventory
+    assert "254 OKF documents" in inventory
+    assert "0 non-reserved markdown files are missing OKF frontmatter" in inventory
     assert "scripts/docs_okf.py" in canonical
     assert "scripts/generate_demo_evidence_docs.py" in generated_readme

@@ -1,3 +1,20 @@
+---
+type: User Guide
+title: User Documentation
+description: End-user guides and non-technical explanations for Kestrel concepts.
+resource: /docs/user-documentation/README.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # User Documentation
 
 End-user guides and non-technical explanations for Kestrel concepts.

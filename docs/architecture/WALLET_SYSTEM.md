@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Kestrel Multi-Chain Wallet System
+description: This document describes the wallet system that enables Kestrel agents
+  to manage cryptocurrency across multiple blockchain networks.
+resource: /docs/architecture/WALLET_SYSTEM.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Multi-Chain Wallet System
 
 This document describes the wallet system that enables Kestrel agents to manage cryptocurrency across multiple blockchain networks.

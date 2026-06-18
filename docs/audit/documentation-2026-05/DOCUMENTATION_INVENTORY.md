@@ -18,15 +18,16 @@ privacy: public
 
 # Documentation Inventory - May 2026
 
-Status: working inventory seed
+Status: OKF corpus inventory
 
-This is not yet a complete document-by-document review. It is the starting inventory for lane reviewers.
+This inventory records the OKF migration baseline. It is not a document-by-document freshness review; lane reviewers still own content accuracy, stale claims, and public-release hygiene.
 
 ## Counts
 
-- `docs/` markdown files at the OKF migration start: 319.
-- Current OKF opt-in set after the first migration slice: 35 markdown concepts validate with `scripts/docs_okf.py validate`.
-- This May 2026 audit workspace is now OKF-complete: 28/28 markdown files validate with `scripts/docs_okf.py validate --all docs/audit/documentation-2026-05`.
+- Current `docs/` markdown files: 260.
+- Current OKF corpus: 254 OKF documents validate with `scripts/docs_okf.py validate --all docs`.
+- Reserved OKF generated views: 6 files (`docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`, `docs/generated/log.md`, `docs/architecture/index.md`, `docs/architecture/log.md`).
+- 0 non-reserved markdown files are missing OKF frontmatter.
 - Previous inventory: `docs/archive/meta/DOCUMENTATION_INVENTORY_2025.md`.
 - Current audit ledger: `docs/audit/DOCUMENTATION_AUDIT_5_2026.md`.
 - OKF migration plan: `docs/audit/OKF_MIGRATION_PLAN.md`.
@@ -60,12 +61,13 @@ This is not yet a complete document-by-document review. It is the starting inven
 
 ## Next Inventory Step
 
-Use generated OKF indexes to track migration status, then use lane reports to fill in current status and action for the remaining pending docs.
+Use generated OKF indexes to track classification and timestamps, then use lane reports to fill in current status and action for documents whose content needs revalidation.
 
 Commands:
 
 ```bash
 uv run python scripts/docs_okf.py inventory docs/audit/documentation-2026-05 --format markdown
+uv run python scripts/docs_okf.py validate --all docs
 uv run python scripts/docs_okf.py index --check
 uv run python scripts/docs_okf.py log --check
 ```

@@ -41,7 +41,7 @@ jobs:
         run: uv sync
 
       - name: Validate OKF metadata
-        run: uv run python scripts/docs_okf.py validate
+        run: uv run python scripts/docs_okf.py validate --all docs
 
       - name: Check generated feature doc metadata
         run: uv run python scripts/generate_feature_docs.py --check

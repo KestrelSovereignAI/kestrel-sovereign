@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Kestrel Integrity Audit System
+description: '**Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional
+  AI Enforcement Mechanism'
+resource: /docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Integrity Audit System
 
 **Date:** November 9, 2025  

@@ -1,3 +1,21 @@
+---
+type: Review Record
+title: 'Claude Review: PR #1333'
+description: '- PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333
+  - Title: fix: preserve OpenAI-compatible reasoning on tool streams - Reviewed: 2026-05-21T16:15:38Z'
+resource: /docs/code_reviews/claude-pr-1333.md
+tags:
+- docs
+- code_reviews
+- review-record
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Claude Review: PR #1333
 
 - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333

@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: 'PRD: Cryptographic Log Anchoring'
+description: '**1. Vision & Background**'
+resource: /docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: Cryptographic Log Anchoring
 
 **1. Vision & Background**

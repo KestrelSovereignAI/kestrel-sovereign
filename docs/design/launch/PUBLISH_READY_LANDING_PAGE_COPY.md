@@ -1,3 +1,21 @@
+---
+type: Design Note
+title: 'Kestrel Landing Page Copy: Publish-Ready Draft'
+description: This draft is the tightened, publish-ready version of the earlier wireframe.
+  It is written to be dropped directly into a launch page with minimal editing.
+resource: /docs/design/launch/PUBLISH_READY_LANDING_PAGE_COPY.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Landing Page Copy: Publish-Ready Draft
 
 This draft is the tightened, publish-ready version of the earlier wireframe. It is written to be dropped directly into a launch page with minimal editing.

@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-10: SQLite-First Sync Architecture'
+description: 'The new architecture: SQLite as primary, sync to cloud when needed.'
+resource: /docs/diagrams/data-architecture/DA-10-sqlite-first-sync.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-10: SQLite-First Sync Architecture
 
 The new architecture: SQLite as primary, sync to cloud when needed.

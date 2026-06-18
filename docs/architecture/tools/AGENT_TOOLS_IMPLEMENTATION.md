@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Agent Tools Implementation
+description: '**Status:** Active implementation map **Last updated:** 2026-05-14 **Related:**
+  [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Building Features](../../guides/BUILDIN...'
+resource: /docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Agent Tools Implementation
 
 **Status:** Active implementation map

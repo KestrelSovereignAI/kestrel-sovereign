@@ -1,6 +1,6 @@
 checks:
   - name: OKF metadata validation
-    command: uv run python scripts/docs_okf.py validate
+    command: uv run python scripts/docs_okf.py validate --all docs
 
   - name: Generated feature docs dry run
     command: uv run python scripts/generate_feature_docs.py --all --dry-run

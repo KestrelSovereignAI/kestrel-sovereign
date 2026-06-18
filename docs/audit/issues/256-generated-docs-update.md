@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Generated Docs Update
+description: Audience-doc generation is now complete, not just dry-run verified.
+resource: /docs/audit/issues/256-generated-docs-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Generated Docs Update
+
 Audience-doc generation is now complete, not just dry-run verified.
 
 Generated and reviewed:

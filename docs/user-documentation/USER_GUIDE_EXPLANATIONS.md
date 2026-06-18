@@ -1,3 +1,20 @@
+---
+type: User Guide
+title: 'Kestrel User Guide: Non-Technical Explanations'
+description: '**Understanding Kestrel''s Technology in Simple Terms**'
+resource: /docs/user-documentation/USER_GUIDE_EXPLANATIONS.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel User Guide: Non-Technical Explanations
 
 **Understanding Kestrel's Technology in Simple Terms**

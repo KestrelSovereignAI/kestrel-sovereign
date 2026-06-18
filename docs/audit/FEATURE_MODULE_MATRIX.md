@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Feature Module Matrix
+description: 'Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py)
+  scans single-file modules, package `__init__.py`, and package `feature.py`.'
+resource: /docs/audit/FEATURE_MODULE_MATRIX.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Feature Module Matrix
 
 Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, package `__init__.py`, and package `feature.py`.

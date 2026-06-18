@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Economic Incentives Deep Dive - Constitutional AI System
+description: '**Date:** November 11, 2025 **Focus:** Detailed explanation of payment
+  flows and economic mechanisms **Audience:** Users and stakeholders'
+resource: /docs/architecture/economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Economic Incentives Deep Dive - Constitutional AI System
 
 **Date:** November 11, 2025

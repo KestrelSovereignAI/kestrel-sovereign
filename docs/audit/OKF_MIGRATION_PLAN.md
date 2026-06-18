@@ -5,7 +5,7 @@ description: Plan for converting Kestrel documentation to Google Open Knowledge 
 resource: /docs/audit/OKF_MIGRATION_PLAN.md
 tags: [docs, okf, talon, generated-docs, audit]
 timestamp: 2026-06-18T00:00:00Z
-status: proposed
+status: implemented
 ---
 
 # Kestrel Documentation OKF Migration Plan
@@ -31,9 +31,17 @@ References:
 
 Snapshot from 2026-06-18:
 
-- `docs/` contains 319 markdown files.
-- 0 markdown files currently have YAML frontmatter at the top of the file.
-- 273 markdown files have an H1 heading.
+- Initial baseline before this migration: `docs/` contained 319 markdown files,
+  0 markdown files had YAML frontmatter at the top of the file, and 273
+  markdown files had an H1 heading.
+- Current corpus after implementation: `docs/` contains 260 markdown files.
+- 254 non-reserved Markdown files have OKF frontmatter and validate with
+  `uv run python scripts/docs_okf.py validate --all docs`.
+- 6 generated OKF views are intentionally reserved and skipped:
+  `docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`,
+  `docs/generated/log.md`, `docs/architecture/index.md`, and
+  `docs/architecture/log.md`.
+- 0 non-reserved Markdown files are missing OKF frontmatter.
 - Only about 14 files mention status conventions or status-like metadata.
 - Existing navigation and inventory surfaces are already strong:
   - `docs/README.md`
@@ -436,7 +444,7 @@ credentials.
 
 ## Recommended First Issue
 
-Create a first Talon issue for Phase 0 only:
+The first Talon issue should stay Phase 0 sized when repeated in another repo:
 
 1. Add `scripts/docs_okf.py`.
 2. Add parser/validator tests.
@@ -444,8 +452,9 @@ Create a first Talon issue for Phase 0 only:
 4. Add this plan file as the first conformant concept.
 5. Do not mass-edit the corpus yet.
 
-That keeps the first PR reviewable and gives future Talon/documentation work a
-hard gate before the larger migration begins.
+That keeps a first PR reviewable and gives future Talon/documentation work a
+hard gate before the larger migration begins. In this worktree, the migration
+continued through the full `docs/` corpus after the pilot tooling proved out.
 
 ## Initial Worktree Implementation
 
@@ -468,6 +477,11 @@ Implemented in branch `codex/okf-docs-demo`:
 - Converted the May 2026 documentation audit workspace
   (`docs/audit/documentation-2026-05/**`) to opt-in OKF frontmatter and added a
   regression test requiring that workspace to remain OKF-complete.
+- Converted all non-reserved Markdown files under `docs/` to OKF frontmatter,
+  added missing H1 headings where legacy issue/code-review notes lacked one,
+  and added a regression test requiring `docs/` to remain OKF-complete.
+- Tightened GitHub Actions and `.kestreltalon/quality.yaml` so the validation
+  gate now runs `uv run python scripts/docs_okf.py validate --all docs`.
 - Added `scripts/docs_okf.py index` and `scripts/docs_okf.py log`, generated
   `index.md` and `log.md` for `docs/audit`, `docs/generated`, and
   `docs/architecture`, and wired `--check` commands into CI/Talon gates.
@@ -483,8 +497,11 @@ Verified locally:
 
 ```bash
 uv run pytest tests/unit/test_docs_okf.py tests/unit/test_generate_feature_docs.py tests/unit/test_demo_evidence_docs.py tests/unit/test_feature_doc_canonicality.py -q
+uv run python scripts/docs_okf.py validate --all docs
 uv run python scripts/docs_okf.py validate
 uv run python scripts/generate_feature_docs.py --check
 uv run python scripts/generate_demo_evidence_docs.py --check
+uv run python scripts/docs_okf.py index --check
+uv run python scripts/docs_okf.py log --check
 uv run python scripts/generate_feature_docs.py --all --dry-run
 ```

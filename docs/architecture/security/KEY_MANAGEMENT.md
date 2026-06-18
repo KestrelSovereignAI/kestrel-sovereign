@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Key Management Architecture
+description: Kestrel uses a two-layer key architecture that separates **Sovereign
+  control** (you) from **Executor access** (your agent). This ensures that even though
+  your agent can use cryp...
+resource: /docs/architecture/security/KEY_MANAGEMENT.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Key Management Architecture
 
 ## Overview

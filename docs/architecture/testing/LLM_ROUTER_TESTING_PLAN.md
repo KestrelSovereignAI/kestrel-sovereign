@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: LLM Router Enhancement - Comprehensive Testing Plan
+description: '**File:** `tests/integration/test_llm_openai_e2e.py`'
+resource: /docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # LLM Router Enhancement - Comprehensive Testing Plan
 
 ## Testing Philosophy

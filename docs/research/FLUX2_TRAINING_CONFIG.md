@@ -1,3 +1,20 @@
+---
+type: Research Note
+title: FLUX.2 LoRA Training Configuration
+description: '**Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)'
+resource: /docs/research/FLUX2_TRAINING_CONFIG.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # FLUX.2 LoRA Training Configuration
 
 **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)

@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: SignalDispatcher Constitutional Injection — Architecture Design
+description: 'Draft v1. Pre-filing-update for epic #1137. Companion to [SIGNAL_DISPATCHER.md](SIGNAL_DISPATCHER.md).
+  The original epic body (filed 2026-05-09 13:21 UTC) overreached because I...'
+resource: /docs/architecture/CONSTITUTION_INJECTION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # SignalDispatcher Constitutional Injection — Architecture Design
 
 > Draft v1. Pre-filing-update for epic #1137. Companion to [SIGNAL_DISPATCHER.md](SIGNAL_DISPATCHER.md). The original epic body (filed 2026-05-09 13:21 UTC) overreached because I drafted it without a platform survey of what already exists. v1 of this design corrects scope based on the actual primitives shipping today.

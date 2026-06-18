@@ -1,3 +1,21 @@
+---
+type: Research Note
+title: '**Training LoRA on the FLUX 2 [dev] Diffusion Model**'
+description: '**FluxGym (Next Diffusion)** – FluxGym is a user-friendly web UI specifically
+  designed for training LoRA adapters on FLUX models [1](https://www.nextdiffusion.ai/tutorials/how-t...'
+resource: /docs/research/LoRA/TrainingLoRA_FLUX2dev.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # **Training LoRA on the FLUX 2 [dev] Diffusion Model**
 
 ## **Tools and Templates for FLUX 2 LoRA Training**

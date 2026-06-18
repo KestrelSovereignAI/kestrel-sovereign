@@ -1,3 +1,21 @@
+---
+type: User Guide
+title: Sovereign Computing - Technical Explanation
+description: '**Date:** November 11, 2025 **Context:** Kestrel''s technical foundation
+  for sovereign computing **Purpose:** Educational overview for stakeholders'
+resource: /docs/user-documentation/SOVEREIGN_COMPUTING_EXPLANATION.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Sovereign Computing - Technical Explanation
 
 **Date:** November 11, 2025

@@ -1,3 +1,21 @@
+---
+type: User Guide
+title: Kestrel Integrity Audit System - Simple Explanation
+description: '**Date:** November 9, 2025 **Version:** 1.0 **Audience:** Non-technical
+  readers, stakeholders, general public'
+resource: /docs/user-documentation/INTEGRITY_AUDIT_SYSTEM_SIMPLE.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Integrity Audit System - Simple Explanation
 
 **Date:** November 9, 2025  

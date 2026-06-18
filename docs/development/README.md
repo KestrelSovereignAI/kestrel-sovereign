@@ -1,3 +1,20 @@
+---
+type: Developer Note
+title: Development Documentation
+description: Developer notes, experiments, and technical development guides.
+resource: /docs/development/README.md
+tags:
+- docs
+- development
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Development Documentation
 
 Developer notes, experiments, and technical development guides.

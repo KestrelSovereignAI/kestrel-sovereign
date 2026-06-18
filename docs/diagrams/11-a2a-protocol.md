@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 11 - A2A Protocol - Agent-to-Agent Communication
+description: Google's Agent-to-Agent protocol implementation in Kestrel.
+resource: /docs/diagrams/11-a2a-protocol.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 11 - A2A Protocol - Agent-to-Agent Communication
 
 Google's Agent-to-Agent protocol implementation in Kestrel.

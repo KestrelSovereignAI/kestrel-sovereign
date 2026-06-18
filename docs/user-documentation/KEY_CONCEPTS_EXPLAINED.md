@@ -1,3 +1,20 @@
+---
+type: User Guide
+title: Kestrel Key Concepts - Explained Simply
+description: '**Understanding Cryptographic Identity and Constitutional AI Governance**'
+resource: /docs/user-documentation/KEY_CONCEPTS_EXPLAINED.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Key Concepts - Explained Simply
 
 **Understanding Cryptographic Identity and Constitutional AI Governance**

@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Endpoint Proof Update
+description: Expanded direct contract proof across the remaining public endpoint families.
+resource: /docs/audit/issues/256-endpoint-proof-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Endpoint Proof Update
+
 Expanded direct contract proof across the remaining public endpoint families.
 
 New focused suites:

@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Introduce stable module descriptors above feature discovery
+description: 'Parent epic: #413 Depends on: kernel boundary doc'
+resource: /docs/audit/issues/413-02-module-descriptors.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Introduce stable module descriptors above feature discovery
 
 Parent epic: #413

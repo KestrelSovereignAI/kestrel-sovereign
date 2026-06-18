@@ -1,3 +1,22 @@
+---
+type: User Guide
+title: Kestrel User Education Strategy
+description: '**Date:** November 9, 2025 **Challenge:** Revolutionary concepts require
+  fundamental user education **Goal:** Enable customers to understand and appreciate
+  Kestrel''s value propo...'
+resource: /docs/user-documentation/USER_EDUCATION_STRATEGY.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel User Education Strategy
 
 **Date:** November 9, 2025  

@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: API Endpoint Matrix
+description: '- `GET /` - `GET /api/auth/key` - `GET /health` - `GET /health/detailed`
+  - `POST /webhooks/stripe/crypto`'
+resource: /docs/audit/API_ENDPOINT_MATRIX.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # API Endpoint Matrix
 
 ## App-level routes

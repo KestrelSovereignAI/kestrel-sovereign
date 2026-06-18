@@ -1,3 +1,21 @@
+---
+type: Design Note
+title: Launch Copy Drafts
+description: This folder holds the current launch-copy assets for the Kestrel open-source
+  launch.
+resource: /docs/design/launch/README.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Launch Copy Drafts
 
 This folder holds the current launch-copy assets for the Kestrel open-source launch.

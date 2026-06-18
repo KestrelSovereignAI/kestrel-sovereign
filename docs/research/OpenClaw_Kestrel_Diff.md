@@ -1,3 +1,21 @@
+---
+type: Research Note
+title: 'OpenClaw vs Kestrel Sovereign: Feature Diff Analysis'
+description: '*Research Date: 2026-01-31* *OpenClaw Version: v2026.1.30* *Source:
+  https://github.com/openclaw/openclaw*'
+resource: /docs/research/OpenClaw_Kestrel_Diff.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # OpenClaw vs Kestrel Sovereign: Feature Diff Analysis
 
 *Research Date: 2026-01-31*

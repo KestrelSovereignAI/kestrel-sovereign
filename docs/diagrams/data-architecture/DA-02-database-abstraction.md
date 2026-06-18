@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-02: Database Abstraction Layer'
+description: 'One codebase, two backends: SQLite and PostgreSQL.'
+resource: /docs/diagrams/data-architecture/DA-02-database-abstraction.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-02: Database Abstraction Layer
 
 One codebase, two backends: SQLite and PostgreSQL.

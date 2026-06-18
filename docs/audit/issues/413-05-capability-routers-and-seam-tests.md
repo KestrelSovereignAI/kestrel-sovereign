@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Move toward capability-mounted routers and enforce modular seams with tests
+description: 'Parent epic: #413 Depends on: descriptor groundwork and startup extraction'
+resource: /docs/audit/issues/413-05-capability-routers-and-seam-tests.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Move toward capability-mounted routers and enforce modular seams with tests
 
 Parent epic: #413

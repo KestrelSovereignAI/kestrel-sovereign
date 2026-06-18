@@ -1,3 +1,22 @@
+---
+type: Design Note
+title: Preview Packet Language
+description: This document stores the current canonical preview-packet language for
+  the Kestrel open-source launch so the team has one repo-based source of truth alongside
+  the other launch a...
+resource: /docs/design/launch/PREVIEW_PACKET_LANGUAGE.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Preview Packet Language
 
 This document stores the current canonical preview-packet language for the Kestrel open-source launch so the team has one repo-based source of truth alongside the other launch assets.

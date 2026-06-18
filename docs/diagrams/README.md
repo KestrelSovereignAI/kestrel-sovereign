@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: Kestrel Diagrams
+description: Visual documentation for the Kestrel Sovereign AI Agent framework.
+resource: /docs/diagrams/README.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Diagrams
 
 Visual documentation for the Kestrel Sovereign AI Agent framework.

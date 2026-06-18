@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: LLM Provider Capabilities
+description: 'Kestrel tracks adapter-level capabilities separately from per-model
+  `ModelInfo`. Both live in `kestrel-sovereign-sdk`: `ModelInfo` describes discovered
+  models, while provider ca...'
+resource: /docs/architecture/LLM_PROVIDER_CAPABILITIES.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # LLM Provider Capabilities
 
 Kestrel tracks adapter-level capabilities separately from per-model

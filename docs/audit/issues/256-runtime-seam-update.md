@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: 256 Runtime Seam Update
+description: Deeper runtime seam audit uncovered and fixed two real cross-cutting
+  issues.
+resource: /docs/audit/issues/256-runtime-seam-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Runtime Seam Update
+
 Deeper runtime seam audit uncovered and fixed two real cross-cutting issues.
 
 1. Privacy-mode model restore bug

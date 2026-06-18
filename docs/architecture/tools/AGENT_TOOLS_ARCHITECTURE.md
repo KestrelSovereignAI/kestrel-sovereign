@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Agent Tools Architecture
+description: '**Status:** Active **Last updated:** 2026-05-14 **Related:** [Feature
+  Agent Framework](../core/FEATURE_AGENT_FRAMEWORK.md), [Modular Runtime Boundary](../core/MODULAR_RUNTIME.md...'
+resource: /docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Agent Tools Architecture
 
 **Status:** Active

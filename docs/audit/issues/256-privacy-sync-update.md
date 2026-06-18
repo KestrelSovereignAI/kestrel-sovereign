@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Privacy Sync Update
+description: Another proof slice is now in place under the umbrella audit.
+resource: /docs/audit/issues/256-privacy-sync-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Privacy Sync Update
+
 Another proof slice is now in place under the umbrella audit.
 
 Completed:

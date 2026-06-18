@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: UI Theme File Schema
+description: 'Theme files define the user-facing labels for the Kestrel UI under the
+  theme + i18n system established by epic #986. Each file pairs one theme with one
+  locale.'
+resource: /docs/architecture/ui_theme_schema.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # UI Theme File Schema
 
 Theme files define the user-facing labels for the Kestrel UI under the theme + i18n system established by epic #986. Each file pairs one theme with one locale.

@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'Privacy Modes: Complete Data Sovereignty'
+description: Kestrel provides unprecedented control over data privacy through **independent
+  privacy flags** with **named presets**. Users can use presets for common configurations
+  or set fla...
+resource: /docs/architecture/security/PRIVACY_MODES.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Privacy Modes: Complete Data Sovereignty
 
 ## 1. Vision

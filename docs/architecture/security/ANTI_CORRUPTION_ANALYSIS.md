@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Preventing Corruption in Kestrel's Integrity Audit System
+description: '**Date:** November 9, 2025 **Analysis:** Anti-Corruption Safeguards
+  & Risk Mitigation **Focus:** Addressing Economic Incentive Vulnerabilities'
+resource: /docs/architecture/security/ANTI_CORRUPTION_ANALYSIS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Preventing Corruption in Kestrel's Integrity Audit System
 
 **Date:** November 9, 2025  

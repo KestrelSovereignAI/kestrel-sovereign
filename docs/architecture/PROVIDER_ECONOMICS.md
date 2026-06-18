@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'Provider Economics: Middleman Architecture & Revenue Strategy'
+description: '**Version:** 1.0 **Drafted:** December 2025 **Last verified:** 2026-04-25
+  (referral-program details still accurate; revenue projections are illustrative,
+  not date-stamped financ...'
+resource: /docs/architecture/PROVIDER_ECONOMICS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Provider Economics: Middleman Architecture & Revenue Strategy
 
 **Version:** 1.0

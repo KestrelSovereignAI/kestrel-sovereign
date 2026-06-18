@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'PRD: The Kestrel Agent Ecosystem'
+description: To evolve Kestrel from a single agent into a scalable bedrock for Sovereign
+  Companions, creating agents for human-led apps, with sovereignty as a future path.
+  This framework wil...
+resource: /docs/architecture/core/AGENT_ECOSYSTEM.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: The Kestrel Agent Ecosystem
 
 ## 1. Vision

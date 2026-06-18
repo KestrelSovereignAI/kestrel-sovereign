@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: UI Label Inventory
+description: 'Catalog of every user-facing string in the Kestrel Sovereign main console,
+  classified for the theme + i18n system (epic #986). Produced for sub-issue #987.'
+resource: /docs/architecture/ui_label_inventory.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # UI Label Inventory
 
 Catalog of every user-facing string in the Kestrel Sovereign main console, classified for the theme + i18n system (epic #986). Produced for sub-issue #987.

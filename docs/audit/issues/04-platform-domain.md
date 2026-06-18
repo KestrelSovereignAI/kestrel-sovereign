@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 04 Platform Domain
+description: Kestrel’s platform layer spans provider adapters, model routing, API
+  contracts, frontend behavior, CLI, config loading, and deployment targets. This
+  is where source-of-truth dri...
+resource: /docs/audit/issues/04-platform-domain.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 04 Platform Domain
+
 ## Problem
 
 Kestrel’s platform layer spans provider adapters, model routing, API contracts, frontend behavior, CLI, config loading, and deployment targets. This is where source-of-truth drift is most likely because the same behavior is often surfaced through multiple interfaces.

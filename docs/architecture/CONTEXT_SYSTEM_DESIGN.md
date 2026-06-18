@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel Context System — Assessment & Redesign
+description: A context window is not a buffer you fill until it overflows. It is a
+  claim about what the model can currently *see and reason over*. Today Kestrel makes
+  that claim in three unc...
+resource: /docs/architecture/CONTEXT_SYSTEM_DESIGN.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Context System — Assessment & Redesign
 
 > A context window is not a buffer you fill until it overflows. It is a

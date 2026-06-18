@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Memory System Ownership Map
+description: 'Created for Issue #501. Defines which classes belong to core, feature,
+  or storage layers to enable clean extraction in Epic #466 Wave 4.'
+resource: /docs/architecture/MEMORY_OWNERSHIP.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Memory System Ownership Map
 
 > Created for Issue #501. Defines which classes belong to core, feature, or storage layers
