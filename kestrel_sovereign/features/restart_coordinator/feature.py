@@ -794,54 +794,13 @@ class RestartCoordinatorFeature(Feature):
             return
 
         emit = getattr(self.agent, "emit_event", None)
-        if emit is not None:
-            try:
-                await emit(EVENT_NAME, payload)
-            except Exception as e:  # pragma: no cover - defensive
-                logger.debug(
-                    "restart_status emit failed for %s: %s",
-                    getattr(req, "id", "?"), e,
-                )
-
-        # Durable chat bubble: the EVENT_NAME emit above is live-only (SSE), so
-        # it vanishes on reload. Persist ONE restart-status message into the
-        # ORIGIN session at terminal state so a chat reload re-renders the
-        # outcome (#1809). It's an ordinary message the existing context
-        # compaction folds like any other old turn.
-        await self._persist_status_chat_bubble(req, payload, str(state))
-
-    # UI states terminal enough to leave a single durable chat bubble. The
-    # transient states (pending/executing/approved) still paint live via SSE.
-    _DURABLE_BUBBLE_STATES = frozenset({"completed", "rejected", "canceled"})
-
-    async def _persist_status_chat_bubble(self, req, payload, state: str) -> None:
-        """Persist a terminal restart-status bubble into the origin chat session.
-
-        Only terminal states, and only when the request carries an
-        ``origin_session_id`` (a chat-filed request) — CLI/system requests have
-        no window to paint into. Best-effort: never break the request lifecycle.
-        """
-        if state not in self._DURABLE_BUBBLE_STATES:
+        if emit is None:
             return
-        origin_session_id = str(getattr(req, "origin_session_id", "") or "")
-        if not origin_session_id:
-            return
-        add = getattr(getattr(self.agent, "privacy_agent", None), "add_conversation", None)
-        if add is None:
-            return
-        # Put the bubble payload in the message CONTENT (encrypted at rest by
-        # add_conversation under privacy/encryption modes) — NOT in metadata,
-        # which is stored as plaintext JSON and would leak the user-supplied
-        # ``reason`` outside the encryption boundary (codex P1). Metadata holds
-        # only the non-sensitive ``type`` flag that routes the frontend to its
-        # restart-bubble renderer, which parses the (decrypted) content payload.
-        content = json.dumps(payload, sort_keys=True)
-        metadata = {"type": "restart_status"}
         try:
-            await add("system", content, metadata=metadata, session_id=origin_session_id)
+            await emit(EVENT_NAME, payload)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(
-                "restart_status chat-bubble persist failed for %s: %s",
+                "restart_status emit failed for %s: %s",
                 getattr(req, "id", "?"), e,
             )
 

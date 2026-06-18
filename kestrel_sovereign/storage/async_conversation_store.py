@@ -1262,23 +1262,16 @@ class AsyncConversationStore:
                     # Continue looking for resumed messages that explicitly belong to this session
                     continue
 
-            # Skip session markers AND restart-status bubbles from the model
-            # context. Restart bubbles are UI-only deployment status (#1809);
-            # their content carries the user-supplied restart `reason`, so
-            # replaying them as conversation turns would both clutter context
-            # and feed user-controlled text back to the model with the row's
-            # role authority. They are still returned by the display history
-            # endpoint (which only skips session markers) so the UI re-renders
-            # them on reload.
+            # Skip session markers from results
             if metadata_json:
                 try:
                     meta = json.loads(metadata_json)
-                    if meta.get('type') in ('session_marker', 'restart_status'):
+                    if meta.get('type') == 'session_marker':
                         last_timestamp = timestamp
                         is_first = False
                         continue
                 except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse metadata for marker check: {e}")
+                    logger.warning(f"Failed to parse metadata for session_marker check: {e}")
 
             session_rows.append(row)
             last_timestamp = timestamp
