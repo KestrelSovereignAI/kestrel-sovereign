@@ -103,6 +103,47 @@ export async function createRealtimeClient({
   }
 
   /**
+   * Report a finalized turn to the backend so it lands in the agent's
+   * conversation history (#1808). The realtime path is end-to-end between this
+   * browser and OpenAI, so the server never sees the transcript unless we send
+   * it. Fire-and-forget: a persistence failure must never interrupt the live
+   * call, so errors are surfaced as non-fatal events only.
+   *
+   * The transcript endpoint is derived from the mint `endpoint` by swapping the
+   * trailing `/session` for `/transcript/<session_id>`, reusing the same auth.
+   */
+  function persistTurn(role, text) {
+    const content = (text ?? '').trim();
+    const sessionId = session?.session_id;
+    if (!content || !sessionId) return;
+    const transcriptUrl =
+      endpoint.replace(/\/session$/, '/transcript/') +
+      encodeURIComponent(sessionId);
+    Promise.resolve(getAuthHeaders())
+      .then((authHeaders) =>
+        fetch(transcriptUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...(authHeaders || {}) },
+          body: JSON.stringify({ role, content }),
+        }),
+      )
+      .then((resp) => {
+        // fetch() only rejects on network failure — an HTTP 401/404/500
+        // still resolves. Without this check a failed persist would look
+        // like success and the turn would be silently dropped from history.
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      })
+      .catch((err) => {
+        if (!closed) {
+          onEvent(makeEvent(Events.ERROR, {
+            message: `transcript persist failed: ${err.message}`,
+            fatal: false,
+          }));
+        }
+      });
+  }
+
+  /**
    * Translate OpenAI server events to Kestrel voice events.
    *
    * Unknown types are logged at debug level and skipped — OpenAI can add new
@@ -136,6 +177,7 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.USER_TRANSCRIPT_FINAL, {
           text: raw.transcript ?? '',
         }));
+        persistTurn('user', raw.transcript ?? '');
         break;
 
       case 'response.created':
@@ -155,6 +197,7 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.AGENT_TEXT_FINAL, {
           text: raw.transcript ?? raw.text ?? '',
         }));
+        persistTurn('assistant', raw.transcript ?? raw.text ?? '');
         break;
       case 'response.done':
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));
@@ -335,6 +378,11 @@ export async function createRealtimeClient({
       },
     });
     sendJSON({ type: 'response.create' });
+    // Typed turns don't produce an input_audio_transcription.completed event,
+    // so persist the user side here or backend history would be one-sided
+    // (assistant reply only). The assistant turn still persists via
+    // response.output_*.done.
+    persistTurn('user', text);
   }
 
   /** Barge-in: abort the in-flight agent response. */
