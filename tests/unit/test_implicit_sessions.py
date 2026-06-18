@@ -259,3 +259,31 @@ class TestSearchHistorySessionScoping:
         await store.add_conversation("user", "hello")
         results = await store.search_history("hello", session_id="nonexistent-session")
         assert results == []
+
+
+class TestRestartStatusExcludedFromContext:
+    """#1809: persisted restart-status bubbles are UI-only — they must not be
+    replayed into the model context (they carry the user-supplied restart
+    reason and would feed user-controlled text back to the model)."""
+
+    @pytest.mark.asyncio
+    async def test_restart_status_row_skipped_in_history(self, store):
+        sid = "sess-restart-1"
+        await store.add_conversation("user", "please restart", session_id=sid)
+        await store.add_conversation(
+            "system",
+            '{"request_id":"r1","status":"completed","reason":"secret reason"}',
+            metadata={"type": "restart_status"},
+            session_id=sid,
+        )
+        await store.add_conversation("assistant", "back online", session_id=sid)
+
+        hist = await store.get_conversation_history(session_id=sid)
+        contents = [m.get("content") or "" for m in hist]
+        roles = [m.get("role") for m in hist]
+
+        # The restart-status row (and its reason) is absent from model context.
+        assert not any("request_id" in c for c in contents)
+        assert not any("secret reason" in c for c in contents)
+        # The real turns survive.
+        assert "user" in roles and "assistant" in roles

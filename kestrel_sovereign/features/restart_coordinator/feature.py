@@ -841,7 +841,8 @@ class RestartCoordinatorFeature(Feature):
             await add("system", content, metadata=metadata, session_id=origin_session_id)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(
-                "restart_status chat-bubble persist failed for %s: %s", short_id, e,
+                "restart_status chat-bubble persist failed for %s: %s",
+                getattr(req, "id", "?"), e,
             )
 
     def _evaluate_safety(self, req) -> Dict[str, Any]:
