@@ -25,7 +25,12 @@ def _discover_exported_feature_classes() -> list[str]:
         if path.name == "base.py":
             continue
         text = path.read_text(encoding="utf-8")
-        names.extend(match.group(1) for match in pattern.finditer(text))
+        for match in pattern.finditer(text):
+            class_name = match.group(1)
+            # Skip ProxyFeature - it's only created programmatically for isolated-runtime features
+            # (matches the skip logic in kestrel_sovereign/features/__init__.py find_feature_class)
+            if class_name != "ProxyFeature":
+                names.append(class_name)
     return sorted(names)
 
 
