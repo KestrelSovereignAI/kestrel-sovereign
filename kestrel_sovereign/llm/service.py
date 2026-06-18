@@ -305,6 +305,9 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         # Metering callback for usage billing (Vending Machine)
         # Set via set_metering_callback() after initialization
         self._metering_callback = None
+        # Whether the registered callback accepts the optional per-call
+        # ``cost`` kwarg (#1806). Resolved in set_metering_callback().
+        self._metering_callback_accepts_cost = False
 
         # Privacy gate for the embedding routing path (#1492). The chat
         # path threads ``force_local_only`` explicitly at call time
@@ -1301,11 +1304,29 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                 completion_tokens=int,
             )
 
+        The callback MAY additionally accept an optional ``cost`` keyword
+        (the provider-reported per-call cost in USD, e.g. OpenRouter
+        ``usage.cost``; ``None`` when the provider does not report one).
+        Callbacks that don't declare ``cost`` (or ``**kwargs``) are still
+        called with the original signature — see #1806.
+
         Args:
             callback: Async function to call after each LLM call
         """
         self._metering_callback = callback
-        logger.info("LLM metering enabled")
+        # Detect whether the callback opts into the optional per-call cost
+        # (#1806) so we stay backward-compatible with callbacks written
+        # against the original (provider, model, tokens) signature.
+        accepts_cost = False
+        try:
+            params = inspect.signature(callback).parameters
+            accepts_cost = "cost" in params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+        except (ValueError, TypeError):
+            accepts_cost = False
+        self._metering_callback_accepts_cost = accepts_cost
+        logger.info("LLM metering enabled (per-call cost: %s)", accepts_cost)
 
     def set_observability_context(
         self,
@@ -1326,6 +1347,100 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             "user_id": user_id,
         }
 
+    @staticmethod
+    def _extract_provider_cost(response: Any) -> Optional[float]:
+        """Best-effort per-call cost reported by the provider (#1806).
+
+        OpenRouter returns an exact ``usage.cost`` (USD) per generation when
+        the request opts in (``usage: {include: true}`` — the OpenRouter
+        adapter sets this). The value rides on the provider-native ``raw``
+        object rather than a typed SDK field, so we read it defensively and
+        return ``None`` for providers that don't report a cost.
+        """
+        raw = getattr(response, "raw", None)
+        if raw is None:
+            return None
+        # Streaming adapters stash the cost directly on the raw dict
+        # (the provider usage object isn't retained past the stream).
+        if isinstance(raw, dict) and raw.get("cost") is not None:
+            try:
+                return float(raw["cost"])
+            except (TypeError, ValueError):
+                return None
+        usage = getattr(raw, "usage", None)
+        if usage is None and isinstance(raw, dict):
+            usage = raw.get("usage")
+        if usage is None:
+            return None
+        cost = getattr(usage, "cost", None)
+        if cost is None:
+            # openai-python v2 stashes unknown response fields (OpenRouter's
+            # ``cost`` extension) on the pydantic model's ``model_extra``.
+            extra = getattr(usage, "model_extra", None)
+            if isinstance(extra, dict):
+                cost = extra.get("cost")
+            elif isinstance(usage, dict):
+                cost = usage.get("cost")
+        try:
+            return float(cost) if cost is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def _meter_message_response(
+        self,
+        response: Any,
+        provider_name: str,
+        model: str,
+        *,
+        tools: Optional[List[Dict[str, Any]]],
+        response_format: Optional[Type[BaseModel]],
+        force_local_only: bool,
+        duration_ms: int = 0,
+    ) -> None:
+        """Record usage for a successful ``generate_with_messages`` call.
+
+        The non-streaming message path previously skipped metering entirely
+        (#1804): a callback set via ``set_metering_callback`` fired for the
+        streaming path and ``get_response`` but not here. Mirror the token /
+        cost extraction ``get_response`` does so the meter sees this path too.
+
+        Best-effort: a metering/tracking failure must never break the call the
+        user is awaiting (mirrors ``_record_streamed_usage``).
+        """
+        try:
+            input_tokens = output_tokens = None
+            cache_creation_input_tokens = cache_read_input_tokens = None
+            if isinstance(response, LLMResponse):
+                input_tokens = response.input_tokens
+                output_tokens = response.output_tokens
+                cache_creation_input_tokens = response.cache_creation_input_tokens
+                cache_read_input_tokens = response.cache_read_input_tokens
+            response_text = (
+                response.content if isinstance(response, LLMResponse) else str(response)
+            )
+            total_tokens = (input_tokens or 0) + (output_tokens or 0)
+            await self._track_model_usage(model, provider_name, tokens=total_tokens)
+            await self._log_llm_call(
+                provider=provider_name,
+                model=model,
+                duration_ms=duration_ms,
+                success=True,
+                response=response_text,
+                metadata={
+                    "force_local_only": force_local_only,
+                    "path": "generate_with_messages",
+                },
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_creation_input_tokens=cache_creation_input_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
+                tools_used=tools is not None,
+                structured_output=response_format is not None,
+                cost=self._extract_provider_cost(response),
+            )
+        except Exception as exc:  # noqa: BLE001 - metering must not break the call
+            logger.warning("Failed to meter generate_with_messages: %s", exc)
+
     @handle_observability_errors
     async def _log_llm_call(
         self,
@@ -1345,6 +1460,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         cache_read_input_tokens: Optional[int] = None,
         tools_used: Optional[bool] = None,
         structured_output: Optional[bool] = None,
+        cost: Optional[float] = None,
     ) -> None:
         """Log an LLM call to the observability store (if configured).
 
@@ -1402,7 +1518,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             user_id = self._observability_context.get("user_id")
 
             if companion_id and user_id:
-                await self._metering_callback(
+                meter_kwargs = dict(
                     companion_id=companion_id,
                     user_id=user_id,
                     provider=provider,
@@ -1410,6 +1526,12 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
                     prompt_tokens=input_tokens or 0,
                     completion_tokens=output_tokens or 0,
                 )
+                # Only pass the provider-reported per-call cost (#1806) to
+                # callbacks that opted in; keeps the original signature
+                # working for callbacks that don't declare ``cost``.
+                if self._metering_callback_accepts_cost:
+                    meter_kwargs["cost"] = cost
+                await self._metering_callback(**meter_kwargs)
 
         # Wrap in try/except so a serialization edge case can never break
         # the call path. See issue #819.
@@ -1653,6 +1775,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             cache_read_input_tokens=cache_read_input_tokens,
             tools_used=tools is not None,
             structured_output=response_format is not None,
+            cost=self._extract_provider_cost(response),
         )
 
         # Return full LLMResponse if tools or structured output requested
@@ -2150,6 +2273,7 @@ No other text or formatting.
             String content or LLMResponse
         """
         self._check_policy()
+        start_time = time.time()
         # Try remote GPU first when active AND routing isn't pinned — #734.
         if (
             self._backend == BackendType.REMOTE_GPU
@@ -2166,6 +2290,12 @@ No other text or formatting.
                     messages=messages,
                     tools=tools,
                     response_format=response_format,
+                )
+                await self._meter_message_response(
+                    response, "remote_gpu", model,
+                    tools=tools, response_format=response_format,
+                    force_local_only=force_local_only,
+                    duration_ms=int((time.time() - start_time) * 1000),
                 )
                 if tools is not None or response_format is not None:
                     return response
@@ -2296,6 +2426,12 @@ No other text or formatting.
                     extra_body=provider_cache_body(provider),
                     session_id=session_id,
                     tool_executor=tool_executor,
+                )
+                await self._meter_message_response(
+                    response, provider["name"], model,
+                    tools=tools, response_format=response_format,
+                    force_local_only=force_local_only,
+                    duration_ms=int((time.time() - start_time) * 1000),
                 )
                 if tools is not None or response_format is not None:
                     return response

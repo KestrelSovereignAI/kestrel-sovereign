@@ -57,3 +57,78 @@ def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children():
     assert r["owner_sees"] == "conn-OWNER"   # owner uses its connection
     assert r["child_sees"] is None           # child does NOT inherit it
     assert r["sibling_sees"] is None         # sibling never saw it
+
+
+def test_autocommit_write_retries_on_tuple_concurrently_updated():
+    """Concurrent upserts of the same row (parallel agent-init writes) can
+    surface a transient 'tuple concurrently updated' from Postgres even with
+    ON CONFLICT DO UPDATE. The autocommit execute() path retries it instead
+    of 500-ing. See kestrel #1805."""
+    import contextvars
+    from kestrel_sovereign.storage.db.postgres import (
+        PostgresBackend,
+        _is_concurrent_update_error,
+    )
+
+    assert _is_concurrent_update_error(Exception("tuple concurrently updated"))
+    assert not _is_concurrent_update_error(Exception("some other error"))
+
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
+
+    class _FlakyPool:
+        def __init__(self, fail_times):
+            self.fail_times = fail_times
+            self.calls = 0
+
+        async def execute(self, query, *params):
+            self.calls += 1
+            if self.calls <= self.fail_times:
+                raise Exception("tuple concurrently updated")
+            return "INSERT 0 1"
+
+    pool = _FlakyPool(fail_times=2)
+    backend._ensure_connected = lambda: pool
+    backend._convert_query = lambda q: q
+    backend._strip_tz = lambda p: p
+
+    async def main():
+        return await backend.execute(
+            "INSERT OR REPLACE INTO agent_metadata (agent_id, key, value) VALUES (?, ?, ?)",
+            ("did:x", "k", "v"),
+        )
+
+    rows = asyncio.run(main())
+    assert rows == 1
+    assert pool.calls == 3  # 2 transient failures + 1 success
+
+
+def test_autocommit_write_gives_up_after_max_retries():
+    """A persistent concurrent-update error eventually raises (bounded retry)."""
+    import contextvars
+    from kestrel_sovereign.storage.db.postgres import PostgresBackend
+    from kestrel_sovereign.storage.db.interface import QueryError
+
+    backend = PostgresBackend.__new__(PostgresBackend)
+    backend._txn_conn_var = contextvars.ContextVar("pg_txn_conn", default=None)
+
+    class _AlwaysFailPool:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, query, *params):
+            self.calls += 1
+            raise Exception("tuple concurrently updated")
+
+    pool = _AlwaysFailPool()
+    backend._ensure_connected = lambda: pool
+    backend._convert_query = lambda q: q
+    backend._strip_tz = lambda p: p
+
+    async def main():
+        await backend.execute("UPDATE agent_metadata SET value = ?", ("v",))
+
+    import pytest
+    with pytest.raises(QueryError):
+        asyncio.run(main())
+    assert pool.calls == 5  # initial + 4 retries

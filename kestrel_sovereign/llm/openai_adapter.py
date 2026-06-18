@@ -484,6 +484,7 @@ class OpenAIAdapter(LLMAdapter):
             input_tokens = None
             output_tokens = None
             total_tokens = None
+            call_cost = None
 
             async for chunk in stream:
                 # Extract usage from final chunk (OpenAI sends it with stream_options)
@@ -491,6 +492,19 @@ class OpenAIAdapter(LLMAdapter):
                     input_tokens = getattr(chunk.usage, 'prompt_tokens', None)
                     output_tokens = getattr(chunk.usage, 'completion_tokens', None)
                     total_tokens = getattr(chunk.usage, 'total_tokens', None)
+                    # OpenRouter reports exact per-call cost on the usage-only
+                    # final chunk when ``usage: {include: true}`` was sent
+                    # (kestrel #1806). Stash it for the terminal response.
+                    _cost = getattr(chunk.usage, 'cost', None)
+                    if _cost is None:
+                        _extra = getattr(chunk.usage, 'model_extra', None)
+                        if isinstance(_extra, dict):
+                            _cost = _extra.get('cost')
+                    if _cost is not None:
+                        try:
+                            call_cost = float(_cost)
+                        except (TypeError, ValueError):
+                            call_cost = None
 
                 # Skip chunks with no choices (like the final usage-only chunk)
                 if not chunk.choices:
@@ -598,10 +612,15 @@ class OpenAIAdapter(LLMAdapter):
             # consumers read it only for tool_calls / usage (visible content was
             # already streamed as chunks). Mirrors the anthropic adapter fix
             # (#1686/#1684). OpenRouter inherits this via super() delegation.
+            _raw = {}
+            if reasoning_content:
+                _raw["reasoning_content"] = reasoning_content
+            if call_cost is not None:
+                _raw["cost"] = call_cost
             yield LLMResponse(
                 content=text_content if text_content else None,
                 tool_calls=parsed_tool_calls,
-                raw={"reasoning_content": reasoning_content} if reasoning_content else None,
+                raw=_raw or None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 total_tokens=total_tokens,

@@ -91,6 +91,24 @@ class OpenRouterAdapter(OpenAIAdapter):
             max_retries=0,
         )
 
+    @staticmethod
+    def _with_usage_accounting(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        """Inject OpenRouter's ``usage: {include: true}`` into ``extra_body``.
+
+        Surfaces the exact per-generation ``usage.cost`` (USD) so the metering
+        callback can bill actual cost (+ margin) instead of recomputing from a
+        models-pricing table that drifts from the real charge. Merges rather
+        than clobbers a caller-supplied ``extra_body``.
+        See kestrel #1806 / frinz #359.
+        """
+        kwargs = dict(kwargs)
+        extra_body = dict(kwargs.pop("extra_body", None) or {})
+        usage_opt = dict(extra_body.get("usage") or {})
+        usage_opt.setdefault("include", True)
+        extra_body["usage"] = usage_opt
+        kwargs["extra_body"] = extra_body
+        return kwargs
+
     async def get_response(
         self,
         client: Optional[openai.AsyncOpenAI],
@@ -117,7 +135,7 @@ class OpenRouterAdapter(OpenAIAdapter):
             format=format,
             tools=tools,
             response_format=response_format,
-            **kwargs
+            **self._with_usage_accounting(kwargs)
         )
 
     async def get_streaming_response(
@@ -162,7 +180,7 @@ class OpenRouterAdapter(OpenAIAdapter):
             messages=messages,
             tools=tools,
             response_format=response_format,
-            **kwargs
+            **self._with_usage_accounting(kwargs)
         ):
             yield item
 
