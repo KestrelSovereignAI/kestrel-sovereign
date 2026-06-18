@@ -126,11 +126,17 @@ def build_signal_for_restart_completed(
         "target_ref": str(getattr(request, "update_target_ref", "")),
         "resolved_ref": resolved_ref,
     }
+    # Route the wake back into the session the request was filed from, so it
+    # surfaces in the same chat window the agent asked from (#1809). Empty for
+    # CLI/system-filed requests → None = system-initiated (a fresh session), the
+    # prior behavior.
+    origin_session_id = str(getattr(request, "origin_session_id", "") or "")
     return Signal(
         source=SOURCE_NAME,
         kind="inbound",
         mode=SignalMode.COGNITION,
         payload=payload,
         target_agent=target_agent,
+        session_id=origin_session_id or None,
         dedupe_key=payload["request_id"],
     )

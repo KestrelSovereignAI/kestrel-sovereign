@@ -1343,6 +1343,26 @@ class KestrelAgent(
         )
         verify_llm_providers_initialized(self.llm_service)
 
+        # All subsystems are now up (memory system, context manager, dispatcher,
+        # LLM). Notify features that the agent is fully ready, so any that must
+        # run a COGNITION turn at boot — notably RestartCoordinator's
+        # post-restart wake — fire NOW, after the context manager exists. This
+        # is deliberately distinct from post_all_features_loaded, which runs
+        # during the feature-load phase BEFORE memory/context are built; a wake
+        # dispatched there could not run a turn and would defer for a full cron
+        # interval (#1809). Best-effort per feature; the hook is optional.
+        for feature in list(self.features.values()):
+            ready_hook = getattr(feature, "on_agent_ready", None)
+            if ready_hook is None:
+                continue
+            try:
+                await ready_hook(self)
+            except Exception as e:
+                logging.warning(
+                    "on_agent_ready failed for %s: %s",
+                    getattr(feature, "name", type(feature).__name__), e,
+                )
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
