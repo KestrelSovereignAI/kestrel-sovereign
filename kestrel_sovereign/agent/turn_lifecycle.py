@@ -151,4 +151,10 @@ class TurnLifecycleMixin:
                 yield turn_id
             finally:
                 _CURRENT_TURN_ID.reset(token)
+                # Clear the per-turn active session on exit so an out-of-turn
+                # caller (e.g. a CLI/system-filed request_restart after a chat
+                # turn) cannot read a stale session and misroute its wake into
+                # an old chat window (#1809). Set inside the turn body by
+                # process_input / the streaming turn; both run under this lock.
+                self._active_session_id = None
                 logger.debug("turn_lifecycle: %s end", turn_id)

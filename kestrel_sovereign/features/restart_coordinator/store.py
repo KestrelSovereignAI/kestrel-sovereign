@@ -64,6 +64,9 @@ _ADDED_COLUMNS = (
     ("update_log", "TEXT DEFAULT ''"),
     ("requester_request_id", "TEXT DEFAULT ''"),
     ("executing_boot_id", "TEXT DEFAULT ''"),
+    # Session the request was filed from, so the post-restart wake can be
+    # dispatched back into the SAME chat window the agent asked from (#1809).
+    ("origin_session_id", "TEXT DEFAULT ''"),
 )
 
 # Canonical column order shared by every SELECT below and ``from_row``.
@@ -72,7 +75,7 @@ _COLUMNS = (
     "urgency, policy, status, status_reason, completed_at, operation, "
     "update_repo_path, update_target_ref, update_profile, "
     "update_allow_migrations, update_log, requester_request_id, "
-    "executing_boot_id"
+    "executing_boot_id, origin_session_id"
 )
 
 
@@ -103,6 +106,11 @@ class RestartRequest:
     # in flight, or a detached restart that failed to kill the parent)
     # must NOT be falsely terminalized as ``completed``.
     executing_boot_id: str = ""
+    # Session id the request was filed from (#1809). Empty for
+    # system/CLI-filed requests with no chat session; when set, the
+    # restart.completed wake is dispatched into this session so it surfaces
+    # in the same chat window the request came from.
+    origin_session_id: str = ""
 
     @classmethod
     def from_row(cls, row: Iterable[Any]) -> "RestartRequest":
@@ -130,6 +138,7 @@ class RestartRequest:
             update_log=str(g(15) or ""),
             requester_request_id=str(g(16) or ""),
             executing_boot_id=str(g(17) or ""),
+            origin_session_id=str(g(18) or ""),
         )
 
     def update_log_dict(self) -> Dict[str, Any]:
@@ -162,6 +171,7 @@ class RestartRequest:
             "update": self.update_log_dict(),
             "requester_request_id": self.requester_request_id,
             "executing_boot_id": self.executing_boot_id,
+            "origin_session_id": self.origin_session_id,
         }
 
 
@@ -187,7 +197,8 @@ async def ensure_restart_requests_table(db) -> None:
             update_allow_migrations INTEGER DEFAULT 0,
             update_log TEXT DEFAULT '',
             requester_request_id TEXT DEFAULT '',
-            executing_boot_id TEXT DEFAULT ''
+            executing_boot_id TEXT DEFAULT '',
+            origin_session_id TEXT DEFAULT ''
         )
         """
     )
@@ -228,6 +239,7 @@ async def insert_request(
     update_profile: str = "",
     update_allow_migrations: bool = False,
     requester_request_id: str = "",
+    origin_session_id: str = "",
 ) -> RestartRequest:
     """Insert a fresh pending request. Returns the dataclass row."""
     req_id = uuid.uuid4().hex
@@ -239,14 +251,14 @@ async def insert_request(
             desired_window, urgency, policy, status, status_reason,
             completed_at, operation, update_repo_path, update_target_ref,
             update_profile, update_allow_migrations, update_log,
-            requester_request_id
+            requester_request_id, origin_session_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '', ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?, ?, ?, '', ?, ?)
         """,
         (req_id, requested_by_agent, reason, now, desired_window,
          urgency, policy, operation, update_repo_path, update_target_ref,
          update_profile, 1 if update_allow_migrations else 0,
-         requester_request_id),
+         requester_request_id, origin_session_id),
     )
     return RestartRequest(
         id=req_id,
@@ -266,6 +278,7 @@ async def insert_request(
         update_allow_migrations=update_allow_migrations,
         update_log="",
         requester_request_id=requester_request_id,
+        origin_session_id=origin_session_id,
     )
 
 
