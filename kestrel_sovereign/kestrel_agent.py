@@ -375,6 +375,11 @@ class KestrelAgent(
         # AttributeError on a half-built agent. Same race class as #1632; the
         # restart wake is the path that surfaced it (#1796/#1797).
         self.context_manager: Optional[ContextManager] = None
+        # The session id of the in-flight turn, set under the turn lock by
+        # process_input / the streaming turn and cleared on turn exit. Tools
+        # that must scope to the active conversation read it (read_attachment;
+        # request_restart's origin-session capture, #1809). None = no turn.
+        self._active_session_id: Optional[str] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
