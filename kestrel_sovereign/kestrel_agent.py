@@ -375,6 +375,11 @@ class KestrelAgent(
         # AttributeError on a half-built agent. Same race class as #1632; the
         # restart wake is the path that surfaced it (#1796/#1797).
         self.context_manager: Optional[ContextManager] = None
+        # The session id of the in-flight turn, set under the turn lock by
+        # process_input / the streaming turn and cleared on turn exit. Tools
+        # that must scope to the active conversation read it (read_attachment;
+        # request_restart's origin-session capture, #1809). None = no turn.
+        self._active_session_id: Optional[str] = None
 
         # TaskManager for A2A unified routing
         self.task_manager: Optional[TaskManager] = None
@@ -1343,6 +1348,26 @@ class KestrelAgent(
         )
         verify_llm_providers_initialized(self.llm_service)
 
+        # All subsystems are now up (memory system, context manager, dispatcher,
+        # LLM). Notify features that the agent is fully ready, so any that must
+        # run a COGNITION turn at boot — notably RestartCoordinator's
+        # post-restart wake — fire NOW, after the context manager exists. This
+        # is deliberately distinct from post_all_features_loaded, which runs
+        # during the feature-load phase BEFORE memory/context are built; a wake
+        # dispatched there could not run a turn and would defer for a full cron
+        # interval (#1809). Best-effort per feature; the hook is optional.
+        for feature in list(self.features.values()):
+            ready_hook = getattr(feature, "on_agent_ready", None)
+            if ready_hook is None:
+                continue
+            try:
+                await ready_hook(self)
+            except Exception as e:
+                logging.warning(
+                    "on_agent_ready failed for %s: %s",
+                    getattr(feature, "name", type(feature).__name__), e,
+                )
+
     @property
     def privacy_mode(self) -> PrivacyMode:
         """Get current privacy mode."""
@@ -2029,6 +2054,17 @@ Expected Duration: {expected_duration}
         # lifecycle here so bootstrap and command-handling paths cannot
         # interleave with a heartbeat tick or another HTTP request.
         async with self._turn_lifecycle():
+            # Record THIS turn's session as soon as the turn lock is held —
+            # before command handling — so tools invoked via an explicit
+            # ``!command`` (e.g. request_restart's origin-session capture) see
+            # this turn's session, not a stale value. Setting it UNDER the lock
+            # (which serializes turns per agent) means an overlapping turn
+            # waiting on the lock cannot overwrite it mid-handling (#1809). Set
+            # even when None so a session-less turn never inherits a prior
+            # window. The traced-locked bodies re-affirm it for the
+            # streaming-delegation path.
+            self._active_session_id = session_id
+
             # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
             if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
                 # Allow bootstrap commands to pass through
@@ -2200,6 +2236,14 @@ Expected Duration: {expected_duration}
         invoke this directly while the streaming generator already holds
         the lifecycle, avoiding a self-deadlock against a non-reentrant
         asyncio.Lock."""
+        # Record THIS turn's session so tools that must scope to the active
+        # conversation (read_attachment, request_restart's origin capture) have
+        # an authoritative value — the tool-call `session_id` arg is
+        # model-controlled and usually omitted. Mirrors the streaming path
+        # (streaming.py); the turn-lifecycle lock serializes turns per agent, so
+        # this plain attribute is safe per-turn (#1662 / #1809).
+        self._active_session_id = session_id
+
         # Prompt injection detection (log-only, does not block)
         check_prompt_injection(user_input)
 

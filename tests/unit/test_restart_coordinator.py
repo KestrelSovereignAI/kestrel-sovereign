@@ -627,6 +627,7 @@ async def test_post_restart_sweep_marks_completed_and_emits_signal(tmp_path):
     agent = _make_agent(backend, dispatcher=dispatcher, registry=registry)
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
+    await feat.on_agent_ready()  # post-restart wake fires once the agent is ready
 
     row = await get_request(backend, req.id)
     assert row.status == "completed"
@@ -654,6 +655,7 @@ async def test_post_restart_sweep_only_touches_this_agents_rows(tmp_path):
     agent = _make_agent(backend, did="did:test:agent")
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
+    await feat.on_agent_ready()  # sweep runs but must not touch another agent's row
 
     row = await get_request(backend, other.id)
     assert row.status == "executing"
@@ -738,6 +740,7 @@ async def test_post_restart_sweep_retries_when_dispatcher_raises(tmp_path):
     agent = _make_agent(backend, dispatcher=_BrokenDispatcher())
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
+    await feat.on_agent_ready()  # sweep dispatches; broken dispatcher leaves it executing
 
     row = await get_request(backend, req.id)
     assert row.status == "executing", (
@@ -770,14 +773,18 @@ class _RealDispatchAgent:
         self.features = {"RestartCoordinatorFeature": True}
         self.background_tasks: list[asyncio.Task] = []
         self.process_input_calls: list[str] = []
+        # Session ids the wake turns were dispatched into (#1809) — parallel
+        # to process_input_calls. None = system-initiated (no origin session).
+        self.process_input_sessions: list = []
         # When set, process_input raises to model a wake that failed
         # inside the resuming turn (dispatcher records Status.FAILED).
         self.process_input_should_raise = False
 
-    async def process_input(self, prompt: str):
+    async def process_input(self, prompt: str, session_id=None):
         if self.process_input_should_raise:
             raise RuntimeError("simulated cognition failure")
         self.process_input_calls.append(prompt)
+        self.process_input_sessions.append(session_id)
         return "resumed"
 
     def _track_background_task(self, coro, *, name: str):
@@ -848,6 +855,7 @@ async def test_post_restart_wake_reaches_process_input_and_then_completes(
     )
 
     await feat.initialize()
+    await feat.on_agent_ready()  # fires the post-restart wake now the agent is ready
     # The wake runs as a supervised background task; the row is still
     # executing until that dispatch lands.
     row_mid = await get_request(backend, req.id)
@@ -880,6 +888,7 @@ async def test_post_restart_wake_failure_leaves_row_retryable(tmp_path):
     )
 
     await feat.initialize()
+    await feat.on_agent_ready()
     await agent.drain_background_tasks()
 
     row = await get_request(backend, req.id)
@@ -905,8 +914,9 @@ async def test_restart_coordinator_cron_retries_undelivered_wake(tmp_path):
         expected_current_status="pending",
     )
 
-    # Init sweep: wake fails, row stays executing.
+    # Ready sweep: wake fails, row stays executing.
     await feat.initialize()
+    await feat.on_agent_ready()
     await agent.drain_background_tasks()
     assert (await get_request(backend, req.id)).status == "executing"
     assert agent.process_input_calls == []
@@ -1299,6 +1309,7 @@ async def test_post_restart_sweep_signal_includes_update_metadata(tmp_path):
     agent = _make_agent(backend, dispatcher=dispatcher)
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
+    await feat.on_agent_ready()
 
     assert len(dispatcher.signals) == 1
     payload = dispatcher.signals[0].payload
@@ -1587,6 +1598,7 @@ async def test_post_restart_sweep_emits_completed_status_event(tmp_path):
     agent.emit_event = _emit
     feat = RestartCoordinatorFeature(agent)
     await feat.initialize()
+    await feat.on_agent_ready()
 
     events = [e for e in _restart_status_events(captured)
               if e["request_id"] == req.id]
@@ -1626,3 +1638,163 @@ async def test_idle_ignores_signal_log_infra_tasks(tmp_path):
         log_task.cancel()
         sweep_task.cancel()
         work_task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# #1809: prompt wake (on_agent_ready) + same-session routing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_origin_session_id_roundtrips_in_store(tmp_path):
+    """insert_request persists origin_session_id and from_row reads it back."""
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:t:a", reason="r",
+        origin_session_id="sess-abc",
+    )
+    assert req.origin_session_id == "sess-abc"
+    fetched = await get_request(backend, req.id)
+    assert fetched.origin_session_id == "sess-abc"
+
+
+@pytest.mark.asyncio
+async def test_request_restart_captures_origin_session(tmp_path):
+    """request_restart records the chat session it was filed from (the
+    session_id_var ContextVar set per HTTP turn)."""
+    from kestrel_sovereign.logging_config import session_id_var
+
+    feat, backend = await _make_feature(tmp_path)
+    token = session_id_var.set("chat-session-42")
+    try:
+        result = await feat.request_restart(reason="ship it")
+    finally:
+        session_id_var.reset(token)
+
+    req_id = result.data["request"]["id"]
+    row = await get_request(backend, req_id)
+    assert row.origin_session_id == "chat-session-42"
+
+
+@pytest.mark.asyncio
+async def test_request_restart_captures_active_session(tmp_path):
+    """The authoritative per-turn _active_session_id (set by the turn body from
+    the JSON-body session — the primary chat path) is captured and takes
+    precedence over the logging ContextVar."""
+    from kestrel_sovereign.logging_config import session_id_var
+
+    feat, backend = await _make_feature(tmp_path)
+    feat.agent._active_session_id = "body-session-9"
+    token = session_id_var.set("header-session-1")
+    try:
+        result = await feat.request_restart(reason="ship it")
+    finally:
+        session_id_var.reset(token)
+
+    row = await get_request(backend, result.data["request"]["id"])
+    assert row.origin_session_id == "body-session-9"  # active wins over header
+
+
+@pytest.mark.asyncio
+async def test_request_restart_no_session_is_blank(tmp_path):
+    """With no chat session in context (CLI/system), origin_session_id is blank."""
+    feat, backend = await _make_feature(tmp_path)
+    result = await feat.request_restart(reason="system filed")
+    row = await get_request(backend, result.data["request"]["id"])
+    assert row.origin_session_id == ""
+
+
+def test_build_signal_carries_origin_session():
+    """The restart.completed Signal routes to the request's origin session;
+    empty origin → session_id None (system-initiated)."""
+    from kestrel_sovereign.features.restart_coordinator.store import RestartRequest
+    from kestrel_sovereign.signals.sources.restart import (
+        build_signal_for_restart_completed,
+    )
+
+    base = dict(
+        id="req-1", requested_by_agent="did:a", reason="r", requested_at="t",
+        desired_window="", urgency="normal", policy="idle_agents_only",
+        status="executing", status_reason="", completed_at=None,
+    )
+    with_sess = RestartRequest(origin_session_id="sess-xyz", **base)
+    sig = build_signal_for_restart_completed(
+        with_sess, target_agent="did:a", completed_at="now",
+    )
+    assert sig.session_id == "sess-xyz"
+
+    without = RestartRequest(origin_session_id="", **base)
+    sig2 = build_signal_for_restart_completed(
+        without, target_agent="did:a", completed_at="now",
+    )
+    assert sig2.session_id is None
+
+
+@pytest.mark.asyncio
+async def test_wake_routes_into_origin_session(tmp_path):
+    """End-to-end: a row filed from a session wakes the agent IN that session
+    (process_input receives the origin session_id), not a fresh one (#1809)."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+        origin_session_id="chat-7",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    await feat.initialize()
+    await feat.on_agent_ready()
+    await agent.drain_background_tasks()
+
+    assert agent.process_input_calls and req.id in agent.process_input_calls[0]
+    assert agent.process_input_sessions == ["chat-7"]
+
+
+@pytest.mark.asyncio
+async def test_wake_without_origin_session_is_system_initiated(tmp_path):
+    """A row with no origin session wakes system-initiated (session_id None)."""
+    feat, backend, agent = await _real_dispatch_feature(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="r",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    await feat.initialize()
+    await feat.on_agent_ready()
+    await agent.drain_background_tasks()
+
+    assert agent.process_input_calls
+    assert agent.process_input_sessions == [None]
+
+
+@pytest.mark.asyncio
+async def test_initialize_alone_does_not_wake_only_on_agent_ready(tmp_path):
+    """The post-restart wake must NOT fire during initialize() (the context
+    manager doesn't exist yet); it fires from on_agent_ready, which the agent
+    calls once fully initialized. This is the #1809 promptness fix — the wake
+    happens at end-of-init, not on a later cron tick."""
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+    dispatcher = _CapturingDispatcher()
+    registry = _StubRegistry()
+    agent = _make_agent(backend, dispatcher=dispatcher, registry=registry)
+    feat = RestartCoordinatorFeature(agent)
+
+    await feat.initialize()
+    # initialize() must NOT have dispatched a wake (too early — pre-context).
+    assert dispatcher.signals == []
+    assert (await get_request(backend, req.id)).status == "executing"
+
+    await feat.on_agent_ready()
+    # now the wake fires and the row terminalizes.
+    assert len(dispatcher.signals) == 1
+    assert (await get_request(backend, req.id)).status == "completed"

@@ -1067,6 +1067,15 @@ class SignalDispatcher:
             process_input_kwargs["system_prompt_budget_bytes"] = budget
         if anchored_doctrine is not None:
             process_input_kwargs["anchored_doctrine"] = anchored_doctrine
+        # Route the cognition turn into the signal's originating session when one
+        # is set (e.g. the restart.completed wake carries the session the
+        # restart was requested from, #1809), so the turn lands in that chat
+        # window instead of a fresh implicit session. Guarded by signature
+        # inspection like the other optional kwargs.
+        if signal.session_id and _agent_accepts_kwarg(
+            self._agent.process_input, "session_id"
+        ):
+            process_input_kwargs["session_id"] = signal.session_id
 
         try:
             if process_input_kwargs:

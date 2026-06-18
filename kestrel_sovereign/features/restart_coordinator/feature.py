@@ -194,11 +194,30 @@ class RestartCoordinatorFeature(Feature):
         # retried, not reported as a completed update-and-restart.
         await self._reset_interrupted_updates()
 
-        # Sweep — any ``executing`` row owned by this agent that
-        # survived a restart needs to land in ``completed`` and wake
-        # the agent so it can verify the post-restart state. The
-        # restart we executed brought us back; mark and wake.
-        await self._reap_post_restart_rows()
+        # NOTE: the post-restart wake sweep does NOT run here. ``initialize``
+        # runs during the feature-load phase — BEFORE the agent builds its
+        # memory system + context manager — so a COGNITION wake dispatched now
+        # cannot run a turn (it would defer/retry, the slow path the Sovereign
+        # flagged). The sweep is fired from ``on_agent_ready`` instead, which the
+        # agent calls at the END of initialize() once everything is up, so the
+        # FIRST wake attempt succeeds immediately. The cron tick remains the
+        # backstop for undelivered wakes (#1809).
+
+    async def on_agent_ready(self, agent=None) -> None:
+        """Agent fully initialized (memory + context manager + dispatcher up).
+
+        The agent calls this at the very end of ``initialize()``. Running the
+        post-restart wake sweep here — rather than in ``initialize`` — means the
+        first ``restart.completed`` COGNITION dispatch happens against a
+        ready-to-think agent, so it wakes the requester immediately instead of
+        deferring and waiting up to a full cron interval (#1809). Best-effort:
+        the cron tick is the backstop, so a transient failure here never wedges
+        the wake.
+        """
+        try:
+            await self._reap_post_restart_rows()
+        except Exception as e:  # never let readiness wiring break boot
+            logger.warning("post-restart wake sweep on_agent_ready failed: %s", e)
 
     @tool(
         name="request_restart",
@@ -301,6 +320,21 @@ class RestartCoordinatorFeature(Feature):
         requester_request_id = (
             getattr(self.agent, "_current_request_id", "") or ""
         )
+        # Capture the chat session this request was filed from so the
+        # post-restart wake lands in the SAME window (#1809). Prefer the agent's
+        # authoritative per-turn ``_active_session_id`` (set by both the
+        # streaming and non-streaming turn bodies from the effective session,
+        # incl. the JSON-body session the primary chat path uses). Fall back to
+        # the logging ``session_id_var`` (set only from a query param / header).
+        # Empty for CLI/system-filed requests with no session — those wake
+        # system-initiated, as before.
+        origin_session_id = getattr(self.agent, "_active_session_id", "") or ""
+        if not origin_session_id:
+            try:
+                from kestrel_sovereign.logging_config import session_id_var
+                origin_session_id = session_id_var.get() or ""
+            except Exception:
+                origin_session_id = ""
         req = await insert_request(
             self._db,
             requested_by_agent=str(agent_id),
@@ -315,6 +349,7 @@ class RestartCoordinatorFeature(Feature):
                             else ""),
             update_allow_migrations=bool(allow_migrations),
             requester_request_id=str(requester_request_id),
+            origin_session_id=origin_session_id,
         )
         logger.info(
             "Restart request filed: id=%s op=%s urgency=%s policy=%s "
