@@ -2016,16 +2016,6 @@ Expected Duration: {expected_duration}
         """
         logging.info(f"[AGENTIC] process_input called ({len(user_input)} chars)")
 
-        # Record THIS turn's session up front — BEFORE command handling — so
-        # tools invoked via an explicit ``!command`` (e.g. request_restart's
-        # origin-session capture) see the current turn's session, not a stale
-        # value from a previous turn. Set to ``session_id`` even when None so a
-        # session-less turn never inherits a prior turn's window (#1809). The
-        # turn-lifecycle lock serializes turns per agent, so this plain
-        # attribute is safe per-turn; the traced-locked bodies re-affirm it for
-        # the streaming-delegation path.
-        self._active_session_id = session_id
-
         # Reset context stats on session change
         if hasattr(self, 'context_stats') and session_id:
             self.context_stats.check_session(session_id)
@@ -2059,6 +2049,17 @@ Expected Duration: {expected_duration}
         # lifecycle here so bootstrap and command-handling paths cannot
         # interleave with a heartbeat tick or another HTTP request.
         async with self._turn_lifecycle():
+            # Record THIS turn's session as soon as the turn lock is held —
+            # before command handling — so tools invoked via an explicit
+            # ``!command`` (e.g. request_restart's origin-session capture) see
+            # this turn's session, not a stale value. Setting it UNDER the lock
+            # (which serializes turns per agent) means an overlapping turn
+            # waiting on the lock cannot overwrite it mid-handling (#1809). Set
+            # even when None so a session-less turn never inherits a prior
+            # window. The traced-locked bodies re-affirm it for the
+            # streaming-delegation path.
+            self._active_session_id = session_id
+
             # BOOTSTRAP CHECK: Handle first-time agent wake-up and discovery
             if self.bootstrap_service and await self.bootstrap_service.is_bootstrap_needed():
                 # Allow bootstrap commands to pass through
