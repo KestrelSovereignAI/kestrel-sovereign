@@ -11,8 +11,11 @@ import pytest
 from kestrel_sovereign.feature_registry import (
     FeaturePackageInfo,
     FeatureStatus,
+    InstalledFeatureRuntime,
     SkillInfo,
+    discover_installed_feature_runtimes,
     get_all_skills,
+    get_installed_feature_runtime,
     get_package_for_feature,
     get_registry,
     get_skills_for_package,
@@ -186,6 +189,58 @@ class TestResolveStatus:
             assert registry["test"].status == FeatureStatus.DISABLED
 
 
+class TestInstalledRuntimeMetadata:
+    """Tests for installed feature runtime metadata."""
+
+    def test_runtime_defaults_to_in_process_without_metadata(self):
+        ep = _FakeEntryPoint(
+            name="TestFeature",
+            value="test_pkg.feature:TestFeature",
+            dist=_FakeDistribution("test-pkg", None),
+        )
+
+        with patch(
+            "kestrel_sovereign.feature_registry.importlib.metadata.entry_points",
+            return_value=_FakeEntryPoints([ep]),
+        ):
+            runtimes = discover_installed_feature_runtimes()
+
+        assert runtimes["TestFeature"] == InstalledFeatureRuntime(
+            class_name="TestFeature",
+            entry_point="test_pkg.feature:TestFeature",
+            distribution="test-pkg",
+        )
+
+    def test_reads_isolated_runtime_from_installed_pyproject(self, tmp_path):
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            """
+[tool.kestrel.feature]
+runtime = "isolated-venv"
+service = "/srv/kestrel-feature-test"
+venv = "/var/kestrel/test/.venv"
+description = "Test isolated surface"
+""".strip()
+        )
+        ep = _FakeEntryPoint(
+            name="test",
+            value="test_pkg.feature:TestFeature",
+            dist=_FakeDistribution("test-pkg", pyproject),
+        )
+
+        with patch(
+            "kestrel_sovereign.feature_registry.importlib.metadata.entry_points",
+            return_value=_FakeEntryPoints([ep]),
+        ):
+            runtime = get_installed_feature_runtime("TestFeature")
+
+        assert runtime is not None
+        assert runtime.runtime == "isolated-venv"
+        assert runtime.service == "/srv/kestrel-feature-test"
+        assert runtime.venv == "/var/kestrel/test/.venv"
+        assert runtime.description == "Test isolated surface"
+
+
 class TestGetRegistry:
     """Tests for the combined load + resolve shortcut."""
 
@@ -265,3 +320,35 @@ class TestSkills:
         assert "deploy_agent" in skill_names
         assert "write_script" in skill_names
         assert "run_script" in skill_names
+
+
+class _FakeEntryPoint:
+    def __init__(self, name, value, dist=None):
+        self.name = name
+        self.value = value
+        self.dist = dist
+
+
+class _FakeEntryPoints(list):
+    def select(self, group):
+        return self
+
+
+class _FakePackageFile:
+    name = "pyproject.toml"
+
+    def __str__(self):
+        return "pyproject.toml"
+
+
+class _FakeDistribution:
+    def __init__(self, name, pyproject):
+        self.name = name
+        self._pyproject = pyproject
+        self.files = [_FakePackageFile()] if pyproject else []
+
+    def locate_file(self, package_file):
+        return self._pyproject
+
+    def read_text(self, name):
+        return None

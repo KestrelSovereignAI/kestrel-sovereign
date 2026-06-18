@@ -169,6 +169,15 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
         Dict mapping class name to Feature class.
     """
     classes: Dict[str, Type[Feature]] = {}
+    try:
+        from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
+
+        isolated_classes = {
+            name for name, runtime in discover_installed_feature_runtimes().items()
+            if runtime.runtime == "isolated-venv"
+        }
+    except Exception:  # noqa: BLE001
+        isolated_classes = set()
 
     try:
         eps = importlib.metadata.entry_points()
@@ -184,6 +193,17 @@ def discover_entrypoint_feature_classes() -> Dict[str, Type[Feature]]:
 
     for ep in feature_eps:
         try:
+            declared_class_name = _entrypoint_class_name(
+                getattr(ep, "value", "") or "",
+                ep.name,
+            )
+            if declared_class_name in isolated_classes:
+                logger.info(
+                    "Entry point feature %s uses isolated-venv runtime; "
+                    "skipping in-process import",
+                    declared_class_name,
+                )
+                continue
             cls = ep.load()
             if not (
                 isinstance(cls, type)
@@ -330,21 +350,27 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
     features = []
     discovered_names = set()
 
-    def _try_add(feature_class: Type[Feature], source: str) -> None:
-        """Attempt to instantiate and add a feature class."""
-        class_name = feature_class.__name__
-
+    def _feature_allowed(class_name: str) -> bool:
         if class_name in disabled:
             logger.info(f"Feature '{class_name}' is disabled via {DISABLED_FEATURES_ENV}")
-            return
+            return False
 
         if allowed_features is not None:
             if class_name not in allowed_features and class_name not in MANDATORY_FEATURES:
                 logger.debug(f"Feature '{class_name}' not in agent's allowed profile, skipping")
-                return
+                return False
 
         if class_name in discovered_names:
-            logger.debug(f"Skipping duplicate feature: {class_name} (from {source})")
+            logger.debug(f"Skipping duplicate feature: {class_name}")
+            return False
+
+        return True
+
+    def _try_add(feature_class: Type[Feature], source: str) -> None:
+        """Attempt to instantiate and add a feature class."""
+        class_name = feature_class.__name__
+
+        if not _feature_allowed(class_name):
             return
 
         # External (SDK-base) features lack the runtime-coupled subagent-dispatch
@@ -357,6 +383,17 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
         features.append(feature)
         discovered_names.add(class_name)
         logger.info(f"Discovered feature: {class_name} from {source}")
+
+    def _try_add_isolated(runtime, source: str) -> None:
+        class_name = runtime.class_name
+        if not _feature_allowed(class_name):
+            return
+        from kestrel_sovereign.features.isolated_runtime import ProxyFeature
+
+        feature = ProxyFeature(agent, runtime)
+        features.append(feature)
+        discovered_names.add(class_name)
+        logger.info(f"Discovered isolated feature: {class_name} from {source}")
 
     # Phase 1: Local features (priority — these win on duplicates)
     for module_path in discover_feature_modules():
@@ -373,6 +410,19 @@ def discover_features(agent, allowed_features: Optional[Set[str]] = None) -> Lis
             logger.error(f"Error loading feature from {module_path}: {e}")
 
     # Phase 2: Entry-point features (external packages)
+    try:
+        from kestrel_sovereign.feature_registry import discover_installed_feature_runtimes
+
+        for class_name, runtime in discover_installed_feature_runtimes().items():
+            if runtime.runtime != "isolated-venv":
+                continue
+            try:
+                _try_add_isolated(runtime, f"entry_point:{runtime.entry_point}")
+            except Exception as e:
+                logger.error(f"Error loading isolated entry_point feature {class_name}: {e}")
+    except Exception as e:
+        logger.warning("Failed to inspect entry_point feature runtime metadata: %s", e)
+
     for class_name, feature_class in discover_entrypoint_feature_classes().items():
         try:
             _try_add(feature_class, f"entry_point:{feature_class.__module__}")

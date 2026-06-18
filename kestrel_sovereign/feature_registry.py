@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 try:
     import tomllib
@@ -63,6 +63,20 @@ class FeaturePackageInfo:
     core: bool = False
     skills: List[SkillInfo] = field(default_factory=list)
     status: FeatureStatus = FeatureStatus.AVAILABLE
+
+
+@dataclass(frozen=True)
+class InstalledFeatureRuntime:
+    """Runtime metadata advertised by an installed feature distribution."""
+
+    class_name: str
+    entry_point: str
+    distribution: str
+    runtime: str = "in-process"
+    service: Optional[str] = None
+    venv: Optional[str] = None
+    description: str = ""
+    config_schema: Optional[Dict[str, Any]] = None
 
 
 def load_registry(path: Optional[Path] = None) -> Dict[str, FeaturePackageInfo]:
@@ -133,6 +147,117 @@ def _get_installed_entrypoint_classes() -> Set[str]:
         installed.add(ep.name)
 
     return installed
+
+
+def _entrypoint_class_name(ep_value: str, ep_name: str) -> str:
+    if ep_value and ":" in ep_value:
+        attr = ep_value.split(":", 1)[1].strip()
+        if attr:
+            return attr.split(".")[-1]
+    return ep_name
+
+
+def _read_distribution_pyproject(dist) -> Dict[str, Any]:
+    """Read ``pyproject.toml`` from installed distribution files, if present."""
+    candidates = ("pyproject.toml",)
+
+    # Wheels may expose project files through the Distribution.files API.
+    try:
+        files = list(dist.files or [])
+    except Exception:  # noqa: BLE001
+        files = []
+
+    for package_file in files:
+        path_text = str(package_file)
+        if Path(path_text).name not in candidates:
+            continue
+        try:
+            path = dist.locate_file(package_file)
+            if Path(path).is_file():
+                with open(path, "rb") as f:
+                    return tomllib.load(f)
+        except Exception:  # noqa: BLE001
+            continue
+
+    # Some editable installs expose read_text for non-dist-info payload files.
+    for candidate in candidates:
+        try:
+            text = dist.read_text(candidate)
+        except Exception:  # noqa: BLE001
+            text = None
+        if text:
+            try:
+                return tomllib.loads(text)
+            except Exception:  # noqa: BLE001
+                return {}
+
+    return {}
+
+
+def _feature_runtime_from_pyproject(data: Dict[str, Any]) -> Dict[str, Any]:
+    section = (
+        data.get("tool", {})
+        .get("kestrel", {})
+        .get("feature", {})
+    )
+    return section if isinstance(section, dict) else {}
+
+
+def discover_installed_feature_runtimes() -> Dict[str, InstalledFeatureRuntime]:
+    """Return feature runtime metadata from entry-point distributions.
+
+    This is intentionally metadata-only: it reads entry points and installed
+    project metadata without importing feature modules. Packages that omit
+    ``[tool.kestrel.feature]`` default to the historical in-process runtime.
+    """
+    discovered: Dict[str, InstalledFeatureRuntime] = {}
+    try:
+        eps = importlib.metadata.entry_points()
+    except Exception:  # noqa: BLE001
+        return discovered
+
+    if hasattr(eps, "select"):
+        feature_eps = eps.select(group=FEATURE_ENTRY_POINT_GROUP)
+    else:
+        feature_eps = eps.get(FEATURE_ENTRY_POINT_GROUP, [])
+
+    for ep in feature_eps:
+        class_name = _entrypoint_class_name(getattr(ep, "value", "") or "", ep.name)
+        dist = getattr(ep, "dist", None)
+        dist_name = getattr(dist, "name", "") if dist is not None else ""
+        feature_meta: Dict[str, Any] = {}
+        if dist is not None:
+            feature_meta = _feature_runtime_from_pyproject(
+                _read_distribution_pyproject(dist)
+            )
+
+        runtime = str(feature_meta.get("runtime") or "in-process").strip().lower()
+        service = feature_meta.get("service")
+        venv = feature_meta.get("venv")
+        description = str(feature_meta.get("description") or "")
+        config_schema = feature_meta.get("config_schema")
+        if config_schema is not None and not isinstance(config_schema, dict):
+            config_schema = None
+
+        discovered[class_name] = InstalledFeatureRuntime(
+            class_name=class_name,
+            entry_point=getattr(ep, "value", "") or "",
+            distribution=dist_name,
+            runtime=runtime,
+            service=str(service) if service else None,
+            venv=str(venv) if venv else None,
+            description=description,
+            config_schema=config_schema,
+        )
+
+    return discovered
+
+
+def get_installed_feature_runtime(
+    feature_class_name: str,
+) -> Optional[InstalledFeatureRuntime]:
+    """Look up installed runtime metadata for a feature class name."""
+    return discover_installed_feature_runtimes().get(feature_class_name)
 
 
 def resolve_status(
