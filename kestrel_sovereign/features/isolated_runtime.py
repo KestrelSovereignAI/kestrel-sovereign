@@ -266,7 +266,11 @@ class ProxyFeature(Feature):
         channel_feature = self._channel_feature()
         registry = getattr(channel_feature, "registry", None) if channel_feature else None
         if registry is not None:
-            registry.unregister(self._channel_adapter.channel_type)
+            # Only remove our own adapter: a reload or a native adapter may have
+            # since replaced this channel_type, and we must not evict it.
+            getter = getattr(registry, "get", None)
+            if not callable(getter) or getter(self._channel_adapter.channel_type) is self._channel_adapter:
+                registry.unregister(self._channel_adapter.channel_type)
         self._channel_adapter = None
 
     def _channel_feature(self) -> Any:
@@ -379,14 +383,21 @@ class ProxyFeature(Feature):
         if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
             return factory(**kwargs)
 
+        accepted = {key: value for key, value in kwargs.items() if key in params}
+
+        # Keyword-only factory (named params, no positional `command`): deliver the
+        # accepted keyword args directly (config/event handlers/etc.).
+        if "command" not in params:
+            if accepted:
+                return factory(**accepted)
+            return factory()
+
         # Positional-command constructor (SubprocessIsolatedFeatureClient): pass the
         # launch argv plus whatever keyword extras the factory accepts (notably
         # `config`, so host config reaches the service via the initialize handshake).
-        extras = {key: value for key, value in kwargs.items() if key in params}
-        # `command` is supplied positionally; never also pass it by keyword.
-        extras.pop("command", None)
+        accepted.pop("command", None)
         try:
-            return factory(self._service_command(), **extras)
+            return factory(self._service_command(), **accepted)
         except (TypeError, ValueError):
             return factory(self._service_command())
 

@@ -179,6 +179,9 @@ class FakeChannelRegistry:
     def register(self, adapter):
         self.adapters[adapter.channel_type] = adapter
 
+    def get(self, channel_type):
+        return self.adapters.get(channel_type)
+
     def unregister(self, channel_type):
         return self.adapters.pop(channel_type, None)
 
@@ -271,6 +274,31 @@ async def test_proxy_bridges_channel_capability_into_registry(monkeypatch, tmp_p
 
     await feature.shutdown()
     assert "whatsapp" not in channel_feature.registry.adapters
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_evict_replacement_adapter(monkeypatch, tmp_path):
+    """If another adapter replaced our channel_type, shutdown must not remove it."""
+    channel_feature = FakeChannelFeature()
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {"ChannelFeature": channel_feature}
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+
+    class ChannelClient(FakeIsolatedClient):
+        capabilities = {"channel": {"channel_type": "whatsapp", "send_tool": "whatsapp_send"}}
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=lambda **kw: ChannelClient(**kw))
+    await feature.initialize()
+    assert channel_feature.registry.get("whatsapp") is feature._channel_adapter
+
+    # A native/replacement adapter takes over the same channel_type.
+    replacement = object.__new__(type(feature._channel_adapter))
+    replacement._channel_type = "whatsapp"  # type: ignore[attr-defined]
+    channel_feature.registry.adapters["whatsapp"] = replacement
+
+    await feature.shutdown()
+    assert channel_feature.registry.get("whatsapp") is replacement
 
 
 @pytest.mark.asyncio
