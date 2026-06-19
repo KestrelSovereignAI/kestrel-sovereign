@@ -217,6 +217,8 @@ function settingsForAgent(agent) {
 
 
 export function initVoiceUI() {
+  if (!API.hasCapability('voice')) return;
+
   const header = document.querySelector('.chat-header');
   if (!header) {
     // Voice UI is opt-in — if the chat header isn't present (e.g. mounted
@@ -266,6 +268,7 @@ export function onAgentSwitch(prevAgent, nextAgent) {
 }
 
 export function mountAgentVoiceControls(item, agentName) {
+  if (!API.hasCapability('voice')) return;
   if (!item) return;
   // Voice cards are located by their OWN attribute, NOT `data-agent-name`.
   // The voice session key for standalone mode is `null` (≠ the real agent name
