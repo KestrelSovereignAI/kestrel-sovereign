@@ -38,7 +38,7 @@ from kestrel_sovereign.security.legacy_decrypt import (
 )
 
 
-EMMA_DID = "did:pkh:eip155:1:0xB4E7F05F9c39FcD0b0d2C516249BE960c863647E"
+TEST_DID = "did:pkh:eip155:1:0xfeedfacefeedfacefeedfacefeedfacefeedface"
 OTHER_DID = "did:pkh:eip155:1:0x1234567890abcdef1234567890abcdef12345678"
 PURPOSE = "service-keys"
 
@@ -67,13 +67,13 @@ class TestCurrentV2Passthrough:
         warning must NOT fire — that signal is reserved for the
         legacy-recovery case so operators can act on it."""
         plaintext = b"sk-or-v1-modern-token"
-        ciphertext = sdk_encrypt(EMMA_DID, PURPOSE, plaintext)
+        ciphertext = sdk_encrypt(TEST_DID, PURPOSE, plaintext)
         # Sanity: the SDK currently writes v2 tokens.
         assert ciphertext.startswith(b"KSAv2:")
 
         with caplog.at_level(logging.WARNING):
             recovered = decrypt_with_legacy_fallback(
-                EMMA_DID, PURPOSE, ciphertext,
+                TEST_DID, PURPOSE, ciphertext,
             )
         assert recovered == plaintext
         assert not any(
@@ -91,11 +91,11 @@ class TestPreV2RawAESGCMRecovery:
         raw AES-GCM (``nonce || ct+tag``, no prefix, no AAD) must
         recover and log the rotation hint."""
         plaintext = b"sk-or-v1-historic-token-from-early-2026"
-        ciphertext = _make_pre_v2_ciphertext(EMMA_DID, PURPOSE, plaintext)
+        ciphertext = _make_pre_v2_ciphertext(TEST_DID, PURPOSE, plaintext)
 
         with caplog.at_level(logging.WARNING):
             recovered = decrypt_with_legacy_fallback(
-                EMMA_DID, PURPOSE, ciphertext,
+                TEST_DID, PURPOSE, ciphertext,
             )
         assert recovered == plaintext
         # The warning must surface enough context for an operator to
@@ -118,7 +118,7 @@ class TestPreV2RawAESGCMRecovery:
         under another agent's DID — the per-agent HKDF derivation is
         the cross-tenant isolation boundary."""
         plaintext = b"sk-or-v1-only-emma"
-        ciphertext = _make_pre_v2_ciphertext(EMMA_DID, PURPOSE, plaintext)
+        ciphertext = _make_pre_v2_ciphertext(TEST_DID, PURPOSE, plaintext)
 
         with pytest.raises(DecryptionError):
             decrypt_with_legacy_fallback(OTHER_DID, PURPOSE, ciphertext)
@@ -128,10 +128,10 @@ class TestPreV2RawAESGCMRecovery:
         under another purpose — purpose-derived subkey is the
         cross-purpose isolation boundary."""
         plaintext = b"sk-or-v1-purpose-bound"
-        ciphertext = _make_pre_v2_ciphertext(EMMA_DID, "service-keys", plaintext)
+        ciphertext = _make_pre_v2_ciphertext(TEST_DID, "service-keys", plaintext)
 
         with pytest.raises(DecryptionError):
-            decrypt_with_legacy_fallback(EMMA_DID, "wallet", ciphertext)
+            decrypt_with_legacy_fallback(TEST_DID, "wallet", ciphertext)
 
 
 class TestRejectionShape:
@@ -141,7 +141,7 @@ class TestRejectionShape:
         than being masked by an attempt that can't possibly succeed."""
         too_short = b"abcd"
         with pytest.raises(DecryptionError):
-            decrypt_with_legacy_fallback(EMMA_DID, PURPOSE, too_short)
+            decrypt_with_legacy_fallback(TEST_DID, PURPOSE, too_short)
 
     def test_random_long_bytes_reject_with_sdk_error_chain(self, caplog):
         """A long random blob that fails BOTH v2/Fernet AND raw AES-GCM
@@ -151,7 +151,7 @@ class TestRejectionShape:
         rubbish = os.urandom(101)  # same length as Emma's row, but random key
         with caplog.at_level(logging.WARNING):
             with pytest.raises(DecryptionError):
-                decrypt_with_legacy_fallback(EMMA_DID, PURPOSE, rubbish)
+                decrypt_with_legacy_fallback(TEST_DID, PURPOSE, rubbish)
         assert not any(
             "raw AES-GCM fallback" in rec.message for rec in caplog.records
         ), (
