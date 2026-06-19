@@ -76,17 +76,20 @@ class FilecoinAdapter:
         
         self._ipfs_available = self._test_ipfs_connection()
         if not self._ipfs_available:
-            logging.warning("Will operate in local-only mode for all decentralized storage tiers.")
-        
+            logging.info("Will operate in local-only mode for all decentralized storage tiers.")
+
         self._lotus_available = self.lotus_client is not None
         if not self._lotus_available:
-            logging.warning("Will operate in IPFS-only mode for Filecoin storage tiers.")
+            logging.info("Will operate in IPFS-only mode for Filecoin storage tiers.")
 
     def _initialize_lotus_client(self, rpc_url: str, token: Optional[str]) -> Optional[object]:
         """Initializes and tests the Lotus client connection."""
+        # pylotus-rpc is an optional dependency. Its absence is the normal case
+        # for most deployments, so log at DEBUG rather than alarming at ERROR.
+        if LotusClient is None or HttpJsonRpcConnector is None:
+            logging.debug("Lotus/Filecoin support disabled: pylotus-rpc not installed.")
+            return None
         try:
-            if LotusClient is None or HttpJsonRpcConnector is None:
-                raise RuntimeError("pylotus-rpc not installed")
             headers = {"Authorization": f"Bearer {token}"} if token else {}
             connector = HttpJsonRpcConnector(url=rpc_url, headers=headers)
             client = LotusClient(connector)
