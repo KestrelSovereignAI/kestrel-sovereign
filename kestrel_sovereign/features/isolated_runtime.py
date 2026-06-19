@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from kestrel_sdk.channels import ChannelAdapter
 from kestrel_sdk.tools.base import AgentTool, ToolCategory, ToolSchema
 
 from kestrel_sovereign.feature_registry import InstalledFeatureRuntime
@@ -127,6 +128,8 @@ class ProxyFeature(Feature):
         self._stopping = False
         self._venv_path: Optional[Path] = None
         self._bin_path: Optional[Path] = None
+        self._host_config: Dict[str, Any] = {}
+        self._channel_adapter: Optional["ProxyChannelAdapter"] = None
 
     @property
     def tool_description(self) -> str:
@@ -142,15 +145,21 @@ class ProxyFeature(Feature):
         self._venv_path, self._bin_path = self.resolve_runtime_paths()
         if self._bin_path is None:
             self.ensure_venv()
+        # Resolve persisted/UI host config BEFORE building the client so it can be
+        # forwarded to the isolated service through the initialize handshake (the
+        # service is otherwise launched bare, with only env vars).
+        self._host_config = await self._load_host_config()
         self._client = self._build_client()
         await _maybe_await(self._client.start())
         await self._register_event_handler()
         advertised_tools = await _maybe_await(self._client.list_tools())
         self._tools = [IsolatedFeatureTool(self, meta) for meta in advertised_tools]
+        self._register_channel_bridge()
         self._supervision_task = self._start_supervision()
 
     async def shutdown(self):
         self._stopping = True
+        self._unregister_channel_bridge()
         if self._supervision_task:
             self._supervision_task.cancel()
             try:
@@ -176,6 +185,117 @@ class ProxyFeature(Feature):
     async def set_config(self, config: Dict) -> None:
         if self._client is not None and hasattr(self._client, "set_config"):
             await _maybe_await(self._client.set_config(config))
+
+    async def _load_host_config(self) -> Dict[str, Any]:
+        """Resolve persisted/UI host config to forward into the service.
+
+        Reads the same graph-store node the in-process Feature base persists to
+        (``feature_config:<name>``). Best-effort: any failure yields an empty
+        config rather than blocking feature startup.
+        """
+        try:
+            persisted = await self.load_persisted_config()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("No persisted config for isolated feature %s: %s", self.name, exc)
+            return {}
+        return persisted if isinstance(persisted, dict) else {}
+
+    # ------------------------------------------------------------------
+    # Channel bridge
+    # ------------------------------------------------------------------
+
+    def _client_capabilities(self) -> Dict[str, Any]:
+        # Prefer the wrapper's passthrough; fall back to the inner JSON-RPC
+        # client, where SubprocessIsolatedFeatureClient stores capabilities after
+        # initialize (covers SDK builds without the wrapper-level property).
+        caps = getattr(self._client, "capabilities", None)
+        if not isinstance(caps, dict) or not caps:
+            inner = getattr(self._client, "client", None)
+            inner_caps = getattr(inner, "capabilities", None)
+            if isinstance(inner_caps, dict):
+                caps = inner_caps
+        return caps if isinstance(caps, dict) else {}
+
+    def _register_channel_bridge(self) -> None:
+        """If the service advertises a channel capability, register a forwarding
+        ``ChannelAdapter`` so the generic channels API works against this
+        isolated feature (otherwise only the feature's own tools + inbound
+        events work, not ``channels_send``/``channels_list``)."""
+        channel = self._client_capabilities().get("channel")
+        if not isinstance(channel, dict):
+            return
+        channel_type = channel.get("channel_type")
+        send_tool = channel.get("send_tool")
+        if not channel_type or not send_tool:
+            logger.warning(
+                "Isolated feature %s advertised an incomplete channel capability: %r",
+                self.name,
+                channel,
+            )
+            return
+
+        channel_feature = self._channel_feature()
+        registry = getattr(channel_feature, "registry", None) if channel_feature else None
+        if registry is None:
+            logger.warning(
+                "Isolated channel feature %s cannot bridge: ChannelFeature/registry "
+                "unavailable; channels_send will not see channel '%s'",
+                self.name,
+                channel_type,
+            )
+            return
+
+        adapter = ProxyChannelAdapter(
+            self,
+            channel_type=str(channel_type),
+            send_tool=str(send_tool),
+            status_tool=channel.get("status_tool"),
+            config=self._channel_config(str(channel_type)),
+        )
+        registry.register(adapter)
+        self._channel_adapter = adapter
+        logger.info(
+            "Bridged isolated feature %s into ChannelFeature.registry as channel '%s'",
+            self.name,
+            channel_type,
+        )
+
+    def _unregister_channel_bridge(self) -> None:
+        if self._channel_adapter is None:
+            return
+        channel_feature = self._channel_feature()
+        registry = getattr(channel_feature, "registry", None) if channel_feature else None
+        if registry is not None:
+            # Only remove our own adapter: a reload or a native adapter may have
+            # since replaced this channel_type, and we must not evict it.
+            getter = getattr(registry, "get", None)
+            if not callable(getter) or getter(self._channel_adapter.channel_type) is self._channel_adapter:
+                registry.unregister(self._channel_adapter.channel_type)
+        self._channel_adapter = None
+
+    def _channel_feature(self) -> Any:
+        features = getattr(self.agent, "features", None)
+        if isinstance(features, dict):
+            return features.get("ChannelFeature")
+        getter = getattr(features, "get", None)
+        return getter("ChannelFeature") if callable(getter) else None
+
+    def _channel_config(self, channel_type: str):
+        """Build a ChannelConfig from host config for sender-filtering / enabled.
+
+        Inbound sender filtering and the disabled-channel guard both read the
+        registered adapter's ``config``, so mirror the host-side feature config
+        onto the forwarding adapter.
+        """
+        from kestrel_sdk.channels import ChannelConfig
+
+        cfg = self._host_config or {}
+        return ChannelConfig(
+            channel_type=channel_type,
+            agent_id=str(cfg.get("agent_id", "") or ""),
+            enabled=bool(cfg.get("enabled", True)),
+            allowed_senders=list(cfg.get("allowed_senders") or []),
+        )
 
     async def call_isolated_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -250,27 +370,36 @@ class ProxyFeature(Feature):
             "executable": str(self._bin_path) if self._bin_path else None,
             "event_handler": self._handle_event,
             "notification_handler": self._handle_event,
+            "config": self._host_config or None,
         }
         kwargs = {key: value for key, value in kwargs.items() if value}
 
         try:
             signature = inspect.signature(factory)
-            if any(
-                param.kind is inspect.Parameter.VAR_KEYWORD
-                for param in signature.parameters.values()
-            ):
-                return factory(**kwargs)
-            accepted = {
-                key: value
-                for key, value in kwargs.items()
-                if key in signature.parameters
-            }
+            params = signature.parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return factory(**kwargs)
+
+        accepted = {key: value for key, value in kwargs.items() if key in params}
+
+        # Keyword-only factory (named params, no positional `command`): deliver the
+        # accepted keyword args directly (config/event handlers/etc.).
+        if "command" not in params:
             if accepted:
                 return factory(**accepted)
-        except (TypeError, ValueError):
-            pass
+            return factory()
 
-        return factory(self._service_command())
+        # Positional-command constructor (SubprocessIsolatedFeatureClient): pass the
+        # launch argv plus whatever keyword extras the factory accepts (notably
+        # `config`, so host config reaches the service via the initialize handshake).
+        accepted.pop("command", None)
+        try:
+            return factory(self._service_command(), **accepted)
+        except (TypeError, ValueError):
+            return factory(self._service_command())
 
     def _service_command(self) -> List[str]:
         """Build the argv to launch the isolated service.
@@ -398,11 +527,7 @@ class ProxyFeature(Feature):
             await self._route_inbound(data)
 
     async def _route_inbound(self, payload: Any) -> None:
-        channel = (
-            self.agent.features.get("ChannelFeature")
-            if hasattr(self.agent, "features")
-            else None
-        )
+        channel = self._channel_feature()
         if channel is None or not hasattr(channel, "handle_inbound"):
             logger.warning(
                 "Inbound notification from %s dropped: ChannelFeature unavailable",
@@ -414,5 +539,128 @@ class ProxyFeature(Feature):
 
         message = payload
         if isinstance(payload, dict):
-            message = ChannelMessage(**payload)
+            # from_dict coerces the wire shape (string direction/timestamp) back
+            # into typed fields and ignores unknown keys.
+            message = ChannelMessage.from_dict(payload)
         await channel.handle_inbound(message)
+
+
+def _send_outcome(envelope: Dict[str, Any], transport_ok: bool):
+    """Classify a send tool's envelope into a DeliveryStatus.
+
+    Recognizes two wire shapes a channel send tool may return:
+      * a plain ``{"ok": bool, ...}`` envelope, and
+      * the framework ``ToolResult`` shape ``{"status": "ok"|"error"|
+        "partial", ...}`` (ok->SUCCESS, error->FAILURE, partial->PENDING).
+    An explicit error/non-OK envelope must NOT be reported as a successful
+    delivery just because the JSON-RPC transport itself succeeded.
+    """
+    from kestrel_sdk.channels import DeliveryStatus
+
+    if not transport_ok:
+        return DeliveryStatus.FAILURE
+    if "ok" in envelope:
+        return DeliveryStatus.SUCCESS if envelope["ok"] else DeliveryStatus.FAILURE
+    status = envelope.get("status")
+    if isinstance(status, str):
+        token = status.lower()
+        if token in {"error", "failure", "failed"}:
+            return DeliveryStatus.FAILURE
+        if token in {"partial", "pending"}:
+            return DeliveryStatus.PENDING
+        if token in {"ok", "success"}:
+            return DeliveryStatus.SUCCESS
+    if "success" in envelope:
+        return DeliveryStatus.SUCCESS if envelope["success"] else DeliveryStatus.FAILURE
+    # No tool-level signal: trust the transport outcome.
+    return DeliveryStatus.SUCCESS
+
+
+def _delivery_receipt_from_result(channel_type: str, result: Dict[str, Any]):
+    """Map a forwarded isolated-tool result onto a ``DeliveryReceipt``.
+
+    ``call_isolated_tool`` wraps the tool's own envelope as
+    ``{"success": bool, "result": <envelope>}``.
+    """
+    import uuid as _uuid
+
+    from kestrel_sdk.channels import DeliveryReceipt, DeliveryStatus
+
+    transport_ok = bool(result.get("success"))
+    envelope = result.get("result")
+    envelope = envelope if isinstance(envelope, dict) else {}
+    data = envelope.get("data")
+    data = data if isinstance(data, dict) else {}
+    receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
+    message_id = str(
+        envelope.get("message_id")
+        or envelope.get("id")
+        or data.get("message_id")
+        or data.get("id")
+        or receipt.get("message_id")
+        or _uuid.uuid4()
+    )
+    status = _send_outcome(envelope, transport_ok)
+    if status is DeliveryStatus.FAILURE:
+        error = envelope.get("error") or result.get("error") or "send failed"
+        return DeliveryReceipt(
+            message_id=message_id,
+            status=status,
+            channel_type=channel_type,
+            error=str(error),
+        )
+    return DeliveryReceipt(message_id=message_id, status=status, channel_type=channel_type)
+
+
+class ProxyChannelAdapter(ChannelAdapter):
+    """Forwarding ``ChannelAdapter`` backed by an isolated feature service.
+
+    Registered into ``ChannelFeature.registry`` for isolated features that
+    advertise a channel capability, so the generic channels API routes through
+    the out-of-venv service. Sends forward to the service's ``send_tool``;
+    inbound flows independently via ``channel.inbound`` events (handled by the
+    proxy's event handler), so ``on_message`` is a no-op here.
+    """
+
+    def __init__(
+        self,
+        proxy: "ProxyFeature",
+        *,
+        channel_type: str,
+        send_tool: str,
+        status_tool: Optional[str] = None,
+        config: Any = None,
+    ):
+        super().__init__(config)
+        self._proxy = proxy
+        self._channel_type = channel_type
+        self._send_tool = send_tool
+        self._status_tool = status_tool
+        # Registered only after the service reports ready; treat as connected
+        # until told otherwise. The send receipt carries the real per-send truth.
+        self._connected = True
+
+    @property
+    def channel_type(self) -> str:
+        return self._channel_type
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def connect(self) -> None:
+        self._connected = True
+
+    async def disconnect(self) -> None:
+        self._connected = False
+
+    async def on_message(self, callback) -> None:
+        # Inbound is delivered to ChannelFeature.handle_inbound via the proxy's
+        # event handler, not through an adapter-held callback.
+        return None
+
+    async def send_message(self, to: str, content: str, **kwargs):
+        result = await self._proxy.call_isolated_tool(
+            self._send_tool, {"to": to, "message": content}
+        )
+        return _delivery_receipt_from_result(self._channel_type, result)

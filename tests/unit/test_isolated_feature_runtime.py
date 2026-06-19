@@ -172,6 +172,197 @@ async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path):
         os.environ.pop("KESTREL_FEATURE_SVCFEATURE_BIN", None)
 
 
+class FakeChannelRegistry:
+    def __init__(self):
+        self.adapters = {}
+
+    def register(self, adapter):
+        self.adapters[adapter.channel_type] = adapter
+
+    def get(self, channel_type):
+        return self.adapters.get(channel_type)
+
+    def unregister(self, channel_type):
+        return self.adapters.pop(channel_type, None)
+
+
+class FakeChannelFeature:
+    def __init__(self):
+        self.registry = FakeChannelRegistry()
+        self.inbound = []
+
+    async def handle_inbound(self, message):
+        self.inbound.append(message)
+
+
+def _isolated_runtime():
+    return InstalledFeatureRuntime(
+        class_name="WhatsAppFeature",
+        entry_point="wa.feature:WhatsAppFeature",
+        distribution="kestrel-channel-whatsapp",
+        runtime="isolated-venv",
+        service="wa-service",
+    )
+
+
+@pytest.mark.asyncio
+async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path):
+    """Persisted host config is loaded and handed to the client (-> initialize handshake)."""
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {}
+
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+    captured = {}
+
+    def client_factory(**kwargs):
+        captured.update(kwargs)
+        return FakeIsolatedClient(**kwargs)
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=client_factory)
+
+    async def fake_load():
+        return {"provider": "web", "allowed_senders": ["+13035551234"]}
+
+    feature.load_persisted_config = fake_load  # type: ignore[assignment]
+    await feature.initialize()
+
+    assert captured["config"] == {
+        "provider": "web",
+        "allowed_senders": ["+13035551234"],
+    }
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proxy_bridges_channel_capability_into_registry(monkeypatch, tmp_path):
+    """A service advertising a channel capability is registered as a forwarding adapter,
+    and channels_send-style routing reaches the service tool."""
+    channel_feature = FakeChannelFeature()
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {"ChannelFeature": channel_feature}
+
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+
+    class ChannelClient(FakeIsolatedClient):
+        capabilities = {
+            "channel": {
+                "channel_type": "whatsapp",
+                "send_tool": "whatsapp_send",
+                "status_tool": "whatsapp_status",
+            }
+        }
+
+        async def call_tool(self, name, args):
+            self.calls.append((name, args))
+            return {"ok": True, "data": {"message_id": "WAMID.1"}, "message": "sent"}
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=lambda **kw: ChannelClient(**kw))
+    await feature.initialize()
+
+    adapter = channel_feature.registry.adapters.get("whatsapp")
+    assert adapter is not None
+    assert adapter.is_connected is True
+
+    receipt = await adapter.send_message(to="+13035551234", content="hi")
+    assert receipt.status.value == "success"
+    assert receipt.message_id == "WAMID.1"
+    assert feature._client.calls == [
+        ("whatsapp_send", {"to": "+13035551234", "message": "hi"})
+    ]
+
+    await feature.shutdown()
+    assert "whatsapp" not in channel_feature.registry.adapters
+
+
+@pytest.mark.asyncio
+async def test_shutdown_does_not_evict_replacement_adapter(monkeypatch, tmp_path):
+    """If another adapter replaced our channel_type, shutdown must not remove it."""
+    channel_feature = FakeChannelFeature()
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {"ChannelFeature": channel_feature}
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+
+    class ChannelClient(FakeIsolatedClient):
+        capabilities = {"channel": {"channel_type": "whatsapp", "send_tool": "whatsapp_send"}}
+
+    feature = ProxyFeature(agent, _isolated_runtime(), client_factory=lambda **kw: ChannelClient(**kw))
+    await feature.initialize()
+    assert channel_feature.registry.get("whatsapp") is feature._channel_adapter
+
+    # A native/replacement adapter takes over the same channel_type.
+    replacement = object.__new__(type(feature._channel_adapter))
+    replacement._channel_type = "whatsapp"  # type: ignore[attr-defined]
+    channel_feature.registry.adapters["whatsapp"] = replacement
+
+    await feature.shutdown()
+    assert channel_feature.registry.get("whatsapp") is replacement
+
+
+@pytest.mark.asyncio
+async def test_proxy_send_maps_failure_receipt(monkeypatch, tmp_path):
+    channel_feature = FakeChannelFeature()
+    agent = Mock()
+    agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
+    agent.features = {"ChannelFeature": channel_feature}
+    monkeypatch.setenv("KESTREL_FEATURE_WHATSAPPFEATURE_BIN", "/bin/wa-service")
+
+    class FailingChannelClient(FakeIsolatedClient):
+        capabilities = {
+            "channel": {"channel_type": "whatsapp", "send_tool": "whatsapp_send"}
+        }
+
+        async def call_tool(self, name, args):
+            return {"ok": False, "error": "not linked"}
+
+    feature = ProxyFeature(
+        agent, _isolated_runtime(), client_factory=lambda **kw: FailingChannelClient(**kw)
+    )
+    await feature.initialize()
+    adapter = channel_feature.registry.adapters["whatsapp"]
+    receipt = await adapter.send_message(to="+1", content="x")
+    assert receipt.status.value == "failure"
+    assert "not linked" in (receipt.error or "")
+    await feature.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_proxy_send_maps_toolresult_envelopes(monkeypatch, tmp_path):
+    """ToolResult wire shapes (status=error/partial) must not read as success."""
+    from kestrel_sovereign.features.isolated_runtime import _delivery_receipt_from_result
+
+    # status=error wrapped as a successful transport call must be a FAILURE
+    err = _delivery_receipt_from_result(
+        "whatsapp", {"success": True, "result": {"status": "error", "error": "not linked"}}
+    )
+    assert err.status.value == "failure"
+    assert "not linked" in (err.error or "")
+
+    # status=partial -> PENDING (honesty: not yet confirmed)
+    part = _delivery_receipt_from_result(
+        "whatsapp",
+        {"success": True, "result": {"status": "partial", "data": {"receipt": {"message_id": "M2"}}}},
+    )
+    assert part.status.value == "pending"
+    assert part.message_id == "M2"
+
+    # status=ok -> SUCCESS
+    ok = _delivery_receipt_from_result(
+        "whatsapp", {"success": True, "result": {"status": "ok", "data": {"message_id": "M3"}}}
+    )
+    assert ok.status.value == "success"
+    assert ok.message_id == "M3"
+
+    # top-level message_id on a plain {"ok": True} envelope is preserved
+    top = _delivery_receipt_from_result(
+        "whatsapp", {"success": True, "result": {"ok": True, "message_id": "WAMID.top"}}
+    )
+    assert top.status.value == "success"
+    assert top.message_id == "WAMID.top"
+
+
 def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
     agent = Mock()
     agent.storage_path = str(tmp_path / "agent" / "kestrel_prime.db")
