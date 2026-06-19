@@ -406,6 +406,12 @@ export function createApiClient({
         getSovereigntyFilePreview: (filename) => client.request(`/api/sovereignty/files/${encodeURIComponent(filename)}/preview`),
         getConversations: (decrypt = true) => client.request(`/api/conversations?decrypt=${decrypt}`),
         getConversation: (sessionId, decrypt = true) => client.request(`/api/conversations/${encodeURIComponent(sessionId)}?decrypt=${decrypt}`),
+        // Recent restart_status lifecycle events for repainting the bubble
+        // trail on conversation reload (#1816). Scoped to the session so a
+        // restart filed from one conversation never repaints in another.
+        getRestartStatusEvents: (sessionId = '', limit = 200) => client.request(
+            `/api/restart/status-events?session=${encodeURIComponent(sessionId)}&limit=${encodeURIComponent(limit)}`,
+        ),
         newConversation: () => client.request('/api/conversations/new', { method: 'POST' }),
         // Soft-delete moves to Trash, recoverable (#763 / #765).  The
         // X-Kestrel-Allow-Destructive header satisfies the demo-isolation

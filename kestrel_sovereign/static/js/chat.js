@@ -1466,16 +1466,19 @@ const RESTART_STATE_ACCENTS = {
  * operation, target ref/profile, policy/urgency, current state, and
  * any deferral reason.
  */
-export function handleRestartStatus(payload) {
+export function handleRestartStatus(payload, targetEl = null) {
     if (!payload || typeof payload !== 'object') return;
     const requestId = String(payload.request_id || '');
     if (!requestId) return;
 
     // Resolve both the pane element (where the bubble lands) and the
     // pane object (so we can detect an active assistant stream and
-    // interrupt it cleanly — #1560 stream-boundary).
-    const paneObj = notificationPaneObject();
-    const target = paneObj ? paneObj.element : resolvePaneElement();
+    // interrupt it cleanly — #1560 stream-boundary). When ``targetEl``
+    // is supplied (chat-history reload repainting the trail, #1816) it
+    // pins the bubble to that conversation's pane and there is no live
+    // stream to interrupt, so the pane object is skipped.
+    const paneObj = targetEl ? null : notificationPaneObject();
+    const target = targetEl || (paneObj ? paneObj.element : resolvePaneElement());
     if (!target) return;
 
     const state = String(payload.status || 'pending');

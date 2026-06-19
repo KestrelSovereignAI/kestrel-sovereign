@@ -205,6 +205,16 @@ class RestartCoordinatorFeature(Feature):
         # FIRST wake attempt succeeds immediately. The cron tick remains the
         # backstop for undelivered wakes (#1809).
 
+    def get_router(self):
+        """Expose the restart status-event API for chat-history reload.
+
+        Lets the Console repaint the restart status-bubble trail when a
+        conversation is loaded (#1816). Mounted dynamically so the route
+        only exists when this feature is loaded.
+        """
+        from kestrel_sovereign.endpoints.restart_events import router
+        return router
+
     async def on_agent_ready(self, agent=None) -> None:
         """Agent fully initialized (memory + context manager + dispatcher up).
 
