@@ -524,6 +524,19 @@ def get_provider_embedding_service(llm_service: Optional[Any] = None) -> Optiona
         from kestrel_sovereign.llm.service import LLMService
 
         return LLMService().get_embedding_service()
+    except ImportError as exc:
+        # A circular import here means provider embeddings are disabled by a
+        # code-structure bug, not by configuration — surface it loudly (#1792).
+        # Everything that depends on embeddings (RAG, memory retrieval) silently
+        # degrades otherwise, and a WARNING is easy to miss in startup noise.
+        logger.error(
+            "Provider embedding service unavailable due to an import error "
+            "(likely a circular import); provider embeddings are DISABLED and "
+            "any RAG/memory-retrieval path will degrade to a non-embedding "
+            "fallback: %s",
+            exc,
+        )
+        return None
     except Exception as exc:
         logger.warning("Provider embedding service not available: %s", exc)
         return None
