@@ -355,6 +355,13 @@ async def test_proxy_send_maps_toolresult_envelopes(monkeypatch, tmp_path):
     assert ok.status.value == "success"
     assert ok.message_id == "M3"
 
+    # top-level message_id on a plain {"ok": True} envelope is preserved
+    top = _delivery_receipt_from_result(
+        "whatsapp", {"success": True, "result": {"ok": True, "message_id": "WAMID.top"}}
+    )
+    assert top.status.value == "success"
+    assert top.message_id == "WAMID.top"
+
 
 def test_proxy_feature_resolves_default_per_agent_venv(tmp_path):
     agent = Mock()

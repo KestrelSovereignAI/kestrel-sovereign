@@ -593,7 +593,9 @@ def _delivery_receipt_from_result(channel_type: str, result: Dict[str, Any]):
     data = data if isinstance(data, dict) else {}
     receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
     message_id = str(
-        data.get("message_id")
+        envelope.get("message_id")
+        or envelope.get("id")
+        or data.get("message_id")
         or data.get("id")
         or receipt.get("message_id")
         or _uuid.uuid4()
