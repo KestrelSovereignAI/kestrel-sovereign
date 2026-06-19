@@ -10,6 +10,7 @@ import {
     wipeAgentChatPane,
     renderAgentContentHtml,
     messageAttachmentsHtml,
+    handleRestartStatus,
 } from './chat.js';
 
 // #1659: tool cards on reload come from the structured, position-stamped
@@ -34,6 +35,20 @@ const LEGACY_TOOL_START_PRESENCE = /\u{1F527}\s+Calling\s+/u;
 // the positions stay exact — the shared renderer (buildToolSegmentsByPos)
 // already strips the `---` wire delimiter and leading blanks PER SEGMENT, so
 // doing it here too would shift every later card's position (codex review).
+// Parse a stored timestamp into an epoch-ms sort key for interleaving the
+// conversation timeline (#1816). DB timestamps are UTC, but conversation rows
+// serialize naive (no tz suffix) while restart_status_events carry an explicit
+// +00:00. Date.parse() reads a naive string as LOCAL time, so pin tz-less
+// strings to UTC ('Z') before parsing — otherwise the two streams drift apart
+// by the viewer's local offset and interleave wrong.
+function timelineTs(value) {
+    const s = String(value || '');
+    if (!s) return 0;
+    const hasTz = /[zZ]$|[+-]\d{2}:?\d{2}$/.test(s);
+    const t = Date.parse(hasTz ? s : `${s}Z`);
+    return Number.isNaN(t) ? 0 : t;
+}
+
 // Render assistant prose for history reload through the shared renderer
 // (protects math spans + sanitizes), falling back to marked / escaped text.
 function renderAssistantHtml(text) {
@@ -324,8 +339,48 @@ window.loadConversation = async function(sessionId) {
             paneEl.appendChild(banner);
         }
 
-        data.messages.forEach(msg => {
+        // Repaint the restart status-bubble trail (requesting → executing
+        // → completed) on reload (#1816). These bubbles render live via the
+        // ``restart_status`` SSE side-channel but vanish on reload because
+        // they're never persisted as conversation rows (rejected in #1815) —
+        // their durable home is the ``restart_status_events`` audit table
+        // (#1562). Scoped server-side to requests filed from THIS session
+        // (``origin_session_id``, #1812) so conversation A never repaints a
+        // restart filed from conversation B. Tolerate the endpoint being
+        // absent (restart feature not loaded) — there's just no trail then.
+        let restartEvents = [];
+        try {
+            const res = await API.getRestartStatusEvents(sessionId);
+            restartEvents = Array.isArray(res?.events) ? res.events : [];
+        } catch (e) {
+            restartEvents = [];
+        }
+
+        // Interleave messages and restart status bubbles in timestamp order
+        // so the trail lands chronologically among the conversation turns,
+        // matching the live render order. DB timestamps are UTC; conversation
+        // rows serialize naive (no tz) while restart events carry +00:00, so
+        // pin naive strings to UTC before comparing.
+        const timeline = [];
+        data.messages.forEach((msg) => {
             if (msg.role === 'system') return;
+            timeline.push({ ts: timelineTs(msg.created_at), kind: 'message', item: msg });
+        });
+        restartEvents.forEach((ev) => {
+            timeline.push({ ts: timelineTs(ev.created_at), kind: 'restart', item: ev });
+        });
+        timeline.sort((a, b) => a.ts - b.ts);
+
+        timeline.forEach((entry) => {
+            if (entry.kind === 'restart') {
+                // Reuse the live bubble renderer; the stored event payload IS
+                // the SSE payload shape it expects. Pin the target to this
+                // conversation's pane so interleaving holds regardless of the
+                // notification-stream agent.
+                handleRestartStatus(entry.item.payload, paneEl);
+                return;
+            }
+            const msg = entry.item;
             const isEncrypted = msg.encrypted && !state.showDecrypted;
             let toolHtml = '';
             let bodyHtml = null;

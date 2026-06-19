@@ -309,3 +309,32 @@ test('no pane mounted: handleRestartStatus is a no-op (does not throw)', () => {
         state.mountedChatAgent = restore;
     }
 });
+
+
+// #1816: chat-history reload repaints the trail by passing an explicit
+// target pane element so the bubbles interleave into the conversation
+// being viewed regardless of the notification-stream agent.
+test('targetEl pins the repainted bubble to the supplied pane element', () => {
+    resetPane();
+    const replayPane = makeNode();
+    chatModule.handleRestartStatus(basePayload(), replayPane);
+    assert.equal(
+        replayPane.querySelectorAll('.restart-status-message').length, 1,
+        'bubble must land in the supplied target element',
+    );
+    assert.equal(
+        pane.element.querySelectorAll('.restart-status-message').length, 0,
+        'mounted pane must be untouched when targetEl is supplied',
+    );
+});
+
+
+test('targetEl repaint dedupes by signature within the target element', () => {
+    const replayPane = makeNode();
+    chatModule.handleRestartStatus(basePayload(), replayPane);
+    chatModule.handleRestartStatus(basePayload(), replayPane);
+    assert.equal(
+        replayPane.querySelectorAll('.restart-status-message').length, 1,
+        'same (request, state) repaint must not duplicate in the target',
+    );
+});
