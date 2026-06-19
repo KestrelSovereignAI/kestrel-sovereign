@@ -205,7 +205,15 @@ class ProxyFeature(Feature):
     # ------------------------------------------------------------------
 
     def _client_capabilities(self) -> Dict[str, Any]:
+        # Prefer the wrapper's passthrough; fall back to the inner JSON-RPC
+        # client, where SubprocessIsolatedFeatureClient stores capabilities after
+        # initialize (covers SDK builds without the wrapper-level property).
         caps = getattr(self._client, "capabilities", None)
+        if not isinstance(caps, dict) or not caps:
+            inner = getattr(self._client, "client", None)
+            inner_caps = getattr(inner, "capabilities", None)
+            if isinstance(inner_caps, dict):
+                caps = inner_caps
         return caps if isinstance(caps, dict) else {}
 
     def _register_channel_bridge(self) -> None:
