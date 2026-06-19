@@ -747,6 +747,53 @@ async def test_post_restart_sweep_retries_when_dispatcher_raises(tmp_path):
     assert row.wake_delivered is False      # wake undelivered → retried later
 
 
+@pytest.mark.asyncio
+async def test_wake_not_delivered_when_terminalize_write_does_not_land(tmp_path):
+    """A completion wake must NEVER be delivered against a row still
+    ``executing`` in the DB (#1801).
+
+    The #1819 sweep terminalizes the row to ``completed`` BEFORE dispatching
+    the wake, but the ``expected_current_status="executing"`` guard can fail
+    to land that write (a concurrent ``on_agent_ready`` / cron-tick sweep
+    already terminalized it). When the durable write does not land and the
+    row is not genuinely ``completed``, the sweep must NOT fire a
+    ``restart.completed`` wake — otherwise chat sees a completion while
+    ``list_restart_requests`` still reports ``executing`` with no
+    ``completed`` status event (the exact inconsistency in #1801).
+    """
+    backend = await _backend(tmp_path)
+    req = await insert_request(
+        backend, requested_by_agent="did:test:agent", reason="pre-restart",
+    )
+    await update_status(
+        backend, req.id, status="executing",
+        expected_current_status="pending",
+    )
+
+    dispatcher = _CapturingDispatcher()
+    registry = _StubRegistry()
+    agent = _make_agent(backend, dispatcher=dispatcher, registry=registry)
+    feat = RestartCoordinatorFeature(agent)
+    await feat.initialize()
+
+    # Model the lost race: the durable executing → completed write does not
+    # land and leaves the row untouched (still executing).
+    async def _write_does_not_land(*args, **kwargs):
+        return False
+
+    with patch(
+        "kestrel_sovereign.features.restart_coordinator.feature.update_status",
+        _write_does_not_land,
+    ):
+        await feat.on_agent_ready()
+
+    # No phantom completion wake while the durable row stays executing.
+    assert dispatcher.signals == []
+    row = await get_request(backend, req.id)
+    assert row.status == "executing"
+    assert row.completed_at is None
+
+
 # ---------------------------------------------------------------------------
 # Post-restart wake reaches the REAL durable/resumption path (#1796)
 # ---------------------------------------------------------------------------

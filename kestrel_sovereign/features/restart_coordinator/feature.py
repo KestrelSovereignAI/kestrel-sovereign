@@ -1315,9 +1315,19 @@ class RestartCoordinatorFeature(Feature):
             # row (#1819). Already-completed rows here are wake retries — skip
             # re-terminalizing (and re-emitting the bubble).
             if row.status == "executing":
-                await self._terminalize_completed(
+                terminalized = await self._terminalize_completed(
                     row, datetime.now(timezone.utc).isoformat(),
                 )
+                if not terminalized:
+                    # The durable ``executing`` → ``completed`` write did not
+                    # land (a concurrent sweep beat us to it). Re-read the
+                    # authoritative row and only deliver the wake once it is
+                    # genuinely ``completed`` — never fire a completion wake
+                    # against a row still ``executing`` in the DB (#1801).
+                    fresh = await get_request(self._db, row.id)
+                    if fresh is None or fresh.status != "completed":
+                        continue
+                    row = fresh
             await self._deliver_restart_completed(
                 row, str(agent_id), dispatcher, dispatcher_usable,
             )
@@ -1433,28 +1443,42 @@ class RestartCoordinatorFeature(Feature):
         else:  # pragma: no cover - production agents always expose tracker
             asyncio.ensure_future(_await_and_ack())
 
-    async def _terminalize_completed(self, row, now: str) -> None:
+    async def _terminalize_completed(self, row, now: str) -> bool:
         """Mark a swept restart row ``completed`` and mirror the COGNITION
-        wake with a chat-visible status event (#1551).
+        wake with a chat-visible status event (#1551). Returns ``True`` only
+        when the durable ``executing`` → ``completed`` write actually landed.
 
         Called BEFORE the wake is dispatched (#1819): the restart provably
         finished (a different process is running the sweep), so the row reaches
         a consistent ``completed`` state — with ``completed_at`` — before the
         wake turn can observe it, and the ``completed`` bubble paints first.
+
+        The ``expected_current_status="executing"`` guard can legitimately
+        fail to update a row — a concurrent sweep (``on_agent_ready`` racing
+        the first cron tick) already terminalized it. Honour that result
+        (#1801): only mutate the in-memory row and emit the ``completed``
+        status event when the write landed. Mutating/emitting on a failed
+        write would deliver a ``restart.completed`` wake claiming a terminal
+        state the durable row never reached, leaving the request stuck
+        ``executing`` with no ``completed`` status event — the exact
+        inconsistency reported in #1801.
         """
-        await update_status(
+        ok = await update_status(
             self._db, row.id,
             status="completed",
             status_reason="post-restart sweep observed agent re-init",
             completed_at=now,
             expected_current_status="executing",
         )
+        if not ok:
+            return False
         row.completed_at = now
         row.status = "completed"
         await self._emit_status_event(
             row, state="completed",
             status_reason="post-restart sweep observed agent re-init",
         )
+        return True
 
     async def _mark_wake_delivered(self, row) -> None:
         """Flag the post-restart wake as delivered so it isn't re-dispatched."""
