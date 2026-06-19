@@ -526,12 +526,42 @@ class ProxyFeature(Feature):
         await channel.handle_inbound(message)
 
 
+def _send_outcome(envelope: Dict[str, Any], transport_ok: bool):
+    """Classify a send tool's envelope into a DeliveryStatus.
+
+    Recognizes two wire shapes a channel send tool may return:
+      * a plain ``{"ok": bool, ...}`` envelope, and
+      * the framework ``ToolResult`` shape ``{"status": "ok"|"error"|
+        "partial", ...}`` (ok->SUCCESS, error->FAILURE, partial->PENDING).
+    An explicit error/non-OK envelope must NOT be reported as a successful
+    delivery just because the JSON-RPC transport itself succeeded.
+    """
+    from kestrel_sdk.channels import DeliveryStatus
+
+    if not transport_ok:
+        return DeliveryStatus.FAILURE
+    if "ok" in envelope:
+        return DeliveryStatus.SUCCESS if envelope["ok"] else DeliveryStatus.FAILURE
+    status = envelope.get("status")
+    if isinstance(status, str):
+        token = status.lower()
+        if token in {"error", "failure", "failed"}:
+            return DeliveryStatus.FAILURE
+        if token in {"partial", "pending"}:
+            return DeliveryStatus.PENDING
+        if token in {"ok", "success"}:
+            return DeliveryStatus.SUCCESS
+    if "success" in envelope:
+        return DeliveryStatus.SUCCESS if envelope["success"] else DeliveryStatus.FAILURE
+    # No tool-level signal: trust the transport outcome.
+    return DeliveryStatus.SUCCESS
+
+
 def _delivery_receipt_from_result(channel_type: str, result: Dict[str, Any]):
     """Map a forwarded isolated-tool result onto a ``DeliveryReceipt``.
 
-    The send tool returns the feature's own envelope (e.g.
-    ``{"ok": bool, "data": {...}, "message": str}``) wrapped by
-    ``call_isolated_tool`` as ``{"success": bool, "result": <envelope>}``.
+    ``call_isolated_tool`` wraps the tool's own envelope as
+    ``{"success": bool, "result": <envelope>}``.
     """
     import uuid as _uuid
 
@@ -540,23 +570,25 @@ def _delivery_receipt_from_result(channel_type: str, result: Dict[str, Any]):
     transport_ok = bool(result.get("success"))
     envelope = result.get("result")
     envelope = envelope if isinstance(envelope, dict) else {}
-    tool_ok = bool(envelope.get("ok", transport_ok))
     data = envelope.get("data")
     data = data if isinstance(data, dict) else {}
-    message_id = str(data.get("message_id") or data.get("id") or _uuid.uuid4())
-    if transport_ok and tool_ok:
+    receipt = data.get("receipt") if isinstance(data.get("receipt"), dict) else {}
+    message_id = str(
+        data.get("message_id")
+        or data.get("id")
+        or receipt.get("message_id")
+        or _uuid.uuid4()
+    )
+    status = _send_outcome(envelope, transport_ok)
+    if status is DeliveryStatus.FAILURE:
+        error = envelope.get("error") or result.get("error") or "send failed"
         return DeliveryReceipt(
             message_id=message_id,
-            status=DeliveryStatus.SUCCESS,
+            status=status,
             channel_type=channel_type,
+            error=str(error),
         )
-    error = envelope.get("error") or result.get("error") or "send failed"
-    return DeliveryReceipt(
-        message_id=message_id,
-        status=DeliveryStatus.FAILURE,
-        channel_type=channel_type,
-        error=str(error),
-    )
+    return DeliveryReceipt(message_id=message_id, status=status, channel_type=channel_type)
 
 
 class ProxyChannelAdapter(ChannelAdapter):
