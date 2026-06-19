@@ -66,6 +66,7 @@ test('CAPABILITY_KEYS lists every canonical key from the issue', () => {
         'chat', 'identity', 'constitution', 'privacy', 'memory', 'tasks',
         'sovereignty', 'storage', 'wallet', 'conversations', 'keys',
         'audit', 'permissions', 'multi_agent', 'spawn', 'featureStore', 'metrics',
+        'voice',
     ];
     for (const key of expected) {
         assert.equal(CAPABILITY_KEYS[key], true, `missing canonical key: ${key}`);
@@ -186,6 +187,11 @@ test('loadAgents short-circuits when multi_agent capability is off', () => {
 test('loadConversations short-circuits when conversations capability is off', () => {
     const client = makeClient({ capabilities: { conversations: false } });
     assert.equal(client.hasCapability('conversations'), false);
+});
+
+test('voice capability defaults on and respects host opt-out', () => {
+    assert.equal(makeClient().hasCapability('voice'), true);
+    assert.equal(makeClient({ capabilities: { voice: false } }).hasCapability('voice'), false);
 });
 
 // --- nav rendering: initNavigation removes hidden tabs from the DOM ---

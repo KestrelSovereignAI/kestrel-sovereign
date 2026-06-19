@@ -17,6 +17,7 @@ import {
 //       multi_agent: false,
 //       spawn: false,
 //       featureStore: false,
+//       voice: false,
 //       audit: false,
 //       permissions: false,
 //       // Object for partial / nested support (e.g. only some key tiers apply)

@@ -42,6 +42,7 @@ export const CAPABILITY_KEYS = Object.freeze({
     spawn: true,
     featureStore: true,
     metrics: true,
+    voice: true,
 });
 
 function getRequiredDependency(name, value) {
