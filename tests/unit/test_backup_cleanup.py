@@ -777,3 +777,63 @@ def test_delete_plan_preserves_newest_and_live_manifest_referenced_objects():
     assert _delete_keys(plan) == {"cid-old-snapshot"}
     assert reasons["cid-live-snapshot"] == "live_manifest_referenced"
     assert reasons["cid-newest-snapshot"] == "newest"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_preview_matches_apply_plan_for_promoted_quarantine(tmp_path):
+    # Regression: the default dry-run preview must use the SAME quarantine-aware
+    # build_delete_plan that --apply executes, so a promoted quarantine object
+    # shown as a planned delete in preview is exactly what apply would remove.
+    raw = _record(
+        "gs://bucket/kestrel/orphan/kestrel_prime.db",
+        None,
+        900,
+        store="gcs",
+        name="kestrel_prime.db",
+    )
+    classified = backup_cleanup.classify_inventory_record(raw)
+    assert classified.inventory_class in backup_cleanup.QUARANTINE_CLASSES
+
+    state_path = tmp_path / "q.json"
+    backup_cleanup.quarantine_records([classified], state_path=state_path)
+    backup_cleanup.promote_quarantine_object(state_path, raw.key)
+
+    args = backup_cleanup.build_parser().parse_args(
+        [
+            "--skip-lighthouse",
+            "--gcs-bucket",
+            "bucket",
+            "--quarantine-state",
+            str(state_path),
+        ]
+    )
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with patch("scripts.backup_cleanup.list_gcs_records", return_value=[raw]):
+        with redirect_stdout(buf):
+            rc = await backup_cleanup._main_async(args)
+
+    assert rc == 0
+    out = buf.getvalue()
+    # Preview is the delete preflight (quarantine-aware), not the legacy report,
+    # and the promoted quarantine class is shown as an eligible delete — exactly
+    # what --apply would remove.
+    assert "manifest-index hash" in out
+    assert "legacy_private_candidate: 1 objects" in out
+
+    # Negative control: with a FRESH (un-promoted) quarantine state, the same
+    # object is NOT eligible — proving the preview reflects promotion state.
+    fresh_state = tmp_path / "q_fresh.json"
+    backup_cleanup.quarantine_records([classified], state_path=fresh_state)
+    args2 = backup_cleanup.build_parser().parse_args(
+        ["--skip-lighthouse", "--gcs-bucket", "bucket",
+         "--quarantine-state", str(fresh_state)]
+    )
+    buf2 = io.StringIO()
+    with patch("scripts.backup_cleanup.list_gcs_records", return_value=[raw]):
+        with redirect_stdout(buf2):
+            await backup_cleanup._main_async(args2)
+    assert "legacy_private_candidate: 1 objects" not in buf2.getvalue()

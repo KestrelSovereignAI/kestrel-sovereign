@@ -1210,13 +1210,9 @@ async def _main_async(args: argparse.Namespace) -> int:
             if lighthouse_client is not None:
                 await lighthouse_client.close()
 
-    if not args.apply:
-        plan = build_plan(records, policy)
-        print(render_report(plan))
-        if lighthouse_client is not None:
-            await lighthouse_client.close()
-        return 0
-
+    # Build the SAME quarantine-aware plan whether previewing or applying, so
+    # the dry-run preview is a faithful preview of what --apply will delete
+    # (incl. promoted quarantine entries and mutation-proof protections).
     plan = build_delete_plan(
         records,
         policy,
@@ -1230,6 +1226,11 @@ async def _main_async(args: argparse.Namespace) -> int:
             policy_version=RETENTION_POLICY_VERSION,
         )
     )
+    if not args.apply:
+        if lighthouse_client is not None:
+            await lighthouse_client.close()
+        return 0
+
     try:
         return await apply_plan(
             plan,
