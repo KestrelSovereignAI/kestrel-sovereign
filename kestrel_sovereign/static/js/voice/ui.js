@@ -1075,6 +1075,11 @@ async function handleToolCall(session, ev) {
   // sidebar refresh fires even if no transcript turn lands.
   session.persistedAny = true;
   const startedAt = Date.now();
+  // Buffer the persisted-shape events ({type,tool,ms?,error?,pos}) so they ride
+  // along with the assistant turn that persists after the tool runs — making the
+  // tool card survive a reload, exactly like text chat. pos=0: realtime runs
+  // tools before the spoken reply, so cards render above its prose.
+  sessionClient.recordToolEvent?.({ type: 'start', tool: toolName, pos: 0 });
 
   let body;
   try {
@@ -1105,9 +1110,15 @@ async function handleToolCall(session, ev) {
   if (errText) {
     card.status = 'error';
     card.events.push({ phase: 'error', name: toolName, detail: String(errText) });
+    sessionClient.recordToolEvent?.({
+      type: 'error', tool: toolName, error: String(errText), pos: 0,
+    });
   } else {
     card.status = 'complete';
     card.events.push({ phase: 'done', name: toolName, ms: Date.now() - startedAt });
+    sessionClient.recordToolEvent?.({
+      type: 'complete', tool: toolName, ms: Date.now() - startedAt, pos: 0,
+    });
   }
   updateVoiceToolCard(cardDiv, card);
 

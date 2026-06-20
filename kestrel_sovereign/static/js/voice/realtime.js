@@ -84,6 +84,7 @@ export async function createRealtimeClient({
   let closed = false;
   const persistedTurnIds = new Set();  // item_ids already sent to /transcript
   const pendingPersists = new Set();   // in-flight /transcript POST promises
+  let pendingToolEvents = [];          // tool cards to attach to next assistant turn
 
   /**
    * Send a JSON control message through the data channel.
@@ -127,6 +128,16 @@ export async function createRealtimeClient({
       if (persistedTurnIds.has(dedupeId)) return;
       persistedTurnIds.add(dedupeId);
     }
+    // Drain buffered tool cards onto this assistant turn so they persist
+    // alongside the spoken reply (realtime runs tools before speaking, so they
+    // belong to the reply that follows). ONLY consume the buffer for assistant
+    // turns: a user transcript can finalize late (after a tool already ran),
+    // and draining it there would lose the cards before the assistant turn.
+    let toolEvents = [];
+    if (role === 'assistant' && pendingToolEvents.length) {
+      toolEvents = pendingToolEvents;
+      pendingToolEvents = [];
+    }
     const transcriptUrl =
       endpoint.replace(/\/session$/, '/transcript/') +
       encodeURIComponent(sessionId);
@@ -135,7 +146,12 @@ export async function createRealtimeClient({
         fetch(transcriptUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(authHeaders || {}) },
-          body: JSON.stringify({ role, content, item_id: dedupeId || '' }),
+          body: JSON.stringify({
+            role,
+            content,
+            item_id: dedupeId || '',
+            tool_events: toolEvents,  // only populated for assistant turns
+          }),
         }),
       )
       .then((resp) => {
@@ -166,6 +182,17 @@ export async function createRealtimeClient({
    */
   function whenPersisted() {
     return Promise.allSettled([...pendingPersists]);
+  }
+
+  /**
+   * Buffer a tool-activity event ({type, tool, ms?, error?, pos}) to attach to
+   * the next assistant turn that persists. The UI's tool-dispatch handler calls
+   * this as a realtime tool call starts and completes, so the cards land on the
+   * spoken reply that follows and survive a reload. `pos` is 0 — realtime runs
+   * tools before the reply, so the cards render above its prose.
+   */
+  function recordToolEvent(ev) {
+    if (ev && typeof ev === 'object') pendingToolEvents.push(ev);
   }
 
   /**
@@ -474,6 +501,7 @@ export async function createRealtimeClient({
     updateInstructions,
     commitToolResult,
     whenPersisted,
+    recordToolEvent,
     getInputLevel,
     setMuted,
     setInputMuted,
