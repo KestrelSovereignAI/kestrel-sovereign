@@ -117,8 +117,14 @@ class ConversationManager:
             history = await self.get_conversation_history(
                 session_id=session_id, limit=10000
             )
+        elif conv_store and hasattr(conv_store, "get_full_history_with_ids"):
+            # Global path MUST carry message ids so originals get EXCLUDED
+            # (not just have a summary appended) — get_full_history() omits
+            # ids, which left originals in context and grew it instead of
+            # compacting (codex review r4). include_excluded defaults False, so
+            # already-compacted messages aren't re-summarized.
+            history = await conv_store.get_full_history_with_ids()
         elif conv_store:
-            # Global: full unfiltered history to see what to compact.
             history = await conv_store.get_full_history()
         else:
             history = await self.get_conversation_history()

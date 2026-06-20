@@ -180,3 +180,35 @@ async def test_compact_session_real_generate_signature_and_session_tagging():
     # Summary marker tagged to the reseeded session (P2).
     add_kwargs = storage.conversation.add_conversation.call_args.kwargs
     assert add_kwargs.get("session_id") == "sess-1"
+
+
+@pytest.mark.asyncio
+async def test_global_compaction_excludes_originals_via_id_bearing_source():
+    """#1844 codex r4: global !compact (session_id=None) must read the
+    id-bearing history source so originals are EXCLUDED, not just have a
+    summary appended (which would grow context instead of compacting)."""
+    from unittest.mock import AsyncMock, MagicMock
+    from kestrel_sovereign.agent.context_manager import ContextManager
+
+    llm = MagicMock()
+    llm.generate = AsyncMock(return_value="SUMMARY: condensed.")
+
+    msgs = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant",
+             "content": f"m{i}"} for i in range(20)]
+    storage = MagicMock()
+    storage.conversation = AsyncMock()
+    storage.conversation.get_full_history_with_ids = AsyncMock(return_value=msgs)
+    storage.conversation.add_conversation = AsyncMock()
+    storage.conversation.update_messages_metadata = AsyncMock()
+    storage.conversation.db = AsyncMock()
+    storage.conversation.db.fetchone = AsyncMock(return_value=[777])
+    storage.conversation.agent_id = "agent-x"
+
+    mgr = ContextManager(storage=storage, model="gpt-4")
+    result = await mgr.compact_session(llm_service=llm, preserve_recent=5)  # no session_id
+
+    assert result["success"] is True, result
+    # Originals must be excluded — exclusion call made with the compacted ids.
+    storage.conversation.update_messages_metadata.assert_awaited()
+    excluded_ids = storage.conversation.update_messages_metadata.call_args.args[0]
+    assert excluded_ids == [m["id"] for m in msgs[:-5]]
