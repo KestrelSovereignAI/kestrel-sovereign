@@ -259,26 +259,32 @@ No maintained "always show" or "always hide" allowlists. Capability and usage si
 
 Model discovery already classifies embedding models with
 `ModelCategory.EMBEDDING`, and the UI/filtering logic keeps those models out of
-chat-model dropdowns. That is model metadata, not yet the embedding execution
-contract.
+chat-model dropdowns. Runtime embedding execution is separate from chat model
+discovery: storage asks the active provider route for embeddings only when that
+route advertises embedding support.
 
 Current execution truth as of 2026-05-31:
 
-- `kestrel_sovereign/llm/embedding_service.py` is still the in-tree embedding
-  generator.
-- That service uses Ollama's embedding API, defaulting to `nomic-embed-text`
-  at 768 dimensions.
+- The SDK LLM contract includes `aembed()`, `aembed_batch()`,
+  `ProviderCapabilities.supports_embeddings`, `embedding_model`, and
+  `embedding_dim`.
+- `kestrel_sovereign/llm/embedding_service.py` still keeps the legacy
+  Ollama-backed `EmbeddingService`, but saved-items and RAG now use
+  `ProviderEmbeddingService` through `LLMService.get_embedding_service()`.
+- OpenAI, Google/Gemini, Vertex, and Ollama advertise embedding capability in
+  tree. Anthropic and OpenRouter do not; storage falls back to keyword/BM25/LIKE
+  search rather than silently using an unrelated embedding service.
 - RAG and saved-item vector search consume embeddings through storage/vector
   backends once embeddings are written.
 - `conversation_history.embedding_vec` exists as SQLAlchemy/vector storage
   groundwork, but the current `MemoryRetriever` semantic score still uses
   keyword/concept overlap.
 
-The architecture direction is to make embeddings a standard provider capability
-on LLM adapters, so the storage and retrieval layers can request embeddings
-through the configured LLM provider instead of a hardcoded Ollama side service.
-Until that lands in code, do not document provider embedding functions as
-available runtime behavior.
+The adapter boundary shape is common: one embedding is `Optional[list[float]]`,
+and batch embeddings return one result slot per input text. The vectors are not
+semantically interchangeable across providers or embedding models. Operators
+who switch embedding models need to re-embed existing rows or ensure vector
+columns match the new dimensions.
 
 ---
 
