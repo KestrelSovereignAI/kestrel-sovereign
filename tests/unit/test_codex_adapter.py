@@ -153,6 +153,62 @@ class TestUsageProjection:
         }
 
 
+class TestThreadOccupancy:
+    """#1844: codex's TRUE server-side thread occupancy capture.
+
+    On openai:plan Kestrel sends only the incremental turn while codex
+    accumulates the full thread server-side, so the per-turn payload the
+    context monitor measures is NOT what fills the window. The adapter
+    captures the real occupancy from ``thread/tokenUsage/updated`` keyed by
+    session so ``/context-status`` can report it.
+    """
+
+    def test_records_and_reports_occupancy(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("sess-1", {
+            "last": {"inputTokens": 54715, "totalTokens": 55039},
+            "modelContextWindow": 258400,
+        })
+        occ = a.get_thread_occupancy("sess-1")
+        assert occ["used_tokens"] == 54715
+        assert occ["window_tokens"] == 258400
+        assert occ["occupancy_percent"] == 21.2
+
+    def test_used_falls_back_to_total_when_input_absent(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"totalTokens": 1000}, "modelContextWindow": 10000,
+        })
+        assert a.get_thread_occupancy("s")["used_tokens"] == 1000
+
+    def test_window_absent_yields_null_percent(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {"last": {"inputTokens": 500}})
+        occ = a.get_thread_occupancy("s")
+        assert occ["used_tokens"] == 500
+        assert occ["window_tokens"] is None
+        assert occ["occupancy_percent"] is None
+
+    def test_latest_turn_overwrites_prior(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 100}, "modelContextWindow": 1000})
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 800}, "modelContextWindow": 1000})
+        assert a.get_thread_occupancy("s")["occupancy_percent"] == 80.0
+
+    def test_unknown_session_and_bad_input_are_safe(self):
+        a = CodexAdapter()
+        assert a.get_thread_occupancy("nope") is None
+        assert a.get_thread_occupancy(None) is None
+        # Non-dict / empty / bool-as-int never raise and never record.
+        a._record_thread_occupancy("s", None)
+        a._record_thread_occupancy(None, {"last": {"inputTokens": 5}})
+        a._record_thread_occupancy("s", {"last": {"inputTokens": True}})
+        a._record_thread_occupancy("s", {"last": {}})
+        assert a.get_thread_occupancy("s") is None
+
+
 class TestResultMarshalling:
     """Kestrel tool results -> codex CodexDynamicToolCallResponse."""
 
