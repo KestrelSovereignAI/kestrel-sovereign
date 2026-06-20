@@ -8,6 +8,7 @@ from kestrel_sovereign.storage.sync.retention import (
     RetentionItem,
     RetentionPolicy,
     classify,
+    parse_timestamp,
 )
 from kestrel_sovereign.storage.sync.service import SyncService
 from kestrel_sovereign.storage.sync.targets import GCSTarget, SyncResult, SyncTarget
@@ -230,3 +231,25 @@ async def test_gcs_prune_scans_snapshots_and_leaves_latest_pointer():
     assert blobs[0].deleted is True
     assert blobs[1].deleted is False
     assert blobs[2].deleted is False
+
+
+def test_parse_timestamp_handles_lighthouse_epoch_ms():
+    # Lighthouse `createdAt` is Unix milliseconds; must parse, not skip.
+    ms = 1781956879692  # 2026-06-...
+    parsed = parse_timestamp(ms)
+    assert parsed is not None
+    assert parsed.tzinfo is not None
+    # Same instant whether passed as int or numeric string.
+    assert parse_timestamp(str(ms)) == parsed
+    # Sanity: milliseconds, not seconds (year must be sane, not 1970/56xxx).
+    assert 2020 <= parsed.year <= 2100
+
+
+def test_parse_timestamp_handles_epoch_seconds_and_calendar_codes():
+    secs = 1781956879  # ~2026 in seconds
+    assert parse_timestamp(secs) is not None
+    assert 2020 <= parse_timestamp(secs).year <= 2100
+    # An 8-digit calendar code must NOT be misread as a ~1970 epoch; the >=1e9
+    # guard lets it fall through to ISO-basic parsing (2026-01-01).
+    cal = parse_timestamp("20260101")
+    assert cal is not None and cal.year == 2026

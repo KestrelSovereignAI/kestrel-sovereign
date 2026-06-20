@@ -239,6 +239,20 @@ def parse_timestamp(value: Any) -> datetime | None:
         return _normalize_ts(value)
     if not value:
         return None
+    # Numeric epoch (Lighthouse `createdAt` is Unix ms; some APIs use seconds).
+    # Guard with a >=1e9 magnitude so calendar codes like YYYYMMDD (~2e7) fall
+    # through to the path/name parsers below instead of being read as epochs.
+    if isinstance(value, (int, float)) or (
+        isinstance(value, str) and value.strip().lstrip("-").isdigit()
+    ):
+        try:
+            epoch = float(value)
+            if abs(epoch) >= 1e9:
+                if abs(epoch) >= 1e12:  # milliseconds
+                    epoch /= 1000.0
+                return datetime.fromtimestamp(epoch, tz=timezone.utc)
+        except (ValueError, OverflowError, OSError):
+            return None
     text = str(value).strip()
     try:
         return _normalize_ts(datetime.fromisoformat(text.replace("Z", "+00:00")))

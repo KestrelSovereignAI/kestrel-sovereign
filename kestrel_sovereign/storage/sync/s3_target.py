@@ -254,10 +254,13 @@ class S3Target(SyncTarget):
                     break
 
         deletions = policy.deletions(items)
-        if deletions:
+        # S3 DeleteObjects accepts at most 1000 keys per request; batch so a
+        # large backlog doesn't fail the whole prune (and delete nothing).
+        for batch_start in range(0, len(deletions), 1000):
+            batch = deletions[batch_start:batch_start + 1000]
             await client.delete_objects(
                 Bucket=self.bucket,
-                Delete={"Objects": [{"Key": item.key} for item in deletions]},
+                Delete={"Objects": [{"Key": item.key} for item in batch]},
             )
         return {
             "deleted": len(deletions),
