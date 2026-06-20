@@ -554,7 +554,7 @@ class StreamingMixin:
         # the freshly-seeded thread carries the compacted view rather than
         # letting codex auto-compact opaquely server-side. Best-effort; no-op
         # off openai:plan or below threshold.
-        await self._maybe_compact_codex_thread(session_id)
+        await self._maybe_compact_codex_thread(session_id, model_override)
 
         # Build full context using context_manager (same as process_input)
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()

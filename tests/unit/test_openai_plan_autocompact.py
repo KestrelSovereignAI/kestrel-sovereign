@@ -37,18 +37,25 @@ class _FakeContextManager:
 
 def _fake_agent(*, primary_adapter, compact_result):
     """Minimal self for the unbound KestrelAgent helpers — no real agent init."""
-    llm = SimpleNamespace(
-        resolve_provider_routing=lambda: (
+    resolve_calls = []
+
+    def _resolve(**kw):
+        resolve_calls.append(kw)
+        return (
             ([{"adapter": primary_adapter}] if primary_adapter is not None else []),
             None,
         )
-    )
+
+    llm = SimpleNamespace(resolve_provider_routing=_resolve)
     fake = SimpleNamespace(
         llm_service=llm,
         context_manager=_FakeContextManager(compact_result),
+        resolve_calls=resolve_calls,
     )
     # Bind the sibling helpers the orchestrator calls.
-    fake._active_codex_adapter = lambda: KestrelAgent._active_codex_adapter(fake)
+    fake._active_codex_adapter = (
+        lambda mo=None: KestrelAgent._active_codex_adapter(fake, mo)
+    )
     fake._codex_compact_threshold_pct = (
         lambda: KestrelAgent._codex_compact_threshold_pct(fake)
     )
@@ -105,6 +112,20 @@ async def test_noop_when_primary_is_not_codex():
     agent = _fake_agent(primary_adapter=object(), compact_result={"success": True})
     await KestrelAgent._maybe_compact_codex_thread(agent, "s")
     assert agent.context_manager.compact_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_per_turn_model_override_is_passed_to_routing():
+    # Gating must resolve with the turn's model_override, not the default
+    # route (codex review r2).
+    codex = _codex_with_occupancy(85)
+    agent = _fake_agent(primary_adapter=codex, compact_result={"success": True})
+    await KestrelAgent._maybe_compact_codex_thread(
+        agent, "s", "openai:plan/gpt-5.5"
+    )
+    assert agent.resolve_calls, "resolver must be called"
+    assert agent.resolve_calls[-1].get("model_override") == "openai:plan/gpt-5.5"
+    assert "force_local_only" in agent.resolve_calls[-1]
 
 
 @pytest.mark.asyncio

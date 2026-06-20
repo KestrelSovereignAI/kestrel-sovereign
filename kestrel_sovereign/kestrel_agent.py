@@ -2315,21 +2315,31 @@ Expected Duration: {expected_duration}
             pass
         return 70.0
 
-    def _active_codex_adapter(self):
+    def _active_codex_adapter(self, model_override: Optional[str] = None):
         """Return the CodexAdapter iff it is the RESOLVED primary provider for
         the next turn, else ``None``.
 
-        Mirrors the ``/context-status`` gating (resolve via
-        ``resolve_provider_routing``, not the display model string) so we only
-        act when openai:plan is actually the active route. Duck-typed on the
-        thread-occupancy/reset surface only CodexAdapter exposes.
+        Resolves with the SAME inputs the turn will use — the per-turn
+        ``model_override`` and the privacy-derived ``force_local_only`` — so
+        gating can't diverge from the route the turn actually takes (e.g. a
+        per-turn override to/from openai:plan; codex review r2). Duck-typed on
+        the thread-occupancy/reset surface only CodexAdapter exposes.
         """
         llm = getattr(self, "llm_service", None)
         resolver = getattr(llm, "resolve_provider_routing", None)
         if not callable(resolver):
             return None
+        force_local = False
         try:
-            providers, _ = resolver()
+            pa = getattr(self, "privacy_agent", None)
+            if pa is not None:
+                force_local = not pa.privacy_config.allows_cloud_llm()
+        except Exception:
+            force_local = False
+        try:
+            providers, _ = resolver(
+                model_override=model_override, force_local_only=force_local
+            )
         except Exception:
             return None
         primary = providers[0] if providers else None
@@ -2342,7 +2352,9 @@ Expected Duration: {expected_duration}
             return adapter
         return None
 
-    async def _maybe_compact_codex_thread(self, session_id: Optional[str]) -> None:
+    async def _maybe_compact_codex_thread(
+        self, session_id: Optional[str], model_override: Optional[str] = None,
+    ) -> None:
         """Pre-turn Kestrel-owned compaction for openai:plan (#1844 Stage 2).
 
         On openai:plan, codex accumulates the full conversation thread
@@ -2361,7 +2373,7 @@ Expected Duration: {expected_duration}
         """
         if not session_id:
             return
-        adapter = self._active_codex_adapter()
+        adapter = self._active_codex_adapter(model_override)
         if adapter is None:
             return
         occ = adapter.get_thread_occupancy(session_id)
@@ -2491,7 +2503,7 @@ Expected Duration: {expected_duration}
         # this turn's context — so the fresh thread reseeds the compacted view
         # rather than letting codex auto-compact opaquely. Best-effort; no-op
         # off openai:plan or below threshold.
-        await self._maybe_compact_codex_thread(session_id)
+        await self._maybe_compact_codex_thread(session_id, model_override)
 
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
