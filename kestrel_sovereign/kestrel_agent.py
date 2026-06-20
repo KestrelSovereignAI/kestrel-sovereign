@@ -75,6 +75,38 @@ class PrivacyTransitionResult:
     voice_switched: Optional[dict] = None
     biometric_warning: Optional[str] = None
 
+
+async def _add_sovereign_ipfs_target_if_active(
+    sync_service,
+    *,
+    agent_id: str,
+    state_dir: Path,
+    sovereign_url: Optional[str],
+) -> bool:
+    """Add the sovereign-operated IPFS target only when the node is reachable."""
+    from kestrel_sovereign.storage.sync.health import check_sovereign_ipfs_health
+    from kestrel_sovereign.storage.sync.targets import SovereignIPFSTarget, TrustTier
+
+    health = await check_sovereign_ipfs_health(api_url=sovereign_url)
+    if health.status != "active":
+        logging.info(
+            "Sovereign-operated IPFS backup tier %s: %s",
+            health.status,
+            health.message,
+        )
+        return False
+
+    api_url = str(health.details.get("api_url") or sovereign_url).rstrip("/")
+    return sync_service.add_remote_target(
+        f"ipfs://{agent_id}",
+        TrustTier.SOVEREIGN,
+        lambda: SovereignIPFSTarget(
+            api_url=api_url,
+            agent_id=agent_id,
+            state_dir=state_dir,
+        ),
+    )
+
 # Maximum chars for a single tool result before truncation
 MAX_TOOL_RESULT_CHARS = int(os.environ.get("KESTREL_MAX_TOOL_RESULT_CHARS", "8000"))
 
@@ -989,7 +1021,6 @@ class KestrelAgent(
                     from kestrel_sovereign.storage.sync.targets import (
                         GCSTarget,
                         LighthouseTarget,
-                        SovereignIPFSTarget,
                         TrustTier,
                     )
 
@@ -999,18 +1030,16 @@ class KestrelAgent(
                         policy_context_provider=live_remote_policy_context,
                     )
 
-                    # Sovereign: self-hosted IPFS (our infrastructure)
+                    # Sovereign-operated: self-hosted IPFS. The historical
+                    # kestrel-ipfs VM is decommissioned, so absence or
+                    # unreachability is an explicit inactive state.
                     sovereign_url = os.environ.get("SOVEREIGN_IPFS_URL")
-                    if sovereign_url:
-                        self._sync_service.add_remote_target(
-                            f"ipfs://{agent_id}",
-                            TrustTier.SOVEREIGN,
-                            lambda: SovereignIPFSTarget(
-                                api_url=sovereign_url,
-                                agent_id=agent_id,
-                                state_dir=state_dir,
-                            ),
-                        )
+                    await _add_sovereign_ipfs_target_if_active(
+                        self._sync_service,
+                        agent_id=agent_id,
+                        state_dir=state_dir,
+                        sovereign_url=sovereign_url,
+                    )
 
                     # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
                     # if the resolver came back with no LighthouseProvider

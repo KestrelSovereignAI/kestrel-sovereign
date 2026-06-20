@@ -117,6 +117,8 @@ def test_ipfs_status_reports_local_node_gateways_and_filecoin_adapter():
                     response = client.get("/api/ipfs/status", headers=_api_headers())
         assert response.status_code == 200
         payload = response.json()
+        assert payload["backup_tier"]["label"] == "sovereign-operated"
+        assert payload["backup_tier"]["status"] == "decommissioned"
         assert payload["local_node"]["available"] is True
         assert payload["local_node"]["peer_id"] == "peer-123"
         assert payload["local_node"]["agent_version"] == "kubo/1.0.0"

@@ -4,9 +4,9 @@ Sync Targets
 Abstractions for sync destinations. Each target declares a TrustTier
 reflecting how much sovereignty the agent retains over its data:
 
-    SOVEREIGN   Infrastructure we own and operate (self-hosted IPFS)
-    DELEGATED   Third-party service with API key (Lighthouse)
-    EXPEDIENT   Centralized cloud, fast but not sovereign (GCS, S3)
+    SOVEREIGN   Sovereign-operated target; currently decommissioned by default
+    DELEGATED   Delegated-decentralized service with API key (Lighthouse)
+    EXPEDIENT   Expedient-cloud target (GCS, S3)
 
 Write to all configured targets. Restore from most trusted.
 """
@@ -32,10 +32,26 @@ class TrustTier(Enum):
 
     Lower value = higher trust. Restore walks tiers in this order.
     """
-    SOVEREIGN = 1   # Own infrastructure — self-hosted IPFS/Kubo
+    SOVEREIGN = 1   # Sovereign-operated — self-hosted IPFS/Kubo
     FEDERATED = 2   # Agent-controlled auth (DID/UCAN); reserved
-    DELEGATED = 3   # API-key gated — Lighthouse
-    EXPEDIENT = 4   # Centralized cloud — GCS, S3
+    DELEGATED = 3   # Delegated-decentralized — Lighthouse
+    EXPEDIENT = 4   # Expedient-cloud — GCS, S3
+
+
+class TierState(Enum):
+    """Operational state for a backup tier."""
+
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    DECOMMISSIONED = "decommissioned"
+
+
+TIER_LABELS = {
+    TrustTier.SOVEREIGN: "sovereign-operated",
+    TrustTier.FEDERATED: "federated",
+    TrustTier.DELEGATED: "delegated-decentralized",
+    TrustTier.EXPEDIENT: "expedient-cloud",
+}
 
 
 def _create_consistent_snapshot(db_path: Path) -> bytes:
@@ -96,6 +112,16 @@ class SyncTarget(ABC):
     def trust_tier(self) -> TrustTier:
         """Trust level of this target. Override in subclasses."""
         return TrustTier.EXPEDIENT
+
+    @property
+    def tier_state(self) -> TierState:
+        """Operational state of this target."""
+        return TierState.ACTIVE
+
+    @property
+    def tier_label(self) -> str:
+        """Honest operator-facing label for this target's trust tier."""
+        return TIER_LABELS.get(self.trust_tier, self.trust_tier.name.lower())
 
     @abstractmethod
     async def sync_snapshot(self, db_path: Path) -> SyncResult:
@@ -169,6 +195,8 @@ from kestrel_sovereign.storage.sync.retention import (  # noqa: E402, F401
 
 __all__ = [
     "TrustTier",
+    "TierState",
+    "TIER_LABELS",
     "SyncResult",
     "SyncTarget",
     "_create_consistent_snapshot",

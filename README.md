@@ -602,9 +602,10 @@ docker run --gpus all -p 8888:8888 kestrel-gpu
 
 Backups can be created interactively from the agent using privacy-gated storage tiers:
 
-- local: cache the backup tar.gz locally only
-- ipfs: encrypt + gzip and store on IPFS; also cache locally
-- filecoin: same as IPFS and propose a Filecoin deal via Lotus when available; fallback to local if not
+- local-only: cache the backup tar.gz locally only
+- delegated-decentralized: encrypt + gzip and store through Lighthouse/IPFS/Filecoin when configured
+- expedient-cloud: store sync snapshots in GCS when configured
+- sovereign-operated: currently none/decommissioned; requires a reachable reprovisioned `SOVEREIGN_IPFS_URL`
 
 Privacy gating:
 
