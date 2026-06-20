@@ -1142,9 +1142,12 @@ ANSWER:"""
                 # behavior without vendor scoping is best-effort.
                 model_override = self.llm_service.get_cheap_model()
 
+            # LLMService.generate is keyword-only and requires user_prompt
+            # (not prompt); the old call TypeError'd into the failure path
+            # below (#1844 root-cause sweep).
             response = await self.llm_service.generate(
-                prompt=prompt,
                 system_prompt="You are answering questions about conversation context. Be concise and accurate.",
+                user_prompt=prompt,
                 model_override=model_override,
             )
         except ValueError as e:

@@ -482,6 +482,22 @@ def _codex_retry_wait_seconds() -> float:
     return _CODEX_RETRY_BASE_SECONDS + random.uniform(0, _CODEX_RETRY_JITTER_SECONDS)
 
 
+def _env_int(name: str) -> Optional[int]:
+    """Parse an int env var, or ``None`` when unset/blank/invalid.
+
+    Used for operator knobs like ``KESTREL_OPENAI_PLAN_AUTO_COMPACT_LIMIT``
+    where an absent/garbage value must cleanly mean "no override" rather than
+    crash thread setup.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        return int(raw.strip())
+    except (ValueError, AttributeError):
+        return None
+
+
 class CodexAdapter(LLMAdapter):
     """OpenAI ChatGPT-subscription adapter backed by the codex app-server."""
 
@@ -991,6 +1007,24 @@ class CodexAdapter(LLMAdapter):
                     "features.code_mode_only": False,
                 },
             }
+            # #1844 Stage 2: optionally raise codex's own auto-compaction
+            # ceiling so KESTREL drives compaction first (observably, via
+            # ContextManager + reset_thread reseed) instead of codex
+            # compacting the thread opaquely server-side. Operator opt-in:
+            # the primary mechanism is Kestrel's pre-turn compaction at the
+            # occupancy threshold, which keeps the thread small enough that
+            # codex's default limit is never reached — so this is left UNSET
+            # (codex default) unless an operator deliberately tunes it.
+            # ``model_auto_compact_token_limit`` + its scope are real codex
+            # config keys (verified in the 0.138 binary).
+            _ac_limit = _env_int("KESTREL_OPENAI_PLAN_AUTO_COMPACT_LIMIT")
+            if _ac_limit and _ac_limit > 0:
+                params["config"]["model_auto_compact_token_limit"] = _ac_limit
+                params["config"]["model_auto_compact_token_limit_scope"] = (
+                    os.environ.get(
+                        "KESTREL_OPENAI_PLAN_AUTO_COMPACT_SCOPE", "all"
+                    )
+                )
             if m:
                 params["model"] = m
             if instructions:
@@ -1230,6 +1264,29 @@ class CodexAdapter(LLMAdapter):
         """
         if session_id:
             self._thread_usage_map().pop(session_id, None)
+
+    def reset_thread(self, session_id: Optional[str]) -> bool:
+        """Drop the cached codex thread (and its occupancy) for a session so
+        the NEXT turn starts a fresh ``thread/start``.
+
+        Combined with ``_build_turn_input(fresh_thread=True)`` — which resends
+        the full "Conversation so far" history — this re-seeds the server-side
+        thread from Kestrel's CURRENT conversation history. When the caller
+        has just compacted that history (durably, via
+        ``ContextManager.compact_session``), the freshly-seeded thread carries
+        the compacted view instead of codex's accumulated full thread. This is
+        the keystone of Kestrel-owned compaction on openai:plan (#1844 Stage
+        2): Kestrel decides WHEN to compact and WHAT survives, rather than
+        codex auto-compacting opaquely server-side.
+
+        Returns True if a thread was actually cached for the session.
+        """
+        if not session_id:
+            return False
+        had = session_id in self._session_threads
+        self._session_threads.pop(session_id, None)
+        self._forget_thread_usage(session_id)
+        return had
 
     def get_thread_occupancy(
         self, session_id: Optional[str],

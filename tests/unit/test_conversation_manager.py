@@ -114,12 +114,17 @@ class MockLLMService:
         self.response = response
         self.generate_calls = []
 
-    async def generate(self, prompt: str, system_prompt: str = None, model_override: str = None):
-        """Mock generate method."""
+    async def generate(self, *, system_prompt: str = None, user_prompt: str = None,
+                       model_override: str = None, **kwargs):
+        """Mock generate — mirrors the REAL keyword-only LLMService.generate
+        signature (system_prompt/user_prompt), so it would reject the old
+        ``prompt=`` call the way production does. The legacy ``prompt`` key is
+        kept (mapped to user_prompt) for existing assertions."""
         self.generate_calls.append({
-            "prompt": prompt,
+            "prompt": user_prompt,
+            "user_prompt": user_prompt,
             "system_prompt": system_prompt,
-            "model_override": model_override
+            "model_override": model_override,
         })
         return self.response
 

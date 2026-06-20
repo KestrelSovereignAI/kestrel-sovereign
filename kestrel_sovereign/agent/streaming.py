@@ -1,5 +1,6 @@
 """Streaming response handling for Kestrel Agent."""
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -548,6 +549,20 @@ class StreamingMixin:
             # check if hooks modified the user_message via that path.
             if hook_input.tool_input and "user_message" in hook_input.tool_input:
                 user_input = hook_input.tool_input["user_message"]
+
+        # #1844 Stage 2: Kestrel-owned compaction for openai:plan. Compact +
+        # reset the codex thread BEFORE fetching history / building context so
+        # the freshly-seeded thread carries the compacted view rather than
+        # letting codex auto-compact opaquely server-side. Gated on the codex
+        # adapter's own recorded occupancy (not route prediction). Best-effort.
+        #
+        # The hook lives on KestrelAgent; StreamingMixin is reusable, so guard
+        # it as OPTIONAL — a standalone-mixin host (or a partial test host) that
+        # lacks the real coroutine helper is a clean no-op rather than an
+        # ``await MagicMock()`` TypeError (codex review r9).
+        _compact_hook = getattr(self, "_maybe_compact_codex_thread", None)
+        if inspect.iscoroutinefunction(_compact_hook):
+            await _compact_hook(session_id)
 
         # Build full context using context_manager (same as process_input)
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()

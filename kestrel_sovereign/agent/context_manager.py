@@ -1138,10 +1138,10 @@ class ContextManager:
         )
 
     # Delegate to ConversationManager
-    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False) -> Dict[str, Any]:
+    async def compact_session(self, llm_service, preserve_recent: int = 10, force: bool = False, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Delegate to ConversationManager."""
         return await self.conversation_manager.compact_session(
-            llm_service, self.counter, preserve_recent, force
+            llm_service, self.counter, preserve_recent, force, session_id=session_id
         )
 
     async def check_compaction_needed(self, utilization_threshold: float = 70.0) -> Dict[str, Any]:

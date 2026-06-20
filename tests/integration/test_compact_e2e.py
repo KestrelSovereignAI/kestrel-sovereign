@@ -241,7 +241,9 @@ class TestCompactionSession:
                 # Verify LLM was called
                 agent.llm_service.generate.assert_called_once()
                 call_args = agent.llm_service.generate.call_args
-                assert "CONVERSATION:" in call_args.kwargs.get("prompt", "")
+                # generate is keyword-only with user_prompt (not prompt) — the
+                # old prompt= call silently no-op'd compaction (#1844).
+                assert "CONVERSATION:" in call_args.kwargs.get("user_prompt", "")
                 print(f"✅ LLM called to generate summary")
 
 

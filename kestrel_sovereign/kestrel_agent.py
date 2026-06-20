@@ -2329,6 +2329,120 @@ Expected Duration: {expected_duration}
                 return system_prompt
         return f"{system_prompt}{self._cached_features_prompt}"
 
+    def _codex_compact_threshold_pct(self) -> float:
+        """Occupancy %% at which Kestrel compacts the codex thread itself
+        (#1844 Stage 2) — kept below codex's own auto-compact ceiling so
+        Kestrel acts first. Operator-tunable via
+        ``KESTREL_OPENAI_PLAN_COMPACT_THRESHOLD_PCT``; default 70%."""
+        try:
+            raw = os.environ.get("KESTREL_OPENAI_PLAN_COMPACT_THRESHOLD_PCT")
+            if raw:
+                v = float(raw.strip())
+                if 0 < v <= 100:
+                    return v
+        except (ValueError, AttributeError):
+            pass
+        return 70.0
+
+    def _codex_adapter(self):
+        """Return the configured CodexAdapter (duck-typed on its thread
+        surface), or ``None``.
+
+        Deliberately does NOT predict the turn's route. ``generate_with_messages``
+        resolves routes via ``_resolve_model_selector`` while
+        ``resolve_provider_routing`` is a separate resolver — predicting with
+        either diverges from the other in edge cases (per-turn overrides,
+        solvency fallback, bare model ids; codex review r2/r5/r6/r7). Instead we
+        gate on the adapter's OWN recorded occupancy (see
+        ``_maybe_compact_codex_thread``): codex records a thread's occupancy only
+        for sessions it actually served, so a high reading is FACTUAL evidence
+        codex built that thread — no prediction needed. ``reset_thread`` clears
+        the snapshot, so a fire after a route switch away from codex is one-time
+        and self-limiting.
+        """
+        llm = getattr(self, "llm_service", None)
+        for prov in (getattr(llm, "providers", None) or []):
+            adapter = prov.get("adapter") if isinstance(prov, dict) else None
+            if (
+                adapter is not None
+                and hasattr(adapter, "get_thread_occupancy")
+                and hasattr(adapter, "reset_thread")
+            ):
+                return adapter
+        return None
+
+    async def _maybe_compact_codex_thread(
+        self, session_id: Optional[str],
+    ) -> None:
+        """Pre-turn Kestrel-owned compaction for openai:plan (#1844 Stage 2).
+
+        On openai:plan, codex accumulates the full conversation thread
+        server-side and auto-compacts it opaquely+lossily when IT fills. Here
+        Kestrel takes ownership: when codex's TRUE thread occupancy (captured
+        in Stage 1) has crossed the threshold, compact our own history
+        DURABLY (``ContextManager.compact_session`` writes a summary marker +
+        excludes the originals) and reset the codex thread so THIS turn starts
+        fresh and ``_build_turn_input(fresh_thread=True)`` re-seeds the
+        compacted view. Net effect: Kestrel decides when to compact and what
+        survives — observable and recoverable — instead of codex doing it
+        invisibly.
+
+        Best-effort: any failure logs and leaves the turn to proceed
+        normally (codex's own auto-compaction remains the backstop).
+        """
+        if not session_id:
+            return
+        adapter = self._codex_adapter()
+        if adapter is None:
+            return
+        # FACTUAL gate: codex records occupancy only for sessions it served, so
+        # a high reading means codex built (and owns) this session's thread —
+        # no route prediction needed.
+        occ = adapter.get_thread_occupancy(session_id)
+        pct = occ.get("occupancy_percent") if occ else None
+        if not isinstance(pct, (int, float)):
+            return
+        threshold = self._codex_compact_threshold_pct()
+        if pct < threshold:
+            return
+        if getattr(self, "context_manager", None) is None:
+            return
+        try:
+            # Scope to THIS session so the summary marker lands in the same
+            # session-filtered history the fresh codex thread will reseed from.
+            # force=True: occupancy is already over threshold, so don't let the
+            # message-count heuristic bail (high-token sessions can cross the
+            # line with relatively few, very large messages/tool outputs —
+            # codex review r3). Smaller preserve_recent so few-message sessions
+            # still have >=3 older messages to summarize while keeping recent
+            # turns verbatim.
+            result = await self.context_manager.compact_session(
+                self.llm_service,
+                preserve_recent=6,
+                force=True,
+                session_id=session_id,
+            )
+        except Exception as e:  # noqa: BLE001 - never break a turn
+            logging.warning(
+                "openai:plan auto-compaction failed at %.1f%% occupancy: %s",
+                pct, e, exc_info=True,
+            )
+            return
+        if isinstance(result, dict) and result.get("success"):
+            adapter.reset_thread(session_id)
+            logging.info(
+                "openai:plan: Kestrel compacted at %.1f%% codex-thread "
+                "occupancy (saved %s tokens, %s msgs) and reset the thread to "
+                "reseed the compacted history (#1844 Stage 2)",
+                pct, result.get("tokens_saved"), result.get("messages_compacted"),
+            )
+        else:
+            reason = result.get("reason") if isinstance(result, dict) else "unknown"
+            logging.info(
+                "openai:plan: compaction at %.1f%% occupancy not applied (%s)",
+                pct, reason,
+            )
+
     async def _process_input_traced_locked(
         self,
         user_input: str,
@@ -2413,6 +2527,14 @@ Expected Duration: {expected_duration}
             logging.warning(
                 "preturn_state: injection skipped: %s", _e, exc_info=True
             )
+
+        # #1844 Stage 2: Kestrel-owned compaction for openai:plan. If codex's
+        # server-side thread occupancy has crossed the threshold, compact our
+        # (durable) history and reset the codex thread now — BEFORE assembling
+        # this turn's context — so the fresh thread reseeds the compacted view
+        # rather than letting codex auto-compact opaquely. Gated on the codex
+        # adapter's own recorded occupancy (not route prediction). Best-effort.
+        await self._maybe_compact_codex_thread(session_id)
 
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history

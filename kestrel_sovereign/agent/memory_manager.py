@@ -1011,13 +1011,17 @@ CONVERSATION SEGMENT:
 
 SUMMARY:"""
 
+        # LLMService.generate is keyword-only and requires user_prompt (not
+        # prompt) — the old call TypeError'd at runtime (#1844 root-cause sweep).
         response = await llm_service.generate(
-            prompt=prompt,
             system_prompt="You are a conversation summarizer. Create concise summaries.",
-            model_override=None
+            user_prompt=prompt,
+            model_override=None,
         )
 
-        return response.strip() if isinstance(response, str) else str(response)
+        if isinstance(response, str):
+            return response.strip()
+        return (getattr(response, "content", None) or "").strip()
 
     def _get_conversation_store(self):
         """Get the conversation store from storage hierarchy."""

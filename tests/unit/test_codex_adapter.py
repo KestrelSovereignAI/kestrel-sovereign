@@ -222,6 +222,19 @@ class TestThreadOccupancy:
         a._forget_thread_usage("s")      # idempotent
         a._forget_thread_usage(None)     # safe
 
+    def test_reset_thread_drops_cache_and_occupancy(self):
+        # #1844 Stage 2 keystone: reset_thread evicts the cached thread AND
+        # its occupancy so the next turn starts fresh and reseeds.
+        a = CodexAdapter()
+        a._session_threads["s"] = ("thread-1", "fp-A")
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 200000}, "modelContextWindow": 258400})
+        assert a.reset_thread("s") is True          # had a cached thread
+        assert "s" not in a._session_threads
+        assert a.get_thread_occupancy("s") is None
+        assert a.reset_thread("s") is False         # nothing left to reset
+        assert a.reset_thread(None) is False        # safe
+
     def test_unknown_session_and_bad_input_are_safe(self):
         a = CodexAdapter()
         assert a.get_thread_occupancy("nope") is None
