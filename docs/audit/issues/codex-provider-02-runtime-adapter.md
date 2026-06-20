@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Add a first-pass `openai_plan` runtime adapter to `kestrel-sovereign`
+description: 'Parent: OpenAI plan provider design issue'
+resource: /docs/audit/issues/codex-provider-02-runtime-adapter.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Add a first-pass `openai_plan` runtime adapter to `kestrel-sovereign`
 
 Parent: OpenAI plan provider design issue

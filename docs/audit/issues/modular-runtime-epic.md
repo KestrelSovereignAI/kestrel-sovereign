@@ -1,3 +1,21 @@
+---
+type: Issue Body
+title: Refactor `kestrel-sovereign` toward a smaller permanent core and capability
+  modules
+description: '`kestrel-sovereign` already has the beginnings of the right architecture:'
+resource: /docs/audit/issues/modular-runtime-epic.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Refactor `kestrel-sovereign` toward a smaller permanent core and capability modules
 
 ## Problem

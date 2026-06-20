@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: 03 - Privacy Modes
+description: Kestrel's privacy system uses **independent flags** with **named presets**
+  for complete control.
+resource: /docs/diagrams/03-privacy-modes.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 03 - Privacy Modes
 
 Kestrel's privacy system uses **independent flags** with **named presets** for complete control.

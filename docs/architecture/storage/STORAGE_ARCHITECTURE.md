@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Kestrel Storage Architecture
+description: '**Status:** Active implementation snapshot **Last updated:** 2026-05-31'
+resource: /docs/architecture/storage/STORAGE_ARCHITECTURE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Storage Architecture
 
 **Status:** Active implementation snapshot

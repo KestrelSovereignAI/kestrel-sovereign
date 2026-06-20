@@ -18,6 +18,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
 from kestrel_sovereign.llm.model_catalog import get_catalog_service
 from kestrel_sovereign.llm.model_metadata import ModelInfo
 from kestrel_sovereign.llm.model_selection import resolve_provider_default
@@ -108,6 +110,78 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SOURCE_FILE = PROJECT_ROOT / "KESTREL_FEATURES.md"
 OUTPUT_DIR = PROJECT_ROOT / "docs" / "generated"
 _DISCOVERY_REFRESH_CACHE: dict[str, list[ModelInfo]] = {}
+
+
+def build_okf_frontmatter(
+    audience: str,
+    *,
+    provider: str,
+    model_name: str,
+    generated_at: datetime,
+) -> str:
+    """Build deterministic OKF metadata for a generated audience doc."""
+    metadata = {
+        "type": "Generated Reference",
+        "title": AUDIENCES[audience]["title"],
+        "description": f"Audience-specific {audience} view generated from the canonical Kestrel feature inventory.",
+        "resource": f"/docs/generated/FEATURES_{audience}.md",
+        "tags": ["features", "generated-docs", audience],
+        "timestamp": generated_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "status": "generated",
+        "generated": True,
+        "canonical": False,
+        "source": "/KESTREL_FEATURES.md",
+        "audience": audience,
+        "generator": "scripts/generate_feature_docs.py",
+        "model": f"{provider}/{model_name}",
+        "regenerate": f"uv run python scripts/generate_feature_docs.py --audience {audience}",
+    }
+    dumped = yaml.safe_dump(metadata, sort_keys=False, allow_unicode=True).strip()
+    return f"---\n{dumped}\n---\n\n"
+
+
+def parse_okf_frontmatter(path: Path) -> dict | None:
+    """Return OKF frontmatter for a markdown file, or None when absent/invalid."""
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8")
+    if not text.startswith("---\n"):
+        return None
+    end = text.find("\n---\n", 4)
+    if end == -1:
+        return None
+    parsed = yaml.safe_load(text[4:end]) or {}
+    return parsed if isinstance(parsed, dict) else None
+
+
+def check_generated_docs() -> int:
+    """Validate checked-in generated docs have OKF generation metadata."""
+    failures: list[str] = []
+    for audience in AUDIENCES:
+        path = OUTPUT_DIR / f"FEATURES_{audience}.md"
+        metadata = parse_okf_frontmatter(path)
+        if metadata is None:
+            failures.append(f"{path.relative_to(PROJECT_ROOT)}: missing OKF frontmatter")
+            continue
+        expected = {
+            "type": "Generated Reference",
+            "generated": True,
+            "canonical": False,
+            "source": "/KESTREL_FEATURES.md",
+            "audience": audience,
+            "generator": "scripts/generate_feature_docs.py",
+        }
+        for key, value in expected.items():
+            if metadata.get(key) != value:
+                failures.append(
+                    f"{path.relative_to(PROJECT_ROOT)}: expected {key}={value!r}, got {metadata.get(key)!r}"
+                )
+    if failures:
+        for failure in failures:
+            print(f"ERROR: {failure}", file=sys.stderr)
+        return 1
+    print("Generated feature docs metadata is current.")
+    return 0
 
 
 async def _discover_provider_models(provider: str) -> list[ModelInfo]:
@@ -250,11 +324,11 @@ def generate(
 
     # Write output
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    header = (
-        f"<!-- AUTO-GENERATED from KESTREL_FEATURES.md — do not edit manually -->\n"
-        f"<!-- Audience: {audience} | Generated: {now} | Model: {provider}/{model_name} -->\n"
-        f"<!-- Regenerate: uv run python scripts/generate_feature_docs.py --audience {audience} -->\n\n"
+    header = build_okf_frontmatter(
+        audience,
+        provider=provider,
+        model_name=model_name,
+        generated_at=datetime.now(timezone.utc),
     )
 
     out_path = OUTPUT_DIR / f"FEATURES_{audience}.md"
@@ -293,6 +367,11 @@ def main():
         help="Print prompts without calling the LLM",
     )
     parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check checked-in generated docs metadata without calling the LLM",
+    )
+    parser.add_argument(
         "--skip-discovery-refresh",
         action="store_true",
         help="Use the existing discovery cache instead of refreshing live provider models",
@@ -309,6 +388,9 @@ def main():
         for name, profile in AUDIENCES.items():
             print(f"  {name:12s}  {profile['title']}")
         return
+
+    if args.check:
+        raise SystemExit(check_generated_docs())
 
     if not SOURCE_FILE.exists():
         print(f"Error: {SOURCE_FILE} not found. Generate it first.")

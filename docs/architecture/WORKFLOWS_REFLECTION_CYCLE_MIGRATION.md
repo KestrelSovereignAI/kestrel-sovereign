@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Reflection Cycle Workflow Migration
+description: 'Parent: #1131. Sub-issue: #1145.'
+resource: /docs/architecture/WORKFLOWS_REFLECTION_CYCLE_MIGRATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Reflection Cycle Workflow Migration
 
 Parent: #1131. Sub-issue: #1145.

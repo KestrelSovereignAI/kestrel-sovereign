@@ -1,3 +1,23 @@
+---
+type: Audit Report
+title: Cleanup Candidates Report
+description: 'Lane report from the May 2026 documentation audit: Cleanup Candidates
+  Report.'
+resource: /docs/audit/documentation-2026-05/reports/cleanup_candidates_report.md
+tags:
+- audit
+- documentation
+- may-2026
+- report
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Cleanup Candidates Report
 
 Source: subagent review, read-only, 2026-05-30.

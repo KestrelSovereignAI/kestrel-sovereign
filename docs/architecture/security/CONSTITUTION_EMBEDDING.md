@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel Constitution Embedding Process
+description: Every Kestrel agent is cryptographically bound to the Kestrel Constitution
+  from inception. This document describes the process by which the constitution becomes
+  part of an agent...
+resource: /docs/architecture/security/CONSTITUTION_EMBEDDING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Constitution Embedding Process
 
 ## Overview

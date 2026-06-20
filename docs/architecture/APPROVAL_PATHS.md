@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Approval paths
+description: 'Closes #1582. Reference for operators and future agents on the three
+  independent approval systems an LLM tool call can ride, and which paths auto-mode
+  covers today.'
+resource: /docs/architecture/APPROVAL_PATHS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Approval paths
 
 Closes #1582. Reference for operators and future agents on the three independent approval systems an LLM tool call can ride, and which paths auto-mode covers today.

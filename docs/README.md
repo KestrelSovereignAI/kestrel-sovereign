@@ -1,3 +1,21 @@
+---
+type: Documentation Index
+title: Kestrel Documentation Index
+description: This directory holds detailed documentation for kestrel-sovereign. The
+  top-level [`README.md`](../README.md) is the single best entry point; this index
+  links into the deeper mat...
+resource: /docs/README.md
+tags:
+- docs
+- documentation-index
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: true
+generated: false
+privacy: public
+---
+
 # Kestrel Documentation Index
 
 This directory holds detailed documentation for kestrel-sovereign. The top-level [`README.md`](../README.md) is the single best entry point; this index links into the deeper material.
@@ -43,8 +61,27 @@ This directory holds detailed documentation for kestrel-sovereign. The top-level
 - **[`generated/FEATURES_developer.md`](generated/FEATURES_developer.md)** — auto-generated developer feature reference
 - **[`generated/FEATURES_user.md`](generated/FEATURES_user.md)** — user-facing feature reference
 - **[`generated/FEATURES_investor.md`](generated/FEATURES_investor.md)** — investor-facing feature reference
+- **[`generated/DEMO_EVIDENCE.md`](generated/DEMO_EVIDENCE.md)** — generated index of executable demos and visual-review configs
 
-Regenerate via `scripts/generate_feature_docs.py`.
+Regenerate feature audience docs via `scripts/generate_feature_docs.py`; regenerate demo evidence via `scripts/generate_demo_evidence_docs.py`.
+
+## OKF metadata
+
+Kestrel `docs/` use Google Open Knowledge Format (OKF): Markdown plus YAML frontmatter. The migration plan and operating ledger are [`audit/OKF_MIGRATION_PLAN.md`](audit/OKF_MIGRATION_PLAN.md). All non-reserved Markdown files under `docs/` are now OKF-classified; the only skipped files are generated OKF `index.md` and `log.md` views.
+
+Generated OKF views:
+
+- **[`audit/index.md`](audit/index.md)** / **[`audit/log.md`](audit/log.md)** — OKF concepts and timestamped docs in the audit tree
+- **[`generated/index.md`](generated/index.md)** / **[`generated/log.md`](generated/log.md)** — generated references and their timestamps
+- **[`architecture/index.md`](architecture/index.md)** / **[`architecture/log.md`](architecture/log.md)** — architecture concepts and timestamped docs
+
+Validation:
+
+```bash
+uv run python scripts/docs_okf.py validate --all docs
+uv run python scripts/docs_okf.py index --check
+uv run python scripts/docs_okf.py log --check
+```
 
 ## Research & references
 

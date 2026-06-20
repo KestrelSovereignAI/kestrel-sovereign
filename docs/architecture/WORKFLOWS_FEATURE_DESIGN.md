@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel Workflows Feature — Architecture Design
+description: 'Draft v4.1. Filed as epic #1131 (body to be updated when v4.1 lands).
+  v1→v3.4 history at the bottom of the appendix; v3.4→v4 was a load-bearing reframing
+  after a platform survey...'
+resource: /docs/architecture/WORKFLOWS_FEATURE_DESIGN.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Workflows Feature — Architecture Design
 
 > Draft v4.1. Filed as epic #1131 (body to be updated when v4.1 lands). v1→v3.4 history at the bottom of the appendix; v3.4→v4 was a load-bearing reframing after a platform survey caught v3.4 designing a parallel runtime instead of composing on top of the existing Signal Dispatcher; v4→v4.1 closed two codex round-5 P2s where v4 referenced SignalDispatcher contract fields that don't exist.

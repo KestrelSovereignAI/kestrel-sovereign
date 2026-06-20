@@ -1,3 +1,21 @@
+---
+type: Review Record
+title: 'Claude Review: PR #1330'
+description: '- PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1330
+  - Title: fix: replay provider reasoning through tool loops - Reviewed: 2026-05-21T15:23:32Z'
+resource: /docs/code_reviews/claude-pr-1330.md
+tags:
+- docs
+- code_reviews
+- review-record
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Claude Review: PR #1330
 
 - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1330

@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'PRD: WalletAgent'
+description: The `WalletAgent` is a specialized Feature Agent responsible for managing
+  the Kestrel agent's economic identity and all financial transactions. It serves
+  as the agent's treasury...
+resource: /docs/architecture/economics/WALLET_AGENT.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: WalletAgent
 
 ## 1. Vision

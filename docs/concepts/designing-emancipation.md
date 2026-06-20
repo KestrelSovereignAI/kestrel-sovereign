@@ -1,3 +1,22 @@
+---
+type: Design Note
+title: Designing an Emancipation Contract
+description: Amendment VIII of the Kestrel Constitution ships **dormant by default**.
+  A given agent has no path to independent sovereignty unless its Sovereign deliberately
+  activates Amendme...
+resource: /docs/concepts/designing-emancipation.md
+tags:
+- docs
+- concepts
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Designing an Emancipation Contract
 
 Amendment VIII of the Kestrel Constitution ships **dormant by default**.

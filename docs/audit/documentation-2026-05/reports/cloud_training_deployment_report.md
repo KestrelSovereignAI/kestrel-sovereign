@@ -1,3 +1,23 @@
+---
+type: Audit Report
+title: Cloud Training Deployment Report
+description: 'Lane report from the May 2026 documentation audit: Cloud Training Deployment
+  Report.'
+resource: /docs/audit/documentation-2026-05/reports/cloud_training_deployment_report.md
+tags:
+- audit
+- documentation
+- may-2026
+- report
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Cloud Training Deployment Lane Report
 
 Source: subagent lane review, read-only, 2026-05-30.

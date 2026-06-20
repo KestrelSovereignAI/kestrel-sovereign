@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Subagent Isolation Audit
+description: '**Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared
+  state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569)
+  **Phase:...'
+resource: /docs/architecture/subagent_isolation_audit.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Subagent Isolation Audit
 
 **Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569)

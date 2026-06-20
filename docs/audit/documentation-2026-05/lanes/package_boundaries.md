@@ -1,3 +1,23 @@
+---
+type: Review Lane
+title: Package Boundaries
+description: Review prompt for the Package Boundaries lane of the May 2026 documentation
+  audit.
+resource: /docs/audit/documentation-2026-05/lanes/package_boundaries.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: Package Boundaries
 
 Goal: determine the current source of truth for what ships in `kestrel-sovereign`, what is an external feature package, what is a provider package, and what is a standalone tool.

@@ -1,3 +1,22 @@
+---
+type: Audit Ledger
+title: Kestrel Whole-of-Vision Audit
+description: This directory is the canonical source for the GitHub issue bodies used
+  to track the feature-by-feature audit, inspection, and red-team program derived
+  from `KESTREL_FEATURES.md`.
+resource: /docs/audit/README.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Whole-of-Vision Audit
 
 This directory is the canonical source for the GitHub issue bodies used to track
@@ -19,3 +38,13 @@ Current documentation audit:
 
 - [`DOCUMENTATION_AUDIT_5_2026.md`](DOCUMENTATION_AUDIT_5_2026.md) - May 2026 audit ledger for package extraction, context, memory, storage, LLM, signals, Talon, cloud, generated docs, and public-doc hygiene.
 - [`documentation-2026-05/`](documentation-2026-05/) - working audit workspace with shared context, lane briefs, subagent reports, stale-artifact review, and execution order.
+- [`OKF_MIGRATION_PLAN.md`](OKF_MIGRATION_PLAN.md) - plan and implementation ledger for converting Kestrel docs to OKF and wiring documentation freshness into Talon/Flight/Eye workflows.
+- [`index.md`](index.md) / [`log.md`](log.md) - generated OKF concept index and timestamp log for this audit tree.
+
+OKF checks:
+
+```bash
+uv run python scripts/docs_okf.py validate --all docs
+uv run python scripts/docs_okf.py index --check
+uv run python scripts/docs_okf.py log --check
+```

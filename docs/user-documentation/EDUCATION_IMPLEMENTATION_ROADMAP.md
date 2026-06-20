@@ -1,3 +1,22 @@
+---
+type: User Guide
+title: 'Kestrel Education Strategy: Implementation Roadmap'
+description: '**Date:** November 9, 2025 **Focus:** Transform education challenge
+  into competitive advantage **Timeline:** 6-month implementation with measurable
+  milestones'
+resource: /docs/user-documentation/EDUCATION_IMPLEMENTATION_ROADMAP.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Education Strategy: Implementation Roadmap
 
 **Date:** November 9, 2025  

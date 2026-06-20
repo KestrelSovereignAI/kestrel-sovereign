@@ -1,3 +1,20 @@
+---
+type: Design Note
+title: Kestrel Landing Page Wireframe
+description: Prepared for the open-source launch on Apr 23 / May 7 planning path.
+resource: /docs/design/launch/LANDING_PAGE_WIREFRAME.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Landing Page Wireframe
 
 Prepared for the open-source launch on Apr 23 / May 7 planning path.

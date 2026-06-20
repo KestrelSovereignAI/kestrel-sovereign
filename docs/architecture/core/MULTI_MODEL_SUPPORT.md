@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'PRD: Multi-Model Foundational Support'
+description: '**Historical PRD — preserved for context, do not follow as guidance.**
+  This describes the *original* multi-model support architecture from initial build.
+  Subsequent work has mat...'
+resource: /docs/architecture/core/MULTI_MODEL_SUPPORT.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: Multi-Model Foundational Support
 
 > **Historical PRD — preserved for context, do not follow as guidance.**

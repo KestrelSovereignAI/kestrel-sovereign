@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-03: Local Storage (SQLite)'
+description: AsyncStorage facade and five specialized stores.
+resource: /docs/diagrams/data-architecture/DA-03-local-storage.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-03: Local Storage (SQLite)
 
 AsyncStorage facade and five specialized stores.

@@ -1,3 +1,24 @@
+---
+type: Review Record
+title: Claude Pr 1337
+description: Good — both adapters handle dict arguments correctly. The OpenAI adapter
+  at line 663 normalizes `dict → json.dumps()` before sending, and the Anthropic adapter
+  at line 420 handl...
+resource: /docs/code_reviews/claude-pr-1337.md
+tags:
+- docs
+- code_reviews
+- review-record
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
+# Claude Pr 1337
+
 Good — both adapters handle dict arguments correctly. The OpenAI adapter at line 663 normalizes `dict → json.dumps()` before sending, and the Anthropic adapter at line 420 handles both string and dict. So the behavioral change (keeping arguments as dict instead of JSON string) is safe — the adapters normalize on the way out.
 
 Now let me check the redundant `tool_calls` guard on line 207:

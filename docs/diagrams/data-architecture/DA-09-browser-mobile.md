@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: 'DA-09: Browser & Mobile Storage'
+description: Client-side storage architecture across browsers, mobile apps, and server
+  compute.
+resource: /docs/diagrams/data-architecture/DA-09-browser-mobile.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-09: Browser & Mobile Storage
 
 Client-side storage architecture across browsers, mobile apps, and server compute.

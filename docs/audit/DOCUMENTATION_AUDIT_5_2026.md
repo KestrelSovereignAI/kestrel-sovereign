@@ -1,3 +1,22 @@
+---
+type: Audit Ledger
+title: Documentation Audit - May 2026
+description: 'Status: working audit ledger Created: 2026-05-30 Scope: Kestrel Sovereign
+  public, operator, architecture, generated, and audit documentation after the recent
+  package extraction,...'
+resource: /docs/audit/DOCUMENTATION_AUDIT_5_2026.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Documentation Audit - May 2026
 
 Status: working audit ledger  

@@ -1,3 +1,22 @@
+---
+type: Audit Ledger
+title: Cross-Feature Seam Campaigns
+description: This matrix tracks adversarial campaigns that cross feature boundaries.
+  Component-local proof is tracked in `FEATURE_PROOF_MATRIX.md`; this file is for
+  regressions that only app...
+resource: /docs/audit/SEAM_CAMPAIGNS.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Cross-Feature Seam Campaigns
 
 This matrix tracks adversarial campaigns that cross feature boundaries. Component-local proof is tracked in `FEATURE_PROOF_MATRIX.md`; this file is for regressions that only appear when UI, auth, runtime, storage, LLM routing, tools, and deployment surfaces interact.

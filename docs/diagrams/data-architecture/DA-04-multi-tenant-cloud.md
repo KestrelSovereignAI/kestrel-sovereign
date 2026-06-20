@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-04: Multi-Tenant Cloud (Kestrel PostgreSQL)'
+description: Kestrel cloud architecture with row-level security.
+resource: /docs/diagrams/data-architecture/DA-04-multi-tenant-cloud.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-04: Multi-Tenant Cloud (Kestrel PostgreSQL)
 
 Kestrel cloud architecture with row-level security.

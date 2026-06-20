@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'PRD: PrivacyAgent'
+description: The `PrivacyAgent` will serve as the Kestrel agent's dedicated guardian
+  of information and confidentiality. It will encapsulate all logic related to the
+  handling of sensitive co...
+resource: /docs/architecture/security/PRIVACY_AGENT.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: PrivacyAgent
 
 ## 1. Vision

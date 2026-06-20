@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Sovereignty Implementation
+description: '**Date:** November 21, 2025 **Status:** ✅ **COMPLETE** - V2 Architecture
+  with Convergent Sharding **Tests:** 16/16 passing (100%) **Vision:** "Your AI companion
+  can never be tak...'
+resource: /docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Sovereignty Implementation
 
 **Date:** November 21, 2025

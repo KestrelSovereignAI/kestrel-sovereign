@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-08: Privacy & Encryption'
+description: Encryption at rest, PII scrubbing, and privacy mode enforcement.
+resource: /docs/diagrams/data-architecture/DA-08-privacy-encryption.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-08: Privacy & Encryption
 
 Encryption at rest, PII scrubbing, and privacy mode enforcement.

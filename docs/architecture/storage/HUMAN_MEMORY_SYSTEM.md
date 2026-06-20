@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Human-Like Memory System
+description: '**Last Updated:** 2026-05-31 **Status:** Historical companion; canonical
+  implementation details live in [`../MEMORY_SYSTEM.md`](../MEMORY_SYSTEM.md) **Commit:**
+  `0b83115`'
+resource: /docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Human-Like Memory System
 
 **Last Updated:** 2026-05-31

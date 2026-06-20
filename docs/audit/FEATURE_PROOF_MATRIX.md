@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Feature Proof Matrix
+description: This is the first pass at mapping each discoverable feature module to
+  direct proof.
+resource: /docs/audit/FEATURE_PROOF_MATRIX.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Feature Proof Matrix
 
 This is the first pass at mapping each discoverable feature module to direct proof.

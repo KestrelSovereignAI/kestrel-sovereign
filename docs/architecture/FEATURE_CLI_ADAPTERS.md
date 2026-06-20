@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Feature-Owned CLI Adapters
+description: 'Status: **Active**. Introduced by [#1185](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1185),
+  extended by [#1192](https://github.com/KestrelSovereignAI/kestrel-s...'
+resource: /docs/architecture/FEATURE_CLI_ADAPTERS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Feature-Owned CLI Adapters
 
 > Status: **Active**. Introduced by [#1185](https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1185),

@@ -1,3 +1,20 @@
+---
+type: Runbook
+title: Deployment Operations
+description: How to build, deploy, and update Kestrel Sovereign on Cloud Run.
+resource: /docs/deployment/README.md
+tags:
+- docs
+- deployment
+- runbook
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Deployment Operations
 
 How to build, deploy, and update Kestrel Sovereign on Cloud Run.

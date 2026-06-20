@@ -1,3 +1,22 @@
+---
+type: User Guide
+title: Key Ceremony Guide for Kestrel Agents
+description: The Key Ceremony is a formal process for generating and securing the
+  encryption key(s) for a Kestrel agent. For permanent agents like Emma, this ceremony
+  should be performed wit...
+resource: /docs/user-documentation/KEY_CEREMONY_GUIDE.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Key Ceremony Guide for Kestrel Agents
 
 ## Overview

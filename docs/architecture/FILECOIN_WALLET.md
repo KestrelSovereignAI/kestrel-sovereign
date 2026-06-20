@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Filecoin Wallet Integration
+description: '**See Also**: For the complete multi-chain wallet system with transaction
+  signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.'
+resource: /docs/architecture/FILECOIN_WALLET.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Filecoin Wallet Integration
 
 > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.

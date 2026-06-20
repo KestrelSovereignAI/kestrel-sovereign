@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Economics Work Session – Kestrel / Sovereign Agents
+description: '**Purpose:** Shared scratchpad for coordinating between top-level models
+  (and humans) on Kestrel / Kestrel economics: pricing, fee containment (LLM, Runpod,
+  Filecoin, infra), re...'
+resource: /docs/architecture/economics/ECONOMICS_WORK_SESSION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Economics Work Session – Kestrel / Sovereign Agents
 
 **Purpose:** Shared scratchpad for coordinating between top-level models (and humans) on Kestrel / Kestrel economics: pricing, fee containment (LLM, Runpod, Filecoin, infra), revenue distribution (platform, agents, creators, users), and solvency.

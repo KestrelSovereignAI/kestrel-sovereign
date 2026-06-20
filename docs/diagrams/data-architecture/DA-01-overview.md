@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 'DA-01: Data Architecture Overview'
+description: The three-layer architecture that enables data sovereignty.
+resource: /docs/diagrams/data-architecture/DA-01-overview.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-01: Data Architecture Overview
 
 The three-layer architecture that enables data sovereignty.

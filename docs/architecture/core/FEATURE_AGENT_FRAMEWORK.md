@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'PRD: Feature Agent Framework'
+description: To transform the Kestrel project from a single, monolithic agent into
+  a robust, scalable, and maintainable "society of agents." Under this framework,
+  the primary `KestrelAgent`...
+resource: /docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # PRD: Feature Agent Framework
 
 ## 1. Vision

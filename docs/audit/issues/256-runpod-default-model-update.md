@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Runpod Default Model Update
+description: Removed hidden fallback models from the RunPod deployment path.
+resource: /docs/audit/issues/256-runpod-default-model-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Runpod Default Model Update
+
 Removed hidden fallback models from the RunPod deployment path.
 
 What changed:

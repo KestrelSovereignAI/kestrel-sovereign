@@ -3,6 +3,9 @@
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from datetime import datetime, timezone
+
+import yaml
 
 from scripts import generate_feature_docs
 from kestrel_sovereign.llm.model_metadata import ModelCategory, ModelInfo
@@ -28,6 +31,32 @@ def test_dry_run_returns_expected_output_paths(capsys):
     assert "DRY RUN: developer" in output
     assert "DRY RUN: user" in output
     assert "DRY RUN: investor" in output
+
+
+def test_okf_frontmatter_for_generated_docs_is_deterministic():
+    header = generate_feature_docs.build_okf_frontmatter(
+        "developer",
+        provider="anthropic",
+        model_name="claude-sonnet-4-6",
+        generated_at=datetime(2026, 6, 18, 12, 30, tzinfo=timezone.utc),
+    )
+
+    assert header.startswith("---\n")
+    frontmatter = header.split("---\n", 2)[1]
+    metadata = yaml.safe_load(frontmatter)
+
+    assert metadata["type"] == "Generated Reference"
+    assert metadata["audience"] == "developer"
+    assert metadata["generated"] is True
+    assert metadata["canonical"] is False
+    assert metadata["source"] == "/KESTREL_FEATURES.md"
+    assert metadata["generator"] == "scripts/generate_feature_docs.py"
+    assert metadata["model"] == "anthropic/claude-sonnet-4-6"
+    assert metadata["timestamp"] == "2026-06-18T12:30:00Z"
+
+
+def test_checked_in_generated_docs_have_okf_metadata():
+    assert generate_feature_docs.check_generated_docs() == 0
 
 
 def test_generator_uses_provider_default_resolution_for_anthropic():

@@ -1,3 +1,21 @@
+---
+type: Developer Note
+title: 'Scout-Plan-Code: Agentic Development Workflow'
+description: '**Date:** November 30, 2025 **Status:** Proposed **Integration:** A2A
+  Protocol, Feedback System, Task Manager'
+resource: /docs/development/SCOUT_PLAN_CODE.md
+tags:
+- docs
+- development
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Scout-Plan-Code: Agentic Development Workflow
 
 **Date:** November 30, 2025  

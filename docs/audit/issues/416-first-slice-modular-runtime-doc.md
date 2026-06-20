@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: 'First slice for #416: add `MODULAR_RUNTIME.md` and a contract test scaffold'
+description: 'Parent issue: #416 Parent epic: #413'
+resource: /docs/audit/issues/416-first-slice-modular-runtime-doc.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # First slice for #416: add `MODULAR_RUNTIME.md` and a contract test scaffold
 
 Parent issue: #416

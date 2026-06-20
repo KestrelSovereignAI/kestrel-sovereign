@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Add smoke proof and docs for sovereign `codex_provider`
+description: 'Parent: Codex provider adapter and model-selection issues'
+resource: /docs/audit/issues/codex-provider-04-smoke-proof.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Add smoke proof and docs for sovereign `codex_provider`
 
 Parent: Codex provider adapter and model-selection issues

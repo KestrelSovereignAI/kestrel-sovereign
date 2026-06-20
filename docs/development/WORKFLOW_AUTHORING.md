@@ -1,3 +1,22 @@
+---
+type: Developer Note
+title: Authoring multi-agent Workflow scripts
+description: When a Claude session uses the Workflow tool to fan out across subagents
+  — typically `observation → diagnosis → synthesis` — the synthesis stage tends to
+  overreach. It reads ups...
+resource: /docs/development/WORKFLOW_AUTHORING.md
+tags:
+- docs
+- development
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
 # Authoring multi-agent Workflow scripts
 
 When a Claude session uses the Workflow tool to fan out across subagents — typically `observation → diagnosis → synthesis` — the synthesis stage tends to overreach. It reads upstream findings, draws a confident conclusion about the world, and produces a clean bottom-line… that doesn't match what observation actually returned.

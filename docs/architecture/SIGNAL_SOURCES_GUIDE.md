@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Signal Sources — Operator Guide
+description: How to add a new signal source to the bird. Companion to [`SIGNAL_DISPATCHER.md`](./SIGNAL_DISPATCHER.md)
+  (which is the design spec) and the dispatcher module docstring (which i...
+resource: /docs/architecture/SIGNAL_SOURCES_GUIDE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Signal Sources — Operator Guide
 
 How to add a new signal source to the bird. Companion to

@@ -1,3 +1,22 @@
+---
+type: Review Lane
+title: Context
+description: Review prompt for the Context lane of the May 2026 documentation audit.
+resource: /docs/audit/documentation-2026-05/lanes/context.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: Context
 
 Goal: reconcile documentation for prompt assembly, token budgets, context pruning, canonical history, rendered provider transport, retrieval insertion, and diagnostics.

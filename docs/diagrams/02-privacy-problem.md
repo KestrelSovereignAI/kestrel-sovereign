@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: 02 - The Privacy Problem
+description: Why current AI platforms like ChatGPT fail you, and why data sovereignty
+  matters.
+resource: /docs/diagrams/02-privacy-problem.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 02 - The Privacy Problem
 
 Why current AI platforms like ChatGPT fail you, and why data sovereignty matters.

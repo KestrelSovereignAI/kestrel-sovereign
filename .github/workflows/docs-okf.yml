@@ -1,0 +1,62 @@
+name: Docs OKF
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "KESTREL_FEATURES.md"
+      - "docs/**"
+      - "demos/**"
+      - "scripts/docs_okf.py"
+      - "scripts/generate_demo_evidence_docs.py"
+      - "scripts/generate_feature_docs.py"
+      - "tests/unit/test_docs_okf.py"
+      - "tests/unit/test_demo_evidence_docs.py"
+      - "tests/unit/test_generate_feature_docs.py"
+      - ".kestreltalon/quality.yaml"
+      - ".github/workflows/docs-okf.yml"
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  okf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          enable-cache: true
+
+      - name: Configure git for private deps
+        run: git config --global url."https://x-access-token:${{ secrets.GH_PAT }}@github.com/".insteadOf "https://github.com/"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Validate OKF metadata
+        run: uv run python scripts/docs_okf.py validate --all docs
+
+      - name: Check generated feature doc metadata
+        run: uv run python scripts/generate_feature_docs.py --check
+
+      - name: Check generated demo evidence index
+        run: uv run python scripts/generate_demo_evidence_docs.py --check
+
+      - name: Check generated OKF indexes
+        run: uv run python scripts/docs_okf.py index --check
+
+      - name: Check generated OKF logs
+        run: uv run python scripts/docs_okf.py log --check
+
+      - name: Dry-run generated feature docs
+        run: uv run python scripts/generate_feature_docs.py --all --dry-run
+
+      - name: Run OKF unit tests
+        run: uv run pytest tests/unit/test_docs_okf.py tests/unit/test_generate_feature_docs.py tests/unit/test_demo_evidence_docs.py tests/unit/test_feature_doc_canonicality.py -q

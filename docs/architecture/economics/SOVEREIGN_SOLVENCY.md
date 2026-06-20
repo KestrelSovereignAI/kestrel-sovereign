@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: 'Sovereign Solvency Protocol: The Economics of Existence'
+description: '**Status:** Draft Proposal **Related Documents:** `AGENT_ECONOMICS.md`,
+  `KESTREL_CONSTITUTION.md`'
+resource: /docs/architecture/economics/SOVEREIGN_SOLVENCY.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Sovereign Solvency Protocol: The Economics of Existence
 
 **Status:** Draft Proposal

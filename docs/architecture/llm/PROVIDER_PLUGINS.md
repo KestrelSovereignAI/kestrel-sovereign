@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Building a Kestrel LLM Provider Plugin
+description: '**Audience:** developers extending Kestrel with a new LLM backend (Kimi,
+  DeepSeek, a private API, a local server) without touching the framework codebase.
+  **Substrate:** `kestre...'
+resource: /docs/architecture/llm/PROVIDER_PLUGINS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Building a Kestrel LLM Provider Plugin
 
 > **Audience:** developers extending Kestrel with a new LLM backend (Kimi, DeepSeek, a private API, a local server) without touching the framework codebase.

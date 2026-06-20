@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: 'Plan: Sovereign GPU Integration (RunPod)'
+description: '**Implementation status (last verified 2026-04-25):** RunPod is **experimental**,
+  not production-stable. The `RunPodManager` and `BrainRouter` exist in `features/runpod/`
+  and th...'
+resource: /docs/architecture/PLAN_RUNPOD_INTEGRATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Plan: Sovereign GPU Integration (RunPod)
 
 > **Implementation status (last verified 2026-04-25):** RunPod is **experimental**, not production-stable. The `RunPodManager` and `BrainRouter` exist in `features/runpod/` and the happy-path lifecycle (start / stop / status / direct-mode logs) works. Known gaps:

@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: 'Convergent Sharding & Merkle Forests: Kestrel Storage V2'
+description: Shard1 -->|Content Hash| IPFS_Block1 Shard2 -->|Content Hash| IPFS_Block2
+  ```
+resource: /docs/architecture/storage/SOVEREIGNTY_V2_TECHNICAL.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Convergent Sharding & Merkle Forests: Kestrel Storage V2
 **Technical Architecture Document**
 

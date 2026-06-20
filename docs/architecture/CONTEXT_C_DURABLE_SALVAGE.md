@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Context C — Unify Auto-Prune With Durable Compaction
+description: Auto-prune is a silent decision. A fact in turn 47 — a constraint, a
+  decision, a number — was true to the model on turn 47 and gone from the model on
+  turn 48, and nothing in the...
+resource: /docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Context C — Unify Auto-Prune With Durable Compaction
 
 > Auto-prune is a silent decision. A fact in turn 47 — a constraint,

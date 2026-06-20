@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Streaming Honesty Layer
+description: '**Status:** Active. Shipped end-to-end as epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048)
+  waves 5A → 5F (PRs #1068, #1069, #1076, #1084, #1089)...'
+resource: /docs/architecture/llm/HONESTY_LAYER.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Streaming Honesty Layer
 
 > **Status:** Active. Shipped end-to-end as epic [#1048](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1048) waves 5A → 5F (PRs #1068, #1069, #1076, #1084, #1089). Closes [#1042](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1042) layers 2 & 3.

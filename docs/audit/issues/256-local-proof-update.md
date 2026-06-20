@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Local Proof Update
+description: Local audit proof is back in place after the power interruptions.
+resource: /docs/audit/issues/256-local-proof-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Local Proof Update
+
 Local audit proof is back in place after the power interruptions.
 
 Completed in the repo:

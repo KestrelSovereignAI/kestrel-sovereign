@@ -1,3 +1,22 @@
+---
+type: Developer Note
+title: Embedding the Kestrel chat component
+description: 'The chat UI (`kestrel_sovereign/static/js/chat.js`) is an embeddable
+  component with a small public API (chat-extract epic #1597). The Kestrel console
+  itself mounts it the same w...'
+resource: /docs/frontend/embedding-chat.md
+tags:
+- docs
+- frontend
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Embedding the Kestrel chat component
 
 The chat UI (`kestrel_sovereign/static/js/chat.js`) is an embeddable component

@@ -1,3 +1,23 @@
+---
+type: Audit Ledger
+title: Kestrel Sovereign — Repo Map
+description: 'Auto-generated file-tree + per-file purpose index. Always-loaded context
+  for the kestrel-agent GitHub App (issue #791). Do **not** edit by hand — regenerate
+  via `python scripts/...'
+resource: /docs/audit/REPO_MAP.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: generated
+owner: documentation
+canonical: false
+generated: true
+privacy: public
+source: scripts/generate_repo_map.py
+---
+
 # Kestrel Sovereign — Repo Map
 
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent

@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Archive Decisions
+description: Cleanup and archive decisions from the May 2026 documentation audit.
+resource: /docs/audit/documentation-2026-05/ARCHIVE_DECISIONS.md
+tags:
+- audit
+- documentation
+- may-2026
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Archive Decisions
 
 This file records cleanup decisions made during the May 2026 documentation audit.

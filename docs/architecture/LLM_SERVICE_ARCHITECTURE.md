@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel LLM Service Architecture
+description: '**Canonical spec for every change touching the LLM service, provider
+  registry, discovery, or routing.** If this doc contradicts code, the code wins —
+  and this doc is a bug. Upda...'
+resource: /docs/architecture/LLM_SERVICE_ARCHITECTURE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel LLM Service Architecture
 
 > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug. Update it in the same change, not later.

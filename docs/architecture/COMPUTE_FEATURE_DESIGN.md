@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel Compute Feature - Architecture Design
+description: The Compute Feature enables the Kestrel Agent to execute bash scripts
+  and Python code with **constitutional security controls**. This follows a novel
+  "write-sign-review-execute"...
+resource: /docs/architecture/COMPUTE_FEATURE_DESIGN.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Compute Feature - Architecture Design
 
 ## Executive Summary

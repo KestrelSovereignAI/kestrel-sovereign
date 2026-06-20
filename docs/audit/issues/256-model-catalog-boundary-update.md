@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: 256 Model Catalog Boundary Update
+description: Resolved the model-catalog boundary and removed another duplicate config
+  source.
+resource: /docs/audit/issues/256-model-catalog-boundary-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Model Catalog Boundary Update
+
 Resolved the model-catalog boundary and removed another duplicate config source.
 
 What changed:

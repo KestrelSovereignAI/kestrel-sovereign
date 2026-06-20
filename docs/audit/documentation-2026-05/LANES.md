@@ -1,3 +1,22 @@
+---
+type: Audit Ledger
+title: Review Lanes
+description: Review lane assignments and expected report format for documentation
+  audit work.
+resource: /docs/audit/documentation-2026-05/LANES.md
+tags:
+- audit
+- documentation
+- may-2026
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Review Lanes
 
 Use these lanes for subagents or human reviewers. Lanes are system-oriented because the main risk is cross-document disagreement about current architecture.

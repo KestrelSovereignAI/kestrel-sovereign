@@ -1,3 +1,22 @@
+---
+type: Developer Note
+title: Remote Ollama
+description: Nice, that narrows it down a lot.
+resource: /docs/development/remote_ollama.md
+tags:
+- docs
+- development
+- developer-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
+# Remote Ollama
+
 Nice, that narrows it down a lot.
 
 Given your constraints:

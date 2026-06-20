@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 272 Proof Update
+description: Auth decision-table proof is now in place.
+resource: /docs/audit/issues/272-proof-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 272 Proof Update
+
 Auth decision-table proof is now in place.
 
 Added `tests/unit/test_auth_decision_table.py` covering:

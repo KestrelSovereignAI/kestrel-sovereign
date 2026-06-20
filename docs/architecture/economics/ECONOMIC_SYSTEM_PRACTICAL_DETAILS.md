@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Economic System & Buy-Out Mechanics - Practical Details
+description: '**Date:** November 11, 2025 **Focus:** Premium licensing, buy-out enforcement,
+  and offline consequences **Audience:** Users and stakeholders'
+resource: /docs/architecture/economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Economic System & Buy-Out Mechanics - Practical Details
 
 **Date:** November 11, 2025

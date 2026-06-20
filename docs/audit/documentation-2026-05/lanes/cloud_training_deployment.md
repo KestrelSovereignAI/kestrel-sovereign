@@ -1,3 +1,23 @@
+---
+type: Review Lane
+title: Cloud Training Deployment
+description: Review prompt for the Cloud Training Deployment lane of the May 2026
+  documentation audit.
+resource: /docs/audit/documentation-2026-05/lanes/cloud_training_deployment.md
+tags:
+- audit
+- documentation
+- may-2026
+- review-lane
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Lane Brief: Cloud Training Deployment
 
 Goal: reconcile Cloud Run deployment docs with external cloud provider packages and research-era GPU/training docs.

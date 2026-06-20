@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: Kestrel Architecture Diagrams
+description: A visual reference library for the Kestrel Sovereign AI Agent framework.
+  Each section is designed to fit on a presentation slide.
+resource: /docs/diagrams/ARCHITECTURE_DIAGRAMS.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Architecture Diagrams
 
 A visual reference library for the Kestrel Sovereign AI Agent framework. Each section is designed to fit on a presentation slide.

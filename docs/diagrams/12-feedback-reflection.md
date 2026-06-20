@@ -1,3 +1,20 @@
+---
+type: Diagram
+title: 12 - Feedback & Self-Reflection
+description: Agent self-observation, feedback collection, and autonomous improvement.
+resource: /docs/diagrams/12-feedback-reflection.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 12 - Feedback & Self-Reflection
 
 Agent self-observation, feedback collection, and autonomous improvement.

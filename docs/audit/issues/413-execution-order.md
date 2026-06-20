@@ -1,3 +1,20 @@
+---
+type: Issue Body
+title: Epic 413 Execution Order
+description: 'Parent epic: [#413](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/413)'
+resource: /docs/audit/issues/413-execution-order.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Epic 413 Execution Order
 
 Parent epic: [#413](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/413)

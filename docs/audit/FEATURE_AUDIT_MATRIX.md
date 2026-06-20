@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Feature Audit Matrix
+description: The audit is not complete until every maintained claim in `KESTREL_FEATURES.md`
+  has executable proof or an explicit open gap.
+resource: /docs/audit/FEATURE_AUDIT_MATRIX.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Feature Audit Matrix
 
 | Domain | Canonical Source | Current Proof | Status |

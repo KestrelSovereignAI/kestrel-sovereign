@@ -1,3 +1,23 @@
+---
+type: Issue Body
+title: Codex Provider 07 Status Honesty
+description: As more backends become first-class in sovereign, user-facing and operator-facing
+  status surfaces risk becoming provider-shaped lies.
+resource: /docs/audit/issues/codex-provider-07-status-honesty.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# Codex Provider 07 Status Honesty
+
 ## Problem
 
 As more backends become first-class in sovereign, user-facing and operator-facing status surfaces risk becoming provider-shaped lies.

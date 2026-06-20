@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel Memory System
+description: The difference between a search engine and a friend is that a friend
+  *actually remembers*. Not just the facts -- the feelings, the weight, the way a
+  conversation mattered.
+resource: /docs/architecture/MEMORY_SYSTEM.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Memory System
 
 > The difference between a search engine and a friend is that a friend

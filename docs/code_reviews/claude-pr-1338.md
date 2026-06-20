@@ -1,3 +1,22 @@
+---
+type: Review Record
+title: Claude Pr 1338
+description: 'Looks clean. Here''s the breakdown:'
+resource: /docs/code_reviews/claude-pr-1338.md
+tags:
+- docs
+- code_reviews
+- review-record
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: internal
+---
+
+# Claude Pr 1338
+
 Looks clean. Here's the breakdown:
 
 **What changed:** `kestrel-llms[all]` pinned from `0.1.4` -> `0.1.5`. The lock file reflects transitive bumps across the LLM sub-packages:

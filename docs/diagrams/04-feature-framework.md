@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: 04 - Feature Framework
+description: Kestrel's dynamic feature system - how capabilities are built, discovered,
+  and extended.
+resource: /docs/diagrams/04-feature-framework.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # 04 - Feature Framework
 
 Kestrel's dynamic feature system - how capabilities are built, discovered, and extended.

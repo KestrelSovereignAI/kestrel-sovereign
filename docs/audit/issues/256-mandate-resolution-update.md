@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Mandate Resolution Update
+description: Mandate/model-routing seam update is now in place.
+resource: /docs/audit/issues/256-mandate-resolution-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Mandate Resolution Update
+
 Mandate/model-routing seam update is now in place.
 
 What changed:

@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: 256 Cloud Launcher Update
+description: Cloud launcher invariants are tighter now.
+resource: /docs/audit/issues/256-cloud-launcher-update.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 256 Cloud Launcher Update
+
 Cloud launcher invariants are tighter now.
 
 Completed in this slice:

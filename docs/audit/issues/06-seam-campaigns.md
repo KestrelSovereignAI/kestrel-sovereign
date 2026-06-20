@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 06 Seam Campaigns
+description: Most expensive regressions do not live inside a single component. They
+  appear when state crosses boundaries between UI, API, services, storage, LLM adapters,
+  or background workers.
+resource: /docs/audit/issues/06-seam-campaigns.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 06 Seam Campaigns
+
 ## Problem
 
 Most expensive regressions do not live inside a single component. They appear when state crosses boundaries between UI, API, services, storage, LLM adapters, or background workers.

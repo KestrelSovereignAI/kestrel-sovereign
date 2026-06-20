@@ -1,3 +1,22 @@
+---
+type: Design Note
+title: docs/design/
+description: Canonical published brand assets — the refreshed kestrel-on-rook mark
+  adopted 2026-05-05. These ship in the public repo so READMEs, the website, and OSS
+  contributors can referen...
+resource: /docs/design/README.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # docs/design/
 
 Canonical published brand assets — the refreshed kestrel-on-rook mark

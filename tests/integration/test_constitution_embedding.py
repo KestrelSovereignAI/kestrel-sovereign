@@ -23,6 +23,17 @@ from kestrel_sovereign.storage import Storage, GraphNode
 # from kestrel_sovereign.kestrel_agent import KestrelAgent  # Import locally to avoid global HTTP client initialization
 
 
+def _read_constitution_body(path: Path) -> bytes:
+    """Return the constitutional contract text, excluding docs-only OKF metadata."""
+    content = path.read_bytes()
+    if not content.startswith(b"---\n"):
+        return content
+    end = content.find(b"\n---\n", 4)
+    if end == -1:
+        return content
+    return content[end + len(b"\n---\n") :].lstrip(b"\n")
+
+
 @pytest.mark.anyio
 @pytest.mark.asyncio
 async def test_constitution_anchored(tmp_path):
@@ -95,9 +106,9 @@ async def test_constitution_retrievable(tmp_path):
     output_dir = tmp_path / "test_agent"
     constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
 
-    # Read original constitution
-    with open(constitution_path, "rb") as f:
-        original_content = f.read()
+    # Read original constitutional contract body. The docs copy may carry OKF
+    # frontmatter, but inception anchors only the runtime constitution text.
+    original_content = _read_constitution_body(constitution_path)
 
     # Create agent
     credentials = await create_kestrel_identity_async(str(output_dir))
@@ -208,9 +219,9 @@ async def test_constitution_content_hash_deterministic(tmp_path):
     output_dir = tmp_path / "test_agent"
     constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
 
-    # Compute expected hash
-    with open(constitution_path, "rb") as f:
-        content = f.read()
+    # Compute expected hash from the constitutional contract body. Docs-only
+    # OKF frontmatter must not change the runtime anchor.
+    content = _read_constitution_body(constitution_path)
     expected_hash = hashlib.sha256(content).hexdigest()
 
     # Create agent
@@ -340,8 +351,7 @@ async def test_constitution_encryption_if_key_set(tmp_path, monkeypatch):
     output_dir = tmp_path / "test_agent"
     constitution_path = Path("docs/principles/KESTREL_CONSTITUTION.md")
 
-    with open(constitution_path, "rb") as f:
-        original_content = f.read()
+    original_content = _read_constitution_body(constitution_path)
 
     # Test WITH encryption key - use monkeypatch for clean env handling
     monkeypatch.setenv("KESTREL_DATA_KEY", "test-encryption-key-for-constitution")

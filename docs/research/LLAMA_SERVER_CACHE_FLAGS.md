@@ -1,3 +1,22 @@
+---
+type: Research Note
+title: llama-server cache flags
+description: 'Recommended `llama-server` startup flags when Kestrel talks to it via
+  the `llama_cpp:local` route. Pairs with issue #704 (client sends `cache_prompt:
+  true`) and issue #703 (stab...'
+resource: /docs/research/LLAMA_SERVER_CACHE_FLAGS.md
+tags:
+- docs
+- research
+- research-note
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # llama-server cache flags
 
 Recommended `llama-server` startup flags when Kestrel talks to it via the

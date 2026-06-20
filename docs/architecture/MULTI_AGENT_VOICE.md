@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Multi-Agent Voice — The Mixing Board
+description: '**Status:** Draft v1 — design proposal. Epic: [#1767](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1767)
+  **Date:** 2026-06-13 **Author:** opus-4.8 (with @Uncle...'
+resource: /docs/architecture/MULTI_AGENT_VOICE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Multi-Agent Voice — The Mixing Board
 
 **Status:** Draft v1 — design proposal. Epic: [#1767](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/1767)

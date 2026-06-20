@@ -1,3 +1,22 @@
+---
+type: Historical Snapshot
+title: Kestrel Sovereign Legacy Feature Catalog
+description: Historical snapshot of the pre-canonical feature catalog. This file is
+  preserved for historical context only. It is not the maintained source of truth.
+  The maintained canonical...
+resource: /docs/archive/KESTREL_FEATURES_legacy.md
+tags:
+- docs
+- archive
+- historical-snapshot
+timestamp: '2026-06-18T00:00:00Z'
+status: historical
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Sovereign Legacy Feature Catalog
 
 > Historical snapshot of the pre-canonical feature catalog.

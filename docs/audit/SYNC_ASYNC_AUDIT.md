@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Sync/Async Audit
+description: Control document for the original issue `#300` and the refreshed current-runtime
+  audit in issue `#624`, focused on maintained runtime surfaces.
+resource: /docs/audit/SYNC_ASYNC_AUDIT.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Sync/Async Audit
 
 Control document for the original issue `#300` and the refreshed current-runtime

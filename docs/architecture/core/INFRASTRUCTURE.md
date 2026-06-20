@@ -1,3 +1,20 @@
+---
+type: Architecture Spec
+title: Kestrel Development Infrastructure
+description: Complete toolkit for accelerated parallel development with Claude Code.
+resource: /docs/architecture/core/INFRASTRUCTURE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Development Infrastructure
 
 Complete toolkit for accelerated parallel development with Claude Code.

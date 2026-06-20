@@ -1,3 +1,21 @@
+---
+type: Audit Ledger
+title: Shared Context
+description: Shared context for May 2026 documentation audit reviewers.
+resource: /docs/audit/documentation-2026-05/SHARED_CONTEXT.md
+tags:
+- audit
+- documentation
+- may-2026
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Shared Context
 
 Date: 2026-05-30

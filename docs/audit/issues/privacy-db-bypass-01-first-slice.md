@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: Privacy Db Bypass 01 First Slice
+description: 'Nellie''s live log is repeatedly emitting:'
+resource: /docs/audit/issues/privacy-db-bypass-01-first-slice.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# Privacy Db Bypass 01 First Slice
+
 ## Problem
 
 Nellie's live log is repeatedly emitting:

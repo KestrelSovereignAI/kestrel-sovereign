@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: 01 Foundation Domain
+description: 'Kestrel’s core trust claims start here: constitutional integrity, DID
+  identity, portable exports, continuity verification, encrypted storage, memory integrity,
+  and sovereignty g...'
+resource: /docs/audit/issues/01-foundation-domain.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# 01 Foundation Domain
+
 ## Problem
 
 Kestrel’s core trust claims start here: constitutional integrity, DID identity, portable exports, continuity verification, encrypted storage, memory integrity, and sovereignty guarantees. These areas underpin nearly every other feature, but they also span multiple modules and persistence layers, which makes drift and false confidence likely unless we test invariants across the full path.

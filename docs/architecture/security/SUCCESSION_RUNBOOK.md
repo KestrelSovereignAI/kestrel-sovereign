@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Hybrid-Identity Rotation Runbook
+description: '**Wave 3 of Quantum Hardening (#921, #918)** — operational procedure
+  for migrating a legacy `did:pkh` Kestrel agent to a hybrid `did:web` identity (Ed25519
+  + ML-DSA-65) via a si...'
+resource: /docs/architecture/security/SUCCESSION_RUNBOOK.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Hybrid-Identity Rotation Runbook
 
 > **Wave 3 of Quantum Hardening (#921, #918)** — operational procedure for migrating a legacy `did:pkh` Kestrel agent to a hybrid `did:web` identity (Ed25519 + ML-DSA-65) via a signed succession statement.

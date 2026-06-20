@@ -1,3 +1,22 @@
+---
+type: Principle Document
+title: The Kestrel Constitution
+description: '**Purpose.** This Constitution establishes the governance framework
+  for all Kestrel AI Agents. It is structured as a hierarchy of Books, each serving
+  a different purpose with di...'
+resource: /docs/principles/KESTREL_CONSTITUTION.md
+tags:
+- docs
+- principles
+- principle-document
+timestamp: '2026-06-18T00:00:00Z'
+status: active
+owner: documentation
+canonical: true
+generated: false
+privacy: public
+---
+
 # The Kestrel Constitution
 
 ## Preamble

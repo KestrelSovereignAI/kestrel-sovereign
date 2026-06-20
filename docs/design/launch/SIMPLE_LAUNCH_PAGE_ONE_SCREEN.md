@@ -1,3 +1,21 @@
+---
+type: Design Note
+title: 'Kestrel Simple Launch Page: One-Screen Version'
+description: Use this if the team wants a single-screen launch page with minimal implementation
+  overhead.
+resource: /docs/design/launch/SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md
+tags:
+- docs
+- design
+- design-note
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Simple Launch Page: One-Screen Version
 
 Use this if the team wants a single-screen launch page with minimal implementation overhead.

@@ -1,3 +1,21 @@
+---
+type: Architecture Spec
+title: Kestrel Architecture Documentation
+description: Detailed Product Requirements Documents (PRDs) and technical specifications
+  for the Kestrel agent architecture.
+resource: /docs/architecture/README.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: true
+generated: false
+privacy: public
+---
+
 # Kestrel Architecture Documentation
 
 Detailed Product Requirements Documents (PRDs) and technical specifications for the Kestrel agent architecture.
@@ -111,6 +129,7 @@ Wallet, solvency, and economic incentives.
 - **Engineering quality program:** [`/docs/audit/`](../audit/) — feature proof matrices, seam campaigns, sync/async audit. Actively maintained.
 - **Live feature inventory:** [`/KESTREL_FEATURES.md`](../../KESTREL_FEATURES.md) (canonical, consumed by `scripts/generate_feature_docs.py`)
 - **Constitution:** [`/docs/principles/KESTREL_CONSTITUTION.md`](../principles/KESTREL_CONSTITUTION.md)
+- **OKF migration view:** [`index.md`](index.md) / [`log.md`](log.md) — generated inventory of architecture OKF concepts and timestamps.
 
 ---
 

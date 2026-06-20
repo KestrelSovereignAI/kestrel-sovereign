@@ -1,3 +1,20 @@
+---
+type: Audit Ledger
+title: Audit Worktree Plan
+description: Use dedicated worktrees to keep domain audits isolated and parallelizable.
+resource: /docs/audit/worktree-plan.md
+tags:
+- docs
+- audit
+- audit-ledger
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Audit Worktree Plan
 
 Use dedicated worktrees to keep domain audits isolated and parallelizable.

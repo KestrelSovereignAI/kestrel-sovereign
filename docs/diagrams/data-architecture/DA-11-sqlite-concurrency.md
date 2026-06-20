@@ -1,3 +1,21 @@
+---
+type: Diagram
+title: 'DA-11: SQLite Concurrency Limitations'
+description: Understanding and mitigating SQLite's single-writer constraint for complex
+  agent architectures.
+resource: /docs/diagrams/data-architecture/DA-11-sqlite-concurrency.md
+tags:
+- docs
+- diagrams
+- diagram
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # DA-11: SQLite Concurrency Limitations
 
 Understanding and mitigating SQLite's single-writer constraint for complex agent architectures.

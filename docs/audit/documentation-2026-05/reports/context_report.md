@@ -1,3 +1,22 @@
+---
+type: Audit Report
+title: Context Report
+description: 'Lane report from the May 2026 documentation audit: Context Report.'
+resource: /docs/audit/documentation-2026-05/reports/context_report.md
+tags:
+- audit
+- documentation
+- may-2026
+- report
+timestamp: 2026-05-30 00:00:00+00:00
+status: snapshot
+owner: documentation-audit
+canonical: false
+generated: false
+privacy: public
+---
+
+
 # Context Lane Report
 
 Source: subagent lane review, read-only, 2026-05-30.

@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Payer Policy Foundation
+description: '**Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped
+  locally **Branch (foundation):** `feat/payer-policy` **Branch (sdk):** `feat/payer-policy`
+  (in `kestrel-sover...'
+resource: /docs/architecture/PAYER_POLICY_FOUNDATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Payer Policy Foundation
 
 **Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped locally

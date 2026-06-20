@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: Codex Provider 06 Nellie Proof
+description: The sovereign plan-provider work should not stop at “provider initializes.”
+  Nellie needs a believable proof path showing that an actual agent can be pinned
+  to the backend and pr...
+resource: /docs/audit/issues/codex-provider-06-nellie-proof.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# Codex Provider 06 Nellie Proof
+
 ## Problem
 
 The sovereign plan-provider work should not stop at “provider initializes.” Nellie needs a believable proof path showing that an actual agent can be pinned to the backend and produce stable responses.

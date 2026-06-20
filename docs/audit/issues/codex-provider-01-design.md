@@ -1,3 +1,22 @@
+---
+type: Issue Body
+title: Add a first-slice design for an `openai_plan` provider in `kestrel-sovereign`
+description: The ecosystem now has a working OpenAI plan execution lane in `kestrel-talon`,
+  but `kestrel-sovereign` still treats OpenAI, Anthropic, Claude plan, Ollama, and
+  others as first-c...
+resource: /docs/audit/issues/codex-provider-01-design.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Add a first-slice design for an `openai_plan` provider in `kestrel-sovereign`
 
 ## Problem

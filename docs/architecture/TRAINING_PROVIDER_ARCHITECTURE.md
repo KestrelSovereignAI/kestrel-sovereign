@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Training Provider Architecture
+description: The Training Provider system provides a unified interface for LoRA training
+  across multiple GPU providers. This enables automatic provider selection, consistent
+  error handling,...
+resource: /docs/architecture/TRAINING_PROVIDER_ARCHITECTURE.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Training Provider Architecture
 
 ## Overview

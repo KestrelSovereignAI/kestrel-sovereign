@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: VastAI LoRA Training Architecture
+description: '**Scope clarification (2026-04-25):** this doc is specifically about
+  *VastAI as a training backend* and that effort is deprioritized — see status banner
+  below. VastAI **as a gen...'
+resource: /docs/architecture/VASTAI_TRAINING.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # VastAI LoRA Training Architecture
 
 > **Scope clarification (2026-04-25):** this doc is specifically about *VastAI as a training backend* and that effort is deprioritized — see status banner below. VastAI **as a general compute provider** is a separate, active feature: `features/vastai/` ships with 29 tests and is exercised by the `manage_vastai` tool. If you're looking for the general-purpose VastAI integration, that's not this document.

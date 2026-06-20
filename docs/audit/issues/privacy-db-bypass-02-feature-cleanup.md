@@ -1,3 +1,24 @@
+---
+type: Issue Body
+title: Privacy Db Bypass 02 Feature Cleanup
+description: 'The `.db` bypass warning in Nellie''s log exposed a broader architectural
+  smell: multiple sovereign features and services reach through `PrivacyEnforcingStorage.db`
+  directly even...'
+resource: /docs/audit/issues/privacy-db-bypass-02-feature-cleanup.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
+# Privacy Db Bypass 02 Feature Cleanup
+
 ## Problem
 
 The `.db` bypass warning in Nellie's log exposed a broader architectural smell: multiple sovereign features and services reach through `PrivacyEnforcingStorage.db` directly even though the wrapper marks that as deprecated and privacy-bypassing.

@@ -1,3 +1,20 @@
+---
+type: User Guide
+title: How to Import KESTREL_ACCELERATED_GTM_SPREADSHEET_DATA.csv into Excel
+description: 'The CSV contains multiple "tabs" marked with `=== TAB NAME ===` headers:'
+resource: /docs/user-documentation/EXCEL_IMPORT_GUIDE.md
+tags:
+- docs
+- user-documentation
+- user-guide
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # How to Import KESTREL_ACCELERATED_GTM_SPREADSHEET_DATA.csv into Excel
 
 ## Step-by-Step Instructions

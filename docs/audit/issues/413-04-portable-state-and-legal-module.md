@@ -1,3 +1,21 @@
+---
+type: Issue Body
+title: Split portable state fragments from runtime behavior, using legal personhood
+  as a proving ground
+description: 'Parent epic: #413 Depends on: kernel boundary and descriptor groundwork'
+resource: /docs/audit/issues/413-04-portable-state-and-legal-module.md
+tags:
+- docs
+- audit
+- issue-body
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Split portable state fragments from runtime behavior, using legal personhood as a proving ground
 
 Parent epic: #413

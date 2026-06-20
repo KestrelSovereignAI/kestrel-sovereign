@@ -63,6 +63,17 @@ The runner:
 
 Outputs land in `demos/<name>/demo-output/` — screenshots, `narration.md`, and (via Playwright) per-test video under `demo-output/playwright/`.
 
+## Documentation evidence
+
+The generated docs evidence index lives at [`docs/generated/DEMO_EVIDENCE.md`](../docs/generated/DEMO_EVIDENCE.md). Regenerate it after adding, renaming, or removing a demo:
+
+```bash
+uv run python scripts/generate_demo_evidence_docs.py
+uv run python scripts/generate_demo_evidence_docs.py --check
+```
+
+When a user-facing doc describes a UI workflow, link it to the matching `demo.cjs`, `eye.toml`, and generated evidence row so Kestrel Flight and Kestrel Eye can keep the prose honest.
+
 ## Vision review (kestrel-eye)
 
 Screenshots are reviewed by [kestrel-eye](https://github.com/KestrelSovereignAI/kestrel-eye) using a cheap vision model.

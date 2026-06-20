@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Kestrel Security Overview
+description: A plain-language tour of Kestrel's cryptographic posture as of the Quantum
+  Hardening epic ([`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921)).
+  Written...
+resource: /docs/architecture/security/SECURITY_OVERVIEW.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Security Overview
 
 > A plain-language tour of Kestrel's cryptographic posture as of the Quantum Hardening epic ([`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921)). Written for sovereign operators, evaluators, and future-you. No prior crypto background required.

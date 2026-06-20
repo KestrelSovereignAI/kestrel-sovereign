@@ -1,3 +1,21 @@
+---
+type: Test Report
+title: Kestrel Test Report — 2026-01-31
+description: 'Tested by: Claw (OpenClaw) + Saurus Agent under test: Claw (Kestrel)
+  Control Panel version: Initial release (commit a9c1b04)'
+resource: /docs/testing/2026-01-31_test_report.md
+tags:
+- docs
+- testing
+- test-report
+timestamp: '2026-06-18T00:00:00Z'
+status: snapshot
+owner: documentation
+canonical: false
+generated: false
+privacy: public
+---
+
 # Kestrel Test Report — 2026-01-31
 
 Tested by: Claw (OpenClaw) + Saurus

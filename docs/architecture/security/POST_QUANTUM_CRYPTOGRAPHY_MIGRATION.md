@@ -1,3 +1,22 @@
+---
+type: Architecture Spec
+title: Post-Quantum Cryptography Migration — PRD v2
+description: '**Status:** ✅ All technical waves shipped (May 2026). This PRD is now
+  historical — it records what we planned and built. For a plain-language overview,
+  see [`SECURITY_OVERVIEW.m...'
+resource: /docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md
+tags:
+- docs
+- architecture
+- architecture-spec
+timestamp: '2026-06-18T00:00:00Z'
+status: needs-revalidation
+owner: architecture
+canonical: false
+generated: false
+privacy: public
+---
+
 # Post-Quantum Cryptography Migration — PRD v2
 
 **Status:** ✅ All technical waves shipped (May 2026). This PRD is now historical — it records what we planned and built. For a plain-language overview, see [`SECURITY_OVERVIEW.md`](SECURITY_OVERVIEW.md). Operational deployment (real-agent ceremonies via [`SUCCESSION_RUNBOOK.md`](SUCCESSION_RUNBOOK.md) + GitHub Actions release-signing secrets) is the only remaining work.
