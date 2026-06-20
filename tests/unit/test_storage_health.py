@@ -326,3 +326,19 @@ def test_load_env_file_preserves_existing_values(tmp_path):
 
     assert result["LIGHTHOUSE_API_KEY"] == "existing"
     assert result["GCS_BACKUP_BUCKET"] == "backup"
+
+
+def test_aggregate_status_counts_active_sovereign_as_healthy():
+    from kestrel_sovereign.storage.sync.health import _aggregate_overall_status
+
+    # Reachable sovereign-only config must be "ok", not "unavailable".
+    assert _aggregate_overall_status(
+        {"active", "not_configured", "not_configured"}
+    ) == "ok"
+    # Decommissioned + unconfigured everywhere is genuinely unavailable.
+    assert _aggregate_overall_status(
+        {"decommissioned", "not_configured", "not_configured"}
+    ) == "unavailable"
+    # Any error/warning dominates.
+    assert _aggregate_overall_status({"active", "warning"}) == "warning"
+    assert _aggregate_overall_status({"ok", "error"}) == "warning"

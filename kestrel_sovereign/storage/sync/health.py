@@ -412,6 +412,20 @@ async def check_gcs_health(
         )
 
 
+def _aggregate_overall_status(statuses: set[str]) -> str:
+    """Reduce per-tier statuses to an overall backup-storage status.
+
+    "active" (a reachable sovereign-operated node) counts as healthy even when
+    it is the only configured tier; "decommissioned"/"not_configured" alone do
+    not make storage healthy.
+    """
+    if "error" in statuses or "warning" in statuses:
+        return "warning"
+    if statuses & {"ok", "pending", "active"}:
+        return "ok"
+    return "unavailable"
+
+
 async def build_storage_health_report(
     *,
     agent_id: str,
@@ -439,13 +453,9 @@ async def build_storage_health_report(
             credentials_path=env.get("GOOGLE_APPLICATION_CREDENTIALS"),
         ),
     )
-    statuses = {sovereign_ipfs.status, lighthouse.status, gcs.status}
-    if "error" in statuses or "warning" in statuses:
-        status = "warning"
-    elif "ok" in statuses or "pending" in statuses:
-        status = "ok"
-    else:
-        status = "unavailable"
+    status = _aggregate_overall_status(
+        {sovereign_ipfs.status, lighthouse.status, gcs.status}
+    )
     return StorageHealthReport(
         status=status,
         sovereign_ipfs=sovereign_ipfs,
