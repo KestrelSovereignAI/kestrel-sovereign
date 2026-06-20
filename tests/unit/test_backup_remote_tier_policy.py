@@ -14,6 +14,7 @@ from kestrel_sovereign.storage.sync.targets import SyncResult, SyncTarget, Trust
 class ConstructorSpyTarget(SyncTarget):
     def __init__(self, name: str = "remote://target"):
         self._name = name
+        self.snapshot_calls = 0
 
     @property
     def name(self):
@@ -24,6 +25,48 @@ class ConstructorSpyTarget(SyncTarget):
         return TrustTier.EXPEDIENT
 
     async def sync_snapshot(self, db_path):
+        self.snapshot_calls += 1
+        return SyncResult(
+            success=True,
+            target_name=self.name,
+            bytes_synced=1,
+            frames_synced=0,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    async def sync_wal(self, wal_path, position):
+        return SyncResult(
+            success=True,
+            target_name=self.name,
+            bytes_synced=0,
+            frames_synced=0,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    async def get_latest_position(self):
+        return None
+
+
+class LocalTrustTier:
+    name = "LOCAL"
+    value = 0
+
+
+class LocalSpyTarget(SyncTarget):
+    def __init__(self, name: str = "local://target"):
+        self._name = name
+        self.snapshot_calls = 0
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def trust_tier(self):
+        return LocalTrustTier
+
+    async def sync_snapshot(self, db_path):
+        self.snapshot_calls += 1
         return SyncResult(
             success=True,
             target_name=self.name,
@@ -228,3 +271,44 @@ def test_normal_sovereign_agent_allows_remote_target_constructor():
     assert added is True
     constructor.assert_called_once_with()
     assert sync.targets == ["remote://target"]
+
+
+@pytest.mark.asyncio
+async def test_live_privacy_mode_denies_remote_snapshot_after_target_construction():
+    live_privacy = {"mode": "normal"}
+
+    def context_provider():
+        return RemoteTierPolicyContext(
+            identity="did:pkh:eip155:1:0xabc",
+            db_path="/var/lib/kestrel/kestrel_prime.db",
+            has_constitution_anchor=True,
+            privacy_mode=live_privacy["mode"],
+        )
+
+    sync = SyncService(
+        db_path="/var/lib/kestrel/kestrel_prime.db",
+        policy_context_provider=context_provider,
+    )
+    remote_target = ConstructorSpyTarget()
+    local_target = LocalSpyTarget()
+
+    added = sync.add_remote_target(
+        remote_target.name,
+        TrustTier.EXPEDIENT,
+        lambda: remote_target,
+    )
+    sync.add_target(local_target)
+    live_privacy["mode"] = "isolated"
+
+    results = await sync.force_snapshot()
+
+    assert added is True
+    assert remote_target.snapshot_calls == 0
+    assert results[remote_target.name].success is True
+    assert results[remote_target.name].metadata == {
+        "skipped": True,
+        "policy_denied": True,
+        "reason": "privacy_mode_local_only",
+    }
+    assert local_target.snapshot_calls == 1
+    assert results[local_target.name].success is True

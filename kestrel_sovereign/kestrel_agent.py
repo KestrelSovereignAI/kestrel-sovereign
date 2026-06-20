@@ -896,6 +896,23 @@ class KestrelAgent(
                 if hasattr(self._privacy_mode, "value")
                 else str(self._privacy_mode),
             )
+
+            def live_remote_policy_context() -> RemoteTierPolicyContext:
+                privacy_mode = (
+                    self._privacy_mode.value
+                    if hasattr(self._privacy_mode, "value")
+                    else str(self._privacy_mode)
+                )
+                return RemoteTierPolicyContext(
+                    identity=agent_id,
+                    db_path=self.storage_path,
+                    is_test_instance=self.is_test_instance,
+                    has_constitution_anchor=has_constitution_anchor,
+                    is_sovereign_identity=bool(agent_id)
+                    and not str(agent_id).lower().startswith("did:test:"),
+                    privacy_mode=privacy_mode,
+                )
+
             remote_policy_decision = _remote_tiers_allowed(remote_policy_context)
 
             # Storage path through PayerPolicy resolver. Honors the policy's
@@ -979,6 +996,7 @@ class KestrelAgent(
                     self._sync_service = SyncService(
                         db_path=self.storage_path,
                         policy_context=remote_policy_context,
+                        policy_context_provider=live_remote_policy_context,
                     )
 
                     # Sovereign: self-hosted IPFS (our infrastructure)

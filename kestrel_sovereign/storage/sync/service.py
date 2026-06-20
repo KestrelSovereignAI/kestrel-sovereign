@@ -189,6 +189,7 @@ class SyncService:
         on_sync: Optional[Callable] = None,
         on_error: Optional[Callable] = None,
         policy_context: Optional[RemoteTierPolicyContext] = None,
+        policy_context_provider: Optional[Callable[[], RemoteTierPolicyContext]] = None,
     ):
         self.db_path = Path(db_path)
         self.state_file = Path(state_file) if state_file else Path(f"{db_path}.sync")
@@ -198,13 +199,17 @@ class SyncService:
         self._targets: List[SyncTarget] = []
         self._policy_skips: Dict[str, SyncResult] = {}
         self._policy_context = policy_context
+        self._policy_context_provider = policy_context_provider
         self._state: Optional[SyncState] = None
         self._poll_task: Optional[asyncio.Task] = None
 
     def add_target(self, target: SyncTarget) -> None:
         """Add a sync target."""
-        if self._policy_context and target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
-            decision = _remote_tiers_allowed(self._policy_context)
+        if target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
+            decision = self._remote_target_policy_decision()
+            if decision is None:
+                self._append_target(target)
+                return
             if not decision.allowed:
                 self._record_policy_skip(target.name, decision.reason)
                 logger.warning(
@@ -226,8 +231,11 @@ class SyncService:
         factory: Callable[[], SyncTarget],
     ) -> bool:
         """Add a remote target, evaluating policy before constructing it."""
-        if self._policy_context and trust_tier in REMOTE_SYNC_TRUST_TIERS:
-            decision = _remote_tiers_allowed(self._policy_context)
+        if trust_tier in REMOTE_SYNC_TRUST_TIERS:
+            decision = self._remote_target_policy_decision()
+            if decision is None:
+                self._append_target(factory())
+                return True
             if not decision.allowed:
                 self._record_policy_skip(target_name, decision.reason)
                 logger.warning(
@@ -248,6 +256,17 @@ class SyncService:
             timestamp=datetime.now(timezone.utc),
             metadata={"skipped": True, "policy_denied": True, "reason": reason},
         )
+
+    def _current_policy_context(self) -> Optional[RemoteTierPolicyContext]:
+        if self._policy_context_provider:
+            return self._policy_context_provider()
+        return self._policy_context
+
+    def _remote_target_policy_decision(self) -> Optional[RemoteTierPolicyDecision]:
+        context = self._current_policy_context()
+        if context is None:
+            return None
+        return _remote_tiers_allowed(context)
 
     def remove_target(self, target_name: str) -> bool:
         """Remove a sync target by name."""
@@ -386,6 +405,17 @@ class SyncService:
         """Snapshot to all targets. Called on shutdown, scheduled backup, or !backup."""
         results = dict(self._policy_skips)
         for target in self._targets:
+            if target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
+                decision = self._remote_target_policy_decision()
+                if decision is not None and not decision.allowed:
+                    self._record_policy_skip(target.name, decision.reason)
+                    results[target.name] = self._policy_skips[target.name]
+                    logger.warning(
+                        "Remote sync target skipped by policy before upload: %s (%s)",
+                        target.name,
+                        decision.reason,
+                    )
+                    continue
             try:
                 result = await target.sync_snapshot(self.db_path)
                 results[target.name] = result

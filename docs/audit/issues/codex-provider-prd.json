@@ -1,0 +1,46 @@
+{
+  "stories": [
+    {
+      "id": "422",
+      "title": "Design first slice for codex_provider",
+      "description": "Write the canonical first-slice design for a sovereign codex_provider in docs/architecture/CODEX_PROVIDER.md. Define scope, auth/session assumptions, and integration points in provider registry, adapter layer, and model preference flow.",
+      "done": false
+    },
+    {
+      "id": "423",
+      "title": "Add first-pass codex_provider runtime adapter",
+      "description": "Implement a narrow codex adapter/provider path in sovereign. Keep scope to text/runtime use only. Do not promise tools, vision, or full CLI feature parity yet.",
+      "done": false
+    },
+    {
+      "id": "424",
+      "title": "Integrate codex_provider with model selection and mandate flows",
+      "description": "Make provider=model routing and mandates work correctly when the selected provider is codex. Add focused tests so codex becomes a first-class routed backend rather than an ad hoc escape hatch.",
+      "done": false
+    },
+    {
+      "id": "425",
+      "title": "Make agent-specific backend routing explicit for codex and claude_max",
+      "description": "Ensure persisted agent preferences map honestly to runtime backend selection, including clear fallback or failure behavior when codex or claude_max is unavailable. Add contract tests around agent-specific routing.",
+      "done": false
+    },
+    {
+      "id": "421",
+      "title": "Add smoke proof and docs for sovereign codex_provider",
+      "description": "Add a smoke-proof path and supporting docs showing the current real confidence level for the sovereign codex_provider. Reference the implementation and test artifacts rather than aspirational claims.",
+      "done": false
+    },
+    {
+      "id": "426",
+      "title": "Add Nellie backend smoke proof for claude_max and codex",
+      "description": "Create a Nellie-specific proof path for backend pinning across claude_max and codex. Verify persisted preference, active runtime backend, and operator-visible behavior line up.",
+      "done": false
+    },
+    {
+      "id": "427",
+      "title": "Audit backend status/model honesty across sovereign surfaces",
+      "description": "Find and fix user-facing or operator-facing backend/model reporting drift in sovereign so status surfaces reflect the active routed provider instead of defaults.",
+      "done": false
+    }
+  ]
+}
