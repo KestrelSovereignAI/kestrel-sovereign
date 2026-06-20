@@ -452,6 +452,15 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
   ON graph_nodes(json_extract(properties, '$.created_at'))
   WHERE node_type = 'action_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
+  ON graph_nodes(json_extract(properties, '$.status'))
+  WHERE node_type = 'todo_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
+  ON graph_nodes(json_extract(properties, '$.scope'))
+  WHERE node_type = 'todo_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
+  ON graph_nodes(json_extract(properties, '$.created_at'))
+  WHERE node_type = 'todo_item';
 """
 
 _POSTGRES_JSON_INDEXES = """
@@ -463,6 +472,15 @@ CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_status
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_action_created
   ON graph_nodes((properties::jsonb->>'created_at'))
   WHERE node_type = 'action_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_status
+  ON graph_nodes((properties::jsonb->>'status'))
+  WHERE node_type = 'todo_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_scope
+  ON graph_nodes((properties::jsonb->>'scope'))
+  WHERE node_type = 'todo_item';
+CREATE INDEX IF NOT EXISTS idx_graph_nodes_todo_created
+  ON graph_nodes((properties::jsonb->>'created_at'))
+  WHERE node_type = 'todo_item';
 CREATE INDEX IF NOT EXISTS idx_graph_nodes_properties_gin
   ON graph_nodes USING GIN ((properties::jsonb));
 """

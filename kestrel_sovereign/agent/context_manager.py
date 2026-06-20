@@ -710,6 +710,12 @@ class ContextManager:
         if hasattr(budget, "mark_section_finalized"):
             budget.mark_section_finalized("episodes")
 
+        # TODO(#1832 follow-up): inject active TodoFeature rollups here,
+        # before query-dependent memory/RAG retrieval. The intended hook
+        # is a bounded active-todo context block for current-session plus
+        # global in_progress/waiting todos so signal wakes, restarts, and
+        # delayed tool callbacks keep unfinished loops visible.
+
         # Relevance gate (#1404): trivial turns (greetings, sign-offs,
         # bang/slash commands, very-short utterances) skip memory + RAG
         # retrieval entirely. The cost is per-call retrieval cycles and,
