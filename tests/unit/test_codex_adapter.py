@@ -2444,33 +2444,46 @@ class TestDiscoveredRouteCapFromEvent:
 
 
 class TestContextStatusRouteGating:
-    """#1844 codex review r2: /context-status must only surface codex_thread
-    occupancy when the ACTIVE route is openai:plan."""
+    """#1844 codex review r2/r3: /context-status surfaces codex_thread only
+    when the RESOLVED primary provider is the CodexAdapter — keyed off
+    resolve_provider_routing, NOT the display model string (so a route-less
+    ``openai/<model>`` that executes on openai:plan still works, and a switch
+    away from plan drops the stale snapshot)."""
 
-    def _agent_with_occupancy(self, used=1000, window=2000):
-        a = CodexAdapter()
-        a._record_thread_occupancy("s", {
+    def _agent(self, resolved_primary, used=1000, window=2000):
+        codex = CodexAdapter()
+        codex._record_thread_occupancy("s", {
             "last": {"inputTokens": used}, "modelContextWindow": window})
+        other = object()  # no get_thread_occupancy → not codex
+        primary = {"adapter": codex if resolved_primary == "codex" else other}
 
         class _LLM:
-            providers = [{"adapter": a}]
+            def resolve_provider_routing(self_inner):
+                return ([primary], None)
 
         class _Agent:
             llm_service = _LLM()
 
         return _Agent()
 
-    def test_returns_occupancy_on_openai_plan(self):
+    def test_surfaced_when_codex_is_resolved_primary(self):
+        # Round 3: even a route-less openai preference whose primary RESOLVES
+        # to the CodexAdapter surfaces occupancy.
         from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
-        agent = self._agent_with_occupancy()
-        occ = _codex_thread_occupancy(agent, "s", "openai:plan/gpt-5.5")
+        occ = _codex_thread_occupancy(self._agent("codex"), "s")
         assert occ is not None and occ["used_tokens"] == 1000
 
-    def test_suppressed_when_active_route_is_not_openai_plan(self):
+    def test_suppressed_when_primary_is_not_codex(self):
+        # Round 2: switched away from plan → primary isn't codex → stale
+        # snapshot must NOT leak.
         from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
-        agent = self._agent_with_occupancy()
-        # Session previously used openai:plan but switched routes — stale
-        # snapshot must NOT leak through.
-        assert _codex_thread_occupancy(agent, "s", "anthropic:plan/opus") is None
-        assert _codex_thread_occupancy(agent, "s", "ollama:local/gemma") is None
-        assert _codex_thread_occupancy(agent, "s", None) is None
+        assert _codex_thread_occupancy(self._agent("other"), "s") is None
+
+    def test_safe_when_no_resolver_or_no_session(self):
+        from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
+
+        class _Bare:
+            llm_service = object()  # no resolve_provider_routing
+
+        assert _codex_thread_occupancy(_Bare(), "s") is None
+        assert _codex_thread_occupancy(self._agent("codex"), None) is None
