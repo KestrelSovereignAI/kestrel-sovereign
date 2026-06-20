@@ -722,7 +722,7 @@ async def notifications_sse(request: Request):
 
 
 def _codex_thread_occupancy(
-    agent: Any, session_id: Optional[str],
+    agent: Any, session_id: Optional[str], current_model: Optional[str],
 ) -> Optional[Dict[str, Any]]:
     """Best-effort: codex's TRUE server-side thread occupancy for the active
     openai:plan session, or ``None``.
@@ -733,7 +733,15 @@ def _codex_thread_occupancy(
     trips codex's lossy auto-compaction (#1844). Read the real occupancy off
     the CodexAdapter (``get_thread_occupancy``) so the monitor can surface
     it and a low per-turn reading can't masquerade as a low context.
+
+    Gated to the ACTIVE route: a session that previously used openai:plan
+    but has since switched models must not surface the stale CodexAdapter
+    snapshot, which the frontend would otherwise treat as authoritative
+    (codex review round 2).
     """
+    route = (current_model or "").lower()
+    if not (route == "openai:plan" or route.startswith("openai:plan/")):
+        return None
     llm = getattr(agent, "llm_service", None)
     providers = getattr(llm, "providers", None) or []
     for prov in providers:
@@ -1094,7 +1102,9 @@ async def get_context_status(
         # masquerade as a healthy context. ``None`` off-route / when unknown.
         codex_thread_block: Optional[Dict[str, Any]] = None
         try:
-            codex_thread_block = _codex_thread_occupancy(agent, session_id)
+            codex_thread_block = _codex_thread_occupancy(
+                agent, session_id, current_model
+            )
         except Exception as e:  # never break the footer poll
             logger.debug(f"codex thread occupancy probe failed: {e}")
 

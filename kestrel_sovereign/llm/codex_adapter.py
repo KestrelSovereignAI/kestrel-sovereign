@@ -934,6 +934,7 @@ class CodexAdapter(LLMAdapter):
                 )
                 # Cached thread no longer matches; drop it.
                 self._session_threads.pop(session_id, None)
+                self._forget_thread_usage(session_id)
             # cwd is already resolved (and locked into the fingerprint)
             # at the top of _ensure_thread — reuse it so the value sent
             # to thread/start matches the value in the fingerprint
@@ -1016,6 +1017,9 @@ class CodexAdapter(LLMAdapter):
             self._record_discovered_route_cap_from_thread_start(m, result)
             if session_id:
                 self._session_threads[session_id] = (thread_id, fingerprint)
+                # Fresh thread → no accumulated server-side history yet; drop
+                # any stale occupancy so /context-status starts from empty.
+                self._forget_thread_usage(session_id)
             return thread_id, True
         finally:
             if lock is not None:
@@ -1198,6 +1202,19 @@ class CodexAdapter(LLMAdapter):
             "used_tokens": used,
             "window_tokens": window,
         }
+
+    def _forget_thread_usage(self, session_id: Optional[str]) -> None:
+        """Drop the cached occupancy snapshot for a session.
+
+        Call whenever the underlying codex thread is invalidated or
+        recreated (fingerprint mismatch, fresh ``thread/start``, idle-timeout
+        recovery). The new server-side thread is empty, so the prior snapshot
+        is stale — otherwise ``/context-status`` would keep reporting a dead
+        thread's high occupancy until the next ``thread/tokenUsage/updated``
+        arrives (#1844, codex review round 2).
+        """
+        if session_id:
+            self._last_thread_usage.pop(session_id, None)
 
     def get_thread_occupancy(
         self, session_id: Optional[str],
@@ -2400,6 +2417,7 @@ class CodexAdapter(LLMAdapter):
                 and "no completion" in msg
             ):
                 self._session_threads.pop(session_id, None)
+                self._forget_thread_usage(session_id)
             raise
         finally:
             app.close_turn_sink(thread_id)
@@ -2507,6 +2525,7 @@ class CodexAdapter(LLMAdapter):
                 # doesn't trigger a spurious pop attempt.
                 if session_id:
                     self._session_threads.pop(session_id, None)
+                    self._forget_thread_usage(session_id)
                 wait_s = _codex_retry_wait_seconds()
                 logger.warning(
                     "codex idle-timeout under cap with zero events; "

@@ -210,6 +210,18 @@ class TestThreadOccupancy:
             "last": {"inputTokens": 800}, "modelContextWindow": 1000})
         assert a.get_thread_occupancy("s")["occupancy_percent"] == 80.0
 
+    def test_forget_clears_snapshot_on_thread_invalidation(self):
+        # A recreated/empty codex thread must not keep reporting the dead
+        # thread's occupancy (codex review round 2).
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 200000}, "modelContextWindow": 258400})
+        assert a.get_thread_occupancy("s")["used_tokens"] == 200000
+        a._forget_thread_usage("s")
+        assert a.get_thread_occupancy("s") is None
+        a._forget_thread_usage("s")      # idempotent
+        a._forget_thread_usage(None)     # safe
+
     def test_unknown_session_and_bad_input_are_safe(self):
         a = CodexAdapter()
         assert a.get_thread_occupancy("nope") is None
@@ -2429,3 +2441,36 @@ class TestDiscoveredRouteCapFromEvent:
             assert len(change_logs) == 1
         finally:
             catalog.clear_discovered_route_context_caps()
+
+
+class TestContextStatusRouteGating:
+    """#1844 codex review r2: /context-status must only surface codex_thread
+    occupancy when the ACTIVE route is openai:plan."""
+
+    def _agent_with_occupancy(self, used=1000, window=2000):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": used}, "modelContextWindow": window})
+
+        class _LLM:
+            providers = [{"adapter": a}]
+
+        class _Agent:
+            llm_service = _LLM()
+
+        return _Agent()
+
+    def test_returns_occupancy_on_openai_plan(self):
+        from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
+        agent = self._agent_with_occupancy()
+        occ = _codex_thread_occupancy(agent, "s", "openai:plan/gpt-5.5")
+        assert occ is not None and occ["used_tokens"] == 1000
+
+    def test_suppressed_when_active_route_is_not_openai_plan(self):
+        from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
+        agent = self._agent_with_occupancy()
+        # Session previously used openai:plan but switched routes — stale
+        # snapshot must NOT leak through.
+        assert _codex_thread_occupancy(agent, "s", "anthropic:plan/opus") is None
+        assert _codex_thread_occupancy(agent, "s", "ollama:local/gemma") is None
+        assert _codex_thread_occupancy(agent, "s", None) is None
