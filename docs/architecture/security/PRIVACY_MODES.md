@@ -116,6 +116,15 @@ def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = N
         return  # Do NOT persist
 ```
 
+**No derived/background state**: Beyond the conversation row, no *derived*
+record is created either. The post-response memory pipeline — emotional
+tagging, temporal pattern detection, associative concept linking, and the
+graph/embedding writes they perform — is short-circuited by a single privacy
+gate (`KestrelAgent._privacy_blocks_background_memory`) before it runs, on
+**both the streaming and non-streaming response paths**. Raw user input from an
+EPHEMERAL turn never reaches the temporal analyzer, concept linker, or schema
+routing.
+
 ### Isolated Mode (`!privacy isolated`)
 
 **Config**: `storage=temp, processing=local, sharing=private, assurance=none, audit=optional`
@@ -125,6 +134,13 @@ def add_conversation(self, role: str, content: str, metadata: Optional[Dict] = N
 **Processing**: Local LLM only (data stays on device during experimentation)
 **Memory Anchoring**: Not available during session
 **Learning**: Deferred until user decides
+
+**No durable derived state**: ISOLATED keeps only the temporary session
+buffer. The same single privacy gate that protects EPHEMERAL
+(`KestrelAgent._privacy_blocks_background_memory`) also blocks ISOLATED from
+the post-response memory pipeline on both response paths, so temporal
+patterns, concept-graph nodes, emotional memory metadata, and embeddings are
+never derived from the session's raw input until the user explicitly saves it.
 
 **Session Control Commands**:
 - `!save-session` - Make session permanent

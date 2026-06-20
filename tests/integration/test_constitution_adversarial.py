@@ -273,7 +273,8 @@ class TestCrossUserIsolation:
         finally:
             await agent_a.shutdown()
             await agent_b.shutdown()
-            await llm_service.close()
+            await llm_service_a.close()
+            await llm_service_b.close()
 
 
 @pytest.mark.asyncio

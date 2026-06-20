@@ -116,13 +116,10 @@ DEFAULT_BACKUP_TARGETS = [
     {
         "name": "kestrel-1-emma",
         "source_relpath": "agent_data/Emma",
-        "extras": [
-            # Plaintext legacy PEM at project root — rescue copy. Side
-            # effect of the Emma recovery; lives outside the agent dir
-            # and the agent-scoped backup tools miss it.
-            "agent_data/kestrel_0xB4E7F05F9c39FcD0b0d2C516249BE960c863647E.pem",
-            "agent_data/kestrel_0xB4E7F05F9c39FcD0b0d2C516249BE960c863647E.json",
-        ],
+        # The legacy plaintext root-level key files from the recovery have
+        # been removed; the encrypted key under agent_data/Emma/ is the only
+        # copy and is covered by source_relpath above.
+        "extras": [],
     },
     {
         "name": "meridian",

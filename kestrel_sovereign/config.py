@@ -176,7 +176,7 @@ def load_config(file_name: str, section: Optional[str] = None) -> Dict[str, Any]
             logger.info(f"'{file_name}' not found. Copying from '{example_path}'.")
             config_path.write_text(example_path.read_text(encoding='utf-8'), encoding='utf-8')
         else:
-            logger.warning(f"'{file_name}' and '{example_path}' not found.")
+            logger.debug(f"'{file_name}' and '{example_path}' not found; using empty config.")
             return {}
 
     # Log deprecation warning if using individual file when unified exists

@@ -22,6 +22,7 @@ from kestrel_sdk.signals import (
     SignalMode,
     SourceRegistration,
     Trust,
+    Visibility,
 )
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,21 @@ def _redact(payload: Dict[str, Any]) -> str:
     )
 
 
+def _restart_completed_result_summary(body: Any) -> str:
+    """Bounded inline body for the ``signal_completed`` UI side-channel (#1809).
+
+    For a COGNITION dispatch ``result.artifact`` is the agent's own response
+    string (the resumed post-restart turn). Surfacing it here is what lets an
+    open chat tab render the wake live — the frontend's ``handleSignalCompleted``
+    appends it the moment the wake's turn lands, instead of the turn staying
+    invisible until a manual refresh. Mirrors a2a.question_answered (#1522). The
+    store caps the returned text at ``MAX_RESULT_SUMMARY_BYTES``.
+    """
+    if body is None:
+        return ""
+    return body if isinstance(body, str) else str(body)
+
+
 def build_restart_completed_registration() -> SourceRegistration:
     return SourceRegistration(
         name=SOURCE_NAME,
@@ -81,6 +97,10 @@ def build_restart_completed_registration() -> SourceRegistration:
         coalescing_window=timedelta(seconds=30),
         attention_policy=AttentionPolicy(),
         resources=frozenset(),
+        # Surface the resumed post-restart turn on the signal_completed UI
+        # side-channel so an open chat tab renders the wake live. Paired with
+        # visibility=USER_VISIBLE + session_id on the signal below (#1809).
+        result_summary=_restart_completed_result_summary,
         allow_self_loops=False,
         log_redaction=RedactionPolicy(
             summarize=_redact,
@@ -138,5 +158,9 @@ def build_signal_for_restart_completed(
         payload=payload,
         target_agent=target_agent,
         session_id=origin_session_id or None,
+        # USER_VISIBLE so the dispatcher emits the signal_completed UI event for
+        # the resumed turn (INTERNAL would log-only and the wake would never
+        # surface live). Paired with the result_summary callback above (#1809).
+        visibility=Visibility.USER_VISIBLE,
         dedupe_key=payload["request_id"],
     )

@@ -24,7 +24,7 @@
  */
 
 import API from '../api.js';
-import { addMessage, addMessageStreaming, finalizeStreamingMessage } from '../chat.js';
+import { addMessage, addMessageStreaming, finalizeStreamingMessage, renderToolCardsHtml } from '../chat.js';
 import { getOrCreateChatPane } from '../ui.js';
 import { Events } from './events.js';
 import { createRealtimeClient } from './realtime.js';
@@ -217,6 +217,8 @@ function settingsForAgent(agent) {
 
 
 export function initVoiceUI() {
+  if (!API.hasCapability('voice')) return;
+
   const header = document.querySelector('.chat-header');
   if (!header) {
     // Voice UI is opt-in — if the chat header isn't present (e.g. mounted
@@ -266,6 +268,7 @@ export function onAgentSwitch(prevAgent, nextAgent) {
 }
 
 export function mountAgentVoiceControls(item, agentName) {
+  if (!API.hasCapability('voice')) return;
   if (!item) return;
   // Voice cards are located by their OWN attribute, NOT `data-agent-name`.
   // The voice session key for standalone mode is `null` (≠ the real agent name
@@ -753,6 +756,10 @@ async function startSession(session = activeSession()) {
 
 async function stopSession(session = activeSession()) {
   const c = session.client;
+  // close() emits SESSION_CLOSED synchronously, by which point session.client
+  // is already null — stash the client so that handler can still await its
+  // pending transcript persistence before refreshing the sidebar.
+  session.closingClient = c;
   session.client = null;
   session.pathLabel = '';
   session.pathTooltip = '';
@@ -892,7 +899,37 @@ function handleClientEvent(agent, ev, startSeq) {
       // sees what they got even if the session ended mid-response.
       if (session.userMsgDiv) finalizeUserTurn(session, session.userTranscriptBuffer);
       if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
+      // The realtime path persists turns server-side out of band (the browser
+      // talks directly to OpenAI), so the conversation sidebar has no idea a
+      // new session was just written. Nudge it to refresh once the call ends,
+      // but only if real turns landed — a connect-fail close shouldn't refetch.
+      // Decoupled via a window event to avoid an import cycle with identity.js.
+      if (session.persistedAny) {
+        session.persistedAny = false;
+        const closingAgent = session.agent;
+        // Realtime persistence is fire-and-forget, so wait for the in-flight
+        // /transcript POSTs to settle before refreshing — otherwise the list
+        // refetch races ahead of the write and shows the stale (pre-call)
+        // history. Pipeline persists synchronously server-side and has no
+        // whenPersisted(), so fall back to an immediate refresh.
+        // stopSession() nulls session.client before close() emits this event,
+        // so prefer the stashed closing client; fall back to session.client
+        // for closes that bypass stopSession (e.g. network data_channel_closed).
+        const closingClient = session.closingClient || session.client;
+        const flush =
+          closingClient && typeof closingClient.whenPersisted === 'function'
+            ? closingClient.whenPersisted()
+            : Promise.resolve();
+        flush.finally(() => {
+          try {
+            window.dispatchEvent(new CustomEvent('kestrel:conversations-stale', {
+              detail: { agent: closingAgent },
+            }));
+          } catch (_) { /* non-DOM context — ignore */ }
+        });
+      }
       session.client = null;
+      session.closingClient = null;
       session.pathLabel = '';
       session.pathTooltip = '';
       const wasControlSession = session === controlSession();
@@ -928,6 +965,10 @@ function finalizeAgentTurn(session, text) {
   const buf = text || '';
   session.agentMsgDiv = null;
   session.agentTextBuffer = '';
+  // Track that this voice session produced a real, persisted turn so
+  // SESSION_CLOSED can refresh the conversation sidebar (#1808 follow-up).
+  // Backend persistence keys off the same finalized turns.
+  if (buf.trim()) session.persistedAny = true;
   if (!div) {
     if (buf.trim()) addMessage('agent', buf, paneForSession(session).element);
     return;
@@ -967,6 +1008,7 @@ function finalizeUserTurn(session, text) {
   const buf = (text || '').trim();
   session.userMsgDiv = null;
   session.userTranscriptBuffer = '';
+  if (buf) session.persistedAny = true;
   if (!div) {
     if (buf) addMessage('user', buf, paneForSession(session).element);
     return;
@@ -1010,13 +1052,36 @@ async function handleToolCall(session, ev) {
     return;
   }
   const sessionId = sessionClient.session.session_id;
-  const url = buildAgentUrlForAgent(
-    `/voice/realtime/tools/${encodeURIComponent(sessionId)}`,
-    session.agent,
-  );
+
+  // Render a live tool card in the chat pane so the user sees the tool call,
+  // mirroring text chat. Realtime tool dispatch is otherwise invisible — the
+  // model runs the tool out of band and only the spoken reply surfaces.
+  // If the agent already streamed text before calling the tool, close that
+  // bubble first so the card lands after it and any post-tool answer opens a
+  // fresh bubble below the card — otherwise later AGENT_TEXT_DELTA events keep
+  // appending to the pre-tool bubble and the order reads wrong.
+  if (session.agentMsgDiv) finalizeAgentTurn(session, session.agentTextBuffer);
+
+  const toolName = ev.name || 'tool';
+  const card = {
+    name: toolName,
+    status: 'running',
+    detail: toolArgsPreview(ev.arguments),
+    pos: 0,
+    events: [{ phase: 'start', name: toolName, detail: toolArgsPreview(ev.arguments) }],
+  };
+  const cardDiv = renderVoiceToolCard(session, card);
+  // A tool call means a real exchange happened, so make sure the post-call
+  // sidebar refresh fires even if no transcript turn lands.
+  session.persistedAny = true;
+  const startedAt = Date.now();
+
   let body;
   try {
-    const resp = await fetch(url, {
+    const resp = await fetch(buildAgentUrlForAgent(
+      `/voice/realtime/tools/${encodeURIComponent(sessionId)}`,
+      session.agent,
+    ), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...await voiceAuthHeaders() },
       body: JSON.stringify({
@@ -1033,6 +1098,19 @@ async function handleToolCall(session, ev) {
     body = { error: `tool dispatch threw: ${err.message}` };
   }
 
+  // Close out the card: error envelope -> error glyph, otherwise complete.
+  const errText = body && typeof body === 'object'
+    ? (body.error ?? body.result?.error ?? null)
+    : null;
+  if (errText) {
+    card.status = 'error';
+    card.events.push({ phase: 'error', name: toolName, detail: String(errText) });
+  } else {
+    card.status = 'complete';
+    card.events.push({ phase: 'done', name: toolName, ms: Date.now() - startedAt });
+  }
+  updateVoiceToolCard(cardDiv, card);
+
   // If the session ended while we were awaiting the dispatch, the model is
   // gone and there's nowhere to commit. Drop silently — the model already
   // closed.
@@ -1047,6 +1125,40 @@ async function handleToolCall(session, ev) {
   } catch (err) {
     console.error('[voice/ui] commitToolResult failed:', err);
   }
+}
+
+
+// Compact, safe one-line preview of tool arguments for the card detail.
+function toolArgsPreview(args) {
+  if (!args || typeof args !== 'object') return '';
+  try {
+    const s = JSON.stringify(args);
+    if (s === '{}') return '';
+    return s.length > 80 ? `${s.slice(0, 77)}...` : s;
+  } catch (_) {
+    return '';
+  }
+}
+
+
+// Insert a tool-activity card as its own agent-side row in the pane and return
+// the wrapper so updateVoiceToolCard can swap it to complete/error in place.
+// Built on addMessageStreaming so it reuses the chat pane's auto-scroll path.
+function renderVoiceToolCard(session, card) {
+  const div = addMessageStreaming('agent', paneForSession(session).element);
+  div.classList.add('voice-tool-call');
+  const content = div.querySelector('.message-content');
+  if (content) {
+    content.classList.remove('streaming');
+    content.innerHTML = renderToolCardsHtml([card]);
+  }
+  return div;
+}
+
+
+function updateVoiceToolCard(div, card) {
+  const content = div?.querySelector?.('.message-content');
+  if (content) content.innerHTML = renderToolCardsHtml([card]);
 }
 
 

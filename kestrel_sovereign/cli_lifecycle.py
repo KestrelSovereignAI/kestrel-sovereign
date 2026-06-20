@@ -465,6 +465,57 @@ def _run_git_pull(project_dir: Path) -> Tuple[int, str]:
     return result.returncode, out
 
 
+def _git_reattach_if_safely_detached(project_dir: Path) -> Optional[str]:
+    """Reattach a detached-HEAD checkout to its default branch, but ONLY when
+    doing so loses no commits. Returns the branch name if it reattached, else
+    ``None``.
+
+    Why this exists: in a multi-agent setup, ``gh pr merge --delete-branch`` run
+    from a *sibling* git worktree silently flips this PRIMARY checkout off its
+    branch into detached HEAD at the same commit. The next ``kestrel update``
+    then aborts because ``git pull --ff-only`` refuses on a detached HEAD. The
+    detached commit is just the old branch tip (no work to lose), so reattaching
+    is safe and lets the update proceed instead of demanding manual recovery.
+
+    Safety: only reattaches when HEAD is an ANCESTOR of ``origin/<branch>`` (a
+    pure fast-forward — nothing committed on the detached HEAD would be
+    orphaned). If the detached HEAD has diverged (someone committed on it), this
+    returns ``None`` and leaves it untouched so a human decides. Call AFTER a
+    fetch (e.g. a failed ``git pull``, which fetches before the merge) so
+    ``origin/<branch>`` is current.
+    """
+    def _git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=str(project_dir),
+            capture_output=True, text=True, check=False,
+        )
+
+    try:
+        # symbolic-ref HEAD fails (non-zero) exactly when HEAD is detached.
+        if _git("symbolic-ref", "-q", "HEAD").returncode == 0:
+            return None  # already on a branch — nothing to do
+
+        # Resolve the remote's default branch (origin/HEAD → e.g. "main");
+        # fall back to "main" if the symbolic ref isn't configured.
+        head_ref = _git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+        if head_ref.returncode == 0 and head_ref.stdout.strip():
+            ref = head_ref.stdout.strip()
+            branch = ref.split("/", 1)[1] if "/" in ref else ref
+        else:
+            branch = "main"
+
+        # Reattach ONLY if the detached commit is already contained in
+        # origin/<branch> — i.e. a no-loss fast-forward.
+        if _git("merge-base", "--is-ancestor", "HEAD", f"origin/{branch}").returncode != 0:
+            return None
+
+        if _git("checkout", branch).returncode != 0:
+            return None
+        return branch
+    except (FileNotFoundError, OSError):
+        return None
+
+
 def _run_uv_sync(project_dir: Path) -> Tuple[int, str]:
     """Run ``uv sync`` against the source checkout, targeting the
     venv that owns this process.
@@ -908,13 +959,25 @@ def cmd_update(args) -> int:
                 print(f"• pull: git pull --ff-only ({source_checkout})")
                 rc, out = cli._run_git_pull(source_checkout)
                 if rc != 0:
-                    print(out.rstrip(), file=sys.stderr)
-                    print(
-                        "• pull: FAILED — aborting before "
-                        "install/sync/restart.",
-                        file=sys.stderr,
-                    )
-                    return rc
+                    # A sibling worktree's `gh pr merge --delete-branch` can flip
+                    # this checkout into detached HEAD, which makes `git pull
+                    # --ff-only` refuse. The failed pull already fetched, so try
+                    # a no-loss reattach to the default branch and retry once.
+                    reattached = cli._git_reattach_if_safely_detached(source_checkout)
+                    if reattached:
+                        print(
+                            f"    detached HEAD detected — reattached to "
+                            f"'{reattached}' (no commits lost); retrying pull"
+                        )
+                        rc, out = cli._run_git_pull(source_checkout)
+                    if rc != 0:
+                        print(out.rstrip(), file=sys.stderr)
+                        print(
+                            "• pull: FAILED — aborting before "
+                            "install/sync/restart.",
+                            file=sys.stderr,
+                        )
+                        return rc
                 if out.strip():
                     for line in out.rstrip().splitlines():
                         print(f"    {line}")

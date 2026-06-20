@@ -1466,16 +1466,19 @@ const RESTART_STATE_ACCENTS = {
  * operation, target ref/profile, policy/urgency, current state, and
  * any deferral reason.
  */
-export function handleRestartStatus(payload) {
+export function handleRestartStatus(payload, targetEl = null) {
     if (!payload || typeof payload !== 'object') return;
     const requestId = String(payload.request_id || '');
     if (!requestId) return;
 
     // Resolve both the pane element (where the bubble lands) and the
     // pane object (so we can detect an active assistant stream and
-    // interrupt it cleanly — #1560 stream-boundary).
-    const paneObj = notificationPaneObject();
-    const target = paneObj ? paneObj.element : resolvePaneElement();
+    // interrupt it cleanly — #1560 stream-boundary). When ``targetEl``
+    // is supplied (chat-history reload repainting the trail, #1816) it
+    // pins the bubble to that conversation's pane and there is no live
+    // stream to interrupt, so the pane object is skipped.
+    const paneObj = targetEl ? null : notificationPaneObject();
+    const target = targetEl || (paneObj ? paneObj.element : resolvePaneElement());
     if (!target) return;
 
     const state = String(payload.status || 'pending');
@@ -3272,27 +3275,29 @@ export async function loadModels() {
     deps().state.selectedModel = selection.model;
     deps().state.selectedProvider = selection.provider;
 
-    // Discover the voice route's Realtime model and mark it unpickable in the
-    // dropdown.  The mic button owns this model (see #1371) — the user can see
-    // it exists but should not pick it manually for text chat.  Fire-and-forget:
-    // a missing voice feature or auth failure just means no unpickable models
-    // (the selector stays usable).
-    (async () => {
-        try {
-            const headers = await deps().api.applyAuth({});
-            const resp = await fetch(
-                deps().api.buildAgentUrl('/voice/realtime/route'),
-                { headers },
-            );
-            if (!resp.ok) return;
-            const route = await resp.json();
-            if (route?.voice_model) {
-                sharedModelSelector.setUnpickableModels([route.voice_model]);
+    if (deps().api.hasCapability('voice')) {
+        // Discover the voice route's Realtime model and mark it unpickable in the
+        // dropdown.  The mic button owns this model (see #1371) — the user can see
+        // it exists but should not pick it manually for text chat.  Fire-and-forget:
+        // a missing voice feature or auth failure just means no unpickable models
+        // (the selector stays usable).
+        (async () => {
+            try {
+                const headers = await deps().api.applyAuth({});
+                const resp = await fetch(
+                    deps().api.buildAgentUrl('/voice/realtime/route'),
+                    { headers },
+                );
+                if (!resp.ok) return;
+                const route = await resp.json();
+                if (route?.voice_model) {
+                    sharedModelSelector.setUnpickableModels([route.voice_model]);
+                }
+            } catch (_) {
+                // Voice not configured / network noise — selector stays usable.
             }
-        } catch (_) {
-            // Voice not configured / network noise — selector stays usable.
-        }
-    })();
+        })();
+    }
 }
 
 /**

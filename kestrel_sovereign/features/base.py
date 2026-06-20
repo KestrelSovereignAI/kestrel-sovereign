@@ -10,8 +10,18 @@ if TYPE_CHECKING:
 from abc import ABC, abstractmethod
 from kestrel_sdk.tools.base import ToolSchema, ToolParameter, ToolCategory, AgentTool
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
-from kestrel_sovereign.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
-from kestrel_sovereign.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
+# Import the A2A types from the SDK directly rather than the
+# ``kestrel_sovereign.a2a`` re-export package. Importing the sovereign a2a
+# package runs its ``__init__`` which eagerly pulls in task_manager/task_worker
+# → the A2A stores → the storage SQLA models, and those models size a vector
+# column at import time via ``get_provider_embedding_service()``. When
+# ``features.base`` is still being initialized (it is imported very early), that
+# chain re-enters ``from kestrel_sovereign.features.base import Feature`` against
+# the half-built module and raises a circular ImportError that silently disables
+# provider embeddings (#1792). The sovereign modules are pure re-exports of
+# these same SDK symbols, so importing them from the SDK is equivalent.
+from kestrel_sdk.a2a.agent_card import AgentCard, AgentSkill, AgentCapabilities
+from kestrel_sdk.a2a.types import Task, TaskState, TaskStatus, Artifact, DataPart, Message, TextPart
 
 # The SDK Feature is the canonical base class for feature packages.
 # Sovereign's richer Feature inherits from it so extracted packages that

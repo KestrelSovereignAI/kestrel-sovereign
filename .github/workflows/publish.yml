@@ -35,10 +35,28 @@ jobs:
     name: CI gate
     uses: ./.github/workflows/ci.yml
     secrets: inherit
+    # Pin the gate to the same revision `build` checks out, so a manual
+    # workflow_dispatch with `inputs.ref` can't validate one SHA and publish
+    # another. On a tag push `inputs.ref` is empty and this is the tag ref.
+    with:
+      ref: ${{ inputs.ref || github.ref }}
+
+  # Fresh-install gate — must pass before anything builds/publishes.
+  # Runs the full cross-platform clean-install matrix (Linux + macOS +
+  # Windows, sync + wheel) on the release SHA. This is the ONLY place the
+  # billed macOS/Windows axis runs per release: a broken `pip install`
+  # experience on any platform blocks the PyPI upload rather than reaching
+  # users. secrets: inherit forwards GH_PAT for the private-dep git config.
+  clean-install:
+    name: Clean install gate
+    uses: ./.github/workflows/clean-install.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.ref || github.ref }}
 
   build:
     name: Build sdist + wheel
-    needs: ci
+    needs: [ci, clean-install]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

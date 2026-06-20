@@ -20,15 +20,43 @@ name: Clean Install Validation
 #
 # See: https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/184
 
+# Cost shape (kestrel-sovereign is a public repo):
+#   Linux minutes bill $0 — so the Linux sync+wheel axis runs on every PR
+#   for fast feedback. macOS and Windows minutes ARE billed even on a public
+#   repo (~10x Linux for macOS 3-core), so the cross-platform axis is NOT run
+#   per-merge. It runs only where a packaging regression actually matters:
+#     - as a HARD GATE before the PyPI publish (workflow_call from publish.yml,
+#       on the tag's SHA — a broken fresh install blocks the upload), and
+#     - a weekly safety-net sweep so a platform-only regression can't lurk for
+#       a whole release cycle undiscovered.
+#   Run the macOS axis locally pre-tag too: scripts/ci/clean_install_verify.py
+#   is pure Python and OS-agnostic, so it reproduces on a dev Mac for free.
 on:
-  push:
-    branches: [main, vision-refinement-v2]
   pull_request:
     branches: [main, vision-refinement-v2, 'epic/**']
   schedule:
-    # Full cross-platform clean-install sweep once per night.
-    - cron: "23 8 * * *"
+    # Weekly cross-platform clean-install safety net (Mondays, off-hours UTC).
+    - cron: "23 8 * * 1"
+  # Invoked as a pre-publish gate by publish.yml on a release tag. The caller
+  # passes secrets via `secrets: inherit`; the tag's original push event makes
+  # select-matrix resolve to the full macOS+Windows+Linux matrix below.
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Git ref/SHA to validate. publish.yml passes the release ref so this
+          gate runs against the EXACT SHA being published. Empty for every
+          other trigger, where checkout falls back to its default event ref.
+        required: false
+        type: string
   workflow_dispatch:
+
+# During churn, supersede an in-flight PR run when a new commit is pushed to
+# the same ref. Never cancels main/tag/scheduled runs — only PR events — so a
+# release-gate or nightly run always completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   PYTHON_VERSION: "3.13"
@@ -67,12 +95,11 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       full_matrix: ${{ steps.matrix.outputs.full_matrix }}
     steps:
-      - name: Checkout
-        if: github.event_name == 'pull_request'
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          fetch-depth: 0
-
+      # Pull requests run the free Linux-only axis for fast feedback. Every
+      # other trigger — the weekly sweep, a workflow_dispatch, and the
+      # pre-publish gate invoked via workflow_call on a tag (which surfaces
+      # here as a non-pull_request event) — runs the full cross-platform
+      # matrix. No checkout/diff needed: the decision is purely event-based.
       - name: Select clean-install matrix
         id: matrix
         shell: bash
@@ -81,14 +108,6 @@ jobs:
 
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             full=true
-          else
-            git diff --name-only \
-              "${{ github.event.pull_request.base.sha }}" \
-              "${{ github.event.pull_request.head.sha }}" > changed-files.txt
-
-            if grep -Eq '^(pyproject\.toml|uv\.lock|README\.md|QUICKSTART\.md|\.github/workflows/|scripts/ci/clean_install_verify\.py|kestrel_sovereign/cli\.py|kestrel_sovereign/cli_|kestrel_sovereign/setup/|kestrel_sovereign/server\.py|kestrel_sovereign/host\.py|kestrel_sovereign/data/feature_registry\.toml)' changed-files.txt; then
-              full=true
-            fi
           fi
 
           if [ "$full" = true ]; then
@@ -116,6 +135,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.ref }}  # release SHA when called from publish.yml; default ref otherwise
 
       - name: Install uv
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0

@@ -67,6 +67,10 @@ def build_restart_status_event(
         "deferral_reason": str(deferral_reason or ""),
         "status_reason": str(status_reason or ""),
         "completed_at": _opt_str(getattr(request, "completed_at", None)),
+        # Chat session this request was filed from (#1812). Carried in
+        # the payload so chat-history reload can scope the repainted
+        # bubble trail to the session being viewed (#1816).
+        "origin_session_id": str(getattr(request, "origin_session_id", "")),
         "dedupe_signature": dedupe_signature(request_id, str(state)),
     }
 

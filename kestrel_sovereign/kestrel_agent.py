@@ -2639,6 +2639,37 @@ Expected Duration: {expected_duration}
 
         return response_text
 
+    def _privacy_blocks_background_memory(self) -> bool:
+        """Single privacy gate for all post-response/background memory work.
+
+        Returns ``True`` when the active privacy mode forbids deriving any
+        durable record from raw chat content. Both the non-streaming and the
+        streaming response paths consult this one predicate before running the
+        post-response pipeline, so emotional tagging, temporal pattern
+        detection, associative concept linking, and the graph/embedding writes
+        they perform can never touch EPHEMERAL or ISOLATED input.
+
+        - EPHEMERAL (``storage="none"``): nothing is stored anywhere, so no
+          derived state may be created either.
+        - ISOLATED (``storage="temp"``): only a temporary session buffer is
+          allowed; durable derived records (graph nodes, temporal patterns,
+          embeddings) are forbidden.
+        - DEIDENTIFIED (``storage="deidentified"``): raw, un-deidentified input
+          must never reach these analyzers.
+
+        Modes that permit persistent storage (NORMAL, PUBLIC, ANONYMOUS) return
+        ``False`` and run the pipeline normally.
+        """
+        privacy_agent = getattr(self, "privacy_agent", None)
+        privacy_config = getattr(privacy_agent, "privacy_config", None)
+        if not privacy_config:
+            return False
+        return bool(
+            privacy_config.is_ephemeral()
+            or privacy_config.uses_temp_storage()
+            or privacy_config.requires_deidentification()
+        )
+
     async def _post_response_pipeline(
         self,
         user_input: str,
@@ -2659,16 +2690,14 @@ Expected Duration: {expected_duration}
         AssociativeLinker concept graph updates. These involve DB/graph writes
         and are fired as a background task so they never block the response.
         """
-        privacy_agent = getattr(self, "privacy_agent", None)
-        privacy_config = getattr(privacy_agent, "privacy_config", None)
-        if privacy_config and (
-            privacy_config.is_ephemeral() or privacy_config.uses_temp_storage()
-            or privacy_config.requires_deidentification()
-        ):
+        if self._privacy_blocks_background_memory():
+            privacy_config = getattr(
+                getattr(self, "privacy_agent", None), "privacy_config", None
+            )
             logging.debug(
                 "Post-response memory pipeline skipped in private volatile mode "
                 "(storage=%s)",
-                privacy_config.storage,
+                getattr(privacy_config, "storage", "unknown"),
             )
             return
 

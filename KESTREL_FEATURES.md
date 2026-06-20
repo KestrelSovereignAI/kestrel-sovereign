@@ -160,6 +160,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `MemoryFeature`
 - `ModelAgent`
 - `PeersFeature`
+- `ProxyFeature`
 - `ResponseAuditFeature`
 - `RestartCoordinatorFeature`
 - `SaveFeature`

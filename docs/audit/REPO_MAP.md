@@ -23,8 +23,8 @@ source: scripts/generate_repo_map.py
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-18
-**Scope:** 1736 tracked files (1131 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-20
+**Scope:** 1742 tracked files (1135 `.py`, 305 `.md`, 302 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -255,6 +255,8 @@ Repo entry points and standard project files.
   - `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def get_observability_summary(request, minutes)`
 - **kestrel_sovereign/endpoints/rasa_shim.py** — Rasa-compatible webhook shim for Kestrel AI.
   - `class RasaWebhookRequest`; `class RasaWebhookResponse`; `async def rasa_webhook(request, payload)`
+- **kestrel_sovereign/endpoints/restart_events.py** — Restart status-event API — repaint the bubble trail on chat reload.
+  - `async def get_restart_status_events(request, session, limit)`
 - **kestrel_sovereign/endpoints/saved_items.py** — Saved Items API endpoints.
   - `class SaveItemRequest`; `class SaveStructuredItemRequest`; `class UpdateItemRequest`; `class SearchRequest`; `async def list_items(request, item_type, limit)`; `async def get_stats(request)`; `async def list_schemas(request)`; `async def get_all_tags(request)`; `…`
 - **kestrel_sovereign/endpoints/security.py** — Kestrel Security API Endpoints.
@@ -277,7 +279,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/feature_reconcile.py** — Reconcile the host venv against the union of per-agent feature allowlists.
   - `class SourceEntry`; `class ReconcileAction`; `def compute_required_classes(multi_agent)`; `def resolve_packages(required_classes, registry, entrypoint_dists, local_core_classes)`; `def build_source_index(manifest_entries, registry)`; `def plan_reconcile(pkg_infos, source_index, installed_versions, editable_paths, …)`
 - **kestrel_sovereign/feature_registry.py** — Feature Registry — catalog loader and status resolver.
-  - `class FeatureStatus`; `class SkillInfo`; `class FeaturePackageInfo`; `def load_registry(path)`; `def resolve_status(registry, enabled_class_names)`; `def get_registry(enabled_class_names, path)`; `def get_package_for_feature(feature_class_name, path)`; `def get_all_skills(path)`; `…`
+  - `class FeatureStatus`; `class SkillInfo`; `class FeaturePackageInfo`; `class InstalledFeatureRuntime`; `def load_registry(path)`; `def discover_installed_feature_runtimes()`; `def get_installed_feature_runtime(feature_class_name)`; `def resolve_status(registry, enabled_class_names)`; `…`
 - **kestrel_sovereign/features/__init__.py** — Feature Discovery for Kestrel Agent.
   - `def get_disabled_features()`; `def discover_feature_modules()`; `def find_feature_class(module)`; `def discover_entrypoint_feature_classes()`; `def discover_local_feature_class_names()`; `def discover_entrypoint_feature_dists()`; `def discover_feature_class_by_name(name)`; `def discover_features(agent, allowed_features)`; `…`
 - **kestrel_sovereign/features/attachments/__init__.py** — Chat attachments feature (#1662): a lazy ``read_attachment`` tool so an agent can read a file the user attached (non-inline) on demand.
@@ -408,6 +410,8 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/identity/__init__.py** — Identity Feature: Agent tools for identity export, import, and verification.
 - **kestrel_sovereign/features/identity/feature.py** — Identity Feature: Agent tools for identity portability.
   - `class IdentityFeature`
+- **kestrel_sovereign/features/isolated_runtime.py** — Isolated feature runtime proxy and per-agent venv provisioning.
+  - `class IsolatedFeatureTool`; `class ProxyFeature`; `class ProxyChannelAdapter`
 - **kestrel_sovereign/features/keys/__init__.py** — Key Management Feature for external service API keys.
 - **kestrel_sovereign/features/keys/component.yaml** — (configuration)
 - **kestrel_sovereign/features/keys/feature.py** — Key Management Feature for Kestrel.
@@ -453,7 +457,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/restart_coordinator/feature.py** — RestartCoordinatorFeature — durable, host-mediated restart requests.
   - `class RestartCoordinatorFeature`
 - **kestrel_sovereign/features/restart_coordinator/store.py** — Durable store helpers for ``restart_requests`` (#1512).
-  - `class RestartRequest`; `async def ensure_restart_requests_table(db)`; `async def insert_request(db)`; `async def list_requests(db)`; `async def get_request(db, request_id)`; `async def record_update_log(db, request_id, update_log)`; `async def update_status(db, request_id)`
+  - `class RestartRequest`; `async def ensure_restart_requests_table(db)`; `async def insert_request(db)`; `async def list_requests(db)`; `async def list_requests_needing_wake(db)`; `async def mark_wake_delivered(db, request_id)`; `async def get_request(db, request_id)`; `async def record_update_log(db, request_id, update_log)`; `…`
 - **kestrel_sovereign/features/restart_coordinator/update_profiles.py** — Allowlisted update/install profiles for ``update_then_restart`` (#1539).
   - `def is_valid_target_ref(ref)`; `def repo_is_git_checkout(path)`; `def default_sovereign_repo_path()`; `class UpdateStep`; `class UpdateProfile`; `def get_update_profile(name)`
 - **kestrel_sovereign/features/save/__init__.py** — Save Feature - Persistent storage with semantic search.
@@ -1426,6 +1430,7 @@ Repo entry points and standard project files.
 - **docs/demos/DEMO_SCRIPT.md** — Kestrel Sovereign - Demo Script — **Issue #133 — Track A: Technical Demo** **Duration:** ~2 minutes automated, 10-12 minutes with live narration **Closer:** *"In 30 minutes you can have your own agent running with all of this active.…
 - **docs/deployment/README.md** — Deployment Operations — How to build, deploy, and update Kestrel Sovereign on Cloud Run.
 - **docs/deployment/prometheus-workflows-alerts.yml** — (configuration)
+- **docs/design/ISOLATED_FEATURE_RUNTIME.md** — Isolated-Feature Runtime — > Status: **Proposed (Draft)** — 2026-06-17.
 - **docs/design/KESTREL_LOGO.png** — —
 - **docs/design/README.md** — docs/design/ — Canonical published brand assets — the refreshed kestrel-on-rook mark adopted 2026-05-05.
 - **docs/design/kestrel_avatar_400x400.png** — —
@@ -1621,6 +1626,7 @@ Repo entry points and standard project files.
 - **tests/frontend/tool_activity_expandable.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
 - **tests/frontend/trash_grouping.test.mjs** — (mjs asset)
+- **tests/frontend/voice_capability.test.mjs** — (mjs asset)
 - **tests/frontend/voice_default_pane.test.mjs** — (mjs asset)
 - **tests/infrastructure/check_pods.py** — Check RunPod pods status.
   - `def main()`
@@ -2100,7 +2106,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_data_loss_hardening.py** — Data-loss hardening (#1725): inception --force, retirement scoping, filecoin tier-aware cleanup + CID integrity verification.
   - `class TestFilecoinCleanup`; `class TestFilecoinIntegrity`; `class TestInceptionForce`; `class TestRetirementScoping`; `class TestImportTimestampPreservation`; `class TestRetirementScopingPeerKeys`
 - **tests/unit/test_db_backend_concurrency.py** — Postgres backend concurrency hardening (#1726).
-  - `def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children()`
+  - `def test_postgres_txn_conn_is_per_task_and_not_inherited_by_children()`; `def test_autocommit_write_retries_on_tuple_concurrently_updated()`; `def test_autocommit_write_gives_up_after_max_retries()`
 - **tests/unit/test_decryption_failure.py** — Tests for decryption failure behavior.
   - `class TestDecryptionFailure`; `class TestDecryptionErrorMessage`; `class TestNoSilentFailures`
 - **tests/unit/test_delegated_wallet.py** — Tests for DelegatedWallet budget delegation and ceiling enforcement.
@@ -2208,7 +2214,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_feature_reconcile.py** — Tests for ``feature_reconcile`` — the pure planning half of #1788.
   - `def test_required_classes_union_plus_mandatory()`; `def test_required_classes_flags_load_all_agents()`; `def test_required_classes_ignores_remote_agents()`; `def test_resolve_packages_maps_classes_and_skips_core()`; `def test_resolve_packages_unknown_class_is_unresolved()`; `def test_resolve_packages_mandatory_missing_from_registry_is_not_error()`; `def test_resolve_packages_uses_live_entrypoint_dist()`; `def test_resolve_packages_bundled_class_wins_over_duplicate_entrypoint()`; `…`
 - **tests/unit/test_feature_registry.py** — Tests for the Feature Registry catalog and loader.
-  - `class TestLoadRegistry`; `class TestResolveStatus`; `class TestGetRegistry`; `class TestGetPackageForFeature`; `class TestSkills`
+  - `class TestLoadRegistry`; `class TestResolveStatus`; `class TestInstalledRuntimeMetadata`; `class TestGetRegistry`; `class TestGetPackageForFeature`; `class TestSkills`
 - **tests/unit/test_feature_startup_promotion.py** — —
   - `class PlainFeature`; `def test_feature_startup_promotion_defaults_to_disabled()`; `def test_meta_features_opt_into_startup_direct_tools()`; `def test_save_and_strategic_memory_opt_into_startup_direct_tools()`; `def test_startup_promotion_stays_under_budget()`; `def test_startup_promotion_uses_feature_descriptor_not_feature_names()`
 - **tests/unit/test_feature_storage_access.py** — —
@@ -2275,6 +2281,8 @@ Repo entry points and standard project files.
   - `def constitution_path()`; `async def test_inception_dormant_anchors_canonical_text(tmp_path, constitution_path)`; `async def test_inception_active_inlines_sovereign_terms(tmp_path, constitution_path)`
 - **tests/unit/test_input_guardrails.py** — Tests for prompt injection detection and input guardrails.
   - `class TestWrapUserInput`; `class TestCheckPromptInjection`; `class TestValidateToolArguments`; `class TestAntiInjectionPrompt`
+- **tests/unit/test_isolated_feature_runtime.py** — Tests for isolated feature runtime proxy behavior.
+  - `class FakeIsolatedClient`; `async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_path)`; `def test_service_command_console_script(tmp_path)`; `def test_service_command_module_func(tmp_path)`; `async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path)`; `class FakeChannelRegistry`; `class FakeChannelFeature`; `async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path)`; `…`
 - **tests/unit/test_kem_suite.py** — KEMSuite tests — Wave 4 sub-PR 1 (#919).
   - `def test_x25519_library_available()`; `def test_mlkem768_library_available()`; `def test_x25519_self_registers()`; `def test_mlkem768_self_registers()`; `def test_registry_lists_both()`; `def test_unknown_alg_raises()`; `def test_x25519_classified_as_classical()`; `def test_mlkem768_classified_as_post_quantum()`; `…`
 - **tests/unit/test_kestrel_agent.py** — Unit tests for KestrelAgent core methods.
@@ -2469,6 +2477,8 @@ Repo entry points and standard project files.
   - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`; `async def test_post_response_hook_flags_user_denial_without_audit()`; `async def test_post_response_hook_allows_audit_backed_user_denial()`; `async def test_post_response_hook_missing_security_feature_does_not_break()`
 - **tests/unit/test_restart_coordinator.py** — Tests for the durable restart coordinator (#1512).
   - `async def test_ensure_table_is_idempotent(tmp_path)`; `async def test_insert_then_list_then_get(tmp_path)`; `async def test_update_status_gated_on_expected_current(tmp_path)`; `async def test_list_requests_filters_by_status_and_agent(tmp_path)`; `async def test_request_restart_creates_pending_row(tmp_path)`; `async def test_request_restart_rejects_unknown_urgency(tmp_path)`; `async def test_request_restart_rejects_unknown_policy(tmp_path)`; `async def test_request_restart_rejects_empty_reason(tmp_path)`; `…`
+- **tests/unit/test_restart_events_endpoint.py** — Tests for the restart status-event API endpoint (#1816).
+  - `async def test_endpoint_returns_events_newest_first(tmp_path)`; `async def test_endpoint_scopes_to_origin_session(tmp_path)`; `async def test_endpoint_no_database_returns_empty(tmp_path)`
 - **tests/unit/test_restart_status_events.py** — Tests for the typed restart_status event store (#1562).
   - `def test_dedupe_signature_is_request_id_colon_state()`; `def test_event_payload_includes_dedupe_signature()`; `def test_event_payload_signature_excludes_volatile_deferral_reason()`; `async def test_record_event_persists_typed_row(tmp_path)`; `async def test_record_event_audit_trail_keeps_all_polls(tmp_path)`; `async def test_list_recent_events_for_history_returns_newest_first(tmp_path)`; `async def test_list_recent_events_since_paging(tmp_path)`; `async def test_list_recent_events_for_agent_context_scopes_by_agent(tmp_path)`; `…`
 - **tests/unit/test_retention_janitor.py** — Unit tests for the retention helpers (#764).

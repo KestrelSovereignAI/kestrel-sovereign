@@ -29,8 +29,8 @@ privacy: public
 > [`../MEMORY_SYSTEM.md`](../MEMORY_SYSTEM.md) and
 > [`STORAGE_ARCHITECTURE.md`](STORAGE_ARCHITECTURE.md). In particular,
 > `MemoryRetriever` now has a six-factor score including certainty, and
-> embedding generation is still Ollama-backed while provider-standard
-> embedding functions are being added.
+> saved-item/RAG embedding generation now routes through embedding-capable
+> LLM providers; conversation-memory vector retrieval remains a follow-up.
 
 ---
 

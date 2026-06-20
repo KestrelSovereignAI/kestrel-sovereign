@@ -134,6 +134,32 @@ class TestDiscoverFeatures:
         for feature in features:
             assert feature.agent is mock_agent
 
+    def test_isolated_entrypoint_builds_proxy_without_importing_feature(self, mock_agent, tmp_path):
+        """isolated-venv entry points are proxied from metadata, not imported."""
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            """
+[tool.kestrel.feature]
+runtime = "isolated-venv"
+service = "isolated_service"
+""".strip()
+        )
+        ep = _IsolatedEntryPoint(
+            name="isolated",
+            value="heavy_pkg.feature:HeavyFeature",
+            dist=_IsolatedDistribution("heavy-pkg", pyproject),
+        )
+
+        with patch("kestrel_sovereign.features.discover_feature_modules", return_value=[]), \
+             patch("kestrel_sovereign.features.importlib.metadata.entry_points", return_value=_IsolatedEntryPoints([ep])), \
+             patch("kestrel_sovereign.feature_registry.importlib.metadata.entry_points", return_value=_IsolatedEntryPoints([ep])):
+            features = discover_features(mock_agent)
+
+        assert len(features) == 1
+        assert features[0].name == "HeavyFeature"
+        assert features[0].runtime.runtime == "isolated-venv"
+        assert ep.loaded is False
+
 
 class TestGetFeatureByName:
     """Tests for get_feature_by_name function."""
@@ -493,3 +519,40 @@ class TestEntrypointClassName:
             dist_map = discover_entrypoint_feature_dists()
 
         assert dist_map == {"GitHubFeature": "kestrel-feature-github"}
+
+
+class _IsolatedEntryPoint:
+    def __init__(self, name, value, dist):
+        self.name = name
+        self.value = value
+        self.dist = dist
+        self.loaded = False
+
+    def load(self):
+        self.loaded = True
+        raise AssertionError("isolated feature entry point should not be imported")
+
+
+class _IsolatedEntryPoints(list):
+    def select(self, group):
+        return self
+
+
+class _IsolatedPackageFile:
+    name = "pyproject.toml"
+
+    def __str__(self):
+        return "pyproject.toml"
+
+
+class _IsolatedDistribution:
+    def __init__(self, name, pyproject):
+        self.name = name
+        self.files = [_IsolatedPackageFile()]
+        self._pyproject = pyproject
+
+    def locate_file(self, package_file):
+        return self._pyproject
+
+    def read_text(self, name):
+        return None

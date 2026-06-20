@@ -82,6 +82,8 @@ export async function createRealtimeClient({
   let micStream = null;  // MediaStream from getUserMedia
   let audioSink = null;  // <audio> element for remote playback
   let closed = false;
+  const persistedTurnIds = new Set();  // item_ids already sent to /transcript
+  const pendingPersists = new Set();   // in-flight /transcript POST promises
 
   /**
    * Send a JSON control message through the data channel.
@@ -111,20 +113,29 @@ export async function createRealtimeClient({
    *
    * The transcript endpoint is derived from the mint `endpoint` by swapping the
    * trailing `/session` for `/transcript/<session_id>`, reusing the same auth.
+   *
+   * `dedupeId` guards against double-persisting one turn: GA emits BOTH
+   * `response.output_audio_transcript.done` and `response.output_text.done`
+   * for the same assistant item (audio + text content parts share an item_id),
+   * which would otherwise write the reply twice.
    */
-  function persistTurn(role, text) {
+  function persistTurn(role, text, dedupeId) {
     const content = (text ?? '').trim();
     const sessionId = session?.session_id;
     if (!content || !sessionId) return;
+    if (dedupeId) {
+      if (persistedTurnIds.has(dedupeId)) return;
+      persistedTurnIds.add(dedupeId);
+    }
     const transcriptUrl =
       endpoint.replace(/\/session$/, '/transcript/') +
       encodeURIComponent(sessionId);
-    Promise.resolve(getAuthHeaders())
+    const p = Promise.resolve(getAuthHeaders())
       .then((authHeaders) =>
         fetch(transcriptUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...(authHeaders || {}) },
-          body: JSON.stringify({ role, content }),
+          body: JSON.stringify({ role, content, item_id: dedupeId || '' }),
         }),
       )
       .then((resp) => {
@@ -141,6 +152,20 @@ export async function createRealtimeClient({
           }));
         }
       });
+    // Track the in-flight POST so callers (the UI's sidebar refresh on session
+    // close) can wait for persistence to settle before refetching history —
+    // otherwise the refresh races ahead of the write and shows a stale list.
+    pendingPersists.add(p);
+    p.finally(() => pendingPersists.delete(p));
+  }
+
+  /**
+   * Resolve once all transcript POSTs issued so far have settled (succeeded
+   * or failed). Lets the UI refresh the conversation list only after the new
+   * turns are actually persisted. Never rejects.
+   */
+  function whenPersisted() {
+    return Promise.allSettled([...pendingPersists]);
   }
 
   /**
@@ -177,7 +202,7 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.USER_TRANSCRIPT_FINAL, {
           text: raw.transcript ?? '',
         }));
-        persistTurn('user', raw.transcript ?? '');
+        persistTurn('user', raw.transcript ?? '', raw.item_id);
         break;
 
       case 'response.created':
@@ -197,7 +222,7 @@ export async function createRealtimeClient({
         onEvent(makeEvent(Events.AGENT_TEXT_FINAL, {
           text: raw.transcript ?? raw.text ?? '',
         }));
-        persistTurn('assistant', raw.transcript ?? raw.text ?? '');
+        persistTurn('assistant', raw.transcript ?? raw.text ?? '', raw.item_id);
         break;
       case 'response.done':
         onEvent(makeEvent(Events.SPEAKING_STOPPED, {}));
@@ -448,6 +473,7 @@ export async function createRealtimeClient({
     cancelResponse,
     updateInstructions,
     commitToolResult,
+    whenPersisted,
     getInputLevel,
     setMuted,
     setInputMuted,
