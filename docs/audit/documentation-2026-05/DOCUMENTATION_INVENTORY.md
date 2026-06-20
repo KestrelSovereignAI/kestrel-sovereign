@@ -24,8 +24,8 @@ This inventory records the OKF migration baseline. It is not a document-by-docum
 
 ## Counts
 
-- Current `docs/` markdown files: 260.
-- Current OKF corpus: 254 OKF documents validate with `scripts/docs_okf.py validate --all docs`.
+- Current `docs/` markdown files: 261.
+- Current OKF corpus: 255 OKF documents validate with `scripts/docs_okf.py validate --all docs`.
 - Reserved OKF generated views: 6 files (`docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`, `docs/generated/log.md`, `docs/architecture/index.md`, `docs/architecture/log.md`).
 - 0 non-reserved markdown files are missing OKF frontmatter.
 - Previous inventory: `docs/archive/meta/DOCUMENTATION_INVENTORY_2025.md`.

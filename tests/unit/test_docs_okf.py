@@ -208,7 +208,7 @@ def test_human_indexes_link_okf_surfaces():
     assert "OKF_MIGRATION_PLAN.md" in audit_readme
     assert "index.md" in audit_readme
     assert "log.md" in audit_readme
-    assert "254 OKF documents" in inventory
+    assert "255 OKF documents" in inventory
     assert "0 non-reserved markdown files are missing OKF frontmatter" in inventory
     assert "scripts/docs_okf.py" in canonical
     assert "scripts/generate_demo_evidence_docs.py" in generated_readme

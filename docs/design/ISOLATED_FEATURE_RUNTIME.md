@@ -1,3 +1,21 @@
+---
+type: Design Note
+title: Isolated-Feature Runtime
+description: Draft design for running Kestrel features in isolated dependency runtimes.
+resource: /docs/design/ISOLATED_FEATURE_RUNTIME.md
+tags:
+- docs
+- design
+- design-note
+- feature-runtime
+timestamp: '2026-06-20T00:00:00Z'
+status: proposed
+owner: feature-runtime
+canonical: false
+generated: false
+privacy: review-before-public
+---
+
 # Isolated-Feature Runtime
 
 > Status: **Proposed (Draft)** — 2026-06-17. Author: UncleSaurus.

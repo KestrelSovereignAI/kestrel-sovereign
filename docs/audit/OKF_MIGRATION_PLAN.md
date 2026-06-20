@@ -34,8 +34,9 @@ Snapshot from 2026-06-18:
 - Initial baseline before this migration: `docs/` contained 319 markdown files,
   0 markdown files had YAML frontmatter at the top of the file, and 273
   markdown files had an H1 heading.
-- Current corpus after implementation: `docs/` contains 260 markdown files.
-- 254 non-reserved Markdown files have OKF frontmatter and validate with
+- Current corpus after rebasing onto the June 20 `main`: `docs/` contains 261
+  markdown files.
+- 255 non-reserved Markdown files have OKF frontmatter and validate with
   `uv run python scripts/docs_okf.py validate --all docs`.
 - 6 generated OKF views are intentionally reserved and skipped:
   `docs/audit/index.md`, `docs/audit/log.md`, `docs/generated/index.md`,
