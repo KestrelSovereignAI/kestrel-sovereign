@@ -549,6 +549,13 @@ class StreamingMixin:
             if hook_input.tool_input and "user_message" in hook_input.tool_input:
                 user_input = hook_input.tool_input["user_message"]
 
+        # #1844 Stage 2: Kestrel-owned compaction for openai:plan. Compact +
+        # reset the codex thread BEFORE fetching history / building context so
+        # the freshly-seeded thread carries the compacted view rather than
+        # letting codex auto-compact opaquely server-side. Best-effort; no-op
+        # off openai:plan or below threshold.
+        await self._maybe_compact_codex_thread(session_id)
+
         # Build full context using context_manager (same as process_input)
         force_local_only = not self.privacy_agent.privacy_config.allows_cloud_llm()
         privacy_mode = self.privacy_agent.privacy_mode.name
