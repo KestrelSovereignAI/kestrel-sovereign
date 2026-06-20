@@ -10,9 +10,10 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
+from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
     SyncResult,
@@ -141,6 +142,15 @@ class SovereignIPFSTarget(ManifestManagerMixin, SyncTarget):
     async def get_latest_position(self) -> Optional[int]:
         """Signal that WAL sync is not needed."""
         return 2**63
+
+    async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
+        """No-op: decommissioned IPFS tier cannot enumerate safe upload records."""
+        logger.info(
+            "Sovereign IPFS retention prune skipped for %s: enumeration/delete "
+            "is not supported by this sync target",
+            self.agent_id,
+        )
+        return {"deleted": 0, "skipped": True, "reason": "enumeration_not_supported"}
 
     async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:
         """Download latest snapshot from sovereign IPFS via /api/v0/cat."""

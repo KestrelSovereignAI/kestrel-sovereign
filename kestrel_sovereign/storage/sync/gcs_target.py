@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
+from kestrel_sovereign.storage.sync.retention import (
+    RetentionItem,
+    RetentionPolicy,
+    classify,
+    parse_timestamp,
+)
 from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
     SyncResult,
@@ -157,6 +163,45 @@ class GCSTarget(ManifestManagerMixin, SyncTarget):
     async def get_latest_position(self) -> Optional[int]:
         """Return max int to prevent WAL sync."""
         return 2**63
+
+    async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
+        """Prune timestamped GCS snapshots while preserving latest.db."""
+        import asyncio
+
+        snapshots_prefix = f"{self.prefix}{self.agent_id}/snapshots/"
+        latest_name = f"{self.prefix}{self.agent_id}/latest.db"
+
+        def _list_and_delete() -> Dict[str, Any]:
+            bucket = self._get_bucket()
+            items: list[RetentionItem] = []
+            blobs_by_name: Dict[str, Any] = {}
+            for blob in bucket.list_blobs(prefix=snapshots_prefix):
+                if blob.name == latest_name or not blob.name.endswith(".db"):
+                    continue
+                ts = parse_timestamp(blob.name) or parse_timestamp(
+                    getattr(blob, "time_created", None)
+                )
+                if ts is None:
+                    logger.debug("GCS retention skipped object without timestamp: %s", blob.name)
+                    continue
+                items.append(
+                    RetentionItem(
+                        key=blob.name,
+                        name=Path(blob.name).name,
+                        timestamp=ts,
+                        data_class=classify({"key": blob.name, "role": "snapshot"}),
+                    )
+                )
+                blobs_by_name[blob.name] = blob
+
+            deleted = []
+            for item in policy.deletions(items):
+                blob = blobs_by_name[item.key]
+                blob.delete()
+                deleted.append(item.key)
+            return {"deleted": len(deleted), "keys": deleted, "scanned": len(items)}
+
+        return await asyncio.to_thread(_list_and_delete)
 
     async def restore_snapshot(self, dest_path: Path) -> Optional[SyncResult]:
         """Download the latest snapshot from GCS."""

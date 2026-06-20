@@ -211,6 +211,21 @@ banned = []
 # memory_min_score = 0.3  # weighted retrieval score on emotionally-weighted memories
 # rag_min_score    = 0.5  # cosine similarity floor on RAG embedding candidates
 
+# =============================================================================
+# Backup Retention
+# =============================================================================
+# Retention is split by data class. Working-memory snapshots are thinned more
+# aggressively; identity/constitutional artifacts keep monthly restore points
+# indefinitely until an explicit sovereign purge.
+[backup.retention.working_memory]
+keep_all_days = 14
+weekly_forever = true
+monthly_forever = false
+
+[backup.retention.identity]
+keep_all_days = 30
+weekly_until_months = 12
+monthly_forever = true
 
 # =============================================================================
 # Voice Configuration (Kestrel-Squack)

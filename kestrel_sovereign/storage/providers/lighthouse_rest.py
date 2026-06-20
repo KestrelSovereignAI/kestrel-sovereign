@@ -181,6 +181,25 @@ class LighthouseRestClient:
                 return data["data"]
         return {"fileList": [], "totalFiles": 0}
 
+    async def delete_file(self, cid: str) -> Dict[str, Any]:
+        """
+        Delete an upload record from the Lighthouse account.
+
+        This removes the account-visible upload and quota usage; it does not
+        attempt to cancel immutable Filecoin deals for already-pinned content.
+        """
+        client = await self._get_client()
+        response = await client.delete(
+            f"{self.API_URL}/api/user/delete_file",
+            headers=self._auth_headers,
+            params={"cid": cid},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and "data" in data:
+            return data["data"]
+        return data if isinstance(data, dict) else {"deleted": True}
+
     async def get_deal_status(self, cid: str) -> Dict[str, Any]:
         """
         Get Filecoin deal status for a CID.
