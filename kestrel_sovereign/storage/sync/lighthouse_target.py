@@ -480,9 +480,14 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
             items: list[RetentionItem] = []
             for upload in uploads:
-                if self._is_legacy_wal_upload(upload):
-                    role = "wal"
-                elif self._is_structured_snapshot_upload(upload):
+                # Only prune uploads attributable to THIS agent by name:
+                # structured snapshots/manifests, and the legacy agent-scoped
+                # manifest_<did>.json. Legacy flat / `*-wal` uploads carry no
+                # agent id, so on a shared Lighthouse key (multi-tenant host)
+                # pruning them here could delete another agent's data. That
+                # unattributed legacy backlog is handled by the cleanup tool
+                # (#1841) via manifest attribution under dry-run + confirm.
+                if self._is_structured_snapshot_upload(upload):
                     role = "snapshot"
                 elif self._is_structured_manifest_upload(
                     upload

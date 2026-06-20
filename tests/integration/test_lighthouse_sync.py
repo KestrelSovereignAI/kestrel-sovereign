@@ -580,7 +580,7 @@ class TestSyncWAL:
 
 class TestPrune:
     @pytest.mark.asyncio
-    async def test_prune_scans_structured_uploads_and_legacy_wal(self):
+    async def test_prune_scopes_to_agent_and_leaves_unattributed_legacy_wal(self):
         target = LighthouseTarget(api_key="test-key", agent_id="agent-1")
         uploads = [
             {
@@ -636,11 +636,14 @@ class TestPrune:
                 )
             )
 
-        assert result["scanned"] == 5
+        # Only this agent's structured snapshots + manifests are scanned (4).
+        # The unattributed legacy `*-wal` is NOT pruned here (shared-key
+        # data-loss risk); another agent's structured upload is never touched.
+        assert result["scanned"] == 4
         deleted = {call.args[0] for call in mock_client.delete_file.await_args_list}
         assert "QmOldSnapshot" in deleted
         assert "QmOldManifest" in deleted
-        assert "QmLegacyWal" in deleted
+        assert "QmLegacyWal" not in deleted
         assert "QmOtherAgent" not in deleted
 
 
