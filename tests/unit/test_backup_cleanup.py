@@ -134,7 +134,10 @@ async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp
             name="old.db",
         ),
     ]
-    plan = backup_cleanup.build_plan(
+    for record in records:
+        record.metadata["manifest_cid"] = f"manifest-{record.agent_id}"
+        record.metadata["manifest_cid_kind"] = "snapshot"
+    plan = backup_cleanup.build_delete_plan(
         records,
         RetentionPolicy.from_config(
             {
@@ -149,6 +152,7 @@ async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp
                 }
             }
         ),
+        quarantine_state={"objects": {}},
         now=NOW,
     )
     lighthouse_client = AsyncDeleteClient()
@@ -188,6 +192,9 @@ class AsyncDeleteClient:
     async def delete_file(self, cid):
         self.deleted.append(cid)
         return {"deleted": True}
+
+    async def get_deal_status(self, cid):
+        return {"deals": [{"dealExpiry": "2030-01-01T00:00:00Z"}]}
 
     async def close(self):
         pass
@@ -557,3 +564,276 @@ def test_manifest_cid_entries_parses_legacy_and_collection_fields():
     assert backup_cleanup._manifest_schema_valid({"cid": "cid-legacy"}) is True
     # A manifest with no CID at all is invalid.
     assert backup_cleanup._manifest_schema_valid({"agent_id": "agent-a"}) is False
+
+
+def _attributed_snapshot(key: str, agent_id: str, days_old: int):
+    record = _record(key, agent_id, days_old, store="lighthouse", name=f"{key}.car")
+    record.metadata["manifest_cid"] = f"manifest-{agent_id}"
+    record.metadata["manifest_cid_kind"] = "snapshot"
+    return record
+
+
+def _expire_everything_policy():
+    return RetentionPolicy.from_config(
+        {
+            "backup": {
+                "retention": {
+                    "working_memory": {
+                        "keep_all_days": 0,
+                        "weekly_forever": False,
+                        "monthly_forever": False,
+                    }
+                }
+            }
+        }
+    )
+
+
+def test_delete_plan_refuses_raw_bin_and_unattributed_without_promotion():
+    safe_old = _attributed_snapshot("cid-safe-old", "agent-a", 900)
+    safe_new = _attributed_snapshot("cid-safe-new", "agent-a", 1)
+    records = [
+        safe_new,
+        safe_old,
+        _record(
+            "cid-test",
+            None,
+            900,
+            store="lighthouse",
+            name="test-orphan.db",
+            attributed=False,
+        ),
+        _record(
+            "cid-raw",
+            None,
+            900,
+            store="lighthouse",
+            name="kestrel_prime.db",
+            attributed=False,
+        ),
+        _record(
+            "cid-wal",
+            None,
+            900,
+            store="lighthouse",
+            name="kestrel_prime.db-wal",
+            attributed=False,
+        ),
+        _record(
+            "cid-bin",
+            None,
+            900,
+            store="lighthouse",
+            name="payload.bin",
+            attributed=False,
+        ),
+        _record(
+            "cid-private",
+            None,
+            900,
+            store="lighthouse",
+            name="unknown.car",
+            attributed=False,
+        ),
+    ]
+
+    plan = backup_cleanup.build_delete_plan(
+        [backup_cleanup._with_test_flag(record) for record in records],
+        _expire_everything_policy(),
+        quarantine_state={"objects": {}},
+        now=NOW,
+    )
+
+    assert _delete_keys(plan) == {"cid-safe-old", "cid-test"}
+    reasons = {row.record.key: row.reason for row in plan.records}
+    assert reasons["cid-raw"].startswith("quarantine_required:")
+    assert reasons["cid-wal"].startswith("quarantine_required:")
+    assert reasons["cid-bin"].startswith("quarantine_required:")
+    assert reasons["cid-private"].startswith("quarantine_required:")
+
+
+def test_quarantine_writes_state_without_provider_delete(tmp_path):
+    state_path = tmp_path / "quarantine.json"
+    records = [
+        _record(
+            "cid-raw",
+            None,
+            1,
+            store="lighthouse",
+            name="kestrel_prime.db",
+            attributed=False,
+        ),
+        _attributed_snapshot("cid-safe", "agent-a", 1),
+    ]
+
+    result = backup_cleanup.quarantine_records(
+        backup_cleanup.classify_records(records),
+        state_path=state_path,
+    )
+
+    state = json.loads(state_path.read_text())
+    assert result["added"] == 1
+    assert "lighthouse:cid-raw" in state["objects"]
+    assert state["objects"]["lighthouse:cid-raw"]["status"] == "quarantined"
+    assert "cid-safe" not in json.dumps(state)
+    assert "provider_deletes: 0" in backup_cleanup.render_quarantine_report(result)
+
+
+def test_promoted_quarantine_object_becomes_delete_eligible(tmp_path):
+    state_path = tmp_path / "quarantine.json"
+    raw = _record(
+        "cid-raw",
+        None,
+        900,
+        store="lighthouse",
+        name="kestrel_prime.db",
+        attributed=False,
+    )
+    backup_cleanup.quarantine_records(
+        backup_cleanup.classify_records([raw]),
+        state_path=state_path,
+    )
+
+    unpromoted = backup_cleanup.build_delete_plan(
+        [raw],
+        _expire_everything_policy(),
+        quarantine_state=backup_cleanup.load_quarantine_state(state_path),
+        now=NOW,
+    )
+    backup_cleanup.promote_quarantine_object(state_path, "lighthouse:cid-raw")
+    promoted = backup_cleanup.build_delete_plan(
+        [raw],
+        _expire_everything_policy(),
+        quarantine_state=backup_cleanup.load_quarantine_state(state_path),
+        now=NOW,
+    )
+
+    assert _delete_keys(unpromoted) == set()
+    assert _delete_keys(promoted) == {"cid-raw"}
+    assert promoted.deletions[0].reason == "promoted_legacy_private_candidate"
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_delete_audit_records_filecoin_caveat_and_pending_expiry(tmp_path):
+    old = _attributed_snapshot("cid-old", "agent-a", 900)
+    new = _attributed_snapshot("cid-new", "agent-a", 1)
+    plan = backup_cleanup.build_delete_plan(
+        [old, new],
+        _expire_everything_policy(),
+        quarantine_state={"objects": {}},
+        now=NOW,
+    )
+    audit_log = tmp_path / "audit.jsonl"
+    client = AsyncDeleteClient()
+
+    rc = await backup_cleanup.apply_plan(
+        plan,
+        lighthouse_client=client,
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=audit_log,
+        manifest_index_hash="abc123",
+        policy_version="policy-test",
+    )
+
+    assert rc == 0
+    assert client.deleted == ["cid-old"]
+    entry = json.loads(audit_log.read_text().strip())
+    assert entry["key"] == "cid-old"
+    assert entry["delete_call_result"] == {"deleted": True}
+    assert backup_cleanup.DEAL_IMMUTABILITY_CAVEAT in entry["deal_immutability_caveat"]
+    assert entry["filecoin_status"] == (
+        "deleted_from_account_but_deal_may_persist_until_expiry"
+    )
+    assert entry["deal_expiry"] == "2030-01-01T00:00:00Z"
+    assert entry["manifest_index_hash"] == "abc123"
+    assert entry["policy_version"] == "policy-test"
+
+
+def test_delete_plan_preserves_newest_and_live_manifest_referenced_objects():
+    live_manifest = _record(
+        "manifest-live",
+        "agent-a",
+        1,
+        store="lighthouse",
+        data_class=DataClass.IDENTITY,
+        name="manifest_agent-a.json",
+    )
+    live_manifest.metadata["manifest_cid"] = "manifest-live"
+    live_snapshot = _attributed_snapshot("cid-live-snapshot", "agent-a", 900)
+    live_snapshot.metadata["manifest_cid"] = "manifest-live"
+    old_snapshot = _attributed_snapshot("cid-old-snapshot", "agent-a", 900)
+    old_snapshot.metadata["manifest_cid"] = "manifest-old"
+    newest_snapshot = _attributed_snapshot("cid-newest-snapshot", "agent-a", 1)
+    newest_snapshot.metadata["manifest_cid"] = "manifest-old"
+
+    plan = backup_cleanup.build_delete_plan(
+        [live_manifest, live_snapshot, old_snapshot, newest_snapshot],
+        _expire_everything_policy(),
+        quarantine_state={"objects": {}},
+        now=NOW,
+    )
+    reasons = {row.record.key: row.reason for row in plan.records}
+
+    assert _delete_keys(plan) == {"cid-old-snapshot"}
+    assert reasons["cid-live-snapshot"] == "live_manifest_referenced"
+    assert reasons["cid-newest-snapshot"] == "newest"
+
+
+@pytest.mark.asyncio
+async def test_dry_run_preview_matches_apply_plan_for_promoted_quarantine(tmp_path):
+    # Regression: the default dry-run preview must use the SAME quarantine-aware
+    # build_delete_plan that --apply executes, so a promoted quarantine object
+    # shown as a planned delete in preview is exactly what apply would remove.
+    raw = _record(
+        "gs://bucket/kestrel/orphan/kestrel_prime.db",
+        None,
+        900,
+        store="gcs",
+        name="kestrel_prime.db",
+    )
+    classified = backup_cleanup.classify_inventory_record(raw)
+    assert classified.inventory_class in backup_cleanup.QUARANTINE_CLASSES
+
+    state_path = tmp_path / "q.json"
+    backup_cleanup.quarantine_records([classified], state_path=state_path)
+    backup_cleanup.promote_quarantine_object(state_path, raw.key)
+
+    args = backup_cleanup.build_parser().parse_args(
+        [
+            "--skip-lighthouse",
+            "--gcs-bucket",
+            "bucket",
+            "--quarantine-state",
+            str(state_path),
+        ]
+    )
+
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with patch("scripts.backup_cleanup.list_gcs_records", return_value=[raw]):
+        with redirect_stdout(buf):
+            rc = await backup_cleanup._main_async(args)
+
+    assert rc == 0
+    out = buf.getvalue()
+    # Preview is the delete preflight (quarantine-aware), not the legacy report,
+    # and the promoted quarantine class is shown as an eligible delete — exactly
+    # what --apply would remove.
+    assert "manifest-index hash" in out
+    assert "legacy_private_candidate: 1 objects" in out
+
+    # Negative control: with a FRESH (un-promoted) quarantine state, the same
+    # object is NOT eligible — proving the preview reflects promotion state.
+    fresh_state = tmp_path / "q_fresh.json"
+    backup_cleanup.quarantine_records([classified], state_path=fresh_state)
+    args2 = backup_cleanup.build_parser().parse_args(
+        ["--skip-lighthouse", "--gcs-bucket", "bucket",
+         "--quarantine-state", str(fresh_state)]
+    )
+    buf2 = io.StringIO()
+    with patch("scripts.backup_cleanup.list_gcs_records", return_value=[raw]):
+        with redirect_stdout(buf2):
+            await backup_cleanup._main_async(args2)
+    assert "legacy_private_candidate: 1 objects" not in buf2.getvalue()
