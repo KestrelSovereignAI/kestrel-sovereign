@@ -303,3 +303,34 @@ def test_reuses_shared_retention_policy_and_classify_without_local_gfs_copy():
     assert "classify" in source
     assert "weekly_until_months" not in source
     assert "monthly_forever" not in source
+
+
+def test_parse_gsutil_ls_handles_real_single_token_iso_timestamp():
+    # Real `gsutil ls -l` output: size, single ISO8601 token, URI, then a
+    # trailing TOTAL line. Regression for the two-token regex that silently
+    # dropped every GCS object.
+    output = (
+        "    299177514  2026-06-19T12:00:00Z  "
+        "gs://bucket/kestrel/agent-a/snapshots/20260619_120000.db\n"
+        "    179382805  2024-01-01T12:00:00Z  "
+        "gs://bucket/kestrel/agent-a/snapshots/20240101_120000.db\n"
+        "          529  2026-06-19T12:00:01Z  "
+        "gs://bucket/kestrel/agent-a/latest.db\n"
+        "TOTAL: 3 objects, 479000000 bytes\n"
+    )
+    records = backup_cleanup.parse_gsutil_ls(
+        output, bucket="bucket", prefix="kestrel/"
+    )
+    keys = {r.key for r in records}
+    assert (
+        "gs://bucket/kestrel/agent-a/snapshots/20260619_120000.db" in keys
+    )
+    assert (
+        "gs://bucket/kestrel/agent-a/snapshots/20240101_120000.db" in keys
+    )
+    # All three lines parsed (latest.db is parsed but marked protected).
+    assert len(records) == 3
+    latest = next(r for r in records if r.name == "latest.db")
+    assert latest.protected is True
+    # Timestamps resolved from the ISO token, not None.
+    assert all(r.timestamp is not None for r in records)

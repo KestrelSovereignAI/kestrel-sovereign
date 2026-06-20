@@ -161,8 +161,11 @@ def parse_gsutil_ls(output: str, *, bucket: str, prefix: str) -> list[BackupReco
         line = raw_line.strip()
         if not line or line.startswith("TOTAL:") or line.endswith(":"):
             continue
+        # `gsutil ls -l` emits: "<size>  <ISO8601-timestamp>  gs://...",
+        # e.g. "299177514  2026-06-20T12:00:00Z  gs://bucket/obj". The
+        # timestamp is a SINGLE whitespace-free token.
         match = re.match(
-            r"(?P<size>\d+)\s+(?P<ts>\S+\s+\S+)\s+(?P<uri>gs://\S+)",
+            r"(?P<size>\d+)\s+(?P<ts>\S+)\s+(?P<uri>gs://\S+)",
             line,
         )
         if not match:
