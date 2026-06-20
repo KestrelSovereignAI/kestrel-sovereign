@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import aiohttp
 import httpx
+import os
 import re
 import time
 import logging
@@ -481,9 +482,29 @@ async def get_ipfs_status(request: Request):
     """Check IPFS node connectivity and status."""
     status = {
         "local_node": {"available": False, "error": None, "peer_id": None, "version": None},
+        "backup_tier": {},
         "gateways": [],
         "pinned_content": [],
     }
+
+    try:
+        from kestrel_sovereign.storage.sync.health import check_sovereign_ipfs_health
+
+        status["backup_tier"] = (
+            await check_sovereign_ipfs_health(
+                api_url=os.environ.get("SOVEREIGN_IPFS_URL")
+            )
+        ).to_dict()
+    except Exception as e:
+        logger.error(f"Sovereign IPFS backup tier check failed: {e}")
+        status["backup_tier"] = {
+            "name": "sovereign_ipfs",
+            "label": "sovereign-operated",
+            "configured": False,
+            "status": "decommissioned",
+            "message": "Sovereign-operated IPFS tier state unavailable",
+            "details": {},
+        }
 
     local_api_url = get_ipfs_api_url() + "/api/v0"
     try:

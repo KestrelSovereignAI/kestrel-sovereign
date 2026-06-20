@@ -1,8 +1,9 @@
 """
 Sovereign IPFS Sync Target
 
-Self-hosted IPFS (Kubo) sync target -- the sovereign default.
-Stores SQLite snapshots on infrastructure we own and operate.
+Self-hosted IPFS (Kubo) sync target for the sovereign-operated tier.
+The historical managed node is decommissioned; construct this target only
+after a reachable replacement node has been configured.
 """
 
 import hashlib
@@ -28,11 +29,10 @@ class SovereignIPFSTarget(ManifestManagerMixin, SyncTarget):
     """
     Self-hosted IPFS (Kubo) sync target.
 
-    The sovereign default. Stores SQLite snapshots on infrastructure
-    we own and operate. Requires only a reachable Kubo API endpoint --
-    no third-party credentials.
+    Stores SQLite snapshots on a configured Kubo API endpoint. Requires
+    reachability before registration; no third-party credentials.
 
-    Trust tier: SOVEREIGN (highest)
+    Trust tier: SOVEREIGN / sovereign-operated
     """
 
     def __init__(

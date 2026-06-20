@@ -3,8 +3,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from kestrel_sovereign.storage.sync.health import (
+    build_storage_health_report,
     check_gcs_health,
     check_lighthouse_health,
+    check_sovereign_ipfs_health,
     load_env_file,
 )
 
@@ -32,6 +34,57 @@ class FakeLighthouseClient:
 
     async def close(self):
         self.closed = True
+
+
+class FakeFailingIpfsClient:
+    def __init__(self, timeout):
+        self.timeout = timeout
+        self.closed = False
+
+    async def post(self, url):
+        raise OSError(f"cannot connect to {url}")
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_sovereign_ipfs_unset_reports_decommissioned():
+    result = await check_sovereign_ipfs_health(api_url=None)
+
+    assert result.name == "sovereign_ipfs"
+    assert result.label == "sovereign-operated"
+    assert result.status == "decommissioned"
+    assert result.configured is False
+    assert "decommissioned" in result.message
+
+
+@pytest.mark.asyncio
+async def test_sovereign_ipfs_unreachable_reports_decommissioned():
+    result = await check_sovereign_ipfs_health(
+        api_url="http://127.0.0.1:5001",
+        client_factory=FakeFailingIpfsClient,
+    )
+
+    assert result.label == "sovereign-operated"
+    assert result.status == "decommissioned"
+    assert result.configured is True
+    assert result.details["api_url"] == "http://127.0.0.1:5001"
+
+
+@pytest.mark.asyncio
+async def test_storage_health_report_uses_honest_tier_labels():
+    report = await build_storage_health_report(
+        agent_id="agent-1",
+        env={},
+        now=NOW,
+    )
+
+    data = report.to_dict()
+    assert data["sovereign_ipfs"]["label"] == "sovereign-operated"
+    assert data["sovereign_ipfs"]["status"] == "decommissioned"
+    assert data["lighthouse"]["label"] == "delegated-decentralized"
+    assert data["gcs"]["label"] == "expedient-cloud"
 
 
 async def _lighthouse_status(uploads, deals, grace=timedelta(hours=24)):

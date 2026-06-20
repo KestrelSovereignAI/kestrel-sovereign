@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
 from kestrel_sovereign.storage.sync.retention import parse_timestamp
+from kestrel_sovereign.storage.sync.targets import TierState, TrustTier, TIER_LABELS
 
 
 DEFAULT_LIGHTHOUSE_DEAL_GRACE = timedelta(hours=24)
@@ -21,6 +22,7 @@ class TargetHealth:
     """Health result for one storage target."""
 
     name: str
+    label: str
     configured: bool
     status: str
     message: str
@@ -35,15 +37,79 @@ class StorageHealthReport:
     """Combined storage health report."""
 
     status: str
+    sovereign_ipfs: TargetHealth
     lighthouse: TargetHealth
     gcs: TargetHealth
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
+            "sovereign_ipfs": self.sovereign_ipfs.to_dict(),
             "lighthouse": self.lighthouse.to_dict(),
             "gcs": self.gcs.to_dict(),
         }
+
+
+async def check_sovereign_ipfs_health(
+    *,
+    api_url: Optional[str],
+    client_factory: Optional[Callable[..., Any]] = None,
+) -> TargetHealth:
+    """Check whether the sovereign-operated IPFS backup tier is active."""
+    label = TIER_LABELS[TrustTier.SOVEREIGN]
+    if not api_url:
+        return TargetHealth(
+            name="sovereign_ipfs",
+            label=label,
+            configured=False,
+            status=TierState.DECOMMISSIONED.value,
+            message=(
+                "No sovereign-operated IPFS node is configured; this tier is "
+                "decommissioned"
+            ),
+        )
+
+    if client_factory is None:
+        import httpx
+
+        client_factory = httpx.AsyncClient
+
+    normalized_url = api_url.rstrip("/")
+    client = client_factory(timeout=10.0)
+    try:
+        response = await client.post(f"{normalized_url}/api/v0/id")
+        response.raise_for_status()
+        peer_info = response.json()
+        return TargetHealth(
+            name="sovereign_ipfs",
+            label=label,
+            configured=True,
+            status=TierState.ACTIVE.value,
+            message="Sovereign-operated IPFS node is reachable",
+            details={
+                "api_url": normalized_url,
+                "peer_id": peer_info.get("ID"),
+                "agent_version": peer_info.get("AgentVersion"),
+            },
+        )
+    except Exception as exc:
+        return TargetHealth(
+            name="sovereign_ipfs",
+            label=label,
+            configured=True,
+            status=TierState.DECOMMISSIONED.value,
+            message=(
+                "Configured sovereign-operated IPFS node is unreachable; "
+                "this tier is decommissioned"
+            ),
+            details={"api_url": normalized_url, "error": str(exc)},
+        )
+    finally:
+        close = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if close is not None:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
 
 
 def _parse_upload_time(value: Any) -> Optional[datetime]:
@@ -160,6 +226,7 @@ async def check_lighthouse_health(
     if not api_key:
         return TargetHealth(
             name="lighthouse",
+            label=TIER_LABELS[TrustTier.DELEGATED],
             configured=False,
             status="not_configured",
             message="LIGHTHOUSE_API_KEY is not set",
@@ -193,6 +260,7 @@ async def check_lighthouse_health(
         if latest is None:
             return TargetHealth(
                 name="lighthouse",
+                label=TIER_LABELS[TrustTier.DELEGATED],
                 configured=True,
                 status="unavailable",
                 message="No Lighthouse snapshot upload found",
@@ -221,6 +289,7 @@ async def check_lighthouse_health(
         if deal_count > 0:
             return TargetHealth(
                 name="lighthouse",
+                label=TIER_LABELS[TrustTier.DELEGATED],
                 configured=True,
                 status="ok",
                 message=f"Latest Lighthouse snapshot has {deal_count} Filecoin deal(s)",
@@ -229,6 +298,7 @@ async def check_lighthouse_health(
         if age is not None and age <= grace_period:
             return TargetHealth(
                 name="lighthouse",
+                label=TIER_LABELS[TrustTier.DELEGATED],
                 configured=True,
                 status="pending",
                 message="Latest Lighthouse snapshot has no deals yet but is within grace",
@@ -236,6 +306,7 @@ async def check_lighthouse_health(
             )
         return TargetHealth(
             name="lighthouse",
+            label=TIER_LABELS[TrustTier.DELEGATED],
             configured=True,
             status="warning",
             message="Latest Lighthouse snapshot has no Filecoin deals beyond grace",
@@ -244,6 +315,7 @@ async def check_lighthouse_health(
     except Exception as exc:
         return TargetHealth(
             name="lighthouse",
+            label=TIER_LABELS[TrustTier.DELEGATED],
             configured=True,
             status="error",
             message=f"Lighthouse health check failed: {exc}",
@@ -267,6 +339,7 @@ async def check_gcs_health(
     if not bucket:
         return TargetHealth(
             name="gcs",
+            label=TIER_LABELS[TrustTier.EXPEDIENT],
             configured=False,
             status="not_configured",
             message="GCS_BACKUP_BUCKET is not set",
@@ -305,6 +378,7 @@ async def check_gcs_health(
         if healthy and latest_exists:
             return TargetHealth(
                 name="gcs",
+                label=TIER_LABELS[TrustTier.EXPEDIENT],
                 configured=True,
                 status="ok",
                 message="GCS fallback is configured and latest snapshot exists",
@@ -313,6 +387,7 @@ async def check_gcs_health(
         if healthy:
             return TargetHealth(
                 name="gcs",
+                label=TIER_LABELS[TrustTier.EXPEDIENT],
                 configured=True,
                 status="warning",
                 message="GCS bucket is reachable but latest snapshot is missing",
@@ -320,6 +395,7 @@ async def check_gcs_health(
             )
         return TargetHealth(
             name="gcs",
+            label=TIER_LABELS[TrustTier.EXPEDIENT],
             configured=True,
             status="unavailable",
             message="GCS bucket is not reachable",
@@ -328,6 +404,7 @@ async def check_gcs_health(
     except Exception as exc:
         return TargetHealth(
             name="gcs",
+            label=TIER_LABELS[TrustTier.EXPEDIENT],
             configured=True,
             status="error",
             message=f"GCS health check failed: {exc}",
@@ -343,8 +420,11 @@ async def build_storage_health_report(
     gcs_prefix: str = "kestrel/",
     now: Optional[datetime] = None,
 ) -> StorageHealthReport:
-    """Build a combined Lighthouse/GCS storage health report from environment."""
-    lighthouse, gcs = await asyncio.gather(
+    """Build a combined backup storage health report from environment."""
+    sovereign_ipfs, lighthouse, gcs = await asyncio.gather(
+        check_sovereign_ipfs_health(
+            api_url=env.get("SOVEREIGN_IPFS_URL"),
+        ),
         check_lighthouse_health(
             api_key=env.get("LIGHTHOUSE_API_KEY"),
             agent_id=agent_id,
@@ -359,14 +439,19 @@ async def build_storage_health_report(
             credentials_path=env.get("GOOGLE_APPLICATION_CREDENTIALS"),
         ),
     )
-    statuses = {lighthouse.status, gcs.status}
+    statuses = {sovereign_ipfs.status, lighthouse.status, gcs.status}
     if "error" in statuses or "warning" in statuses:
         status = "warning"
     elif "ok" in statuses or "pending" in statuses:
         status = "ok"
     else:
         status = "unavailable"
-    return StorageHealthReport(status=status, lighthouse=lighthouse, gcs=gcs)
+    return StorageHealthReport(
+        status=status,
+        sovereign_ipfs=sovereign_ipfs,
+        lighthouse=lighthouse,
+        gcs=gcs,
+    )
 
 
 def load_env_file(path: Path, env: Optional[dict[str, str]] = None) -> dict[str, str]:

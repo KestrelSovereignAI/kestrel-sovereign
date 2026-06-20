@@ -104,13 +104,14 @@ Default interpretation:
 
 Storage tiers should be read as layered backups, not equivalent sovereignty:
 
-- Lighthouse is the delegated durable path: IPFS gateway access plus Filecoin
+- `sovereign-operated` is currently **none/decommissioned**. The historical
+  self-hosted Kubo VM is not an active backup tier; `SOVEREIGN_IPFS_URL` must
+  point at a reachable reprovisioned node before this tier is active.
+- `delegated-decentralized` is Lighthouse: IPFS gateway access plus Filecoin
   deals once Lighthouse aggregation completes.
-- GCS is an expedient operational fallback: fast restore on infrastructure we
-  already operate, but not decentralized.
-- Self-hosted Kubo with the GCS-backed Docker image is the sovereign path when
-  `SOVEREIGN_IPFS_URL` is configured; its blocks are backed up to GCS by the
-  IPFS container.
+- `expedient-cloud` is GCS: fast restore on centralized cloud infrastructure,
+  but not decentralized.
+- `local-only` means data stays in the local cache/disk backup path.
 
 Examples:
 

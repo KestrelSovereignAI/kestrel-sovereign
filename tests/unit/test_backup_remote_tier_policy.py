@@ -1,8 +1,10 @@
 from datetime import datetime, timezone
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 import pytest
 
+import kestrel_sovereign.kestrel_agent as kestrel_agent
 from kestrel_sovereign.storage.sync import service as sync_service
 from kestrel_sovereign.storage.sync.service import (
     RemoteTierPolicyContext,
@@ -312,3 +314,38 @@ async def test_live_privacy_mode_denies_remote_snapshot_after_target_constructio
     }
     assert local_target.snapshot_calls == 1
     assert results[local_target.name].success is True
+
+
+@pytest.mark.asyncio
+async def test_decommissioned_sovereign_ipfs_excluded_from_active_targets(monkeypatch):
+    async def fake_health(api_url):
+        return SimpleNamespace(
+            status="decommissioned",
+            message="configured node is unreachable",
+            details={"api_url": api_url},
+        )
+
+    def fail_constructor(*args, **kwargs):
+        raise AssertionError("SovereignIPFSTarget must not be constructed")
+
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.sync.health.check_sovereign_ipfs_health",
+        fake_health,
+    )
+    monkeypatch.setattr(
+        "kestrel_sovereign.storage.sync.targets.SovereignIPFSTarget",
+        fail_constructor,
+    )
+    sync = SyncService(db_path="/var/lib/kestrel/kestrel_prime.db")
+
+    added = await kestrel_agent._add_sovereign_ipfs_target_if_active(
+        sync,
+        agent_id="agent-1",
+        state_dir=None,
+        sovereign_url="http://127.0.0.1:5001",
+    )
+    results = await sync.force_snapshot()
+
+    assert added is False
+    assert sync.targets == []
+    assert "ipfs://agent-1" not in results

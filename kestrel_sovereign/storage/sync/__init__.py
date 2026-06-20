@@ -8,9 +8,9 @@ and fan out to all configured targets.
 Architecture:
     SQLite (primary) ---> SyncService ---> Targets (ordered by trust)
 
-    SOVEREIGN   Self-hosted IPFS (Kubo)
-    DELEGATED   Lighthouse (API key)
-    EXPEDIENT   GCS / S3
+    SOVEREIGN   Sovereign-operated; decommissioned by default
+    DELEGATED   Delegated-decentralized Lighthouse (API key)
+    EXPEDIENT   Expedient-cloud GCS / S3
 
 Write to all. Restore from most trusted.
 """
@@ -20,6 +20,8 @@ from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
     SyncResult,
     TrustTier,
+    TierState,
+    TIER_LABELS,
     DataClass,
     RetentionItem,
     RetentionPolicy,
@@ -36,6 +38,8 @@ __all__ = [
     "SyncTarget",
     "SyncResult",
     "TrustTier",
+    "TierState",
+    "TIER_LABELS",
     "DataClass",
     "RetentionItem",
     "RetentionPolicy",

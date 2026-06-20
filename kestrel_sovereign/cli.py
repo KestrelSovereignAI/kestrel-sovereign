@@ -642,7 +642,7 @@ def cmd_tool_log_recent_failures(args) -> int:
 
 
 def cmd_storage_health(args) -> int:
-    """Show Lighthouse deal-lag and GCS fallback health."""
+    """Show backup tier health with honest tier labels."""
     from datetime import timedelta
 
     from kestrel_sovereign.storage.sync.health import (
@@ -665,14 +665,21 @@ def cmd_storage_health(args) -> int:
         print(json.dumps(data, indent=2))
     else:
         print(f"Storage health: {report.status}")
-        for target in (report.lighthouse, report.gcs):
+        for target in (report.sovereign_ipfs, report.lighthouse, report.gcs):
             configured = "configured" if target.configured else "not configured"
-            print(f"  {target.name:12} {target.status:14} {configured}")
+            print(
+                f"  {target.name:15} {target.status:14} "
+                f"{configured} [{target.label}]"
+            )
             print(f"    {target.message}")
             if target.details:
                 cid = target.details.get("cid")
                 if cid:
                     print(f"    cid: {cid}")
+                if target.name == "sovereign_ipfs":
+                    api_url = target.details.get("api_url")
+                    if api_url:
+                        print(f"    api: {api_url}")
                 if target.name == "lighthouse":
                     deal_count = target.details.get("deal_count")
                     age_seconds = target.details.get("age_seconds")

@@ -67,7 +67,7 @@ We use **RunPod for both training AND generation** with FLUX.2-dev:
 
 | Component | Provider | Reason |
 |-----------|----------|--------|
-| **LoRA Training** | **RunPod** | FLUX.2-dev, sovereign infrastructure |
+| **LoRA Training** | **RunPod** | FLUX.2-dev, operator-controlled training |
 | **Selfie Generation** | **RunPod** | FLUX.2-dev, same pod, fast |
 
 **Training on RunPod:**
@@ -375,7 +375,7 @@ kestrel_URL=http://localhost:7777 npx playwright test tests/e2e/test_luna_runpod
 
 RunPod self-hosted training may be worth revisiting for:
 1. **Batch training** - Multiple companions on same pod amortizes overhead
-2. **Full data sovereignty** - Avatar never leaves your infrastructure
+2. **Full data control** - Avatar data stays inside the configured training environment
 3. **Custom training configs** - Full SimpleTuner control
 
 ## Current Configuration

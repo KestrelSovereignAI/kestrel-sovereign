@@ -15,8 +15,9 @@ block storage:
   (``gs://kestrel-ipfs``) so the VM is stateless.
 - ``kestrel ipfs pin [--manifest <path>]`` — take a consistent SQLite
   snapshot of every agent DB under ``agent_data/*/kestrel_prime.db``
-  and pin the snapshot via the running IPFS API. Default API:
-  ``http://localhost:5001`` (override with ``--api-url``).
+  and pin the snapshot via an explicitly running IPFS API. This is
+  direct tooling, not an active backup tier unless ``SOVEREIGN_IPFS_URL``
+  points at a reachable node.
 
 Implementation notes
 --------------------
