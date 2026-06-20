@@ -1,6 +1,6 @@
 [project]
 name = "kestrel_sovereign"
-version = "0.30.0"
+version = "0.31.0"
 description = "Kestrel Sovereign AI Agent Framework - Constitutional AI with cryptographic identity"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
