@@ -17,6 +17,15 @@ class _PrivacyConfig:
     def allows_cloud_llm(self):
         return self._allows_cloud
 
+    def is_ephemeral(self):
+        return False
+
+    def uses_temp_storage(self):
+        return False
+
+    def requires_deidentification(self):
+        return False
+
 
 class _PrivacyAgent:
     def __init__(self):

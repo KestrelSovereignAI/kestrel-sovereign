@@ -320,6 +320,11 @@ class TestPostResponsePipeline:
             agent,
             KestrelAgent,
         )
+        agent._privacy_blocks_background_memory = (
+            KestrelAgent._privacy_blocks_background_memory.__get__(
+                agent, KestrelAgent
+            )
+        )
 
         # Memory system
         agent.memory_system = MagicMock()
