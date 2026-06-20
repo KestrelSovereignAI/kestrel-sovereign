@@ -81,7 +81,8 @@ class ConversationManager:
         llm_service,
         counter,
         preserve_recent: int = 10,
-        force: bool = False
+        force: bool = False,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Compact the current session by summarizing older messages.
@@ -97,13 +98,27 @@ class ConversationManager:
             counter: TokenCounter for token counting
             preserve_recent: Number of recent messages to keep verbatim
             force: Compact even if utilization is low
+            session_id: When provided, compact ONLY that session's messages and
+                tag the summary marker to it — so a caller that immediately
+                reseeds that session (e.g. openai:plan thread reset, #1844
+                Stage 2) sees the summary in the session-filtered history rather
+                than a marker written under an implicit/different session. When
+                ``None`` (e.g. the global ``!compact``), behaviour is unchanged:
+                compact across the agent's full history.
 
         Returns:
             Dict with compaction results (messages_compacted, tokens_saved, etc.)
         """
-        # Compaction needs full unfiltered history to see what to compact
         conv_store = self._get_conversation_store()
-        if conv_store:
+        if session_id is not None:
+            # Session-scoped: filtered, session-aware history (already excludes
+            # previously-compacted messages). High limit to capture the whole
+            # session, not just the recent window.
+            history = await self.get_conversation_history(
+                session_id=session_id, limit=10000
+            )
+        elif conv_store:
+            # Global: full unfiltered history to see what to compact.
             history = await conv_store.get_full_history()
         else:
             history = await self.get_conversation_history()
@@ -154,14 +169,34 @@ CONVERSATION:
 SUMMARY:"""
 
         try:
-            # Generate summary using LLM
+            # Generate summary using LLM. NOTE: LLMService.generate is
+            # keyword-only and requires ``user_prompt`` (not ``prompt``) —
+            # passing ``prompt=`` raised TypeError that the broad except below
+            # swallowed into success=False, silently no-opping ALL compaction
+            # (incl. !compact) in production until #1844 Stage 2.
             summary_response = await llm_service.generate(
-                prompt=summary_prompt,
                 system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
-                model_override=None  # Use default model
+                user_prompt=summary_prompt,
+                model_override=None,  # Use default model
             )
 
-            summary_text = summary_response.strip() if isinstance(summary_response, str) else str(summary_response)
+            if isinstance(summary_response, str):
+                summary_text = summary_response.strip()
+            else:
+                # generate may return an LLMResponse — pull its text, never the
+                # repr (str(LLMResponse) would poison the summary marker).
+                summary_text = (
+                    getattr(summary_response, "content", None) or ""
+                ).strip()
+
+            # An empty summary would replace real history with nothing —
+            # refuse rather than destroy context.
+            if not summary_text:
+                return {
+                    "success": False,
+                    "reason": "Summarizer returned empty text",
+                    "message_count": message_count,
+                }
 
             # Count tokens saved
             tokens_after = counter.count(summary_text)
@@ -199,7 +234,12 @@ SUMMARY:"""
                 await conv_store.add_conversation(
                     role="system",
                     content=compaction_marker["content"],
-                    metadata=compaction_marker["metadata"]
+                    metadata=compaction_marker["metadata"],
+                    # Tag the marker to the SAME session being reseeded so it
+                    # appears in the session-filtered history (#1844 Stage 2).
+                    # None preserves the legacy implicit-session behaviour for
+                    # global !compact.
+                    session_id=session_id,
                 )
 
                 # Get the ID of the compaction marker we just created

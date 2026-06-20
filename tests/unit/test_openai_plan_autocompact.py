@@ -114,3 +114,48 @@ async def test_threshold_env_override(monkeypatch):
     agent = _fake_agent(primary_adapter=codex, compact_result={"success": True})
     await KestrelAgent._maybe_compact_codex_thread(agent, "s")
     assert agent.context_manager.compact_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_compact_session_real_generate_signature_and_session_tagging():
+    """#1844 Stage 2 P1+P2: compact_session must call generate with the REAL
+    keyword-only signature (user_prompt, not prompt) — the prior prompt= call
+    TypeError'd into a silent no-op — AND tag the summary marker to the
+    reseeded session so it survives the fresh-thread reseed."""
+    from unittest.mock import AsyncMock, MagicMock
+    from kestrel_sovereign.agent.context_manager import ContextManager
+
+    captured = {}
+
+    async def strict_generate(*, system_prompt, user_prompt, model_override=None, **kw):
+        # Keyword-only + requires user_prompt: passing prompt= would TypeError.
+        captured["user_prompt"] = user_prompt
+        return "SUMMARY: key points preserved."
+
+    llm = MagicMock()
+    llm.generate = strict_generate
+
+    msgs = [
+        {"id": i, "role": "user" if i % 2 == 0 else "assistant",
+         "content": f"message {i} with content"}
+        for i in range(20)
+    ]
+    storage = MagicMock()
+    storage.conversation = AsyncMock()
+    storage.conversation.get_conversation_history = AsyncMock(return_value=msgs)
+    storage.conversation.add_conversation = AsyncMock()
+    storage.conversation.update_messages_metadata = AsyncMock()
+    storage.conversation.db = AsyncMock()
+    storage.conversation.db.fetchone = AsyncMock(return_value=[999])
+    storage.conversation.agent_id = "agent-x"
+
+    mgr = ContextManager(storage=storage, model="gpt-4")
+    result = await mgr.compact_session(
+        llm_service=llm, preserve_recent=5, session_id="sess-1"
+    )
+
+    assert result["success"] is True, result
+    assert captured.get("user_prompt"), "generate must be called with user_prompt"
+    # Summary marker tagged to the reseeded session (P2).
+    add_kwargs = storage.conversation.add_conversation.call_args.kwargs
+    assert add_kwargs.get("session_id") == "sess-1"

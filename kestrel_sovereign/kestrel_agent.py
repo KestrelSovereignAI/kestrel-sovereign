@@ -2374,7 +2374,11 @@ Expected Duration: {expected_duration}
         if getattr(self, "context_manager", None) is None:
             return
         try:
-            result = await self.context_manager.compact_session(self.llm_service)
+            # Scope to THIS session so the summary marker lands in the same
+            # session-filtered history the fresh codex thread will reseed from.
+            result = await self.context_manager.compact_session(
+                self.llm_service, session_id=session_id
+            )
         except Exception as e:  # noqa: BLE001 - never break a turn
             logging.warning(
                 "openai:plan auto-compaction failed at %.1f%% occupancy: %s",
