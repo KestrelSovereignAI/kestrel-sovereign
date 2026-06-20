@@ -48,7 +48,35 @@ PRIVACY_TIER_POLICY = {
     PrivacyMode.ANONYMOUS: [StorageTier.LOCAL, StorageTier.BROWSER, StorageTier.CLOUD_HOT],
     PrivacyMode.NORMAL: [StorageTier.LOCAL, StorageTier.BROWSER, StorageTier.CLOUD_HOT, StorageTier.CLOUD_COLD],
     PrivacyMode.PUBLIC: [StorageTier.LOCAL, StorageTier.BROWSER, StorageTier.CLOUD_HOT, StorageTier.CLOUD_COLD],
+    PrivacyMode.DEIDENTIFIED: [StorageTier.LOCAL, StorageTier.BROWSER],
 }
+
+REMOTE_STORAGE_TIERS = {
+    StorageTier.CLOUD_HOT,
+    StorageTier.CLOUD_COLD,
+    StorageTier.IPFS,
+    StorageTier.FILECOIN,
+    StorageTier.ENCRYPTED_FILECOIN,
+}
+
+
+def allowed_tiers_for_privacy_mode(privacy_mode: str) -> List[StorageTier]:
+    """Return the storage tiers allowed by the canonical privacy tier map."""
+    mode = privacy_mode
+    if isinstance(privacy_mode, str):
+        try:
+            mode = PrivacyMode(privacy_mode)
+        except ValueError:
+            return []
+    return PRIVACY_TIER_POLICY.get(mode, [])
+
+
+def privacy_allows_remote_tiers(privacy_mode: str) -> bool:
+    """Whether this privacy mode permits any non-local storage tier."""
+    return any(
+        tier in REMOTE_STORAGE_TIERS
+        for tier in allowed_tiers_for_privacy_mode(privacy_mode)
+    )
 
 
 class TieredStorageManager:
@@ -95,7 +123,12 @@ class TieredStorageManager:
         Args:
             mode: Privacy mode (ephemeral, isolated, anonymous, normal, public)
         """
-        if mode not in PRIVACY_TIER_POLICY:
+        if isinstance(mode, str):
+            try:
+                PrivacyMode(mode)
+            except ValueError:
+                raise ValueError(f"Unknown privacy mode: {mode}") from None
+        elif mode not in PRIVACY_TIER_POLICY:
             raise ValueError(f"Unknown privacy mode: {mode}")
         self._privacy_mode = mode
         logger.info(f"🔒 Privacy mode set to: {mode}")
@@ -107,7 +140,7 @@ class TieredStorageManager:
         Returns:
             List of available StorageTier values
         """
-        allowed = PRIVACY_TIER_POLICY.get(self._privacy_mode, [])
+        allowed = allowed_tiers_for_privacy_mode(self._privacy_mode)
         return [
             tier for tier in allowed
             if tier in self._providers and self._providers[tier].is_available()
