@@ -254,22 +254,50 @@ def _agent_from_manifest_filename(filename: str) -> str | None:
     return None
 
 
+def _coerce_cid(value: Any) -> str | None:
+    """Extract a CID string from a scalar or a dict entry in a collection."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("cid", "Hash", "hash", "snapshot_cid", "payload_cid"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+    return None
+
+
 def _manifest_cid_entries(manifest: Mapping[str, Any]) -> dict[str, str]:
     entries: dict[str, str] = {}
+    # Scalar CID fields across current + historical manifest formats.
     for key, kind in (
         ("snapshot_cid", "snapshot"),
         ("snapshot_payload_cid", "snapshot_payload"),
+        ("cid", "snapshot"),
+        ("state_cid", "snapshot"),
+        ("backup_cid", "snapshot"),
     ):
+        cid = _coerce_cid(manifest.get(key))
+        if cid:
+            entries.setdefault(cid, kind)
+    # Collection CID fields (lists of CIDs or of {cid: ...} dicts).
+    for key in ("snapshots", "snapshot_cids", "files", "items"):
         value = manifest.get(key)
-        if isinstance(value, str) and value.strip():
-            entries[value.strip()] = kind
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                cid = _coerce_cid(item)
+                if cid:
+                    entries.setdefault(cid, "snapshot")
     return entries
 
 
 def _manifest_schema_valid(manifest: Mapping[str, Any]) -> bool:
-    if not isinstance(manifest.get("snapshot_cid"), str):
+    # Valid if the manifest references at least one snapshot CID by any
+    # supported field (current or historical). Don't hard-require
+    # snapshot_cid — older manifests used cid/state_cid/backup_cid/etc.
+    if not _manifest_cid_entries(manifest):
         return False
     optional_strings = (
+        "snapshot_cid",
         "snapshot_payload_cid",
         "snapshot_format",
         "uploaded_at",
@@ -300,11 +328,15 @@ def _valid_manifest_agent(
     filename: str,
 ) -> str | None:
     filename_agent = _agent_from_manifest_filename(filename)
-    body_agent = manifest.get("agent_id")
-    if not isinstance(body_agent, str) or not body_agent.strip():
+    raw_body = manifest.get("agent_id")
+    body_agent = raw_body.strip() if isinstance(raw_body, str) and raw_body.strip() else None
+    # Reject when both are present and disagree (provenance mismatch).
+    if body_agent and filename_agent and body_agent != filename_agent:
         return None
-    agent_id = body_agent.strip()
-    if filename_agent is not None and filename_agent != agent_id:
+    # Fall back to filename attribution when the body lacks agent_id (legacy
+    # manifest_<agent>.json / kestrel_manifest__<agent>__... formats).
+    agent_id = body_agent or filename_agent
+    if not agent_id:
         return None
     if not _manifest_schema_valid(manifest):
         return None

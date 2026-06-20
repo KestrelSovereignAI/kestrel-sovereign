@@ -521,3 +521,39 @@ def test_parse_gsutil_ls_handles_real_single_token_iso_timestamp():
     assert latest.protected is True
     # Timestamps resolved from the ISO token, not None.
     assert all(r.timestamp is not None for r in records)
+
+
+def test_manifest_agent_falls_back_to_filename_when_body_missing_agent_id():
+    # Legacy manifest_<agent>.json with no agent_id in body -> attribute via filename.
+    agent = backup_cleanup._valid_manifest_agent(
+        {"snapshot_cid": "cid-1"},
+        filename="manifest_did:pkh:eip155:1:0xABC.json",
+    )
+    assert agent == "did:pkh:eip155:1:0xABC"
+    # Body present + matching filename still works.
+    assert backup_cleanup._valid_manifest_agent(
+        {"agent_id": "agent-a", "snapshot_cid": "cid-1"},
+        filename="manifest_agent-a.json",
+    ) == "agent-a"
+    # Body vs filename mismatch is still rejected (provenance guard).
+    assert backup_cleanup._valid_manifest_agent(
+        {"agent_id": "agent-x", "snapshot_cid": "cid-1"},
+        filename="manifest_agent-b.json",
+    ) is None
+
+
+def test_manifest_cid_entries_parses_legacy_and_collection_fields():
+    # Historical scalar fields.
+    entries = backup_cleanup._manifest_cid_entries(
+        {"cid": "cid-legacy", "state_cid": "cid-state", "backup_cid": "cid-bak"}
+    )
+    assert {"cid-legacy", "cid-state", "cid-bak"} <= set(entries)
+    # Collection fields: list of strings and list of {cid: ...} dicts.
+    entries = backup_cleanup._manifest_cid_entries(
+        {"snapshots": ["cid-a", {"cid": "cid-b"}], "snapshot_cids": ["cid-c"]}
+    )
+    assert {"cid-a", "cid-b", "cid-c"} <= set(entries)
+    # A manifest using only legacy fields is still schema-valid (has a CID).
+    assert backup_cleanup._manifest_schema_valid({"cid": "cid-legacy"}) is True
+    # A manifest with no CID at all is invalid.
+    assert backup_cleanup._manifest_schema_valid({"agent_id": "agent-a"}) is False
