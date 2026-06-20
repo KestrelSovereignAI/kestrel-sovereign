@@ -22,6 +22,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, Any
 
+from kestrel_sovereign.storage.sync.retention import RetentionPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -136,6 +138,15 @@ class SyncTarget(ABC):
         """Check if target is reachable and healthy."""
         return True
 
+    async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
+        """Apply backup retention after a successful snapshot.
+
+        Targets that cannot enumerate their remote objects should override only
+        when they can safely delete. The default no-op keeps older targets
+        compatible and makes pruning best-effort.
+        """
+        return {"deleted": 0, "skipped": True, "reason": "not_supported"}
+
 
 # ---------------------------------------------------------------------------
 # Re-export provider classes for backward compatibility.
@@ -149,12 +160,23 @@ from kestrel_sovereign.storage.sync.s3_target import S3Target  # noqa: E402, F40
 from kestrel_sovereign.storage.sync.gcs_target import GCSTarget  # noqa: E402, F401
 from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget  # noqa: E402, F401
 from kestrel_sovereign.storage.sync.sovereign_ipfs_target import SovereignIPFSTarget  # noqa: E402, F401
+from kestrel_sovereign.storage.sync.retention import (  # noqa: E402, F401
+    DataClass,
+    RetentionItem,
+    classify,
+    load_retention_policy,
+)
 
 __all__ = [
     "TrustTier",
     "SyncResult",
     "SyncTarget",
     "_create_consistent_snapshot",
+    "DataClass",
+    "RetentionItem",
+    "RetentionPolicy",
+    "classify",
+    "load_retention_policy",
     "S3Target",
     "GCSTarget",
     "LighthouseTarget",

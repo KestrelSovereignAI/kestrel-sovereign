@@ -15,6 +15,12 @@ from typing import Any, Dict, Optional
 
 from kestrel_sovereign.storage.car_builder import CARBuilder, CARReader
 from kestrel_sovereign.storage.sync.manifest_manager import ManifestManagerMixin
+from kestrel_sovereign.storage.sync.retention import (
+    RetentionItem,
+    RetentionPolicy,
+    classify,
+    parse_timestamp,
+)
 from kestrel_sovereign.storage.sync.targets import (
     SyncTarget,
     SyncResult,
@@ -376,6 +382,81 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         in SyncService._sync_pending() is never true.
         """
         return 2**63
+
+    async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
+        """Prune Lighthouse upload records when the API can enumerate/delete."""
+        from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+
+        snapshot_tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
+        manifest_tag = f"{self.MANIFEST_TAG}-{self.agent_id}"
+        client = LighthouseRestClient(api_key=self.api_key)
+        try:
+            uploads: list[Dict[str, Any]] = []
+            last_key = None
+            while True:
+                page = await client.get_uploads(last_key=last_key)
+                file_list = page.get("fileList", [])
+                if not isinstance(file_list, list):
+                    break
+                uploads.extend(file_list)
+                last_key = page.get("lastKey") or page.get("nextLastKey")
+                if not last_key or len(file_list) == 0:
+                    break
+
+            items: list[RetentionItem] = []
+            for upload in uploads:
+                tag = upload.get("tag")
+                if tag not in {snapshot_tag, manifest_tag}:
+                    continue
+                cid = (
+                    upload.get("cid")
+                    or upload.get("Hash")
+                    or upload.get("hash")
+                    or upload.get("fileHash")
+                )
+                if not cid:
+                    continue
+                ts = parse_timestamp(
+                    upload.get("createdAt")
+                    or upload.get("created_at")
+                    or upload.get("uploadedAt")
+                    or upload.get("timestamp")
+                )
+                if ts is None:
+                    logger.debug(
+                        "Lighthouse retention skipped upload without timestamp: %s",
+                        cid,
+                    )
+                    continue
+                role = "identity" if tag == manifest_tag else "snapshot"
+                item_data = {
+                    "role": role,
+                    "tag": tag,
+                    "fileName": upload.get("fileName") or upload.get("Name"),
+                    "cid": cid,
+                }
+                items.append(
+                    RetentionItem(
+                        key=str(cid),
+                        name=str(item_data.get("fileName") or cid),
+                        timestamp=ts,
+                        data_class=classify(item_data),
+                        metadata=upload,
+                    )
+                )
+
+            deletions = policy.deletions(items)
+            deleted = []
+            for item in deletions:
+                await client.delete_file(item.key)
+                deleted.append(item.key)
+            return {
+                "deleted": len(deleted),
+                "cids": deleted,
+                "scanned": len(items),
+            }
+        finally:
+            await client.close()
 
     async def health_check(self) -> bool:
         """Check Lighthouse API connectivity."""

@@ -7,8 +7,14 @@ Amazon S3 / S3-compatible storage target for database snapshots and WAL segments
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
+from kestrel_sovereign.storage.sync.retention import (
+    RetentionItem,
+    RetentionPolicy,
+    classify,
+    parse_timestamp,
+)
 from kestrel_sovereign.storage.sync.targets import SyncTarget, SyncResult, TrustTier
 
 logger = logging.getLogger(__name__)
@@ -207,6 +213,60 @@ class S3Target(SyncTarget):
         except Exception as e:
             logger.warning(f"Failed to get WAL position from S3: {e}")
             return None
+
+    async def prune(self, policy: RetentionPolicy) -> Dict[str, Any]:
+        """Prune timestamped S3 snapshots and WAL segments."""
+        client = await self._get_client()
+        prefixes = (f"{self.prefix}snapshots/", f"{self.prefix}wal/")
+        items: list[RetentionItem] = []
+
+        for prefix in prefixes:
+            continuation_token = None
+            while True:
+                kwargs: Dict[str, Any] = {"Bucket": self.bucket, "Prefix": prefix}
+                if continuation_token:
+                    kwargs["ContinuationToken"] = continuation_token
+                response = await client.list_objects_v2(**kwargs)
+                for obj in response.get("Contents", []):
+                    key = obj.get("Key")
+                    if not key or key in {
+                        f"{self.prefix}latest_snapshot",
+                        f"{self.prefix}wal_position",
+                    }:
+                        continue
+                    ts = parse_timestamp(key) or parse_timestamp(obj.get("LastModified"))
+                    if ts is None:
+                        logger.debug("S3 retention skipped object without timestamp: %s", key)
+                        continue
+                    role = "wal" if "/wal/" in key else "snapshot"
+                    items.append(
+                        RetentionItem(
+                            key=key,
+                            name=Path(key).name,
+                            timestamp=ts,
+                            data_class=classify({"key": key, "role": role}),
+                        )
+                    )
+                if not response.get("IsTruncated"):
+                    break
+                continuation_token = response.get("NextContinuationToken")
+                if not continuation_token:
+                    break
+
+        deletions = policy.deletions(items)
+        # S3 DeleteObjects accepts at most 1000 keys per request; batch so a
+        # large backlog doesn't fail the whole prune (and delete nothing).
+        for batch_start in range(0, len(deletions), 1000):
+            batch = deletions[batch_start:batch_start + 1000]
+            await client.delete_objects(
+                Bucket=self.bucket,
+                Delete={"Objects": [{"Key": item.key} for item in batch]},
+            )
+        return {
+            "deleted": len(deletions),
+            "keys": [item.key for item in deletions],
+            "scanned": len(items),
+        }
 
     async def health_check(self) -> bool:
         """Check S3 connectivity."""

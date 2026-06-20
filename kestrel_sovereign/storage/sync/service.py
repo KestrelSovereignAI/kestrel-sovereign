@@ -15,6 +15,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Any
 
+from kestrel_sovereign.storage.sync.retention import (
+    RetentionPolicy,
+    load_retention_policy,
+)
 from kestrel_sovereign.storage.sync.targets import SyncTarget, SyncResult, TrustTier
 from kestrel_sovereign.storage.tiered_manager import privacy_allows_remote_tiers
 
@@ -190,6 +194,7 @@ class SyncService:
         on_error: Optional[Callable] = None,
         policy_context: Optional[RemoteTierPolicyContext] = None,
         policy_context_provider: Optional[Callable[[], RemoteTierPolicyContext]] = None,
+        retention_policy: Optional[RetentionPolicy] = None,
     ):
         self.db_path = Path(db_path)
         self.state_file = Path(state_file) if state_file else Path(f"{db_path}.sync")
@@ -200,6 +205,7 @@ class SyncService:
         self._policy_skips: Dict[str, SyncResult] = {}
         self._policy_context = policy_context
         self._policy_context_provider = policy_context_provider
+        self._retention_policy = retention_policy or load_retention_policy()
         self._state: Optional[SyncState] = None
         self._poll_task: Optional[asyncio.Task] = None
 
@@ -418,6 +424,8 @@ class SyncService:
                     continue
             try:
                 result = await target.sync_snapshot(self.db_path)
+                if result.success:
+                    await self._prune_after_success(target, result)
                 results[target.name] = result
                 self._update_stats(result)
                 if self.on_sync:
@@ -440,6 +448,23 @@ class SyncService:
             await self._save_state()
 
         return results
+
+    async def _prune_after_success(
+        self,
+        target: SyncTarget,
+        result: SyncResult,
+    ) -> None:
+        try:
+            prune_result = await target.prune(self._retention_policy)
+            if prune_result:
+                metadata = dict(result.metadata or {})
+                metadata["prune"] = prune_result
+                result.metadata = metadata
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Retention prune failed for %s: %s", target.name, e)
+            metadata = dict(result.metadata or {})
+            metadata["prune_error"] = str(e)
+            result.metadata = metadata
 
     async def restore_by_trust(self, dest_path: Path) -> Optional[SyncResult]:
         """Restore from the most trusted available target.
