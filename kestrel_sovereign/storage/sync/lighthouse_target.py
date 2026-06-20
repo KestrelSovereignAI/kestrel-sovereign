@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -48,6 +49,8 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
     SNAPSHOT_TAG = "kestrel-state"
     MANIFEST_TAG = "kestrel-manifest"
     SNAPSHOT_FORMAT_CAR_V1 = "car-v1/raw-sqlite"
+    SNAPSHOT_NAME_PREFIX = "kestrel_state"
+    MANIFEST_NAME_PREFIX = "kestrel_manifest"
 
     def __init__(
         self,
@@ -109,8 +112,14 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             client = LighthouseRestClient(api_key=self.api_key)
 
             tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
+            timestamp_token = self._timestamp_token(timestamp)
+            snapshot_filename = self._structured_snapshot_filename(timestamp_token)
             car_bytes, payload_cid = self._build_snapshot_car(content)
-            result = await client.upload_car(car_bytes=car_bytes, tag=tag)
+            result = await client.upload_car(
+                car_bytes=car_bytes,
+                tag=tag,
+                filename=snapshot_filename,
+            )
 
             cid = result.get("Hash") or result.get("cid")
             size = int(result.get("Size", len(car_bytes)))
@@ -130,6 +139,7 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
                 "snapshot_payload_cid": payload_cid,
                 "raw_snapshot_size": len(content),
                 "uploaded_at": timestamp.isoformat(),
+                "upload_name": snapshot_filename,
                 "source_file": db_path.name,
                 "content_hash": content_hash,
             }
@@ -161,15 +171,21 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         try:
             manifest_bytes = json.dumps(manifest, indent=2).encode("utf-8")
             tag = f"{self.MANIFEST_TAG}-{self.agent_id}"
+            manifest_time = parse_timestamp(manifest.get("uploaded_at")) or datetime.now(
+                timezone.utc
+            )
+            timestamp_token = self._timestamp_token(manifest_time)
+            manifest_filename = self._structured_manifest_filename(timestamp_token)
 
             result = await client.upload(
                 content=manifest_bytes,
-                filename=f"manifest_{self.agent_id}.json",
+                filename=manifest_filename,
                 tag=tag,
             )
 
             manifest_cid = result.get("Hash") or result.get("cid")
             manifest["manifest_cid"] = manifest_cid
+            manifest["manifest_upload_name"] = manifest_filename
             self._save_local_manifest(manifest)
             logger.debug(f"Uploaded manifest to Lighthouse: {manifest_cid}")
 
@@ -251,6 +267,66 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         builder.set_root(payload_cid)
         return builder.build(), payload_cid
 
+    def _filename_agent_id(self) -> str:
+        return self.agent_id.replace("/", "_")
+
+    def _timestamp_token(self, timestamp: datetime) -> str:
+        return timestamp.astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    def _structured_snapshot_filename(self, timestamp_token: str) -> str:
+        return (
+            f"{self.SNAPSHOT_NAME_PREFIX}__{self._filename_agent_id()}__"
+            f"{timestamp_token}.car"
+        )
+
+    def _structured_manifest_filename(self, timestamp_token: str) -> str:
+        return (
+            f"{self.MANIFEST_NAME_PREFIX}__{self._filename_agent_id()}__"
+            f"{timestamp_token}.json"
+        )
+
+    def _upload_filename(self, upload: Dict[str, Any]) -> str:
+        return str(upload.get("fileName") or upload.get("Name") or "")
+
+    def _upload_cid(self, upload: Dict[str, Any]) -> Optional[str]:
+        for key in ("cid", "Hash", "hash", "fileHash", "CID"):
+            value = upload.get(key)
+            if value:
+                return str(value)
+        return None
+
+    def _upload_timestamp(self, upload: Dict[str, Any]) -> datetime:
+        filename = self._upload_filename(upload)
+        return (
+            parse_timestamp(
+                upload.get("createdAt")
+                or upload.get("created_at")
+                or upload.get("uploadedAt")
+                or upload.get("timestamp")
+            )
+            or parse_timestamp(filename)
+            or datetime.min.replace(tzinfo=timezone.utc)
+        )
+
+    def _is_structured_snapshot_upload(self, upload: Dict[str, Any]) -> bool:
+        return self._upload_filename(upload).startswith(
+            f"{self.SNAPSHOT_NAME_PREFIX}__{self._filename_agent_id()}__"
+        ) and self._upload_filename(upload).endswith(".car")
+
+    def _is_structured_manifest_upload(self, upload: Dict[str, Any]) -> bool:
+        return self._upload_filename(upload).startswith(
+            f"{self.MANIFEST_NAME_PREFIX}__{self._filename_agent_id()}__"
+        ) and self._upload_filename(upload).endswith(".json")
+
+    def _is_legacy_agent_manifest_upload(self, upload: Dict[str, Any]) -> bool:
+        return self._upload_filename(upload) == f"manifest_{self.agent_id}.json"
+
+    def _is_legacy_wal_upload(self, upload: Dict[str, Any]) -> bool:
+        filename = self._upload_filename(upload)
+        return bool(
+            re.search(r"(^|[._-])wal($|[._-])", filename)
+        ) or filename.endswith("-wal")
+
     def _extract_snapshot_content(self, content: bytes) -> bytes:
         """Return raw SQLite bytes from CAR snapshots, preserving legacy raw files."""
         try:
@@ -301,45 +377,38 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
             client = LighthouseRestClient(api_key=self.api_key)
-            result = await client.get_uploads()
-            await client.close()
+            try:
+                result = await client.get_uploads()
+            finally:
+                await client.close()
 
             uploads = result.get("fileList", [])
             if not isinstance(uploads, list):
                 return None
 
-            # Filter for our agent's snapshots by filename pattern
-            tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
             agent_snapshots = [
-                u for u in uploads
-                if u.get("tag") == tag or (
-                    u.get("fileName", "").startswith("kestrel")
-                    and u.get("fileName", "").endswith(".db")
-                )
+                u for u in uploads if self._is_structured_snapshot_upload(u)
             ]
+            if agent_snapshots:
+                latest = max(agent_snapshots, key=self._upload_timestamp)
+                cid = self._upload_cid(latest)
+                logger.info(f"Found latest snapshot via uploads API: {cid}")
+                return cid
 
-            if not agent_snapshots:
-                # Try manifest files as fallback
-                manifest_tag = f"{self.MANIFEST_TAG}-{self.agent_id}"
-                manifests = [u for u in uploads if u.get("tag") == manifest_tag]
-                if manifests:
-                    # Get the most recent manifest
-                    manifests.sort(
-                        key=lambda u: u.get("createdAt", ""), reverse=True
-                    )
-                    manifest_cid = manifests[0].get("cid") or manifests[0].get("Hash")
-                    if manifest_cid:
-                        return await self._read_manifest_cid(manifest_cid)
+            manifests = [
+                u
+                for u in uploads
+                if self._is_structured_manifest_upload(u)
+                or self._is_legacy_agent_manifest_upload(u)
+            ]
+            if not manifests:
                 return None
 
-            # Sort by creation time (most recent first)
-            agent_snapshots.sort(
-                key=lambda u: u.get("createdAt", ""), reverse=True
-            )
-
-            cid = agent_snapshots[0].get("cid") or agent_snapshots[0].get("Hash")
-            logger.info(f"Found latest snapshot via uploads API: {cid}")
-            return cid
+            latest_manifest = max(manifests, key=self._upload_timestamp)
+            manifest_cid = self._upload_cid(latest_manifest)
+            if manifest_cid:
+                return await self._read_manifest_cid(manifest_cid)
+            return None
 
         except Exception as e:
             logger.warning(f"Failed to query Lighthouse uploads API: {e}")
@@ -354,6 +423,14 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
             content = await client.download(manifest_cid)
             await client.close()
             manifest = json.loads(content)
+            manifest_agent = manifest.get("agent_id")
+            if manifest_agent and manifest_agent != self.agent_id:
+                logger.warning(
+                    "Ignoring Lighthouse manifest %s for different agent_id: %s",
+                    manifest_cid,
+                    manifest_agent,
+                )
+                return None
             return manifest.get("snapshot_cid")
         except Exception as e:
             logger.warning(f"Failed to read manifest {manifest_cid}: {e}")
@@ -387,8 +464,6 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         """Prune Lighthouse upload records when the API can enumerate/delete."""
         from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
 
-        snapshot_tag = f"{self.SNAPSHOT_TAG}-{self.agent_id}"
-        manifest_tag = f"{self.MANIFEST_TAG}-{self.agent_id}"
         client = LighthouseRestClient(api_key=self.api_key)
         try:
             uploads: list[Dict[str, Any]] = []
@@ -405,34 +480,30 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
             items: list[RetentionItem] = []
             for upload in uploads:
-                tag = upload.get("tag")
-                if tag not in {snapshot_tag, manifest_tag}:
+                if self._is_legacy_wal_upload(upload):
+                    role = "wal"
+                elif self._is_structured_snapshot_upload(upload):
+                    role = "snapshot"
+                elif self._is_structured_manifest_upload(
+                    upload
+                ) or self._is_legacy_agent_manifest_upload(upload):
+                    role = "identity"
+                else:
                     continue
-                cid = (
-                    upload.get("cid")
-                    or upload.get("Hash")
-                    or upload.get("hash")
-                    or upload.get("fileHash")
-                )
+                cid = self._upload_cid(upload)
                 if not cid:
                     continue
-                ts = parse_timestamp(
-                    upload.get("createdAt")
-                    or upload.get("created_at")
-                    or upload.get("uploadedAt")
-                    or upload.get("timestamp")
-                )
+                ts = self._upload_timestamp(upload)
                 if ts is None:
                     logger.debug(
                         "Lighthouse retention skipped upload without timestamp: %s",
                         cid,
                     )
                     continue
-                role = "identity" if tag == manifest_tag else "snapshot"
                 item_data = {
                     "role": role,
-                    "tag": tag,
-                    "fileName": upload.get("fileName") or upload.get("Name"),
+                    "tag": upload.get("tag"),
+                    "fileName": self._upload_filename(upload),
                     "cid": cid,
                 }
                 items.append(

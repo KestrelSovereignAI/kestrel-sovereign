@@ -5,12 +5,14 @@ Tests restore_snapshot, CID tracking, manifest upload/download, and cold-start f
 """
 
 import json
+import re
 import pytest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch, MagicMock
 
 from kestrel_sovereign.storage.car_builder import CARBuilder
+from kestrel_sovereign.storage.sync.retention import RetentionPolicy
 from kestrel_sovereign.storage.sync.targets import LighthouseTarget, SyncResult
 
 
@@ -110,7 +112,13 @@ def _mock_rest_client(upload_responses=None, download_content=None, uploads_list
         mock_client.upload = AsyncMock(return_value={"Hash": "QmDefault", "Size": "0"})
 
     mock_client.download = AsyncMock(return_value=download_content or b"")
-    mock_client.get_uploads = AsyncMock(return_value={"fileList": uploads_list or [], "totalFiles": len(uploads_list or [])})
+    mock_client.get_uploads = AsyncMock(
+        return_value={
+            "fileList": uploads_list or [],
+            "totalFiles": len(uploads_list or []),
+        }
+    )
+    mock_client.delete_file = AsyncMock(return_value={"deleted": True})
     mock_client.get_balance = AsyncMock(return_value=balance_data or {"data": {"dataUsed": "0"}})
     mock_client.close = AsyncMock()
 
@@ -149,6 +157,11 @@ class TestSyncSnapshot:
         assert result.metadata["format"] == "car-v1/raw-sqlite"
         assert target._latest_cid == "QmSnapshot123"
         mock_client.upload_car.assert_awaited_once()
+        upload_car_kwargs = mock_client.upload_car.await_args.kwargs
+        assert re.fullmatch(
+            r"kestrel_state__agent-1__\d{8}_\d{6}\.car",
+            upload_car_kwargs["filename"],
+        )
 
         # Verify manifest was saved locally
         manifest = target._load_local_manifest()
@@ -157,6 +170,10 @@ class TestSyncSnapshot:
         assert manifest["snapshot_format"] == "car-v1/raw-sqlite"
         assert manifest["raw_snapshot_size"] == len(b"SQLite database content")
         assert manifest["snapshot_payload_cid"].startswith("b")
+        assert re.fullmatch(
+            r"kestrel_manifest__agent-1__\d{8}_\d{6}\.json",
+            manifest["manifest_upload_name"],
+        )
 
     @pytest.mark.asyncio
     async def test_sync_snapshot_upload_failure(self, target, tmp_path):
@@ -420,12 +437,21 @@ class TestQueryUploadsAPI:
         return LighthouseTarget(api_key="test-key", agent_id="agent-1")
 
     @pytest.mark.asyncio
-    async def test_finds_snapshot_by_tag(self, target):
-        """Should find latest snapshot matching agent tag."""
+    async def test_finds_snapshot_by_structured_agent_filename(self, target):
+        """Should find latest snapshot matching agent-scoped structured name."""
         uploads = [
-            {"tag": "kestrel-state-agent-1", "cid": "QmOlder", "createdAt": "2026-01-01T00:00:00Z"},
-            {"tag": "kestrel-state-agent-1", "cid": "QmNewer", "createdAt": "2026-02-01T00:00:00Z"},
-            {"tag": "kestrel-state-other-agent", "cid": "QmOther", "createdAt": "2026-03-01T00:00:00Z"},
+            {
+                "fileName": "kestrel_state__agent-1__20260101_000000.car",
+                "cid": "QmOlder",
+            },
+            {
+                "fileName": "kestrel_state__agent-1__20260201_000000.car",
+                "cid": "QmNewer",
+            },
+            {
+                "fileName": "kestrel_state__agent-2__20260301_000000.car",
+                "cid": "QmOther",
+            },
         ]
 
         mock_client = _mock_rest_client(uploads_list=uploads)
@@ -437,6 +463,74 @@ class TestQueryUploadsAPI:
             cid = await target._query_uploads_api()
 
         assert cid == "QmNewer"
+
+    @pytest.mark.asyncio
+    async def test_does_not_use_cross_agent_legacy_db_heuristic(self, target):
+        """Regression: unscoped kestrel*.db uploads must never restore cross-agent."""
+        uploads = [
+            {
+                "fileName": "kestrel_prime.db",
+                "cid": "QmAgentBFlatDb",
+                "createdAt": "2026-03-01T00:00:00Z",
+            },
+            {
+                "fileName": "kestrel_state__agent-2__20260301_000000.car",
+                "cid": "QmAgentBStructured",
+            },
+        ]
+
+        mock_client = _mock_rest_client(uploads_list=uploads)
+
+        with patch(
+            LIGHTHOUSE_REST_CLIENT,
+            return_value=mock_client,
+        ):
+            cid = await target._query_uploads_api()
+
+        assert cid is None
+
+    @pytest.mark.asyncio
+    async def test_legacy_manifest_restore_still_works(self, target):
+        """Legacy flat snapshots remain restorable only through agent manifest."""
+        uploads = [
+            {
+                "fileName": "manifest_agent-1.json",
+                "cid": "QmManifest",
+                "createdAt": "2026-02-01T00:00:00Z",
+            },
+            {
+                "fileName": "manifest_agent-2.json",
+                "cid": "QmOtherManifest",
+                "createdAt": "2026-03-01T00:00:00Z",
+            },
+        ]
+
+        listing_client = _mock_rest_client(uploads_list=uploads)
+        manifest_client = _mock_rest_client(
+            download_content=b'{"agent_id":"agent-1","snapshot_cid":"QmLegacySnapshot"}'
+        )
+
+        with patch(
+            LIGHTHOUSE_REST_CLIENT,
+            side_effect=[listing_client, manifest_client],
+        ):
+            cid = await target._query_uploads_api()
+
+        assert cid == "QmLegacySnapshot"
+
+    @pytest.mark.asyncio
+    async def test_rejects_manifest_for_different_agent(self, target):
+        manifest_client = _mock_rest_client(
+            download_content=b'{"agent_id":"agent-2","snapshot_cid":"QmWrongAgent"}'
+        )
+
+        with patch(
+            LIGHTHOUSE_REST_CLIENT,
+            return_value=manifest_client,
+        ):
+            cid = await target._read_manifest_cid("QmManifest")
+
+        assert cid is None
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_snapshots(self, target):
@@ -482,6 +576,72 @@ class TestSyncWAL:
 
         assert result.success is True
         assert result.bytes_synced == 0
+
+
+class TestPrune:
+    @pytest.mark.asyncio
+    async def test_prune_scans_structured_uploads_and_legacy_wal(self):
+        target = LighthouseTarget(api_key="test-key", agent_id="agent-1")
+        uploads = [
+            {
+                "fileName": "kestrel_state__agent-1__20260101_000000.car",
+                "cid": "QmOldSnapshot",
+            },
+            {
+                "fileName": "kestrel_state__agent-1__20260201_000000.car",
+                "cid": "QmNewSnapshot",
+            },
+            {
+                "fileName": "kestrel_manifest__agent-1__20260101_000000.json",
+                "cid": "QmOldManifest",
+            },
+            {
+                "fileName": "kestrel_manifest__agent-1__20260201_000000.json",
+                "cid": "QmNewManifest",
+            },
+            {
+                "fileName": "kestrel_prime.db-wal",
+                "cid": "QmLegacyWal",
+                "createdAt": "2026-01-15T00:00:00Z",
+            },
+            {
+                "fileName": "kestrel_state__agent-2__20240101_000000.car",
+                "cid": "QmOtherAgent",
+            },
+        ]
+        mock_client = _mock_rest_client(uploads_list=uploads)
+
+        with patch(
+            LIGHTHOUSE_REST_CLIENT,
+            return_value=mock_client,
+        ):
+            result = await target.prune(
+                RetentionPolicy.from_config(
+                    {
+                        "backup": {
+                            "retention": {
+                                "working_memory": {
+                                    "keep_all_days": 0,
+                                    "weekly_forever": False,
+                                    "monthly_forever": False,
+                                },
+                                "identity": {
+                                    "keep_all_days": 0,
+                                    "weekly_until_months": 0,
+                                    "monthly_forever": False,
+                                },
+                            }
+                        }
+                    }
+                )
+            )
+
+        assert result["scanned"] == 5
+        deleted = {call.args[0] for call in mock_client.delete_file.await_args_list}
+        assert "QmOldSnapshot" in deleted
+        assert "QmOldManifest" in deleted
+        assert "QmLegacyWal" in deleted
+        assert "QmOtherAgent" not in deleted
 
 
 class TestGetLatestPosition:

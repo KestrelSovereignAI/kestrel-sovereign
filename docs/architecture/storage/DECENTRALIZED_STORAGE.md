@@ -120,6 +120,14 @@ kestrel storage health --agent-id did:example:agent --lighthouse-grace-hours 48
 kestrel storage health --agent-id did:example:agent --json
 ```
 
+Lighthouse upload names are agent scoped for restore safety and retention:
+state snapshots use `kestrel_state__<agent_id>__<YYYYMMDD_HHMMSS>.car`, and
+remote manifests use `kestrel_manifest__<agent_id>__<YYYYMMDD_HHMMSS>.json`.
+Pre-cutover flat uploads such as `export.car` or `kestrel_prime.db` are not
+renamed and are attributed during cleanup only through the local manifest or
+legacy agent manifest (`manifest_<did>.json`); filename-only flat database
+heuristics are intentionally not used for restore.
+
 ## Pricing Reality (Mar 2026)
 
 | Storage Type | Cost | Duration | Notes |

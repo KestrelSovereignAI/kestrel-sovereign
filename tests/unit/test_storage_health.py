@@ -69,6 +69,30 @@ async def test_lighthouse_active_deals_are_ok():
 
 
 @pytest.mark.asyncio
+async def test_lighthouse_health_finds_structured_snapshot_without_tag():
+    result = await _lighthouse_status(
+        uploads=[
+            {
+                "cid": "QmOther",
+                "fileName": "kestrel_state__agent-2__20260510_120000.car",
+                "tag": None,
+                "createdAt": int(NOW.timestamp() * 1000),
+            },
+            {
+                "cid": "QmNew",
+                "fileName": "kestrel_state__agent-1__20260510_120000.car",
+                "tag": None,
+                "createdAt": int(NOW.timestamp() * 1000),
+            },
+        ],
+        deals=[{"DealID": 1, "Provider": 10479}],
+    )
+
+    assert result.status == "ok"
+    assert result.details["cid"] == "QmNew"
+
+
+@pytest.mark.asyncio
 async def test_lighthouse_fresh_no_deal_is_pending():
     result = await _lighthouse_status(
         uploads=[

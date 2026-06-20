@@ -56,9 +56,15 @@ class TestLighthouseRestClient:
             mock_http.post = AsyncMock(return_value=resp)
             mock_get.return_value = mock_http
 
-            result = await client.upload_car(b"car file bytes", tag="test")
+            result = await client.upload_car(
+                b"car file bytes",
+                tag="test",
+                filename="kestrel_state__agent-1__20260620_120000.car",
+            )
 
         assert result["Hash"] == "QmCarTest"
+        files = mock_http.post.await_args.kwargs["files"]
+        assert files["file"][0] == "kestrel_state__agent-1__20260620_120000.car"
 
     @pytest.mark.asyncio
     async def test_download(self, client, mock_response):
