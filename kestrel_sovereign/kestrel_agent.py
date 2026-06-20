@@ -654,6 +654,19 @@ class KestrelAgent(
             # Wrap storage with privacy-enforcing layer
             self.storage = PrivacyEnforcingStorage(self._raw_storage, self._privacy_mode)
 
+            early_agent_node = None
+            try:
+                early_agent_node = await self.storage.get_node(self.agent_id)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("Could not load agent identity node for sync policy: %s", exc)
+            if early_agent_node is not None:
+                self._is_test_instance = bool(
+                    early_agent_node.properties.get("is_test_instance", False)
+                )
+                self._test_cycle_id = early_agent_node.properties.get("test_cycle_id")
+                self._agent_name = early_agent_node.properties.get("name", "Unnamed Agent")
+                self._is_demo = bool(early_agent_node.properties.get("is_demo", False))
+
             # Initialize privacy agent. When the agent's kestrel.toml flips
             # ``[privacy] computer_access = true`` (#956), we build a
             # ``PrivacyConfig`` from the preset, set the flag, and pass that
@@ -859,6 +872,31 @@ class KestrelAgent(
 
             # Initialize storage providers for features (reflection self-model, etc.)
             self.lighthouse_provider = None
+            from kestrel_sovereign.storage.sync.service import (
+                RemoteTierPolicyContext,
+                SyncService,
+                _remote_tiers_allowed,
+            )
+
+            agent_id = self.did or "default"
+            state_dir = Path(self.storage_path).parent if self.storage_path else None
+            has_constitution_anchor = (
+                bool(early_agent_node.properties.get("constitution_hash"))
+                if early_agent_node is not None
+                else False
+            )
+            remote_policy_context = RemoteTierPolicyContext(
+                identity=agent_id,
+                db_path=self.storage_path,
+                is_test_instance=self.is_test_instance,
+                has_constitution_anchor=has_constitution_anchor,
+                is_sovereign_identity=bool(agent_id)
+                and not str(agent_id).lower().startswith("did:test:"),
+                privacy_mode=self._privacy_mode.value
+                if hasattr(self._privacy_mode, "value")
+                else str(self._privacy_mode),
+            )
+            remote_policy_decision = _remote_tiers_allowed(remote_policy_context)
 
             # Storage path through PayerPolicy resolver. Honors the policy's
             # `storage` slot:
@@ -872,52 +910,58 @@ class KestrelAgent(
             # unaware: it runs before the agent's DB exists and so cannot
             # consult the policy. Operators who want NONE storage should not
             # set LIGHTHOUSE_API_KEY.
-            try:
-                from kestrel_sdk.payer_policy import ResourceClass
-                from kestrel_sovereign.services.payer_resolver import (
-                    FoundationPayerResolver,
+            if not remote_policy_decision.allowed:
+                logging.warning(
+                    "Remote storage providers skipped by policy: %s",
+                    remote_policy_decision.reason,
                 )
-                from kestrel_sovereign.storage.providers.lighthouse_provider import (
-                    LighthouseProvider,
-                )
-
-                # Injected policy/host-db (multi-tenant embedding) take
-                # precedence over the standalone kestrel.toml / on-disk host.db.
-                # When no host master is configured, _resolve_host_db returns
-                # None and the resolver falls back to the agent's db (which has
-                # no host_service_keys rows → 'no host master' for delegated
-                # kinds). See #1649.
-                _policy = self._resolve_payer_policy()
-                _host_db = await self._resolve_host_db()
-                _resolver = FoundationPayerResolver(
-                    _policy,
-                    db=self._raw_storage.db if self._raw_storage else None,
-                    host_db=_host_db,
-                    wallet_private_key=self._private_key,
-                )
-                _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
-                if _resolved.enabled:
-                    self.lighthouse_provider = LighthouseProvider(
-                        api_key=None,
-                        key_resolver=_resolved.key_resolver,
+            else:
+                try:
+                    from kestrel_sdk.payer_policy import ResourceClass
+                    from kestrel_sovereign.services.payer_resolver import (
+                        FoundationPayerResolver,
                     )
-                    # With api_key=None at construction, the provider's
-                    # internal client isn't created until _ensure_client()
-                    # consults the resolver. Drive that once now so
-                    # is_available() reflects the resolver's result rather
-                    # than the (None) constructor input. Without this poke
-                    # the provider would always look unavailable post-policy.
-                    await self.lighthouse_provider._ensure_client()
-                    if not self.lighthouse_provider.is_available():
-                        self.lighthouse_provider = None
-                # else: NONE policy — leave self.lighthouse_provider as None
-            except NotImplementedError:
-                # Deferred PayerKind values (for example Lighthouse
-                # HOST_MASTER_PROVISIONED) raise here. Surface
-                # explicitly rather than degrading silently.
-                raise
-            except Exception as e:
-                logging.warning(f"LighthouseProvider init failed: {e}")
+                    from kestrel_sovereign.storage.providers.lighthouse_provider import (
+                        LighthouseProvider,
+                    )
+
+                    # Injected policy/host-db (multi-tenant embedding) take
+                    # precedence over the standalone kestrel.toml / on-disk host.db.
+                    # When no host master is configured, _resolve_host_db returns
+                    # None and the resolver falls back to the agent's db (which has
+                    # no host_service_keys rows → 'no host master' for delegated
+                    # kinds). See #1649.
+                    _policy = self._resolve_payer_policy()
+                    _host_db = await self._resolve_host_db()
+                    _resolver = FoundationPayerResolver(
+                        _policy,
+                        db=self._raw_storage.db if self._raw_storage else None,
+                        host_db=_host_db,
+                        wallet_private_key=self._private_key,
+                    )
+                    _resolved = await _resolver.resolve_for(self.did, ResourceClass.STORAGE)
+                    if _resolved.enabled:
+                        self.lighthouse_provider = LighthouseProvider(
+                            api_key=None,
+                            key_resolver=_resolved.key_resolver,
+                        )
+                        # With api_key=None at construction, the provider's
+                        # internal client isn't created until _ensure_client()
+                        # consults the resolver. Drive that once now so
+                        # is_available() reflects the resolver's result rather
+                        # than the (None) constructor input. Without this poke
+                        # the provider would always look unavailable post-policy.
+                        await self.lighthouse_provider._ensure_client()
+                        if not self.lighthouse_provider.is_available():
+                            self.lighthouse_provider = None
+                    # else: NONE policy — leave self.lighthouse_provider as None
+                except NotImplementedError:
+                    # Deferred PayerKind values (for example Lighthouse
+                    # HOST_MASTER_PROVISIONED) raise here. Surface
+                    # explicitly rather than degrading silently.
+                    raise
+                except Exception as e:
+                    logging.warning(f"LighthouseProvider init failed: {e}")
 
             # Sync service — event-driven snapshots to all configured targets.
             # Targets are ordered by trust: Sovereign → Federated → Delegated → Expedient.
@@ -925,22 +969,30 @@ class KestrelAgent(
             self._sync_service = None
             if self._db_backend.lower() != "postgres" and self._sync_enabled:
                 try:
-                    from kestrel_sovereign.storage.sync.service import SyncService
                     from kestrel_sovereign.storage.sync.targets import (
-                        SovereignIPFSTarget, LighthouseTarget, GCSTarget,
+                        GCSTarget,
+                        LighthouseTarget,
+                        SovereignIPFSTarget,
+                        TrustTier,
                     )
 
-                    agent_id = self.did or "default"
-                    state_dir = Path(self.storage_path).parent if self.storage_path else None
-
-                    self._sync_service = SyncService(db_path=self.storage_path)
+                    self._sync_service = SyncService(
+                        db_path=self.storage_path,
+                        policy_context=remote_policy_context,
+                    )
 
                     # Sovereign: self-hosted IPFS (our infrastructure)
                     sovereign_url = os.environ.get("SOVEREIGN_IPFS_URL")
                     if sovereign_url:
-                        self._sync_service.add_target(SovereignIPFSTarget(
-                            api_url=sovereign_url, agent_id=agent_id, state_dir=state_dir,
-                        ))
+                        self._sync_service.add_remote_target(
+                            f"ipfs://{agent_id}",
+                            TrustTier.SOVEREIGN,
+                            lambda: SovereignIPFSTarget(
+                                api_url=sovereign_url,
+                                agent_id=agent_id,
+                                state_dir=state_dir,
+                            ),
+                        )
 
                     # Delegated: Lighthouse (API key). Honor PayerPolicy.storage:
                     # if the resolver came back with no LighthouseProvider
@@ -951,21 +1003,34 @@ class KestrelAgent(
                     if self.lighthouse_provider is not None and os.environ.get(
                         "LIGHTHOUSE_API_KEY"
                     ):
-                        self._sync_service.add_target(LighthouseTarget(
-                            api_key=os.environ["LIGHTHOUSE_API_KEY"],
-                            agent_id=agent_id, state_dir=state_dir,
-                        ))
+                        self._sync_service.add_remote_target(
+                            f"lighthouse://{agent_id}",
+                            TrustTier.DELEGATED,
+                            lambda: LighthouseTarget(
+                                api_key=os.environ["LIGHTHOUSE_API_KEY"],
+                                agent_id=agent_id,
+                                state_dir=state_dir,
+                            ),
+                        )
 
                     # Expedient: GCS (fast cloud backup)
                     gcs_bucket = os.environ.get("GCS_BACKUP_BUCKET")
                     if gcs_bucket:
-                        self._sync_service.add_target(GCSTarget(
-                            bucket=gcs_bucket, agent_id=agent_id, state_dir=state_dir,
-                            project=os.environ.get("GCP_PROJECT"),
-                            credentials_path=os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"),
-                        ))
+                        self._sync_service.add_remote_target(
+                            f"gs://{gcs_bucket}/kestrel/{agent_id}",
+                            TrustTier.EXPEDIENT,
+                            lambda: GCSTarget(
+                                bucket=gcs_bucket,
+                                agent_id=agent_id,
+                                state_dir=state_dir,
+                                project=os.environ.get("GCP_PROJECT"),
+                                credentials_path=os.environ.get(
+                                    "GOOGLE_APPLICATION_CREDENTIALS"
+                                ),
+                            ),
+                        )
 
-                    if self._sync_service.targets:
+                    if self._sync_service.has_work:
                         await self._sync_service.start()
                     else:
                         self._sync_service = None

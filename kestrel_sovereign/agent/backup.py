@@ -39,6 +39,35 @@ class BackupMixin:
         if self.privacy_agent.privacy_config.requires_anonymization() and storage_tier == StorageTier.FILECOIN:
             encrypt = True
 
+        from kestrel_sovereign.storage.sync.service import (
+            RemoteTierPolicyContext,
+            _remote_tiers_allowed,
+        )
+        from kestrel_sovereign.storage.tiered_manager import REMOTE_STORAGE_TIERS
+
+        if storage_tier in REMOTE_STORAGE_TIERS:
+            has_constitution_anchor = False
+            if hasattr(self, "get_constitution_hash"):
+                try:
+                    has_constitution_anchor = bool(await self.get_constitution_hash())
+                except Exception:  # noqa: BLE001
+                    has_constitution_anchor = False
+            privacy_mode = getattr(getattr(self, "_privacy_mode", None), "value", None)
+            decision = _remote_tiers_allowed(
+                RemoteTierPolicyContext(
+                    identity=getattr(self, "agent_id", None) or getattr(self, "did", None),
+                    db_path=getattr(self, "storage_path", None),
+                    is_test_instance=bool(getattr(self, "is_test_instance", False)),
+                    has_constitution_anchor=has_constitution_anchor,
+                    is_sovereign_identity=not str(
+                        getattr(self, "agent_id", None) or getattr(self, "did", "")
+                    ).lower().startswith("did:test:"),
+                    privacy_mode=privacy_mode,
+                )
+            )
+            if not decision.allowed:
+                return f"Remote backup skipped by policy: {decision.reason}. Use tier=local."
+
         fee_main = Decimal('1.0') if storage_tier != StorageTier.LOCAL_ONLY else Decimal('0.0')
         if fee_main > 0 and not self.wallet.can_afford(fee_main):
             return "Insufficient funds for backup."

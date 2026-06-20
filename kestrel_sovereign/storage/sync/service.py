@@ -9,14 +9,98 @@ rather than continuous WAL polling.
 import asyncio
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Any
 
 from kestrel_sovereign.storage.sync.targets import SyncTarget, SyncResult, TrustTier
+from kestrel_sovereign.storage.tiered_manager import privacy_allows_remote_tiers
 
 logger = logging.getLogger(__name__)
+
+REMOTE_SYNC_TRUST_TIERS = {
+    TrustTier.SOVEREIGN,
+    TrustTier.FEDERATED,
+    TrustTier.DELEGATED,
+    TrustTier.EXPEDIENT,
+}
+
+DENIED_IDENTITY_TOKENS = (
+    "malicious_agent",
+    "no_constitution_agent",
+    "test_ensemble_agent",
+    "test_storage_agent",
+    "gcs-live-test",
+    "codex-live-check",
+)
+
+DENIED_PATH_PARTS = {
+    "gcs-live-test",
+    "codex-live-check",
+}
+
+
+@dataclass(frozen=True)
+class RemoteTierPolicyContext:
+    """Identity and instance facts needed before constructing remote targets."""
+
+    identity: Optional[str] = None
+    db_path: Optional[str] = None
+    is_test_instance: bool = False
+    has_constitution_anchor: Optional[bool] = None
+    is_sovereign_identity: bool = True
+    privacy_mode: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RemoteTierPolicyDecision:
+    allowed: bool
+    reason: Optional[str] = None
+
+
+def _path_is_fixture_or_temp(db_path: Optional[str]) -> bool:
+    if not db_path:
+        return False
+    path = Path(db_path)
+    name = path.name.lower()
+    if name in {"test.db", "binary_test.bin", "roundtrip.txt"}:
+        return True
+    if name.startswith("test") and name.endswith(".db"):
+        return True
+    if any(part.lower() in DENIED_PATH_PARTS for part in path.parts):
+        return True
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path.absolute()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    return resolved == temp_root or temp_root in resolved.parents
+
+
+def _remote_tiers_allowed(
+    context: RemoteTierPolicyContext,
+) -> RemoteTierPolicyDecision:
+    """Authoritative hard gate for production remote backup tiers."""
+    identity = (context.identity or "").strip()
+    identity_lower = identity.lower()
+
+    if context.privacy_mode and not privacy_allows_remote_tiers(context.privacy_mode):
+        return RemoteTierPolicyDecision(False, "privacy_mode_local_only")
+    if context.is_test_instance:
+        return RemoteTierPolicyDecision(False, "test_instance")
+    if identity_lower.startswith("did:test:"):
+        return RemoteTierPolicyDecision(False, "test_did")
+    if any(token in identity_lower for token in DENIED_IDENTITY_TOKENS):
+        return RemoteTierPolicyDecision(False, "denied_fixture_identity")
+    if not context.is_sovereign_identity:
+        return RemoteTierPolicyDecision(False, "non_sovereign_identity")
+    if context.has_constitution_anchor is False:
+        return RemoteTierPolicyDecision(False, "missing_constitution_anchor")
+    if _path_is_fixture_or_temp(context.db_path):
+        return RemoteTierPolicyDecision(False, "fixture_or_temp_db_path")
+    return RemoteTierPolicyDecision(True)
 
 
 @dataclass
@@ -104,6 +188,7 @@ class SyncService:
         wal_sync_interval: Optional[float] = None,
         on_sync: Optional[Callable] = None,
         on_error: Optional[Callable] = None,
+        policy_context: Optional[RemoteTierPolicyContext] = None,
     ):
         self.db_path = Path(db_path)
         self.state_file = Path(state_file) if state_file else Path(f"{db_path}.sync")
@@ -111,13 +196,58 @@ class SyncService:
         self.on_sync = on_sync
         self.on_error = on_error
         self._targets: List[SyncTarget] = []
+        self._policy_skips: Dict[str, SyncResult] = {}
+        self._policy_context = policy_context
         self._state: Optional[SyncState] = None
         self._poll_task: Optional[asyncio.Task] = None
 
     def add_target(self, target: SyncTarget) -> None:
         """Add a sync target."""
+        if self._policy_context and target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
+            decision = _remote_tiers_allowed(self._policy_context)
+            if not decision.allowed:
+                self._record_policy_skip(target.name, decision.reason)
+                logger.warning(
+                    "Remote sync target skipped by policy before upload: %s (%s)",
+                    target.name,
+                    decision.reason,
+                )
+                return
+        self._append_target(target)
+
+    def _append_target(self, target: SyncTarget) -> None:
         self._targets.append(target)
         logger.info(f"Added sync target: {target.name} ({target.trust_tier.name})")
+
+    def add_remote_target(
+        self,
+        target_name: str,
+        trust_tier: TrustTier,
+        factory: Callable[[], SyncTarget],
+    ) -> bool:
+        """Add a remote target, evaluating policy before constructing it."""
+        if self._policy_context and trust_tier in REMOTE_SYNC_TRUST_TIERS:
+            decision = _remote_tiers_allowed(self._policy_context)
+            if not decision.allowed:
+                self._record_policy_skip(target_name, decision.reason)
+                logger.warning(
+                    "Remote sync target skipped by policy before construction: %s (%s)",
+                    target_name,
+                    decision.reason,
+                )
+                return False
+        self._append_target(factory())
+        return True
+
+    def _record_policy_skip(self, target_name: str, reason: Optional[str]) -> None:
+        self._policy_skips[target_name] = SyncResult(
+            success=True,
+            target_name=target_name,
+            bytes_synced=0,
+            frames_synced=0,
+            timestamp=datetime.now(timezone.utc),
+            metadata={"skipped": True, "policy_denied": True, "reason": reason},
+        )
 
     def remove_target(self, target_name: str) -> bool:
         """Remove a sync target by name."""
@@ -131,7 +261,12 @@ class SyncService:
     @property
     def is_running(self) -> bool:
         """For backward compatibility. Always True if targets exist."""
-        return len(self._targets) > 0
+        return len(self._targets) > 0 or bool(self._policy_skips)
+
+    @property
+    def has_work(self) -> bool:
+        """True when snapshots will produce upload or policy-skip results."""
+        return self.is_running
 
     @property
     def targets(self) -> List[str]:
@@ -249,7 +384,7 @@ class SyncService:
 
     async def force_snapshot(self) -> Dict[str, SyncResult]:
         """Snapshot to all targets. Called on shutdown, scheduled backup, or !backup."""
-        results = {}
+        results = dict(self._policy_skips)
         for target in self._targets:
             try:
                 result = await target.sync_snapshot(self.db_path)
