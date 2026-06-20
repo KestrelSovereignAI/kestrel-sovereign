@@ -52,7 +52,14 @@ class BackupMixin:
                     has_constitution_anchor = bool(await self.get_constitution_hash())
                 except Exception:  # noqa: BLE001
                     has_constitution_anchor = False
-            privacy_mode = getattr(getattr(self, "_privacy_mode", None), "value", None)
+            # Normalize privacy mode like the sync path: enum -> .value,
+            # supported string modes (e.g. "deidentified") -> str, else None.
+            # Without this, string modes pass None and skip the privacy gate.
+            _pm = getattr(self, "_privacy_mode", None)
+            privacy_mode = (
+                _pm.value if hasattr(_pm, "value")
+                else (str(_pm) if _pm is not None else None)
+            )
             decision = _remote_tiers_allowed(
                 RemoteTierPolicyContext(
                     identity=getattr(self, "agent_id", None) or getattr(self, "did", None),
