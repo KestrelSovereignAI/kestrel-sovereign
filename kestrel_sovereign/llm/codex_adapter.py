@@ -1158,7 +1158,15 @@ class CodexAdapter(LLMAdapter):
         """
         if not session_id or not isinstance(token_usage, dict):
             return
-        last = token_usage.get("last") or token_usage.get("lastTokenUsage") or {}
+        # Codex's wire format isn't stable across versions/spellings; accept
+        # camelCase and snake_case for the ``last`` block and its fields,
+        # mirroring the defensive probing the discovered-cap path uses.
+        last = (
+            token_usage.get("last")
+            or token_usage.get("lastTokenUsage")
+            or token_usage.get("last_token_usage")
+            or {}
+        )
         if not isinstance(last, dict):
             return
 
@@ -1169,14 +1177,23 @@ class CodexAdapter(LLMAdapter):
                 return None
             return value if value > 0 else None
 
-        # ``inputTokens`` on the most recent request is the live thread
-        # size fed to the model; fall back to that request's total tokens.
-        used = _pos_int(last.get("inputTokens")) or _pos_int(last.get("totalTokens"))
+        def _first_field(src: Dict[str, Any], *names: str) -> Optional[int]:
+            for name in names:
+                got = _pos_int(src.get(name))
+                if got is not None:
+                    return got
+            return None
+
+        # The most recent request's input tokens are the live thread size
+        # fed to the model; fall back to that request's total tokens.
+        used = _first_field(
+            last, "inputTokens", "input_tokens", "totalTokens", "total_tokens"
+        )
         if used is None:
             return
-        window = _pos_int(
-            token_usage.get("modelContextWindow")
-        ) or _pos_int(token_usage.get("model_context_window"))
+        window = _first_field(
+            token_usage, "modelContextWindow", "model_context_window"
+        )
         self._last_thread_usage[session_id] = {
             "used_tokens": used,
             "window_tokens": window,
@@ -2143,6 +2160,15 @@ class CodexAdapter(LLMAdapter):
                 # static config. Best-effort; no-op when the field is absent.
                 if method in self._DISCOVERED_CAP_EVENT_METHODS:
                     self._record_discovered_route_cap_from_event(p)
+                    # #1844: capture codex's TRUE server-side thread
+                    # occupancy alongside the discovered cap, on the SAME
+                    # accepted-method set + both wire spellings, so a host
+                    # emitting ``thread/token_usage/updated`` isn't silently
+                    # left with ``codex_thread: null`` in /context-status.
+                    self._record_thread_occupancy(
+                        session_id,
+                        p.get("tokenUsage") or p.get("token_usage") or {},
+                    )
                 if method == "item/agentMessage/delta":
                     delta = p.get("delta") or ""
                     if delta:
@@ -2290,12 +2316,6 @@ class CodexAdapter(LLMAdapter):
                             yield {"tool_call": tc}
                 elif method == "thread/tokenUsage/updated":
                     usage = _usage_from(p.get("tokenUsage") or {})
-                    # #1844: also capture codex's TRUE server-side thread
-                    # occupancy so /context-status reports the real number,
-                    # not just Kestrel's incremental per-turn payload.
-                    self._record_thread_occupancy(
-                        session_id, p.get("tokenUsage") or {}
-                    )
                 elif method == "turn/failed":
                     err = p.get("error") or p.get("turn", {}).get("error") or {}
                     raise CodexAppServerError(

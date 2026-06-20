@@ -174,6 +174,19 @@ class TestThreadOccupancy:
         assert occ["window_tokens"] == 258400
         assert occ["occupancy_percent"] == 21.2
 
+    def test_snake_case_event_spelling_is_captured(self):
+        # Hosts emitting thread/token_usage/updated use snake_case fields;
+        # occupancy must still be captured (codex review P2).
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last_token_usage": {"input_tokens": 600},
+            "model_context_window": 1200,
+        })
+        occ = a.get_thread_occupancy("s")
+        assert occ["used_tokens"] == 600
+        assert occ["window_tokens"] == 1200
+        assert occ["occupancy_percent"] == 50.0
+
     def test_used_falls_back_to_total_when_input_absent(self):
         a = CodexAdapter()
         a._record_thread_occupancy("s", {
