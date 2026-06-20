@@ -630,3 +630,89 @@ def test_subparser_registers_and_help_mentions_steps():
     assert ns.command == "update"
     assert ns.pull is False
     assert ns.dry_run is True
+
+
+def test_update_recovers_from_detached_head_and_retries_pull(stub_project_dir):
+    """A sibling worktree's PR merge can flip the checkout into detached HEAD,
+    making `git pull --ff-only` refuse. cmd_update must reattach (no-loss) and
+    retry the pull, then proceed (#1819 follow-up)."""
+    pulls = []
+
+    def fake_pull(_):
+        pulls.append(1)
+        # First call fails (detached HEAD), second (post-reattach) succeeds.
+        return (1, "You are not currently on a branch.\n") if len(pulls) == 1 \
+            else (0, "Updated.\n")
+
+    later = []
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull", fake_pull), \
+         patch.object(cli, "_git_reattach_if_safely_detached", lambda _: "main"), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: later.append("install") or (0, "")), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: later.append("sync") or 0), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: later.append("restart") or 0):
+        rc = cli.cmd_update(_ns())
+
+    assert rc == 0
+    assert len(pulls) == 2          # failed, reattached, retried
+    assert later == ["install", "sync", "restart"]
+
+
+def test_update_aborts_when_detached_head_has_diverged(stub_project_dir):
+    """If the detached HEAD has diverged (reattach refuses, returns None), the
+    pull failure stands and the update aborts — no clobbering the operator's
+    commits."""
+    later = []
+    with patch.object(cli, "_project_dir_is_git", lambda _: True), \
+         patch.object(cli, "_git_working_tree_dirty", lambda _: (False, "")), \
+         patch.object(cli, "_run_git_pull",
+                      lambda _: (1, "You are not currently on a branch.\n")), \
+         patch.object(cli, "_git_reattach_if_safely_detached", lambda _: None), \
+         patch.object(cli, "_run_uv_pip_install_editable",
+                      lambda *a, **kw: later.append("install") or (0, "")), \
+         patch.object(cli, "cmd_feature_sync",
+                      lambda args: later.append("sync") or 0), \
+         patch.object(cli, "cmd_restart",
+                      lambda args: later.append("restart") or 0):
+        rc = cli.cmd_update(_ns())
+
+    assert rc != 0
+    assert later == []
+
+
+def test_reattach_helper_against_real_repo(tmp_path):
+    """`_git_reattach_if_safely_detached` reattaches a no-loss detached HEAD and
+    refuses a diverged one, against a real git repo."""
+    from kestrel_sovereign.cli_lifecycle import _git_reattach_if_safely_detached
+
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=str(tmp_path),
+                              capture_output=True, text=True, check=True)
+
+    # origin (bare) + local clone with a commit on main.
+    origin = tmp_path.parent / (tmp_path.name + "-origin.git")
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True,
+                   capture_output=True)
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    git("symbolic-ref", "HEAD", "refs/heads/main")
+    git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    git("remote", "add", "origin", str(origin))
+    (tmp_path / "f.txt").write_text("1")
+    git("add", "."); git("commit", "-m", "c1")
+    git("push", "-u", "origin", "main")
+    head = git("rev-parse", "HEAD").stdout.strip()
+
+    # Detach HEAD at the current (pushed) commit → safe to reattach.
+    git("checkout", "--detach", head)
+    assert _git_reattach_if_safely_detached(tmp_path) == "main"
+    assert git("symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+
+    # Detach + commit a divergent change → must NOT reattach (would orphan it).
+    git("checkout", "--detach", head)
+    (tmp_path / "f.txt").write_text("2")
+    git("add", "."); git("commit", "-m", "divergent")
+    assert _git_reattach_if_safely_detached(tmp_path) is None
