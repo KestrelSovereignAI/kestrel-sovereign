@@ -2,7 +2,7 @@
 from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
-from typing import Optional
+from typing import Any, Dict, Optional
 import asyncio
 import json
 import logging
@@ -721,6 +721,53 @@ async def notifications_sse(request: Request):
     )
 
 
+def _codex_thread_occupancy(
+    agent: Any, session_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Best-effort: codex's TRUE server-side thread occupancy for the active
+    openai:plan session, or ``None``.
+
+    On openai:plan, codex holds the conversation thread server-side while
+    Kestrel sends only incremental turns — so the per-turn payload the
+    context monitor measures is NOT the number that fills the window and
+    trips codex's lossy auto-compaction (#1844). Read the real occupancy off
+    the CodexAdapter (``get_thread_occupancy``) so the monitor can surface
+    it and a low per-turn reading can't masquerade as a low context.
+
+    Gated to the RESOLVED active provider — NOT the display model string.
+    Using ``resolve_provider_routing`` (the single source of truth every
+    turn funnels through) means a route-less ``openai/<model>`` preference
+    that actually executes on openai:plan still surfaces occupancy (codex
+    review round 3), while a switch AWAY from plan drops the CodexAdapter
+    from the resolved primary so a stale snapshot can't leak (round 2).
+    """
+    if not session_id:
+        return None
+    llm = getattr(agent, "llm_service", None)
+    if llm is None:
+        return None
+    # The primary (first) resolved provider is the one that will actually
+    # serve the next turn; fallbacks behind it don't define current context.
+    resolver = getattr(llm, "resolve_provider_routing", None)
+    providers: list = []
+    if callable(resolver):
+        try:
+            providers, _ = resolver()
+        except Exception:
+            providers = []
+    primary = providers[0] if providers else None
+    adapter = primary.get("adapter") if isinstance(primary, dict) else None
+    getter = getattr(adapter, "get_thread_occupancy", None)
+    if not callable(getter):
+        # Active route isn't the CodexAdapter (only it exposes this) — no
+        # server-side occupancy to report.
+        return None
+    try:
+        return getter(session_id) or None
+    except Exception:
+        return None
+
+
 @router.get("/context-status")
 async def get_context_status(
     request: Request,
@@ -1058,6 +1105,18 @@ async def get_context_status(
             # "no route cap surface" rather than 500ing the footer poll.
             logger.debug(f"route_cap probe failed for breakdown: {e}")
 
+        # #1844: codex's TRUE server-side thread occupancy on openai:plan.
+        # ``total_measured`` above is Kestrel's incremental per-turn payload;
+        # on this route codex accumulates the full thread server-side and
+        # auto-compacts (lossily) when IT fills — which the per-turn number
+        # can't see. Surface the real occupancy so a low reading can't
+        # masquerade as a healthy context. ``None`` off-route / when unknown.
+        codex_thread_block: Optional[Dict[str, Any]] = None
+        try:
+            codex_thread_block = _codex_thread_occupancy(agent, session_id)
+        except Exception as e:  # never break the footer poll
+            logger.debug(f"codex thread occupancy probe failed: {e}")
+
         return {
             "model": current_model,
             "message_count": message_count,
@@ -1077,6 +1136,13 @@ async def get_context_status(
             # Route-level per-turn cap (#1503). ``None`` when the active
             # route declares no cap or the catalog probe failed.
             "route_cap": route_cap_block,
+            # #1844: codex's TRUE server-side thread occupancy on openai:plan
+            # ({used_tokens, window_tokens, occupancy_percent}), or ``None``
+            # off-route / when no turn has reported usage yet. The chat
+            # footer/popup should prefer this over ``utilization_percent`` on
+            # openai:plan, since that figure only measures Kestrel's per-turn
+            # payload — not the server-side thread that actually compacts.
+            "codex_thread": codex_thread_block,
             # While C has not shipped, this stays True per the
             # auto-detection invariant. When C lands and the prune
             # path emits sync salvage records, flip this to False.

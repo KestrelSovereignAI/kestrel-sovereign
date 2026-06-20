@@ -502,6 +502,15 @@ class CodexAdapter(LLMAdapter):
         # history for that session, same posture as OpenClaw's
         # ``dynamicToolsFingerprint`` reset).
         self._session_threads: Dict[str, Tuple[str, str]] = {}
+        # #1844: codex's TRUE server-side thread occupancy, keyed by
+        # session_id. On openai:plan Kestrel sends only the incremental
+        # turn while codex accumulates the full thread server-side, so the
+        # context monitor's per-turn payload measurement is NOT the number
+        # that actually fills the window and triggers codex auto-compaction.
+        # Captured from ``thread/tokenUsage/updated`` and read by
+        # ``/context-status`` via ``get_thread_occupancy`` so a low per-turn
+        # reading can't masquerade as a low context.
+        self._last_thread_usage: Dict[str, Dict[str, Optional[int]]] = {}
         # Per-session lock for ``_ensure_thread`` lookup-or-create — two
         # concurrent first calls on the same session_id would otherwise
         # both call thread/start and race to overwrite the cache,
@@ -925,6 +934,7 @@ class CodexAdapter(LLMAdapter):
                 )
                 # Cached thread no longer matches; drop it.
                 self._session_threads.pop(session_id, None)
+                self._forget_thread_usage(session_id)
             # cwd is already resolved (and locked into the fingerprint)
             # at the top of _ensure_thread — reuse it so the value sent
             # to thread/start matches the value in the fingerprint
@@ -1007,6 +1017,9 @@ class CodexAdapter(LLMAdapter):
             self._record_discovered_route_cap_from_thread_start(m, result)
             if session_id:
                 self._session_threads[session_id] = (thread_id, fingerprint)
+                # Fresh thread → no accumulated server-side history yet; drop
+                # any stale occupancy so /context-status starts from empty.
+                self._forget_thread_usage(session_id)
             return thread_id, True
         finally:
             if lock is not None:
@@ -1125,6 +1138,120 @@ class CodexAdapter(LLMAdapter):
                 "failed to record discovered route cap %d on %s: %s",
                 discovered_cap, self._DISCOVERED_CAP_ROUTE_KEY, e,
             )
+
+    def _record_thread_occupancy(
+        self,
+        session_id: Optional[str],
+        token_usage: Optional[Dict[str, Any]],
+    ) -> None:
+        """Record codex's TRUE server-side thread occupancy for a session.
+
+        On openai:plan, Kestrel sends only the incremental turn while codex
+        accumulates the full conversation thread server-side
+        (``persistExtendedHistory``). The context monitor would otherwise
+        only ever see Kestrel's small per-turn assembled payload — NOT the
+        number that actually fills the window and trips codex's lossy
+        server-side auto-compaction (#1844). Codex's
+        ``thread/tokenUsage/updated`` carries ``tokenUsage.last`` (the most
+        recent request's input = current thread size) and
+        ``modelContextWindow`` (the ceiling). Capture occupancy keyed by
+        session so ``/context-status`` can report the real number.
+
+        Best-effort: missing/unparseable fields leave the prior snapshot
+        intact and never raise into the turn pipeline.
+        """
+        if not session_id or not isinstance(token_usage, dict):
+            return
+        # Codex's wire format isn't stable across versions/spellings; accept
+        # camelCase and snake_case for the ``last`` block and its fields,
+        # mirroring the defensive probing the discovered-cap path uses.
+        last = (
+            token_usage.get("last")
+            or token_usage.get("lastTokenUsage")
+            or token_usage.get("last_token_usage")
+            or {}
+        )
+        if not isinstance(last, dict):
+            return
+
+        def _pos_int(value: Any) -> Optional[int]:
+            # ``bool`` is an int subclass — reject so a stray flag isn't
+            # treated as a 1-token occupancy.
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None
+            return value if value > 0 else None
+
+        def _first_field(src: Dict[str, Any], *names: str) -> Optional[int]:
+            for name in names:
+                got = _pos_int(src.get(name))
+                if got is not None:
+                    return got
+            return None
+
+        # The most recent request's input tokens are the live thread size
+        # fed to the model; fall back to that request's total tokens.
+        used = _first_field(
+            last, "inputTokens", "input_tokens", "totalTokens", "total_tokens"
+        )
+        if used is None:
+            return
+        window = _first_field(
+            token_usage, "modelContextWindow", "model_context_window"
+        )
+        self._thread_usage_map()[session_id] = {
+            "used_tokens": used,
+            "window_tokens": window,
+        }
+
+    def _thread_usage_map(self) -> Dict[str, Dict[str, Optional[int]]]:
+        """Lazy-safe accessor for the per-session occupancy cache.
+
+        ``__init__`` always creates ``_last_thread_usage``, but several of
+        the callers below run from error-recovery paths (idle-timeout / retry
+        thread teardown). If the attribute were ever absent there, raising a
+        fresh ``AttributeError`` would mask the real transport error being
+        recovered from — so resolve it defensively and create on demand.
+        """
+        m = getattr(self, "_last_thread_usage", None)
+        if m is None:
+            m = {}
+            self._last_thread_usage = m
+        return m
+
+    def _forget_thread_usage(self, session_id: Optional[str]) -> None:
+        """Drop the cached occupancy snapshot for a session.
+
+        Call whenever the underlying codex thread is invalidated or
+        recreated (fingerprint mismatch, fresh ``thread/start``, idle-timeout
+        recovery). The new server-side thread is empty, so the prior snapshot
+        is stale — otherwise ``/context-status`` would keep reporting a dead
+        thread's high occupancy until the next ``thread/tokenUsage/updated``
+        arrives (#1844, codex review round 2).
+        """
+        if session_id:
+            self._thread_usage_map().pop(session_id, None)
+
+    def get_thread_occupancy(
+        self, session_id: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Return codex's last-known TRUE thread occupancy for a session,
+        or ``None`` when unknown. Surfaced by ``/context-status`` so a low
+        per-turn payload can't masquerade as a low context (#1844)."""
+        if not session_id:
+            return None
+        snap = self._thread_usage_map().get(session_id)
+        if not snap:
+            return None
+        used = snap.get("used_tokens")
+        window = snap.get("window_tokens")
+        pct: Optional[float] = None
+        if isinstance(used, int) and isinstance(window, int) and window > 0:
+            pct = round((used / window) * 100.0, 1)
+        return {
+            "used_tokens": used,
+            "window_tokens": window,
+            "occupancy_percent": pct,
+        }
 
     # Notification methods (codex sends these on the wire after a turn
     # advances; ``method`` is the JSON-RPC method name). Only the first
@@ -2065,6 +2192,15 @@ class CodexAdapter(LLMAdapter):
                 # static config. Best-effort; no-op when the field is absent.
                 if method in self._DISCOVERED_CAP_EVENT_METHODS:
                     self._record_discovered_route_cap_from_event(p)
+                    # #1844: capture codex's TRUE server-side thread
+                    # occupancy alongside the discovered cap, on the SAME
+                    # accepted-method set + both wire spellings, so a host
+                    # emitting ``thread/token_usage/updated`` isn't silently
+                    # left with ``codex_thread: null`` in /context-status.
+                    self._record_thread_occupancy(
+                        session_id,
+                        p.get("tokenUsage") or p.get("token_usage") or {},
+                    )
                 if method == "item/agentMessage/delta":
                     delta = p.get("delta") or ""
                     if delta:
@@ -2296,6 +2432,7 @@ class CodexAdapter(LLMAdapter):
                 and "no completion" in msg
             ):
                 self._session_threads.pop(session_id, None)
+                self._forget_thread_usage(session_id)
             raise
         finally:
             app.close_turn_sink(thread_id)
@@ -2403,6 +2540,7 @@ class CodexAdapter(LLMAdapter):
                 # doesn't trigger a spurious pop attempt.
                 if session_id:
                     self._session_threads.pop(session_id, None)
+                    self._forget_thread_usage(session_id)
                 wait_s = _codex_retry_wait_seconds()
                 logger.warning(
                     "codex idle-timeout under cap with zero events; "

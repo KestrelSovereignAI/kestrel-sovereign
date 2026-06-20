@@ -2425,22 +2425,46 @@ export async function updateContextStatus() {
         }
 
         const status = await deps().api.getContextStatus(sessionId);
-        const { message_count, utilization_percent, status: contextState, warnings, route_cap } = status;
+        const { message_count, utilization_percent, status: contextState, warnings, route_cap, codex_thread } = status;
+
+        // #1844: on openai:plan, codex holds the conversation thread
+        // server-side while Kestrel sends only incremental turns — so
+        // ``utilization_percent`` reflects Kestrel's per-turn payload, NOT
+        // the server-side thread that actually fills the window and trips
+        // codex's (lossy) auto-compaction. When the backend supplies the
+        // real occupancy, drive the pill off THAT so a low per-turn reading
+        // can't masquerade as a healthy context.
+        const codexOcc = (codex_thread && typeof codex_thread.occupancy_percent === 'number')
+            ? codex_thread.occupancy_percent
+            : null;
+        const effectiveUtil = (codexOcc != null) ? codexOcc : utilization_percent;
 
         // Color based on utilization
         let color, icon;
-        if (utilization_percent < 50) {
+        if (effectiveUtil < 50) {
             color = '#22c55e';  // green
             icon = '●';
-        } else if (utilization_percent < 80) {
+        } else if (effectiveUtil < 80) {
             color = '#eab308';  // yellow
             icon = '●';
-        } else if (utilization_percent < 95) {
+        } else if (effectiveUtil < 95) {
             color = '#f97316';  // orange
             icon = deps().kicon('warning');
         } else {
             color = '#ef4444';  // red
             icon = deps().kicon('warning');
+        }
+
+        // Server-side thread tooltip note when the real occupancy drives
+        // the pill (openai:plan), so the operator knows this is codex's
+        // thread, not Kestrel's per-turn payload.
+        let codexThreadTooltip = '';
+        if (codexOcc != null) {
+            const usedTok = Number(codex_thread.used_tokens || 0).toLocaleString();
+            const winTok = codex_thread.window_tokens
+                ? Number(codex_thread.window_tokens).toLocaleString()
+                : '?';
+            codexThreadTooltip = `\nCodex server-side thread: ${usedTok} / ${winTok} tokens (${codexOcc.toFixed(1)}%). Kestrel per-turn payload: ${utilization_percent.toFixed(1)}%.`;
         }
 
         // #1503: route per-turn cap labeling. On capped routes (notably
@@ -2475,7 +2499,14 @@ export async function updateContextStatus() {
 
         contextStatusElement.style.color = color;
 
-        // Show compact button when utilization is 70%+
+        // Show the Compact CTA only when LOCAL utilization is 70%+ — NOT
+        // codex's server-side occupancy. `!compact` compacts Kestrel's stored
+        // history; on openai:plan the adapter still sends only the latest
+        // turn and relies on codex's server-side thread, so compacting local
+        // history can't relieve the codex occupancy that drives effectiveUtil.
+        // Offering it there would be a remedy that does nothing (codex review
+        // round 4). The honest display above still reflects true occupancy;
+        // the real codex-thread remediation is Stage 2 of #1844.
         const showCompact = utilization_percent >= 70;
         const compactButton = showCompact
             // The Compact button lives inside the clickable pill
@@ -2509,8 +2540,8 @@ export async function updateContextStatus() {
                   onclick="window.openContextBreakdownPopup()"
                   onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); window.openContextBreakdownPopup(); }"
                   style="cursor: pointer; user-select: none;"
-                  title="Click for per-section context breakdown · ${message_count} messages · ${utilization_percent.toFixed(1)}% of window used${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
-                ${icon} ${message_count} msgs · ${utilization_percent.toFixed(0)}%${routeCapBadge}${compactButton}
+                  title="Click for per-section context breakdown · ${message_count} messages · ${effectiveUtil.toFixed(1)}% of window used${_esc(codexThreadTooltip)}${warnings.length ? '\nWarnings: ' + warnings.join(', ') : ''}${_esc(routeCapTooltip)}">
+                ${icon} ${message_count} msgs · ${effectiveUtil.toFixed(0)}%${routeCapBadge}${compactButton}
             </span>
         `;
 
@@ -2878,6 +2909,42 @@ function renderContextBreakdown(status) {
         `;
     }
 
+    // #1844: codex's TRUE server-side thread occupancy on openai:plan.
+    // The "Window utilization" figure below measures Kestrel's per-turn
+    // payload; on openai:plan codex accumulates the full thread server-side
+    // and auto-compacts (lossily) when IT fills — which that figure can't
+    // see. Surface the real occupancy prominently so a low whole-window
+    // reading can't masquerade as a healthy context.
+    const ct = status.codex_thread;
+    let codexThreadBlock = '';
+    if (ct && typeof ct.occupancy_percent === 'number') {
+        const ctUtil = Number(ct.occupancy_percent || 0);
+        let ctColor;
+        if (ctUtil < 50) ctColor = '#22c55e';
+        else if (ctUtil < 80) ctColor = '#eab308';
+        else if (ctUtil < 95) ctColor = '#f97316';
+        else ctColor = '#ef4444';
+        const winNote = ct.window_tokens
+            ? `${fmt(ct.used_tokens)} / ${fmt(ct.window_tokens)} tokens`
+            : `${fmt(ct.used_tokens)} tokens`;
+        codexThreadBlock = `
+            <div style="margin-bottom:0.5rem;padding:0.75rem;background:${ctColor}15;border-left:3px solid ${ctColor};border-radius:4px">
+                <div style="display:flex;justify-content:space-between;align-items:baseline">
+                    <div>
+                        <div style="font-size:0.7rem;color:var(--text-secondary);text-transform:uppercase">Codex server-side thread</div>
+                        <div style="font-size:1.1rem;font-weight:600;color:${ctColor}">${ctUtil.toFixed(1)}% of window</div>
+                    </div>
+                    <div style="text-align:right;color:var(--text-secondary);font-size:0.85rem">
+                        <div>${winNote}</div>
+                    </div>
+                </div>
+                <div style="font-size:0.7rem;color:var(--text-secondary);margin-top:0.4rem">
+                    On openai:plan, codex holds the conversation thread server-side. This is the real occupancy that triggers compaction — the "Window utilization" below only measures Kestrel's per-turn payload.
+                </div>
+            </div>
+        `;
+    }
+
     return `
         <div style="font-size:0.875rem">
             <div style="display:flex; justify-content:space-between; align-items:baseline; padding-bottom:0.75rem; border-bottom:2px solid var(--border-color); margin-bottom:0.5rem">
@@ -2890,6 +2957,7 @@ function renderContextBreakdown(status) {
                     <div style="font-size:0.7rem; margin-top:0.15rem">${_esc(breakdown.model || '')} · reserve ${fmt(breakdown.response_reserve || 0)} · limit ${fmt(breakdown.context_limit || 0)}</div>
                 </div>
             </div>
+            ${codexThreadBlock}
             ${routeCapBlock}
             ${dynamicSection}
             ${notesBlock}

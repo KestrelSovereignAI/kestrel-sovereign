@@ -153,6 +153,87 @@ class TestUsageProjection:
         }
 
 
+class TestThreadOccupancy:
+    """#1844: codex's TRUE server-side thread occupancy capture.
+
+    On openai:plan Kestrel sends only the incremental turn while codex
+    accumulates the full thread server-side, so the per-turn payload the
+    context monitor measures is NOT what fills the window. The adapter
+    captures the real occupancy from ``thread/tokenUsage/updated`` keyed by
+    session so ``/context-status`` can report it.
+    """
+
+    def test_records_and_reports_occupancy(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("sess-1", {
+            "last": {"inputTokens": 54715, "totalTokens": 55039},
+            "modelContextWindow": 258400,
+        })
+        occ = a.get_thread_occupancy("sess-1")
+        assert occ["used_tokens"] == 54715
+        assert occ["window_tokens"] == 258400
+        assert occ["occupancy_percent"] == 21.2
+
+    def test_snake_case_event_spelling_is_captured(self):
+        # Hosts emitting thread/token_usage/updated use snake_case fields;
+        # occupancy must still be captured (codex review P2).
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last_token_usage": {"input_tokens": 600},
+            "model_context_window": 1200,
+        })
+        occ = a.get_thread_occupancy("s")
+        assert occ["used_tokens"] == 600
+        assert occ["window_tokens"] == 1200
+        assert occ["occupancy_percent"] == 50.0
+
+    def test_used_falls_back_to_total_when_input_absent(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"totalTokens": 1000}, "modelContextWindow": 10000,
+        })
+        assert a.get_thread_occupancy("s")["used_tokens"] == 1000
+
+    def test_window_absent_yields_null_percent(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {"last": {"inputTokens": 500}})
+        occ = a.get_thread_occupancy("s")
+        assert occ["used_tokens"] == 500
+        assert occ["window_tokens"] is None
+        assert occ["occupancy_percent"] is None
+
+    def test_latest_turn_overwrites_prior(self):
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 100}, "modelContextWindow": 1000})
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 800}, "modelContextWindow": 1000})
+        assert a.get_thread_occupancy("s")["occupancy_percent"] == 80.0
+
+    def test_forget_clears_snapshot_on_thread_invalidation(self):
+        # A recreated/empty codex thread must not keep reporting the dead
+        # thread's occupancy (codex review round 2).
+        a = CodexAdapter()
+        a._record_thread_occupancy("s", {
+            "last": {"inputTokens": 200000}, "modelContextWindow": 258400})
+        assert a.get_thread_occupancy("s")["used_tokens"] == 200000
+        a._forget_thread_usage("s")
+        assert a.get_thread_occupancy("s") is None
+        a._forget_thread_usage("s")      # idempotent
+        a._forget_thread_usage(None)     # safe
+
+    def test_unknown_session_and_bad_input_are_safe(self):
+        a = CodexAdapter()
+        assert a.get_thread_occupancy("nope") is None
+        assert a.get_thread_occupancy(None) is None
+        # Non-dict / empty / bool-as-int never raise and never record.
+        a._record_thread_occupancy("s", None)
+        a._record_thread_occupancy(None, {"last": {"inputTokens": 5}})
+        a._record_thread_occupancy("s", {"last": {"inputTokens": True}})
+        a._record_thread_occupancy("s", {"last": {}})
+        assert a.get_thread_occupancy("s") is None
+
+
 class TestResultMarshalling:
     """Kestrel tool results -> codex CodexDynamicToolCallResponse."""
 
@@ -2360,3 +2441,49 @@ class TestDiscoveredRouteCapFromEvent:
             assert len(change_logs) == 1
         finally:
             catalog.clear_discovered_route_context_caps()
+
+
+class TestContextStatusRouteGating:
+    """#1844 codex review r2/r3: /context-status surfaces codex_thread only
+    when the RESOLVED primary provider is the CodexAdapter — keyed off
+    resolve_provider_routing, NOT the display model string (so a route-less
+    ``openai/<model>`` that executes on openai:plan still works, and a switch
+    away from plan drops the stale snapshot)."""
+
+    def _agent(self, resolved_primary, used=1000, window=2000):
+        codex = CodexAdapter()
+        codex._record_thread_occupancy("s", {
+            "last": {"inputTokens": used}, "modelContextWindow": window})
+        other = object()  # no get_thread_occupancy → not codex
+        primary = {"adapter": codex if resolved_primary == "codex" else other}
+
+        class _LLM:
+            def resolve_provider_routing(self_inner):
+                return ([primary], None)
+
+        class _Agent:
+            llm_service = _LLM()
+
+        return _Agent()
+
+    def test_surfaced_when_codex_is_resolved_primary(self):
+        # Round 3: even a route-less openai preference whose primary RESOLVES
+        # to the CodexAdapter surfaces occupancy.
+        from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
+        occ = _codex_thread_occupancy(self._agent("codex"), "s")
+        assert occ is not None and occ["used_tokens"] == 1000
+
+    def test_suppressed_when_primary_is_not_codex(self):
+        # Round 2: switched away from plan → primary isn't codex → stale
+        # snapshot must NOT leak.
+        from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
+        assert _codex_thread_occupancy(self._agent("other"), "s") is None
+
+    def test_safe_when_no_resolver_or_no_session(self):
+        from kestrel_sovereign.endpoints.agent import _codex_thread_occupancy
+
+        class _Bare:
+            llm_service = object()  # no resolve_provider_routing
+
+        assert _codex_thread_occupancy(_Bare(), "s") is None
+        assert _codex_thread_occupancy(self._agent("codex"), None) is None
