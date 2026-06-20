@@ -1129,6 +1129,18 @@ class StreamingMixin:
             stop_tool_results = None
             stop_tool_calls = None
 
+        # Post-response memory pipeline — parity with the non-streaming path
+        # (kestrel_agent._post_response_pipeline). Routed through the SINGLE
+        # privacy gate so EPHEMERAL/ISOLATED (and deidentified) turns never
+        # derive durable state (temporal patterns, concept-graph nodes,
+        # emotional metadata, embeddings) from raw user input. The guard is
+        # also the gate's call site for the streaming path: when it returns
+        # True the pipeline is never entered, so no background memory work is
+        # scheduled. Mirrors the non-streaming fire at kestrel_agent.py.
+        post_pipeline = getattr(self, "_post_response_pipeline", None)
+        if callable(post_pipeline) and not self._privacy_blocks_background_memory():
+            await post_pipeline(user_input, final_assistant_text, session_id)
+
         # Fire STOP hook (streaming response cycle complete).
         #
         # STOP HookInput carries the turn's user message, the final visible
