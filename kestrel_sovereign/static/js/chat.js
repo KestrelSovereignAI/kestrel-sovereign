@@ -2499,9 +2499,15 @@ export async function updateContextStatus() {
 
         contextStatusElement.style.color = color;
 
-        // Show compact button when utilization is 70%+ (true occupancy on
-        // openai:plan via #1844, else the whole-window utilization).
-        const showCompact = effectiveUtil >= 70;
+        // Show the Compact CTA only when LOCAL utilization is 70%+ — NOT
+        // codex's server-side occupancy. `!compact` compacts Kestrel's stored
+        // history; on openai:plan the adapter still sends only the latest
+        // turn and relies on codex's server-side thread, so compacting local
+        // history can't relieve the codex occupancy that drives effectiveUtil.
+        // Offering it there would be a remedy that does nothing (codex review
+        // round 4). The honest display above still reflects true occupancy;
+        // the real codex-thread remediation is Stage 2 of #1844.
+        const showCompact = utilization_percent >= 70;
         const compactButton = showCompact
             // The Compact button lives inside the clickable pill
             // span, so its click would bubble up to the pill's
