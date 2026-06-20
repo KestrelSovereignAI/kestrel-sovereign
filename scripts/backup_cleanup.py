@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
@@ -35,6 +36,7 @@ DEFAULT_GCS_BUCKET = "kestrel-agent-backup"
 DEFAULT_GCS_PREFIX = "kestrel/"
 CONFIRMATION_PHRASE = "DELETE BACKUPS"
 AUDIT_LOG = "backup_cleanup_deletions.log"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,23 @@ class CleanupPlan:
     @property
     def deletions(self) -> tuple[PlannedRecord, ...]:
         return tuple(row for row in self.records if not row.keep)
+
+
+@dataclass(frozen=True)
+class ManifestAttribution:
+    agent_id: str
+    timestamp: datetime | None
+    snapshot_format: str | None
+    manifest_cid: str
+    cid_kind: str
+
+
+@dataclass(frozen=True)
+class ClassifiedRecord:
+    record: BackupRecord
+    inventory_class: str
+    confidence: str
+    reason: str
 
 
 class LighthouseClient(Protocol):
@@ -235,76 +254,182 @@ def _agent_from_manifest_filename(filename: str) -> str | None:
     return None
 
 
-def _manifest_snapshot_cids(manifest: Mapping[str, Any]) -> set[str]:
-    cids: set[str] = set()
-    for key in ("snapshot_cid", "cid", "state_cid", "backup_cid"):
-        value = manifest.get(key)
-        if value:
-            cids.add(str(value))
+def _coerce_cid(value: Any) -> str | None:
+    """Extract a CID string from a scalar or a dict entry in a collection."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, Mapping):
+        for key in ("cid", "Hash", "hash", "snapshot_cid", "payload_cid"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+    return None
+
+
+def _manifest_cid_entries(manifest: Mapping[str, Any]) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    # Scalar CID fields across current + historical manifest formats.
+    for key, kind in (
+        ("snapshot_cid", "snapshot"),
+        ("snapshot_payload_cid", "snapshot_payload"),
+        ("cid", "snapshot"),
+        ("state_cid", "snapshot"),
+        ("backup_cid", "snapshot"),
+    ):
+        cid = _coerce_cid(manifest.get(key))
+        if cid:
+            entries.setdefault(cid, kind)
+    # Collection CID fields (lists of CIDs or of {cid: ...} dicts).
     for key in ("snapshots", "snapshot_cids", "files", "items"):
         value = manifest.get(key)
-        if isinstance(value, list):
+        if isinstance(value, (list, tuple)):
             for item in value:
-                if isinstance(item, Mapping):
-                    for cid_key in ("snapshot_cid", "cid", "Hash", "hash", "fileHash"):
-                        cid_value = item.get(cid_key)
-                        if cid_value:
-                            cids.add(str(cid_value))
-                elif item:
-                    cids.add(str(item))
-        elif isinstance(value, Mapping):
-            for cid_value in value.values():
-                if isinstance(cid_value, Mapping):
-                    cid_value = cid_value.get("snapshot_cid") or cid_value.get("cid")
-                if cid_value:
-                    cids.add(str(cid_value))
-    return cids
+                cid = _coerce_cid(item)
+                if cid:
+                    entries.setdefault(cid, "snapshot")
+    return entries
 
 
-async def _all_lighthouse_uploads(client: LighthouseClient) -> list[Mapping[str, Any]]:
-    uploads: list[Mapping[str, Any]] = []
-    last_key: str | None = None
-    while True:
-        page = await client.get_uploads(last_key=last_key)
-        file_list = page.get("fileList", [])
-        if not isinstance(file_list, list):
-            break
-        uploads.extend(item for item in file_list if isinstance(item, Mapping))
-        last_key = page.get("lastKey") or page.get("nextLastKey")
-        if not last_key or not file_list:
-            break
-    return uploads
+def _manifest_schema_valid(manifest: Mapping[str, Any]) -> bool:
+    # Valid if the manifest references at least one snapshot CID by any
+    # supported field (current or historical). Don't hard-require
+    # snapshot_cid — older manifests used cid/state_cid/backup_cid/etc.
+    if not _manifest_cid_entries(manifest):
+        return False
+    optional_strings = (
+        "snapshot_cid",
+        "snapshot_payload_cid",
+        "snapshot_format",
+        "uploaded_at",
+        "source_file",
+        "content_hash",
+    )
+    if any(
+        key in manifest and not isinstance(manifest.get(key), str)
+        for key in optional_strings
+    ):
+        return False
+    if (
+        "uploaded_at" in manifest
+        and parse_timestamp(manifest.get("uploaded_at")) is None
+    ):
+        return False
+    if "raw_snapshot_size" in manifest:
+        try:
+            int(manifest.get("raw_snapshot_size") or 0)
+        except (TypeError, ValueError):
+            return False
+    return True
 
 
-async def lighthouse_records(client: LighthouseClient) -> list[BackupRecord]:
-    uploads = await _all_lighthouse_uploads(client)
-    cid_to_agent: dict[str, str] = {}
+def _valid_manifest_agent(
+    manifest: Mapping[str, Any],
+    *,
+    filename: str,
+) -> str | None:
+    filename_agent = _agent_from_manifest_filename(filename)
+    raw_body = manifest.get("agent_id")
+    body_agent = raw_body.strip() if isinstance(raw_body, str) and raw_body.strip() else None
+    # Reject when both are present and disagree (provenance mismatch).
+    if body_agent and filename_agent and body_agent != filename_agent:
+        return None
+    # Fall back to filename attribution when the body lacks agent_id (legacy
+    # manifest_<agent>.json / kestrel_manifest__<agent>__... formats).
+    agent_id = body_agent or filename_agent
+    if not agent_id:
+        return None
+    if not _manifest_schema_valid(manifest):
+        return None
+    return agent_id
+
+
+async def build_manifest_index(
+    uploads: Iterable[Mapping[str, Any]],
+    client: LighthouseClient,
+) -> tuple[dict[str, ManifestAttribution], set[str], dict[str, str]]:
+    cid_index: dict[str, ManifestAttribution] = {}
     manifest_cids: set[str] = set()
+    manifest_agents: dict[str, str] = {}
 
     for upload in uploads:
         cid = _cid(upload)
         if not cid:
             continue
         filename = _filename(upload)
-        agent_id = _agent_from_manifest_filename(filename)
-        if agent_id is None and filename.startswith("kestrel_manifest__"):
-            agent_id = _agent_from_manifest_filename(filename)
-        if agent_id is None:
+        if _agent_from_manifest_filename(filename) is None:
             continue
         manifest_cids.add(cid)
-        cid_to_agent[cid] = agent_id
         try:
             body = await client.download(cid)
             manifest = json.loads(body.decode("utf-8"))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - malformed manifests are skipped.
+            logger.warning("Skipping unreadable Lighthouse manifest %s: %s", cid, exc)
             continue
-        if isinstance(manifest, Mapping):
-            body_agent = manifest.get("agent_id")
-            if body_agent:
-                agent_id = str(body_agent)
-                cid_to_agent[cid] = agent_id
-            for snapshot_cid in _manifest_snapshot_cids(manifest):
-                cid_to_agent[snapshot_cid] = agent_id
+        if not isinstance(manifest, Mapping):
+            logger.warning("Skipping non-object Lighthouse manifest %s", cid)
+            continue
+        agent_id = _valid_manifest_agent(manifest, filename=filename)
+        if agent_id is None:
+            logger.warning("Skipping malformed Lighthouse manifest %s", cid)
+            continue
+        manifest_agents[cid] = agent_id
+        timestamp = parse_timestamp(manifest.get("uploaded_at")) or _upload_timestamp(
+            upload
+        )
+        snapshot_format = manifest.get("snapshot_format")
+        if snapshot_format is not None:
+            snapshot_format = str(snapshot_format)
+        for snapshot_cid, cid_kind in _manifest_cid_entries(manifest).items():
+            cid_index[snapshot_cid] = ManifestAttribution(
+                agent_id=agent_id,
+                timestamp=timestamp,
+                snapshot_format=snapshot_format,
+                manifest_cid=cid,
+                cid_kind=cid_kind,
+            )
+    return cid_index, manifest_cids, manifest_agents
+
+
+async def _all_lighthouse_uploads(client: LighthouseClient) -> list[Mapping[str, Any]]:
+    uploads: list[Mapping[str, Any]] = []
+    last_key: str | None = None
+    seen_cursors: set[str] = set()
+    account_total: int | None = None
+    while True:
+        page = await client.get_uploads(last_key=last_key)
+        file_list = page.get("fileList", [])
+        if not isinstance(file_list, list):
+            break
+        uploads.extend(item for item in file_list if isinstance(item, Mapping))
+        if account_total is None and page.get("totalFiles") is not None:
+            account_total = _size(page.get("totalFiles"))
+        next_key = page.get("nextLastKey") or page.get("lastKey")
+        next_key = str(next_key) if next_key else None
+        if not next_key:
+            break
+        if next_key in seen_cursors:
+            logger.warning(
+                "Stopping Lighthouse pagination on repeated cursor %s",
+                next_key,
+            )
+            break
+        seen_cursors.add(next_key)
+        last_key = next_key
+    logger.info("Lighthouse total files seen: %s", len(uploads))
+    if account_total is not None and len(uploads) != account_total:
+        logger.warning(
+            "Lighthouse enumeration saw %s files, account reported %s",
+            len(uploads),
+            account_total,
+        )
+    return uploads
+
+
+async def lighthouse_records(client: LighthouseClient) -> list[BackupRecord]:
+    uploads = await _all_lighthouse_uploads(client)
+    manifest_index, manifest_cids, manifest_agents = await build_manifest_index(
+        uploads, client
+    )
 
     records: list[BackupRecord] = []
     for upload in uploads:
@@ -312,9 +437,25 @@ async def lighthouse_records(client: LighthouseClient) -> list[BackupRecord]:
         if not cid:
             continue
         filename = _filename(upload) or cid
-        agent_id = cid_to_agent.get(cid)
+        attribution = manifest_index.get(cid)
+        agent_id = attribution.agent_id if attribution else manifest_agents.get(cid)
         metadata = dict(upload)
-        role = "identity" if cid in manifest_cids else upload.get("role")
+        if attribution:
+            metadata.update(
+                {
+                    "manifest_cid": attribution.manifest_cid,
+                    "snapshot_format": attribution.snapshot_format,
+                    "manifest_cid_kind": attribution.cid_kind,
+                }
+            )
+        if cid in manifest_cids and agent_id:
+            metadata["manifest_cid"] = cid
+        if cid in manifest_cids:
+            role = "identity"
+        elif attribution:
+            role = "snapshot"
+        else:
+            role = upload.get("role")
         record = BackupRecord(
             store="lighthouse",
             key=cid,
@@ -335,6 +476,59 @@ async def lighthouse_records(client: LighthouseClient) -> list[BackupRecord]:
         )
         records.append(_with_test_flag(record))
     return records
+
+
+def classify_inventory_record(record: BackupRecord) -> ClassifiedRecord:
+    _ = classify(
+        {
+            "role": record.data_class.value,
+            "fileName": record.name,
+            "key": record.key,
+            "tag": record.metadata.get("tag"),
+            "cid": record.key,
+        }
+    )
+    filename = Path(record.name).name.lower()
+    if record.test_artifact or _is_test_artifact(record):
+        return ClassifiedRecord(
+            record,
+            "test_proven_orphan",
+            "high",
+            "matches did:test/test file/live-check/fixture marker",
+        )
+    if record.metadata.get("manifest_cid_kind"):
+        return ClassifiedRecord(
+            record,
+            "attributed_snapshot",
+            "high",
+            f"CID found in manifest index as {record.metadata['manifest_cid_kind']}",
+        )
+    if filename in {"kestrel_prime.db", "kestrel_prime.db-wal"} or filename.endswith(
+        "-wal"
+    ):
+        return ClassifiedRecord(
+            record,
+            "legacy_private_candidate",
+            "medium",
+            "raw legacy database/WAL upload without manifest attribution",
+        )
+    if filename.endswith(".bin"):
+        return ClassifiedRecord(
+            record,
+            "unattributed_bin",
+            "medium",
+            "binary blob without manifest attribution",
+        )
+    return ClassifiedRecord(
+        record,
+        "unattributed_private_candidate",
+        "low" if record.attributed else "medium",
+        "no manifest index attribution for this object",
+    )
+
+
+def classify_records(records: Iterable[BackupRecord]) -> list[ClassifiedRecord]:
+    return [classify_inventory_record(record) for record in records]
 
 
 def build_plan(
@@ -421,6 +615,44 @@ def render_report(plan: CleanupPlan) -> str:
         lines.append("Unattributed Lighthouse/GCS items kept:")
         for row in unattributed:
             lines.append(f"  {row.record.store} {row.record.key} {row.record.name}")
+    return "\n".join(lines)
+
+
+def render_inventory(classified: Iterable[ClassifiedRecord]) -> str:
+    summary: dict[tuple[str, str], dict[str, int]] = {}
+    for row in classified:
+        agent = row.record.agent_id or "(unattributed)"
+        bucket = summary.setdefault(
+            (row.inventory_class, agent),
+            {"count": 0, "bytes": 0},
+        )
+        bucket["count"] += 1
+        bucket["bytes"] += row.record.size
+
+    lines = ["Backup inventory report", ""]
+    for (inventory_class, agent), counts in sorted(summary.items()):
+        lines.append(
+            f"{inventory_class} {agent}: "
+            f"{counts['count']} files ({_fmt_bytes(counts['bytes'])})"
+        )
+    return "\n".join(lines)
+
+
+def render_classification(classified: Iterable[ClassifiedRecord]) -> str:
+    lines = ["Backup classification report", ""]
+    for row in sorted(
+        classified,
+        key=lambda item: (
+            item.record.store,
+            item.record.agent_id or "",
+            item.record.key,
+        ),
+    ):
+        lines.append(
+            f"{row.record.store} {row.record.key} {row.record.name}: "
+            f"{row.inventory_class} confidence={row.confidence} "
+            f"agent={row.record.agent_id or '(unattributed)'} reason={row.reason}"
+        )
     return "\n".join(lines)
 
 
@@ -517,6 +749,17 @@ async def _main_async(args: argparse.Namespace) -> int:
             raise
 
     plan = build_plan(records, policy)
+    if args.mode == "inventory":
+        print(render_inventory(classify_records(records)))
+        if lighthouse_client is not None:
+            await lighthouse_client.close()
+        return 0
+    if args.mode == "classify":
+        print(render_classification(classify_records(records)))
+        if lighthouse_client is not None:
+            await lighthouse_client.close()
+        return 0
+
     print(render_report(plan))
     if not args.apply:
         if lighthouse_client is not None:
@@ -549,6 +792,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-gcs", action="store_true")
     parser.add_argument("--skip-lighthouse", action="store_true")
     parser.add_argument(
+        "--mode",
+        choices=("dry-run", "inventory", "classify"),
+        default="dry-run",
+        help="Read-only report mode. dry-run preserves the historical cleanup report.",
+    )
+    parser.add_argument(
         "--apply",
         action="store_true",
         help="Delete planned records after typed confirmation",
@@ -565,6 +814,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
         return asyncio.run(_main_async(args))
     except Exception as exc:  # noqa: BLE001 - CLI should surface exact failure.

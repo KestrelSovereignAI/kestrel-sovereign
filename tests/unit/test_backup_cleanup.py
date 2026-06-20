@@ -194,6 +194,56 @@ class AsyncDeleteClient:
 
 
 @pytest.mark.asyncio
+async def test_lighthouse_pagination_consumes_empty_and_multi_page_responses(caplog):
+    class FakeClient:
+        def __init__(self):
+            self.calls = []
+            self.pages = {
+                None: {
+                    "fileList": [{"cid": "cid-1", "fileName": "one.db"}],
+                    "nextLastKey": "cursor-1",
+                    "totalFiles": 3,
+                },
+                "cursor-1": {
+                    "fileList": [],
+                    "nextLastKey": "cursor-empty",
+                    "totalFiles": 3,
+                },
+                "cursor-empty": {
+                    "fileList": [{"cid": "cid-2", "fileName": "two.db"}],
+                    "lastKey": "cursor-2",
+                    "totalFiles": 3,
+                },
+                "cursor-2": {
+                    "fileList": [{"cid": "cid-3", "fileName": "three.db"}],
+                    "totalFiles": 3,
+                },
+            }
+
+        async def get_uploads(self, last_key=None):
+            self.calls.append(last_key)
+            return self.pages[last_key]
+
+        async def download(self, cid, timeout=None):
+            return b"{}"
+
+        async def delete_file(self, cid):
+            raise AssertionError("delete_file should not be called")
+
+        async def close(self):
+            pass
+
+    client = FakeClient()
+
+    with caplog.at_level("INFO"):
+        uploads = await backup_cleanup._all_lighthouse_uploads(client)
+
+    assert client.calls == [None, "cursor-1", "cursor-empty", "cursor-2"]
+    assert [upload["cid"] for upload in uploads] == ["cid-1", "cid-2", "cid-3"]
+    assert "Lighthouse total files seen: 3" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_unattributed_lighthouse_files_are_reported_and_never_deleted():
     class FakeClient:
         async def get_uploads(self, last_key=None):
@@ -257,6 +307,143 @@ async def test_unattributed_lighthouse_files_are_reported_and_never_deleted():
     assert "cid-known" not in _delete_keys(plan)  # newest/only working item for agent.
     assert "(unattributed)" in report
     assert "cid-unknown" in report
+
+
+@pytest.mark.asyncio
+async def test_manifest_index_attributes_export_car_and_rejects_malformed_manifest():
+    class FakeClient:
+        async def get_uploads(self, last_key=None):
+            return {
+                "fileList": [
+                    {
+                        "cid": "cid-export",
+                        "fileName": "export.car",
+                        "fileSizeInBytes": "300",
+                    },
+                    {
+                        "cid": "cid-payload",
+                        "fileName": "payload.bin",
+                        "fileSizeInBytes": "200",
+                    },
+                    {
+                        "cid": "cid-bad-export",
+                        "fileName": "export.car",
+                        "fileSizeInBytes": "300",
+                    },
+                    {
+                        "cid": "cid-manifest-good",
+                        "fileName": "kestrel_manifest__agent-a__20260620_120000.json",
+                    },
+                    {
+                        "cid": "cid-manifest-bad",
+                        "fileName": "manifest_agent-b.json",
+                    },
+                ],
+                "totalFiles": 5,
+            }
+
+        async def download(self, cid, timeout=None):
+            if cid == "cid-manifest-good":
+                return json.dumps(
+                    {
+                        "agent_id": "agent-a",
+                        "snapshot_cid": "cid-export",
+                        "snapshot_payload_cid": "cid-payload",
+                        "snapshot_format": "car-v1/raw-sqlite",
+                        "uploaded_at": "2026-06-20T12:00:00Z",
+                        "raw_snapshot_size": 123,
+                        "source_file": "kestrel_prime.db",
+                        "content_hash": "abc",
+                    }
+                ).encode()
+            if cid == "cid-manifest-bad":
+                return json.dumps(
+                    {"agent_id": "agent-x", "snapshot_cid": "cid-bad-export"}
+                ).encode()
+            raise AssertionError(f"unexpected download {cid}")
+
+        async def delete_file(self, cid):
+            raise AssertionError("delete_file should not be called")
+
+        async def close(self):
+            pass
+
+    records = await backup_cleanup.lighthouse_records(FakeClient())
+    by_key = {record.key: record for record in records}
+
+    assert by_key["cid-export"].agent_id == "agent-a"
+    assert by_key["cid-export"].metadata["manifest_cid"] == "cid-manifest-good"
+    assert by_key["cid-export"].metadata["manifest_cid_kind"] == "snapshot"
+    assert by_key["cid-payload"].agent_id == "agent-a"
+    assert by_key["cid-payload"].metadata["manifest_cid_kind"] == "snapshot_payload"
+    assert by_key["cid-bad-export"].agent_id is None
+    assert "manifest_cid_kind" not in by_key["cid-bad-export"].metadata
+
+
+def test_inventory_classifier_assigns_expected_class_confidence_and_reason():
+    records = [
+        _record(
+            "cid-export",
+            "agent-a",
+            1,
+            store="lighthouse",
+            name="export.car",
+        ),
+        _record(
+            "cid-test",
+            "did:test:agent",
+            1,
+            store="lighthouse",
+            name="test-alpha.db",
+        ),
+        _record(
+            "cid-db",
+            None,
+            1,
+            store="lighthouse",
+            name="kestrel_prime.db",
+            attributed=False,
+        ),
+        _record(
+            "cid-wal",
+            None,
+            1,
+            store="lighthouse",
+            name="kestrel_prime.db-wal",
+            attributed=False,
+        ),
+        _record(
+            "cid-bin",
+            None,
+            1,
+            store="lighthouse",
+            name="random.bin",
+            attributed=False,
+        ),
+        _record(
+            "cid-private",
+            None,
+            1,
+            store="lighthouse",
+            name="unknown.car",
+            attributed=False,
+        ),
+    ]
+    records[0].metadata["manifest_cid_kind"] = "snapshot"
+    rows = backup_cleanup.classify_records(
+        [backup_cleanup._with_test_flag(record) for record in records]
+    )
+    by_key = {row.record.key: row for row in rows}
+
+    assert by_key["cid-export"].inventory_class == "attributed_snapshot"
+    assert by_key["cid-export"].confidence == "high"
+    assert "manifest index" in by_key["cid-export"].reason
+    assert by_key["cid-test"].inventory_class == "test_proven_orphan"
+    assert "fixture marker" in by_key["cid-test"].reason
+    assert by_key["cid-db"].inventory_class == "legacy_private_candidate"
+    assert by_key["cid-wal"].inventory_class == "legacy_private_candidate"
+    assert by_key["cid-bin"].inventory_class == "unattributed_bin"
+    assert by_key["cid-private"].inventory_class == "unattributed_private_candidate"
 
 
 def test_latest_db_is_never_deleted_even_when_it_matches_test_artifact():
@@ -334,3 +521,39 @@ def test_parse_gsutil_ls_handles_real_single_token_iso_timestamp():
     assert latest.protected is True
     # Timestamps resolved from the ISO token, not None.
     assert all(r.timestamp is not None for r in records)
+
+
+def test_manifest_agent_falls_back_to_filename_when_body_missing_agent_id():
+    # Legacy manifest_<agent>.json with no agent_id in body -> attribute via filename.
+    agent = backup_cleanup._valid_manifest_agent(
+        {"snapshot_cid": "cid-1"},
+        filename="manifest_did:pkh:eip155:1:0xABC.json",
+    )
+    assert agent == "did:pkh:eip155:1:0xABC"
+    # Body present + matching filename still works.
+    assert backup_cleanup._valid_manifest_agent(
+        {"agent_id": "agent-a", "snapshot_cid": "cid-1"},
+        filename="manifest_agent-a.json",
+    ) == "agent-a"
+    # Body vs filename mismatch is still rejected (provenance guard).
+    assert backup_cleanup._valid_manifest_agent(
+        {"agent_id": "agent-x", "snapshot_cid": "cid-1"},
+        filename="manifest_agent-b.json",
+    ) is None
+
+
+def test_manifest_cid_entries_parses_legacy_and_collection_fields():
+    # Historical scalar fields.
+    entries = backup_cleanup._manifest_cid_entries(
+        {"cid": "cid-legacy", "state_cid": "cid-state", "backup_cid": "cid-bak"}
+    )
+    assert {"cid-legacy", "cid-state", "cid-bak"} <= set(entries)
+    # Collection fields: list of strings and list of {cid: ...} dicts.
+    entries = backup_cleanup._manifest_cid_entries(
+        {"snapshots": ["cid-a", {"cid": "cid-b"}], "snapshot_cids": ["cid-c"]}
+    )
+    assert {"cid-a", "cid-b", "cid-c"} <= set(entries)
+    # A manifest using only legacy fields is still schema-valid (has a CID).
+    assert backup_cleanup._manifest_schema_valid({"cid": "cid-legacy"}) is True
+    # A manifest with no CID at all is invalid.
+    assert backup_cleanup._manifest_schema_valid({"agent_id": "agent-a"}) is False
