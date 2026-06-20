@@ -2315,45 +2315,35 @@ Expected Duration: {expected_duration}
             pass
         return 70.0
 
-    def _active_codex_adapter(self, model_override: Optional[str] = None):
-        """Return the CodexAdapter iff it is the RESOLVED primary provider for
-        the next turn, else ``None``.
+    def _codex_adapter(self):
+        """Return the configured CodexAdapter (duck-typed on its thread
+        surface), or ``None``.
 
-        Resolves with the SAME inputs the turn will use — the per-turn
-        ``model_override`` and the privacy-derived ``force_local_only`` — so
-        gating can't diverge from the route the turn actually takes (e.g. a
-        per-turn override to/from openai:plan; codex review r2). Duck-typed on
-        the thread-occupancy/reset surface only CodexAdapter exposes.
+        Deliberately does NOT predict the turn's route. ``generate_with_messages``
+        resolves routes via ``_resolve_model_selector`` while
+        ``resolve_provider_routing`` is a separate resolver — predicting with
+        either diverges from the other in edge cases (per-turn overrides,
+        solvency fallback, bare model ids; codex review r2/r5/r6/r7). Instead we
+        gate on the adapter's OWN recorded occupancy (see
+        ``_maybe_compact_codex_thread``): codex records a thread's occupancy only
+        for sessions it actually served, so a high reading is FACTUAL evidence
+        codex built that thread — no prediction needed. ``reset_thread`` clears
+        the snapshot, so a fire after a route switch away from codex is one-time
+        and self-limiting.
         """
         llm = getattr(self, "llm_service", None)
-        resolver = getattr(llm, "resolve_provider_routing", None)
-        if not callable(resolver):
-            return None
-        force_local = False
-        try:
-            pa = getattr(self, "privacy_agent", None)
-            if pa is not None:
-                force_local = not pa.privacy_config.allows_cloud_llm()
-        except Exception:
-            force_local = False
-        try:
-            providers, _ = resolver(
-                model_override=model_override, force_local_only=force_local
-            )
-        except Exception:
-            return None
-        primary = providers[0] if providers else None
-        adapter = primary.get("adapter") if isinstance(primary, dict) else None
-        if (
-            adapter is not None
-            and hasattr(adapter, "get_thread_occupancy")
-            and hasattr(adapter, "reset_thread")
-        ):
-            return adapter
+        for prov in (getattr(llm, "providers", None) or []):
+            adapter = prov.get("adapter") if isinstance(prov, dict) else None
+            if (
+                adapter is not None
+                and hasattr(adapter, "get_thread_occupancy")
+                and hasattr(adapter, "reset_thread")
+            ):
+                return adapter
         return None
 
     async def _maybe_compact_codex_thread(
-        self, session_id: Optional[str], model_override: Optional[str] = None,
+        self, session_id: Optional[str],
     ) -> None:
         """Pre-turn Kestrel-owned compaction for openai:plan (#1844 Stage 2).
 
@@ -2373,9 +2363,12 @@ Expected Duration: {expected_duration}
         """
         if not session_id:
             return
-        adapter = self._active_codex_adapter(model_override)
+        adapter = self._codex_adapter()
         if adapter is None:
             return
+        # FACTUAL gate: codex records occupancy only for sessions it served, so
+        # a high reading means codex built (and owns) this session's thread —
+        # no route prediction needed.
         occ = adapter.get_thread_occupancy(session_id)
         pct = occ.get("occupancy_percent") if occ else None
         if not isinstance(pct, (int, float)):
@@ -2506,23 +2499,13 @@ Expected Duration: {expected_duration}
                 "preturn_state: injection skipped: %s", _e, exc_info=True
             )
 
-        # Resolve the model THIS turn will actually use — explicit override
-        # else a FRESH solvency check — up front, so the compaction gate below
-        # and the turn agree on the route (codex review r5/r6: a stale cached
-        # preference could compact/reset codex for a turn solvency forces local,
-        # or skip it after a refill). Computed once and reused at the generate
-        # call below.
-        effective_model = model_override
-        if not effective_model:
-            effective_model = await self.check_solvency()
-
         # #1844 Stage 2: Kestrel-owned compaction for openai:plan. If codex's
         # server-side thread occupancy has crossed the threshold, compact our
         # (durable) history and reset the codex thread now — BEFORE assembling
         # this turn's context — so the fresh thread reseeds the compacted view
-        # rather than letting codex auto-compact opaquely. Best-effort; no-op
-        # off openai:plan or below threshold.
-        await self._maybe_compact_codex_thread(session_id, effective_model)
+        # rather than letting codex auto-compact opaquely. Gated on the codex
+        # adapter's own recorded occupancy (not route prediction). Best-effort.
+        await self._maybe_compact_codex_thread(session_id)
 
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
@@ -2677,8 +2660,10 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.warning(f"Failed to get extension system prompt prefix: {e}", exc_info=True)
 
-        # Model already resolved above (override > solvency > default) ahead of
-        # the pre-turn compaction gate so both agree on the route.
+        # Determine model: user override > solvency check > default
+        effective_model = model_override
+        if not effective_model:
+            effective_model = await self.check_solvency()
 
         # Build feature tools for the orchestrator
         # Includes feature dispatch tools + any direct tools from explored features
