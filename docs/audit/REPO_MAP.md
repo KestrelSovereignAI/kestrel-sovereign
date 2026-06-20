@@ -3,8 +3,8 @@
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
 GitHub App (issue #791). Do **not** edit by hand — regenerate via `python scripts/generate_repo_map.py`.
 
-**Generated:** 2026-06-19
-**Scope:** 1738 tracked files (1133 `.py`, 304 `.md`, 301 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
+**Generated:** 2026-06-20
+**Scope:** 1742 tracked files (1135 `.py`, 305 `.md`, 302 other). Excludes `__pycache__`, `node_modules`, `.venv`, `.claude`, build artifacts.
 
 **Format per file:** `path — one-line purpose` plus the public top-level Python symbols on the next line
 (classes and functions; private `_name` skipped).
@@ -235,6 +235,8 @@ Repo entry points and standard project files.
   - `async def get_observability_events(request, agent_name, event_type, session_id, …)`; `async def get_observability_summary(request, minutes)`
 - **kestrel_sovereign/endpoints/rasa_shim.py** — Rasa-compatible webhook shim for Kestrel AI.
   - `class RasaWebhookRequest`; `class RasaWebhookResponse`; `async def rasa_webhook(request, payload)`
+- **kestrel_sovereign/endpoints/restart_events.py** — Restart status-event API — repaint the bubble trail on chat reload.
+  - `async def get_restart_status_events(request, session, limit)`
 - **kestrel_sovereign/endpoints/saved_items.py** — Saved Items API endpoints.
   - `class SaveItemRequest`; `class SaveStructuredItemRequest`; `class UpdateItemRequest`; `class SearchRequest`; `async def list_items(request, item_type, limit)`; `async def get_stats(request)`; `async def list_schemas(request)`; `async def get_all_tags(request)`; `…`
 - **kestrel_sovereign/endpoints/security.py** — Kestrel Security API Endpoints.
@@ -389,7 +391,7 @@ Repo entry points and standard project files.
 - **kestrel_sovereign/features/identity/feature.py** — Identity Feature: Agent tools for identity portability.
   - `class IdentityFeature`
 - **kestrel_sovereign/features/isolated_runtime.py** — Isolated feature runtime proxy and per-agent venv provisioning.
-  - `class IsolatedFeatureTool`; `class ProxyFeature`
+  - `class IsolatedFeatureTool`; `class ProxyFeature`; `class ProxyChannelAdapter`
 - **kestrel_sovereign/features/keys/__init__.py** — Key Management Feature for external service API keys.
 - **kestrel_sovereign/features/keys/component.yaml** — (configuration)
 - **kestrel_sovereign/features/keys/feature.py** — Key Management Feature for Kestrel.
@@ -1408,6 +1410,7 @@ Repo entry points and standard project files.
 - **docs/demos/DEMO_SCRIPT.md** — Kestrel Sovereign - Demo Script — **Issue #133 — Track A: Technical Demo** **Duration:** ~2 minutes automated, 10-12 minutes with live narration **Closer:** *"In 30 minutes you can have your own agent running with all of this active.…
 - **docs/deployment/README.md** — Deployment Operations — How to build, deploy, and update Kestrel Sovereign on Cloud Run.
 - **docs/deployment/prometheus-workflows-alerts.yml** — (configuration)
+- **docs/design/ISOLATED_FEATURE_RUNTIME.md** — Isolated-Feature Runtime — > Status: **Proposed (Draft)** — 2026-06-17.
 - **docs/design/KESTREL_LOGO.png** — —
 - **docs/design/README.md** — docs/design/ — Canonical published brand assets — the refreshed kestrel-on-rook mark adopted 2026-05-05.
 - **docs/design/kestrel_avatar_400x400.png** — —
@@ -1603,6 +1606,7 @@ Repo entry points and standard project files.
 - **tests/frontend/tool_activity_expandable.test.mjs** — (mjs asset)
 - **tests/frontend/trash_api_client.test.mjs** — (mjs asset)
 - **tests/frontend/trash_grouping.test.mjs** — (mjs asset)
+- **tests/frontend/voice_capability.test.mjs** — (mjs asset)
 - **tests/frontend/voice_default_pane.test.mjs** — (mjs asset)
 - **tests/infrastructure/check_pods.py** — Check RunPod pods status.
   - `def main()`
@@ -2258,7 +2262,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_input_guardrails.py** — Tests for prompt injection detection and input guardrails.
   - `class TestWrapUserInput`; `class TestCheckPromptInjection`; `class TestValidateToolArguments`; `class TestAntiInjectionPrompt`
 - **tests/unit/test_isolated_feature_runtime.py** — Tests for isolated feature runtime proxy behavior.
-  - `class FakeIsolatedClient`; `async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_path)`; `def test_service_command_console_script(tmp_path)`; `def test_service_command_module_func(tmp_path)`; `async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path)`; `def test_proxy_feature_resolves_default_per_agent_venv(tmp_path)`
+  - `class FakeIsolatedClient`; `async def test_proxy_feature_mirrors_tools_and_forwards_calls(monkeypatch, tmp_path)`; `def test_service_command_console_script(tmp_path)`; `def test_service_command_module_func(tmp_path)`; `async def test_supervision_registered_and_child_stopped_on_cancel(tmp_path)`; `class FakeChannelRegistry`; `class FakeChannelFeature`; `async def test_proxy_forwards_host_config_into_client(monkeypatch, tmp_path)`; `…`
 - **tests/unit/test_kem_suite.py** — KEMSuite tests — Wave 4 sub-PR 1 (#919).
   - `def test_x25519_library_available()`; `def test_mlkem768_library_available()`; `def test_x25519_self_registers()`; `def test_mlkem768_self_registers()`; `def test_registry_lists_both()`; `def test_unknown_alg_raises()`; `def test_x25519_classified_as_classical()`; `def test_mlkem768_classified_as_post_quantum()`; `…`
 - **tests/unit/test_kestrel_agent.py** — Unit tests for KestrelAgent core methods.
@@ -2453,6 +2457,8 @@ Repo entry points and standard project files.
   - `class TestResponseAuditHook`; `class TestResponseAuditHookNarrationFolding`; `class TestResponseAuditFeature`; `async def test_post_response_hook_flags_user_denial_without_audit()`; `async def test_post_response_hook_allows_audit_backed_user_denial()`; `async def test_post_response_hook_missing_security_feature_does_not_break()`
 - **tests/unit/test_restart_coordinator.py** — Tests for the durable restart coordinator (#1512).
   - `async def test_ensure_table_is_idempotent(tmp_path)`; `async def test_insert_then_list_then_get(tmp_path)`; `async def test_update_status_gated_on_expected_current(tmp_path)`; `async def test_list_requests_filters_by_status_and_agent(tmp_path)`; `async def test_request_restart_creates_pending_row(tmp_path)`; `async def test_request_restart_rejects_unknown_urgency(tmp_path)`; `async def test_request_restart_rejects_unknown_policy(tmp_path)`; `async def test_request_restart_rejects_empty_reason(tmp_path)`; `…`
+- **tests/unit/test_restart_events_endpoint.py** — Tests for the restart status-event API endpoint (#1816).
+  - `async def test_endpoint_returns_events_newest_first(tmp_path)`; `async def test_endpoint_scopes_to_origin_session(tmp_path)`; `async def test_endpoint_no_database_returns_empty(tmp_path)`
 - **tests/unit/test_restart_status_events.py** — Tests for the typed restart_status event store (#1562).
   - `def test_dedupe_signature_is_request_id_colon_state()`; `def test_event_payload_includes_dedupe_signature()`; `def test_event_payload_signature_excludes_volatile_deferral_reason()`; `async def test_record_event_persists_typed_row(tmp_path)`; `async def test_record_event_audit_trail_keeps_all_polls(tmp_path)`; `async def test_list_recent_events_for_history_returns_newest_first(tmp_path)`; `async def test_list_recent_events_since_paging(tmp_path)`; `async def test_list_recent_events_for_agent_context_scopes_by_agent(tmp_path)`; `…`
 - **tests/unit/test_retention_janitor.py** — Unit tests for the retention helpers (#764).
