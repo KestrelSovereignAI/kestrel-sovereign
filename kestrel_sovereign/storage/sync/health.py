@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
+from kestrel_sovereign.storage.sync.retention import parse_timestamp
+
 
 DEFAULT_LIGHTHOUSE_DEAL_GRACE = timedelta(hours=24)
 
@@ -78,22 +80,40 @@ def _upload_cid(upload: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+def _lighthouse_filename_agent_id(agent_id: str) -> str:
+    return agent_id.replace("/", "_")
+
+
+def _upload_filename(upload: Mapping[str, Any]) -> str:
+    return str(upload.get("fileName") or upload.get("Name") or "")
+
+
 def _latest_lighthouse_snapshot(
     uploads: list[Mapping[str, Any]],
     agent_id: str,
 ) -> Optional[Mapping[str, Any]]:
     tag = f"kestrel-state-{agent_id}"
+    structured_prefix = (
+        f"kestrel_state__{_lighthouse_filename_agent_id(agent_id)}__"
+    )
     candidates = [
         upload
         for upload in uploads
         if upload.get("tag") == tag
+        or (
+            _upload_filename(upload).startswith(structured_prefix)
+            and _upload_filename(upload).endswith(".car")
+        )
     ]
     if not candidates:
         return None
     return max(
         candidates,
-        key=lambda upload: _parse_upload_time(upload.get("createdAt"))
-        or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda upload: (
+            parse_timestamp(upload.get("createdAt"))
+            or parse_timestamp(_upload_filename(upload))
+            or datetime.min.replace(tzinfo=timezone.utc)
+        ),
     )
 
 
@@ -103,17 +123,28 @@ def _latest_lighthouse_manifest(
 ) -> Optional[Mapping[str, Any]]:
     tag = f"kestrel-manifest-{agent_id}"
     filename = f"manifest_{agent_id}.json"
+    structured_prefix = (
+        f"kestrel_manifest__{_lighthouse_filename_agent_id(agent_id)}__"
+    )
     candidates = [
         upload
         for upload in uploads
-        if upload.get("tag") == tag or upload.get("fileName") == filename
+        if upload.get("tag") == tag
+        or _upload_filename(upload) == filename
+        or (
+            _upload_filename(upload).startswith(structured_prefix)
+            and _upload_filename(upload).endswith(".json")
+        )
     ]
     if not candidates:
         return None
     return max(
         candidates,
-        key=lambda upload: _parse_upload_time(upload.get("createdAt"))
-        or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda upload: (
+            parse_timestamp(upload.get("createdAt"))
+            or parse_timestamp(_upload_filename(upload))
+            or datetime.min.replace(tzinfo=timezone.utc)
+        ),
     )
 
 

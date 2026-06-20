@@ -105,6 +105,7 @@ class LighthouseRestClient:
         self,
         car_bytes: bytes,
         tag: str = "kestrel-storage",
+        filename: str = "export.car",
     ) -> Dict[str, Any]:
         """
         Upload CAR (Content Addressable aRchive) file.
@@ -115,12 +116,13 @@ class LighthouseRestClient:
         Args:
             car_bytes: CAR v1 file bytes
             tag: Tag for organizing uploads
+            filename: Name for the uploaded CAR file
 
         Returns:
             Dict with 'Hash' (CID), 'Name', and 'Size' keys
         """
         client = await self._get_client()
-        files = {"file": ("export.car", car_bytes, "application/vnd.ipld.car")}
+        files = {"file": (filename, car_bytes, "application/vnd.ipld.car")}
 
         response = await client.post(
             f"{self.UPLOAD_URL}/api/v0/add",
