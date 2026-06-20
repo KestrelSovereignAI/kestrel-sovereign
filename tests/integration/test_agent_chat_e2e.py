@@ -40,6 +40,9 @@ def client(monkeypatch):
         # Set environment variable for the server to find the database
         monkeypatch.setenv("KESTREL_DB_PATH", agent_dir)
 
+        # Disable multi-agent mode for this test (force single-agent mode)
+        monkeypatch.delenv("KESTREL_MULTI_AGENT", raising=False)
+
         # Monkeypatch the function that returns the default data directory
         monkeypatch.setattr(storage, "get_default_agent_data_dir", lambda: agent_dir)
 
