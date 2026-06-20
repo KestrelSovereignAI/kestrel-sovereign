@@ -2388,8 +2388,17 @@ Expected Duration: {expected_duration}
         try:
             # Scope to THIS session so the summary marker lands in the same
             # session-filtered history the fresh codex thread will reseed from.
+            # force=True: occupancy is already over threshold, so don't let the
+            # message-count heuristic bail (high-token sessions can cross the
+            # line with relatively few, very large messages/tool outputs —
+            # codex review r3). Smaller preserve_recent so few-message sessions
+            # still have >=3 older messages to summarize while keeping recent
+            # turns verbatim.
             result = await self.context_manager.compact_session(
-                self.llm_service, session_id=session_id
+                self.llm_service,
+                preserve_recent=6,
+                force=True,
+                session_id=session_id,
             )
         except Exception as e:  # noqa: BLE001 - never break a turn
             logging.warning(

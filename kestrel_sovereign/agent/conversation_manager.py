@@ -761,13 +761,20 @@ SUMMARY:"""
 
         try:
             # Generate summary
+            # Same keyword-only signature fix as compact_session: user_prompt,
+            # not prompt (the old call TypeError'd into the broad except).
             summary_response = await llm_service.generate(
-                prompt=summary_prompt,
                 system_prompt="You are a conversation summarizer. Create concise summaries that preserve essential context.",
-                model_override=None
+                user_prompt=summary_prompt,
+                model_override=None,
             )
 
-            summary_text = summary_response.strip() if isinstance(summary_response, str) else str(summary_response)
+            if isinstance(summary_response, str):
+                summary_text = summary_response.strip()
+            else:
+                summary_text = (
+                    getattr(summary_response, "content", None) or ""
+                ).strip()
             tokens_after = counter.count(summary_text)
 
             # Collect original message IDs for transcript reference
