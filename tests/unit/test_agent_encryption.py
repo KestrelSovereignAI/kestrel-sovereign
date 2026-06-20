@@ -155,7 +155,7 @@ class TestErrorHandling:
 class TestAllPurposes:
     """Test all valid purposes work correctly."""
 
-    @pytest.mark.parametrize("purpose", list(VALID_PURPOSES))
+    @pytest.mark.parametrize("purpose", sorted(VALID_PURPOSES))
     def test_purpose_encrypt_decrypt(self, purpose):
         """Each purpose can encrypt and decrypt."""
         plaintext = f"data for {purpose}".encode()
