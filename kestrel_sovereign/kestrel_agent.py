@@ -2329,15 +2329,6 @@ Expected Duration: {expected_duration}
         resolver = getattr(llm, "resolve_provider_routing", None)
         if not callable(resolver):
             return None
-        # Solvency fallback (codex review r5): in ECONOMY/CRITICAL mode the turn
-        # is served by a local model (check_solvency returns a local fallback),
-        # so codex won't be used — don't compact/reset. Read the cached
-        # preference rather than calling check_solvency() here, to avoid a
-        # duplicate wallet lookup and reordering the turn's own solvency step.
-        if getattr(self, "_current_model_preference", "NORMAL") in (
-            "ECONOMY", "CRITICAL"
-        ):
-            return None
         force_local = False
         try:
             pa = getattr(self, "privacy_agent", None)
@@ -2515,13 +2506,23 @@ Expected Duration: {expected_duration}
                 "preturn_state: injection skipped: %s", _e, exc_info=True
             )
 
+        # Resolve the model THIS turn will actually use — explicit override
+        # else a FRESH solvency check — up front, so the compaction gate below
+        # and the turn agree on the route (codex review r5/r6: a stale cached
+        # preference could compact/reset codex for a turn solvency forces local,
+        # or skip it after a refill). Computed once and reused at the generate
+        # call below.
+        effective_model = model_override
+        if not effective_model:
+            effective_model = await self.check_solvency()
+
         # #1844 Stage 2: Kestrel-owned compaction for openai:plan. If codex's
         # server-side thread occupancy has crossed the threshold, compact our
         # (durable) history and reset the codex thread now — BEFORE assembling
         # this turn's context — so the fresh thread reseeds the compacted view
         # rather than letting codex auto-compact opaquely. Best-effort; no-op
         # off openai:plan or below threshold.
-        await self._maybe_compact_codex_thread(session_id, model_override)
+        await self._maybe_compact_codex_thread(session_id, effective_model)
 
         # Use unified ContextManager for token-aware context assembly
         # This handles: system prompt, episodes, memories, RAG, history
@@ -2676,10 +2677,8 @@ Expected Duration: {expected_duration}
             except Exception as e:
                 logging.warning(f"Failed to get extension system prompt prefix: {e}", exc_info=True)
 
-        # Determine model: user override > solvency check > default
-        effective_model = model_override
-        if not effective_model:
-            effective_model = await self.check_solvency()
+        # Model already resolved above (override > solvency > default) ahead of
+        # the pre-turn compaction gate so both agree on the route.
 
         # Build feature tools for the orchestrator
         # Includes feature dispatch tools + any direct tools from explored features
