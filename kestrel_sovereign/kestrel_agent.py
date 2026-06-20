@@ -2329,6 +2329,15 @@ Expected Duration: {expected_duration}
         resolver = getattr(llm, "resolve_provider_routing", None)
         if not callable(resolver):
             return None
+        # Solvency fallback (codex review r5): in ECONOMY/CRITICAL mode the turn
+        # is served by a local model (check_solvency returns a local fallback),
+        # so codex won't be used — don't compact/reset. Read the cached
+        # preference rather than calling check_solvency() here, to avoid a
+        # duplicate wallet lookup and reordering the turn's own solvency step.
+        if getattr(self, "_current_model_preference", "NORMAL") in (
+            "ECONOMY", "CRITICAL"
+        ):
+            return None
         force_local = False
         try:
             pa = getattr(self, "privacy_agent", None)

@@ -212,3 +212,16 @@ async def test_global_compaction_excludes_originals_via_id_bearing_source():
     storage.conversation.update_messages_metadata.assert_awaited()
     excluded_ids = storage.conversation.update_messages_metadata.call_args.args[0]
     assert excluded_ids == [m["id"] for m in msgs[:-5]]
+
+
+@pytest.mark.asyncio
+async def test_noop_in_economy_or_critical_solvency_mode():
+    # codex r5: when solvency forces a local model (ECONOMY/CRITICAL), the turn
+    # won't use codex — don't compact/reset on a stale-high occupancy.
+    for pref in ("ECONOMY", "CRITICAL"):
+        codex = _codex_with_occupancy(95)
+        agent = _fake_agent(primary_adapter=codex, compact_result={"success": True})
+        agent._current_model_preference = pref
+        await KestrelAgent._maybe_compact_codex_thread(agent, "s")
+        assert agent.context_manager.compact_calls == 0
+        assert "s" in codex._session_threads  # untouched
