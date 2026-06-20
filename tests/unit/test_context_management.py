@@ -454,10 +454,10 @@ class TestSessionCompaction:
         """Test compaction fails when not enough messages."""
         from kestrel_sovereign.agent.context_manager import ContextManager
 
-        # Only 5 messages - not enough to compact. Global path now reads the
-        # id-bearing source (get_full_history_with_ids) so originals can be
-        # excluded (codex review r4).
-        mock_storage.conversation.get_full_history_with_ids = AsyncMock(return_value=[
+        # Only 5 messages - not enough to compact. Compaction reads the
+        # id-bearing, canonical-resolved get_conversation_history so originals
+        # can be excluded (codex r4) and raw turns summarized (codex r8).
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=[
             {"id": 1, "role": "user", "content": "Hello"},
             {"id": 2, "role": "assistant", "content": "Hi there"},
             {"id": 3, "role": "user", "content": "How are you?"},
@@ -482,7 +482,7 @@ class TestSessionCompaction:
             role = "user" if i % 2 == 0 else "assistant"
             messages.append({"id": i + 1, "role": role, "content": f"Message {i} with some content"})
 
-        mock_storage.conversation.get_full_history_with_ids = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
         mock_storage.compact_conversation_history = AsyncMock()
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
@@ -503,7 +503,7 @@ class TestSessionCompaction:
         messages = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": f"Msg {i}"}
                     for i in range(12)]
 
-        mock_storage.conversation.get_full_history_with_ids = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
         mock_storage.compact_conversation_history = AsyncMock()
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")
@@ -531,7 +531,7 @@ class TestSessionCompaction:
 
         messages = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": f"Msg {i}"}
                     for i in range(20)]
-        mock_storage.conversation.get_full_history_with_ids = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
 
         # LLM service that throws an error
         failing_llm = MagicMock()
@@ -551,7 +551,7 @@ class TestSessionCompaction:
         messages = [{"id": i + 1, "role": "user" if i % 2 == 0 else "assistant", "content": f"Msg {i}"}
                     for i in range(15)]
 
-        mock_storage.conversation.get_full_history_with_ids = AsyncMock(return_value=messages)
+        mock_storage.conversation.get_conversation_history = AsyncMock(return_value=messages)
         mock_storage.compact_conversation_history = AsyncMock()
 
         manager = ContextManager(storage=mock_storage, model="gpt-4")

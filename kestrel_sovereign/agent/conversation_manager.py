@@ -109,25 +109,20 @@ class ConversationManager:
         Returns:
             Dict with compaction results (messages_compacted, tokens_saved, etc.)
         """
-        conv_store = self._get_conversation_store()
-        if session_id is not None:
-            # Session-scoped: filtered, session-aware history (already excludes
-            # previously-compacted messages). High limit to capture the whole
-            # session, not just the recent window.
-            history = await self.get_conversation_history(
-                session_id=session_id, limit=10000
-            )
-        elif conv_store and hasattr(conv_store, "get_full_history_with_ids"):
-            # Global path MUST carry message ids so originals get EXCLUDED
-            # (not just have a summary appended) — get_full_history() omits
-            # ids, which left originals in context and grew it instead of
-            # compacting (codex review r4). include_excluded defaults False, so
-            # already-compacted messages aren't re-summarized.
-            history = await conv_store.get_full_history_with_ids()
-        elif conv_store:
-            history = await conv_store.get_full_history()
-        else:
-            history = await self.get_conversation_history()
+        # Both global (session_id=None) and session-scoped compaction read via
+        # get_conversation_history. It is the only source that is simultaneously:
+        #   - id-bearing, so originals get EXCLUDED (not just have a summary
+        #     appended, which grew context instead of compacting — codex r4); and
+        #   - canonical/transport-resolved (#1402), so we summarize the RAW user
+        #     turn, not the rendered transport prompt for legacy sent_form rows
+        #     (codex r8); and
+        #   - exclusion-filtered, so already-compacted messages aren't
+        #     re-summarized.
+        # High limit captures the whole (session or global) history, not just
+        # the recent window. session_id=None means no session filter (global).
+        history = await self.get_conversation_history(
+            session_id=session_id, limit=10000
+        )
         message_count = len(history)
 
         # Check if compaction is needed

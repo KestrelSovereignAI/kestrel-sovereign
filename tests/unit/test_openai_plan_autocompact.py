@@ -186,7 +186,7 @@ async def test_global_compaction_excludes_originals_via_id_bearing_source():
              "content": f"m{i}"} for i in range(20)]
     storage = MagicMock()
     storage.conversation = AsyncMock()
-    storage.conversation.get_full_history_with_ids = AsyncMock(return_value=msgs)
+    storage.conversation.get_conversation_history = AsyncMock(return_value=msgs)
     storage.conversation.add_conversation = AsyncMock()
     storage.conversation.update_messages_metadata = AsyncMock()
     storage.conversation.db = AsyncMock()
