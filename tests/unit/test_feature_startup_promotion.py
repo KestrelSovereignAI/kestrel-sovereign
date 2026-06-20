@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock
 
+from kestrel_sovereign.agent.tool_registry import ToolRegistryMixin
 from kestrel_sovereign.features.base import Feature
+from kestrel_sovereign.features.memory.feature import MemoryFeature
+from kestrel_sovereign.features.model.feature import ModelAgent
 from kestrel_sovereign.features.peers.feature import PeersFeature
 from kestrel_sovereign.features.save.feature import SaveFeature
 from kestrel_sovereign.features.spawn.feature import SpawnFeature
@@ -8,6 +11,7 @@ from kestrel_sovereign.features.strategic_memory.feature import (
     StrategicMemoryFeature,
 )
 from kestrel_sovereign.features.tasks.feature import TaskFeature
+from kestrel_sovereign.features.todo.feature import TodoFeature
 from kestrel_sovereign.kestrel_agent import KestrelAgent
 
 
@@ -18,6 +22,21 @@ class PlainFeature(Feature):
 
     async def initialize(self):
         pass
+
+
+def _tool_count(cls, agent):
+    feat = cls(agent)
+    try:
+        return len(list(feat.get_tools()))
+    except Exception:
+        # Some feature classes lazy-init tools in initialize(); if get_tools
+        # raises pre-init, count the @tool-decorated methods by introspection
+        # instead so the budget assertion is still meaningful for that class.
+        return len([
+            name for name in dir(cls)
+            if callable(getattr(cls, name, None))
+            and hasattr(getattr(cls, name), "_tool_schema")
+        ])
 
 
 def test_feature_startup_promotion_defaults_to_disabled():
@@ -47,40 +66,31 @@ def test_save_and_strategic_memory_opt_into_startup_direct_tools():
 def test_startup_promotion_stays_under_budget():
     """#1578 (B) startup-budget guardrail: the count of @tool methods
     surfaced by features opting into startup promotion must stay
-    under a target so we don't silently chew the
-    ``MAX_DIRECT_TOOLS = 60`` budget and force LRU eviction of
-    other promoted-but-not-pinned features. Emma's reshape demanded
-    this assertion."""
+    under a target so we don't silently chew the direct-tool budget
+    and force LRU eviction of other promoted-but-not-pinned features.
+    Emma's reshape demanded this assertion."""
     agent = MagicMock()
     promoted_classes = (
         SaveFeature, StrategicMemoryFeature,
-        SpawnFeature, TaskFeature, PeersFeature,
+        SpawnFeature, TaskFeature, PeersFeature, TodoFeature,
     )
     total = 0
     for cls in promoted_classes:
         feat = cls(agent)
         assert feat.promote_tools_on_startup is True
-        try:
-            total += len(list(feat.get_tools()))
-        except Exception:
-            # Some feature classes lazy-init tools in initialize();
-            # if get_tools raises pre-init, count the @tool-decorated
-            # methods by introspection instead so the budget assertion
-            # is still meaningful for that class.
-            tool_methods = [
-                name for name in dir(cls)
-                if callable(getattr(cls, name, None))
-                and hasattr(getattr(cls, name), "_kestrel_tool_schema")
-            ]
-            total += len(tool_methods)
-    # Target leaves headroom inside the 60-tool cap so explored-but-
-    # not-pinned features have room to land without immediate
-    # eviction. If this assertion ever fails, raise MAX_DIRECT_TOOLS
-    # in tool_registry.py rather than removing it.
-    assert total <= 50, (
+        total += _tool_count(cls, agent)
+
+    common_exploration = _tool_count(ModelAgent, agent) + _tool_count(MemoryFeature, agent)
+
+    # Target leaves headroom inside the direct-tool cap so common
+    # explored-but-not-pinned feature pairs have room to land without
+    # immediate eviction. If this assertion ever fails, raise
+    # MAX_DIRECT_TOOLS in tool_registry.py rather than removing it.
+    assert total + common_exploration <= ToolRegistryMixin.MAX_DIRECT_TOOLS, (
         f"Startup-promoted features expose {total} direct tools; "
-        f"budget is 50 (out of {60} cap). Tighten promotion scope or "
-        f"raise MAX_DIRECT_TOOLS."
+        f"model_agent + memory_feature expose {common_exploration}; "
+        f"cap is {ToolRegistryMixin.MAX_DIRECT_TOOLS}. Tighten promotion "
+        f"scope or raise MAX_DIRECT_TOOLS."
     )
 
 

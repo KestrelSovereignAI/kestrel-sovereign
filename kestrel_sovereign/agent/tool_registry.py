@@ -15,7 +15,11 @@ from kestrel_sovereign.tools.result_contract import enforce_tool_result_contract
 class ToolRegistryMixin:
     """Mixin providing dynamic tool loading and management for KestrelAgent."""
 
-    MAX_DIRECT_TOOLS = 60
+    # Startup-promoted operational features currently pin 44 tools
+    # (Task, Todo, Peers, Save, Spawn, StrategicMemory). Keep enough
+    # headroom for the common model_agent + memory_feature exploration
+    # path without immediately evicting the first explored feature.
+    MAX_DIRECT_TOOLS = 80
 
     def _build_feature_tools(self) -> List[Dict[str, Any]]:
         """
