@@ -1198,10 +1198,25 @@ class CodexAdapter(LLMAdapter):
         window = _first_field(
             token_usage, "modelContextWindow", "model_context_window"
         )
-        self._last_thread_usage[session_id] = {
+        self._thread_usage_map()[session_id] = {
             "used_tokens": used,
             "window_tokens": window,
         }
+
+    def _thread_usage_map(self) -> Dict[str, Dict[str, Optional[int]]]:
+        """Lazy-safe accessor for the per-session occupancy cache.
+
+        ``__init__`` always creates ``_last_thread_usage``, but several of
+        the callers below run from error-recovery paths (idle-timeout / retry
+        thread teardown). If the attribute were ever absent there, raising a
+        fresh ``AttributeError`` would mask the real transport error being
+        recovered from — so resolve it defensively and create on demand.
+        """
+        m = getattr(self, "_last_thread_usage", None)
+        if m is None:
+            m = {}
+            self._last_thread_usage = m
+        return m
 
     def _forget_thread_usage(self, session_id: Optional[str]) -> None:
         """Drop the cached occupancy snapshot for a session.
@@ -1214,7 +1229,7 @@ class CodexAdapter(LLMAdapter):
         arrives (#1844, codex review round 2).
         """
         if session_id:
-            self._last_thread_usage.pop(session_id, None)
+            self._thread_usage_map().pop(session_id, None)
 
     def get_thread_occupancy(
         self, session_id: Optional[str],
@@ -1224,7 +1239,7 @@ class CodexAdapter(LLMAdapter):
         per-turn payload can't masquerade as a low context (#1844)."""
         if not session_id:
             return None
-        snap = self._last_thread_usage.get(session_id)
+        snap = self._thread_usage_map().get(session_id)
         if not snap:
             return None
         used = snap.get("used_tokens")
