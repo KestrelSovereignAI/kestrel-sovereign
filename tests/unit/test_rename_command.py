@@ -25,6 +25,13 @@ class MockStorage:
         self.nodes[node.node_id] = node
 
 
+class FailingAddNodeStorage(MockStorage):
+    """Storage that can read the graph node but fails writing it."""
+
+    async def add_node(self, node):
+        raise RuntimeError("graph store unavailable")
+
+
 class MockDB:
     """Mock database for testing."""
 
@@ -45,6 +52,17 @@ class MockDB:
         if key and key in self.data:
             return [(self.data[key],)]
         return []
+
+
+class FailingDB:
+    """Database that fails before any rename state is written."""
+
+    def __init__(self):
+        self.executed = []
+
+    async def execute(self, query: str, params: tuple = None):
+        self.executed.append((query, params))
+        raise RuntimeError("metadata store unavailable")
 
 
 class MockAgent:
@@ -158,6 +176,45 @@ class TestRenameValidation:
         with pytest.raises(ValueError, match="too long"):
             await rename_agent_core(mock_agent, "A" * 65)
 
+    @pytest.mark.asyncio
+    async def test_rename_core_returns_partial_outcome_after_metadata_write(self, mock_agent):
+        """A later store failure must surface the already-written DB row."""
+        from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+        mock_agent.storage = FailingAddNodeStorage()
+        mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
+            mock_agent.agent_id,
+            properties={"name": "OldName"},
+            label="OldName",
+        )
+
+        outcome = await rename_agent_core(mock_agent, "NewName")
+
+        assert outcome.success is False
+        assert outcome.db_row_written is True
+        assert outcome.graph_updated is False
+        assert outcome.memory_updated is False
+        assert outcome.soul_md_updated is False
+        assert "graph update failed" in outcome.error
+        assert mock_agent._raw_storage.db.data[(mock_agent.agent_id, "name")] == "NewName"
+        node = await mock_agent.storage.get_node(mock_agent.agent_id)
+        assert node.properties["name"] == "OldName"
+        assert node.label == "OldName"
+        assert mock_agent._agent_name == "TestAgent"
+
+    @pytest.mark.asyncio
+    async def test_rename_core_returns_failed_outcome_when_first_write_fails(self, mock_agent):
+        """If the metadata write fails, no partial rename should be claimed."""
+        from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
+
+        mock_agent._raw_storage.db = FailingDB()
+
+        outcome = await rename_agent_core(mock_agent, "NewName")
+
+        assert outcome.success is False
+        assert outcome.any_written is False
+        assert "metadata DB write failed" in outcome.error
+
 
 class TestRenameExecution:
     """Tests for rename execution."""
@@ -222,6 +279,48 @@ class TestRenameExecution:
         assert "OldName" in result.confirmation
         assert "NewName" in result.confirmation
         assert "Renamed" in result.confirmation
+
+    @pytest.mark.asyncio
+    async def test_rename_tool_reports_partial_when_later_store_fails(self, mock_agent):
+        """The command wrapper must not collapse a partial rename into ERROR."""
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent.storage = FailingAddNodeStorage()
+        mock_agent.storage.nodes[mock_agent.agent_id] = MockNode(
+            mock_agent.agent_id,
+            properties={"name": "OldName"},
+            label="OldName",
+        )
+        feature = BootstrapFeature(mock_agent)
+        await feature.initialize()
+
+        result = await feature.rename_agent("NewName")
+
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "metadata DB has the new name" in result.error
+        assert result.data["rename_outcome"]["db_row_written"] is True
+        assert result.data["rename_outcome"]["graph_updated"] is False
+        assert mock_agent._raw_storage.db.data[(mock_agent.agent_id, "name")] == "NewName"
+        node = await mock_agent.storage.get_node(mock_agent.agent_id)
+        assert node.properties["name"] == "OldName"
+        assert node.label == "OldName"
+        assert mock_agent._agent_name == "TestAgent"
+
+    @pytest.mark.asyncio
+    async def test_rename_tool_reports_failed_when_first_write_fails(self, mock_agent):
+        """No store writes means a regular failed ToolResult."""
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+        from kestrel_sdk.tools.result import ToolResultStatus
+
+        mock_agent._raw_storage.db = FailingDB()
+        feature = BootstrapFeature(mock_agent)
+        await feature.initialize()
+
+        result = await feature.rename_agent("NewName")
+
+        assert result.status is ToolResultStatus.ERROR
+        assert "metadata DB write failed" in result.error
 
 
 class TestSoulMdUpdate:

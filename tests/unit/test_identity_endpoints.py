@@ -97,9 +97,13 @@ class TestRenameAgentCore:
         from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
 
         agent = MockAgent()
-        result, soul_updated = await rename_agent_core(agent, "NewName")
+        outcome = await rename_agent_core(agent, "NewName")
 
-        assert "NewName" in result
+        assert outcome.success is True
+        assert outcome.db_row_written is True
+        assert outcome.graph_updated is True
+        assert outcome.memory_updated is True
+        assert outcome.soul_md_updated is False
         assert agent._agent_name == "NewName"
         assert agent.bootstrap_service.agent_name == "NewName"
 
@@ -132,7 +136,8 @@ class TestRenameAgentCore:
         from kestrel_sovereign.features.bootstrap.feature import rename_agent_core
 
         agent = MockAgent()
-        result, _ = await rename_agent_core(agent, "  Trimmed  ")
+        outcome = await rename_agent_core(agent, "  Trimmed  ")
+        assert outcome.success is True
         assert agent._agent_name == "Trimmed"
 
     @pytest.mark.asyncio
