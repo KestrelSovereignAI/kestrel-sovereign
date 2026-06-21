@@ -1348,6 +1348,16 @@ class TaskFeature(Feature):
             poll_interval_seconds: Seconds between polls of a ``target``.
             reason: Optional human-readable note (recorded in the result).
         """
+        # The first positional accepts BOTH forms so the interface stays
+        # one tool: `!wait 5` (bare number) is a bounded sleep, while
+        # `!wait talon:job_42` is a handle wait. parse_command_args binds
+        # positional CLI tokens in signature order, so a numeric target is
+        # the legacy `!wait <seconds>` command — route it to the pause.
+        target = str(target).strip() if target else ""
+        if target and target.lstrip("-").isdigit():
+            duration_seconds = int(target)
+            target = ""
+
         if target:
             registry = getattr(self.agent, "wait_registry", None) if self.agent else None
             if registry is None:

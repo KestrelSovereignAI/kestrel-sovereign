@@ -107,6 +107,16 @@ class TestUnifiedWaitTarget:
         assert "no wait provider for kind 'bogus'" in result.error
 
     @pytest.mark.asyncio
+    async def test_numeric_target_is_bounded_sleep(self):
+        """`!wait 5` binds the token positionally to `target`; a bare
+        number must still mean a bounded pause, not a malformed ref."""
+        feature = TaskFeature(agent=None)
+        result = await feature.wait(target="0", reason="legacy positional")
+        assert result.status is ToolResultStatus.OK
+        assert result.data["requested_seconds"] == 0
+        assert result.data["reason"] == "legacy positional"
+
+    @pytest.mark.asyncio
     async def test_post_load_registers_task_provider(self):
         agent = _StubAgent()
         feature = TaskFeature(agent=None)
