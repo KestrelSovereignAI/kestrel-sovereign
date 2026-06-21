@@ -891,6 +891,21 @@ class KestrelAgent(
                 build_a2a_question_answered_registration()
             )
 
+            # Register the generic wait.complete source — the resumption
+            # rail the Wave-2 wait reconciler (#1860) fires when ANY
+            # MonitorableWaitable provider's handle reaches a terminal
+            # Outcome. Providers that declare their own signal name
+            # (e.g. TalonWaitable -> talon.job_complete) keep firing that;
+            # wait.complete is the fallback for providers that only set the
+            # generic name. Registered unconditionally (core, not gated on
+            # any feature) so the reconciler always has a routing target.
+            from kestrel_sovereign.signals.sources.wait import (
+                build_wait_complete_registration,
+            )
+            self.signal_registry.register(
+                build_wait_complete_registration()
+            )
+
             # Sender-side store for in-flight send_a2a_question
             # correlation rows (#1444). PeersFeature.send_a2a_question
             # inserts here on POST; the subscription supervisor marks

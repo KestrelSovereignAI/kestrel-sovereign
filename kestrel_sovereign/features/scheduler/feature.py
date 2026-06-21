@@ -31,7 +31,9 @@ Built-in cron sources (see ``signals/sources/scheduler.py`` CRON_TASKS):
                              the [forgetting] deletion tier. Still schedulable,
                              but no longer auto-seeded — `sleep` runs the same
                              MemorySystem.consolidate() flow nightly (#1674).
-    talon_monitor         -- poll Talon jobs, wake on completion (#1510)
+    wait_reconcile        -- poll every MonitorableWaitable provider's
+                             in-flight handles, wake on any terminal
+                             transition (Wave 2 of #1860)
     restart_coordinator   -- execute pending restart requests (#1512)
     github_pr_watch       -- poll a GitHub PR/issue, wake on relevant
                              state/comment/check/merge changes (#1618)
@@ -68,6 +70,7 @@ logger = logging.getLogger(__name__)
 # built-in cron is retired; never list user-schedulable feature tools.
 _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "cognition_retention",  # #1674 — superseded by [forgetting] in memory_consolidate
+    "talon_monitor",  # #1860 Wave 2 — superseded by the generic wait_reconcile
 })
 
 # Crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3). These names are also
@@ -134,6 +137,7 @@ class SchedulerFeature(Feature):
                     "trash_retention": self._run_trash_retention,
                     "github_pr_watch": self._run_github_pr_watch,
                     "sleep": self._handle_sleep,
+                    "wait_reconcile": self._run_wait_reconcile,
                 },
             )
             for reg in cron_registrations:
@@ -312,13 +316,15 @@ class SchedulerFeature(Feature):
                 ("training_cycle", "0 3 * * *", '{"iterations":3,"depth":"normal"}'),
             )
 
-        # Talon-job monitor (#1510) — installs only if the Talon
-        # coordinator feature is loaded. Cheap (no LLM, just file/PID
-        # checks) so 1/min cadence is OK. Emits one
-        # talon.job_complete COGNITION signal per state transition;
-        # the dispatcher coalesces if two adjacent polls double-fire.
-        if "TalonCoordinatorFeature" in agent.features:
-            defaults.append(("talon_monitor", "* * * * *", "{}"))
+        # Generic wait reconciler (Wave 2 of #1860) — the core, always-on
+        # successor to the talon-specific talon_monitor. Cheap (no LLM,
+        # just polling each MonitorableWaitable provider's in-flight
+        # handles) so 1/min cadence is fine. Emits one COGNITION signal
+        # per terminal-state transition (provider-specific source when the
+        # provider declares one, else wait.complete). Unconditional — the
+        # reconciler is core and no-ops cleanly when no monitorable
+        # provider is registered.
+        defaults.append(("wait_reconcile", "* * * * *", "{}"))
 
         # Restart coordinator (#1512) — installs only if the
         # RestartCoordinatorFeature is loaded. Cheap (no LLM; idle
@@ -759,6 +765,30 @@ class SchedulerFeature(Feature):
         })
 
     # ------------------------------------------------------------------
+    # wait_reconcile (Wave 2 of #1860)
+    # ------------------------------------------------------------------
+
+    async def _run_wait_reconcile(self, args: dict) -> str:
+        """Built-in handler for the ``wait_reconcile`` scheduled task.
+
+        Delegates to the agent's singleton :class:`WaitReconciler` (built
+        lazily + cached on ``agent._wait_reconciler`` so its in-memory
+        pending-task map survives across ticks). This is the generic
+        successor to the talon-specific ``talon_monitor`` cron — it wakes
+        the agent on ANY MonitorableWaitable provider's terminal handle.
+
+        Returns a JSON summary so the task_execution_log carries the
+        per-run delivery breakdown.
+
+        Args:
+            args: Unused (the reconciler enumerates the registry itself).
+        """
+        from kestrel_sovereign.waits.reconciler import run_wait_reconcile
+
+        result = await run_wait_reconcile(self.agent)
+        return json.dumps(result.data or {}, default=str)
+
+    # ------------------------------------------------------------------
     # github_pr_watch (#1618)
     # ------------------------------------------------------------------
 
@@ -1084,7 +1114,7 @@ class SchedulerFeature(Feature):
         Args:
             cron_expression: Cron expression (5 fields) or alias like @daily, @hourly
             task_name: Name of a registered scheduler-executable task — a
-                built-in cron source (e.g. memory_consolidate, talon_monitor,
+                built-in cron source (e.g. memory_consolidate, wait_reconcile,
                 github_pr_watch) or a loaded feature tool. Unknown names are
                 rejected so they can't silently fail every tick (#1618).
             args_json: JSON-encoded arguments to pass to the tool (default: {})

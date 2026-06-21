@@ -1,20 +1,23 @@
 """Signal source for Talon background-job state transitions.
 
 When a Talon CLI-background job moves from ``running`` to a terminal
-state (``complete``, ``failed``, ``finished_unknown``), the
-periodically-scheduled ``talon_monitor`` task emits one COGNITION
-signal so the agent wakes and can act on the result without the user
-having to poll ``talon_status`` manually.
+state (``complete``, ``failed``, ``finished_unknown``), the generic wait
+reconciler cron (Wave 2 of #1860) emits one COGNITION signal so the agent
+wakes and can act on the result without the user having to poll
+``talon_status`` manually.
 
-This is the signal-dispatcher half of #1510. The polling half lives
-in ``TalonCoordinatorFeature.talon_monitor`` (built as an ACTION cron
-task by ``signals/sources/scheduler.py``).
+This is the signal-dispatcher half of #1510. The polling half is now the
+generic reconciler (``kestrel_sovereign/waits/reconciler.py``), which drives
+this source via :class:`TalonWaitable` — that provider declares
+``signal = "talon.job_complete"`` so terminal talon transitions route here
+rather than to the generic ``wait.complete`` source. The talon-specific
+``talon_monitor`` cron it replaced is retired.
 
-Idempotency: the monitor records ``last_signaled_status`` on each
-job in ``jobs.json`` and only emits when the current status differs
-from the persisted last-signalled value. The signal source itself
-also coalesces by ``dedupe_key=job_id`` within a short window as a
-defense-in-depth against double-firing across two adjacent polls.
+Idempotency: the reconciler records ``last_signaled_outcome`` per
+``(kind, handle)`` in the ``wait_signal_state`` table and only emits when the
+current terminal outcome differs from the persisted value. The signal source
+itself also coalesces by ``dedupe_key`` within a short window as a
+defense-in-depth against double-firing across two adjacent ticks.
 """
 
 from __future__ import annotations
@@ -28,7 +31,6 @@ from kestrel_sdk.signals import (
     AttentionPolicy,
     RateLimit,
     RedactionPolicy,
-    Signal,
     SignalMode,
     SourceRegistration,
     Trust,
@@ -118,48 +120,4 @@ def build_talon_job_complete_registration() -> SourceRegistration:
             redact_caller_identifier=True,
         ),
         retention_days=14,
-    )
-
-
-def build_signal_for_completed_job(
-    job_id: str,
-    info: Dict[str, Any],
-    *,
-    target_agent: str,
-    log_tail: str = "",
-) -> Signal:
-    """Build a COGNITION signal envelope for a Talon job that has
-    transitioned to a terminal state.
-
-    Caller is the monitor poll inside ``TalonCoordinatorFeature``.
-    ``info`` is the in-memory/persisted job record. ``target_agent``
-    is the agent's DID (or fallback identifier) — the dispatcher
-    rejects signals lacking it.
-    """
-    payload: Dict[str, Any] = {
-        "job_id": str(job_id),
-        "status": str(info.get("status", "")),
-        "repo": str(info.get("repo", "")),
-        "issue": str(info.get("issue", "")),
-        "label": str(info.get("label", "")),
-        "returncode": str(info.get("returncode", "")),
-        "log_path": str(info.get("log_path", "")),
-        "log_tail": log_tail or "",
-        "started_at": str(info.get("started_at", "")),
-        "completed_at": str(info.get("completed_at", "")),
-        "test_evidence": str(info.get("test_evidence", "")),
-        "ci_status": str(info.get("ci_status", "")),
-    }
-    return Signal(
-        source=SOURCE_NAME,
-        kind="inbound",
-        mode=SignalMode.COGNITION,
-        payload=payload,
-        target_agent=target_agent,
-        # ``(job_id, status)`` lets a status correction inside the
-        # coalescing window (e.g. running→finished_unknown→failed
-        # if the sidecar lands a poll late) still fire a fresh wake
-        # for the corrected terminal state — the monitor's contract
-        # is "one signal per state transition", not "one per job".
-        dedupe_key=f"{payload['job_id']}:{payload['status']}",
     )

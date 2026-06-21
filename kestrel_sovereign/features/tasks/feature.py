@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.waits import run_wait_loop
 from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
+from kestrel_sovereign.waits.reconciler import register_wait_watch
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -1320,8 +1321,15 @@ class TaskFeature(Feature):
             "• Pass `duration_seconds` with no target for a plain bounded "
             "pause — the native alternative to shelling out to `sleep` "
             "between polls in an autonomous loop.\n"
-            "Long unattended waits should use the signal-resume path, not "
-            "a held turn."
+            "`mode` controls how a `target` wait behaves:\n"
+            "• `mode=\"block\"` (default) holds the turn, polling until the "
+            "target is terminal or the timeout expires.\n"
+            "• `mode=\"signal\"` registers a watch and returns IMMEDIATELY — "
+            "the wait reconciler wakes you with a `wait.complete` cognition "
+            "signal once the target finishes. Use this for long/unattended "
+            "waits so you don't hold a turn. Requires a `target`.\n"
+            "Long unattended waits should use the signal-resume path "
+            "(`mode=\"signal\"`), not a held turn."
         ),
         category=ToolCategory.UTILITY,
         command_prefix="!wait",
@@ -1333,6 +1341,7 @@ class TaskFeature(Feature):
         timeout_seconds: int = 600,
         poll_interval_seconds: int = 5,
         reason: str = "",
+        mode: str = "block",
     ) -> ToolResult:
         """
         Block on a handle, or pause for a bounded duration.
@@ -1347,7 +1356,17 @@ class TaskFeature(Feature):
                 returning a still-pending result.
             poll_interval_seconds: Seconds between polls of a ``target``.
             reason: Optional human-readable note (recorded in the result).
+            mode: ``"block"`` (default) holds the turn until the target is
+                terminal; ``"signal"`` registers a watch and returns
+                immediately, waking the agent via a ``wait.complete`` signal
+                when the target finishes (requires a ``target``).
         """
+        mode = str(mode).strip().lower() if mode else "block"
+        if mode not in ("block", "signal"):
+            return ToolResult.failed(
+                f"mode must be 'block' or 'signal', got {mode!r}"
+            )
+
         # The first positional accepts BOTH forms so the interface stays
         # one tool: `!wait 5` (bare number) is a bounded sleep, while
         # `!wait talon:job_42` is a handle wait. parse_command_args binds
@@ -1358,7 +1377,28 @@ class TaskFeature(Feature):
             duration_seconds = int(target)
             target = ""
 
+        if mode == "signal" and not target:
+            return ToolResult.failed(
+                "mode='signal' requires a target handle (e.g. "
+                "'task:<id>'); a bare duration sleep cannot be signalled"
+            )
+
         if target:
+            if mode == "signal":
+                # Register a watch and return immediately — the reconciler
+                # wakes the agent with a wait.complete signal on completion.
+                try:
+                    await register_wait_watch(self.agent, target)
+                except ValueError as exc:
+                    return ToolResult.failed(str(exc))
+                return ToolResult.ok(
+                    confirmation=(
+                        f"Watching {target}; will wake on completion via "
+                        f"wait.complete"
+                    ),
+                    data={"ref": target, "mode": "signal", "watching": True},
+                )
+
             registry = getattr(self.agent, "wait_registry", None) if self.agent else None
             if registry is None:
                 return ToolResult.failed(

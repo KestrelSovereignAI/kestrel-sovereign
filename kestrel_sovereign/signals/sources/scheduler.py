@@ -98,12 +98,14 @@ CRON_TASKS: list[tuple[str, SignalMode, frozenset[ResourceLock]]] = [
     # "Unknown task: sleep". Supersedes the auto-seeded memory_consolidate +
     # reflect crons.
     ("sleep", SignalMode.ACTION, frozenset({ResourceLock.MEMORY})),
-    # Talon CLI-background job monitor (#1510). ACTION — no LLM cost.
-    # Polls the durable jobs.json registry, detects state transitions,
-    # and ENQUEUES one talon.job_complete COGNITION signal per
-    # transition. The COGNITION wake comes from that downstream
-    # signal, not from the monitor task itself.
-    ("talon_monitor", SignalMode.ACTION, frozenset()),
+    # Generic wait reconciler (Wave 2 of #1860). ACTION — no LLM cost.
+    # Enumerates every MonitorableWaitable provider in agent.wait_registry,
+    # polls each provider's in-flight handles, and ENQUEUES one COGNITION
+    # signal per terminal-state transition. The COGNITION wake comes from
+    # that downstream signal, not from the reconcile task itself. This is
+    # the generic successor to the talon-specific talon_monitor; it's core
+    # (no feature gate). Built-in handler: run_wait_reconcile(agent).
+    ("wait_reconcile", SignalMode.ACTION, frozenset()),
     # Restart coordinator (#1512). ACTION — no LLM cost. Scans the
     # restart_requests table, evaluates safety, and spawns a detached
     # subprocess to execute the restart. Idle by default; only fires

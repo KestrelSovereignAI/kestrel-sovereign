@@ -504,6 +504,131 @@ class TestTalonWait:
         assert result.data["timed_out"] is False
         assert feature._jobs["job-b"]["error"] == "boom"
 
+    @pytest.mark.asyncio
+    async def test_talon_wait_mode_signal_returns_immediately(self, tmp_path):
+        """mode='signal' registers a watch and returns immediately instead of
+        holding the turn. talon is also auto-monitored via active_handles, so
+        this is mostly symmetry, but it must still work + persist a watch."""
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.waits import WaitRegistry
+        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
+        registry = WaitRegistry()
+        agent = SimpleNamespace(
+            did="did:test:agent",
+            agent_id="did:test:agent",
+            agent_name="kestrel",
+            _features=[],
+            _scheduler=MagicMock(),
+            _raw_storage=SimpleNamespace(db=db),
+            wait_registry=registry,
+        )
+        feature = TalonCoordinatorFeature(agent)
+        registry.register(TalonWaitable(feature))
+
+        result = await feature.talon_wait(job_id="job-z", mode="signal")
+        assert result.status is ToolResultStatus.OK
+        assert result.data["mode"] == "signal"
+        assert result.data["watching"] is True
+        assert result.data["ref"] == "talon:job-z"
+
+        watched = await agent._wait_reconciler._store.list_watched()
+        assert {(w.kind, w.handle) for w in watched} == {("talon", "job-z")}
+
+    @pytest.mark.asyncio
+    async def test_talon_wait_invalid_mode_errors(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        result = await feature.talon_wait(job_id="job-z", mode="bogus")
+        assert result.status is ToolResultStatus.ERROR
+        assert "mode must be 'block' or 'signal'" in result.error
+
+    @pytest.mark.asyncio
+    async def test_active_handles_includes_terminal_jobs(self):
+        """Regression (codex Wave 2 P1): a TERMINAL cli_background job must
+        still be enumerated so a soft-dropped/restart-lost completion signal
+        gets retried. Excluding terminal handles would silently lose the
+        wake. The reconciler gates re-emits on the dedup ledger."""
+        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._jobs = {
+            "running-1": {"method": "cli_background", "status": "running"},
+            "done-1": {"method": "cli_background", "status": "complete"},
+            "failed-1": {"method": "cli_background", "status": "failed"},
+            "a2a-1": {"method": "a2a", "status": "running"},
+        }
+        # _reload_persisted_jobs would clobber the in-memory dict from disk;
+        # stub it so the test's fixture jobs are what active_handles sees.
+        feature._reload_persisted_jobs = lambda: None
+        handles = await TalonWaitable(feature).active_handles()
+        # All cli_background jobs (terminal included); a2a excluded.
+        assert set(handles) == {"running-1", "done-1", "failed-1"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_job_poll_is_talon_schema_valid(self):
+        """Regression (codex Wave 2 P2): a mode='signal' watch on a stale/
+        unknown job id must still produce a talon.job_complete-schema-valid
+        payload (job_id + status), else the dispatcher drops the wake and the
+        caller is never woken."""
+        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+        from kestrel_sovereign.signals.sources.talon import (
+            _schema as talon_schema,
+        )
+
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = lambda: None
+        feature._jobs = {}
+        status = await TalonWaitable(feature).poll("ghost-1")
+        assert status.outcome.value == "failed"
+        # The talon.job_complete schema must accept the payload (it requires
+        # job_id + status); this would raise ValueError if status were absent.
+        talon_schema(dict(status.data))
+        assert status.data["status"] == "finished_unknown"
+
+    @pytest.mark.asyncio
+    async def test_post_load_seeds_legacy_signal_ledger(self, tmp_path):
+        """Regression (codex Wave 2 P2): on upgrade, jobs.json rows carrying
+        legacy last_signaled_status must seed the generic ledger so the first
+        wait_reconcile tick doesn't re-fire talon.job_complete for an
+        already-delivered terminal job."""
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_wait_signal_store import (
+            WaitSignalStore,
+        )
+        from kestrel_sovereign.waits import WaitRegistry
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
+        agent = SimpleNamespace(
+            did="did:test:agent",
+            agent_id="did:test:agent",
+            _raw_storage=SimpleNamespace(db=db),
+            wait_registry=WaitRegistry(),
+        )
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs = {
+            "done-1": {"method": "cli_background", "status": "complete",
+                       "last_signaled_status": "complete"},
+            "failed-1": {"method": "cli_background", "status": "failed",
+                         "last_signaled_status": "failed"},
+            "unsig-1": {"method": "cli_background", "status": "complete"},
+        }
+        feature._reload_persisted_jobs = lambda: None
+
+        await feature.post_all_features_loaded(agent)
+
+        store = WaitSignalStore(db, "did:test:agent")
+        # Seeded with the reconciler's dedup token shape "<outcome>:<status>"
+        # (complete -> done, failed -> failed) so the first tick won't re-fire.
+        assert (await store.get("talon", "done-1")).last_signaled_outcome == "done:complete"
+        assert (await store.get("talon", "failed-1")).last_signaled_outcome == "failed:failed"
+        # No legacy status => no seed row (the reconciler will signal it fresh).
+        assert await store.get("talon", "unsig-1") is None
+
 
 class TestTalonVerify:
     @pytest.mark.asyncio

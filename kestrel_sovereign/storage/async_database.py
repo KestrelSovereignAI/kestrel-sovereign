@@ -438,6 +438,51 @@ CREATE TABLE IF NOT EXISTS pending_a2a_questions (
 
 CREATE INDEX IF NOT EXISTS idx_pending_a2a_questions_sweep
     ON pending_a2a_questions(agent_id, status, deadline);
+
+-- ============================================================================
+-- wait_signal_state — durable dedup/delivery ledger for the generic wait
+-- reconciler (Wave 2 of #1860). One row per (agent_id, kind, handle) the
+-- reconciler has observed. Mirrors what talon_monitor used to stash inside
+-- jobs.json (last_signaled_status plus the pending_signal_* fields), but
+-- generically for EVERY MonitorableWaitable provider.
+--
+--   - last_signaled_outcome  application-level dedup: the terminal Outcome
+--                            value we have already delivered a signal for, so
+--                            the next tick does not re-fire the same transition
+--   - last_delivery_*        diagnostics plus retry accounting (attempts caps
+--                            the soft-fail retry loop, MAX_DELIVERY_ATTEMPTS)
+--   - pending_signal_*       the two-phase harvest set: a signal we enqueued
+--                            but have not yet confirmed delivered, cleared on
+--                            harvest (record_delivery) so a restart that lost
+--                            the in-memory task re-detects and retries
+--   - watching               explicit watched-handle flag: the agent called
+--                            wait(target, mode="signal") to register a watch on
+--                            this (kind, handle). The reconciler polls watched
+--                            handles via provider.poll() even when the provider
+--                            is poll-only (not MonitorableWaitable), so EVERY
+--                            async waitable is wakeable without auto-waking all
+--                            tasks (which would self-wake on inbound work)
+--
+-- ``agent_id`` scopes rows to the OWNING agent for shared-backend isolation,
+-- exactly like pending_a2a_questions above.
+CREATE TABLE IF NOT EXISTS wait_signal_state (
+    agent_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    handle TEXT NOT NULL,
+    last_signaled_outcome TEXT,
+    last_delivery_status TEXT,
+    last_delivery_error TEXT,
+    last_delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    last_delivery_attempt_at TIMESTAMP,
+    pending_signal_id TEXT,
+    pending_signaled_target TEXT,
+    pending_signal_enqueued_at TIMESTAMP,
+    watching INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (agent_id, kind, handle)
+);
+CREATE INDEX IF NOT EXISTS idx_wait_signal_state_pending
+    ON wait_signal_state(agent_id, pending_signal_id);
 """
 
 # Backend-specific JSON-path indexes on graph_nodes properties.

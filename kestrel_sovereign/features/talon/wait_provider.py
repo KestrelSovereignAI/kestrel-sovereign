@@ -12,7 +12,7 @@ the other three -> FAILED.
 
 from __future__ import annotations
 
-from typing import ClassVar, Optional
+from typing import ClassVar, List, Optional
 
 from kestrel_sdk.tools import Outcome, WaitStatus
 
@@ -47,10 +47,17 @@ class TalonWaitable:
         feature._reload_persisted_jobs()
         info = feature._jobs.get(handle)
         if info is None:
+            # Schema-valid even for an unknown/pruned job: the reconciler
+            # routes this through the talon.job_complete source, whose schema
+            # REQUIRES job_id + status. Omitting status would make the
+            # dispatcher drop the signal as invalid, so a mode="signal" watch
+            # on a stale job id would acknowledge OK yet never wake the caller
+            # (codex Wave 2 P2). "finished_unknown" is the honest status — the
+            # job left the registry with its fate unrecorded.
             return WaitStatus(
                 Outcome.FAILED,
                 f"Unknown job_id: {handle}",
-                data={"job_id": handle},
+                data={"job_id": handle, "status": "finished_unknown"},
             )
 
         changed = feature._reap_cli_job(info)
@@ -63,11 +70,25 @@ class TalonWaitable:
 
         status = info.get("status")
         rc = info.get("returncode")
+        # Enrich with the fields the talon.job_complete prompt template
+        # indexes (repo/issue/label/started_at/completed_at/test_evidence/
+        # ci_status), read straight off the durable job record. The generic
+        # reconciler spreads WaitStatus.data into the signal payload, so the
+        # talon template still renders fully now that the bespoke
+        # build_signal_for_completed_job builder is gone (Wave 2 of #1860).
         payload = {
             "job_id": handle,
             "status": status,
             "returncode": rc,
+            "log_path": info.get("log_path", ""),
             "log_tail": feature._tail_job_log(info.get("log_path"), lines=20),
+            "repo": info.get("repo", ""),
+            "issue": info.get("issue", ""),
+            "label": info.get("label", ""),
+            "started_at": info.get("started_at", ""),
+            "completed_at": info.get("completed_at", ""),
+            "test_evidence": info.get("test_evidence", ""),
+            "ci_status": info.get("ci_status", ""),
         }
 
         if status == "complete":
@@ -87,3 +108,36 @@ class TalonWaitable:
             f"Talon job {handle[:8]} status: {status}",
             data=payload,
         )
+
+    async def active_handles(self) -> List[str]:
+        """Return the job ids the reconciler should poll for a wake.
+
+        Implements :class:`~kestrel_sdk.tools.MonitorableWaitable`. Reloads
+        the durable registry so a freshly-restarted feature sees jobs from a
+        prior process, then returns ALL cli_background job ids. Cheap (a JSON
+        reload + dict scan) — the reconciler calls it every cron tick.
+        Classifying + signaling are the reconciler's job; this only enumerates.
+
+        Terminal jobs are intentionally INCLUDED, not filtered out: the
+        completion signal for a terminal job may have been soft-dropped
+        (rate limit / quiet hours) or lost across a restart, in which case
+        the dedup ledger leaves ``last_signaled_outcome`` unset so the next
+        tick must re-poll and retry. Excluding terminal handles here would
+        silently lose that wake — exactly the regression the legacy
+        talon_monitor avoided by scanning every cli_background job each tick
+        and gating re-emits on the ledger (codex Wave 2 P1). The reconciler
+        skips jobs already confirmed-signaled, so re-polling a delivered job
+        is a cheap no-op.
+
+        Scoped to ``cli_background`` jobs: those are the ones the retired
+        talon_monitor cron drove; the a2a path has its own resumption rail
+        (a2a.task_complete).
+        """
+        feature = self._feature
+        feature._reload_persisted_jobs()
+        active: List[str] = []
+        for job_id, info in feature._jobs.items():
+            if info.get("method") != "cli_background":
+                continue
+            active.append(job_id)
+        return active
