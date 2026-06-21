@@ -28,6 +28,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
 from kestrel_sovereign.waits import run_wait_loop
+from kestrel_sovereign.waits.reconciler import register_wait_watch
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 # Mesh is gone (#1367 phase 5). Talon dispatch now uses the A2A
 # task-submission path — same wire endpoint as send_a2a_task on
@@ -269,8 +270,10 @@ class TalonCoordinatorFeature(Feature):
     """
 
     # Conservative ceiling on a single blocking ``talon_wait``. Waits
-    # longer than this should rely on the ``talon_monitor`` cron signal
-    # to wake the agent rather than holding a turn open.
+    # longer than this should rely on the generic wait reconciler cron
+    # signal to wake the agent rather than holding a turn open. The
+    # reconciler drives the talon.job_complete wake via TalonWaitable
+    # (Wave 2 of #1860) — the talon-specific talon_monitor cron is retired.
     _TALON_WAIT_MAX_SECONDS = 3600
 
     def __init__(self, agent):
@@ -278,14 +281,6 @@ class TalonCoordinatorFeature(Feature):
         # message_id -> {pid, started_at, log_path, command, repo,
         # issue, status, returncode, completed_at, process}
         self._jobs: Dict[str, Dict[str, Any]] = {}
-        # In-memory only — SignalHandle objects from enqueue_signal,
-        # checked at the start of each talon_monitor poll to harvest
-        # delivery outcomes without blocking the cron loop on an LLM
-        # turn (kestrel-sovereign#1528 codex P1). Lost on restart;
-        # the persisted ``pending_signal_*`` fields on each job let
-        # us notice that a delivery is unaccounted-for after reboot
-        # and mark it as ``lost_at_restart`` so the next poll re-emits.
-        self._pending_signal_tasks: Dict[str, Any] = {}
         # Eager reload so a fresh feature instance immediately sees
         # jobs from a previous process — dispatch-then-persist would
         # otherwise truncate the registry to the new job alone.
@@ -2058,8 +2053,11 @@ class TalonCoordinatorFeature(Feature):
             "of shelling out to `sleep`. Returns the terminal status, "
             "the return code when known, a log tail, and timeout "
             "metadata if the job is still running. Use this when "
-            "actively supervising a job this turn; use talon_monitor "
-            "(the cron/signal path) for unattended completions."
+            "actively supervising a job this turn; the generic wait "
+            "reconciler cron (signal path) handles unattended completions. "
+            "Pass mode='signal' to register a watch and return immediately "
+            "instead of holding the turn (talon is already auto-monitored, "
+            "so this is mostly for symmetry with the generic wait tool)."
         ),
         category=ToolCategory.UTILITY,
         command_prefix="!talon wait",
@@ -2069,6 +2067,7 @@ class TalonCoordinatorFeature(Feature):
         job_id: str,
         timeout_seconds: int = 600,
         poll_interval_seconds: int = 10,
+        mode: str = "block",
     ) -> ToolResult:
         """Wait for a dispatched Talon job to finish.
 
@@ -2077,7 +2076,33 @@ class TalonCoordinatorFeature(Feature):
             timeout_seconds: Maximum seconds to wait before returning
                 still-running (capped at the enforced maximum).
             poll_interval_seconds: Seconds between registry polls.
+            mode: ``"block"`` (default) holds the turn polling until the job
+                is terminal; ``"signal"`` registers a watch and returns
+                immediately, waking the agent via a signal on completion.
         """
+        mode = str(mode).strip().lower() if mode else "block"
+        if mode not in ("block", "signal"):
+            return ToolResult.failed(
+                f"mode must be 'block' or 'signal', got {mode!r}"
+            )
+
+        if mode == "signal":
+            # Register a watch and return immediately. talon is already
+            # auto-monitored via active_handles, so this is redundant for
+            # talon specifically, but it keeps the interface symmetric and
+            # still wakes the agent on completion.
+            try:
+                await register_wait_watch(self.agent, f"talon:{job_id}")
+            except ValueError as exc:
+                return ToolResult.failed(str(exc))
+            return ToolResult.ok(
+                confirmation=(
+                    f"Watching talon:{job_id}; will wake on completion via "
+                    f"the wait reconciler"
+                ),
+                data={"ref": f"talon:{job_id}", "mode": "signal", "watching": True},
+            )
+
         # Thin wrapper over the generic wait engine: the TalonWaitable
         # provider runs the same reap/reconcile single-step the legacy
         # loop ran per iteration; the engine owns the loop, the cap, and
@@ -2088,330 +2113,6 @@ class TalonCoordinatorFeature(Feature):
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
             max_seconds=self._TALON_WAIT_MAX_SECONDS,
-        )
-
-    @tool(
-        name="talon_monitor",
-        description=(
-            "Poll active Talon CLI-background jobs and emit one "
-            "talon.job_complete signal per state transition. Wired "
-            "into the scheduler so completion wakes the agent "
-            "without explicit polling. ACTION; no LLM turn."
-        ),
-        category=ToolCategory.SYSTEM,
-        command_prefix="!talon monitor",
-    )
-    async def talon_monitor(self) -> ToolResult:
-        """Scan the durable registry, detect terminal-state transitions,
-        and enqueue COGNITION signals via the agent's SignalDispatcher.
-
-        Designed to be called by the scheduler (``cron.talon_monitor``)
-        every minute as an ACTION task — no LLM cost. Each job emits
-        exactly one signal per state transition; ``last_signaled_status``
-        is persisted in ``jobs.json`` so wakeups survive Kestrel restart
-        without re-firing for jobs that already woke a prior cognition.
-        """
-        # Lazy import to avoid a circular dependency between the
-        # coordinator and the signal-source module that builds the
-        # signal envelope referencing the same registry.
-        from kestrel_sovereign.signals.sources.talon import (
-            build_signal_for_completed_job,
-        )
-
-        self._reload_persisted_jobs()
-
-        dispatcher = getattr(self.agent, "dispatcher", None)
-        terminal_states = ("complete", "failed", "finished_unknown")
-        transitions: List[Dict[str, Any]] = []
-        # delivered = dispatcher returned OK or COALESCED (cognition
-        # fired or was collapsed into another wake).
-        signals_delivered = 0
-        # hard_fail = DROPPED_VALIDATION / DROPPED_CYCLE / retry cap —
-        # never retry.
-        signals_hard_failed = 0
-        # soft_fail = DROPPED_RATE_LIMIT / DROPPED_QUIET_HOURS / FAILED
-        # — leave last_signaled_status alone so the next poll retries.
-        signals_soft_failed = 0
-        signals_enqueued = 0
-        signals_skipped_no_dispatcher = 0
-        jobs_changed = False
-
-        # Step 0 — harvest any pending signal tasks from prior polls.
-        # The monitor uses ``enqueue_signal`` (fire-and-forget) so the
-        # cron loop does NOT block on an LLM turn; the handle's task
-        # is checked on the next poll. Without this two-phase design
-        # one slow COGNITION dispatch would starve other due cron
-        # tasks (codex P1 on PR #1530, kestrel-sovereign#1528).
-        delivered_states = {"ok", "coalesced"}
-        hard_fail_states = {"dropped_validation", "dropped_cycle"}
-        for jid, info in list(self._jobs.items()):
-            handle = self._pending_signal_tasks.get(jid)
-            persisted_pending_id = info.get("pending_signal_id")
-            if handle is None and persisted_pending_id is None:
-                continue
-            target = info.get("pending_signaled_target")
-            now_iso = datetime.now(timezone.utc).isoformat()
-
-            if handle is None:
-                # We have a persisted pending row but no in-memory
-                # task — Kestrel restarted mid-flight. The original
-                # background task died with the parent process; we
-                # can't know whether the cognition turn fired. Mark
-                # as lost so the next poll re-emits.
-                info["last_delivery_status"] = "lost_at_restart"
-                info["last_delivery_attempt_at"] = now_iso
-                info.pop("pending_signal_id", None)
-                info.pop("pending_signaled_target", None)
-                info.pop("pending_signal_enqueued_at", None)
-                signals_soft_failed += 1
-                jobs_changed = True
-                continue
-
-            if not handle.task.done():
-                # Still in flight; check again next poll.
-                continue
-
-            try:
-                result = handle.task.result()
-                status_value = result.status.value
-                info["last_delivery_status"] = status_value
-                if result.error:
-                    info["last_delivery_error"] = result.error
-                else:
-                    info.pop("last_delivery_error", None)
-            except Exception as e:
-                logger.warning(
-                    "talon_monitor: pending signal task raised for "
-                    "%s: %s", jid, e,
-                )
-                status_value = "dispatcher_raised"
-                info["last_delivery_status"] = status_value
-                info["last_delivery_error"] = (
-                    f"{type(e).__name__}: {e}"
-                )
-
-            info["last_delivery_attempt_at"] = now_iso
-            self._pending_signal_tasks.pop(jid, None)
-            info.pop("pending_signal_id", None)
-            info.pop("pending_signaled_target", None)
-            info.pop("pending_signal_enqueued_at", None)
-
-            if status_value in delivered_states:
-                info["last_signaled_status"] = target
-                info["last_delivered_at"] = now_iso
-                signals_delivered += 1
-                transitions.append({
-                    "job_id": jid,
-                    "status": target,
-                    "delivery_status": status_value,
-                    "returncode": info.get("returncode"),
-                })
-            elif status_value in hard_fail_states:
-                # Permanent rejection — lock signaled to prevent
-                # re-emit loops.
-                info["last_signaled_status"] = target
-                signals_hard_failed += 1
-                transitions.append({
-                    "job_id": jid,
-                    "status": target,
-                    "delivery_status": status_value,
-                    "delivery_error": info.get(
-                        "last_delivery_error", ""
-                    ),
-                    "returncode": info.get("returncode"),
-                })
-            else:
-                # Soft fail (rate_limit / quiet_hours / failed /
-                # dispatcher_raised / lost_at_restart). Don't mark
-                # signaled — next poll re-detects the transition
-                # and re-emits with a fresh attempt counter so the
-                # dispatcher's coalescing window doesn't swallow
-                # the retry as COALESCED (codex P1 round 1).
-                signals_soft_failed += 1
-            jobs_changed = True
-
-        # Cap repeated soft-fail retries so a deterministically-
-        # broken signal does not produce unbounded LLM turns. After
-        # this many attempts, lock the signaled flag and surface a
-        # synthetic ``max_attempts_exceeded`` delivery status so an
-        # operator can investigate.
-        MAX_DELIVERY_ATTEMPTS = 10
-
-        for jid, info in list(self._jobs.items()):
-            if info.get("method") != "cli_background":
-                continue
-
-            # Step 1 — refresh the in-memory status from the most
-            # authoritative source available.
-            proc = info.get("process")
-            current_status: Optional[str] = info.get("status")
-            if proc is not None:
-                rc = proc.returncode
-                if rc is None:
-                    current_status = "running"
-                else:
-                    current_status = "complete" if rc == 0 else "failed"
-                    info["returncode"] = rc
-                    info.setdefault(
-                        "completed_at",
-                        datetime.now(timezone.utc).isoformat(),
-                    )
-            elif current_status in ("dispatched", "running"):
-                rc_sidecar = self._read_exit_sidecar(info.get("exit_path"))
-                if rc_sidecar is not None:
-                    current_status = (
-                        "complete" if rc_sidecar == 0 else "failed"
-                    )
-                    info["returncode"] = rc_sidecar
-                    info.setdefault(
-                        "completed_at",
-                        datetime.now(timezone.utc).isoformat(),
-                    )
-                elif not self._pid_alive(info.get("pid")):
-                    current_status = "finished_unknown"
-                    info.setdefault("returncode", None)
-                    info.setdefault(
-                        "completed_at",
-                        datetime.now(timezone.utc).isoformat(),
-                    )
-                else:
-                    current_status = "running"
-
-            if info.get("status") != current_status:
-                info["status"] = current_status
-                jobs_changed = True
-
-            # Step 2 — emit a signal once per transition into a
-            # terminal state, via ``enqueue_signal`` so the cron
-            # loop doesn't block on the LLM turn. Confirmation is
-            # harvested at the top of the NEXT poll (Step 0).
-            if current_status not in terminal_states:
-                continue
-            last_signaled = info.get("last_signaled_status")
-            if last_signaled == current_status:
-                continue
-            if jid in self._pending_signal_tasks:
-                # A prior emit is still in flight — wait for Step 0
-                # next poll to confirm it before re-emitting.
-                continue
-
-            attempts_so_far = int(info.get("last_delivery_attempts", 0))
-            if attempts_so_far >= MAX_DELIVERY_ATTEMPTS:
-                # Retry cap reached — lock signaled and surface a
-                # synthetic delivery status so it shows up in
-                # talon_status output for operator review.
-                info["last_signaled_status"] = current_status
-                info["last_delivery_status"] = "max_attempts_exceeded"
-                signals_hard_failed += 1
-                jobs_changed = True
-                transitions.append({
-                    "job_id": jid,
-                    "status": current_status,
-                    "delivery_status": "max_attempts_exceeded",
-                    "delivery_attempts": attempts_so_far,
-                    "returncode": info.get("returncode"),
-                })
-                continue
-
-            log_tail = self._tail_job_log(info.get("log_path"), lines=20)
-            target_agent = (
-                getattr(self.agent, "did", None)
-                or getattr(self.agent, "agent_id", None)
-                or ""
-            )
-            attempts = attempts_so_far + 1
-            signal = build_signal_for_completed_job(
-                jid, info,
-                target_agent=str(target_agent),
-                log_tail=log_tail,
-            )
-            # Make the dedupe_key unique per attempt so retries after
-            # a soft failure don't get swallowed by the dispatcher's
-            # coalescing window as ``COALESCED`` against the prior
-            # failed attempt (codex round 1 P1). Application-level
-            # dedupe via ``last_signaled_status`` still prevents
-            # redundant emits.
-            signal.dedupe_key = (
-                f"{signal.dedupe_key or jid}:attempt-{attempts}"
-            )
-
-            if dispatcher is None or not hasattr(
-                dispatcher, "enqueue_signal"
-            ):
-                signals_skipped_no_dispatcher += 1
-                # Don't update last_signaled_status — without a
-                # dispatcher we have NOT actually woken anyone, so
-                # next poll should retry.
-                continue
-
-            info["last_delivery_attempts"] = attempts
-            info["last_delivery_attempt_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-            info["last_signal_id"] = signal.id
-            info["pending_signal_id"] = signal.id
-            info["pending_signaled_target"] = current_status
-            info["pending_signal_enqueued_at"] = datetime.now(
-                timezone.utc
-            ).isoformat()
-
-            try:
-                enq = dispatcher.enqueue_signal(signal)
-                handle = await enq if asyncio.iscoroutine(enq) else enq
-            except Exception as e:
-                logger.warning(
-                    "talon_monitor: enqueue_signal raised for %s: %s",
-                    jid, e,
-                )
-                info["last_delivery_status"] = "dispatcher_raised"
-                info["last_delivery_error"] = f"{type(e).__name__}: {e}"
-                info.pop("pending_signal_id", None)
-                info.pop("pending_signaled_target", None)
-                info.pop("pending_signal_enqueued_at", None)
-                signals_soft_failed += 1
-                jobs_changed = True
-                continue
-
-            self._pending_signal_tasks[jid] = handle
-            signals_enqueued += 1
-            jobs_changed = True
-
-        if jobs_changed:
-            self._persist_jobs()
-
-        parts = [
-            f"delivered={signals_delivered}",
-            f"enqueued={signals_enqueued}",
-        ]
-        if signals_hard_failed:
-            parts.append(f"hard_failed={signals_hard_failed}")
-        if signals_soft_failed:
-            parts.append(f"soft_failed={signals_soft_failed}")
-        if signals_skipped_no_dispatcher:
-            parts.append(
-                f"skipped_no_dispatcher={signals_skipped_no_dispatcher}"
-            )
-        return ToolResult.ok(
-            confirmation=(
-                f"Talon monitor: scanned {len(self._jobs)} job(s), "
-                + ", ".join(parts)
-            ),
-            data={
-                "scanned": len(self._jobs),
-                # signals_emitted counts deliveries confirmed in
-                # THIS poll (from the prior poll's enqueues that
-                # have since completed). signals_enqueued counts
-                # this poll's NEW emits awaiting confirmation.
-                "signals_emitted": signals_delivered,
-                "signals_enqueued": signals_enqueued,
-                "signals_hard_failed": signals_hard_failed,
-                "signals_soft_failed": signals_soft_failed,
-                "signals_skipped_no_dispatcher": (
-                    signals_skipped_no_dispatcher
-                ),
-                "pending_deliveries": len(self._pending_signal_tasks),
-                "transitions": transitions,
-            },
         )
 
     @tool(
@@ -2799,8 +2500,8 @@ class TalonCoordinatorFeature(Feature):
     def _tail_job_log(path: Any, lines: int = 20) -> str:
         """Best-effort tail of a job's combined log file.
 
-        Used by ``talon_monitor`` to attach a short context snippet to
-        the COGNITION signal it emits, so the agent does not have to
+        Used by :class:`TalonWaitable` to attach a short context snippet to
+        the COGNITION signal the reconciler emits, so the agent does not have to
         call ``talon_job_log`` as a follow-up tool just to see what
         happened. Returns ``""`` on any read error — the signal is
         still useful without it.

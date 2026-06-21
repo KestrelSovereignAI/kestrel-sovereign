@@ -504,6 +504,47 @@ class TestTalonWait:
         assert result.data["timed_out"] is False
         assert feature._jobs["job-b"]["error"] == "boom"
 
+    @pytest.mark.asyncio
+    async def test_talon_wait_mode_signal_returns_immediately(self, tmp_path):
+        """mode='signal' registers a watch and returns immediately instead of
+        holding the turn. talon is also auto-monitored via active_handles, so
+        this is mostly symmetry, but it must still work + persist a watch."""
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.waits import WaitRegistry
+        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
+        registry = WaitRegistry()
+        agent = SimpleNamespace(
+            did="did:test:agent",
+            agent_id="did:test:agent",
+            agent_name="kestrel",
+            _features=[],
+            _scheduler=MagicMock(),
+            _raw_storage=SimpleNamespace(db=db),
+            wait_registry=registry,
+        )
+        feature = TalonCoordinatorFeature(agent)
+        registry.register(TalonWaitable(feature))
+
+        result = await feature.talon_wait(job_id="job-z", mode="signal")
+        assert result.status is ToolResultStatus.OK
+        assert result.data["mode"] == "signal"
+        assert result.data["watching"] is True
+        assert result.data["ref"] == "talon:job-z"
+
+        watched = await agent._wait_reconciler._store.list_watched()
+        assert {(w.kind, w.handle) for w in watched} == {("talon", "job-z")}
+
+    @pytest.mark.asyncio
+    async def test_talon_wait_invalid_mode_errors(self):
+        feature = TalonCoordinatorFeature(_make_agent())
+        result = await feature.talon_wait(job_id="job-z", mode="bogus")
+        assert result.status is ToolResultStatus.ERROR
+        assert "mode must be 'block' or 'signal'" in result.error
+
 
 class TestTalonVerify:
     @pytest.mark.asyncio

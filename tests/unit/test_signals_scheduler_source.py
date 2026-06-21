@@ -96,7 +96,7 @@ def test_all_cron_tasks_are_classified():
         "reflect",
         "memory_consolidate",
         "sleep",  # #1674 P3 — nightly memory-maintenance cycle
-        "talon_monitor",  # #1510
+        "wait_reconcile",  # #1860 Wave 2 — generic wait→signal reconciler
         "restart_coordinator",  # #1512
         "github_pr_watch",  # #1618
     ])
@@ -116,7 +116,7 @@ def test_action_vs_artifact_split_matches_design():
         "training_cycle",
         "sleep",  # #1674 P3 — built-in handler (_handle_sleep); ACTION so the
                   # handler is wired (builtin_handlers are ACTION-only)
-        "talon_monitor",  # #1510 — polls jobs, emits signals, no LLM
+        "wait_reconcile",  # #1860 Wave 2 — polls waitables, emits signals, no LLM
         "restart_coordinator",  # #1512 — scans, spawns subprocess
         "github_pr_watch",  # #1618 — polls a PR, emits signal on change
     }

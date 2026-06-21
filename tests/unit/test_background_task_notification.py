@@ -104,7 +104,7 @@ def test_scheduler_origin_via_causation_chain():
     — never ``unknown/task``."""
     source, name = describe_background_task(
         _task(_cron_chain_metadata(
-            "cron.talon_monitor", "cron.restart_coordinator",
+            "cron.wait_reconcile", "cron.restart_coordinator",
         ))
     )
     assert (source, name) == ("cron", "restart_coordinator")
@@ -190,7 +190,7 @@ def test_scheduler_completion_notification_string():
 def test_failed_notification_includes_label_and_error():
     agent = _AgentLike()
     task = _task(
-        _cron_chain_metadata("cron.talon_monitor"),
+        _cron_chain_metadata("cron.wait_reconcile"),
         task_id="6314e1ea-41a8-4074-87ba-4f191551de61",
         state=TaskState.FAILED,
         message=Message(role="agent", parts=[TextPart(text="boom")]),
@@ -200,7 +200,7 @@ def test_failed_notification_includes_label_and_error():
 
     msg = agent._pending_task_notifications[0]
     assert "Background task failed" in msg
-    assert "cron/talon_monitor" in msg
+    assert "cron/wait_reconcile" in msg
     assert "boom" in msg
     assert "task: 6314e1ea-41a8-4074-87ba-4f191551de61" in msg
 
