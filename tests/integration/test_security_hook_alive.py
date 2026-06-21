@@ -172,7 +172,7 @@ async def test_ungranted_tool_queues_for_approval(bare_agent):
         # queued request leaks into the agent's shutdown which logs
         # a benign "cancelled_all" line.
         if queue.pending_count > 0:
-            queue.submit_decision(
+            await queue.submit_decision(
                 queue.pending_requests[0].id,
                 approved=False,
                 scope="once",

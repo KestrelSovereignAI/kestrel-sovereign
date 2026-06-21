@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from kestrel_sovereign.features.security.approval_queue import DecisionResult
+
 
 def _prepare_app(agent):
     from server import app
@@ -79,6 +81,9 @@ def _make_security_feature():
                 created_at=datetime(2026, 3, 17, 12, 0, tzinfo=timezone.utc),
             )
         ]
+    )
+    approval_queue.submit_decision = AsyncMock(
+        return_value=DecisionResult(in_memory=True, persisted=True)
     )
     return MagicMock(permission_store=permission_store, approval_queue=approval_queue)
 
@@ -165,7 +170,10 @@ def test_security_permission_mutation_endpoints_validate_levels_and_scope():
 
 def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts():
     security_feature = _make_security_feature()
-    security_feature.approval_queue.submit_decision.return_value = True
+    security_feature.approval_queue.submit_decision.return_value = DecisionResult(
+        in_memory=True,
+        persisted=True,
+    )
     security_feature.approval_queue.cancel_request.return_value = True
     security_feature.approval_queue.cancel_all.return_value = 3
     agent = MagicMock(features={"SecurityFeature": security_feature})
@@ -192,8 +200,15 @@ def test_security_approval_and_cancellation_endpoints_preserve_queue_contracts()
                     headers=_api_headers(),
                 )
         assert approve_response.status_code == 200
-        assert approve_response.json() == {"success": True, "approved": True, "scope": "session"}
-        security_feature.approval_queue.submit_decision.assert_called_once_with("req-1", True, "session")
+        assert approve_response.json() == {
+            "success": True,
+            "approved": True,
+            "scope": "session",
+            "persisted": True,
+        }
+        security_feature.approval_queue.submit_decision.assert_awaited_once_with(
+            "req-1", True, "session"
+        )
         assert cancel_response.status_code == 200
         assert cancel_all_response.status_code == 200
         assert cancel_all_response.json()["cancelled"] == 3
