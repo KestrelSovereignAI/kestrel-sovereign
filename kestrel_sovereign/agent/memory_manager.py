@@ -114,6 +114,7 @@ class MemoryManager:
         counter,
         emotional_context: Optional[Dict[str, Any]] = None,
         min_score: Optional[float] = None,
+        read_only: bool = False,
     ) -> Optional[str]:
         """
         Retrieve emotionally-weighted memories.
@@ -131,6 +132,8 @@ class MemoryManager:
                 dropped — keeps weak matches from being stamped into
                 the rendered transport form. ``None`` keeps the
                 underlying ``MemoryRetriever`` default (0.1).
+            read_only: When True, run the same retrieval and formatting path
+                without scheduling access-count updates.
         """
         if not self.memory_retriever:
             return None
@@ -158,6 +161,8 @@ class MemoryManager:
             }
             if min_score is not None:
                 retrieve_kwargs["min_score"] = min_score
+            if read_only:
+                retrieve_kwargs["read_only"] = True
             memories = await self.memory_retriever.retrieve(**retrieve_kwargs)
 
             if not memories:

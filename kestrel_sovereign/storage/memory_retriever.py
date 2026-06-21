@@ -153,7 +153,8 @@ class MemoryRetriever:
         agent_id: str,
         emotional_context: Optional[MemoryMetadata] = None,
         limit: int = 10,
-        min_score: float = 0.1
+        min_score: float = 0.1,
+        read_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Retrieve memories with human-like weighting.
@@ -164,6 +165,9 @@ class MemoryRetriever:
             emotional_context: Current emotional context for matching
             limit: Max results to return
             min_score: Minimum score threshold
+            read_only: When True, skip access-count update scheduling so
+                callers can estimate the memory block without rehearsal-effect
+                writes.
 
         Returns:
             List of message dicts with 'score' field added,
@@ -309,10 +313,11 @@ class MemoryRetriever:
             result["retrieval_score"] = round(score, 4)
             results.append(result)
 
-        for result in results:
-            msg_id = result.get("id")
-            if msg_id is not None:
-                self._schedule_access_update(msg_id, agent_id)
+        if not read_only:
+            for result in results:
+                msg_id = result.get("id")
+                if msg_id is not None:
+                    self._schedule_access_update(msg_id, agent_id)
 
         return results
 

@@ -267,7 +267,16 @@ def build_map(files: list[str]) -> str:
     other_count = len(relevant) - py_count - md_count
 
     today = dt.date.today().isoformat()
+    timestamp = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     header = [
+        "---",
+        "type: Audit Ledger",
+        "status: generated",
+        "generated: true",
+        f"timestamp: {timestamp}",
+        "title: Kestrel Sovereign — Repo Map",
+        "---",
+        "",
         "# Kestrel Sovereign — Repo Map",
         "",
         "Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent",

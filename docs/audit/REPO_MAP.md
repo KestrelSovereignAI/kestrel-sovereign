@@ -1,3 +1,11 @@
+---
+type: Audit Ledger
+status: generated
+generated: true
+timestamp: 2026-06-21T00:00:00+00:00
+title: Kestrel Sovereign — Repo Map
+---
+
 # Kestrel Sovereign — Repo Map
 
 Auto-generated file-tree + per-file purpose index. Always-loaded context for the kestrel-agent
@@ -1331,7 +1339,7 @@ Repo entry points and standard project files.
 - **docs/audit/FEATURE_PROOF_MATRIX.md** — --- type: Audit Ledger title: Feature Proof Matrix description: This is the first pass at mapping each discoverable feature module to direct proof.
 - **docs/audit/OKF_MIGRATION_PLAN.md** — --- type: Migration Plan title: Kestrel Documentation OKF Migration Plan description: Plan for converting Kestrel documentation to Google Open Knowledge Format and wiring automated upkeep into doc ge…
 - **docs/audit/README.md** — --- type: Audit Ledger title: Kestrel Whole-of-Vision Audit description: This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and…
-- **docs/audit/REPO_MAP.md** — --- type: Audit Ledger title: Kestrel Sovereign — Repo Map description: 'Auto-generated file-tree + per-file purpose index.
+- **docs/audit/REPO_MAP.md** — --- type: Audit Ledger status: generated generated: true title: Kestrel Sovereign — Repo Map ---
 - **docs/audit/SEAM_CAMPAIGNS.md** — --- type: Audit Ledger title: Cross-Feature Seam Campaigns description: This matrix tracks adversarial campaigns that cross feature boundaries.
 - **docs/audit/SYNC_ASYNC_AUDIT.md** — --- type: Audit Ledger title: Sync/Async Audit description: Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfa…
 - **docs/audit/documentation-2026-05/ARCHIVE_DECISIONS.md** — --- type: Audit Ledger title: Archive Decisions description: Cleanup and archive decisions from the May 2026 documentation audit.
@@ -1888,7 +1896,7 @@ Repo entry points and standard project files.
 - **tests/unit/test_agent_prefix_consolidation.py** — Regression tests for the /agent → /api/agent prefix consolidation (#871).
   - `def test_canonical_api_agent_prefix_serves_agent_routes()`; `def test_deprecated_agent_prefix_still_resolves(caplog)`; `def test_deprecation_log_dedupes_per_path_and_ua()`
 - **tests/unit/test_agent_runtime_endpoint_contracts.py** — Focused contract tests for agent runtime/status endpoints.
-  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch)`; `def test_context_status_route_cap_absent_when_no_cap(monkeypatch)`; `def test_context_status_route_cap_shown_regardless_of_model_window(monkeypatch)`; `…`
+  - `def test_context_status_reports_whole_window_utilization_and_warning_band()`; `def test_context_status_full_query_param_runs_rag()`; `def test_context_status_full_path_wires_read_only_memory_retriever()`; `def test_context_status_full_path_uses_last_user_turn_as_rag_query()`; `def test_context_status_full_path_labels_rag_when_no_user_turn_available()`; `def test_context_status_surfaces_route_cap_when_binding(monkeypatch)`; `def test_context_status_route_cap_includes_rag_on_full_path(monkeypatch)`; `def test_context_status_route_cap_absent_when_no_cap(monkeypatch)`; `…`
 - **tests/unit/test_anthropic_cache_control.py** — Unit tests for Anthropic cache_control markers (issue #705).
   - `def test_attach_cache_control_returns_copy()`; `def test_system_as_cacheable_array_wraps_string()`; `def test_tools_with_final_cache_marker_marks_last_only()`; `def test_tools_with_final_cache_marker_empty_list_passthrough()`; `def test_messages_with_penultimate_marker_marks_second_to_last()`; `def test_messages_with_penultimate_marker_no_history()`; `def test_messages_with_penultimate_marker_list_content_preserved()`; `def test_messages_with_trailing_system_marks_last_stable_turn()`; `…`
 - **tests/unit/test_anthropic_oauth_delegation.py** — Unit tests for Claude Code credential delegation (anthropic:plan).
