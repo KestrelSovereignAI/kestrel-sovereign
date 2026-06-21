@@ -161,6 +161,16 @@ def summarize_markdown(path: Path) -> FileEntry:
         return entry
 
     lines = text.splitlines()
+    # Skip a leading YAML frontmatter block (``---`` … ``---``) so the summary
+    # comes from the doc's real H1/body, not its metadata. Without this, a doc
+    # with frontmatter (now including the generated REPO_MAP.md itself) would be
+    # summarized as "--- type: ..." — and the self-entry would change on every
+    # regen, breaking ``--check`` (codex review).
+    if lines and lines[0].strip() == "---":
+        for close_idx in range(1, len(lines)):
+            if lines[close_idx].strip() == "---":
+                lines = lines[close_idx + 1:]
+                break
     body_start = 0
     title = ""
     for idx, line in enumerate(lines):
@@ -267,14 +277,29 @@ def build_map(files: list[str]) -> str:
     other_count = len(relevant) - py_count - md_count
 
     today = dt.date.today().isoformat()
-    timestamp = dt.datetime.now(dt.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     header = [
+        # OKF frontmatter — generated docs carry metadata like the rest of the
+        # corpus so the docs-completeness gate (tests/unit/test_docs_okf.py)
+        # passes on this auto-regenerated file. ``generated: true`` marks it as
+        # machine-produced; do not hand-edit.
         "---",
-        "type: Audit Ledger",
+        "type: Generated Reference",
+        "title: Repo Map",
+        "description: Auto-generated file-tree + per-file purpose index for the "
+        "Kestrel Sovereign codebase.",
+        "resource: /docs/audit/REPO_MAP.md",
+        "tags:",
+        "- docs",
+        "- audit",
+        "- generated-docs",
+        "- repo-map",
+        # No ``timestamp`` field on purpose: it would change every nightly
+        # regeneration and make the OKF index/log gate stale daily. The body's
+        # ``**Generated:**`` line records the date; OKF index/log read only
+        # frontmatter, so omitting it keeps those generated indexes stable.
         "status: generated",
+        "canonical: false",
         "generated: true",
-        f"timestamp: {timestamp}",
-        "title: Kestrel Sovereign — Repo Map",
         "---",
         "",
         "# Kestrel Sovereign — Repo Map",
