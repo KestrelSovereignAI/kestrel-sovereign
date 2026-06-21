@@ -63,7 +63,11 @@ from kestrel_sovereign.features.security.permissions import (
     ToolPermission,
     FeaturePermissions,
 )
-from kestrel_sovereign.features.security.approval_queue import ApprovalQueue, ApprovalRequest
+from kestrel_sovereign.features.security.approval_queue import (
+    ApprovalQueue,
+    ApprovalRequest,
+    DecisionResult,
+)
 from kestrel_sovereign.features.security.hooks import SecurityHook
 from kestrel_sovereign.features.security.feature import SecurityFeature
 from kestrel_sdk.hooks.base import HookInput, HookEvent, PermissionDecision
@@ -271,7 +275,7 @@ class TestApprovalQueue:
             # Find the request
             pending = queue.pending_requests
             assert len(pending) == 1
-            queue.submit_decision(pending[0].id, True, "session")
+            await queue.submit_decision(pending[0].id, True, "session")
 
         asyncio.create_task(approve_later())
 
@@ -290,7 +294,7 @@ class TestApprovalQueue:
             await asyncio.sleep(0.1)
             pending = queue.pending_requests
             assert len(pending) == 1
-            queue.submit_decision(pending[0].id, False, "denied")
+            await queue.submit_decision(pending[0].id, False, "denied")
 
         asyncio.create_task(deny_later())
 
@@ -322,12 +326,16 @@ class TestApprovalQueue:
             assert len(pending) == 1
             req_id = pending[0].id
             # First decision: approve once. Must succeed.
-            assert queue.submit_decision(req_id, True, "once") is True
+            result = await queue.submit_decision(req_id, True, "once")
+            assert result.in_memory is True
+            assert result.persisted is True
             # Second decision: approve again with a different scope.
             # Must be rejected — same request, already decided.
-            assert queue.submit_decision(req_id, True, "session") is False
+            result = await queue.submit_decision(req_id, True, "session")
+            assert result.in_memory is False
             # Even an opposite decision must be rejected.
-            assert queue.submit_decision(req_id, False, "denied") is False
+            result = await queue.submit_decision(req_id, False, "denied")
+            assert result.in_memory is False
 
         asyncio.create_task(respond_twice())
 
@@ -475,9 +483,10 @@ class TestApprovalQueue:
         # request — exactly the "user comes back later" path that
         # the old behavior denied them.
         request_id = next(iter(queue._pending.keys()))
-        assert queue.submit_decision(
+        result = await queue.submit_decision(
             request_id, approved=True, scope="once",
-        ) is True
+        )
+        assert result.in_memory is True
 
     @pytest.mark.asyncio
     async def test_sweep_stale_reaps_old_pending(self):
@@ -533,7 +542,10 @@ class TestApprovalQueue:
         await asyncio.sleep(0.05)
         # Find the queued request and resolve it as if the user clicked.
         request_id = next(iter(queue._pending.keys()))
-        assert queue.submit_decision(request_id, approved=True, scope="once") is True
+        result = await queue.submit_decision(
+            request_id, approved=True, scope="once"
+        )
+        assert result.in_memory is True
         approved, scope = await request_task
         assert approved is True
         assert scope == "once"
@@ -660,7 +672,7 @@ class TestSecurityHook:
             await asyncio.sleep(0.1)
             pending = approval_queue.pending_requests
             if pending:
-                approval_queue.submit_decision(pending[0].id, True, "once")
+                await approval_queue.submit_decision(pending[0].id, True, "once")
 
         asyncio.create_task(approve_later())
 
@@ -687,7 +699,7 @@ class TestSecurityHook:
             await asyncio.sleep(0.1)
             pending = approval_queue.pending_requests
             if pending:
-                approval_queue.submit_decision(pending[0].id, False, "denied")
+                await approval_queue.submit_decision(pending[0].id, False, "denied")
 
         asyncio.create_task(deny_later())
 
@@ -716,7 +728,7 @@ class TestSecurityHook:
             await asyncio.sleep(0.1)
             pending = approval_queue.pending_requests
             if pending:
-                approval_queue.submit_decision(pending[0].id, True, "always")
+                await approval_queue.submit_decision(pending[0].id, True, "always")
 
         asyncio.create_task(approve_always())
 
@@ -782,7 +794,7 @@ class TestSecurityIntegration:
             await asyncio.sleep(0.1)
             pending = queue.pending_requests
             if pending:
-                queue.submit_decision(pending[0].id, True, "session")
+                await queue.submit_decision(pending[0].id, True, "session")
 
         asyncio.create_task(user_approves())
 
@@ -902,7 +914,7 @@ class TestApprovalQueueScopePersistence:
             await asyncio.sleep(0.05)
             pending = queue_with_store.pending_requests
             assert len(pending) == 1
-            queue_with_store.submit_decision(pending[0].id, True, "session")
+            await queue_with_store.submit_decision(pending[0].id, True, "session")
 
         asyncio.create_task(approve_session())
         approved, scope = await queue_with_store.request_approval(
@@ -923,7 +935,7 @@ class TestApprovalQueueScopePersistence:
         async def approve_always():
             await asyncio.sleep(0.05)
             pending = queue_with_store.pending_requests
-            queue_with_store.submit_decision(pending[0].id, True, "always")
+            await queue_with_store.submit_decision(pending[0].id, True, "always")
 
         asyncio.create_task(approve_always())
         approved, scope = await queue_with_store.request_approval(
@@ -954,7 +966,7 @@ class TestApprovalQueueScopePersistence:
         async def approve_once():
             await asyncio.sleep(0.05)
             pending = queue_with_store.pending_requests
-            queue_with_store.submit_decision(pending[0].id, True, "once")
+            await queue_with_store.submit_decision(pending[0].id, True, "once")
 
         asyncio.create_task(approve_once())
         approved, _ = await queue_with_store.request_approval(
@@ -976,7 +988,7 @@ class TestApprovalQueueScopePersistence:
         async def approve_session():
             await asyncio.sleep(0.05)
             pending = queue_with_store.pending_requests
-            queue_with_store.submit_decision(pending[0].id, True, "session")
+            await queue_with_store.submit_decision(pending[0].id, True, "session")
 
         asyncio.create_task(approve_session())
         await queue_with_store.request_approval(
@@ -995,11 +1007,41 @@ class TestApprovalQueueScopePersistence:
         )
 
     @pytest.mark.asyncio
+    async def test_submit_decision_reports_persistence_failure(
+        self, queue_with_store, store
+    ):
+        async def fail_set_permission(*args, **kwargs):
+            raise RuntimeError("permission store write failed")
+
+        store.set_permission = fail_set_permission
+
+        request_task = asyncio.create_task(
+            queue_with_store.request_approval(
+                feature_name="reflection",
+                tool_name="self_model",
+                tool_args={},
+            )
+        )
+        await asyncio.sleep(0.05)
+        pending = queue_with_store.pending_requests
+
+        result = await queue_with_store.submit_decision(
+            pending[0].id, True, "session"
+        )
+        approved, scope = await request_task
+
+        assert result.in_memory is True
+        assert result.persisted is False
+        assert "permission store write failed" in result.error
+        assert approved is True
+        assert scope == "session"
+
+    @pytest.mark.asyncio
     async def test_user_denied_writes_audit_row(self, queue_with_store, store):
         async def deny():
             await asyncio.sleep(0.05)
             pending = queue_with_store.pending_requests
-            queue_with_store.submit_decision(pending[0].id, False, "denied")
+            await queue_with_store.submit_decision(pending[0].id, False, "denied")
 
         asyncio.create_task(deny())
         approved, _ = await queue_with_store.request_approval(
@@ -1037,7 +1079,7 @@ class TestApprovalQueueScopePersistence:
         async def approve():
             await asyncio.sleep(0.05)
             pending = queue_without_store.pending_requests
-            queue_without_store.submit_decision(pending[0].id, True, "session")
+            await queue_without_store.submit_decision(pending[0].id, True, "session")
 
         asyncio.create_task(approve())
         approved, scope = await queue_without_store.request_approval(
@@ -1083,12 +1125,14 @@ class TestSecurityFeature:
 
     @pytest.mark.asyncio
     async def test_approve_once_returns_ok(self):
-        """scope='once' has no async persistence — OK is honest."""
+        """scope='once' has no durable permission row — OK is honest."""
         from kestrel_sdk.tools.result import ToolResultStatus
         agent = MagicMock()
         feature = SecurityFeature(agent)
         feature.approval_queue = MagicMock()
-        feature.approval_queue.submit_decision = MagicMock(return_value=True)
+        feature.approval_queue.submit_decision = AsyncMock(
+            return_value=DecisionResult(in_memory=True, persisted=True)
+        )
         feature.approval_queue.pending_requests = [
             ApprovalRequest(
                 id="req-once-12345678",
@@ -1102,20 +1146,19 @@ class TestSecurityFeature:
         result = await feature.approve_request("req-once-1", scope="once")
         assert result.status is ToolResultStatus.OK
         assert result.data["scope"] == "once"
+        assert result.data["scope_persisted"] is True
 
     @pytest.mark.asyncio
-    async def test_approve_with_session_scope_is_partial(self):
-        """Round 2 codex finding: scope='session'/'always' persistence
-        is asynchronous and the store path swallows failures —
-        ApprovalQueue.submit_decision returning True only means the
-        in-memory decision was set, not that the durable scope was
-        written. Surface as PARTIAL so the LLM doesn't promise the
-        scope took effect."""
+    async def test_approve_with_durable_scope_returns_ok_when_persisted(self):
+        """scope='session'/'always' returns OK when the queue confirms
+        durable persistence succeeded."""
         from kestrel_sdk.tools.result import ToolResultStatus
         agent = MagicMock()
         feature = SecurityFeature(agent)
         feature.approval_queue = MagicMock()
-        feature.approval_queue.submit_decision = MagicMock(return_value=True)
+        feature.approval_queue.submit_decision = AsyncMock(
+            return_value=DecisionResult(in_memory=True, persisted=True)
+        )
         feature.approval_queue.pending_requests = [
             ApprovalRequest(
                 id="req-session-12345678",
@@ -1128,10 +1171,40 @@ class TestSecurityFeature:
 
         for scope in ("session", "always"):
             result = await feature.approve_request("req-session-1", scope=scope)
-            assert result.status is ToolResultStatus.PARTIAL, scope
-            assert "asynchronous" in result.error.lower(), scope
+            assert result.status is ToolResultStatus.OK, scope
             assert result.data["scope"] == scope
-            assert result.data["scope_persistence"] == "asynchronous_and_unverified"
+            assert result.data["scope_persisted"] is True
+
+    @pytest.mark.asyncio
+    async def test_approve_with_durable_scope_is_partial_when_persistence_fails(self):
+        """If the queue accepts the decision but reports a store failure,
+        the tool reports PARTIAL instead of claiming the scope stuck."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        agent = MagicMock()
+        feature = SecurityFeature(agent)
+        feature.approval_queue = MagicMock()
+        feature.approval_queue.submit_decision = AsyncMock(
+            return_value=DecisionResult(
+                in_memory=True,
+                persisted=False,
+                error="database is locked",
+            )
+        )
+        feature.approval_queue.pending_requests = [
+            ApprovalRequest(
+                id="req-session-12345678",
+                feature_name="WalletAgent",
+                tool_name="send_tokens",
+                tool_args={},
+                created_at=datetime.now(timezone.utc),
+            )
+        ]
+
+        result = await feature.approve_request("req-session-1", scope="session")
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "database is locked" in result.error
+        assert result.data["scope"] == "session"
+        assert result.data["scope_persisted"] is False
 
     @pytest.mark.asyncio
     async def test_approve_when_request_withdrawn_is_error(self):
@@ -1141,8 +1214,14 @@ class TestSecurityFeature:
         agent = MagicMock()
         feature = SecurityFeature(agent)
         feature.approval_queue = MagicMock()
-        # submit returns False — withdrawal race
-        feature.approval_queue.submit_decision = MagicMock(return_value=False)
+        # submit reports in_memory=False — withdrawal race
+        feature.approval_queue.submit_decision = AsyncMock(
+            return_value=DecisionResult(
+                in_memory=False,
+                persisted=False,
+                error="request not found or expired",
+            )
+        )
         feature.approval_queue.pending_requests = [
             ApprovalRequest(
                 id="req-race-12345678",

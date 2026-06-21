@@ -109,7 +109,7 @@ class _ApprovalResponder:
                 if req.id in self._seen:
                     continue
                 self._seen.add(req.id)
-                self._security.approval_queue.submit_decision(
+                await self._security.approval_queue.submit_decision(
                     req.id, self._decision, self._scope
                 )
                 self.responded_count += 1
@@ -452,7 +452,7 @@ async def test_symlink_resolves_to_realpath_for_human_approver(
                         continue
                     self._seen.add(req.id)
                     captured_args.update(req.tool_args)
-                    self._security.approval_queue.submit_decision(
+                    await self._security.approval_queue.submit_decision(
                         req.id, self._decision, self._scope
                     )
                     self.responded_count += 1
@@ -1271,7 +1271,7 @@ async def test_fs_edit_diff_preview_present_in_approval_payload(
                         continue
                     self._seen.add(req.id)
                     captured.update(req.tool_args)
-                    self._security.approval_queue.submit_decision(
+                    await self._security.approval_queue.submit_decision(
                         req.id, self._decision, self._scope
                     )
                     self.responded_count += 1

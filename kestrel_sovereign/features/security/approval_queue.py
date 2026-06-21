@@ -77,6 +77,19 @@ class ApprovalRequest:
         }
 
 
+@dataclass(frozen=True)
+class DecisionResult:
+    """Result of applying a user's approval-queue decision."""
+
+    in_memory: bool
+    persisted: bool
+    error: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        """Back-compat truthiness for callers that only need acceptance."""
+        return self.in_memory
+
+
 # Type for the SSE callbacks
 OnRequestAddedCallback = Callable[[ApprovalRequest], Awaitable[None]]
 # ``reason`` is one of "timeout" | "cancelled" — the request exited
@@ -132,11 +145,10 @@ class ApprovalQueue:
                              user's modal would 404 on submit. See #877.
             permission_store: Optional store for persisting the user's scope
                              choice ("session"/"always") and writing audit
-                             rows.  When set, every approval resolved through
-                             :meth:`request_approval` is persisted/audited
-                             centrally so that callers don't have to remember
-                             to do it (#785).  When None, callers retain the
-                             old responsibility of persisting scope themselves.
+                             rows.  When set, every submitted approval
+                             decision is persisted/audited centrally so that
+                             callers don't have to remember to do it (#785).
+                             When None, persistence is treated as unnecessary.
         """
         self._pending: Dict[str, ApprovalRequest] = {}
         self._resolved: Dict[str, ApprovalRequest] = {}
@@ -383,14 +395,6 @@ class ApprovalQueue:
                 f"{'approved' if approved else 'denied'} ({scope})"
             )
 
-            await self._persist_decision(
-                feature_name=feature_name,
-                tool_name=tool_name,
-                tool_args=tool_args,
-                approved=approved,
-                scope=scope,
-            )
-
             return (approved, scope)
 
         except asyncio.TimeoutError:
@@ -458,7 +462,7 @@ class ApprovalQueue:
         tool_args: Dict,
         approved: bool,
         scope: str,
-    ) -> None:
+    ) -> Optional[str]:
         """Persist the user's scope choice and write an audit row.
 
         Idempotent for the "once" case (no persistence). When ``scope`` is
@@ -473,7 +477,7 @@ class ApprovalQueue:
         ``reflection``) all benefit without having to repeat the logic.
         """
         if self._permission_store is None:
-            return
+            return None
 
         # Lazy import: PermissionLevel lives next door but we keep the
         # import out of module-load to avoid a circular reference.
@@ -520,12 +524,15 @@ class ApprovalQueue:
             )
         except Exception as e:  # noqa: BLE001
             # A persistence failure must not corrupt the user's decision.
-            # Log loudly and let the caller proceed with `approved` as-is.
+            # Log loudly and let the caller report the exact persistence
+            # failure while preserving the in-memory decision.
             logger.warning(
                 "ApprovalQueue: failed to persist decision for "
                 f"{feature_name}.{tool_name}: {e}",
                 exc_info=True,
             )
+            return str(e)
+        return None
 
     @staticmethod
     def _summarize_args(args: Optional[Dict], max_chars: int = 500) -> Optional[str]:
@@ -543,12 +550,12 @@ class ApprovalQueue:
             return text[:max_chars] + "..."
         return text
 
-    def submit_decision(
+    async def submit_decision(
         self,
         request_id: str,
         approved: bool,
         scope: str = "once",
-    ) -> bool:
+    ) -> DecisionResult:
         """
         Submit a user's decision for a pending request.
 
@@ -560,13 +567,18 @@ class ApprovalQueue:
             scope: Scope of approval - "once", "session", or "always"
 
         Returns:
-            True if the request was found and decision submitted,
-            False if the request was not found (expired or invalid)
+            DecisionResult with ``in_memory=True`` when the pending request
+            accepted the decision, and ``persisted=True`` only when the
+            scope/audit persistence path completed or was unnecessary.
         """
         request = self._pending.get(request_id)
         if not request:
             logger.warning(f"Decision submitted for unknown request: {request_id}")
-            return False
+            return DecisionResult(
+                in_memory=False,
+                persisted=False,
+                error="request not found or expired",
+            )
 
         # Idempotency / CAS: a request that already has a decision must
         # not accept another one. Without this guard, callers that race
@@ -583,7 +595,11 @@ class ApprovalQueue:
                 f"Decision submitted for already-decided request "
                 f"{request_id[:8]} (status={request.status.value}); ignored"
             )
-            return False
+            return DecisionResult(
+                in_memory=False,
+                persisted=False,
+                error=f"request already {request.status.value}",
+            )
 
         request.status = ApprovalStatus.APPROVED if approved else ApprovalStatus.DENIED
         request.user_decision = scope
@@ -591,6 +607,15 @@ class ApprovalQueue:
         if len(self._resolved) > 512:
             oldest = next(iter(self._resolved))
             self._resolved.pop(oldest, None)
+
+        persist_error = await self._persist_decision(
+            feature_name=request.feature_name,
+            tool_name=request.tool_name,
+            tool_args=request.tool_args,
+            approved=approved,
+            scope=scope,
+        )
+
         request.resume_event.set()  # Unblock the waiting coroutine
 
         logger.info(
@@ -598,7 +623,11 @@ class ApprovalQueue:
             f"{'approved' if approved else 'denied'} ({scope})"
         )
 
-        return True
+        return DecisionResult(
+            in_memory=True,
+            persisted=persist_error is None,
+            error=persist_error,
+        )
 
     def get_request(self, request_id: str) -> Optional[ApprovalRequest]:
         """

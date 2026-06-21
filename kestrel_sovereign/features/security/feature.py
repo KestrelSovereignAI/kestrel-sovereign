@@ -591,50 +591,42 @@ class SecurityFeature(Feature):
                 data={"request_id": request_id},
             )
 
-        # submit_decision returns True only if the queue accepted the
-        # decision (the request is still pending). If False, the queue
-        # withdrew or expired it between _find_request_id and now —
-        # surface as ERROR rather than claiming approval.
-        if not self.approval_queue.submit_decision(full_id, True, scope):
+        # submit_decision returns a result object: ``in_memory`` means the
+        # queue accepted the decision, while ``persisted`` reports whether
+        # the durable scope/audit write completed.
+        decision = await self.approval_queue.submit_decision(full_id, True, scope)
+        if not decision.in_memory:
             return ToolResult.failed(
                 f"Request '{request_id}' is no longer pending "
                 "(timeout, cancellation, or already decided)",
                 data={"request_id": full_id, "decision_attempted": "approved"},
             )
 
-        # Honesty: ``ApprovalQueue.submit_decision`` only sets the
-        # in-memory decision; the scope is persisted later by
-        # ``request_approval()`` via ``_persist_decision``, and that
-        # path swallows store failures. For ``scope="once"`` there's
-        # no persistence — the immediate approval is the whole
-        # action, so OK is honest. For ``scope="session"``/``"always"``
-        # the durable scope may not actually be written, so we surface
-        # PARTIAL and tell the LLM the next tool call may re-prompt.
-        # See round 2 codex finding + #1078 follow-up ticket.
-        if scope == "once":
+        if decision.persisted:
             return ToolResult.ok(
-                confirmation=f"Approved {request_id[:8]} (once)",
+                confirmation=f"Approved {request_id[:8]} ({scope})",
                 data={
                     "request_id": full_id,
                     "scope": scope,
                     "decision": "approved",
+                    "scope_persisted": True,
                 },
             )
         return ToolResult.partial(
             confirmation=(
                 f"Approved {request_id[:8]} for this request "
-                f"(decision submitted with scope={scope})"
+                f"(scope={scope} persistence failed)"
             ),
             error=(
-                f"scope={scope} persistence is asynchronous and store "
-                "failures are not surfaced; the durable permission may "
-                "not have been written. The next tool call may re-prompt"
+                f"scope={scope} decision was accepted in memory, but the "
+                f"durable permission/audit write failed: {decision.error}"
             ),
             data={
                 "request_id": full_id,
                 "scope": scope,
                 "decision": "approved",
-                "scope_persistence": "asynchronous_and_unverified",
+                "scope_persisted": False,
+                "persistence_error": decision.error,
             },
         )
 
@@ -667,10 +659,31 @@ class SecurityFeature(Feature):
         # only for a real user denial and never mislabel a policy/sandbox
         # block as one (#1542). The resulting ``request.user_decision`` still
         # audits as ``user_denied`` via ``_persist_decision``.
-        if self.approval_queue.submit_decision(full_id, False, "user_denied"):
+        decision = await self.approval_queue.submit_decision(
+            full_id, False, "user_denied"
+        )
+        if decision.in_memory and decision.persisted:
             return ToolResult.ok(
                 confirmation=f"Denied {request_id[:8]}",
-                data={"request_id": full_id, "decision": "user_denied"},
+                data={
+                    "request_id": full_id,
+                    "decision": "user_denied",
+                    "scope_persisted": True,
+                },
+            )
+        if decision.in_memory:
+            return ToolResult.partial(
+                confirmation=f"Denied {request_id[:8]}",
+                error=(
+                    "Denial was accepted in memory, but the audit write "
+                    f"failed: {decision.error}"
+                ),
+                data={
+                    "request_id": full_id,
+                    "decision": "user_denied",
+                    "scope_persisted": False,
+                    "persistence_error": decision.error,
+                },
             )
         return ToolResult.failed(
             f"Request '{request_id}' is no longer pending "

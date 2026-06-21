@@ -409,11 +409,11 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
         None,
     )
 
-    success = security.approval_queue.submit_decision(
+    decision = await security.approval_queue.submit_decision(
         data.approval_id, data.approved, data.scope
     )
 
-    if not success:
+    if not decision.in_memory:
         raise HTTPException(
             status_code=404,
             detail=f"Request '{data.approval_id}' not found or expired"
@@ -463,9 +463,14 @@ async def submit_approval(request: Request, data: ApprovalDecisionRequest):
         "success": True,
         "approved": data.approved,
         "scope": data.scope,
+        "persisted": decision.persisted,
     }
-    # Only present when a rule was actually remembered, so the existing
-    # /approve contract is byte-identical on the normal path.
+    if decision.error is not None:
+        result["warning"] = (
+            "Decision was accepted in memory, but durable persistence failed"
+        )
+        result["persistence_error"] = decision.error
+    # Only present when a rule was actually remembered.
     if remembered is not None:
         result["remembered"] = remembered
     return result

@@ -235,7 +235,7 @@ class TestAskBlocksUntilApproved:
 
         # Submit approval
         pending = approval_queue.pending_requests[0]
-        approval_queue.submit_decision(pending.id, approved=True, scope="once")
+        await approval_queue.submit_decision(pending.id, approved=True, scope="once")
 
         # Now the task should complete
         result = await asyncio.wait_for(task, timeout=5.0)
@@ -280,7 +280,7 @@ class TestAskDenyBlocksTool:
         assert approval_queue.pending_count == 1
 
         pending = approval_queue.pending_requests[0]
-        approval_queue.submit_decision(pending.id, approved=False, scope="once")
+        await approval_queue.submit_decision(pending.id, approved=False, scope="once")
 
         result = await asyncio.wait_for(task, timeout=5.0)
 
@@ -325,7 +325,7 @@ class TestSessionScopePersists:
         assert approval_queue.pending_count == 1
 
         pending = approval_queue.pending_requests[0]
-        approval_queue.submit_decision(pending.id, approved=True, scope="session")
+        await approval_queue.submit_decision(pending.id, approved=True, scope="session")
 
         result1 = await asyncio.wait_for(task, timeout=5.0)
         assert result1["success"] is True
@@ -407,7 +407,7 @@ class TestAuditLogPopulated:
 
         await asyncio.sleep(0.1)
         pending = approval_queue.pending_requests[0]
-        approval_queue.submit_decision(pending.id, approved=True, scope="once")
+        await approval_queue.submit_decision(pending.id, approved=True, scope="once")
         await asyncio.wait_for(task, timeout=5.0)
 
         # --- Verify audit log ---
