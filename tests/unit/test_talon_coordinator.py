@@ -601,9 +601,10 @@ class TestTalonWait:
         await feature.post_all_features_loaded(agent)
 
         store = WaitSignalStore(db, "did:test:agent")
-        # complete -> done, failed -> failed; mapped onto generic Outcome.
-        assert (await store.get("talon", "done-1")).last_signaled_outcome == "done"
-        assert (await store.get("talon", "failed-1")).last_signaled_outcome == "failed"
+        # Seeded with the reconciler's dedup token shape "<outcome>:<status>"
+        # (complete -> done, failed -> failed) so the first tick won't re-fire.
+        assert (await store.get("talon", "done-1")).last_signaled_outcome == "done:complete"
+        assert (await store.get("talon", "failed-1")).last_signaled_outcome == "failed:failed"
         # No legacy status => no seed row (the reconciler will signal it fresh).
         assert await store.get("talon", "unsig-1") is None
 

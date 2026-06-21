@@ -323,11 +323,19 @@ class WaitReconciler:
             # Non-terminal — leave it (watched handles stay watched).
             return
 
-        outcome_value = status.outcome.value
+        # Dedup token: the generic Outcome alone is too coarse — a provider
+        # can map several distinct native states onto one Outcome (talon's
+        # ``finished_unknown`` and ``failed`` both -> FAILED). The legacy
+        # talon_monitor dedup'd on the native status and explicitly allowed a
+        # corrected ``finished_unknown -> failed`` to re-signal. So we dedup on
+        # the outcome PLUS the provider's native ``status`` (when it exposes one
+        # in WaitStatus.data) — preserving one-signal-per-real-transition
+        # (codex Wave 2 P2).
+        signaled_token = self._signaled_token(status)
         state = await store.get(kind, handle)
 
         # Application-level dedup: already signaled this transition.
-        if state and state.last_signaled_outcome == outcome_value:
+        if state and state.last_signaled_outcome == signaled_token:
             return
         # A prior emit for this handle is still in flight — wait for the
         # next tick's Phase 0 to confirm it before re-emitting.
@@ -341,12 +349,12 @@ class WaitReconciler:
             await store.record_delivery(
                 kind, handle,
                 delivery_status="max_attempts_exceeded",
-                signaled_outcome=outcome_value,
+                signaled_outcome=signaled_token,
                 attempt_at=datetime.now(timezone.utc),
             )
             counters["signals_hard_failed"] += 1
             transitions.append({
-                "kind": kind, "handle": handle, "outcome": outcome_value,
+                "kind": kind, "handle": handle, "outcome": status.outcome.value,
                 "delivery_status": "max_attempts_exceeded",
                 "delivery_attempts": attempts_so_far,
             })
@@ -365,7 +373,7 @@ class WaitReconciler:
         await store.record_pending(
             kind, handle,
             signal_id=signal.id,
-            target=outcome_value,
+            target=signaled_token,
             attempts=attempts,
             attempt_at=now,
         )
@@ -389,6 +397,21 @@ class WaitReconciler:
 
         self._pending_signal_tasks[(kind, handle)] = handle_obj
         counters["signals_enqueued"] += 1
+
+    @staticmethod
+    def _signaled_token(status: Any) -> str:
+        """Dedup token for a terminal poll.
+
+        The generic ``Outcome`` plus the provider's native ``status`` (when it
+        exposes one in ``WaitStatus.data``), so providers that collapse several
+        native terminal states into one Outcome still get one signal per real
+        transition (talon ``finished_unknown`` -> ``failed``). Falls back to
+        the bare outcome value for providers that expose no native status.
+        """
+        native = (status.data or {}).get("status")
+        if native:
+            return f"{status.outcome.value}:{native}"
+        return status.outcome.value
 
     @staticmethod
     def _monitorable_providers(registry: Any) -> List[MonitorableWaitable]:
@@ -447,7 +470,9 @@ class WaitReconciler:
             # against the prior failed attempt (talon_monitor codex round 1
             # P1). Application-level dedup via last_signaled_outcome still
             # prevents redundant emits across ticks.
-            dedupe_key=f"{kind}:{handle}:{status.outcome.value}:attempt-{attempts}",
+            dedupe_key=(
+                f"{kind}:{handle}:{self._signaled_token(status)}:attempt-{attempts}"
+            ),
         )
 
 

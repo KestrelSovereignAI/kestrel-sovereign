@@ -227,6 +227,37 @@ async def test_coalesced_counts_as_delivered(tmp_path):
     assert row.last_delivery_status == "coalesced"
 
 
+@pytest.mark.asyncio
+async def test_corrected_native_status_resignals_within_same_outcome(tmp_path):
+    """Regression (codex Wave 2 P2): when a provider's native status changes
+    but maps to the SAME generic Outcome (talon finished_unknown -> failed,
+    both FAILED), the corrected transition must re-signal — dedup is on the
+    outcome+native-status token, not the bare outcome."""
+    provider = _FakeProvider()
+    provider.set("h1", Outcome.FAILED, summary="finished, no exit code",
+                 data={"status": "finished_unknown"})
+    dispatcher = _CapturingDispatcher()
+    agent = await _make_agent(tmp_path, provider, dispatcher)
+    rec = WaitReconciler(agent)
+
+    # First terminal state: enqueue + harvest delivered.
+    await rec.reconcile()
+    await rec.reconcile()
+    row = await rec._store.get("fake", "h1")
+    assert row.last_signaled_outcome == "failed:finished_unknown"
+    assert len(dispatcher.signals) == 1
+
+    # The late exit sidecar lands: same Outcome.FAILED, different native status.
+    provider.set("h1", Outcome.FAILED, summary="exit code 2",
+                 data={"status": "failed"})
+    t = await rec.reconcile()
+    assert t.data["signals_enqueued"] == 1  # re-signaled, not suppressed
+    await rec.reconcile()
+    row = await rec._store.get("fake", "h1")
+    assert row.last_signaled_outcome == "failed:failed"
+    assert len(dispatcher.signals) == 2
+
+
 # ---------------------------------------------------------------------------
 # Soft / hard fail classification
 # ---------------------------------------------------------------------------

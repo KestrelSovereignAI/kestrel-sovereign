@@ -364,12 +364,17 @@ class TalonCoordinatorFeature(Feature):
                 legacy = info.get("last_signaled_status")
                 if not legacy:
                     continue
-                # Map the legacy talon status onto the generic Outcome the
-                # reconciler dedups on (complete -> done; the rest -> failed).
+                # The reconciler dedups on a token of the generic Outcome
+                # PLUS the provider's native status ("<outcome>:<status>"), so
+                # finished_unknown vs failed (both FAILED) stay distinct. Seed
+                # the SAME token shape from the legacy talon status, else the
+                # first tick would see a mismatch and re-fire (complete -> done;
+                # the rest -> failed).
                 outcome = (
                     Outcome.DONE if legacy == "complete" else Outcome.FAILED
                 )
-                await store.seed_signaled("talon", str(job_id), outcome.value)
+                token = f"{outcome.value}:{legacy}"
+                await store.seed_signaled("talon", str(job_id), token)
         except Exception as e:  # never let a migration hiccup block startup
             logger.warning(
                 "TalonCoordinatorFeature: legacy signal-ledger seed failed: %s",
