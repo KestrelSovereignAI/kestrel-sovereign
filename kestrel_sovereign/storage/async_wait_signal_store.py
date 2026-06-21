@@ -155,6 +155,12 @@ class WaitSignalStore:
         ``INSERT OR IGNORE`` so it never clobbers a row the reconciler is
         already managing — re-running on every startup is a safe no-op.
         Returns True if a row was inserted, False if one already existed.
+
+        Portable across backends: the storage layer's ``sqlite_to_postgres``
+        translation (storage/db/placeholder.py) rewrites ``INSERT OR IGNORE
+        INTO`` to ``... ON CONFLICT DO NOTHING`` for Postgres, with matching
+        rowcount semantics (0 on conflict). This is the same pattern
+        ``PendingA2AQuestionStore.insert`` relies on.
         """
         rowcount = await self._db.execute(
             """
