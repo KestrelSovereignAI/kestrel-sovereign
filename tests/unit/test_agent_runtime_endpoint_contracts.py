@@ -2,7 +2,7 @@
 
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -152,6 +152,7 @@ def test_context_status_reports_whole_window_utilization_and_warning_band():
         ctx_builder.measure_context_breakdown.assert_awaited_once()
         kw = ctx_builder.measure_context_breakdown.call_args.kwargs
         assert kw["include_rag"] is False
+        assert kw["memory_retriever"] is None
     finally:
         _restore_app(app, original)
 
@@ -188,6 +189,71 @@ def test_context_status_full_query_param_runs_rag():
         assert resp.status_code == 200
         kw = ctx_builder.measure_context_breakdown.call_args.kwargs
         assert kw["include_rag"] is True
+    finally:
+        _restore_app(app, original)
+
+
+def test_context_status_full_path_wires_read_only_memory_retriever():
+    """The popup's full breakdown should count retrieved memories without
+    scheduling the production access-count rehearsal update."""
+    history = [{"role": "user", "content": "tell me about sunny weather"}]
+    agent = MagicMock()
+    agent.get_current_model = MagicMock(return_value="gpt-5")
+    agent.storage.get_conversation_history = AsyncMock(return_value=history)
+    agent.get_constitution = lambda: ""
+    agent.llm_service = None
+    agent.tool_registry = None
+
+    memory_manager = MagicMock()
+    memory_manager.retrieve_memories = AsyncMock(return_value="[Memory 1] sunny")
+    agent.context_manager = SimpleNamespace(memory_manager=memory_manager)
+
+    async def measured_with_memory(**kwargs):
+        block = await kwargs["memory_retriever"]("sunny weather", 123)
+        assert block == "[Memory 1] sunny"
+        return _breakdown_payload(
+            100,
+            2976,
+            sections_overrides={
+                "memories": {
+                    "tokens": len("<memories>\n[Memory 1] sunny\n</memories>"),
+                    "budget": 123,
+                    "count": 1,
+                    "wired": True,
+                    "excluded": False,
+                },
+            },
+        )
+
+    ctx_builder = MagicMock()
+    ctx_builder.measure_context_breakdown = AsyncMock(side_effect=measured_with_memory)
+    agent.context_builder = ctx_builder
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch(
+            "kestrel_sovereign.agent.token_counter.get_token_counter",
+            return_value=_CounterStub(context_limit=4000),
+        ):
+            with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+                with TestClient(app) as client:
+                    resp = client.get(
+                        "/api/agent/context-status?session_id=session-1&full=true",
+                        headers=_api_headers(),
+                    )
+        assert resp.status_code == 200
+        kw = ctx_builder.measure_context_breakdown.call_args.kwargs
+        assert kw["memory_retriever"] is not None
+        memory_manager.retrieve_memories.assert_awaited_once_with(
+            query="sunny weather",
+            max_tokens=123,
+            counter=ANY,
+            read_only=True,
+            min_score=0.3,
+        )
+        mem = resp.json()["breakdown"]["sections"]["memories"]
+        assert mem["wired"] is True
+        assert mem["tokens"] == len("<memories>\n[Memory 1] sunny\n</memories>")
     finally:
         _restore_app(app, original)
 

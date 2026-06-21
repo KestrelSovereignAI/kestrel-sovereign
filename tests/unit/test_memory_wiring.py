@@ -104,6 +104,36 @@ class TestRetrieveTriggersAccessUpdate:
         assert called_ids == result_ids
 
     @pytest.mark.asyncio
+    async def test_read_only_retrieve_does_not_schedule_access_updates(self):
+        """Breakdown/estimation callers need the same retrieved bytes
+        without rehearsal-effect writes."""
+        conv_store = MagicMock()
+        conv_store.agent_id = "test-agent"
+        conv_store.get_conversation_history = AsyncMock(return_value=[
+            {"id": 1, "role": "assistant", "content": "I love sunny days",
+             "metadata": {"importance": 0.8}, "created_at": "2026-04-18T10:00:00Z"},
+            {"id": 2, "role": "assistant", "content": "Rain makes me sad",
+             "metadata": {"importance": 0.7}, "created_at": "2026-04-18T11:00:00Z"},
+        ])
+
+        retriever = MemoryRetriever(conversation_store=conv_store)
+        retriever._schedule_access_update = MagicMock(
+            side_effect=AssertionError("read-only retrieval must not schedule writes")
+        )
+
+        results = await retriever.retrieve(
+            query="sunny weather",
+            agent_id="test-agent",
+            min_score=0.0,
+            limit=2,
+            read_only=True,
+        )
+
+        assert len(results) > 0, "retrieve returned no results to verify against"
+        retriever._schedule_access_update.assert_not_called()
+        assert retriever._access_update_tasks == set()
+
+    @pytest.mark.asyncio
     async def test_shutdown_cancels_pending_access_updates(self):
         """Access-count bookkeeping is owned and cancelled during shutdown."""
         conv_store = MagicMock()

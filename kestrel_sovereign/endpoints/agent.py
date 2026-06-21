@@ -914,6 +914,27 @@ async def get_context_status(
                     "turn available for query-specific retrieval"
                 )
 
+        memory_retriever = None
+        if full:
+            memory_min_score = None
+            try:
+                from kestrel_sovereign.agent.context_manager import _retrieval_config
+                memory_min_score = _retrieval_config().get("memory_min_score")
+            except Exception as e:
+                logger.debug(f"retrieval config lookup failed for breakdown: {e}")
+            context_manager = getattr(agent, "context_manager", None)
+            memory_manager = getattr(context_manager, "memory_manager", None)
+            retrieve_memories = getattr(memory_manager, "retrieve_memories", None)
+            if callable(retrieve_memories):
+                async def memory_retriever(query: str, max_tokens: int) -> Optional[str]:
+                    return await retrieve_memories(
+                        query=query,
+                        max_tokens=max_tokens,
+                        counter=counter,
+                        read_only=True,
+                        min_score=memory_min_score,
+                    )
+
         breakdown = await ctx_builder.measure_context_breakdown(
             query=rag_query,
             history=history,
@@ -923,7 +944,7 @@ async def get_context_status(
             tools=tool_schemas,
             state_of_mind=state_of_mind,
             include_rag=full,
-            memory_retriever=None,
+            memory_retriever=memory_retriever,
         )
 
         # Drop the internal artifacts blob — it's the assembled bytes,
