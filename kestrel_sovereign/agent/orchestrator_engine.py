@@ -448,7 +448,8 @@ class OrchestratorEngineMixin:
             args: Arguments to pass to the tool
             session_id: Session ID for hook context
             execute_fn: Async callable that performs the actual tool execution.
-                        Called with no arguments; should return the tool result.
+                        Called with the post-hook args; should return the tool
+                        result.
 
         Returns:
             Tool result dict, or an error dict if permission was denied.
@@ -472,11 +473,11 @@ class OrchestratorEngineMixin:
             logging.info(f"[HOOKS] Tool denied: {feature_name}.{tool_name} - {reason}")
             return {"success": False, "error": f"Permission denied: {reason}"}
 
-        # If hooks modified the input, update args (callers that need it can
-        # inspect the returned result; the execute_fn closure already captured
-        # the original args, so we pass updated_input through the result).
-        if hook_output.updated_input:
-            args = hook_output.updated_input
+        args = (
+            hook_output.updated_input
+            if hook_output.updated_input is not None
+            else hook_input.tool_input
+        )
 
         # --- Execute the tool ---
         exec_start = time.time()
@@ -484,7 +485,7 @@ class OrchestratorEngineMixin:
             "tool.name": tool_name,
             "tool.feature": feature_name,
         }) as tool_span:
-            result = await execute_fn()
+            result = await execute_fn(args)
             exec_duration_ms = int((time.time() - exec_start) * 1000)
             if tool_span:
                 tool_span.set_attribute("tool.duration_ms", exec_duration_ms)
@@ -1467,9 +1468,9 @@ class OrchestratorEngineMixin:
         if denied_tools:
             logging.info(f"[SECURITY] Stripping denied tools from {hook_feature_name}: {denied_tools}")
 
-        async def _exec_feature(f=feature, a=args, dt=denied_tools):
-            task = a.get("task", "")
-            context = a.get("context")
+        async def _exec_feature(effective_args, f=feature, dt=denied_tools):
+            task = effective_args.get("task", "")
+            context = effective_args.get("context")
             if not context and user_message:
                 context = f"User's original request: {user_message}"
             log_tag = "[STREAM] " if streaming else ""
@@ -1648,8 +1649,8 @@ class OrchestratorEngineMixin:
         tool = self._direct_tools[tool_name]
         hook_feature_name = self._security_feature_name_for_tool(tool_name)
 
-        async def _exec_direct(t=tool, a=args):
-            return await t.execute(**a)
+        async def _exec_direct(effective_args, t=tool):
+            return await t.execute(**effective_args)
 
         try:
             result = await self._execute_tool_with_hooks(
