@@ -716,3 +716,42 @@ def test_reattach_helper_against_real_repo(tmp_path):
     (tmp_path / "f.txt").write_text("2")
     git("add", "."); git("commit", "-m", "divergent")
     assert _git_reattach_if_safely_detached(tmp_path) is None
+
+
+def test_editable_git_pull_recovers_detached_head(tmp_path):
+    """`_editable_git_pull` reattaches a no-loss detached editable checkout and
+    retries the pull, so the reconcile step survives a sibling-worktree flip of
+    a feature checkout (the parametric-self case)."""
+    from kestrel_sovereign.cli_lifecycle import _editable_git_pull
+
+    origin = tmp_path / "origin.git"
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True,
+                   capture_output=True)
+
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=str(clone),
+                              capture_output=True, text=True, check=True)
+
+    subprocess.run(["git", "clone", str(origin), str(clone)], check=True,
+                   capture_output=True)
+    git("symbolic-ref", "HEAD", "refs/heads/main")
+    git("config", "user.email", "t@t"); git("config", "user.name", "t")
+    (clone / "f.txt").write_text("1")
+    git("add", "."); git("commit", "-m", "c1")
+    git("push", "-u", "origin", "main")
+    # Advance origin/main by one commit so there's something to pull after reattach.
+    git("commit", "--allow-empty", "-m", "c2")
+    git("push", "origin", "main")
+    git("reset", "--hard", "HEAD~1")  # local main behind origin/main by 1
+
+    # Flip into detached HEAD at the (no-loss) local commit.
+    git("checkout", "--detach", "HEAD")
+
+    rc, out = _editable_git_pull(clone, allow_dirty=False)
+    assert rc == 0
+    assert "reattached to 'main'" in out
+    assert git("symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
+    # And it actually fast-forwarded to origin/main (picked up c2).
+    assert git("rev-parse", "HEAD").stdout.strip() == \
+        git("rev-parse", "origin/main").stdout.strip()
