@@ -47,10 +47,17 @@ class TalonWaitable:
         feature._reload_persisted_jobs()
         info = feature._jobs.get(handle)
         if info is None:
+            # Schema-valid even for an unknown/pruned job: the reconciler
+            # routes this through the talon.job_complete source, whose schema
+            # REQUIRES job_id + status. Omitting status would make the
+            # dispatcher drop the signal as invalid, so a mode="signal" watch
+            # on a stale job id would acknowledge OK yet never wake the caller
+            # (codex Wave 2 P2). "finished_unknown" is the honest status — the
+            # job left the registry with its fate unrecorded.
             return WaitStatus(
                 Outcome.FAILED,
                 f"Unknown job_id: {handle}",
-                data={"job_id": handle},
+                data={"job_id": handle, "status": "finished_unknown"},
             )
 
         changed = feature._reap_cli_job(info)

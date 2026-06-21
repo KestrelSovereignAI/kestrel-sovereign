@@ -568,6 +568,27 @@ class TestTalonWait:
         assert set(handles) == {"running-1", "done-1", "failed-1"}
 
     @pytest.mark.asyncio
+    async def test_unknown_job_poll_is_talon_schema_valid(self):
+        """Regression (codex Wave 2 P2): a mode='signal' watch on a stale/
+        unknown job id must still produce a talon.job_complete-schema-valid
+        payload (job_id + status), else the dispatcher drops the wake and the
+        caller is never woken."""
+        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+        from kestrel_sovereign.signals.sources.talon import (
+            _schema as talon_schema,
+        )
+
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._reload_persisted_jobs = lambda: None
+        feature._jobs = {}
+        status = await TalonWaitable(feature).poll("ghost-1")
+        assert status.outcome.value == "failed"
+        # The talon.job_complete schema must accept the payload (it requires
+        # job_id + status); this would raise ValueError if status were absent.
+        talon_schema(dict(status.data))
+        assert status.data["status"] == "finished_unknown"
+
+    @pytest.mark.asyncio
     async def test_post_load_seeds_legacy_signal_ledger(self, tmp_path):
         """Regression (codex Wave 2 P2): on upgrade, jobs.json rows carrying
         legacy last_signaled_status must seed the generic ledger so the first
