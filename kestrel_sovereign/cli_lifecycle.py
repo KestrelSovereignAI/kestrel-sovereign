@@ -623,7 +623,22 @@ def _editable_git_pull(checkout: Path, allow_dirty: bool) -> Tuple[int, str]:
         if summary:
             msg += "\n" + summary
         return 2, msg
-    return _run_git_pull(checkout)
+    rc, out = _run_git_pull(checkout)
+    if rc != 0:
+        # Same sibling-worktree detached-HEAD flip that hits the main source
+        # checkout can hit an editable feature checkout too. The failed pull
+        # already fetched, so try a no-loss reattach to the default branch and
+        # retry once; a diverged HEAD is left untouched (the failure stands).
+        reattached = _git_reattach_if_safely_detached(checkout)
+        if reattached:
+            rc2, out2 = _run_git_pull(checkout)
+            if rc2 == 0:
+                return rc2, (
+                    f"detached HEAD detected — reattached to "
+                    f"'{reattached}' (no commits lost)\n" + out2
+                )
+            return rc2, out2
+    return rc, out
 
 
 def _run_feature_reconcile(
