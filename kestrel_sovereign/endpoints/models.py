@@ -281,7 +281,7 @@ _AVATAR_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
 
 @router.patch("/api/identity")
 @limiter.limit("10/minute")
-async def update_identity(request: Request, body: UpdateIdentityRequest):
+async def update_identity(request: Request, response: Response, body: UpdateIdentityRequest):
     """Update agent name and/or description."""
     try:
         agent = get_agent(request)
@@ -290,13 +290,28 @@ async def update_identity(request: Request, body: UpdateIdentityRequest):
             raise HTTPException(status_code=422, detail="At least one of 'name' or 'description' required.")
 
         updated_fields = []
+        rename_outcome = None
+        partial_update = False
 
         if body.name is not None:
             try:
-                await rename_agent_core(agent, body.name)
-                updated_fields.append("name")
+                rename_outcome = await rename_agent_core(agent, body.name)
             except ValueError as e:
                 raise HTTPException(status_code=422, detail=str(e))
+            if not rename_outcome.any_written:
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "message": "Error updating identity name.",
+                        "rename_outcome": rename_outcome.to_dict(),
+                    },
+                )
+            if rename_outcome.success:
+                updated_fields.append("name")
+            else:
+                response.status_code = 207
+                partial_update = True
+                updated_fields.append("name_partial")
 
         if body.description is not None:
             from datetime import datetime, timezone
@@ -316,18 +331,27 @@ async def update_identity(request: Request, body: UpdateIdentityRequest):
             updated_fields.append("description")
 
         # Return updated identity
-        agent_node = await agent.storage.get_node(agent.agent_id)
+        try:
+            agent_node = await agent.storage.get_node(agent.agent_id)
+        except Exception:
+            if rename_outcome and rename_outcome.any_written and not rename_outcome.success:
+                agent_node = None
+            else:
+                raise
         avatar_hash = agent_node.properties.get("avatar_hash") if agent_node else None
 
-        return {
-            "success": True,
+        payload = {
+            "success": not partial_update,
             "updated_fields": updated_fields,
             "did": agent.agent_id,
-            "name": agent_node.properties.get("name") if agent_node else None,
+            "name": agent_node.properties.get("name") if agent_node else getattr(agent, "_agent_name", None),
             "description": agent_node.properties.get("description") if agent_node else None,
             "avatar_hash": avatar_hash,
             "avatar_url": f"/api/files/{avatar_hash}" if avatar_hash else None,
         }
+        if rename_outcome is not None:
+            payload["rename_outcome"] = rename_outcome.to_dict()
+        return payload
 
     except HTTPException:
         raise

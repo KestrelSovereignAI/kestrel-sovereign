@@ -17,6 +17,8 @@ kestrel-sovereign #1042 narration-honesty contract (#1061).
 
 import logging
 import re
+from copy import copy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,7 +34,72 @@ logger = logging.getLogger(__name__)
 # Shared rename helpers (used by both !rename tool and HTTP endpoint)
 # ------------------------------------------------------------------
 
-async def rename_agent_core(agent, new_name: str) -> tuple[str, bool]:
+
+@dataclass(frozen=True)
+class RenameOutcome:
+    success: bool
+    db_row_written: bool
+    graph_updated: bool
+    memory_updated: bool
+    soul_md_updated: bool
+    error: Optional[str] = None
+
+    @property
+    def any_written(self) -> bool:
+        return any((
+            self.db_row_written,
+            self.graph_updated,
+            self.memory_updated,
+            self.soul_md_updated,
+        ))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "db_row_written": self.db_row_written,
+            "graph_updated": self.graph_updated,
+            "memory_updated": self.memory_updated,
+            "soul_md_updated": self.soul_md_updated,
+            "error": self.error,
+        }
+
+
+def _rename_confirmation(old_name: str, new_name: str, outcome: RenameOutcome) -> str:
+    result = f"Renamed from '{old_name}' to '{new_name}'."
+    if outcome.soul_md_updated:
+        result += " SOUL.md updated."
+    return result
+
+
+def _rename_partial_error(outcome: RenameOutcome) -> str:
+    caveats = []
+    if outcome.db_row_written:
+        caveats.append("metadata DB has the new name")
+    else:
+        caveats.append("metadata DB still has the old name")
+    if outcome.graph_updated:
+        caveats.append("agent graph node has the new name")
+    else:
+        caveats.append("agent graph node may still have the old name")
+    if outcome.memory_updated:
+        caveats.append("live agent memory has the new name")
+    else:
+        caveats.append("live agent memory still has the old name")
+    if outcome.soul_md_updated:
+        caveats.append("SOUL.md has the new name")
+    else:
+        caveats.append("SOUL.md was not updated")
+
+    detail = "; ".join(caveats)
+    if outcome.error:
+        detail += f"; error: {outcome.error}"
+    return (
+        f"Rename partially applied: {detail}. "
+        "Restart the agent or call !rename again after fixing the failed store."
+    )
+
+
+async def rename_agent_core(agent, new_name: str) -> RenameOutcome:
     """
     Rename an agent, updating all stores + SOUL.md.
 
@@ -41,11 +108,10 @@ async def rename_agent_core(agent, new_name: str) -> tuple[str, bool]:
         new_name: New name (1-64 characters, pre-stripped)
 
     Returns:
-        (result_message, soul_updated) tuple
+        RenameOutcome with per-store progress flags.
 
     Raises:
         ValueError: If name is invalid
-        RuntimeError: If rename fails
     """
     if not new_name or not new_name.strip():
         raise ValueError("Name cannot be empty.")
@@ -60,36 +126,94 @@ async def rename_agent_core(agent, new_name: str) -> tuple[str, bool]:
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    await agent._raw_storage.db.execute(
-        """
-        INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (agent.agent_id, "name", new_name, now),
-    )
+    db_row_written = False
+    graph_updated = False
+    memory_updated = False
+    soul_md_updated = False
+
+    try:
+        await agent._raw_storage.db.execute(
+            """
+            INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (agent.agent_id, "name", new_name, now),
+        )
+        db_row_written = True
+    except Exception as e:
+        logger.error(f"Agent rename failed before metadata write: {e}", exc_info=True)
+        return RenameOutcome(
+            success=False,
+            db_row_written=False,
+            graph_updated=False,
+            memory_updated=False,
+            soul_md_updated=False,
+            error=f"metadata DB write failed: {e}",
+        )
 
     # Update agent node properties
-    agent_node = await agent.storage.get_node(agent.agent_id)
-    if agent_node:
-        agent_node.properties["name"] = new_name
-        agent_node.label = new_name
-        await agent.storage.add_node(agent_node)
+    try:
+        agent_node = await agent.storage.get_node(agent.agent_id)
+        if agent_node:
+            updated_node = copy(agent_node)
+            updated_node.properties = dict(agent_node.properties)
+            updated_node.properties["name"] = new_name
+            updated_node.label = new_name
+            await agent.storage.add_node(updated_node)
+            graph_updated = True
+    except Exception as e:
+        logger.error(f"Agent rename failed after metadata write: {e}", exc_info=True)
+        return RenameOutcome(
+            success=False,
+            db_row_written=db_row_written,
+            graph_updated=False,
+            memory_updated=False,
+            soul_md_updated=False,
+            error=f"graph update failed: {e}",
+        )
 
     # Update in-memory reference
-    agent._agent_name = new_name
+    try:
+        agent._agent_name = new_name
 
-    # Update bootstrap service name
-    if hasattr(agent, 'bootstrap_service') and agent.bootstrap_service:
-        agent.bootstrap_service.agent_name = new_name
+        # Update bootstrap service name
+        if hasattr(agent, 'bootstrap_service') and agent.bootstrap_service:
+            agent.bootstrap_service.agent_name = new_name
+        memory_updated = True
+    except Exception as e:
+        logger.error(f"Agent rename failed after graph update: {e}", exc_info=True)
+        return RenameOutcome(
+            success=False,
+            db_row_written=db_row_written,
+            graph_updated=graph_updated,
+            memory_updated=False,
+            soul_md_updated=False,
+            error=f"in-memory update failed: {e}",
+        )
 
     # Update SOUL.md if it exists
-    soul_updated = await _update_soul_name(agent, old_name, new_name)
+    try:
+        soul_md_updated = await _update_soul_name(agent, old_name, new_name)
+    except Exception as e:
+        logger.error(f"Agent rename failed during SOUL.md update: {e}", exc_info=True)
+        return RenameOutcome(
+            success=False,
+            db_row_written=db_row_written,
+            graph_updated=graph_updated,
+            memory_updated=memory_updated,
+            soul_md_updated=False,
+            error=f"SOUL.md update failed: {e}",
+        )
 
     logger.info(f"Agent renamed: {old_name} -> {new_name}")
-    result = f"Renamed from '{old_name}' to '{new_name}'."
-    if soul_updated:
-        result += " SOUL.md updated."
-    return result, soul_updated
+    return RenameOutcome(
+        success=db_row_written and graph_updated and memory_updated,
+        db_row_written=db_row_written,
+        graph_updated=graph_updated,
+        memory_updated=memory_updated,
+        soul_md_updated=soul_md_updated,
+        error=None if graph_updated else "agent graph node not found; metadata and memory were updated",
+    )
 
 
 async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
@@ -105,34 +229,29 @@ async def _update_soul_name(agent, old_name: str, new_name: str) -> bool:
     if not soul_path.exists():
         return False
 
-    try:
-        content = soul_path.read_text(encoding="utf-8")
+    content = soul_path.read_text(encoding="utf-8")
 
-        patterns = [
-            (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
-            (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
-            (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
-            (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
-        ]
+    patterns = [
+        (rf"# SOUL\.md\s*[-—]\s*You Are {re.escape(old_name)}", f"# SOUL.md - You Are {new_name}"),
+        (rf"# SOUL\.md\s*[-—]\s*{re.escape(old_name)}", f"# SOUL.md - {new_name}"),
+        (rf"You're {re.escape(old_name)}", f"You're {new_name}"),
+        (rf"I'm {re.escape(old_name)}", f"I'm {new_name}"),
+    ]
 
-        updated = False
-        for pattern, replacement in patterns:
-            new_content, count = re.subn(pattern, replacement, content, flags=re.IGNORECASE)
-            if count > 0:
-                content = new_content
-                updated = True
+    updated = False
+    for pattern, replacement in patterns:
+        new_content, count = re.subn(pattern, replacement, content, flags=re.IGNORECASE)
+        if count > 0:
+            content = new_content
+            updated = True
 
-        if updated:
-            soul_path.write_text(content, encoding="utf-8")
-            if hasattr(agent, 'context_builder'):
-                agent.context_builder._load_soul_md()
-            return True
+    if updated:
+        soul_path.write_text(content, encoding="utf-8")
+        if hasattr(agent, 'context_builder'):
+            agent.context_builder._load_soul_md()
+        return True
 
-        return False
-
-    except Exception as e:
-        logger.warning(f"Failed to update SOUL.md name: {e}")
-        return False
+    return False
 
 
 class BootstrapFeature(Feature):
@@ -857,19 +976,34 @@ class BootstrapFeature(Feature):
             )
 
         try:
-            result, soul_updated = await rename_agent_core(self.agent, new_name)
+            old_name = getattr(self.agent, '_agent_name', 'Unknown')
+            outcome = await rename_agent_core(self.agent, new_name)
         except ValueError as e:
             return ToolResult.failed(str(e))
         except Exception as e:
             logger.error(f"Failed to rename agent: {e}")
             return ToolResult.failed(f"Failed to rename: {str(e)}")
 
+        data = {
+            "new_name": new_name.strip(),
+            "soul_updated": outcome.soul_md_updated,
+            "rename_outcome": outcome.to_dict(),
+        }
+        if not outcome.any_written:
+            return ToolResult.failed(
+                f"Failed to rename: {outcome.error or 'no rename stores were updated'}",
+                data=data,
+            )
+        if not outcome.success:
+            return ToolResult.partial(
+                confirmation=_rename_confirmation(old_name, new_name.strip(), outcome),
+                error=_rename_partial_error(outcome),
+                data=data,
+            )
+
         return ToolResult.ok(
-            confirmation=str(result),
-            data={
-                "new_name": new_name.strip(),
-                "soul_updated": soul_updated,
-            },
+            confirmation=_rename_confirmation(old_name, new_name.strip(), outcome),
+            data=data,
         )
 
     # ------------------------------------------------------------------
