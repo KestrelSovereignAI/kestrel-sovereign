@@ -112,11 +112,14 @@ async def _execute_tool_with_hooks(
         reason = hook_output.permission_reason or "Blocked by security policy"
         return {"success": False, "error": f"Permission denied: {reason}"}
 
-    if hook_output.updated_input:
-        args = hook_output.updated_input
+    args = (
+        hook_output.updated_input
+        if hook_output.updated_input is not None
+        else hook_input.tool_input
+    )
 
     exec_start = time.time()
-    result = await execute_fn()
+    result = await execute_fn(args)
     exec_duration_ms = int((time.time() - exec_start) * 1000)
 
     post_hook_input = HookInput(
@@ -149,7 +152,7 @@ class TestDenyBlocksTool:
 
         tool_executed = False
 
-        async def mock_execute():
+        async def mock_execute(effective_args):
             nonlocal tool_executed
             tool_executed = True
             return {"success": True, "data": "should not appear"}
@@ -179,7 +182,7 @@ class TestAllowPassesThrough:
             "TestFeature", "safe_tool", PermissionLevel.ALLOW
         )
 
-        async def mock_execute():
+        async def mock_execute(effective_args):
             return {"success": True, "data": "hello"}
 
         result = await _execute_tool_with_hooks(
@@ -211,7 +214,7 @@ class TestAskBlocksUntilApproved:
 
         tool_executed = False
 
-        async def mock_execute():
+        async def mock_execute(effective_args):
             nonlocal tool_executed
             tool_executed = True
             return {"success": True, "data": "approved result"}
@@ -260,7 +263,7 @@ class TestAskDenyBlocksTool:
 
         tool_executed = False
 
-        async def mock_execute():
+        async def mock_execute(effective_args):
             nonlocal tool_executed
             tool_executed = True
             return {"success": True}
@@ -304,7 +307,7 @@ class TestSessionScopePersists:
 
         call_count = 0
 
-        async def mock_execute():
+        async def mock_execute(effective_args):
             nonlocal call_count
             call_count += 1
             return {"success": True, "call": call_count}
@@ -361,7 +364,7 @@ class TestAuditLogPopulated:
             "AuditFeature", "allowed_tool", PermissionLevel.ALLOW
         )
 
-        async def mock_execute():
+        async def mock_execute(effective_args):
             return {"success": True}
 
         await _execute_tool_with_hooks(
