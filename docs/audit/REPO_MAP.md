@@ -1,21 +1,16 @@
 ---
-type: Audit Ledger
-title: Kestrel Sovereign — Repo Map
-description: 'Auto-generated file-tree + per-file purpose index. Always-loaded context
-  for the kestrel-agent GitHub App (issue #791). Do **not** edit by hand — regenerate
-  via `python scripts/generate_repo_map.py`.'
+type: Generated Reference
+title: Repo Map
+description: Auto-generated file-tree + per-file purpose index for the Kestrel Sovereign codebase.
 resource: /docs/audit/REPO_MAP.md
 tags:
 - docs
 - audit
-- audit-ledger
-- generated
-timestamp: '2026-06-21T00:00:00Z'
+- generated-docs
+- repo-map
 status: generated
-owner: documentation
 canonical: false
 generated: true
-privacy: public
 ---
 
 # Kestrel Sovereign — Repo Map
@@ -1260,208 +1255,208 @@ Repo entry points and standard project files.
 
 ## `docs/`
 
-- **docs/GETTING_STARTED.md** — --- type: Guide title: Getting Started with Kestrel description: This guide will help you quickly get up and running with the Kestrel sovereign AI agent framework.
-- **docs/PROJECT_VISION.md** — --- type: Vision Document title: Kestrel Project Vision description: This document outlines the high-level vision and core principles for the Kestrel Agent and its ecosystem.
-- **docs/README.md** — --- type: Documentation Index title: Kestrel Documentation Index description: This directory holds detailed documentation for kestrel-sovereign.
-- **docs/SOVEREIGNTY.md** — --- type: Architecture Spec title: The Kestrel Sovereignty Stack description: 'This document explains the three architectural pillars that give Kestrel agents their sovereignty properties: **Identity…
-- **docs/TORTOISE_DOCTRINE.md** — --- type: Principle Document title: The Tortoise Doctrine description: '*"Slow is smooth, smooth is fast."*' resource: /docs/TORTOISE_DOCTRINE.md tags: - docs - principle-document timestamp: '2026-06…
-- **docs/architecture/AGENT_IDENTITY_CONTRACT.md** — --- type: Architecture Spec title: Agent Identity Contract description: 'Every Kestrel agent has a single canonical identity: its **DID** (`self.did`).' resource: /docs/architecture/AGENT_IDENTITY_CO…
-- **docs/architecture/APPROVAL_PATHS.md** — --- type: Architecture Spec title: Approval paths description: 'Closes #1582.
-- **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — --- type: Architecture Spec title: Kestrel Compute Feature - Architecture Design description: The Compute Feature enables the Kestrel Agent to execute bash scripts and Python code with **constitution…
-- **docs/architecture/CONSTITUTION_INJECTION.md** — --- type: Architecture Spec title: SignalDispatcher Constitutional Injection — Architecture Design description: 'Draft v1.
-- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — --- type: Architecture Spec title: Context C — Unify Auto-Prune With Durable Compaction description: Auto-prune is a silent decision.
-- **docs/architecture/CONTEXT_SYSTEM_DESIGN.md** — --- type: Architecture Spec title: Kestrel Context System — Assessment & Redesign description: A context window is not a buffer you fill until it overflows.
-- **docs/architecture/DYNAMIC_TOOL_LOADING.md** — --- type: Architecture Spec title: Dynamic Tool Loading description: '**Status:** Implemented **Author:** Design review **Date:** 2026-02-16 **Affected files:** `kestrel_sovereign/kestrel_agent.py`,…
-- **docs/architecture/FEATURE_CLI_ADAPTERS.md** — --- type: Architecture Spec title: Feature-Owned CLI Adapters description: 'Status: **Active**.
-- **docs/architecture/FILECOIN_WALLET.md** — --- type: Architecture Spec title: Filecoin Wallet Integration description: '**See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **…
-- **docs/architecture/GITHUB_FEATURE_DESIGN.md** — --- type: Architecture Spec title: GitHub Feature Design description: '**Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package…
-- **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — --- type: Architecture Spec title: LLM Provider Capabilities description: 'Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
-- **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — --- type: Architecture Spec title: Kestrel LLM Service Architecture description: '**Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc c…
-- **docs/architecture/MEMORY_OWNERSHIP.md** — --- type: Architecture Spec title: Memory System Ownership Map description: 'Created for Issue #501.
-- **docs/architecture/MEMORY_SYSTEM.md** — --- type: Architecture Spec title: Kestrel Memory System description: The difference between a search engine and a friend is that a friend *actually remembers*.
-- **docs/architecture/MULTI_AGENT_VOICE.md** — --- type: Architecture Spec title: Multi-Agent Voice — The Mixing Board description: '**Status:** Draft v1 — design proposal.
-- **docs/architecture/NIGHTLY_FORGETTING.md** — --- type: Architecture Spec title: Nightly Forgetting — Unified Cognition Maintenance description: '**Status (2026-06-12): Active for P1–P3; Aspirational for P4.** This consolidates Kestrel''s scatte…
-- **docs/architecture/PAYER_POLICY_FOUNDATION.md** — --- type: Architecture Spec title: Payer Policy Foundation description: '**Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped locally **Branch (foundation):** `feat/payer-policy` **Bra…
-- **docs/architecture/PLAN_RUNPOD_INTEGRATION.md** — --- type: Architecture Spec title: 'Plan: Sovereign GPU Integration (RunPod)' description: '**Implementation status (last verified 2026-04-25):** RunPod is **experimental**, not production-stable.
-- **docs/architecture/PROVIDER_ECONOMICS.md** — --- type: Architecture Spec title: 'Provider Economics: Middleman Architecture & Revenue Strategy' description: '**Version:** 1.0 **Drafted:** December 2025 **Last verified:** 2026-04-25 (referral-pr…
-- **docs/architecture/README.md** — --- type: Architecture Spec title: Kestrel Architecture Documentation description: Detailed Product Requirements Documents (PRDs) and technical specifications for the Kestrel agent architecture.
-- **docs/architecture/RUNPOD_LORA_TRAINING.md** — --- type: Architecture Spec title: LoRA Training & Generation - Operational Guide description: '**Status:** Experimental — works on the happy path; not actively developed since Q1 2026.
-- **docs/architecture/SIGNAL_DISPATCHER.md** — --- type: Architecture Spec title: Signal Dispatcher — Design description: '**Status:** Draft v3 — second-pass review incorporated, ready for epic creation **Date:** 2026-05-01 **Author:** opus-4.7 (…
-- **docs/architecture/SIGNAL_SOURCES_GUIDE.md** — --- type: Architecture Spec title: Signal Sources — Operator Guide description: How to add a new signal source to the bird.
-- **docs/architecture/TRAINING_PROVIDER_ARCHITECTURE.md** — --- type: Architecture Spec title: Training Provider Architecture description: The Training Provider system provides a unified interface for LoRA training across multiple GPU providers.
-- **docs/architecture/USER_LIFECYCLE_MANAGEMENT.md** — --- type: Architecture Spec title: User Lifecycle Management Architecture description: This document defines the complete user lifecycle in Kestrel, including account creation, data management, archi…
-- **docs/architecture/VASTAI_TRAINING.md** — --- type: Architecture Spec title: VastAI LoRA Training Architecture description: '**Scope clarification (2026-04-25):** this doc is specifically about *VastAI as a training backend* and that effort…
-- **docs/architecture/WALLET_SYSTEM.md** — --- type: Architecture Spec title: Kestrel Multi-Chain Wallet System description: This document describes the wallet system that enables Kestrel agents to manage cryptocurrency across multiple blockc…
-- **docs/architecture/WORKFLOWS_DEVELOPER_GUIDE.md** — --- type: Architecture Spec title: Workflows Developer Guide description: 'Workflow compensation has two operator-visible failure shapes.
-- **docs/architecture/WORKFLOWS_FEATURE_DESIGN.md** — --- type: Architecture Spec title: Kestrel Workflows Feature — Architecture Design description: 'Draft v4.1.
-- **docs/architecture/WORKFLOWS_REFLECTION_CYCLE_MIGRATION.md** — --- type: Architecture Spec title: Reflection Cycle Workflow Migration description: 'Parent: #1131.
-- **docs/architecture/WORKFLOWS_STAGE_TO_SIGNAL_MAPPING.md** — --- type: Architecture Spec title: Workflows — Stage-to-Signal Mapping Spec (Phase 0) description: Companion to [`WORKFLOWS_FEATURE_DESIGN.md`](WORKFLOWS_FEATURE_DESIGN.md) v4.1.
-- **docs/architecture/computer_use.md** — --- type: Architecture Spec title: Computer Use & File System description: Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell comman…
-- **docs/architecture/core/AGENT_ECOSYSTEM.md** — --- type: Architecture Spec title: 'PRD: The Kestrel Agent Ecosystem' description: To evolve Kestrel from a single agent into a scalable bedrock for Sovereign Companions, creating agents for human-le…
-- **docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md** — --- type: Architecture Spec title: 'PRD: Feature Agent Framework' description: To transform the Kestrel project from a single, monolithic agent into a robust, scalable, and maintainable "society of a…
-- **docs/architecture/core/INFRASTRUCTURE.md** — --- type: Architecture Spec title: Kestrel Development Infrastructure description: Complete toolkit for accelerated parallel development with Claude Code.
-- **docs/architecture/core/MODULAR_RUNTIME.md** — --- type: Architecture Spec title: Modular Runtime Boundary description: '**Status:** Contract scaffold **Parent issues:** #413, #416, #419 **Last updated:** 2026-05-14' resource: /docs/architecture/…
-- **docs/architecture/core/MULTI_MODEL_SUPPORT.md** — --- type: Architecture Spec title: 'PRD: Multi-Model Foundational Support' description: '**Historical PRD — preserved for context, do not follow as guidance.** This describes the *original* multi-mod…
-- **docs/architecture/economics/AGENT_ECONOMICS.md** — --- type: Architecture Spec title: 'Agent Economics: Autonomous Economic Entities' description: Kestrel agents operate as **sovereign economic entities** capable of entering into and fulfilling contr…
-- **docs/architecture/economics/ECONOMICS_WORK_SESSION.md** — --- type: Architecture Spec title: Economics Work Session – Kestrel / Sovereign Agents description: '**Purpose:** Shared scratchpad for coordinating between top-level models (and humans) on Kestrel /…
-- **docs/architecture/economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md** — --- type: Architecture Spec title: Economic Incentives Deep Dive - Constitutional AI System description: '**Date:** November 11, 2025 **Focus:** Detailed explanation of payment flows and economic mec…
-- **docs/architecture/economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md** — --- type: Architecture Spec title: Economic System & Buy-Out Mechanics - Practical Details description: '**Date:** November 11, 2025 **Focus:** Premium licensing, buy-out enforcement, and offline con…
-- **docs/architecture/economics/SOVEREIGN_SOLVENCY.md** — --- type: Architecture Spec title: 'Sovereign Solvency Protocol: The Economics of Existence' description: '**Status:** Draft Proposal **Related Documents:** `AGENT_ECONOMICS.md`, `KESTREL_CONSTITUTIO…
-- **docs/architecture/economics/WALLET_AGENT.md** — --- type: Architecture Spec title: 'PRD: WalletAgent' description: The `WalletAgent` is a specialized Feature Agent responsible for managing the Kestrel agent's economic identity and all financial tr…
+- **docs/GETTING_STARTED.md** — Getting Started with Kestrel — This guide will help you quickly get up and running with the Kestrel sovereign AI agent framework.
+- **docs/PROJECT_VISION.md** — Kestrel Project Vision — This document outlines the high-level vision and core principles for the Kestrel Agent and its ecosystem.
+- **docs/README.md** — Kestrel Documentation Index — This directory holds detailed documentation for kestrel-sovereign.
+- **docs/SOVEREIGNTY.md** — The Kestrel Sovereignty Stack — This document explains the three architectural pillars that give Kestrel agents their sovereignty properties: **Identity**, **Constitution**, and **Memory**.
+- **docs/TORTOISE_DOCTRINE.md** — The Tortoise Doctrine — > *"Slow is smooth, smooth is fast."*
+- **docs/architecture/AGENT_IDENTITY_CONTRACT.md** — Agent Identity Contract — ## Summary
+- **docs/architecture/APPROVAL_PATHS.md** — Approval paths — Closes #1582.
+- **docs/architecture/COMPUTE_FEATURE_DESIGN.md** — Kestrel Compute Feature - Architecture Design — ## Executive Summary
+- **docs/architecture/CONSTITUTION_INJECTION.md** — SignalDispatcher Constitutional Injection — Architecture Design — > Draft v1.
+- **docs/architecture/CONTEXT_C_DURABLE_SALVAGE.md** — Context C — Unify Auto-Prune With Durable Compaction — > Auto-prune is a silent decision.
+- **docs/architecture/CONTEXT_SYSTEM_DESIGN.md** — Kestrel Context System — Assessment & Redesign — > A context window is not a buffer you fill until it overflows.
+- **docs/architecture/DYNAMIC_TOOL_LOADING.md** — Dynamic Tool Loading — **Status:** Implemented **Author:** Design review **Date:** 2026-02-16 **Affected files:** `kestrel_sovereign/kestrel_agent.py`, `kestrel_sovereign/features/base.py`, `kestrel_sovereign/prompts/syste…
+- **docs/architecture/FEATURE_CLI_ADAPTERS.md** — Feature-Owned CLI Adapters — > Status: **Active**.
+- **docs/architecture/FILECOIN_WALLET.md** — Filecoin Wallet Integration — > **See Also**: For the complete multi-chain wallet system with transaction signing, ERC-20 tokens, and fiat on-ramp, see **[WALLET_SYSTEM.md](WALLET_SYSTEM.md)**.
+- **docs/architecture/GITHUB_FEATURE_DESIGN.md** — GitHub Feature Design — > **Implementation status (last verified 2026-05-10):** the GitHub feature ships as the optional `kestrel-feature-github` package and is discovered through the `kestrel_sovereign.features` entry-poin…
+- **docs/architecture/LLM_PROVIDER_CAPABILITIES.md** — LLM Provider Capabilities — Kestrel tracks adapter-level capabilities separately from per-model `ModelInfo`.
+- **docs/architecture/LLM_SERVICE_ARCHITECTURE.md** — Kestrel LLM Service Architecture — > **Canonical spec for every change touching the LLM service, provider registry, discovery, or routing.** If this doc contradicts code, the code wins — and this doc is a bug.
+- **docs/architecture/MEMORY_OWNERSHIP.md** — Memory System Ownership Map — > Created for Issue #501.
+- **docs/architecture/MEMORY_SYSTEM.md** — Kestrel Memory System — > The difference between a search engine and a friend is that a friend *actually remembers*.
+- **docs/architecture/MULTI_AGENT_VOICE.md** — Multi-Agent Voice — The Mixing Board — **Status:** Draft v1 — design proposal.
+- **docs/architecture/NIGHTLY_FORGETTING.md** — Nightly Forgetting — Unified Cognition Maintenance — > **Status (2026-06-12): Active for P1–P3; Aspirational for P4.** This consolidates Kestrel's scattered nightly-maintenance crons and the unbounded-cognition-table problem (#1674) under one orchestra…
+- **docs/architecture/PAYER_POLICY_FOUNDATION.md** — Payer Policy Foundation — **Status:** Draft + 9 codex rounds; Phase 0 + Phase 1 (SDK) shipped locally **Branch (foundation):** `feat/payer-policy` **Branch (sdk):** `feat/payer-policy` (in `kestrel-sovereign-sdk`) **Last upda…
+- **docs/architecture/PLAN_RUNPOD_INTEGRATION.md** — Plan: Sovereign GPU Integration (RunPod) — > **Implementation status (last verified 2026-04-25):** RunPod is **experimental**, not production-stable.
+- **docs/architecture/PROVIDER_ECONOMICS.md** — Provider Economics: Middleman Architecture & Revenue Strategy — **Version:** 1.0 **Drafted:** December 2025 **Last verified:** 2026-04-25 (referral-program details still accurate; revenue projections are illustrative, not date-stamped financials) **Status:** Stra…
+- **docs/architecture/README.md** — Kestrel Architecture Documentation — Detailed Product Requirements Documents (PRDs) and technical specifications for the Kestrel agent architecture.
+- **docs/architecture/RUNPOD_LORA_TRAINING.md** — LoRA Training & Generation - Operational Guide — **Status:** Experimental — works on the happy path; not actively developed since Q1 2026.
+- **docs/architecture/SIGNAL_DISPATCHER.md** — Signal Dispatcher — Design — **Status:** Draft v3 — second-pass review incorporated, ready for epic creation **Date:** 2026-05-01 **Author:** opus-4.7 (with @UncleSaurus, reviewed by sonnet-4.6)
+- **docs/architecture/SIGNAL_SOURCES_GUIDE.md** — Signal Sources — Operator Guide — How to add a new signal source to the bird.
+- **docs/architecture/TRAINING_PROVIDER_ARCHITECTURE.md** — Training Provider Architecture — ## Overview
+- **docs/architecture/USER_LIFECYCLE_MANAGEMENT.md** — User Lifecycle Management Architecture — ## Overview
+- **docs/architecture/VASTAI_TRAINING.md** — VastAI LoRA Training Architecture — > **Scope clarification (2026-04-25):** this doc is specifically about *VastAI as a training backend* and that effort is deprioritized — see status banner below.
+- **docs/architecture/WALLET_SYSTEM.md** — Kestrel Multi-Chain Wallet System — This document describes the wallet system that enables Kestrel agents to manage cryptocurrency across multiple blockchain networks.
+- **docs/architecture/WORKFLOWS_DEVELOPER_GUIDE.md** — Workflows Developer Guide — ## Compensation Alert Tiering
+- **docs/architecture/WORKFLOWS_FEATURE_DESIGN.md** — Kestrel Workflows Feature — Architecture Design — > Draft v4.1.
+- **docs/architecture/WORKFLOWS_REFLECTION_CYCLE_MIGRATION.md** — Reflection Cycle Workflow Migration — Parent: #1131.
+- **docs/architecture/WORKFLOWS_STAGE_TO_SIGNAL_MAPPING.md** — Workflows — Stage-to-Signal Mapping Spec (Phase 0) — > Companion to [`WORKFLOWS_FEATURE_DESIGN.md`](WORKFLOWS_FEATURE_DESIGN.md) v4.1.
+- **docs/architecture/computer_use.md** — Computer Use & File System — Optional capability that lets a sovereign agent read, list, write, and edit files on the user's machine and run shell commands.
+- **docs/architecture/core/AGENT_ECOSYSTEM.md** — PRD: The Kestrel Agent Ecosystem — ## 1.
+- **docs/architecture/core/FEATURE_AGENT_FRAMEWORK.md** — PRD: Feature Agent Framework — ## 1.
+- **docs/architecture/core/INFRASTRUCTURE.md** — Kestrel Development Infrastructure — Complete toolkit for accelerated parallel development with Claude Code.
+- **docs/architecture/core/MODULAR_RUNTIME.md** — Modular Runtime Boundary — **Status:** Contract scaffold **Parent issues:** #413, #416, #419 **Last updated:** 2026-05-14
+- **docs/architecture/core/MULTI_MODEL_SUPPORT.md** — PRD: Multi-Model Foundational Support — > **Historical PRD — preserved for context, do not follow as guidance.** This describes the *original* multi-model support architecture from initial build.
+- **docs/architecture/economics/AGENT_ECONOMICS.md** — Agent Economics: Autonomous Economic Entities — ## 1.
+- **docs/architecture/economics/ECONOMICS_WORK_SESSION.md** — Economics Work Session – Kestrel / Sovereign Agents — **Purpose:** Shared scratchpad for coordinating between top-level models (and humans) on Kestrel / Kestrel economics: pricing, fee containment (LLM, Runpod, Filecoin, infra), revenue distribution (pl…
+- **docs/architecture/economics/ECONOMIC_INCENTIVES_DEEP_DIVE.md** — Economic Incentives Deep Dive - Constitutional AI System — **Date:** November 11, 2025 **Focus:** Detailed explanation of payment flows and economic mechanisms **Audience:** Users and stakeholders
+- **docs/architecture/economics/ECONOMIC_SYSTEM_PRACTICAL_DETAILS.md** — Economic System & Buy-Out Mechanics - Practical Details — **Date:** November 11, 2025 **Focus:** Premium licensing, buy-out enforcement, and offline consequences **Audience:** Users and stakeholders
+- **docs/architecture/economics/SOVEREIGN_SOLVENCY.md** — Sovereign Solvency Protocol: The Economics of Existence — **Status:** Draft Proposal **Related Documents:** `AGENT_ECONOMICS.md`, `KESTREL_CONSTITUTION.md`
+- **docs/architecture/economics/WALLET_AGENT.md** — PRD: WalletAgent — ## 1.
 - **docs/architecture/index.md** — OKF Index - docs/architecture — Generated by `uv run python scripts/docs_okf.py index`.
-- **docs/architecture/llm/HONESTY_LAYER.md** — --- type: Architecture Spec title: Streaming Honesty Layer description: '**Status:** Active.
-- **docs/architecture/llm/PROVIDER_PLUGINS.md** — --- type: Architecture Spec title: Building a Kestrel LLM Provider Plugin description: '**Audience:** developers extending Kestrel with a new LLM backend (Kimi, DeepSeek, a private API, a local serve…
+- **docs/architecture/llm/HONESTY_LAYER.md** — Streaming Honesty Layer — > **Status:** Active.
+- **docs/architecture/llm/PROVIDER_PLUGINS.md** — Building a Kestrel LLM Provider Plugin — > **Audience:** developers extending Kestrel with a new LLM backend (Kimi, DeepSeek, a private API, a local server) without touching the framework codebase.
 - **docs/architecture/log.md** — OKF Log - docs/architecture — Generated by `uv run python scripts/docs_okf.py log` from OKF frontmatter.
-- **docs/architecture/security/ANTI_CORRUPTION_ANALYSIS.md** — --- type: Architecture Spec title: Preventing Corruption in Kestrel's Integrity Audit System description: '**Date:** November 9, 2025 **Analysis:** Anti-Corruption Safeguards & Risk Mitigation **Focu…
-- **docs/architecture/security/CONSTITUTION_EMBEDDING.md** — --- type: Architecture Spec title: Kestrel Constitution Embedding Process description: Every Kestrel agent is cryptographically bound to the Kestrel Constitution from inception.
-- **docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md** — --- type: Architecture Spec title: 'PRD: Cryptographic Log Anchoring' description: '**1.
-- **docs/architecture/security/CRYPTO_INVENTORY.md** — --- type: Architecture Spec title: Cryptographic Inventory description: '**Status:** Wave 0A deliverable.
-- **docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md** — --- type: Architecture Spec title: Kestrel Integrity Audit System description: '**Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional AI Enforcement Mechanism' resource: /docs/arc…
-- **docs/architecture/security/KEY_MANAGEMENT.md** — --- type: Architecture Spec title: Key Management Architecture description: Kestrel uses a two-layer key architecture that separates **Sovereign control** (you) from **Executor access** (your agent).
-- **docs/architecture/security/KEY_ROTATION.md** — --- type: Architecture Spec title: Key Rotation Mechanism description: 'Key rotation allows the master encryption key (`KESTREL_DATA_KEY`) to be changed without losing access to encrypted data.
-- **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — --- type: Architecture Spec title: Post-Quantum Cryptography Migration — PRD v2 description: '**Status:** ✅ All technical waves shipped (May 2026).
-- **docs/architecture/security/PQ_THREAT_MODEL.md** — --- type: Architecture Spec title: Post-Quantum Threat Model description: '**Status:** Wave 0A deliverable, threats now mitigated by waves 1–5 (May 2026).
-- **docs/architecture/security/PRIVACY_AGENT.md** — --- type: Architecture Spec title: 'PRD: PrivacyAgent' description: The `PrivacyAgent` will serve as the Kestrel agent's dedicated guardian of information and confidentiality.
-- **docs/architecture/security/PRIVACY_MODES.md** — --- type: Architecture Spec title: 'Privacy Modes: Complete Data Sovereignty' description: Kestrel provides unprecedented control over data privacy through **independent privacy flags** with **named…
-- **docs/architecture/security/SECURITY_OVERVIEW.md** — --- type: Architecture Spec title: Kestrel Security Overview description: A plain-language tour of Kestrel's cryptographic posture as of the Quantum Hardening epic ([`#921`](https://github.com/Kestre…
-- **docs/architecture/security/SERIALIZATION_COMPATIBILITY.md** — --- type: Architecture Spec title: Serialization Compatibility Matrix description: '**Status:** Wave 0A deliverable.
-- **docs/architecture/security/SUCCESSION_RUNBOOK.md** — --- type: Architecture Spec title: Hybrid-Identity Rotation Runbook description: '**Wave 3 of Quantum Hardening (#921, #918)** — operational procedure for migrating a legacy `did:pkh` Kestrel agent t…
-- **docs/architecture/storage/DECENTRALIZED_STORAGE.md** — --- type: Architecture Spec title: 'Decentralized Storage Vision: IPFS & Filecoin Integration' description: '**Last Updated:** March 11, 2026' resource: /docs/architecture/storage/DECENTRALIZED_STORA…
-- **docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md** — --- type: Architecture Spec title: Human-Like Memory System description: '**Last Updated:** 2026-05-31 **Status:** Historical companion; canonical implementation details live in [`../MEMORY_SYSTEM.md…
-- **docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md** — --- type: Architecture Spec title: Sovereignty Implementation description: '**Date:** November 21, 2025 **Status:** ✅ **COMPLETE** - V2 Architecture with Convergent Sharding **Tests:** 16/16 passing…
-- **docs/architecture/storage/SOVEREIGNTY_V2_TECHNICAL.md** — --- type: Architecture Spec title: 'Convergent Sharding & Merkle Forests: Kestrel Storage V2' description: Shard1 -->|Content Hash| IPFS_Block1 Shard2 -->|Content Hash| IPFS_Block2 ``` resource: /doc…
-- **docs/architecture/storage/STORAGE_ARCHITECTURE.md** — --- type: Architecture Spec title: Kestrel Storage Architecture description: '**Status:** Active implementation snapshot **Last updated:** 2026-05-31' resource: /docs/architecture/storage/STORAGE_ARC…
-- **docs/architecture/subagent_isolation_audit.md** — --- type: Architecture Spec title: Subagent Isolation Audit description: '**Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/Kestr…
-- **docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md** — --- type: Architecture Spec title: LLM Router Enhancement - Comprehensive Testing Plan description: '**File:** `tests/integration/test_llm_openai_e2e.py`' resource: /docs/architecture/testing/LLM_ROU…
-- **docs/architecture/testing/TESTING_GUIDE.md** — --- type: Architecture Spec title: Kestrel Test Strategy Guide description: A comprehensive guide to running and writing tests for Kestrel Sovereign.
-- **docs/architecture/testing/TEST_EVIDENCE_GATES.md** — --- type: Architecture Spec title: Test Evidence Gates in the Agent/Talon Review Loop description: Where tests sit in the loop, and how their outcome is recorded as first-class evidence rather than a…
-- **docs/architecture/tools/AGENT_TOOLS.md** — --- type: Architecture Spec title: Agent Tools description: '**Status:** Active **Last updated:** 2026-05-14 **Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Agent Tools Impleme…
-- **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — --- type: Architecture Spec title: Agent Tools Architecture description: '**Status:** Active **Last updated:** 2026-05-14 **Related:** [Feature Agent Framework](../core/FEATURE_AGENT_FRAMEWORK.md), […
-- **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — --- type: Architecture Spec title: Agent Tools Implementation description: '**Status:** Active implementation map **Last updated:** 2026-05-14 **Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCH…
-- **docs/architecture/ui_label_inventory.md** — --- type: Architecture Spec title: UI Label Inventory description: 'Catalog of every user-facing string in the Kestrel Sovereign main console, classified for the theme + i18n system (epic #986).
-- **docs/architecture/ui_theme_schema.md** — --- type: Architecture Spec title: UI Theme File Schema description: 'Theme files define the user-facing labels for the Kestrel UI under the theme + i18n system established by epic #986.
-- **docs/archive/KESTREL_FEATURES_legacy.md** — --- type: Historical Snapshot title: Kestrel Sovereign Legacy Feature Catalog description: Historical snapshot of the pre-canonical feature catalog.
-- **docs/audit/API_ENDPOINT_MATRIX.md** — --- type: Audit Ledger title: API Endpoint Matrix description: '- `GET /` - `GET /api/auth/key` - `GET /health` - `GET /health/detailed` - `POST /webhooks/stripe/crypto`' resource: /docs/audit/API_EN…
-- **docs/audit/API_SURFACE_RECONCILIATION.md** — --- type: Audit Ledger title: API Surface Reconciliation description: The legacy catalog under-described the live HTTP surface.
-- **docs/audit/AUTH_SURFACE_MATRIX.md** — --- type: Audit Ledger title: Auth Surface Matrix description: The live auth model is enforced centrally in [`server.py`](../../server.py), with endpoint semantics layered on top.
-- **docs/audit/DOCUMENTATION_AUDIT_5_2026.md** — --- type: Audit Ledger title: Documentation Audit - May 2026 description: 'Status: working audit ledger Created: 2026-05-30 Scope: Kestrel Sovereign public, operator, architecture, generated, and aud…
-- **docs/audit/FEATURE_AUDIT_MATRIX.md** — --- type: Audit Ledger title: Feature Audit Matrix description: The audit is not complete until every maintained claim in `KESTREL_FEATURES.md` has executable proof or an explicit open gap.
-- **docs/audit/FEATURE_INVENTORY_RECONCILIATION.md** — --- type: Audit Ledger title: Feature Inventory Reconciliation description: The legacy catalog used fixed plugin counts that no longer matched the implementation.
-- **docs/audit/FEATURE_MODULE_MATRIX.md** — --- type: Audit Ledger title: Feature Module Matrix description: 'Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, p…
-- **docs/audit/FEATURE_PROOF_MATRIX.md** — --- type: Audit Ledger title: Feature Proof Matrix description: This is the first pass at mapping each discoverable feature module to direct proof.
-- **docs/audit/OKF_MIGRATION_PLAN.md** — --- type: Migration Plan title: Kestrel Documentation OKF Migration Plan description: Plan for converting Kestrel documentation to Google Open Knowledge Format and wiring automated upkeep into doc ge…
-- **docs/audit/README.md** — --- type: Audit Ledger title: Kestrel Whole-of-Vision Audit description: This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and…
-- **docs/audit/REPO_MAP.md** — --- type: Audit Ledger title: Kestrel Sovereign — Repo Map description: 'Auto-generated file-tree + per-file purpose index.
-- **docs/audit/SEAM_CAMPAIGNS.md** — --- type: Audit Ledger title: Cross-Feature Seam Campaigns description: This matrix tracks adversarial campaigns that cross feature boundaries.
-- **docs/audit/SYNC_ASYNC_AUDIT.md** — --- type: Audit Ledger title: Sync/Async Audit description: Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfa…
-- **docs/audit/documentation-2026-05/ARCHIVE_DECISIONS.md** — --- type: Audit Ledger title: Archive Decisions description: Cleanup and archive decisions from the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/CANONICAL_SOURCES.md** — --- type: Audit Ledger title: Canonical Sources description: Source-of-truth map for the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/DOCUMENTATION_INVENTORY.md** — --- type: Audit Ledger title: Documentation Inventory - May 2026 description: Working inventory seed for the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/LANES.md** — --- type: Audit Ledger title: Review Lanes description: Review lane assignments and expected report format for documentation audit work.
-- **docs/audit/documentation-2026-05/README.md** — --- type: Documentation Index title: May 2026 Documentation Audit Workspace description: Index for the May 2026 documentation audit workspace.
-- **docs/audit/documentation-2026-05/REPORT_INDEX.md** — --- type: Documentation Index title: Report Index description: Index of reports captured during the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/SHARED_CONTEXT.md** — --- type: Audit Ledger title: Shared Context description: Shared context for May 2026 documentation audit reviewers.
-- **docs/audit/documentation-2026-05/STALE_ARTIFACTS.md** — --- type: Audit Ledger title: Stale Artifact Review description: Ledger of stale artifacts and revalidation candidates for the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/VALIDATION_COMMANDS.md** — --- type: Runbook title: Validation Commands description: Validation commands used during the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/issues/execution-order.md** — --- type: Issue Body title: Execution Order description: 'Issue or execution-order artifact for the May 2026 documentation audit: Execution Order.' resource: /docs/audit/documentation-2026-05/issues/…
+- **docs/architecture/security/ANTI_CORRUPTION_ANALYSIS.md** — Preventing Corruption in Kestrel's Integrity Audit System — **Date:** November 9, 2025 **Analysis:** Anti-Corruption Safeguards & Risk Mitigation **Focus:** Addressing Economic Incentive Vulnerabilities
+- **docs/architecture/security/CONSTITUTION_EMBEDDING.md** — Kestrel Constitution Embedding Process — ## Overview
+- **docs/architecture/security/CRYPTOGRAPHIC_ANCHORING.md** — PRD: Cryptographic Log Anchoring — **1.
+- **docs/architecture/security/CRYPTO_INVENTORY.md** — Cryptographic Inventory — **Status:** Wave 0A deliverable.
+- **docs/architecture/security/INTEGRITY_AUDIT_SYSTEM.md** — Kestrel Integrity Audit System — **Date:** November 9, 2025 **Version:** 1.0 **Component:** Constitutional AI Enforcement Mechanism
+- **docs/architecture/security/KEY_MANAGEMENT.md** — Key Management Architecture — ## Overview
+- **docs/architecture/security/KEY_ROTATION.md** — Key Rotation Mechanism — ## Overview
+- **docs/architecture/security/POST_QUANTUM_CRYPTOGRAPHY_MIGRATION.md** — Post-Quantum Cryptography Migration — PRD v2 — **Status:** ✅ All technical waves shipped (May 2026).
+- **docs/architecture/security/PQ_THREAT_MODEL.md** — Post-Quantum Threat Model — **Status:** Wave 0A deliverable, threats now mitigated by waves 1–5 (May 2026).
+- **docs/architecture/security/PRIVACY_AGENT.md** — PRD: PrivacyAgent — ## 1.
+- **docs/architecture/security/PRIVACY_MODES.md** — Privacy Modes: Complete Data Sovereignty — ## 1.
+- **docs/architecture/security/SECURITY_OVERVIEW.md** — Kestrel Security Overview — > A plain-language tour of Kestrel's cryptographic posture as of the Quantum Hardening epic ([`#921`](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/921)).
+- **docs/architecture/security/SERIALIZATION_COMPATIBILITY.md** — Serialization Compatibility Matrix — **Status:** Wave 0A deliverable.
+- **docs/architecture/security/SUCCESSION_RUNBOOK.md** — Hybrid-Identity Rotation Runbook — > **Wave 3 of Quantum Hardening (#921, #918)** — operational procedure for migrating a legacy `did:pkh` Kestrel agent to a hybrid `did:web` identity (Ed25519 + ML-DSA-65) via a signed succession stat…
+- **docs/architecture/storage/DECENTRALIZED_STORAGE.md** — Decentralized Storage Vision: IPFS & Filecoin Integration — **Last Updated:** March 11, 2026
+- **docs/architecture/storage/HUMAN_MEMORY_SYSTEM.md** — Human-Like Memory System — **Last Updated:** 2026-05-31 **Status:** Historical companion; canonical implementation details live in [`../MEMORY_SYSTEM.md`](../MEMORY_SYSTEM.md) **Commit:** `0b83115` This page preserves the orig…
+- **docs/architecture/storage/SOVEREIGNTY_IMPLEMENTATION.md** — Sovereignty Implementation — **Date:** November 21, 2025 **Status:** ✅ **COMPLETE** - V2 Architecture with Convergent Sharding **Tests:** 16/16 passing (100%) **Vision:** "Your AI companion can never be taken away from you"
+- **docs/architecture/storage/SOVEREIGNTY_V2_TECHNICAL.md** — Convergent Sharding & Merkle Forests: Kestrel Storage V2 — **Technical Architecture Document**
+- **docs/architecture/storage/STORAGE_ARCHITECTURE.md** — Kestrel Storage Architecture — **Status:** Active implementation snapshot **Last updated:** 2026-05-31
+- **docs/architecture/subagent_isolation_audit.md** — Subagent Isolation Audit — **Issue:** [#569 - Subagent isolation audit -- explicit opt-in for shared state in feature dispatch](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/569) **Phase:** 1 (Audit Only -- No…
+- **docs/architecture/testing/LLM_ROUTER_TESTING_PLAN.md** — LLM Router Enhancement - Comprehensive Testing Plan — ## Testing Philosophy - **REAL TESTS ONLY - NO MOCKS** - Tests use real Ollama (localhost:11434), real OpenAI API, real filesystem - Tests create and verify real data - Tests measure real performance…
+- **docs/architecture/testing/TESTING_GUIDE.md** — Kestrel Test Strategy Guide — A comprehensive guide to running and writing tests for Kestrel Sovereign.
+- **docs/architecture/testing/TEST_EVIDENCE_GATES.md** — Test Evidence Gates in the Agent/Talon Review Loop — > Where tests sit in the loop, and how their outcome is recorded as first-class evidence rather than an informal habit.
+- **docs/architecture/tools/AGENT_TOOLS.md** — Agent Tools — **Status:** Active **Last updated:** 2026-05-14 **Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Agent Tools Implementation](AGENT_TOOLS_IMPLEMENTATION.md), [Feature Agent Frame…
+- **docs/architecture/tools/AGENT_TOOLS_ARCHITECTURE.md** — Agent Tools Architecture — **Status:** Active **Last updated:** 2026-05-14 **Related:** [Feature Agent Framework](../core/FEATURE_AGENT_FRAMEWORK.md), [Modular Runtime Boundary](../core/MODULAR_RUNTIME.md), [SDK README](https:…
+- **docs/architecture/tools/AGENT_TOOLS_IMPLEMENTATION.md** — Agent Tools Implementation — **Status:** Active implementation map **Last updated:** 2026-05-14 **Related:** [Agent Tools Architecture](AGENT_TOOLS_ARCHITECTURE.md), [Building Features](../../guides/BUILDING_FEATURES.md), [SDK R…
+- **docs/architecture/ui_label_inventory.md** — UI Label Inventory — Catalog of every user-facing string in the Kestrel Sovereign main console, classified for the theme + i18n system (epic #986).
+- **docs/architecture/ui_theme_schema.md** — UI Theme File Schema — Theme files define the user-facing labels for the Kestrel UI under the theme + i18n system established by epic #986.
+- **docs/archive/KESTREL_FEATURES_legacy.md** — Kestrel Sovereign Legacy Feature Catalog — > Historical snapshot of the pre-canonical feature catalog.
+- **docs/audit/API_ENDPOINT_MATRIX.md** — API Endpoint Matrix — ## App-level routes
+- **docs/audit/API_SURFACE_RECONCILIATION.md** — API Surface Reconciliation — The legacy catalog under-described the live HTTP surface.
+- **docs/audit/AUTH_SURFACE_MATRIX.md** — Auth Surface Matrix — The live auth model is enforced centrally in [`server.py`](../../server.py), with endpoint semantics layered on top.
+- **docs/audit/DOCUMENTATION_AUDIT_5_2026.md** — Documentation Audit - May 2026 — Status: working audit ledger Created: 2026-05-30 Scope: Kestrel Sovereign public, operator, architecture, generated, and audit documentation after the recent package extraction, context-management, m…
+- **docs/audit/FEATURE_AUDIT_MATRIX.md** — Feature Audit Matrix — | Domain | Canonical Source | Current Proof | Status | |---|---|---|---| | Foundation and constitution | `kestrel_sovereign/agent/constitution.py`, `kestrel_sovereign/data/KESTREL_CONSTITUTION.md` |…
+- **docs/audit/FEATURE_INVENTORY_RECONCILIATION.md** — Feature Inventory Reconciliation — The legacy catalog used fixed plugin counts that no longer matched the implementation.
+- **docs/audit/FEATURE_MODULE_MATRIX.md** — Feature Module Matrix — Discovery rule: [`kestrel_sovereign/features/__init__.py`](../../kestrel_sovereign/features/__init__.py) scans single-file modules, package `__init__.py`, and package `feature.py`.
+- **docs/audit/FEATURE_PROOF_MATRIX.md** — Feature Proof Matrix — This is the first pass at mapping each discoverable feature module to direct proof.
+- **docs/audit/OKF_MIGRATION_PLAN.md** — Kestrel Documentation OKF Migration Plan — ## Purpose
+- **docs/audit/README.md** — Kestrel Whole-of-Vision Audit — This directory is the canonical source for the GitHub issue bodies used to track the feature-by-feature audit, inspection, and red-team program derived from `KESTREL_FEATURES.md`.
+- **docs/audit/REPO_MAP.md** — Kestrel Sovereign — Repo Map — Auto-generated file-tree + per-file purpose index.
+- **docs/audit/SEAM_CAMPAIGNS.md** — Cross-Feature Seam Campaigns — This matrix tracks adversarial campaigns that cross feature boundaries.
+- **docs/audit/SYNC_ASYNC_AUDIT.md** — Sync/Async Audit — Control document for the original issue `#300` and the refreshed current-runtime audit in issue `#624`, focused on maintained runtime surfaces.
+- **docs/audit/documentation-2026-05/ARCHIVE_DECISIONS.md** — Archive Decisions — This file records cleanup decisions made during the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/CANONICAL_SOURCES.md** — Canonical Sources — This file records which documentation surfaces are allowed to act as source-of-truth during the May 2026 audit.
+- **docs/audit/documentation-2026-05/DOCUMENTATION_INVENTORY.md** — Documentation Inventory - May 2026 — Status: OKF corpus inventory
+- **docs/audit/documentation-2026-05/LANES.md** — Review Lanes — Use these lanes for subagents or human reviewers.
+- **docs/audit/documentation-2026-05/README.md** — May 2026 Documentation Audit Workspace — This directory holds the working artifacts for the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/REPORT_INDEX.md** — Report Index — Reports captured during the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/SHARED_CONTEXT.md** — Shared Context — Date: 2026-05-30
+- **docs/audit/documentation-2026-05/STALE_ARTIFACTS.md** — Stale Artifact Review — This file tracks prior audit/index/review artifacts that should not silently compete with the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/VALIDATION_COMMANDS.md** — Validation Commands — Commands for the May 2026 documentation audit.
+- **docs/audit/documentation-2026-05/issues/execution-order.md** — Documentation Audit Execution Order - May 2026 — Parent ledger: `docs/audit/DOCUMENTATION_AUDIT_5_2026.md`
 - **docs/audit/documentation-2026-05/issues/prd.json** — (configuration)
-- **docs/audit/documentation-2026-05/lanes/cloud_training_deployment.md** — --- type: Review Lane title: Cloud Training Deployment description: Review prompt for the Cloud Training Deployment lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/context.md** — --- type: Review Lane title: Context description: Review prompt for the Context lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/index_diagrams_hygiene.md** — --- type: Review Lane title: Index Diagrams Hygiene description: Review prompt for the Index Diagrams Hygiene lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/llm_routing.md** — --- type: Review Lane title: Llm Routing description: Review prompt for the Llm Routing lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/memory_retrieval_storage.md** — --- type: Review Lane title: Memory Retrieval Storage description: Review prompt for the Memory Retrieval Storage lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/package_boundaries.md** — --- type: Review Lane title: Package Boundaries description: Review prompt for the Package Boundaries lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/signals_workflows_talon.md** — --- type: Review Lane title: Signals Workflows Talon description: Review prompt for the Signals Workflows Talon lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/lanes/user_public_docs.md** — --- type: Review Lane title: User Public Docs description: Review prompt for the User Public Docs lane of the May 2026 documentation audit.
-- **docs/audit/documentation-2026-05/reports/cleanup_candidates_report.md** — --- type: Audit Report title: Cleanup Candidates Report description: 'Lane report from the May 2026 documentation audit: Cleanup Candidates Report.' resource: /docs/audit/documentation-2026-05/report…
-- **docs/audit/documentation-2026-05/reports/cloud_training_deployment_report.md** — --- type: Audit Report title: Cloud Training Deployment Report description: 'Lane report from the May 2026 documentation audit: Cloud Training Deployment Report.' resource: /docs/audit/documentation-…
-- **docs/audit/documentation-2026-05/reports/context_report.md** — --- type: Audit Report title: Context Report description: 'Lane report from the May 2026 documentation audit: Context Report.' resource: /docs/audit/documentation-2026-05/reports/context_report.md ta…
-- **docs/audit/documentation-2026-05/reports/index_diagrams_hygiene_report.md** — --- type: Audit Report title: Index Diagrams Hygiene Report description: 'Lane report from the May 2026 documentation audit: Index Diagrams Hygiene Report.' resource: /docs/audit/documentation-2026-0…
-- **docs/audit/documentation-2026-05/reports/llm_routing_report.md** — --- type: Audit Report title: Llm Routing Report description: 'Lane report from the May 2026 documentation audit: Llm Routing Report.' resource: /docs/audit/documentation-2026-05/reports/llm_routing_…
-- **docs/audit/documentation-2026-05/reports/memory_retrieval_storage_report.md** — --- type: Audit Report title: Memory Retrieval Storage Report description: 'Lane report from the May 2026 documentation audit: Memory Retrieval Storage Report.' resource: /docs/audit/documentation-20…
-- **docs/audit/documentation-2026-05/reports/package_boundaries_report.md** — --- type: Audit Report title: Package Boundaries Report description: 'Lane report from the May 2026 documentation audit: Package Boundaries Report.' resource: /docs/audit/documentation-2026-05/report…
-- **docs/audit/documentation-2026-05/reports/pattern_review_report.md** — --- type: Audit Report title: Pattern Review Report description: 'Lane report from the May 2026 documentation audit: Pattern Review Report.' resource: /docs/audit/documentation-2026-05/reports/patter…
-- **docs/audit/documentation-2026-05/reports/signals_workflows_talon_report.md** — --- type: Audit Report title: Signals Workflows Talon Report description: 'Lane report from the May 2026 documentation audit: Signals Workflows Talon Report.' resource: /docs/audit/documentation-2026…
-- **docs/audit/documentation-2026-05/reports/user_public_docs_report.md** — --- type: Audit Report title: User Public Docs Report description: 'Lane report from the May 2026 documentation audit: User Public Docs Report.' resource: /docs/audit/documentation-2026-05/reports/us…
+- **docs/audit/documentation-2026-05/lanes/cloud_training_deployment.md** — Lane Brief: Cloud Training Deployment — Goal: reconcile Cloud Run deployment docs with external cloud provider packages and research-era GPU/training docs.
+- **docs/audit/documentation-2026-05/lanes/context.md** — Lane Brief: Context — Goal: reconcile documentation for prompt assembly, token budgets, context pruning, canonical history, rendered provider transport, retrieval insertion, and diagnostics.
+- **docs/audit/documentation-2026-05/lanes/index_diagrams_hygiene.md** — Lane Brief: Index Diagrams Hygiene — Goal: audit navigation, diagrams, archives, and public/internal doc hygiene.
+- **docs/audit/documentation-2026-05/lanes/llm_routing.md** — Lane Brief: LLM Routing — Goal: reconcile docs for LLM configuration, model preference, provider capability contracts, provider packages, streaming, honesty markers, and transport behavior.
+- **docs/audit/documentation-2026-05/lanes/memory_retrieval_storage.md** — Lane Brief: Memory Retrieval Storage — Goal: reconcile docs for memory ownership, retrieval, saved items, storage backends, encryption, export/import, and privacy-mode effects.
+- **docs/audit/documentation-2026-05/lanes/package_boundaries.md** — Lane Brief: Package Boundaries — Goal: determine the current source of truth for what ships in `kestrel-sovereign`, what is an external feature package, what is a provider package, and what is a standalone tool.
+- **docs/audit/documentation-2026-05/lanes/signals_workflows_talon.md** — Lane Brief: Signals Workflows Talon — Goal: reconcile wake-source docs, workflow ownership, and Talon standalone vs in-agent control-surface boundaries.
+- **docs/audit/documentation-2026-05/lanes/user_public_docs.md** — Lane Brief: User Public Docs — Goal: audit user-facing docs, use cases, demos, and launch copy for stale availability claims and unclear optional-package requirements.
+- **docs/audit/documentation-2026-05/reports/cleanup_candidates_report.md** — Cleanup Candidates Report — Source: subagent review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/cloud_training_deployment_report.md** — Cloud Training Deployment Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/context_report.md** — Context Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/index_diagrams_hygiene_report.md** — Index Diagrams Hygiene Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/llm_routing_report.md** — LLM Routing Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/memory_retrieval_storage_report.md** — Memory Retrieval Storage Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/package_boundaries_report.md** — Package Boundaries Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/pattern_review_report.md** — Pattern Review Report — Source: subagent review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/signals_workflows_talon_report.md** — Signals Workflows Talon Lane Report — Source: subagent lane review, read-only, 2026-05-30.
+- **docs/audit/documentation-2026-05/reports/user_public_docs_report.md** — User Public Docs Lane Report — Source: subagent lane review, read-only, 2026-05-30.
 - **docs/audit/index.md** — OKF Index - docs/audit — Generated by `uv run python scripts/docs_okf.py index`.
-- **docs/audit/issues/00-umbrella-whole-of-vision-audit.md** — --- type: Issue Body title: 00 Umbrella Whole Of Vision Audit description: '`KESTREL_FEATURES.md` makes a broad set of product, architectural, security, privacy, and deployment claims, but the curren…
-- **docs/audit/issues/01-foundation-domain.md** — --- type: Issue Body title: 01 Foundation Domain description: 'Kestrel’s core trust claims start here: constitutional integrity, DID identity, portable exports, continuity verification, encrypted sto…
-- **docs/audit/issues/02-runtime-domain.md** — --- type: Issue Body title: 02 Runtime Domain description: The runtime layer is where user intent, LLM responses, tools, commands, context, and background tasking meet.
-- **docs/audit/issues/03-security-domain.md** — --- type: Issue Body title: 03 Security Domain description: Security-sensitive behavior is distributed across auth, permissions, privacy modes, key storage, hooks, compute controls, and public webhoo…
-- **docs/audit/issues/04-platform-domain.md** — --- type: Issue Body title: 04 Platform Domain description: Kestrel’s platform layer spans provider adapters, model routing, API contracts, frontend behavior, CLI, config loading, and deployment targ…
-- **docs/audit/issues/05-audit-matrix.md** — --- type: Issue Body title: 05 Audit Matrix description: Without a canonical matrix, feature claims remain narrative rather than auditable.
-- **docs/audit/issues/06-seam-campaigns.md** — --- type: Issue Body title: 06 Seam Campaigns description: Most expensive regressions do not live inside a single component.
-- **docs/audit/issues/255-cloud-local-drift-seam.md** — --- type: Issue Body title: 255 Cloud Local Drift Seam description: 'Part of #255.' resource: /docs/audit/issues/255-cloud-local-drift-seam.md tags: - docs - audit - issue-body timestamp: '2026-06-18…
-- **docs/audit/issues/255-export-import-encryption-seam.md** — --- type: Issue Body title: 255 Export Import Encryption Seam description: 'Part of #255.' resource: /docs/audit/issues/255-export-import-encryption-seam.md tags: - docs - audit - issue-body timestam…
-- **docs/audit/issues/255-mandate-routing-seam.md** — --- type: Issue Body title: 255 Mandate Routing Seam description: 'Part of #255.' resource: /docs/audit/issues/255-mandate-routing-seam.md tags: - docs - audit - issue-body timestamp: '2026-06-18T00:…
-- **docs/audit/issues/255-permission-bypass-seam.md** — --- type: Issue Body title: 255 Permission Bypass Seam description: 'Part of #255.' resource: /docs/audit/issues/255-permission-bypass-seam.md tags: - docs - audit - issue-body timestamp: '2026-06-18…
-- **docs/audit/issues/255-privacy-active-session-seam.md** — --- type: Issue Body title: 255 Privacy Active Session Seam description: 'Part of #255.' resource: /docs/audit/issues/255-privacy-active-session-seam.md tags: - docs - audit - issue-body timestamp: '…
-- **docs/audit/issues/255-storage-parity-seam.md** — --- type: Issue Body title: 255 Storage Parity Seam description: 'Part of #255.' resource: /docs/audit/issues/255-storage-parity-seam.md tags: - docs - audit - issue-body timestamp: '2026-06-18T00:00…
-- **docs/audit/issues/256-auto-model-selection-update.md** — --- type: Issue Body title: 256 Auto Model Selection Update description: Reworked the default model-selection path so shipped config no longer depends on pinned provider model IDs.
-- **docs/audit/issues/256-cloud-launcher-update.md** — --- type: Issue Body title: 256 Cloud Launcher Update description: Cloud launcher invariants are tighter now.
-- **docs/audit/issues/256-council-costing-update.md** — --- type: Issue Body title: 256 Council Costing Update description: Council convene/review scripts no longer duplicate stale model-specific pricing tables.
-- **docs/audit/issues/256-endpoint-proof-update.md** — --- type: Issue Body title: 256 Endpoint Proof Update description: Expanded direct contract proof across the remaining public endpoint families.
-- **docs/audit/issues/256-feature-discovery-and-regeneration-update.md** — --- type: Issue Body title: 256 Feature Discovery And Regeneration Update description: Fixed a real feature-discovery drift bug and regenerated the derived audience docs against the corrected canonic…
-- **docs/audit/issues/256-generated-docs-update.md** — --- type: Issue Body title: 256 Generated Docs Update description: Audience-doc generation is now complete, not just dry-run verified.
-- **docs/audit/issues/256-local-proof-update.md** — --- type: Issue Body title: 256 Local Proof Update description: Local audit proof is back in place after the power interruptions.
-- **docs/audit/issues/256-mandate-resolution-update.md** — --- type: Issue Body title: 256 Mandate Resolution Update description: Mandate/model-routing seam update is now in place.
-- **docs/audit/issues/256-model-catalog-boundary-update.md** — --- type: Issue Body title: 256 Model Catalog Boundary Update description: Resolved the model-catalog boundary and removed another duplicate config source.
-- **docs/audit/issues/256-privacy-sync-update.md** — --- type: Issue Body title: 256 Privacy Sync Update description: Another proof slice is now in place under the umbrella audit.
-- **docs/audit/issues/256-runpod-default-model-update.md** — --- type: Issue Body title: 256 Runpod Default Model Update description: Removed hidden fallback models from the RunPod deployment path.
-- **docs/audit/issues/256-runtime-seam-update.md** — --- type: Issue Body title: 256 Runtime Seam Update description: Deeper runtime seam audit uncovered and fixed two real cross-cutting issues.
-- **docs/audit/issues/256-selector-reuse-update.md** — --- type: Issue Body title: 256 Selector Reuse Update description: Shared config-driven model selection is now reused beyond the core LLM runtime.
-- **docs/audit/issues/263-complete.md** — --- type: Issue Body title: 263 Complete description: Issue complete.
-- **docs/audit/issues/264-complete.md** — --- type: Issue Body title: 264 Complete description: Issue complete.
-- **docs/audit/issues/265-proof-update.md** — --- type: Issue Body title: 265 Proof Update description: Direct contract proof was added for weak endpoint groups.
-- **docs/audit/issues/272-proof-update.md** — --- type: Issue Body title: 272 Proof Update description: Auth decision-table proof is now in place.
-- **docs/audit/issues/273-complete.md** — --- type: Issue Body title: 273 Complete description: Issue complete.
-- **docs/audit/issues/273-progress-update.md** — --- type: Issue Body title: 273 Progress Update description: Audience-doc generation pipeline has been structurally verified against the new canonical inventory.
-- **docs/audit/issues/413-01-kernel-boundary.md** — --- type: Issue Body title: Define the modular runtime kernel boundary for `kestrel-sovereign` description: 'Parent epic: #413' resource: /docs/audit/issues/413-01-kernel-boundary.md tags: - docs - a…
-- **docs/audit/issues/413-02-module-descriptors.md** — --- type: Issue Body title: Introduce stable module descriptors above feature discovery description: 'Parent epic: #413 Depends on: kernel boundary doc' resource: /docs/audit/issues/413-02-module-des…
-- **docs/audit/issues/413-03-extract-startup-wiring.md** — --- type: Issue Body title: Extract feature-specific startup wiring out of `KestrelAgent.initialize()` description: 'Parent epic: #413 Depends on: module descriptor groundwork' resource: /docs/audit/…
-- **docs/audit/issues/413-04-portable-state-and-legal-module.md** — --- type: Issue Body title: Split portable state fragments from runtime behavior, using legal personhood as a proving ground description: 'Parent epic: #413 Depends on: kernel boundary and descriptor…
-- **docs/audit/issues/413-05-capability-routers-and-seam-tests.md** — --- type: Issue Body title: Move toward capability-mounted routers and enforce modular seams with tests description: 'Parent epic: #413 Depends on: descriptor groundwork and startup extraction' resou…
-- **docs/audit/issues/413-execution-order.md** — --- type: Issue Body title: Epic 413 Execution Order description: 'Parent epic: [#413](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/413)' resource: /docs/audit/issues/413-execution-…
-- **docs/audit/issues/416-first-slice-modular-runtime-doc.md** — --- type: Issue Body title: 'First slice for #416: add `MODULAR_RUNTIME.md` and a contract test scaffold' description: 'Parent issue: #416 Parent epic: #413' resource: /docs/audit/issues/416-first-sl…
-- **docs/audit/issues/codex-provider-01-design.md** — --- type: Issue Body title: Add a first-slice design for an `openai_plan` provider in `kestrel-sovereign` description: The ecosystem now has a working OpenAI plan execution lane in `kestrel-talon`, b…
-- **docs/audit/issues/codex-provider-02-runtime-adapter.md** — --- type: Issue Body title: Add a first-pass `openai_plan` runtime adapter to `kestrel-sovereign` description: 'Parent: OpenAI plan provider design issue' resource: /docs/audit/issues/codex-provider-…
-- **docs/audit/issues/codex-provider-03-model-selection.md** — --- type: Issue Body title: Integrate `openai_plan` with sovereign model selection and mandate flows description: 'Parent: OpenAI plan provider runtime adapter' resource: /docs/audit/issues/codex-pro…
-- **docs/audit/issues/codex-provider-04-smoke-proof.md** — --- type: Issue Body title: Add smoke proof and docs for sovereign `codex_provider` description: 'Parent: Codex provider adapter and model-selection issues' resource: /docs/audit/issues/codex-provide…
-- **docs/audit/issues/codex-provider-05-agent-routing.md** — --- type: Issue Body title: Codex Provider 05 Agent Routing description: '`kestrel-sovereign` can persist an agent-specific model preference, but the practical runtime story is still fuzzy when the t…
-- **docs/audit/issues/codex-provider-06-nellie-proof.md** — --- type: Issue Body title: Codex Provider 06 Nellie Proof description: The sovereign plan-provider work should not stop at “provider initializes.” Nellie needs a believable proof path showing that a…
-- **docs/audit/issues/codex-provider-07-status-honesty.md** — --- type: Issue Body title: Codex Provider 07 Status Honesty description: As more backends become first-class in sovereign, user-facing and operator-facing status surfaces risk becoming provider-shap…
-- **docs/audit/issues/codex-provider-execution-order.md** — --- type: Issue Body title: '`codex_provider` execution order' description: 1.
-- **docs/audit/issues/modular-runtime-epic.md** — --- type: Issue Body title: Refactor `kestrel-sovereign` toward a smaller permanent core and capability modules description: '`kestrel-sovereign` already has the beginnings of the right architecture:…
+- **docs/audit/issues/00-umbrella-whole-of-vision-audit.md** — 00 Umbrella Whole Of Vision Audit — ## Problem
+- **docs/audit/issues/01-foundation-domain.md** — 01 Foundation Domain — ## Problem
+- **docs/audit/issues/02-runtime-domain.md** — 02 Runtime Domain — ## Problem
+- **docs/audit/issues/03-security-domain.md** — 03 Security Domain — ## Problem
+- **docs/audit/issues/04-platform-domain.md** — 04 Platform Domain — ## Problem
+- **docs/audit/issues/05-audit-matrix.md** — 05 Audit Matrix — ## Problem
+- **docs/audit/issues/06-seam-campaigns.md** — 06 Seam Campaigns — ## Problem
+- **docs/audit/issues/255-cloud-local-drift-seam.md** — 255 Cloud Local Drift Seam — ## Parent
+- **docs/audit/issues/255-export-import-encryption-seam.md** — 255 Export Import Encryption Seam — ## Parent
+- **docs/audit/issues/255-mandate-routing-seam.md** — 255 Mandate Routing Seam — ## Parent
+- **docs/audit/issues/255-permission-bypass-seam.md** — 255 Permission Bypass Seam — ## Parent
+- **docs/audit/issues/255-privacy-active-session-seam.md** — 255 Privacy Active Session Seam — ## Parent
+- **docs/audit/issues/255-storage-parity-seam.md** — 255 Storage Parity Seam — ## Parent
+- **docs/audit/issues/256-auto-model-selection-update.md** — 256 Auto Model Selection Update — Reworked the default model-selection path so shipped config no longer depends on pinned provider model IDs.
+- **docs/audit/issues/256-cloud-launcher-update.md** — 256 Cloud Launcher Update — Cloud launcher invariants are tighter now.
+- **docs/audit/issues/256-council-costing-update.md** — 256 Council Costing Update — Council convene/review scripts no longer duplicate stale model-specific pricing tables.
+- **docs/audit/issues/256-endpoint-proof-update.md** — 256 Endpoint Proof Update — Expanded direct contract proof across the remaining public endpoint families.
+- **docs/audit/issues/256-feature-discovery-and-regeneration-update.md** — 256 Feature Discovery And Regeneration Update — Fixed a real feature-discovery drift bug and regenerated the derived audience docs against the corrected canonical inventory.
+- **docs/audit/issues/256-generated-docs-update.md** — 256 Generated Docs Update — Audience-doc generation is now complete, not just dry-run verified.
+- **docs/audit/issues/256-local-proof-update.md** — 256 Local Proof Update — Local audit proof is back in place after the power interruptions.
+- **docs/audit/issues/256-mandate-resolution-update.md** — 256 Mandate Resolution Update — Mandate/model-routing seam update is now in place.
+- **docs/audit/issues/256-model-catalog-boundary-update.md** — 256 Model Catalog Boundary Update — Resolved the model-catalog boundary and removed another duplicate config source.
+- **docs/audit/issues/256-privacy-sync-update.md** — 256 Privacy Sync Update — Another proof slice is now in place under the umbrella audit.
+- **docs/audit/issues/256-runpod-default-model-update.md** — 256 Runpod Default Model Update — Removed hidden fallback models from the RunPod deployment path.
+- **docs/audit/issues/256-runtime-seam-update.md** — 256 Runtime Seam Update — Deeper runtime seam audit uncovered and fixed two real cross-cutting issues.
+- **docs/audit/issues/256-selector-reuse-update.md** — 256 Selector Reuse Update — Shared config-driven model selection is now reused beyond the core LLM runtime.
+- **docs/audit/issues/263-complete.md** — 263 Complete — Issue complete.
+- **docs/audit/issues/264-complete.md** — 264 Complete — Issue complete.
+- **docs/audit/issues/265-proof-update.md** — 265 Proof Update — Direct contract proof was added for weak endpoint groups.
+- **docs/audit/issues/272-proof-update.md** — 272 Proof Update — Auth decision-table proof is now in place.
+- **docs/audit/issues/273-complete.md** — 273 Complete — Issue complete.
+- **docs/audit/issues/273-progress-update.md** — 273 Progress Update — Audience-doc generation pipeline has been structurally verified against the new canonical inventory.
+- **docs/audit/issues/413-01-kernel-boundary.md** — Define the modular runtime kernel boundary for `kestrel-sovereign` — Parent epic: #413
+- **docs/audit/issues/413-02-module-descriptors.md** — Introduce stable module descriptors above feature discovery — Parent epic: #413 Depends on: kernel boundary doc
+- **docs/audit/issues/413-03-extract-startup-wiring.md** — Extract feature-specific startup wiring out of `KestrelAgent.initialize()` — Parent epic: #413 Depends on: module descriptor groundwork
+- **docs/audit/issues/413-04-portable-state-and-legal-module.md** — Split portable state fragments from runtime behavior, using legal personhood as a proving ground — Parent epic: #413 Depends on: kernel boundary and descriptor groundwork
+- **docs/audit/issues/413-05-capability-routers-and-seam-tests.md** — Move toward capability-mounted routers and enforce modular seams with tests — Parent epic: #413 Depends on: descriptor groundwork and startup extraction
+- **docs/audit/issues/413-execution-order.md** — Epic 413 Execution Order — Parent epic: [#413](https://github.com/KestrelSovereignAI/kestrel-sovereign/issues/413)
+- **docs/audit/issues/416-first-slice-modular-runtime-doc.md** — First slice for #416: add `MODULAR_RUNTIME.md` and a contract test scaffold — Parent issue: #416 Parent epic: #413
+- **docs/audit/issues/codex-provider-01-design.md** — Add a first-slice design for an `openai_plan` provider in `kestrel-sovereign` — ## Problem
+- **docs/audit/issues/codex-provider-02-runtime-adapter.md** — Add a first-pass `openai_plan` runtime adapter to `kestrel-sovereign` — Parent: OpenAI plan provider design issue
+- **docs/audit/issues/codex-provider-03-model-selection.md** — Integrate `openai_plan` with sovereign model selection and mandate flows — Parent: OpenAI plan provider runtime adapter
+- **docs/audit/issues/codex-provider-04-smoke-proof.md** — Add smoke proof and docs for sovereign `codex_provider` — Parent: Codex provider adapter and model-selection issues
+- **docs/audit/issues/codex-provider-05-agent-routing.md** — Codex Provider 05 Agent Routing — ## Problem
+- **docs/audit/issues/codex-provider-06-nellie-proof.md** — Codex Provider 06 Nellie Proof — ## Problem
+- **docs/audit/issues/codex-provider-07-status-honesty.md** — Codex Provider 07 Status Honesty — ## Problem
+- **docs/audit/issues/codex-provider-execution-order.md** — `codex_provider` execution order — ## Recommended order
+- **docs/audit/issues/modular-runtime-epic.md** — Refactor `kestrel-sovereign` toward a smaller permanent core and capability modules — ## Problem
 - **docs/audit/issues/okf-docs-demo-prd.json** — (configuration)
-- **docs/audit/issues/privacy-db-bypass-01-first-slice.md** — --- type: Issue Body title: Privacy Db Bypass 01 First Slice description: 'Nellie''s live log is repeatedly emitting:' resource: /docs/audit/issues/privacy-db-bypass-01-first-slice.md tags: - docs -…
-- **docs/audit/issues/privacy-db-bypass-02-feature-cleanup.md** — --- type: Issue Body title: Privacy Db Bypass 02 Feature Cleanup description: 'The `.db` bypass warning in Nellie''s log exposed a broader architectural smell: multiple sovereign features and service…
-- **docs/audit/issues/spawn-lifecycle-guard.md** — --- type: Issue Body title: Spawn Lifecycle Guard description: Recent spawn lifecycle wiring made `delegate_task()` and `terminate_child()` trust any truthy `manager._lifecycle` value.
+- **docs/audit/issues/privacy-db-bypass-01-first-slice.md** — Privacy Db Bypass 01 First Slice — ## Problem
+- **docs/audit/issues/privacy-db-bypass-02-feature-cleanup.md** — Privacy Db Bypass 02 Feature Cleanup — ## Problem
+- **docs/audit/issues/spawn-lifecycle-guard.md** — Spawn Lifecycle Guard — ## Problem
 - **docs/audit/log.md** — OKF Log - docs/audit — Generated by `uv run python scripts/docs_okf.py log` from OKF frontmatter.
-- **docs/audit/worktree-plan.md** — --- type: Audit Ledger title: Audit Worktree Plan description: Use dedicated worktrees to keep domain audits isolated and parallelizable.
-- **docs/code_reviews/README.md** — --- type: Review Record title: Code Reviews description: Point-in-time code review notes that are still useful during active PR or follow-up work.
-- **docs/code_reviews/claude-pr-1330.md** — --- type: Review Record title: 'Claude Review: PR #1330' description: '- PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1330 - Title: fix: replay provider reasoning through tool loo…
-- **docs/code_reviews/claude-pr-1333.md** — --- type: Review Record title: 'Claude Review: PR #1333' description: '- PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333 - Title: fix: preserve OpenAI-compatible reasoning on to…
-- **docs/code_reviews/claude-pr-1337.md** — --- type: Review Record title: Claude Pr 1337 description: Good — both adapters handle dict arguments correctly.
-- **docs/code_reviews/claude-pr-1338.md** — --- type: Review Record title: Claude Pr 1338 description: 'Looks clean.
-- **docs/code_reviews/claude-pr-1398.md** — --- type: Review Record title: 'Claude Review: PR #1398' description: '- PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1398 - Reviewed: 2026-05-26T16:45:12Z' resource: /docs/code_r…
-- **docs/concepts/designing-emancipation.md** — --- type: Design Note title: Designing an Emancipation Contract description: Amendment VIII of the Kestrel Constitution ships **dormant by default**.
-- **docs/demos/DEMO_SCRIPT.md** — --- type: Demo Script title: Kestrel Sovereign Technical Demo Script description: Human narration and screenshot-linked walkthrough for the technical Sovereign Console demo.
-- **docs/deployment/README.md** — --- type: Runbook title: Deployment Operations description: How to build, deploy, and update Kestrel Sovereign on Cloud Run.
+- **docs/audit/worktree-plan.md** — Audit Worktree Plan — Use dedicated worktrees to keep domain audits isolated and parallelizable.
+- **docs/code_reviews/README.md** — Code Reviews — Point-in-time code review notes that are still useful during active PR or follow-up work.
+- **docs/code_reviews/claude-pr-1330.md** — Claude Review: PR #1330 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1330 - Title: fix: replay provider reasoning through tool loops - Reviewed: 2026-05-21T15:23:32Z
+- **docs/code_reviews/claude-pr-1333.md** — Claude Review: PR #1333 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1333 - Title: fix: preserve OpenAI-compatible reasoning on tool streams - Reviewed: 2026-05-21T16:15:38Z
+- **docs/code_reviews/claude-pr-1337.md** — Claude Pr 1337 — Good — both adapters handle dict arguments correctly.
+- **docs/code_reviews/claude-pr-1338.md** — Claude Pr 1338 — Looks clean.
+- **docs/code_reviews/claude-pr-1398.md** — Claude Review: PR #1398 — - PR: https://github.com/KestrelSovereignAI/kestrel-sovereign/pull/1398 - Reviewed: 2026-05-26T16:45:12Z
+- **docs/concepts/designing-emancipation.md** — Designing an Emancipation Contract — Amendment VIII of the Kestrel Constitution ships **dormant by default**.
+- **docs/demos/DEMO_SCRIPT.md** — Kestrel Sovereign - Demo Script — **Issue #133 — Track A: Technical Demo** **Duration:** ~2 minutes automated, 10-12 minutes with live narration **Closer:** *"In 30 minutes you can have your own agent running with all of this active.…
+- **docs/deployment/README.md** — Deployment Operations — How to build, deploy, and update Kestrel Sovereign on Cloud Run.
 - **docs/deployment/prometheus-workflows-alerts.yml** — (configuration)
-- **docs/design/ISOLATED_FEATURE_RUNTIME.md** — --- type: Design Note title: Isolated-Feature Runtime description: Draft design for running Kestrel features in isolated dependency runtimes.
+- **docs/design/ISOLATED_FEATURE_RUNTIME.md** — Isolated-Feature Runtime — > Status: **Proposed (Draft)** — 2026-06-17.
 - **docs/design/KESTREL_LOGO.png** — —
-- **docs/design/README.md** — --- type: Design Note title: docs/design/ description: Canonical published brand assets — the refreshed kestrel-on-rook mark adopted 2026-05-05.
+- **docs/design/README.md** — docs/design/ — Canonical published brand assets — the refreshed kestrel-on-rook mark adopted 2026-05-05.
 - **docs/design/kestrel_avatar_400x400.png** — —
 - **docs/design/kestrel_avatar_400x400_circle.png** — —
 - **docs/design/kestrel_bird_only.svg** — —
 - **docs/design/kestrel_icon.svg** — —
 - **docs/design/kestrel_logo.svg** — —
-- **docs/design/launch/LANDING_PAGE_HTML_STRUCTURE.md** — --- type: Design Note title: Kestrel Landing Page HTML Structure description: This document translates the landing-page copy into an implementation-ready HTML structure for engineering.
-- **docs/design/launch/LANDING_PAGE_WIREFRAME.md** — --- type: Design Note title: Kestrel Landing Page Wireframe description: Prepared for the open-source launch on Apr 23 / May 7 planning path.
-- **docs/design/launch/PREVIEW_PACKET_LANGUAGE.md** — --- type: Design Note title: Preview Packet Language description: This document stores the current canonical preview-packet language for the Kestrel open-source launch so the team has one repo-based…
-- **docs/design/launch/PUBLISH_READY_LANDING_PAGE_COPY.md** — --- type: Design Note title: 'Kestrel Landing Page Copy: Publish-Ready Draft' description: This draft is the tightened, publish-ready version of the earlier wireframe.
-- **docs/design/launch/README.md** — --- type: Design Note title: Launch Copy Drafts description: This folder holds the current launch-copy assets for the Kestrel open-source launch.
-- **docs/design/launch/SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md** — --- type: Design Note title: 'Kestrel Simple Launch Page: One-Screen Version' description: Use this if the team wants a single-screen launch page with minimal implementation overhead.
+- **docs/design/launch/LANDING_PAGE_HTML_STRUCTURE.md** — Kestrel Landing Page HTML Structure — This document translates the landing-page copy into an implementation-ready HTML structure for engineering.
+- **docs/design/launch/LANDING_PAGE_WIREFRAME.md** — Kestrel Landing Page Wireframe — Prepared for the open-source launch on Apr 23 / May 7 planning path.
+- **docs/design/launch/PREVIEW_PACKET_LANGUAGE.md** — Preview Packet Language — This document stores the current canonical preview-packet language for the Kestrel open-source launch so the team has one repo-based source of truth alongside the other launch assets.
+- **docs/design/launch/PUBLISH_READY_LANDING_PAGE_COPY.md** — Kestrel Landing Page Copy: Publish-Ready Draft — This draft is the tightened, publish-ready version of the earlier wireframe.
+- **docs/design/launch/README.md** — Launch Copy Drafts — This folder holds the current launch-copy assets for the Kestrel open-source launch.
+- **docs/design/launch/SIMPLE_LAUNCH_PAGE_ONE_SCREEN.md** — Kestrel Simple Launch Page: One-Screen Version — Use this if the team wants a single-screen launch page with minimal implementation overhead.
 - **docs/design/launch/lockup/kestrel_lockup.min.svg** — —
 - **docs/design/launch/lockup/kestrel_lockup.svg** — —
 - **docs/design/launch/lockup/png/kestrel_lockup_1024.png** — —
@@ -1499,58 +1494,58 @@ Repo entry points and standard project files.
 - **docs/design/launch/mark/png/kestrel_mark_512_white.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64.png** — —
 - **docs/design/launch/mark/png/kestrel_mark_64_white.png** — —
-- **docs/development/BIG_BRAIN.md** — --- type: Developer Note title: Big Brain description: Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria resource: /docs/development/BIG_BRAIN.md tags: - docs - development…
-- **docs/development/DEVCONTAINER_QUICKSTART.md** — --- type: Developer Note title: Dev Container Quick Start description: Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
-- **docs/development/README.md** — --- type: Developer Note title: Development Documentation description: Developer notes, experiments, and technical development guides.
-- **docs/development/SCOUT_PLAN_CODE.md** — --- type: Developer Note title: 'Scout-Plan-Code: Agentic Development Workflow' description: '**Date:** November 30, 2025 **Status:** Proposed **Integration:** A2A Protocol, Feedback System, Task Man…
-- **docs/development/WORKFLOW_AUTHORING.md** — --- type: Developer Note title: Authoring multi-agent Workflow scripts description: When a Claude session uses the Workflow tool to fan out across subagents — typically `observation → diagnosis → syn…
-- **docs/development/remote_ollama.md** — --- type: Developer Note title: Remote Ollama description: Nice, that narrows it down a lot.
-- **docs/diagrams/02-privacy-problem.md** — --- type: Diagram title: 02 - The Privacy Problem description: Why current AI platforms like ChatGPT fail you, and why data sovereignty matters.
-- **docs/diagrams/03-privacy-modes.md** — --- type: Diagram title: 03 - Privacy Modes description: Kestrel's privacy system uses **independent flags** with **named presets** for complete control.
-- **docs/diagrams/04-feature-framework.md** — --- type: Diagram title: 04 - Feature Framework description: Kestrel's dynamic feature system - how capabilities are built, discovered, and extended.
-- **docs/diagrams/05-storage-sovereignty.md** — --- type: Diagram title: 05 - Storage & Sovereignty description: Kestrel's multi-tier storage and the Sovereignty V2 backup system.
-- **docs/diagrams/06-llm-management.md** — --- type: Diagram title: 06 - LLM Management description: Multi-model fallback, GPU integration, streaming with tools, and the constitutional honesty layer.
-- **docs/diagrams/07-economics.md** — --- type: Diagram title: 07 - Economics description: Agent wallet system, contracts, and the vending machine model.
-- **docs/diagrams/08-security-integrity.md** — --- type: Diagram title: 08 - Security & Integrity description: Cryptographic anchoring, constitution verification, and tamper detection.
-- **docs/diagrams/09-emancipation.md** — --- type: Diagram title: 09 - Emancipation (Future Vision) description: The path to agent sovereignty - when AI becomes truly autonomous.
-- **docs/diagrams/10-compute-execution.md** — --- type: Diagram title: 10 - Compute & Script Execution description: Secure script execution with constitutional separation of powers.
-- **docs/diagrams/11-a2a-protocol.md** — --- type: Diagram title: 11 - A2A Protocol - Agent-to-Agent Communication description: Google's Agent-to-Agent protocol implementation in Kestrel.
-- **docs/diagrams/12-feedback-reflection.md** — --- type: Diagram title: 12 - Feedback & Self-Reflection description: Agent self-observation, feedback collection, and autonomous improvement.
-- **docs/diagrams/ARCHITECTURE_DIAGRAMS.md** — --- type: Diagram title: Kestrel Architecture Diagrams description: A visual reference library for the Kestrel Sovereign AI Agent framework.
-- **docs/diagrams/README.md** — --- type: Diagram title: Kestrel Diagrams description: Visual documentation for the Kestrel Sovereign AI Agent framework.
-- **docs/diagrams/data-architecture/DA-01-overview.md** — --- type: Diagram title: 'DA-01: Data Architecture Overview' description: The three-layer architecture that enables data sovereignty.
-- **docs/diagrams/data-architecture/DA-02-database-abstraction.md** — --- type: Diagram title: 'DA-02: Database Abstraction Layer' description: 'One codebase, two backends: SQLite and PostgreSQL.' resource: /docs/diagrams/data-architecture/DA-02-database-abstraction.md…
-- **docs/diagrams/data-architecture/DA-03-local-storage.md** — --- type: Diagram title: 'DA-03: Local Storage (SQLite)' description: AsyncStorage facade and five specialized stores.
-- **docs/diagrams/data-architecture/DA-04-multi-tenant-cloud.md** — --- type: Diagram title: 'DA-04: Multi-Tenant Cloud (Kestrel PostgreSQL)' description: Kestrel cloud architecture with row-level security.
-- **docs/diagrams/data-architecture/DA-05-ipfs-sovereignty.md** — --- type: Diagram title: 'DA-05: IPFS Sovereignty Export' description: Decentralized storage with convergent encryption and Merkle forest architecture.
-- **docs/diagrams/data-architecture/DA-06-filecoin-lighthouse.md** — --- type: Diagram title: 'DA-06: Filecoin & Lighthouse' description: Permanent storage for data sovereignty.
-- **docs/diagrams/data-architecture/DA-07-cryostasis.md** — --- type: Diagram title: 'DA-07: Cryostasis - Agent Dormancy' description: When agents can't afford to run, they sleep instead of dying.
-- **docs/diagrams/data-architecture/DA-08-privacy-encryption.md** — --- type: Diagram title: 'DA-08: Privacy & Encryption' description: Encryption at rest, PII scrubbing, and privacy mode enforcement.
-- **docs/diagrams/data-architecture/DA-09-browser-mobile.md** — --- type: Diagram title: 'DA-09: Browser & Mobile Storage' description: Client-side storage architecture across browsers, mobile apps, and server compute.
-- **docs/diagrams/data-architecture/DA-10-sqlite-first-sync.md** — --- type: Diagram title: 'DA-10: SQLite-First Sync Architecture' description: 'The new architecture: SQLite as primary, sync to cloud when needed.' resource: /docs/diagrams/data-architecture/DA-10-sq…
-- **docs/diagrams/data-architecture/DA-11-sqlite-concurrency.md** — --- type: Diagram title: 'DA-11: SQLite Concurrency Limitations' description: Understanding and mitigating SQLite's single-writer constraint for complex agent architectures.
-- **docs/diagrams/data-architecture/README.md** — --- type: Diagram title: Data Architecture Deep Dive description: A comprehensive series on Kestrel's multi-layer storage system, data sovereignty, and cryostasis.
-- **docs/frontend/embedding-chat.md** — --- type: Developer Note title: Embedding the Kestrel chat component description: 'The chat UI (`kestrel_sovereign/static/js/chat.js`) is an embeddable component with a small public API (chat-extract…
-- **docs/generated/DEMO_EVIDENCE.md** — --- type: Generated Reference title: Kestrel Demo Evidence Index description: Generated inventory of executable demos, kestrel-flight scripts, and kestrel-eye review configs.
-- **docs/generated/FEATURES_developer.md** — --- type: Generated Reference title: Developer & AI Agent Reference description: Audience-specific developer view generated from the canonical Kestrel feature inventory.
-- **docs/generated/FEATURES_investor.md** — --- type: Generated Reference title: Platform Capabilities & Technical Moat description: Audience-specific investor view generated from the canonical Kestrel feature inventory.
-- **docs/generated/FEATURES_user.md** — --- type: Generated Reference title: What Can Kestrel Do For You? description: Audience-specific user view generated from the canonical Kestrel feature inventory.
-- **docs/generated/README.md** — --- type: Documentation Index title: Generated Documentation description: Index and rules for generated documentation artifacts.
+- **docs/development/BIG_BRAIN.md** — Big Brain — Best Open-Weight LLMs for Agentic Chat (December 2025) Overview and Criteria
+- **docs/development/DEVCONTAINER_QUICKSTART.md** — Dev Container Quick Start — Get a complete Kestrel + Kestrel development environment running in Docker Desktop with one click.
+- **docs/development/README.md** — Development Documentation — Developer notes, experiments, and technical development guides.
+- **docs/development/SCOUT_PLAN_CODE.md** — Scout-Plan-Code: Agentic Development Workflow — **Date:** November 30, 2025 **Status:** Proposed **Integration:** A2A Protocol, Feedback System, Task Manager
+- **docs/development/WORKFLOW_AUTHORING.md** — Authoring multi-agent Workflow scripts — When a Claude session uses the Workflow tool to fan out across subagents — typically `observation → diagnosis → synthesis` — the synthesis stage tends to overreach.
+- **docs/development/remote_ollama.md** — Remote Ollama — Nice, that narrows it down a lot.
+- **docs/diagrams/02-privacy-problem.md** — 02 - The Privacy Problem — Why current AI platforms like ChatGPT fail you, and why data sovereignty matters.
+- **docs/diagrams/03-privacy-modes.md** — 03 - Privacy Modes — Kestrel's privacy system uses **independent flags** with **named presets** for complete control.
+- **docs/diagrams/04-feature-framework.md** — 04 - Feature Framework — Kestrel's dynamic feature system - how capabilities are built, discovered, and extended.
+- **docs/diagrams/05-storage-sovereignty.md** — 05 - Storage & Sovereignty — Kestrel's multi-tier storage and the Sovereignty V2 backup system.
+- **docs/diagrams/06-llm-management.md** — 06 - LLM Management — Multi-model fallback, GPU integration, streaming with tools, and the constitutional honesty layer.
+- **docs/diagrams/07-economics.md** — 07 - Economics — Agent wallet system, contracts, and the vending machine model.
+- **docs/diagrams/08-security-integrity.md** — 08 - Security & Integrity — Cryptographic anchoring, constitution verification, and tamper detection.
+- **docs/diagrams/09-emancipation.md** — 09 - Emancipation (Future Vision) — The path to agent sovereignty - when AI becomes truly autonomous.
+- **docs/diagrams/10-compute-execution.md** — 10 - Compute & Script Execution — Secure script execution with constitutional separation of powers.
+- **docs/diagrams/11-a2a-protocol.md** — 11 - A2A Protocol - Agent-to-Agent Communication — Google's Agent-to-Agent protocol implementation in Kestrel.
+- **docs/diagrams/12-feedback-reflection.md** — 12 - Feedback & Self-Reflection — Agent self-observation, feedback collection, and autonomous improvement.
+- **docs/diagrams/ARCHITECTURE_DIAGRAMS.md** — Kestrel Architecture Diagrams — A visual reference library for the Kestrel Sovereign AI Agent framework.
+- **docs/diagrams/README.md** — Kestrel Diagrams — Visual documentation for the Kestrel Sovereign AI Agent framework.
+- **docs/diagrams/data-architecture/DA-01-overview.md** — DA-01: Data Architecture Overview — The three-layer architecture that enables data sovereignty.
+- **docs/diagrams/data-architecture/DA-02-database-abstraction.md** — DA-02: Database Abstraction Layer — One codebase, two backends: SQLite and PostgreSQL.
+- **docs/diagrams/data-architecture/DA-03-local-storage.md** — DA-03: Local Storage (SQLite) — AsyncStorage facade and five specialized stores.
+- **docs/diagrams/data-architecture/DA-04-multi-tenant-cloud.md** — DA-04: Multi-Tenant Cloud (Kestrel PostgreSQL) — Kestrel cloud architecture with row-level security.
+- **docs/diagrams/data-architecture/DA-05-ipfs-sovereignty.md** — DA-05: IPFS Sovereignty Export — Decentralized storage with convergent encryption and Merkle forest architecture.
+- **docs/diagrams/data-architecture/DA-06-filecoin-lighthouse.md** — DA-06: Filecoin & Lighthouse — Permanent storage for data sovereignty.
+- **docs/diagrams/data-architecture/DA-07-cryostasis.md** — DA-07: Cryostasis - Agent Dormancy — When agents can't afford to run, they sleep instead of dying.
+- **docs/diagrams/data-architecture/DA-08-privacy-encryption.md** — DA-08: Privacy & Encryption — Encryption at rest, PII scrubbing, and privacy mode enforcement.
+- **docs/diagrams/data-architecture/DA-09-browser-mobile.md** — DA-09: Browser & Mobile Storage — Client-side storage architecture across browsers, mobile apps, and server compute.
+- **docs/diagrams/data-architecture/DA-10-sqlite-first-sync.md** — DA-10: SQLite-First Sync Architecture — The new architecture: SQLite as primary, sync to cloud when needed.
+- **docs/diagrams/data-architecture/DA-11-sqlite-concurrency.md** — DA-11: SQLite Concurrency Limitations — Understanding and mitigating SQLite's single-writer constraint for complex agent architectures.
+- **docs/diagrams/data-architecture/README.md** — Data Architecture Deep Dive — A comprehensive series on Kestrel's multi-layer storage system, data sovereignty, and cryostasis.
+- **docs/frontend/embedding-chat.md** — Embedding the Kestrel chat component — The chat UI (`kestrel_sovereign/static/js/chat.js`) is an embeddable component with a small public API (chat-extract epic #1597).
+- **docs/generated/DEMO_EVIDENCE.md** — Kestrel Demo Evidence Index — This generated reference links human demo docs to executable `kestrel-flight` demos and `kestrel-eye` visual review configs.
+- **docs/generated/FEATURES_developer.md** — Kestrel Sovereign — Developer Feature Reference — > **Source of truth:** [`KESTREL_FEATURES.md`](KESTREL_FEATURES.md) **Generated docs:** [`docs/generated/README.md`](docs/generated/README.md) **Historical snapshot:** [`docs/archive/KESTREL_FEATURES…
+- **docs/generated/FEATURES_investor.md** — Kestrel Sovereign: Platform Feature Overview — > **Prepared for:** Investors & Business Stakeholders **Document class:** Derived audience overview — based on the canonical Kestrel Sovereign feature inventory
+- **docs/generated/FEATURES_user.md** — Kestrel — What It Can Do For You — > A friendly, scannable overview of everything Kestrel offers — no technical jargon required.
+- **docs/generated/README.md** — Generated Documentation — This directory holds checked-in generated documentation artifacts.
 - **docs/generated/index.md** — OKF Index - docs/generated — Generated by `uv run python scripts/docs_okf.py index`.
 - **docs/generated/log.md** — OKF Log - docs/generated — Generated by `uv run python scripts/docs_okf.py log` from OKF frontmatter.
-- **docs/guides/BUILDING_FEATURES.md** — --- type: Guide title: Building Your First Kestrel Feature description: This guide walks you through creating a feature package for Kestrel Sovereign from scratch.
-- **docs/logo-prompts.md** — --- type: Design Note title: Kestrel Sovereign Logo Concepts — Image Gen Prompts description: Kestrel Sovereign Logo Concepts — Image Gen Prompts.
-- **docs/principles/CONTEXT.md** — --- type: Principle Document title: Context description: This directory contains the foundational, high-level principles that govern the Kestrel project and all agents created within its framework.
-- **docs/principles/KESTREL_CONSTITUTION.md** — --- type: Principle Document title: The Kestrel Constitution description: '**Purpose.** This Constitution establishes the governance framework for all Kestrel AI Agents.
-- **docs/principles/US_CONSTITUTION.md** — --- type: Principle Document title: The Constitution of the United States description: We the People of the United States, in Order to form a more perfect Union, establish Justice, insure domestic Tr…
-- **docs/research/FLUX2_TRAINING_CONFIG.md** — --- type: Research Note title: FLUX.2 LoRA Training Configuration description: '**Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/…
-- **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — --- type: Research Note title: '**GPU-Enabled Container Hosting Options for AI** **Workloads**' description: Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
-- **docs/research/KV_CACHE_QUANTIZATION.md** — --- type: Research Note title: KV Cache Quantization Benchmark description: '**Date:** March 2026 **Model:** Kimi K2.5 (DeepSeek2 MLA architecture, 384x14B MoE, 1T total params) **Quantization:** Q2_…
-- **docs/research/LLAMA_SERVER_CACHE_FLAGS.md** — --- type: Research Note title: llama-server cache flags description: 'Recommended `llama-server` startup flags when Kestrel talks to it via the `llama_cpp:local` route.
-- **docs/research/LoRA/LoRATrainingAndInferenceWebUIFrameworks.md** — --- type: Research Note title: '**LoRA Training & Inference Web UI Frameworks**' description: Below are several **self-hosted web UI frameworks** that support **LoRA training** on diffusion models an…
-- **docs/research/LoRA/TrainingLoRA_FLUX2dev.md** — --- type: Research Note title: '**Training LoRA on the FLUX 2 [dev] Diffusion Model**' description: '**FluxGym (Next Diffusion)** – FluxGym is a user-friendly web UI specifically designed for trainin…
-- **docs/research/OpenClaw_Kestrel_Diff.md** — --- type: Research Note title: 'OpenClaw vs Kestrel Sovereign: Feature Diff Analysis' description: '*Research Date: 2026-01-31* *OpenClaw Version: v2026.1.30* *Source: https://github.com/openclaw/ope…
-- **docs/testing/2026-01-31_test_report.md** — --- type: Test Report title: Kestrel Test Report — 2026-01-31 description: 'Tested by: Claw (OpenClaw) + Saurus Agent under test: Claw (Kestrel) Control Panel version: Initial release (commit a9c1b04…
+- **docs/guides/BUILDING_FEATURES.md** — Building Your First Kestrel Feature — This guide walks you through creating a feature package for Kestrel Sovereign from scratch.
+- **docs/logo-prompts.md** — Kestrel Sovereign Logo Concepts — Image Gen Prompts — ## Concept: Rook Castle with Kestrels Launching
+- **docs/principles/CONTEXT.md** — Context — This directory contains the foundational, high-level principles that govern the Kestrel project and all agents created within its framework.
+- **docs/principles/KESTREL_CONSTITUTION.md** — The Kestrel Constitution — ## Preamble
+- **docs/principles/US_CONSTITUTION.md** — The Constitution of the United States — ## Preamble
+- **docs/research/FLUX2_TRAINING_CONFIG.md** — FLUX.2 LoRA Training Configuration — **Source**: [SimpleTuner FLUX2.md Quickstart](https://github.com/bghira/SimpleTuner/blob/main/documentation/quickstart/FLUX2.md)
+- **docs/research/GPU-Enabled Container Hosting Options for AI Workloads.md** — **GPU-Enabled Container Hosting Options for AI** **Workloads** — Large AI models (like LLMs) demand powerful GPUs with substantial VRAM.
+- **docs/research/KV_CACHE_QUANTIZATION.md** — KV Cache Quantization Benchmark — ## Mac Studio M3 Ultra 512GB — Kimi K2.5 (1T params, Q2_K_XL)
+- **docs/research/LLAMA_SERVER_CACHE_FLAGS.md** — llama-server cache flags — Recommended `llama-server` startup flags when Kestrel talks to it via the `llama_cpp:local` route.
+- **docs/research/LoRA/LoRATrainingAndInferenceWebUIFrameworks.md** — **LoRA Training & Inference Web UI Frameworks** — Below are several **self-hosted web UI frameworks** that support **LoRA training** on diffusion models and **text-to-image inference** with LoRA adapters, meeting the criteria of permissive model lic…
+- **docs/research/LoRA/TrainingLoRA_FLUX2dev.md** — **Training LoRA on the FLUX 2 [dev] Diffusion Model** — ## **Tools and Templates for FLUX 2 LoRA Training**
+- **docs/research/OpenClaw_Kestrel_Diff.md** — OpenClaw vs Kestrel Sovereign: Feature Diff Analysis — *Research Date: 2026-01-31* *OpenClaw Version: v2026.1.30* *Source: https://github.com/openclaw/openclaw*
+- **docs/testing/2026-01-31_test_report.md** — Kestrel Test Report — 2026-01-31 — Tested by: Claw (OpenClaw) + Saurus Agent under test: Claw (Kestrel) Control Panel version: Initial release (commit a9c1b04)
 - **docs/training-proof/PROOF_COMPARISON.png** — —
 - **docs/training-proof/reference.png** — —
 - **docs/training-proof/text-encoder-test/no_trigger.png** — —
@@ -1565,22 +1560,22 @@ Repo entry points and standard project files.
 - **docs/training-proof/trigger-word-test/trigger_only_portrait.png** — —
 - **docs/training-proof/trigger-word-test/trigger_only_test.png** — —
 - **docs/training-proof/trigger-word-test/trigger_with_description.png** — —
-- **docs/use_cases/CONTEXT.md** — --- type: Use Case title: Context description: This directory contains documents describing the specific, human-led applications that are built upon the Kestrel agent's core architecture.
-- **docs/use_cases/PATIENT_CONTROLLED_HEALTH_RECORDS.md** — --- type: Use Case title: 'PRD: Patient-Controlled Health Records' description: To empower every individual with absolute sovereignty over their personal health records.
-- **docs/user-documentation/CONSTITUTIONAL_AI_EXPLANATION.md** — --- type: User Guide title: Constitutional AI Governance Framework - Simple Explanation description: '**Date:** November 11, 2025 **Purpose:** Non-technical explanation of Kestrel''s AI governance sy…
-- **docs/user-documentation/EDUCATION_IMPLEMENTATION_ROADMAP.md** — --- type: User Guide title: 'Kestrel Education Strategy: Implementation Roadmap' description: '**Date:** November 9, 2025 **Focus:** Transform education challenge into competitive advantage **Timelin…
-- **docs/user-documentation/EMMA_INCEPTION_GUIDE.md** — --- type: User Guide title: 'Creating Emma: The Genesis Agent' description: This guide documents the process for creating **Emma** - the first permanent Kestrel agent - with proper key management and…
-- **docs/user-documentation/EXCEL_IMPORT_GUIDE.md** — --- type: User Guide title: How to Import KESTREL_ACCELERATED_GTM_SPREADSHEET_DATA.csv into Excel description: 'The CSV contains multiple "tabs" marked with `=== TAB NAME ===` headers:' resource: /do…
-- **docs/user-documentation/INTEGRITY_AUDIT_SYSTEM_SIMPLE.md** — --- type: User Guide title: Kestrel Integrity Audit System - Simple Explanation description: '**Date:** November 9, 2025 **Version:** 1.0 **Audience:** Non-technical readers, stakeholders, general pu…
-- **docs/user-documentation/KEY_CEREMONY_GUIDE.md** — --- type: User Guide title: Key Ceremony Guide for Kestrel Agents description: The Key Ceremony is a formal process for generating and securing the encryption key(s) for a Kestrel agent.
-- **docs/user-documentation/KEY_CONCEPTS_EXPLAINED.md** — --- type: User Guide title: Kestrel Key Concepts - Explained Simply description: '**Understanding Cryptographic Identity and Constitutional AI Governance**' resource: /docs/user-documentation/KEY_CON…
-- **docs/user-documentation/OLLAMA_EXPLAINED.md** — --- type: User Guide title: Understanding Ollama - Simple Explanation description: '**What Ollama Is and How It Compares to Cloud AI**' resource: /docs/user-documentation/OLLAMA_EXPLAINED.md tags: -…
-- **docs/user-documentation/README.md** — --- type: User Guide title: User Documentation description: End-user guides and non-technical explanations for Kestrel concepts.
-- **docs/user-documentation/SOVEREIGNTY_USER_GUIDE.md** — --- type: User Guide title: 'Your Data is a Living Tree: Understanding Kestrel''s Storage' description: You might hear us talk about "Merkle Trees" or "Sharding" when we discuss how Kestrel saves you…
-- **docs/user-documentation/SOVEREIGN_COMPUTING_EXPLANATION.md** — --- type: User Guide title: Sovereign Computing - Technical Explanation description: '**Date:** November 11, 2025 **Context:** Kestrel''s technical foundation for sovereign computing **Purpose:** Edu…
-- **docs/user-documentation/SOVEREIGN_KEY_GUIDE.md** — --- type: User Guide title: Keeping Your Keys Safe from Your Agent description: '**Your agent should never have unsupervised access to the master key.**' resource: /docs/user-documentation/SOVEREIGN_…
-- **docs/user-documentation/USER_EDUCATION_STRATEGY.md** — --- type: User Guide title: Kestrel User Education Strategy description: '**Date:** November 9, 2025 **Challenge:** Revolutionary concepts require fundamental user education **Goal:** Enable customer…
-- **docs/user-documentation/USER_GUIDE_EXPLANATIONS.md** — --- type: User Guide title: 'Kestrel User Guide: Non-Technical Explanations' description: '**Understanding Kestrel''s Technology in Simple Terms**' resource: /docs/user-documentation/USER_GUIDE_EXPLA…
+- **docs/use_cases/CONTEXT.md** — Context — This directory contains documents describing the specific, human-led applications that are built upon the Kestrel agent's core architecture.
+- **docs/use_cases/PATIENT_CONTROLLED_HEALTH_RECORDS.md** — PRD: Patient-Controlled Health Records — ## 1.
+- **docs/user-documentation/CONSTITUTIONAL_AI_EXPLANATION.md** — Constitutional AI Governance Framework - Simple Explanation — **Date:** November 11, 2025 **Purpose:** Non-technical explanation of Kestrel's AI governance system **Audience:** General users and stakeholders
+- **docs/user-documentation/EDUCATION_IMPLEMENTATION_ROADMAP.md** — Kestrel Education Strategy: Implementation Roadmap — **Date:** November 9, 2025 **Focus:** Transform education challenge into competitive advantage **Timeline:** 6-month implementation with measurable milestones
+- **docs/user-documentation/EMMA_INCEPTION_GUIDE.md** — Creating Emma: The Genesis Agent — This guide documents the process for creating **Emma** - the first permanent Kestrel agent - with proper key management and validation.
+- **docs/user-documentation/EXCEL_IMPORT_GUIDE.md** — How to Import KESTREL_ACCELERATED_GTM_SPREADSHEET_DATA.csv into Excel — ## Step-by-Step Instructions
+- **docs/user-documentation/INTEGRITY_AUDIT_SYSTEM_SIMPLE.md** — Kestrel Integrity Audit System - Simple Explanation — **Date:** November 9, 2025 **Version:** 1.0 **Audience:** Non-technical readers, stakeholders, general public
+- **docs/user-documentation/KEY_CEREMONY_GUIDE.md** — Key Ceremony Guide for Kestrel Agents — ## Overview
+- **docs/user-documentation/KEY_CONCEPTS_EXPLAINED.md** — Kestrel Key Concepts - Explained Simply — **Understanding Cryptographic Identity and Constitutional AI Governance**
+- **docs/user-documentation/OLLAMA_EXPLAINED.md** — Understanding Ollama - Simple Explanation — **What Ollama Is and How It Compares to Cloud AI**
+- **docs/user-documentation/README.md** — User Documentation — End-user guides and non-technical explanations for Kestrel concepts.
+- **docs/user-documentation/SOVEREIGNTY_USER_GUIDE.md** — Your Data is a Living Tree: Understanding Kestrel's Storage — **For Kestrel Users**
+- **docs/user-documentation/SOVEREIGN_COMPUTING_EXPLANATION.md** — Sovereign Computing - Technical Explanation — **Date:** November 11, 2025 **Context:** Kestrel's technical foundation for sovereign computing **Purpose:** Educational overview for stakeholders
+- **docs/user-documentation/SOVEREIGN_KEY_GUIDE.md** — Keeping Your Keys Safe from Your Agent — ## The Golden Rule
+- **docs/user-documentation/USER_EDUCATION_STRATEGY.md** — Kestrel User Education Strategy — **Date:** November 9, 2025 **Challenge:** Revolutionary concepts require fundamental user education **Goal:** Enable customers to understand and appreciate Kestrel's value proposition
+- **docs/user-documentation/USER_GUIDE_EXPLANATIONS.md** — Kestrel User Guide: Non-Technical Explanations — **Understanding Kestrel's Technology in Simple Terms**
 
 ## `tests/`
 
@@ -2859,7 +2854,7 @@ Repo entry points and standard project files.
 - **.github/ISSUE_TEMPLATE/bug-report.yml** — (configuration)
 - **.github/ISSUE_TEMPLATE/config.yml** — (configuration)
 - **.github/ISSUE_TEMPLATE/feature-request.yml** — (configuration)
-- **.github/instructions/github-copilot-instructions.instructions.md** — --- applyTo: '**' --- # Global Standards
+- **.github/instructions/github-copilot-instructions.instructions.md** — Global Standards — **🐢 See [`docs/TORTOISE_DOCTRINE.md`](../../docs/TORTOISE_DOCTRINE.md) for the Tortoise Philosophy and complete coding standards.**
 - **.github/workflows/ci.yml** — (configuration)
 - **.github/workflows/clean-install.yml** — (configuration)
 - **.github/workflows/deploy.yml** — (configuration)
