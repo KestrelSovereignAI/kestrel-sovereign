@@ -311,7 +311,14 @@ class BootstrapFeature(Feature):
             )
 
         files = loader.list_files()
-        loaded = sum(1 for f in files if f.get("status") == "loaded")
+        loaded = sum(
+            1 for f in files
+            if f.get("status") in {"loaded", "partial"}
+        )
+        truncated_files = [
+            f["name"] for f in files
+            if f.get("status") == "partial"
+        ]
         return ToolResult.ok(
             confirmation=(
                 f"Bootstrap catalog: {loader.file_count} file(s) configured, "
@@ -323,6 +330,7 @@ class BootstrapFeature(Feature):
                 "total_chars": loader.total_chars,
                 "file_order": loader.file_order,
                 "loaded_count": loaded,
+                "truncated_files": truncated_files,
             },
         )
 
@@ -372,7 +380,14 @@ class BootstrapFeature(Feature):
                         exc_info=True,
                     )
                     files = loader.list_files()
-                    loaded = [f["name"] for f in files if f.get("status") == "loaded"]
+                    loaded = [
+                        f["name"] for f in files
+                        if f.get("status") in {"loaded", "partial"}
+                    ]
+                    truncated_files = [
+                        f["name"] for f in files
+                        if f.get("status") == "partial"
+                    ]
                     return ToolResult.partial(
                         confirmation=(
                             f"Reloaded {loader.file_count} file(s) from disk; "
@@ -386,12 +401,21 @@ class BootstrapFeature(Feature):
                             "loaded_count": loader.file_count,
                             "total_chars": loader.total_chars,
                             "files": loaded,
+                            "file_details": files,
+                            "truncated_files": truncated_files,
                             "cache_refresh_error": str(e),
                         },
                     )
 
         files = loader.list_files()
-        loaded = [f["name"] for f in files if f.get("status") == "loaded"]
+        loaded = [
+            f["name"] for f in files
+            if f.get("status") in {"loaded", "partial"}
+        ]
+        truncated_files = [
+            f["name"] for f in files
+            if f.get("status") == "partial"
+        ]
         # Honesty: BootstrapLoader.reload() catches per-file read
         # exceptions and silently drops the file from the cache.
         # ``list_files()`` reports those (and budget-exhausted entries)
@@ -404,23 +428,34 @@ class BootstrapFeature(Feature):
             f["name"] for f in files
             if (f.get("status") or "").startswith("skipped")
         ]
-        if dropped:
+        if dropped or truncated_files:
+            errors = []
+            if dropped:
+                errors.append(
+                    f"{len(dropped)} configured file(s) exist on disk "
+                    f"but were dropped from the prompt "
+                    f"(read failure or budget exhausted): "
+                    f"{', '.join(dropped)}"
+                )
+            if truncated_files:
+                errors.append(
+                    f"{len(truncated_files)} configured file(s) were "
+                    f"loaded partially due to bootstrap size budgets: "
+                    f"{', '.join(truncated_files)}"
+                )
             return ToolResult.partial(
                 confirmation=(
                     f"Reloaded {len(loaded)} file(s) from disk; "
                     f"{loader.total_chars} char(s) total"
                 ),
-                error=(
-                    f"{len(dropped)} configured file(s) exist on disk "
-                    f"but were dropped from the prompt "
-                    f"(read failure or budget exhausted): "
-                    f"{', '.join(dropped)}"
-                ),
+                error="; ".join(errors),
                 data={
                     "loaded_count": loader.file_count,
                     "total_chars": loader.total_chars,
                     "files": loaded,
+                    "file_details": files,
                     "dropped_files": dropped,
+                    "truncated_files": truncated_files,
                 },
             )
         return ToolResult.ok(
@@ -433,6 +468,8 @@ class BootstrapFeature(Feature):
                 "loaded_count": loader.file_count,
                 "total_chars": loader.total_chars,
                 "files": loaded,
+                "file_details": files,
+                "truncated_files": [],
             },
         )
 
@@ -886,6 +923,69 @@ class BootstrapFeature(Feature):
             logger.error(f"restart_discovery failed: {e}", exc_info=True)
             return ToolResult.failed(str(e))
 
+        history_clear_succeeded = bool(
+            getattr(result, "history_clear_succeeded", True)
+        )
+        history_count_after = getattr(result, "history_count_after", None)
+        history_clear_error = getattr(result, "history_clear_error", None)
+
+        try:
+            strict_loader = getattr(
+                type(self.agent.bootstrap_service),
+                "_load_discovery_history_strict",
+                None,
+            )
+            if strict_loader is not None:
+                history_after = await (
+                    self.agent.bootstrap_service._load_discovery_history_strict()
+                )
+            else:
+                history_after = await (
+                    self.agent.bootstrap_service.get_discovery_history()
+                )
+            history_count_after = len(history_after)
+            history_clear_succeeded = (
+                history_clear_succeeded and history_count_after == 0
+            )
+            if history_count_after != 0 and not history_clear_error:
+                history_clear_error = (
+                    f"discovery history still has {history_count_after} "
+                    "persisted entr(ies) after reset"
+                )
+        except Exception as e:
+            logger.error(
+                f"restart_discovery history verification failed: {e}",
+                exc_info=True,
+            )
+            history_clear_succeeded = False
+            history_clear_error = (
+                f"failed to verify discovery history was cleared: {e}"
+            )
+
+        service_data = {
+            "service_result": str(result),
+            "history_clear_succeeded": history_clear_succeeded,
+            "history_count_after": history_count_after,
+            "history_clear_error": history_clear_error,
+            "state_reset": getattr(result, "state_reset", None),
+            "soul_deleted": getattr(result, "soul_deleted", None),
+            "soul_path": getattr(result, "soul_path", None),
+        }
+
+        if not history_clear_succeeded:
+            return ToolResult.partial(
+                confirmation=(
+                    f"{str(result) if result else 'Discovery restarted'} "
+                    "Bootstrap state reset was attempted, but persisted "
+                    "discovery history clear is unverified."
+                ),
+                error=(
+                    history_clear_error
+                    or "persisted discovery history was not confirmed empty"
+                ),
+                data=service_data,
+            )
+
         # Clear SOUL.md from context builder
         if hasattr(self.agent, 'context_builder'):
             try:
@@ -904,12 +1004,12 @@ class BootstrapFeature(Feature):
                         f"SOUL.md cache clear failed: {e}; "
                         "stale personality may persist until restart"
                     ),
-                    data={"service_result": str(result)},
+                    data=service_data,
                 )
 
         return ToolResult.ok(
             confirmation=str(result) if result else "Discovery restarted",
-            data={"service_result": str(result)},
+            data=service_data,
         )
 
     @tool(
