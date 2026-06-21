@@ -545,6 +545,28 @@ class TestTalonWait:
         assert result.status is ToolResultStatus.ERROR
         assert "mode must be 'block' or 'signal'" in result.error
 
+    @pytest.mark.asyncio
+    async def test_active_handles_includes_terminal_jobs(self):
+        """Regression (codex Wave 2 P1): a TERMINAL cli_background job must
+        still be enumerated so a soft-dropped/restart-lost completion signal
+        gets retried. Excluding terminal handles would silently lose the
+        wake. The reconciler gates re-emits on the dedup ledger."""
+        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+
+        feature = TalonCoordinatorFeature(_make_agent())
+        feature._jobs = {
+            "running-1": {"method": "cli_background", "status": "running"},
+            "done-1": {"method": "cli_background", "status": "complete"},
+            "failed-1": {"method": "cli_background", "status": "failed"},
+            "a2a-1": {"method": "a2a", "status": "running"},
+        }
+        # _reload_persisted_jobs would clobber the in-memory dict from disk;
+        # stub it so the test's fixture jobs are what active_handles sees.
+        feature._reload_persisted_jobs = lambda: None
+        handles = await TalonWaitable(feature).active_handles()
+        # All cli_background jobs (terminal included); a2a excluded.
+        assert set(handles) == {"running-1", "done-1", "failed-1"}
+
 
 class TestTalonVerify:
     @pytest.mark.asyncio

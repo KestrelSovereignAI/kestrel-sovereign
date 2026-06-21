@@ -17,10 +17,6 @@ from typing import ClassVar, List, Optional
 from kestrel_sdk.tools import Outcome, WaitStatus
 
 _TERMINAL_FAIL = ("failed", "reject", "finished_unknown")
-# The terminal vocabulary across both dispatch methods: a job in any of
-# these is finished and the reconciler should NOT re-enumerate it as
-# in-flight. ``complete`` -> DONE; the rest -> FAILED in ``poll``.
-_TERMINAL_STATES = ("complete",) + _TERMINAL_FAIL
 
 
 class TalonWaitable:
@@ -111,23 +107,30 @@ class TalonWaitable:
 
         Implements :class:`~kestrel_sdk.tools.MonitorableWaitable`. Reloads
         the durable registry so a freshly-restarted feature sees jobs from a
-        prior process, then returns the ids of cli_background jobs not yet in
-        a terminal state. Cheap (a JSON reload + dict scan) — the reconciler
-        calls it every cron tick. Classifying + signaling are the
-        reconciler's job; this only enumerates.
+        prior process, then returns ALL cli_background job ids. Cheap (a JSON
+        reload + dict scan) — the reconciler calls it every cron tick.
+        Classifying + signaling are the reconciler's job; this only enumerates.
+
+        Terminal jobs are intentionally INCLUDED, not filtered out: the
+        completion signal for a terminal job may have been soft-dropped
+        (rate limit / quiet hours) or lost across a restart, in which case
+        the dedup ledger leaves ``last_signaled_outcome`` unset so the next
+        tick must re-poll and retry. Excluding terminal handles here would
+        silently lose that wake — exactly the regression the legacy
+        talon_monitor avoided by scanning every cli_background job each tick
+        and gating re-emits on the ledger (codex Wave 2 P1). The reconciler
+        skips jobs already confirmed-signaled, so re-polling a delivered job
+        is a cheap no-op.
 
         Scoped to ``cli_background`` jobs: those are the ones the retired
-        talon_monitor cron drove, and the a2a path has its own resumption
-        rail (a2a.task_complete). The reconciler still polls each returned
-        handle to detect the actual terminal transition.
+        talon_monitor cron drove; the a2a path has its own resumption rail
+        (a2a.task_complete).
         """
         feature = self._feature
         feature._reload_persisted_jobs()
         active: List[str] = []
         for job_id, info in feature._jobs.items():
             if info.get("method") != "cli_background":
-                continue
-            if info.get("status") in _TERMINAL_STATES:
                 continue
             active.append(job_id)
         return active

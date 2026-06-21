@@ -70,6 +70,7 @@ logger = logging.getLogger(__name__)
 # built-in cron is retired; never list user-schedulable feature tools.
 _RETIRED_BUILTIN_CRON_TASKS = frozenset({
     "cognition_retention",  # #1674 — superseded by [forgetting] in memory_consolidate
+    "talon_monitor",  # #1860 Wave 2 — superseded by the generic wait_reconcile
 })
 
 # Crons SUPERSEDED by the nightly `sleep` cycle (#1674 P3). These names are also
