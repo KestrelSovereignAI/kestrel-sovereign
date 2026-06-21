@@ -815,6 +815,7 @@ class KestrelAgent(
                 SignalLogStore,
                 SourceRegistry,
             )
+            from kestrel_sovereign.waits import WaitRegistry
 
             # AsyncStorage owns the underlying DatabaseBackend; reuse it
             # so signal_log shares the agent's pool/connection rather than
@@ -823,6 +824,11 @@ class KestrelAgent(
             await signal_log_store.initialize()
 
             self.signal_registry = SourceRegistry()
+            # Per-agent dispatch table for generic waits. Features register
+            # one Waitable provider per handle kind in
+            # post_all_features_loaded; the generic `wait("<kind>:<handle>")`
+            # tool resolves kinds here. Mirrors signal_registry.
+            self.wait_registry = WaitRegistry()
             self.signal_log_store = signal_log_store
             self.dispatcher = SignalDispatcher(
                 agent=self,
