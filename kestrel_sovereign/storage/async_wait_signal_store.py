@@ -141,6 +141,31 @@ class WaitSignalStore:
     # Writes
     # ------------------------------------------------------------------
 
+    async def seed_signaled(
+        self, kind: str, handle: str, outcome: str,
+    ) -> bool:
+        """Seed a confirmed-signaled row ONLY IF ABSENT (idempotent).
+
+        Used for one-time migration of legacy per-feature dedup state into
+        this generic ledger — e.g. talon_monitor stashed
+        ``last_signaled_status`` inside ``jobs.json``; on upgrade we seed a
+        row here so the first ``wait_reconcile`` tick does not re-fire a
+        signal for an already-delivered terminal handle (codex Wave 2 P2).
+
+        ``INSERT OR IGNORE`` so it never clobbers a row the reconciler is
+        already managing — re-running on every startup is a safe no-op.
+        Returns True if a row was inserted, False if one already existed.
+        """
+        rowcount = await self._db.execute(
+            """
+            INSERT OR IGNORE INTO wait_signal_state
+                (agent_id, kind, handle, last_signaled_outcome)
+            VALUES (?, ?, ?, ?)
+            """,
+            (self._agent_id, kind, handle, outcome),
+        )
+        return rowcount > 0
+
     async def record_pending(
         self,
         kind: str,

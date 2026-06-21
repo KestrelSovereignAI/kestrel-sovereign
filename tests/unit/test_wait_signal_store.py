@@ -230,6 +230,32 @@ async def test_watch_isolation_between_agents(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_seed_signaled_is_insert_or_ignore(tmp_path):
+    """seed_signaled inserts a confirmed-signaled row only if absent, and
+    never clobbers an existing reconciler-managed row (codex Wave 2 P2)."""
+    store = await _make_store(tmp_path)
+    assert await store.seed_signaled("talon", "job-1", "done") is True
+    assert (await store.get("talon", "job-1")).last_signaled_outcome == "done"
+    # Re-seeding the same handle is a no-op (returns False, value unchanged).
+    assert await store.seed_signaled("talon", "job-1", "failed") is False
+    assert (await store.get("talon", "job-1")).last_signaled_outcome == "done"
+
+
+@pytest.mark.asyncio
+async def test_seed_does_not_clobber_managed_row(tmp_path):
+    """A later legacy seed must not overwrite a row the reconciler already
+    manages (e.g. an in-flight pending row)."""
+    store = await _make_store(tmp_path)
+    await store.record_pending(
+        "talon", "job-1", signal_id="s1", target="done", attempts=1,
+    )
+    assert await store.seed_signaled("talon", "job-1", "failed") is False
+    row = await store.get("talon", "job-1")
+    assert row.pending_signal_id == "s1"
+    assert row.last_signaled_outcome is None
+
+
+@pytest.mark.asyncio
 async def test_agent_id_isolation(tmp_path):
     """A shared backend must not leak rows between agents (the codex P1
     isolation contract carried over from PendingA2AQuestionStore)."""

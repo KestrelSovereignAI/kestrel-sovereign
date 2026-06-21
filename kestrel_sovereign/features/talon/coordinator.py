@@ -332,6 +332,50 @@ class TalonCoordinatorFeature(Feature):
         if registry is not None:
             registry.register(TalonWaitable(self), replace=True)
 
+        # One-time migration of legacy talon_monitor dedup state into the
+        # generic reconciler ledger. Pre-Wave-2 jobs.json rows carry
+        # ``last_signaled_status`` from the retired monitor; without seeding
+        # the (initially empty) ledger, the first wait_reconcile tick would
+        # re-fire talon.job_complete for every already-delivered terminal job
+        # (codex Wave 2 P2). seed_signaled is INSERT-OR-IGNORE, so this is a
+        # safe no-op on every subsequent startup.
+        await self._seed_legacy_signal_ledger(agent)
+
+    async def _seed_legacy_signal_ledger(self, agent) -> None:
+        """Seed wait_signal_state from legacy jobs.json ``last_signaled_status``."""
+        raw_storage = getattr(agent, "_raw_storage", None)
+        db = getattr(raw_storage, "db", None)
+        if db is None:
+            return
+        try:
+            from kestrel_sdk.tools import Outcome
+            from kestrel_sovereign.storage.async_wait_signal_store import (
+                WaitSignalStore,
+            )
+
+            agent_id = (
+                getattr(agent, "did", None)
+                or getattr(agent, "agent_id", None)
+                or ""
+            )
+            store = WaitSignalStore(db, str(agent_id))
+            self._reload_persisted_jobs()
+            for job_id, info in self._jobs.items():
+                legacy = info.get("last_signaled_status")
+                if not legacy:
+                    continue
+                # Map the legacy talon status onto the generic Outcome the
+                # reconciler dedups on (complete -> done; the rest -> failed).
+                outcome = (
+                    Outcome.DONE if legacy == "complete" else Outcome.FAILED
+                )
+                await store.seed_signaled("talon", str(job_id), outcome.value)
+        except Exception as e:  # never let a migration hiccup block startup
+            logger.warning(
+                "TalonCoordinatorFeature: legacy signal-ledger seed failed: %s",
+                e,
+            )
+
     # ------------------------------------------------------------------
     # Tools
     # ------------------------------------------------------------------

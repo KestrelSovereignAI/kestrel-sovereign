@@ -567,6 +567,46 @@ class TestTalonWait:
         # All cli_background jobs (terminal included); a2a excluded.
         assert set(handles) == {"running-1", "done-1", "failed-1"}
 
+    @pytest.mark.asyncio
+    async def test_post_load_seeds_legacy_signal_ledger(self, tmp_path):
+        """Regression (codex Wave 2 P2): on upgrade, jobs.json rows carrying
+        legacy last_signaled_status must seed the generic ledger so the first
+        wait_reconcile tick doesn't re-fire talon.job_complete for an
+        already-delivered terminal job."""
+        from types import SimpleNamespace
+
+        from kestrel_sovereign.storage.async_database import AsyncDatabase
+        from kestrel_sovereign.storage.async_wait_signal_store import (
+            WaitSignalStore,
+        )
+        from kestrel_sovereign.waits import WaitRegistry
+
+        db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
+        agent = SimpleNamespace(
+            did="did:test:agent",
+            agent_id="did:test:agent",
+            _raw_storage=SimpleNamespace(db=db),
+            wait_registry=WaitRegistry(),
+        )
+        feature = TalonCoordinatorFeature(agent)
+        feature._jobs = {
+            "done-1": {"method": "cli_background", "status": "complete",
+                       "last_signaled_status": "complete"},
+            "failed-1": {"method": "cli_background", "status": "failed",
+                         "last_signaled_status": "failed"},
+            "unsig-1": {"method": "cli_background", "status": "complete"},
+        }
+        feature._reload_persisted_jobs = lambda: None
+
+        await feature.post_all_features_loaded(agent)
+
+        store = WaitSignalStore(db, "did:test:agent")
+        # complete -> done, failed -> failed; mapped onto generic Outcome.
+        assert (await store.get("talon", "done-1")).last_signaled_outcome == "done"
+        assert (await store.get("talon", "failed-1")).last_signaled_outcome == "failed"
+        # No legacy status => no seed row (the reconciler will signal it fresh).
+        assert await store.get("talon", "unsig-1") is None
+
 
 class TestTalonVerify:
     @pytest.mark.asyncio
