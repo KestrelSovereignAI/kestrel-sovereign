@@ -384,6 +384,18 @@ class TestBootstrapLoaderListFiles:
         assert soul_entry["status"] == "loaded"
         assert soul_entry["chars"] == len("Content")
 
+    def test_list_marks_truncated_files_partial(self, tmp_agent_dir):
+        loader = BootstrapLoader(
+            agent_data_path=str(tmp_agent_dir),
+            max_chars_per_file=100,
+        )
+        (tmp_agent_dir / "SOUL.md").write_text("X" * 1000)
+        files = loader.list_files()
+        soul_entry = next(f for f in files if f["name"] == "SOUL.md")
+        assert soul_entry["status"] == "partial"
+        assert soul_entry["original_chars"] == 1000
+        assert soul_entry["truncated_chars"] > 0
+
     def test_list_shows_not_found_status(self, tmp_agent_dir, loader):
         loader.load()
         files = loader.list_files()
@@ -554,6 +566,63 @@ class TestBootstrapFeatureTools:
         assert "B.md" in result.error
         assert "B.md" in result.data["dropped_files"]
         assert "A.md" in result.data["files"]
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_reload_partial_when_file_truncated(
+        self, mock_agent, tmp_agent_dir,
+    ):
+        """A file that is included only partially must not be reported
+        as cleanly loaded."""
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        loader = BootstrapLoader(
+            agent_data_path=str(tmp_agent_dir),
+            max_chars_per_file=100,
+            file_order=["SOUL.md"],
+        )
+        (tmp_agent_dir / "SOUL.md").write_text("S" * 1000)
+
+        mock_agent.context_builder = MagicMock()
+        mock_agent.context_builder._bootstrap_loader = loader
+        feature = BootstrapFeature(mock_agent)
+
+        result = await feature.bootstrap_reload()
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "SOUL.md" in result.error
+        assert result.data["truncated_files"] == ["SOUL.md"]
+        detail = result.data["file_details"][0]
+        assert detail["status"] == "partial"
+        assert detail["truncated_chars"] > 0
+
+    @pytest.mark.asyncio
+    async def test_restart_discovery_partial_when_history_not_cleared(
+        self, mock_agent,
+    ):
+        from kestrel_sdk.tools.result import ToolResultStatus
+        from kestrel_sovereign.bootstrap.service import RestartDiscoveryResult
+        from kestrel_sovereign.features.bootstrap.feature import BootstrapFeature
+
+        mock_agent.bootstrap_service.restart_discovery = AsyncMock(
+            return_value=RestartDiscoveryResult(
+                message="Discovery reset! Send me a message to start fresh.",
+                history_clear_succeeded=False,
+                history_count_after=1,
+                state_reset=True,
+                soul_deleted=True,
+                history_clear_error="failed to persist empty discovery history",
+            )
+        )
+        mock_agent.bootstrap_service.get_discovery_history = AsyncMock(
+            return_value=[{"role": "user", "content": "old"}]
+        )
+        feature = BootstrapFeature(mock_agent)
+
+        result = await feature.restart_discovery()
+        assert result.status is ToolResultStatus.PARTIAL
+        assert "history" in result.error
+        assert result.data["history_clear_succeeded"] is False
+        assert result.data["history_count_after"] == 1
 
     @pytest.mark.asyncio
     async def test_bootstrap_add_in_memory_only_is_partial(self, feature_with_loader):

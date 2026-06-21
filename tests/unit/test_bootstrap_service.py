@@ -34,6 +34,20 @@ class MockDB:
             self.data[key] = params[2]
 
 
+class FailingHistoryClearDB(MockDB):
+    """Mock DB that refuses to overwrite discovery history with []."""
+
+    async def execute(self, query: str, params: tuple = None):
+        if (
+            params
+            and len(params) >= 4
+            and params[1] == BootstrapService.DISCOVERY_HISTORY_KEY
+            and params[2] == "[]"
+        ):
+            raise RuntimeError("write failed")
+        await super().execute(query, params)
+
+
 class MockLLMService:
     """Mock LLM service for testing."""
 
@@ -453,10 +467,38 @@ class TestSkipAndRestart:
             {"role": "user", "content": "Test message"},
         ])
 
-        await bootstrap_service.restart_discovery()
+        result = await bootstrap_service.restart_discovery()
 
         history = await bootstrap_service.get_discovery_history()
         assert len(history) == 0
+        assert result.history_clear_succeeded is True
+        assert result.history_count_after == 0
+
+    @pytest.mark.asyncio
+    async def test_restart_discovery_reports_history_clear_failure(
+        self, mock_llm, temp_agent_dir,
+    ):
+        """A DB write failure must not look like a confirmed reset."""
+        db = FailingHistoryClearDB()
+        service = BootstrapService(
+            db=db,
+            agent_id="did:pkh:eip155:1:0x123",
+            agent_name="TestAgent",
+            llm_service=mock_llm,
+            agent_data_path=temp_agent_dir,
+        )
+        await service._save_discovery_history([
+            {"role": "user", "content": "Test message"},
+        ])
+
+        result = await service.restart_discovery()
+
+        assert result.history_clear_succeeded is False
+        assert result.history_count_after == 1
+        assert "failed" in result.history_clear_error
+        assert await service.get_discovery_history() == [
+            {"role": "user", "content": "Test message"},
+        ]
 
     @pytest.mark.asyncio
     async def test_restart_discovery_resets_state(self, bootstrap_service):

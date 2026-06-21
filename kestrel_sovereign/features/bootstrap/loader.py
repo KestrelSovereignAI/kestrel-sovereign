@@ -17,7 +17,7 @@ Features:
 import logging
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,11 @@ class BootstrapLoader:
         self._cache: OrderedDict[str, str] = OrderedDict()
         # Track resolved paths for reporting
         self._resolved_paths: Dict[str, str] = {}
+        # Track files that were included in the prompt only partially.
+        # Value is the number of source characters omitted after all
+        # per-file and total-budget truncation has been applied.
+        self._truncated_chars: Dict[str, int] = {}
+        self._source_chars: Dict[str, int] = {}
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -145,6 +150,8 @@ class BootstrapLoader:
         self._loaded = False
         self._cache.clear()
         self._resolved_paths.clear()
+        self._truncated_chars.clear()
+        self._source_chars.clear()
         return self.load()
 
     def get_bootstrap_content(self) -> Dict[str, str]:
@@ -158,7 +165,7 @@ class BootstrapLoader:
         """Get the content of a specific bootstrap file, or None."""
         return self.load().get(filename)
 
-    def list_files(self) -> List[Dict[str, str]]:
+    def list_files(self) -> List[Dict[str, Any]]:
         """List all loaded bootstrap files with metadata.
 
         Returns:
@@ -172,12 +179,20 @@ class BootstrapLoader:
             path = self._resolved_paths.get(filename)
             content = self._cache.get(filename)
             if content is not None:
-                result.append({
+                entry = {
                     "name": filename,
                     "path": path or "unknown",
                     "chars": len(content),
-                    "status": "loaded",
-                })
+                    "status": (
+                        "partial"
+                        if filename in self._truncated_chars
+                        else "loaded"
+                    ),
+                }
+                if filename in self._truncated_chars:
+                    entry["truncated_chars"] = self._truncated_chars[filename]
+                    entry["original_chars"] = self._source_chars.get(filename, len(content))
+                result.append(entry)
             else:
                 # Try to find the file path even if not loaded
                 found_path = self._find_file(filename)
@@ -224,6 +239,8 @@ class BootstrapLoader:
         self._file_order.remove(filename)
         self._cache.pop(filename, None)
         self._resolved_paths.pop(filename, None)
+        self._truncated_chars.pop(filename, None)
+        self._source_chars.pop(filename, None)
         return True
 
     @property
@@ -341,6 +358,8 @@ class BootstrapLoader:
         """Scan directories and load bootstrap files into cache."""
         self._cache.clear()
         self._resolved_paths.clear()
+        self._truncated_chars.clear()
+        self._source_chars.clear()
 
         if not self._agent_data_path and not self._extra_paths:
             self._loaded = True
@@ -367,12 +386,15 @@ class BootstrapLoader:
                 continue
 
             try:
-                content = filepath.read_text(encoding="utf-8")
+                raw_content = filepath.read_text(encoding="utf-8")
+                source_chars = len(raw_content)
+                content = raw_content
                 if not content.strip():
                     continue
 
                 # Per-file truncation
-                content = truncate_content(content, self._max_chars_per_file)
+                if len(content) > self._max_chars_per_file:
+                    content = truncate_content(content, self._max_chars_per_file)
 
                 # Total budget check
                 if total_chars + len(content) > self._max_total_chars:
@@ -387,6 +409,10 @@ class BootstrapLoader:
 
                 self._cache[filename] = content
                 self._resolved_paths[filename] = str(filepath)
+                self._source_chars[filename] = source_chars
+                truncated_chars = max(source_chars - len(content), 0)
+                if truncated_chars > 0:
+                    self._truncated_chars[filename] = truncated_chars
                 total_chars += len(content)
                 logger.info(
                     f"Loaded bootstrap file: {filename} ({len(content)} chars)"

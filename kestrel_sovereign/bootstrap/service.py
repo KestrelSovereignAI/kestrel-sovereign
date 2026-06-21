@@ -9,6 +9,7 @@ import asyncio
 import html
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -46,6 +47,26 @@ class BootstrapState(Enum):
     DISCOVERY = "discovery"  # In discovery conversation
     AVATAR = "avatar"        # Offering avatar generation
     COMPLETE = "complete"    # Bootstrap finished
+
+
+@dataclass(frozen=True)
+class RestartDiscoveryResult:
+    """Structured result for discovery reset side effects."""
+
+    message: str
+    history_clear_succeeded: bool
+    history_count_after: int
+    state_reset: bool
+    soul_deleted: bool
+    soul_path: Optional[str] = None
+    history_clear_error: Optional[str] = None
+
+    def __str__(self) -> str:
+        return self.message
+
+    def lower(self) -> str:
+        """Backward-compatible string-like helper for older tests/callers."""
+        return self.message.lower()
 
 
 class BootstrapService:
@@ -244,21 +265,25 @@ And how do you like to work together - quick and direct, or more room to think t
     async def get_discovery_history(self) -> List[Dict[str, str]]:
         """Get the discovery conversation history."""
         try:
-            result = await self.db.fetchall(
-                """
-                SELECT value FROM agent_metadata
-                WHERE agent_id = ? AND key = ?
-                """,
-                (self.agent_id, self.DISCOVERY_HISTORY_KEY),
-            )
-            if result:
-                return json.loads(result[0][0])
-            return []
+            return await self._load_discovery_history_strict()
         except Exception as e:
             logger.warning(f"Failed to get discovery history: {e}")
             return []
 
-    async def _save_discovery_history(self, history: List[Dict[str, str]]) -> None:
+    async def _load_discovery_history_strict(self) -> List[Dict[str, str]]:
+        """Load discovery history without swallowing DB or JSON errors."""
+        result = await self.db.fetchall(
+            """
+            SELECT value FROM agent_metadata
+            WHERE agent_id = ? AND key = ?
+            """,
+            (self.agent_id, self.DISCOVERY_HISTORY_KEY),
+        )
+        if result:
+            return json.loads(result[0][0])
+        return []
+
+    async def _save_discovery_history(self, history: List[Dict[str, str]]) -> bool:
         """Save the discovery conversation history."""
         try:
             now = datetime.now(timezone.utc)
@@ -269,8 +294,10 @@ And how do you like to work together - quick and direct, or more room to think t
                 """,
                 (self.agent_id, self.DISCOVERY_HISTORY_KEY, json.dumps(history), now),
             )
+            return True
         except Exception as e:
             logger.error(f"Failed to save discovery history: {e}")
+            return False
 
     async def _save_user_name(self, name: str) -> None:
         """Save the discovered user name."""
@@ -715,26 +742,59 @@ You can always customize me later with !restart-discovery, or just tell me your 
 
 What would you like to help with?"""
 
-    async def restart_discovery(self) -> str:
+    async def restart_discovery(self) -> RestartDiscoveryResult:
         """
         Reset and restart the discovery process.
 
         Returns:
-            Restart message
+            Structured reset result.
         """
         # Clear discovery history
-        await self._save_discovery_history([])
+        history_clear_error = None
+        save_ok = await self._save_discovery_history([])
+        if not save_ok:
+            history_clear_error = "failed to persist empty discovery history"
 
         # Reset state to pending
         await self.set_bootstrap_state(BootstrapState.PENDING)
+        state = await self.get_bootstrap_state()
+        state_reset = state == BootstrapState.PENDING
 
         # Delete existing SOUL.md if present
+        soul_deleted = False
+        soul_path_str = None
         if self.agent_data_path:
             soul_path = self.agent_data_path / "SOUL.md"
+            soul_path_str = str(soul_path)
             if soul_path.exists():
                 soul_path.unlink()
+                soul_deleted = True
+            else:
+                soul_deleted = True
 
-        return "Discovery reset! Send me a message to start fresh."
+        try:
+            history_after = await self._load_discovery_history_strict()
+            history_count_after = len(history_after)
+        except Exception as e:
+            history_count_after = -1
+            history_clear_error = f"failed to verify discovery history clear: {e}"
+
+        history_clear_succeeded = save_ok and history_count_after == 0
+        if save_ok and history_count_after > 0:
+            history_clear_error = (
+                f"discovery history still has {history_count_after} "
+                "persisted entr(ies) after reset"
+            )
+
+        return RestartDiscoveryResult(
+            message="Discovery reset! Send me a message to start fresh.",
+            history_clear_succeeded=history_clear_succeeded,
+            history_count_after=history_count_after,
+            state_reset=state_reset,
+            soul_deleted=soul_deleted,
+            soul_path=soul_path_str,
+            history_clear_error=history_clear_error,
+        )
 
     async def get_bootstrap_status(self) -> str:
         """Get human-readable bootstrap status."""
