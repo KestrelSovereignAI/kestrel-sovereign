@@ -25,6 +25,9 @@ import time
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.waits import run_wait_loop
+from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
+from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
 
@@ -79,6 +82,17 @@ class TaskFeature(Feature):
         """Initialize with task manager reference."""
         # Task manager will be set by server startup if available
         self.enabled = True
+
+    async def post_all_features_loaded(self, agent):
+        """Register the ``task:`` Waitable provider with the wait engine.
+
+        Lets ``wait("task:<task_id>")`` dispatch here, and lets the
+        Wave-2 reconciler enumerate this kind. ``wait_for_task`` calls
+        the engine directly and does not depend on this registration.
+        """
+        registry = getattr(agent, "wait_registry", None)
+        if registry is not None:
+            registry.register(TaskWaitable(self), replace=True)
 
     def set_task_manager(self, task_manager):
         """Set the A2A task manager for querying tasks."""
@@ -1282,98 +1296,71 @@ class TaskFeature(Feature):
         if not self.task_manager:
             return ToolResult.failed("Task manager not available")
 
-        try:
-            timeout_val = int(timeout_seconds)
-            poll_val = int(poll_interval)
-        except (TypeError, ValueError):
-            return ToolResult.failed(
-                f"timeout_seconds and poll_interval must be integers, "
-                f"got {timeout_seconds!r}, {poll_interval!r}"
-            )
-        if timeout_val < 0 or poll_val <= 0:
-            return ToolResult.failed(
-                "timeout_seconds must be >= 0 and poll_interval must be > 0"
-            )
-
-        elapsed = 0
-        last_status: Optional[str] = None
-        while elapsed < timeout_val:
-            data = await self._get_task_status_data(task_id)
-            if not data["ok"]:
-                return ToolResult.failed(
-                    data["error"],
-                    data={"task_id": task_id, "waited_seconds": elapsed},
-                )
-
-            last_status = data["status"]
-
-            if last_status == "completed":
-                return ToolResult.ok(
-                    confirmation=(
-                        f"Task {task_id[:8]} completed after {elapsed}s "
-                        f"({len(data['artifacts'])} artifact(s))"
-                    ),
-                    data={
-                        "task_id": data["task_id"],
-                        "status": "completed",
-                        "task_type": data["task_type"],
-                        "artifacts": data["artifacts"],
-                        "message": data["message"],
-                        "waited_seconds": elapsed,
-                    },
-                )
-
-            if last_status in ("failed", "canceled"):
-                return ToolResult.failed(
-                    data.get("message") or f"Task {last_status}",
-                    data={
-                        "task_id": data["task_id"],
-                        "status": last_status,
-                        "waited_seconds": elapsed,
-                    },
-                )
-
-            logger.info(f"Task {task_id} status: {last_status}, waiting...")
-            await asyncio.sleep(poll_val)
-            elapsed += poll_val
-
-        return ToolResult.failed(
-            f"Timeout after {timeout_val}s. Task status: {last_status}",
-            data={
-                "task_id": task_id,
-                "status": last_status,
-                "waited_seconds": elapsed,
-                "timeout_seconds": timeout_val,
-            },
+        # Thin wrapper over the generic wait engine: the TaskWaitable
+        # provider classifies one status read, the engine owns the loop,
+        # the cap, and the ToolResult mapping. ``wait_for_task`` keeps its
+        # name so existing callers keep working.
+        return await run_wait_loop(
+            TaskWaitable(self),
+            task_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval,
         )
 
     @tool(
         name="wait",
         description=(
-            "Pause for a bounded number of seconds, then resume — the "
-            "native alternative to shelling out to `sleep` between polls "
-            "in an autonomous work loop. Enforces a conservative maximum "
-            "duration and returns the observed elapsed time. This is the "
-            "generic wait; to block on a specific job use that feature's "
-            "own wait helper (e.g. talon_wait), and for a Kestrel "
-            "background task use wait_for_task."
+            "The one wait. Two modes:\n"
+            "• Pass `target` as `\"<kind>:<handle>\"` to block until that "
+            "thing reaches a terminal state — e.g. `\"talon:<job_id>\"`, "
+            "`\"task:<task_id>\"`. Polls the right feature's provider and "
+            "returns the terminal outcome (or a still-pending result on "
+            "timeout). This replaces the per-feature waiters (talon_wait, "
+            "wait_for_task).\n"
+            "• Pass `duration_seconds` with no target for a plain bounded "
+            "pause — the native alternative to shelling out to `sleep` "
+            "between polls in an autonomous loop.\n"
+            "Long unattended waits should use the signal-resume path, not "
+            "a held turn."
         ),
         category=ToolCategory.UTILITY,
         command_prefix="!wait",
     )
     async def wait(
         self,
-        duration_seconds: int,
+        target: str = "",
+        duration_seconds: int = 0,
+        timeout_seconds: int = 600,
+        poll_interval_seconds: int = 5,
         reason: str = "",
     ) -> ToolResult:
         """
-        Pause execution for a bounded duration without using a shell.
+        Block on a handle, or pause for a bounded duration.
 
         Args:
-            duration_seconds: Seconds to wait (0 to the enforced maximum).
-            reason: Optional human-readable note on why we are waiting
-                (recorded in the audited tool result).
+            target: ``"<kind>:<handle>"`` to wait on (e.g.
+                ``"talon:job_42"``). When set, ``duration_seconds`` is
+                ignored and the wait is driven by the registered provider.
+            duration_seconds: Seconds to pause when no ``target`` is given
+                (0 to the enforced maximum).
+            timeout_seconds: Max seconds to block on a ``target`` before
+                returning a still-pending result.
+            poll_interval_seconds: Seconds between polls of a ``target``.
+            reason: Optional human-readable note (recorded in the result).
         """
+        if target:
+            registry = getattr(self.agent, "wait_registry", None) if self.agent else None
+            if registry is None:
+                return ToolResult.failed(
+                    "wait engine unavailable: no wait_registry on the agent"
+                )
+            return await registry.wait(
+                target,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+
+        # No target: bounded idle pause (the legacy generic `wait`).
         try:
             duration = int(duration_seconds)
         except (TypeError, ValueError):

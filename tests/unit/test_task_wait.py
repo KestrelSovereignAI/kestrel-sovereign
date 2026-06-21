@@ -10,6 +10,12 @@ import pytest
 
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.tasks.feature import TaskFeature
+from kestrel_sovereign.waits import WaitRegistry
+
+
+class _StubAgent:
+    def __init__(self):
+        self.wait_registry = WaitRegistry()
 
 
 class TestGenericWait:
@@ -54,3 +60,56 @@ class TestGenericWait:
         result = await feature.wait(duration_seconds="soon")
         assert result.status is ToolResultStatus.ERROR
         assert "must be an integer" in result.error
+
+
+class TestUnifiedWaitTarget:
+    """The single `wait` tool dispatches `target="<kind>:<handle>"` to the
+    agent's wait_registry — the unified interface replacing per-feature
+    waiters."""
+
+    @pytest.mark.asyncio
+    async def test_target_dispatches_to_registry(self, monkeypatch):
+        agent = _StubAgent()
+        feature = TaskFeature(agent=None)
+        feature.agent = agent
+
+        # Register a TaskFeature provider whose status read is stubbed
+        # to "completed" so the engine returns OK immediately.
+        await feature.post_all_features_loaded(agent)
+
+        async def fake_status(task_id):
+            return {
+                "ok": True, "task_id": task_id, "status": "completed",
+                "task_type": "demo", "artifacts": [], "message": "done",
+            }
+
+        monkeypatch.setattr(feature, "_get_task_status_data", fake_status)
+        # The provider registered above wraps THIS feature instance, so
+        # the monkeypatched method is the one the engine polls.
+        result = await feature.wait(target="task:abc123", timeout_seconds=5)
+        assert result.status is ToolResultStatus.OK
+        assert result.data["ref"] == "task:abc123"
+
+    @pytest.mark.asyncio
+    async def test_target_without_registry_errors(self):
+        feature = TaskFeature(agent=None)
+        result = await feature.wait(target="task:abc", timeout_seconds=5)
+        assert result.status is ToolResultStatus.ERROR
+        assert "wait engine unavailable" in result.error
+
+    @pytest.mark.asyncio
+    async def test_unknown_kind_errors(self):
+        agent = _StubAgent()
+        feature = TaskFeature(agent=None)
+        feature.agent = agent
+        result = await feature.wait(target="bogus:xyz", timeout_seconds=5)
+        assert result.status is ToolResultStatus.ERROR
+        assert "no wait provider for kind 'bogus'" in result.error
+
+    @pytest.mark.asyncio
+    async def test_post_load_registers_task_provider(self):
+        agent = _StubAgent()
+        feature = TaskFeature(agent=None)
+        feature.agent = agent
+        await feature.post_all_features_loaded(agent)
+        assert "task" in agent.wait_registry.kinds()

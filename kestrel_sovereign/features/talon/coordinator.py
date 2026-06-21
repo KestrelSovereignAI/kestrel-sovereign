@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
+from kestrel_sovereign.waits import run_wait_loop
+from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 # Mesh is gone (#1367 phase 5). Talon dispatch now uses the A2A
 # task-submission path — same wire endpoint as send_a2a_task on
 # PeersFeature, but called directly because coordinator dispatch
@@ -323,6 +325,17 @@ class TalonCoordinatorFeature(Feature):
                         "TalonCoordinatorFeature could not register "
                         "talon.job_complete signal source: %s", e,
                     )
+
+    async def post_all_features_loaded(self, agent):
+        """Register the ``talon:`` Waitable provider with the wait engine.
+
+        Lets ``wait("talon:<job_id>")`` dispatch here, and lets the
+        Wave-2 reconciler enumerate this kind. ``talon_wait`` calls the
+        engine directly and does not depend on this registration.
+        """
+        registry = getattr(agent, "wait_registry", None)
+        if registry is not None:
+            registry.register(TalonWaitable(self), replace=True)
 
     # ------------------------------------------------------------------
     # Tools
@@ -2065,113 +2078,17 @@ class TalonCoordinatorFeature(Feature):
                 still-running (capped at the enforced maximum).
             poll_interval_seconds: Seconds between registry polls.
         """
-        try:
-            timeout_val = int(timeout_seconds)
-            poll_val = int(poll_interval_seconds)
-        except (TypeError, ValueError):
-            return ToolResult.failed(
-                "timeout_seconds and poll_interval_seconds must be "
-                f"integers, got {timeout_seconds!r}, "
-                f"{poll_interval_seconds!r}"
-            )
-        if timeout_val < 0 or poll_val <= 0:
-            return ToolResult.failed(
-                "timeout_seconds must be >= 0 and poll_interval_seconds "
-                "must be > 0"
-            )
-        if timeout_val > self._TALON_WAIT_MAX_SECONDS:
-            return ToolResult.failed(
-                f"timeout_seconds {timeout_val} exceeds the maximum "
-                f"{self._TALON_WAIT_MAX_SECONDS}s for talon_wait; rely on "
-                f"talon_monitor to wake the agent instead",
-                data={
-                    "job_id": job_id,
-                    "requested_seconds": timeout_val,
-                    "max_seconds": self._TALON_WAIT_MAX_SECONDS,
-                },
-            )
-
-        terminal_states = (
-            "complete", "failed", "reject", "finished_unknown",
+        # Thin wrapper over the generic wait engine: the TalonWaitable
+        # provider runs the same reap/reconcile single-step the legacy
+        # loop ran per iteration; the engine owns the loop, the cap, and
+        # the ToolResult mapping. Name kept so existing callers work.
+        return await run_wait_loop(
+            TalonWaitable(self),
+            job_id,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            max_seconds=self._TALON_WAIT_MAX_SECONDS,
         )
-
-        # Pull in CLI jobs persisted before a restart so a freshly
-        # reloaded feature can still wait on them.
-        self._reload_persisted_jobs()
-        if job_id not in self._jobs:
-            return ToolResult.failed(
-                f"Unknown job_id: {job_id}", data={"job_id": job_id},
-            )
-
-        # Resolve the host URL once so each poll can reconcile A2A jobs
-        # against Talon's task_store (the default dispatch transport);
-        # without this the loop only sees CLI-background transitions.
-        host_url = self._discover_host_url()
-
-        start = time.monotonic()
-        while True:
-            info = self._jobs.get(job_id)
-            if info is None:
-                return ToolResult.failed(
-                    f"Unknown job_id: {job_id}", data={"job_id": job_id},
-                )
-            changed = self._reap_cli_job(info)
-            if info.get("method") == "a2a" and host_url:
-                if await self._reconcile_a2a_job(job_id, info, host_url):
-                    changed = True
-            if changed:
-                self._persist_jobs()
-
-            status = info.get("status")
-            elapsed = int(time.monotonic() - start)
-
-            if status in terminal_states:
-                rc = info.get("returncode")
-                log_tail = self._tail_job_log(info.get("log_path"), lines=20)
-                data = {
-                    "job_id": job_id,
-                    "status": status,
-                    "returncode": rc,
-                    "waited_seconds": elapsed,
-                    "log_tail": log_tail,
-                    "timed_out": False,
-                }
-                if status == "complete":
-                    return ToolResult.ok(
-                        confirmation=(
-                            f"Talon job {job_id[:8]} completed after "
-                            f"{elapsed}s (rc={rc})"
-                        ),
-                        data=data,
-                    )
-                return ToolResult.failed(
-                    f"Talon job {job_id[:8]} ended in '{status}' after "
-                    f"{elapsed}s (rc={rc})",
-                    data=data,
-                )
-
-            if elapsed >= timeout_val:
-                log_tail = self._tail_job_log(info.get("log_path"), lines=20)
-                return ToolResult.partial(
-                    confirmation=(
-                        f"Talon job {job_id[:8]} still '{status}' after "
-                        f"{elapsed}s"
-                    ),
-                    error=(
-                        f"Timeout after {timeout_val}s; job not terminal"
-                    ),
-                    data={
-                        "job_id": job_id,
-                        "status": status,
-                        "returncode": info.get("returncode"),
-                        "waited_seconds": elapsed,
-                        "log_tail": log_tail,
-                        "timed_out": True,
-                        "timeout_seconds": timeout_val,
-                    },
-                )
-
-            await asyncio.sleep(poll_val)
 
     @tool(
         name="talon_monitor",
