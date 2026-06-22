@@ -104,6 +104,43 @@ async def test_streaming_text_real():
 
 
 @pytest.mark.asyncio
+async def test_vision_call_gpt55_real():
+    """Live multimodal smoke: Chat image_url input reaches Codex as an
+    input_image part and the model can answer from the image."""
+    adapter = CodexAdapter()
+    red_png = (
+        "data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4"
+        "z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+    )
+    try:
+        resp = await adapter.get_response(
+            client=None,
+            model="gpt-5.5",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Answer with one lowercase color word.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What color is this image?"},
+                        {"type": "image_url", "image_url": {"url": red_png}},
+                    ],
+                },
+            ],
+            session_id="it-vision-gpt55",
+        )
+    finally:
+        await adapter.aclose()
+
+    print(f"\nvision gpt-5.5: {resp.content!r}", file=sys.stderr)
+    assert isinstance(resp, LLMResponse)
+    assert "red" in (resp.content or "").lower()
+
+
+@pytest.mark.asyncio
 async def test_tool_call_round_trip_real():
     """The decisive end-to-end test: real subscription + dynamicTools +
     server-driven item/tool/call → our executor → result relayed back →

@@ -21,6 +21,16 @@ SESSION_GAP_OVERSAMPLE = 20
 MAX_CONVERSATION_LIST_ROWS = 1000
 
 
+def _public_metadata(meta):
+    """Return metadata safe for user-facing conversation history payloads."""
+    if not isinstance(meta, dict):
+        return {}
+    public = dict(meta)
+    public.pop("pre_tool_reasoning", None)
+    public.pop("key_version", None)
+    return public
+
+
 @router.get("/sessions")
 async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
     """List conversation sessions with summary info."""
@@ -28,6 +38,13 @@ async def list_sessions(request: Request, limit: int = Query(50, ge=1, le=500)):
         agent = get_agent(request)
         storage = agent.storage
         history = await storage.get_conversation_history(limit)
+        for message in history:
+            if "metadata" in message:
+                public_meta = _public_metadata(message.get("metadata"))
+                if public_meta:
+                    message["metadata"] = public_meta
+                else:
+                    message.pop("metadata", None)
         total_messages = len(history)
         user_messages = sum(1 for m in history if m.get("role") == "user")
         agent_messages = sum(1 for m in history if m.get("role") == "assistant")
@@ -309,7 +326,7 @@ async def get_conversation(request: Request, session_id: str, limit: int = Query
                 "role": role,
                 "content": display_content,
                 "encrypted": is_encrypted or decryption_failed,
-                "metadata": meta or {},
+                "metadata": _public_metadata(meta),
                 "created_at": timestamp.isoformat()
             })
 

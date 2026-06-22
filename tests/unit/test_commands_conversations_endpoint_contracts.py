@@ -261,6 +261,37 @@ def test_get_conversation_filters_session_markers_and_decrypts_messages():
         _restore_app(app, original)
 
 
+def test_get_conversation_filters_pre_tool_reasoning_from_metadata():
+    now = datetime(2026, 6, 22, 12, 0, 0)
+    metadata = {
+        "pre_tool_reasoning": {
+            "content": "I'll save that now.",
+            "seam": "\n\n",
+        },
+        "tool_results": [{"tool_call_id": "tc1", "name": "save_fact"}],
+    }
+    rows = [
+        (20, "assistant", "Saved after the tool confirmed it.", json.dumps(metadata), now),
+    ]
+    storage = MagicMock(agent_id="did:agent", encryption_enabled=False)
+    storage.query_conversation_start = AsyncMock(return_value=(now,))
+    storage.query_conversation_messages = AsyncMock(return_value=rows)
+    agent = MagicMock(storage=storage)
+
+    app, original = _prepare_app(agent)
+    try:
+        with patch.dict("os.environ", {"KESTREL_API_KEY": "test-key"}):
+            with TestClient(app) as client:
+                response = client.get("/api/conversations/20", headers=_api_headers())
+        assert response.status_code == 200
+        message = response.json()["messages"][0]
+        assert message["content"] == "Saved after the tool confirmed it."
+        assert "pre_tool_reasoning" not in message["metadata"]
+        assert message["metadata"]["tool_results"] == metadata["tool_results"]
+    finally:
+        _restore_app(app, original)
+
+
 def test_get_conversation_unwraps_sent_form_user_content():
     """Rows written with metadata.sent_form=True carry the full rendered
     sent-form (<retrieved_context>.../<user_input>... wrappers). The

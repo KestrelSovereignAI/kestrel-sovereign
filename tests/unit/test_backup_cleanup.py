@@ -1109,3 +1109,54 @@ async def test_lighthouse_delete_succeeds_with_list_deal_status(tmp_path):
     entries = [json.loads(l) for l in (tmp_path / "audit.jsonl").read_text().splitlines()]
     deleted = [e for e in entries if e["result"] == "deleted"]
     assert deleted and all(e.get("deal_expiry") == 999 for e in deleted)
+
+
+def test_include_quarantined_bulk_deletes_legacy_but_protects_live():
+    records = [
+        # legacy raw DB + bin, UNATTRIBUTED (the real ~147 GiB pile) - quarantine
+        _record("cid-rawdb", None, 900, store="lighthouse", name="kestrel_prime.db"),
+        _record("cid-bin", None, 900, store="lighthouse", name="blob.bin"),
+        # live manifest-referenced snapshot - must stay protected even under override
+        _record("cid-live", "agent-a", 900, store="lighthouse", name="export.car"),
+        _record("manifest-live", "agent-a", 1, store="lighthouse",
+                data_class=DataClass.IDENTITY, name="manifest_agent-a.json"),
+    ]
+    records[2].metadata["manifest_cid"] = "manifest-live"
+    records[3].metadata["manifest_cid"] = "manifest-live"
+
+    # Without override: legacy stays quarantined (kept).
+    plan_off = backup_cleanup.build_delete_plan(
+        records, _expire_everything_policy(), quarantine_state={"objects": {}},
+        include_quarantined=False, now=NOW)
+    assert "cid-rawdb" not in _delete_keys(plan_off)
+    assert "cid-bin" not in _delete_keys(plan_off)
+
+    # With override: legacy quarantine classes deleted; live snapshot protected.
+    plan_on = backup_cleanup.build_delete_plan(
+        records, _expire_everything_policy(), quarantine_state={"objects": {}},
+        include_quarantined=True, now=NOW)
+    deleted = _delete_keys(plan_on)
+    assert "cid-rawdb" in deleted
+    assert "cid-bin" in deleted
+    assert "cid-live" not in deleted  # live-manifest-referenced stays protected
+
+
+@pytest.mark.asyncio
+async def test_include_quarantined_actually_applies_deletes(tmp_path):
+    # Regression for the apply-gate: bulk_quarantined rows must pass _deletion_allowed.
+    records = [
+        _record("cid-rawdb", None, 900, store="lighthouse", name="kestrel_prime.db"),
+        _record("cid-bin", None, 900, store="lighthouse", name="x.bin"),
+    ]
+    for r in records:
+        r.metadata["id"] = f"file-{r.key}"
+    plan = backup_cleanup.build_delete_plan(
+        records, _expire_everything_policy(), quarantine_state={"objects": {}},
+        include_quarantined=True, now=NOW)
+    client = AsyncDeleteClient()
+    rc = await backup_cleanup.apply_plan(
+        plan, lighthouse_client=client,
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=tmp_path / "audit.jsonl")
+    assert rc == 0
+    assert set(client.deleted) == {"file-cid-rawdb", "file-cid-bin"}

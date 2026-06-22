@@ -17,6 +17,7 @@ from kestrel_sovereign.llm.adapter import LLMAdapter, LLMResponse, ThinkingDelta
 from kestrel_sovereign.llm.codex_adapter import (
     CodexAdapter,
     _build_turn_input,
+    _content_to_codex_input_parts,
     _convert_tools_to_codex_dynamic_tools,
     _extract_instructions_and_input,
     _result_to_codex_response,
@@ -140,6 +141,72 @@ class TestTurnInputBuilder:
         assert "Conversation so far" in out
         assert "user: first" in out and "assistant: ok" in out
         assert out.rstrip().endswith("second")
+
+    def test_image_url_parts_convert_to_responses_input_image(self):
+        out = _content_to_codex_input_parts([
+            {"type": "text", "text": "What is shown?"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,AAAA",
+                    "detail": "low",
+                },
+            },
+        ])
+        assert out == [
+            {"type": "input_text", "text": "What is shown?"},
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA",
+                "detail": "low",
+            },
+        ]
+
+    def test_multimodal_latest_user_returns_input_parts(self):
+        out = _build_turn_input(
+            [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }],
+            fresh_thread=False,
+        )
+        assert out == [
+            {"type": "input_text", "text": "Describe this"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]
+
+    def test_fresh_thread_keeps_transcript_then_multimodal_parts(self):
+        out = _build_turn_input(
+            [
+                {"role": "user", "content": "remember: tortoise"},
+                {"role": "assistant", "content": "ok"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What color is this?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,BBBB"},
+                        },
+                    ],
+                },
+            ],
+            fresh_thread=True,
+        )
+        assert isinstance(out, list)
+        assert out[0]["type"] == "input_text"
+        assert "Conversation so far" in out[0]["text"]
+        assert "user: remember: tortoise" in out[0]["text"]
+        assert out[1:] == [
+            {"type": "input_text", "text": "What color is this?"},
+            {"type": "input_image", "image_url": "data:image/png;base64,BBBB"},
+        ]
 
 
 class TestUsageProjection:
@@ -354,6 +421,33 @@ class TestAdapterTextPath:
         assert r.cache_read_input_tokens == 3
         cached_id, cached_fp = a._session_threads["s1"]
         assert cached_id == "thr-1" and cached_fp  # fingerprint set
+
+    @pytest.mark.asyncio
+    async def test_multimodal_user_turn_sends_input_image_part(self):
+        a = _adapter_with(_TEXT_TURN)
+        await a.get_response(
+            client="ignored",
+            model="auto",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    },
+                ],
+            }],
+            session_id="vision",
+        )
+        turn_params = [
+            params for method, params in a._client.requests
+            if method == "turn/start"
+        ][0]
+        assert turn_params["input"] == [
+            {"type": "input_text", "text": "Describe this image."},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+        ]
 
     @pytest.mark.asyncio
     async def test_session_thread_reused(self):

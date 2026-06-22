@@ -876,14 +876,14 @@ def test_in_tree_adapter_capability_matrix():
         ),
         CodexAdapter(): (
             True,
-            False,
+            True,
             False,
             False,
             None,
             None,
             StructuredOutputMode.NONE,
             ToolStreamingMode.INLINE_EXECUTOR,
-            VisionInputMode.NONE,
+            VisionInputMode.OPENAI_IMAGE_URL,
         ),
         MockAdapter(): (
             False,

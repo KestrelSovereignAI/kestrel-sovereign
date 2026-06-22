@@ -193,10 +193,11 @@ async def test_streaming_stop_hook_carries_tool_calls_and_results_when_tools_fir
     assert len(captured) == 1
     stop = captured[0]
     assert stop.user_message == "what's on #1238?"
-    # Visible response = pre-tool prose + post-tool synthesis (per the
-    # Meridian self-recall fix). STOP carries the same text.
-    assert "Looking that up." in (stop.response_text or "")
+    # Visible response = post-tool synthesis only (pre-tool prose was
+    # retracted via the "revising" event, per #1045). STOP carries the
+    # final user-visible text.
     assert "Found it." in (stop.response_text or "")
+    assert "Looking that up." not in (stop.response_text or "")
     # Tool calls derived from accumulated tool_results envelopes —
     # name/arguments/id line up by index.
     assert stop.tool_calls is not None and len(stop.tool_calls) == 1
