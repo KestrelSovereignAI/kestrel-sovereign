@@ -9,6 +9,7 @@ rather than continuous WAL polling.
 import asyncio
 import json
 import logging
+import sqlite3
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +45,8 @@ DENIED_PATH_PARTS = {
     "gcs-live-test",
     "codex-live-check",
 }
+
+DEFAULT_EMPTY_DB_WARNING_THRESHOLD = 5
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,7 @@ class SyncStats:
     total_syncs: int = 0
     successful_syncs: int = 0
     failed_syncs: int = 0
+    empty_database_syncs: int = 0
     bytes_synced: int = 0
     last_sync: Optional[datetime] = None
     last_error: Optional[str] = None
@@ -146,6 +150,7 @@ class SyncState:
                 "total_syncs": self.stats.total_syncs,
                 "successful_syncs": self.stats.successful_syncs,
                 "failed_syncs": self.stats.failed_syncs,
+                "empty_database_syncs": self.stats.empty_database_syncs,
                 "bytes_synced": self.stats.bytes_synced,
                 "last_sync": self.stats.last_sync.isoformat() if self.stats.last_sync else None,
                 "last_error": self.stats.last_error,
@@ -165,6 +170,7 @@ class SyncState:
                 total_syncs=stats_data.get("total_syncs", 0),
                 successful_syncs=stats_data.get("successful_syncs", 0),
                 failed_syncs=stats_data.get("failed_syncs", 0),
+                empty_database_syncs=stats_data.get("empty_database_syncs", 0),
                 bytes_synced=stats_data.get("bytes_synced", 0),
                 last_sync=datetime.fromisoformat(stats_data["last_sync"]) if stats_data.get("last_sync") else None,
                 last_error=stats_data.get("last_error"),
@@ -195,6 +201,7 @@ class SyncService:
         policy_context: Optional[RemoteTierPolicyContext] = None,
         policy_context_provider: Optional[Callable[[], RemoteTierPolicyContext]] = None,
         retention_policy: Optional[RetentionPolicy] = None,
+        empty_db_warning_threshold: int = DEFAULT_EMPTY_DB_WARNING_THRESHOLD,
     ):
         self.db_path = Path(db_path)
         self.state_file = Path(state_file) if state_file else Path(f"{db_path}.sync")
@@ -206,6 +213,7 @@ class SyncService:
         self._policy_context = policy_context
         self._policy_context_provider = policy_context_provider
         self._retention_policy = retention_policy or load_retention_policy()
+        self.empty_db_warning_threshold = empty_db_warning_threshold
         self._state: Optional[SyncState] = None
         self._poll_task: Optional[asyncio.Task] = None
 
@@ -410,6 +418,7 @@ class SyncService:
     async def force_snapshot(self) -> Dict[str, SyncResult]:
         """Snapshot to all targets. Called on shutdown, scheduled backup, or !backup."""
         results = dict(self._policy_skips)
+        successful_snapshots = 0
         for target in self._targets:
             if target.trust_tier in REMOTE_SYNC_TRUST_TIERS:
                 decision = self._remote_target_policy_decision()
@@ -425,6 +434,7 @@ class SyncService:
             try:
                 result = await target.sync_snapshot(self.db_path)
                 if result.success:
+                    successful_snapshots += 1
                     await self._prune_after_success(target, result)
                 results[target.name] = result
                 self._update_stats(result)
@@ -444,10 +454,96 @@ class SyncService:
                 )
 
         if self._state:
+            self._warn_if_repeated_empty_syncs(successful_snapshots)
             self._state.last_snapshot = datetime.now(timezone.utc)
             await self._save_state()
 
         return results
+
+    def _warn_if_repeated_empty_syncs(self, successful_snapshots: int) -> None:
+        if not self._state:
+            return
+        if successful_snapshots <= 0:
+            return
+        threshold = self.empty_db_warning_threshold
+        if threshold <= 0:
+            return
+        try:
+            is_empty_pending = self._database_is_empty_and_bootstrap_pending()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Empty database sync check skipped: %s", e)
+            return
+        if not is_empty_pending:
+            self._state.stats.empty_database_syncs = 0
+            return
+        self._state.stats.empty_database_syncs += successful_snapshots
+        if self._state.stats.empty_database_syncs < threshold:
+            return
+        logger.warning(
+            "Agent has been alive for %s syncs with no conversations. "
+            "Possible misconfiguration.",
+            self._state.stats.empty_database_syncs,
+        )
+
+    def _database_is_empty_and_bootstrap_pending(self) -> bool:
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conversations = self._table_row_count(conn, "conversation_history")
+            episodes = self._table_row_count(conn, "memory_episodes")
+            if conversations > 0 or episodes > 0:
+                return False
+            return self._bootstrap_state_is_pending(conn)
+
+    @staticmethod
+    def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()
+        return row is not None
+
+    @classmethod
+    def _table_row_count(cls, conn: sqlite3.Connection, table_name: str) -> int:
+        if not cls._table_exists(conn, table_name):
+            return 0
+        if table_name == "conversation_history":
+            row = conn.execute("SELECT COUNT(*) FROM conversation_history").fetchone()
+        elif table_name == "memory_episodes":
+            row = conn.execute("SELECT COUNT(*) FROM memory_episodes").fetchone()
+        else:
+            raise ValueError(f"unsupported table for sync health check: {table_name}")
+        return int(row[0]) if row else 0
+
+    @classmethod
+    def _bootstrap_state_is_pending(cls, conn: sqlite3.Connection) -> bool:
+        states: List[str] = []
+        if cls._table_exists(conn, "agent_metadata"):
+            rows = conn.execute(
+                """
+                SELECT value FROM agent_metadata
+                WHERE key = 'bootstrap_state'
+                """
+            ).fetchall()
+            states.extend(str(row[0]).strip().lower() for row in rows if row and row[0])
+
+        if cls._table_exists(conn, "graph_nodes"):
+            rows = conn.execute(
+                """
+                SELECT properties FROM graph_nodes
+                WHERE node_type = 'agent'
+                """
+            ).fetchall()
+            for row in rows:
+                if not row or not row[0]:
+                    continue
+                try:
+                    properties = json.loads(row[0])
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                state = properties.get("bootstrap_state")
+                if state:
+                    states.append(str(state).strip().lower())
+
+        return any(state == "pending" for state in states)
 
     async def _prune_after_success(
         self,

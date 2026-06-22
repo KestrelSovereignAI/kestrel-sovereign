@@ -19,6 +19,7 @@ PostgreSQL removal consideration.
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import pytest
 import signal
@@ -591,6 +592,225 @@ class TestChangeAwareSnapshot:
         result = await sync.force_snapshot()
         assert result[mock_target.name].success
         assert len(mock_target._state.uploads) > n
+        await sync.stop()
+
+
+def _create_agent_sync_health_db(
+    db_path: Path,
+    *,
+    bootstrap_state: str = "pending",
+    conversations: int = 0,
+    episodes: int = 0,
+    use_agent_metadata: bool = True,
+    use_graph_node: bool = False,
+) -> None:
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE conversation_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL DEFAULT '',
+                role TEXT NOT NULL,
+                content TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE memory_episodes (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                title TEXT NOT NULL
+            )
+            """
+        )
+        if use_agent_metadata:
+            conn.execute(
+                """
+                CREATE TABLE agent_metadata (
+                    agent_id TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (agent_id, key)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO agent_metadata (agent_id, key, value)
+                VALUES ('did:test:agent', 'bootstrap_state', ?)
+                """,
+                (bootstrap_state,),
+            )
+        if use_graph_node:
+            conn.execute(
+                """
+                CREATE TABLE graph_nodes (
+                    node_id TEXT PRIMARY KEY,
+                    node_type TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    properties TEXT
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO graph_nodes (node_id, node_type, label, properties)
+                VALUES ('did:test:agent', 'agent', 'TestAgent', ?)
+                """,
+                (json.dumps({"bootstrap_state": bootstrap_state}),),
+            )
+        for idx in range(conversations):
+            conn.execute(
+                """
+                INSERT INTO conversation_history (agent_id, role, content)
+                VALUES ('did:test:agent', 'user', ?)
+                """,
+                (f"message {idx}",),
+            )
+        for idx in range(episodes):
+            conn.execute(
+                """
+                INSERT INTO memory_episodes (id, agent_id, title)
+                VALUES (?, 'did:test:agent', ?)
+                """,
+                (f"episode-{idx}", f"Episode {idx}"),
+            )
+        conn.commit()
+
+
+class TestEmptyDatabaseSyncWarning:
+    """Repeated successful backups of an empty pending agent should surface
+    as an observability warning without failing the sync."""
+
+    @pytest.mark.asyncio
+    async def test_warns_after_threshold_for_empty_pending_agent(self, tmp_path, caplog):
+        db_path = tmp_path / "empty_agent.db"
+        _create_agent_sync_health_db(db_path)
+
+        sync = SyncService(
+            db_path=str(db_path),
+            state_file=str(tmp_path / "sync.state"),
+            empty_db_warning_threshold=3,
+        )
+        sync.add_target(MockSyncTarget())
+        await sync.start()
+
+        caplog.set_level(logging.WARNING, logger="kestrel_sovereign.storage.sync.service")
+        await sync.force_snapshot()
+        await sync.force_snapshot()
+        assert "Possible misconfiguration" not in caplog.text
+
+        results = await sync.force_snapshot()
+
+        assert results["mock_target"].success
+        assert sync.stats.empty_database_syncs == 3
+        assert (
+            "Agent has been alive for 3 syncs with no conversations. "
+            "Possible misconfiguration."
+        ) in caplog.text
+        await sync.stop()
+
+    @pytest.mark.asyncio
+    async def test_warns_when_pending_state_is_on_agent_graph_node(self, tmp_path, caplog):
+        db_path = tmp_path / "graph_agent.db"
+        _create_agent_sync_health_db(
+            db_path,
+            use_agent_metadata=False,
+            use_graph_node=True,
+        )
+
+        sync = SyncService(
+            db_path=str(db_path),
+            state_file=str(tmp_path / "sync.state"),
+            empty_db_warning_threshold=1,
+        )
+        sync.add_target(MockSyncTarget())
+        await sync.start()
+
+        caplog.set_level(logging.WARNING, logger="kestrel_sovereign.storage.sync.service")
+        await sync.force_snapshot()
+
+        assert "Agent has been alive for 1 syncs with no conversations." in caplog.text
+        await sync.stop()
+
+    @pytest.mark.asyncio
+    async def test_does_not_warn_when_conversation_history_exists(self, tmp_path, caplog):
+        db_path = tmp_path / "non_empty_agent.db"
+        _create_agent_sync_health_db(db_path, conversations=1)
+
+        sync = SyncService(
+            db_path=str(db_path),
+            state_file=str(tmp_path / "sync.state"),
+            empty_db_warning_threshold=2,
+        )
+        sync.add_target(MockSyncTarget())
+        await sync.start()
+
+        caplog.set_level(logging.WARNING, logger="kestrel_sovereign.storage.sync.service")
+        await sync.force_snapshot()
+        await sync.force_snapshot()
+
+        assert "Possible misconfiguration" not in caplog.text
+        await sync.stop()
+
+    @pytest.mark.asyncio
+    async def test_does_not_warn_when_bootstrap_is_not_pending(self, tmp_path, caplog):
+        db_path = tmp_path / "complete_agent.db"
+        _create_agent_sync_health_db(db_path, bootstrap_state="complete")
+
+        sync = SyncService(
+            db_path=str(db_path),
+            state_file=str(tmp_path / "sync.state"),
+            empty_db_warning_threshold=2,
+        )
+        sync.add_target(MockSyncTarget())
+        await sync.start()
+
+        caplog.set_level(logging.WARNING, logger="kestrel_sovereign.storage.sync.service")
+        await sync.force_snapshot()
+        await sync.force_snapshot()
+
+        assert "Possible misconfiguration" not in caplog.text
+        await sync.stop()
+
+    @pytest.mark.asyncio
+    async def test_counter_resets_when_database_becomes_non_empty(self, tmp_path, caplog):
+        db_path = tmp_path / "reset_agent.db"
+        _create_agent_sync_health_db(db_path)
+
+        sync = SyncService(
+            db_path=str(db_path),
+            state_file=str(tmp_path / "sync.state"),
+            empty_db_warning_threshold=3,
+        )
+        sync.add_target(MockSyncTarget())
+        await sync.start()
+
+        caplog.set_level(logging.WARNING, logger="kestrel_sovereign.storage.sync.service")
+        await sync.force_snapshot()
+        await sync.force_snapshot()
+        assert sync.stats.empty_database_syncs == 2
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute(
+                """
+                INSERT INTO conversation_history (agent_id, role, content)
+                VALUES ('did:test:agent', 'user', 'hello')
+                """
+            )
+            conn.commit()
+        await sync.force_snapshot()
+        assert sync.stats.empty_database_syncs == 0
+
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.execute("DELETE FROM conversation_history")
+            conn.commit()
+        await sync.force_snapshot()
+
+        assert sync.stats.empty_database_syncs == 1
+        assert "Possible misconfiguration" not in caplog.text
         await sync.stop()
 
 
@@ -1644,6 +1864,7 @@ class TestSyncState:
                 total_syncs=10,
                 successful_syncs=8,
                 failed_syncs=2,
+                empty_database_syncs=4,
                 bytes_synced=1024,
                 last_sync=now,
                 last_error="test error",
@@ -1659,6 +1880,7 @@ class TestSyncState:
         assert restored.stats.total_syncs == original.stats.total_syncs
         assert restored.stats.successful_syncs == original.stats.successful_syncs
         assert restored.stats.failed_syncs == original.stats.failed_syncs
+        assert restored.stats.empty_database_syncs == original.stats.empty_database_syncs
         assert restored.stats.bytes_synced == original.stats.bytes_synced
         assert restored.stats.last_error == original.stats.last_error
 
@@ -1672,6 +1894,7 @@ class TestSyncState:
         assert restored.stats.total_syncs == 0
         assert restored.stats.successful_syncs == 0
         assert restored.stats.failed_syncs == 0
+        assert restored.stats.empty_database_syncs == 0
 
 
 # =============================================================================
