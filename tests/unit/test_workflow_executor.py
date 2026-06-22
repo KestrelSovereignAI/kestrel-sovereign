@@ -658,8 +658,8 @@ class TestRunWorkflowSemanticHonesty:
 
     @pytest.mark.asyncio
     async def test_check_task_status_artifact_is_json_serializable(self, task_feature):
-        """Round 6 finding: check_task_status / get_task_result / wait_for_task
-        all read task artifacts. A migrated @tool's artifact data can
+        """Round 6 finding: check_task_status / get_task_result and the task
+        waitable all read task artifacts. A migrated @tool's artifact data can
         carry a raw ToolResult inside the DynamicTool wrapper. Returning
         part.data unchanged would embed the raw object inside this
         tool's ToolResult.data, breaking the wire's JSON serialization.

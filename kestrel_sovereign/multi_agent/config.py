@@ -31,6 +31,10 @@ MANDATORY_FEATURES = frozenset({
     "SecurityFeature",
     "PeersFeature",
     "ConstitutionFeature",
+    # The single generic `wait` tool lives in its own mandatory feature so it
+    # is always present — independent of optional features like Tasks/Talon
+    # that register waitable providers (#1860 clean cutover).
+    "WaitFeature",
 })
 
 

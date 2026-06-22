@@ -27,8 +27,6 @@ from typing import Any, Dict, List, Optional
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.waits import run_wait_loop
-from kestrel_sovereign.waits.reconciler import register_wait_watch
 from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
 # Mesh is gone (#1367 phase 5). Talon dispatch now uses the A2A
 # task-submission path — same wire endpoint as send_a2a_task on
@@ -269,13 +267,6 @@ class TalonCoordinatorFeature(Feature):
     and checking status. Prefers mesh dispatch over CLI fallback.
     """
 
-    # Conservative ceiling on a single blocking ``talon_wait``. Waits
-    # longer than this should rely on the generic wait reconciler cron
-    # signal to wake the agent rather than holding a turn open. The
-    # reconciler drives the talon.job_complete wake via TalonWaitable
-    # (Wave 2 of #1860) — the talon-specific talon_monitor cron is retired.
-    _TALON_WAIT_MAX_SECONDS = 3600
-
     def __init__(self, agent):
         super().__init__(agent)
         # message_id -> {pid, started_at, log_path, command, repo,
@@ -324,9 +315,9 @@ class TalonCoordinatorFeature(Feature):
     async def post_all_features_loaded(self, agent):
         """Register the ``talon:`` Waitable provider with the wait engine.
 
-        Lets ``wait("talon:<job_id>")`` dispatch here, and lets the
-        Wave-2 reconciler enumerate this kind. ``talon_wait`` calls the
-        engine directly and does not depend on this registration.
+        Lets the generic ``wait("talon:<job_id>")`` tool dispatch here, and
+        lets the wait reconciler enumerate in-flight jobs for auto-wake /
+        signal-resume.
         """
         registry = getattr(agent, "wait_registry", None)
         if registry is not None:
@@ -2094,77 +2085,6 @@ class TalonCoordinatorFeature(Feature):
         )
 
     @tool(
-        name="talon_wait",
-        description=(
-            "Block the current turn until a specific Talon job reaches a "
-            "terminal state (complete/failed/finished_unknown) or the "
-            "timeout expires, polling the durable job registry instead "
-            "of shelling out to `sleep`. Returns the terminal status, "
-            "the return code when known, a log tail, and timeout "
-            "metadata if the job is still running. Use this when "
-            "actively supervising a job this turn; the generic wait "
-            "reconciler cron (signal path) handles unattended completions. "
-            "Pass mode='signal' to register a watch and return immediately "
-            "instead of holding the turn (talon is already auto-monitored, "
-            "so this is mostly for symmetry with the generic wait tool)."
-        ),
-        category=ToolCategory.UTILITY,
-        command_prefix="!talon wait",
-    )
-    async def talon_wait(
-        self,
-        job_id: str,
-        timeout_seconds: int = 600,
-        poll_interval_seconds: int = 10,
-        mode: str = "block",
-    ) -> ToolResult:
-        """Wait for a dispatched Talon job to finish.
-
-        Args:
-            job_id: The job_id returned by talon_claim.
-            timeout_seconds: Maximum seconds to wait before returning
-                still-running (capped at the enforced maximum).
-            poll_interval_seconds: Seconds between registry polls.
-            mode: ``"block"`` (default) holds the turn polling until the job
-                is terminal; ``"signal"`` registers a watch and returns
-                immediately, waking the agent via a signal on completion.
-        """
-        mode = str(mode).strip().lower() if mode else "block"
-        if mode not in ("block", "signal"):
-            return ToolResult.failed(
-                f"mode must be 'block' or 'signal', got {mode!r}"
-            )
-
-        if mode == "signal":
-            # Register a watch and return immediately. talon is already
-            # auto-monitored via active_handles, so this is redundant for
-            # talon specifically, but it keeps the interface symmetric and
-            # still wakes the agent on completion.
-            try:
-                await register_wait_watch(self.agent, f"talon:{job_id}")
-            except ValueError as exc:
-                return ToolResult.failed(str(exc))
-            return ToolResult.ok(
-                confirmation=(
-                    f"Watching talon:{job_id}; will wake on completion via "
-                    f"the wait reconciler"
-                ),
-                data={"ref": f"talon:{job_id}", "mode": "signal", "watching": True},
-            )
-
-        # Thin wrapper over the generic wait engine: the TalonWaitable
-        # provider runs the same reap/reconcile single-step the legacy
-        # loop ran per iteration; the engine owns the loop, the cap, and
-        # the ToolResult mapping. Name kept so existing callers work.
-        return await run_wait_loop(
-            TalonWaitable(self),
-            job_id,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
-            max_seconds=self._TALON_WAIT_MAX_SECONDS,
-        )
-
-    @tool(
         name="talon_pause",
         description="Pause the autonomous Talon loop (kill switch).",
         category=ToolCategory.SYSTEM,
@@ -2573,7 +2493,8 @@ class TalonCoordinatorFeature(Feature):
         caller knows to re-persist the registry. No-op (returns
         ``False``) for jobs that are not ``cli_background`` or are no
         longer in ``dispatched``/``running``. Shared by ``talon_status``
-        and ``talon_wait`` so the reaping logic lives in one place.
+        and the ``TalonWaitable`` provider so the reaping logic lives in
+        one place.
         """
         if info.get("method") != "cli_background":
             return False
@@ -2628,8 +2549,8 @@ class TalonCoordinatorFeature(Feature):
         the persisted state changed so the caller knows to re-persist the
         registry. No-op (returns ``False``) for jobs that are not ``a2a``,
         are no longer ``dispatched``/``running``, or when the network
-        query fails. Shared by ``talon_status`` and ``talon_wait`` so the
-        A2A reconciliation lives in one place — mirroring ``_reap_cli_job``
+        query fails. Shared by ``talon_status`` and the ``TalonWaitable``
+        provider so the A2A reconciliation lives in one place — mirroring ``_reap_cli_job``
         for the CLI transport.
         """
         if info.get("method") != "a2a":

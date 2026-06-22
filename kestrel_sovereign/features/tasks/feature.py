@@ -25,9 +25,6 @@ import time
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.waits import run_wait_loop
-from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
-from kestrel_sovereign.waits.reconciler import register_wait_watch
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult, ToolResultStatus
@@ -54,10 +51,6 @@ class TaskFeature(Feature):
     - Monitor async operations (selfie generation, LoRA training, etc.)
     - Query task status and results
     """
-
-    # Conservative ceiling on a single blocking ``wait``. A pause longer
-    # than this should be a scheduled/cron resume, not a held agent turn.
-    _MAX_WAIT_SECONDS = 1800
 
     def __init__(self, agent=None):
         if agent is not None:
@@ -87,9 +80,8 @@ class TaskFeature(Feature):
     async def post_all_features_loaded(self, agent):
         """Register the ``task:`` Waitable provider with the wait engine.
 
-        Lets ``wait("task:<task_id>")`` dispatch here, and lets the
-        Wave-2 reconciler enumerate this kind. ``wait_for_task`` calls
-        the engine directly and does not depend on this registration.
+        Lets the generic ``wait("task:<task_id>")`` tool dispatch here, and
+        lets the wait reconciler enumerate this kind for signal-resume.
         """
         registry = getattr(agent, "wait_registry", None)
         if registry is not None:
@@ -105,9 +97,8 @@ class TaskFeature(Feature):
     #
     # The @tool methods are thin ToolResult-returning wrappers around
     # these dict-returning helpers. Keeping the helpers private means
-    # tools that invoke other tools internally (e.g. ``wait_for_task``
-    # polling ``check_task_status``) don't have to unpack a ToolResult
-    # envelope just to read state.
+    # internal callers (e.g. the TaskWaitable provider reading task status)
+    # don't have to unpack a ToolResult envelope just to read state.
     # ------------------------------------------------------------------
 
     async def _get_task_status_data(self, task_id: str) -> Dict[str, Any]:
@@ -178,9 +169,9 @@ class TaskFeature(Feature):
                             # ToolResult inside the DynamicTool wrapper
                             # (only serialized on wire output, not on
                             # in-process reads). Serialize here so
-                            # check_task_status / get_task_result /
-                            # wait_for_task all return JSON-clean
-                            # payloads. Round 6 codex finding.
+                            # check_task_status / get_task_result and the
+                            # task waitable all read JSON-clean payloads.
+                            # Round 6 codex finding.
                             artifact_data["data"] = self._serialize_step_payload(
                                 part.data
                             )
@@ -1270,180 +1261,6 @@ class TaskFeature(Feature):
                 "task_id": task_id,
                 "status": "canceled",
                 "status_before": current_state,
-                "reason": reason,
-            },
-        )
-
-    @tool(
-        name="wait_for_task",
-        description="Wait for a task to complete and return its result.",
-        category=ToolCategory.UTILITY,
-        command_prefix="!wait-task"
-    )
-    async def wait_for_task(
-        self,
-        task_id: str,
-        timeout_seconds: int = 300,
-        poll_interval: int = 5
-    ) -> ToolResult:
-        """
-        Wait for a task to complete.
-
-        Args:
-            task_id: The task ID to wait for
-            timeout_seconds: Maximum time to wait (default 5 minutes)
-            poll_interval: Seconds between status checks
-        """
-        if not self.task_manager:
-            return ToolResult.failed("Task manager not available")
-
-        # Thin wrapper over the generic wait engine: the TaskWaitable
-        # provider classifies one status read, the engine owns the loop,
-        # the cap, and the ToolResult mapping. ``wait_for_task`` keeps its
-        # name so existing callers keep working.
-        return await run_wait_loop(
-            TaskWaitable(self),
-            task_id,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval,
-        )
-
-    @tool(
-        name="wait",
-        description=(
-            "The one wait. Two modes:\n"
-            "• Pass `target` as `\"<kind>:<handle>\"` to block until that "
-            "thing reaches a terminal state — e.g. `\"talon:<job_id>\"`, "
-            "`\"task:<task_id>\"`. Polls the right feature's provider and "
-            "returns the terminal outcome (or a still-pending result on "
-            "timeout). This replaces the per-feature waiters (talon_wait, "
-            "wait_for_task).\n"
-            "• Pass `duration_seconds` with no target for a plain bounded "
-            "pause — the native alternative to shelling out to `sleep` "
-            "between polls in an autonomous loop.\n"
-            "`mode` controls how a `target` wait behaves:\n"
-            "• `mode=\"block\"` (default) holds the turn, polling until the "
-            "target is terminal or the timeout expires.\n"
-            "• `mode=\"signal\"` registers a watch and returns IMMEDIATELY — "
-            "the wait reconciler wakes you with a `wait.complete` cognition "
-            "signal once the target finishes. Use this for long/unattended "
-            "waits so you don't hold a turn. Requires a `target`.\n"
-            "Long unattended waits should use the signal-resume path "
-            "(`mode=\"signal\"`), not a held turn."
-        ),
-        category=ToolCategory.UTILITY,
-        command_prefix="!wait",
-    )
-    async def wait(
-        self,
-        target: str = "",
-        duration_seconds: int = 0,
-        timeout_seconds: int = 600,
-        poll_interval_seconds: int = 5,
-        reason: str = "",
-        mode: str = "block",
-    ) -> ToolResult:
-        """
-        Block on a handle, or pause for a bounded duration.
-
-        Args:
-            target: ``"<kind>:<handle>"`` to wait on (e.g.
-                ``"talon:job_42"``). When set, ``duration_seconds`` is
-                ignored and the wait is driven by the registered provider.
-            duration_seconds: Seconds to pause when no ``target`` is given
-                (0 to the enforced maximum).
-            timeout_seconds: Max seconds to block on a ``target`` before
-                returning a still-pending result.
-            poll_interval_seconds: Seconds between polls of a ``target``.
-            reason: Optional human-readable note (recorded in the result).
-            mode: ``"block"`` (default) holds the turn until the target is
-                terminal; ``"signal"`` registers a watch and returns
-                immediately, waking the agent via a ``wait.complete`` signal
-                when the target finishes (requires a ``target``).
-        """
-        mode = str(mode).strip().lower() if mode else "block"
-        if mode not in ("block", "signal"):
-            return ToolResult.failed(
-                f"mode must be 'block' or 'signal', got {mode!r}"
-            )
-
-        # The first positional accepts BOTH forms so the interface stays
-        # one tool: `!wait 5` (bare number) is a bounded sleep, while
-        # `!wait talon:job_42` is a handle wait. parse_command_args binds
-        # positional CLI tokens in signature order, so a numeric target is
-        # the legacy `!wait <seconds>` command — route it to the pause.
-        target = str(target).strip() if target else ""
-        if target and target.lstrip("-").isdigit():
-            duration_seconds = int(target)
-            target = ""
-
-        if mode == "signal" and not target:
-            return ToolResult.failed(
-                "mode='signal' requires a target handle (e.g. "
-                "'task:<id>'); a bare duration sleep cannot be signalled"
-            )
-
-        if target:
-            if mode == "signal":
-                # Register a watch and return immediately — the reconciler
-                # wakes the agent with a wait.complete signal on completion.
-                try:
-                    await register_wait_watch(self.agent, target)
-                except ValueError as exc:
-                    return ToolResult.failed(str(exc))
-                return ToolResult.ok(
-                    confirmation=(
-                        f"Watching {target}; will wake on completion via "
-                        f"wait.complete"
-                    ),
-                    data={"ref": target, "mode": "signal", "watching": True},
-                )
-
-            registry = getattr(self.agent, "wait_registry", None) if self.agent else None
-            if registry is None:
-                return ToolResult.failed(
-                    "wait engine unavailable: no wait_registry on the agent"
-                )
-            return await registry.wait(
-                target,
-                timeout_seconds=timeout_seconds,
-                poll_interval_seconds=poll_interval_seconds,
-            )
-
-        # No target: bounded idle pause (the legacy generic `wait`).
-        try:
-            duration = int(duration_seconds)
-        except (TypeError, ValueError):
-            return ToolResult.failed(
-                f"duration_seconds must be an integer, got {duration_seconds!r}"
-            )
-        if duration < 0:
-            return ToolResult.failed(
-                f"duration_seconds must be >= 0, got {duration}"
-            )
-        if duration > self._MAX_WAIT_SECONDS:
-            return ToolResult.failed(
-                f"duration_seconds {duration} exceeds the maximum "
-                f"{self._MAX_WAIT_SECONDS}s for a single wait; schedule a "
-                f"resume instead of holding the turn",
-                data={
-                    "requested_seconds": duration,
-                    "max_seconds": self._MAX_WAIT_SECONDS,
-                },
-            )
-
-        start = time.monotonic()
-        await asyncio.sleep(duration)
-        elapsed = round(time.monotonic() - start, 3)
-
-        confirmation = f"Waited {elapsed}s"
-        if reason:
-            confirmation += f" ({reason})"
-        return ToolResult.ok(
-            confirmation=confirmation,
-            data={
-                "requested_seconds": duration,
-                "elapsed_seconds": elapsed,
                 "reason": reason,
             },
         )

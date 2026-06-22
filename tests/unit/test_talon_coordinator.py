@@ -7,6 +7,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from kestrel_sdk.tools.result import ToolResultStatus
 from kestrel_sovereign.features.talon.coordinator import TalonCoordinatorFeature
 from kestrel_sovereign.features.talon.verification import CommandExecution
+from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
+from kestrel_sovereign.waits import run_wait_loop
+from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 
 
 def _make_agent():
@@ -339,10 +342,24 @@ class TestCLIDispatch:
 
 
 class TestTalonWait:
+    """The TalonWaitable provider driven by the generic engine.
+
+    There is no `talon_wait` tool any more — talon jobs are waited on via the
+    single generic `wait("talon:<job_id>")` tool, which dispatches to this
+    provider through the WaitRegistry. These tests exercise the same code path
+    by calling ``run_wait_loop(TalonWaitable(feature), job_id, ...)`` directly
+    (what the registry does), so the talon-specific reap/reconcile/terminal
+    behavior stays covered.
+    """
+
+    @staticmethod
+    async def _wait(feature, job_id, **kw):
+        return await run_wait_loop(TalonWaitable(feature), job_id, **kw)
+
     @pytest.mark.asyncio
     async def test_unknown_job(self):
         feature = TalonCoordinatorFeature(_make_agent())
-        result = await feature.talon_wait(job_id="nope", timeout_seconds=0)
+        result = await self._wait(feature, "nope", timeout_seconds=0)
         assert result.status is ToolResultStatus.ERROR
         assert "Unknown job_id" in result.error
 
@@ -357,8 +374,8 @@ class TestTalonWait:
             "returncode": 0,
             "log_path": str(log),
         }
-        result = await feature.talon_wait(
-            job_id="job-x", timeout_seconds=30, poll_interval_seconds=1,
+        result = await self._wait(
+            feature, "job-x", timeout_seconds=30, poll_interval_seconds=1,
         )
         assert result.status is ToolResultStatus.OK
         assert result.data["status"] == "complete"
@@ -374,9 +391,7 @@ class TestTalonWait:
             "status": "failed",
             "returncode": 2,
         }
-        result = await feature.talon_wait(
-            job_id="job-f", timeout_seconds=30,
-        )
+        result = await self._wait(feature, "job-f", timeout_seconds=30)
         assert result.status is ToolResultStatus.ERROR
         assert result.data["status"] == "failed"
         assert result.data["returncode"] == 2
@@ -389,8 +404,8 @@ class TestTalonWait:
         # 'running'; timeout_seconds=0 returns after a single poll with
         # no sleep.
         feature._jobs["job-r"] = {"method": "a2a", "status": "running"}
-        result = await feature.talon_wait(
-            job_id="job-r", timeout_seconds=0, poll_interval_seconds=1,
+        result = await self._wait(
+            feature, "job-r", timeout_seconds=0, poll_interval_seconds=1,
         )
         assert result.status is ToolResultStatus.PARTIAL
         assert result.data["status"] == "running"
@@ -401,15 +416,12 @@ class TestTalonWait:
     async def test_max_duration_rejected(self):
         feature = TalonCoordinatorFeature(_make_agent())
         feature._jobs["job-r"] = {"method": "a2a", "status": "running"}
-        too_long = TalonCoordinatorFeature._TALON_WAIT_MAX_SECONDS + 1
-        result = await feature.talon_wait(
-            job_id="job-r", timeout_seconds=too_long,
-        )
+        # The engine caps a held wait at MAX_HANDLE_WAIT_SECONDS.
+        too_long = MAX_HANDLE_WAIT_SECONDS + 1
+        result = await self._wait(feature, "job-r", timeout_seconds=too_long)
         assert result.status is ToolResultStatus.ERROR
         assert "exceeds the maximum" in result.error
-        assert result.data["max_seconds"] == (
-            TalonCoordinatorFeature._TALON_WAIT_MAX_SECONDS
-        )
+        assert result.data["max_seconds"] == MAX_HANDLE_WAIT_SECONDS
 
     @pytest.mark.asyncio
     async def test_reaps_cli_job_via_sidecar(self, tmp_path):
@@ -431,8 +443,8 @@ class TestTalonWait:
             "exit_path": str(exit_file),
             "pid": 999999,
         }
-        result = await feature.talon_wait(
-            job_id="job-s", timeout_seconds=30, poll_interval_seconds=1,
+        result = await self._wait(
+            feature, "job-s", timeout_seconds=30, poll_interval_seconds=1,
         )
         assert result.status is ToolResultStatus.OK
         assert result.data["status"] == "complete"
@@ -465,8 +477,8 @@ class TestTalonWait:
             "kestrel_sovereign.features.talon.coordinator.urllib.request.urlopen",
             return_value=_Resp(),
         ):
-            result = await feature.talon_wait(
-                job_id="job-a", timeout_seconds=30, poll_interval_seconds=1,
+            result = await self._wait(
+                feature, "job-a", timeout_seconds=30, poll_interval_seconds=1,
             )
         assert result.status is ToolResultStatus.OK
         assert result.data["status"] == "complete"
@@ -496,54 +508,13 @@ class TestTalonWait:
             "kestrel_sovereign.features.talon.coordinator.urllib.request.urlopen",
             return_value=_Resp(),
         ):
-            result = await feature.talon_wait(
-                job_id="job-b", timeout_seconds=30, poll_interval_seconds=1,
+            result = await self._wait(
+                feature, "job-b", timeout_seconds=30, poll_interval_seconds=1,
             )
         assert result.status is ToolResultStatus.ERROR
         assert result.data["status"] == "failed"
         assert result.data["timed_out"] is False
         assert feature._jobs["job-b"]["error"] == "boom"
-
-    @pytest.mark.asyncio
-    async def test_talon_wait_mode_signal_returns_immediately(self, tmp_path):
-        """mode='signal' registers a watch and returns immediately instead of
-        holding the turn. talon is also auto-monitored via active_handles, so
-        this is mostly symmetry, but it must still work + persist a watch."""
-        from types import SimpleNamespace
-
-        from kestrel_sovereign.storage.async_database import AsyncDatabase
-        from kestrel_sovereign.waits import WaitRegistry
-        from kestrel_sovereign.features.talon.wait_provider import TalonWaitable
-
-        db = await AsyncDatabase.sqlite(str(tmp_path / "agent.db"))
-        registry = WaitRegistry()
-        agent = SimpleNamespace(
-            did="did:test:agent",
-            agent_id="did:test:agent",
-            agent_name="kestrel",
-            _features=[],
-            _scheduler=MagicMock(),
-            _raw_storage=SimpleNamespace(db=db),
-            wait_registry=registry,
-        )
-        feature = TalonCoordinatorFeature(agent)
-        registry.register(TalonWaitable(feature))
-
-        result = await feature.talon_wait(job_id="job-z", mode="signal")
-        assert result.status is ToolResultStatus.OK
-        assert result.data["mode"] == "signal"
-        assert result.data["watching"] is True
-        assert result.data["ref"] == "talon:job-z"
-
-        watched = await agent._wait_reconciler._store.list_watched()
-        assert {(w.kind, w.handle) for w in watched} == {("talon", "job-z")}
-
-    @pytest.mark.asyncio
-    async def test_talon_wait_invalid_mode_errors(self):
-        feature = TalonCoordinatorFeature(_make_agent())
-        result = await feature.talon_wait(job_id="job-z", mode="bogus")
-        assert result.status is ToolResultStatus.ERROR
-        assert "mode must be 'block' or 'signal'" in result.error
 
     @pytest.mark.asyncio
     async def test_active_handles_includes_terminal_jobs(self):
