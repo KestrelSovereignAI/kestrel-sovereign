@@ -1071,3 +1071,41 @@ def test_gcs_raw_db_outside_snapshots_stays_quarantine():
         backup_cleanup.classify_inventory_record(raw).inventory_class
         == "legacy_private_candidate"
     )
+
+
+def test_deal_expiry_from_status_handles_list_response():
+    # Real Lighthouse deal_status returns a LIST of deals, not a dict.
+    assert backup_cleanup._deal_expiry_from_status(
+        [{"dealId": 1, "dealExpiry": 4000000}, {"dealId": 2}]
+    ) == 4000000
+    # dict with nested deals list still works.
+    assert backup_cleanup._deal_expiry_from_status(
+        {"deals": [{"endEpoch": 12345}]}
+    ) == 12345
+    # garbage shapes never raise.
+    assert backup_cleanup._deal_expiry_from_status("nope") is None
+    assert backup_cleanup._deal_expiry_from_status([]) is None
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_delete_succeeds_with_list_deal_status(tmp_path):
+    rows = [_attributed_snapshot("cid-a", "agent-a", 900),
+            _attributed_snapshot("cid-new", "agent-a", 1)]
+    plan = backup_cleanup.build_delete_plan(
+        rows, _expire_everything_policy(), quarantine_state={"objects": {}}, now=NOW
+    )
+
+    class ListDealClient(AsyncDeleteClient):
+        async def get_deal_status(self, cid):
+            return [{"dealId": 7, "dealExpiry": 999}]  # list, like the real API
+
+    rc = await backup_cleanup.apply_plan(
+        plan,
+        lighthouse_client=ListDealClient(),
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=tmp_path / "audit.jsonl",
+    )
+    assert rc == 0
+    entries = [json.loads(l) for l in (tmp_path / "audit.jsonl").read_text().splitlines()]
+    deleted = [e for e in entries if e["result"] == "deleted"]
+    assert deleted and all(e.get("deal_expiry") == 999 for e in deleted)
