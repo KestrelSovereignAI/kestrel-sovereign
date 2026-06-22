@@ -523,13 +523,23 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
 
             deletions = policy.deletions(items)
             deleted = []
+            skipped_missing_id = 0
             for item in deletions:
-                await client.delete_file(item.key)
+                file_id = item.metadata.get("id")
+                if not file_id:
+                    skipped_missing_id += 1
+                    logger.warning(
+                        "Skipping Lighthouse prune delete for %s without file id",
+                        item.key,
+                    )
+                    continue
+                await client.delete_file(str(file_id))
                 deleted.append(item.key)
             return {
                 "deleted": len(deleted),
                 "cids": deleted,
                 "scanned": len(items),
+                "skipped_missing_id": skipped_missing_id,
             }
         finally:
             await client.close()
