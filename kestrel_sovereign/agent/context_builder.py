@@ -473,6 +473,17 @@ Use `!constitution article <N>` for specific articles, or `!constitution search 
             else:
                 content = rendered_content if (rendered_content is not None) else raw_content
 
+            if role == 'assistant' and meta.get('pre_tool_reasoning'):
+                pre_tool = meta.get('pre_tool_reasoning') or {}
+                if isinstance(pre_tool, dict):
+                    pre_text = pre_tool.get('content') or ''
+                    seam = pre_tool.get('seam') or ''
+                else:
+                    pre_text = str(pre_tool)
+                    seam = "\n\n" if pre_text and content else ""
+                if pre_text:
+                    content = f"{pre_text}{seam}{content}"
+
             # Per-message hard cap (against the emit bytes — what actually
             # goes to the LLM) before budget accounting.
             content, content_tokens = self._cap_oversized_message(content, msg_id)
