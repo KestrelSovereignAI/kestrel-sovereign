@@ -86,7 +86,10 @@ async def test_sovereign_can_run_reanchor():
     handler, agent = _make_handler()
     agent.reanchor_constitution = AsyncMock(return_value="Constitution re-anchored successfully.\n  Old hash: abc...\n  New hash: def...")
 
-    result = await handler.handle("!reanchor-constitution abcdef12", caller=CallerContext.sovereign())
+    result = await handler.handle(
+        "!reanchor-constitution artifact.json abcdef12",
+        caller=CallerContext.sovereign(),
+    )
 
     assert "re-anchored" in result.lower()
     agent.reanchor_constitution.assert_called_once()

@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Optional
 
+from .destructive_policy import DestructiveOperationPolicy
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,14 +67,24 @@ class TrashManager:
         deleted_count = manager.empty(older_than_days=30)
     """
     
-    def __init__(self, trash_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        trash_dir: Optional[Path] = None,
+        current_agent_data_path: Optional[str | Path] = None,
+    ):
         """
         Initialize the trash manager.
         
         Args:
             trash_dir: Path to trash directory (default: ~/.kestrel/trash)
+            current_agent_data_path: This agent's own data directory. Restore
+                targets under other agent_data children are rejected.
         """
         self.trash_dir = trash_dir or DEFAULT_TRASH_DIR
+        self._policy = DestructiveOperationPolicy(
+            trash_dir=self.trash_dir,
+            current_agent_data_path=current_agent_data_path,
+        )
     
     def ensure_trash_dir(self) -> None:
         """Create trash directory if it doesn't exist."""
@@ -207,6 +219,8 @@ class TrashManager:
             dest_path = Path(destination)
         else:
             dest_path = Path.cwd() / trash_path.name
+
+        self._policy.assert_agent_data_deletion_allowed(dest_path, "trash_restore")
         
         # Check destination doesn't exist
         if dest_path.exists():
@@ -271,6 +285,12 @@ class TrashManager:
                     continue
             
             if deleted_at < cutoff:
+                if self._contains_agent_database(subdir):
+                    logger.warning(
+                        "Refusing to permanently delete trash directory with agent database: %s",
+                        subdir,
+                    )
+                    continue
                 if dry_run:
                     # Count items in directory
                     try:
@@ -287,6 +307,25 @@ class TrashManager:
                         logger.warning(f"Error deleting trash directory {subdir}: {e}")
         
         return deleted_count
+
+    def _contains_agent_database(self, path: Path) -> bool:
+        """Return True for agent database files or directories containing one."""
+        protected_names = {
+            "kestrel_prime.db",
+            "kestrel_prime.db-wal",
+            "kestrel_prime.db-shm",
+        }
+        if path.name in protected_names:
+            return True
+        if not path.is_dir():
+            return False
+        try:
+            for protected_name in protected_names:
+                if any(path.rglob(protected_name)):
+                    return True
+        except OSError:
+            return False
+        return False
     
     def get_stats(self) -> dict:
         """

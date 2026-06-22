@@ -27,7 +27,13 @@ BUILTIN_COMMAND_SPECS = [
 
     # Constitution
     {"cmd": "!verify-constitution", "handler": "_cmd_verify_constitution", "description": "Verify constitution integrity", "category": "Constitution"},
-    {"cmd": "!reanchor-constitution", "handler": "_cmd_reanchor_constitution", "description": "Re-anchor to current constitution after legitimate update", "args": "<expected_hash>", "category": "Constitution"},
+    {
+        "cmd": "!reanchor-constitution",
+        "handler": "_cmd_reanchor_constitution",
+        "description": "Re-anchor to current constitution after legitimate update",
+        "args": "<signed_artifact.json> [expected_hash]",
+        "category": "Constitution",
+    },
     {"cmd": "!safe-mode", "handler": "_cmd_safe_mode", "description": "Check or exit safe mode", "args": "[exit]", "category": "Constitution"},
 
     # Privacy
@@ -416,15 +422,20 @@ class CommandHandler:
             return f"🚨 {message}\n\nAgent has entered SAFE MODE. Contact administrator."
     
     async def _cmd_reanchor_constitution(self, user_input: str) -> str:
-        """Handle !reanchor-constitution <expected_hash> command."""
+        """Handle !reanchor-constitution <signed_artifact.json> [expected_hash]."""
         parts = user_input.split()
         if len(parts) < 2:
-            return "Usage: !reanchor-constitution <expected_hash_prefix>\n\nGet the hash with: sha256sum docs/principles/KESTREL_CONSTITUTION.md"
-        expected_hash = parts[1]
+            return (
+                "Usage: !reanchor-constitution <signed_artifact.json> [expected_hash_prefix]\n\n"
+                "The artifact must be signed by the Sovereign root key."
+            )
+        amendment_artifact_path = parts[1]
+        expected_hash = parts[2] if len(parts) >= 3 else None
         # Caller identity already verified by SOVEREIGN_COMMANDS gate in handle()
         result = await self.agent.reanchor_constitution(
             expected_hash=expected_hash,
             authorization="sovereign_api_key",
+            amendment_artifact_path=amendment_artifact_path,
         )
         if result.startswith("Error:"):
             return f"🚨 {result}"
