@@ -1248,8 +1248,129 @@ async def apply_plan(
     return 0
 
 
+def _upload_age_days(upload: Mapping[str, Any], now: datetime) -> float | None:
+    ts = parse_timestamp(
+        upload.get("createdAt")
+        or upload.get("created_at")
+        or upload.get("uploadedAt")
+    )
+    if ts is None:
+        return None
+    return (now - ts).total_seconds() / 86400.0
+
+
+def _append_age_audit(
+    audit_log: Path,
+    upload: Mapping[str, Any],
+    result: str,
+    detail: Any,
+) -> None:
+    entry = {
+        "store": "lighthouse",
+        "file_id": upload.get("id"),
+        "cid": _cid(upload),
+        "name": _filename(upload),
+        "size": _upload_size(upload),
+        "created_at": upload.get("createdAt"),
+        "result": result,
+        "detail": detail,
+        "actor": "backup_cleanup_age_purge",
+        "tool_version": TOOL_VERSION,
+        "deal_immutability_caveat": DEAL_IMMUTABILITY_CAVEAT,
+    }
+    with audit_log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+async def age_purge_lighthouse(
+    client: LighthouseClient,
+    *,
+    days: int,
+    keep_cids: set[str],
+    audit_log: Path,
+    confirmation: str | None,
+    now: datetime | None = None,
+) -> int:
+    """Gateway-free age purge: delete Lighthouse uploads older than `days` by
+    file id. Needs only the files_uploaded listing (id + createdAt) — no
+    manifest-body / gateway reads. Never deletes a CID in `keep_cids`, and never
+    deletes an undated upload (fails safe)."""
+    now = now or datetime.now(timezone.utc)
+    uploads = await _all_lighthouse_uploads(client)
+    plan: list[Mapping[str, Any]] = []
+    kept_protected = kept_recent = kept_undated = 0
+    for u in uploads:
+        if not u.get("id"):
+            kept_undated += 1
+            continue
+        cid = _cid(u)
+        if cid and cid in keep_cids:
+            kept_protected += 1
+            continue
+        age = _upload_age_days(u, now)
+        if age is None:
+            kept_undated += 1
+            continue
+        if age > days:
+            plan.append(u)
+        else:
+            kept_recent += 1
+    total = sum(_upload_size(p) for p in plan)
+    print(
+        "Lighthouse age-purge preflight\n\n"
+        f"threshold: older than {days} days\n"
+        f"to delete: {len(plan)} files ({total / 1024**3:.1f} GiB)\n"
+        f"kept (recent <= {days}d): {kept_recent}\n"
+        f"kept (protected keep-set CIDs): {kept_protected}\n"
+        f"kept (undated, fail-safe): {kept_undated}\n"
+    )
+    if not _confirm_apply(confirmation):
+        print("Refusing age purge: confirmation phrase not provided", file=sys.stderr)
+        return 2
+    failures = 0
+    for u in plan:
+        file_id = str(u.get("id"))
+        try:
+            result = await client.delete_file(file_id)
+        except Exception as exc:  # noqa: BLE001 - audit and continue
+            failures += 1
+            _append_age_audit(audit_log, u, "failed", {"error": str(exc)})
+            continue
+        _append_age_audit(audit_log, u, "deleted", result)
+    if failures:
+        logger.error("%s age-purge deletion(s) failed; see %s", failures, audit_log)
+        return 1
+    return 0
+
+
 async def _main_async(args: argparse.Namespace) -> int:
     policy = load_retention_policy()
+    if getattr(args, "delete_older_than_days", None) is not None:
+        if args.skip_lighthouse:
+            raise RuntimeError("--delete-older-than-days targets Lighthouse; remove --skip-lighthouse")
+        api_key = os.environ.get("LIGHTHOUSE_API_KEY")
+        if not api_key:
+            raise RuntimeError("LIGHTHOUSE_API_KEY is required for age purge")
+        keep_cids: set[str] = set()
+        if args.keep_cids_file:
+            keep_cids = {
+                line.strip()
+                for line in Path(args.keep_cids_file).read_text().splitlines()
+                if line.strip()
+            }
+        from kestrel_sovereign.storage.providers.lighthouse_rest import LighthouseRestClient
+
+        client = LighthouseRestClient(api_key=api_key)
+        try:
+            return await age_purge_lighthouse(
+                client,
+                days=args.delete_older_than_days,
+                keep_cids=keep_cids,
+                audit_log=Path(args.audit_log),
+                confirmation=args.confirm,
+            )
+        finally:
+            await client.close()
     if args.mode == "promote":
         if not args.promote_object:
             raise RuntimeError("--promote-object is required in promote mode")
@@ -1414,6 +1535,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Object id (store:key) or unique key/name to promote from quarantine",
     )
     parser.add_argument("--gcs-batch-size", type=int, default=100)
+    parser.add_argument(
+        "--delete-older-than-days",
+        type=int,
+        default=None,
+        help=(
+            "Gateway-free age purge: delete Lighthouse uploads older than N days "
+            "by file id (no manifest/gateway reads). Keeps recent uploads + any "
+            "CID in --keep-cids-file; never deletes undated uploads. Requires "
+            "the typed --confirm phrase."
+        ),
+    )
+    parser.add_argument(
+        "--keep-cids-file",
+        default=None,
+        help="Path to a newline-separated list of CIDs to never delete (safety keep-set).",
+    )
     parser.add_argument(
         "--include-quarantined",
         action="store_true",
