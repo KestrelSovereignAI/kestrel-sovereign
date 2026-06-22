@@ -33,7 +33,7 @@ from .script_store import ScriptStore
 from .script_signer import ScriptSigner
 from .script_analyzer import ScriptAnalyzer
 from .destructive_policy import DestructiveOperationPolicy
-from .trash_manager import TrashManager, get_trash_manager
+from .trash_manager import TrashManager
 from .executors import BaseExecutor, UvExecutor, DockerExecutor, LocalExecutor
 from .security_hook import ComputeSecurityHook, ComputeDebugHook
 
@@ -95,12 +95,19 @@ class ComputeFeature(Feature):
         # Get database path from agent
         # For PostgreSQL mode, storage_path is None - features that need local SQLite
         # should use a fallback path in the agent_data directory
-        db_path = getattr(self.agent, "storage_path", None)
+        agent_storage_path = getattr(self.agent, "storage_path", None)
+        db_path = agent_storage_path
+        agent_data_dir = None
         if not db_path:
             # Fallback to agent_data directory for compute scripts
             agent_data_dir = os.environ.get("KESTREL_DB_PATH", "./agent_data")
             os.makedirs(agent_data_dir, exist_ok=True)
             db_path = os.path.join(agent_data_dir, "compute_scripts.db")
+        current_agent_data_path = (
+            str(Path(agent_storage_path).parent)
+            if agent_storage_path
+            else agent_data_dir
+        )
 
         # Get agent DID for signing
         agent_did = getattr(self.agent, "did", None)
@@ -109,8 +116,10 @@ class ComputeFeature(Feature):
         self.script_store = ScriptStore(db_path)
         self.signer = ScriptSigner(agent_did, db_path)
         self.analyzer = ScriptAnalyzer()
-        self.trash_manager = get_trash_manager()
-        self._destructive_policy = DestructiveOperationPolicy()
+        self.trash_manager = TrashManager(current_agent_data_path=current_agent_data_path)
+        self._destructive_policy = DestructiveOperationPolicy(
+            current_agent_data_path=current_agent_data_path
+        )
 
         # Ensure trash directory exists
         self.trash_manager.ensure_trash_dir()
@@ -126,12 +135,18 @@ class ComputeFeature(Feature):
 
         # Initialize executors
         self.executors = {
-            "uv": UvExecutor(),
-            "docker": DockerExecutor() if self._docker_available() else None,
+            "uv": UvExecutor(current_agent_data_path=current_agent_data_path),
+            "docker": (
+                DockerExecutor(current_agent_data_path=current_agent_data_path)
+                if self._docker_available()
+                else None
+            ),
         }
 
         if self.policy.allow_local:
-            self.executors["local"] = LocalExecutor()
+            self.executors["local"] = LocalExecutor(
+                current_agent_data_path=current_agent_data_path
+            )
 
         # Track initialization state - async init will complete this
         self._initialized = False

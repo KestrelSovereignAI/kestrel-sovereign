@@ -55,6 +55,7 @@ class DockerExecutor(BaseExecutor):
         default_cpu_quota: int = 50000,  # 50% of one CPU
         default_pids_limit: int = 50,
         max_output_bytes: int = 1024 * 1024,  # 1MB
+        current_agent_data_path: Optional[str | Path] = None,
     ):
         """
         Initialize the Docker executor.
@@ -74,7 +75,9 @@ class DockerExecutor(BaseExecutor):
         self._cpu_quota = default_cpu_quota
         self._pids_limit = default_pids_limit
         self._max_output_bytes = max_output_bytes
-        self._policy = DestructiveOperationPolicy()
+        self._policy = DestructiveOperationPolicy(
+            current_agent_data_path=current_agent_data_path
+        )
     
     @property
     def name(self) -> str:
