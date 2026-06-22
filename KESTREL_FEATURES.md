@@ -101,7 +101,7 @@ Features come from two sources:
 
 The inventory below lists **core features only**. Installed feature packages appear at runtime via `discover_entrypoint_feature_classes()` and are not enumerated here.
 
-- Current audited snapshot: `36` discoverable modules and `36` exported `Feature` subclasses.
+- Current audited snapshot: `37` discoverable modules and `37` exported `Feature` subclasses.
 
 - `attachments`
 - `audit_anchor`
@@ -136,6 +136,7 @@ The inventory below lists **core features only**. Installed feature packages app
 - `talon`
 - `tasks`
 - `todo`
+- `wait`
 - `web_search`
 - `webhooks`
 - `wellness`
@@ -175,6 +176,7 @@ The currently exported `Feature` subclasses discovered from those modules includ
 - `TalonCoordinatorFeature`
 - `TaskFeature`
 - `TodoFeature`
+- `WaitFeature`
 - `WebSearchFeature`
 - `WebhookFeature`
 - `WellnessFeature`
