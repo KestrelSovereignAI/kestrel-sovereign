@@ -25,8 +25,6 @@ import time
 from typing import Any, Dict, List, Optional
 
 from kestrel_sovereign.features.base import Feature, tool
-from kestrel_sovereign.waits import run_wait_loop
-from kestrel_sovereign.waits.engine import MAX_HANDLE_WAIT_SECONDS
 from kestrel_sovereign.waits.reconciler import register_wait_watch
 from kestrel_sovereign.features.tasks.wait_provider import TaskWaitable
 from kestrel_sdk.tools.base import ToolCategory
@@ -87,9 +85,8 @@ class TaskFeature(Feature):
     async def post_all_features_loaded(self, agent):
         """Register the ``task:`` Waitable provider with the wait engine.
 
-        Lets ``wait("task:<task_id>")`` dispatch here, and lets the
-        Wave-2 reconciler enumerate this kind. ``wait_for_task`` calls
-        the engine directly and does not depend on this registration.
+        Lets the generic ``wait("task:<task_id>")`` tool dispatch here, and
+        lets the wait reconciler enumerate this kind for signal-resume.
         """
         registry = getattr(agent, "wait_registry", None)
         if registry is not None:
@@ -105,9 +102,8 @@ class TaskFeature(Feature):
     #
     # The @tool methods are thin ToolResult-returning wrappers around
     # these dict-returning helpers. Keeping the helpers private means
-    # tools that invoke other tools internally (e.g. ``wait_for_task``
-    # polling ``check_task_status``) don't have to unpack a ToolResult
-    # envelope just to read state.
+    # internal callers (e.g. the TaskWaitable provider reading task status)
+    # don't have to unpack a ToolResult envelope just to read state.
     # ------------------------------------------------------------------
 
     async def _get_task_status_data(self, task_id: str) -> Dict[str, Any]:
@@ -178,9 +174,9 @@ class TaskFeature(Feature):
                             # ToolResult inside the DynamicTool wrapper
                             # (only serialized on wire output, not on
                             # in-process reads). Serialize here so
-                            # check_task_status / get_task_result /
-                            # wait_for_task all return JSON-clean
-                            # payloads. Round 6 codex finding.
+                            # check_task_status / get_task_result and the
+                            # task waitable all read JSON-clean payloads.
+                            # Round 6 codex finding.
                             artifact_data["data"] = self._serialize_step_payload(
                                 part.data
                             )
@@ -1275,61 +1271,32 @@ class TaskFeature(Feature):
         )
 
     @tool(
-        name="wait_for_task",
-        description="Wait for a task to complete and return its result.",
-        category=ToolCategory.UTILITY,
-        command_prefix="!wait-task"
-    )
-    async def wait_for_task(
-        self,
-        task_id: str,
-        timeout_seconds: int = 300,
-        poll_interval: int = 5
-    ) -> ToolResult:
-        """
-        Wait for a task to complete.
-
-        Args:
-            task_id: The task ID to wait for
-            timeout_seconds: Maximum time to wait (default 5 minutes)
-            poll_interval: Seconds between status checks
-        """
-        if not self.task_manager:
-            return ToolResult.failed("Task manager not available")
-
-        # Thin wrapper over the generic wait engine: the TaskWaitable
-        # provider classifies one status read, the engine owns the loop,
-        # the cap, and the ToolResult mapping. ``wait_for_task`` keeps its
-        # name so existing callers keep working.
-        return await run_wait_loop(
-            TaskWaitable(self),
-            task_id,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval,
-        )
-
-    @tool(
         name="wait",
         description=(
-            "The one wait. Two modes:\n"
-            "• Pass `target` as `\"<kind>:<handle>\"` to block until that "
-            "thing reaches a terminal state — e.g. `\"talon:<job_id>\"`, "
-            "`\"task:<task_id>\"`. Polls the right feature's provider and "
-            "returns the terminal outcome (or a still-pending result on "
-            "timeout). This replaces the per-feature waiters (talon_wait, "
-            "wait_for_task).\n"
-            "• Pass `duration_seconds` with no target for a plain bounded "
-            "pause — the native alternative to shelling out to `sleep` "
-            "between polls in an autonomous loop.\n"
-            "`mode` controls how a `target` wait behaves:\n"
-            "• `mode=\"block\"` (default) holds the turn, polling until the "
-            "target is terminal or the timeout expires.\n"
-            "• `mode=\"signal\"` registers a watch and returns IMMEDIATELY — "
-            "the wait reconciler wakes you with a `wait.complete` cognition "
-            "signal once the target finishes. Use this for long/unattended "
-            "waits so you don't hold a turn. Requires a `target`.\n"
-            "Long unattended waits should use the signal-resume path "
-            "(`mode=\"signal\"`), not a held turn."
+            "The ONE generic wait — works across EVERY feature. There is no "
+            "per-feature wait tool; whatever async work a loaded feature "
+            "exposes, you wait on it here with `target=\"<kind>:<handle>\"`.\n"
+            "Known handle kinds (each contributed by a feature; more may be "
+            "registered by whatever features are loaded):\n"
+            "• `task:<task_id>` — a Kestrel background task\n"
+            "• `talon:<job_id>` — a Talon coding job\n"
+            "• `ci:<...>`, `lora_train:<...>`, `tx:<...>`, `workflow:<run_id>` "
+            "and others when those features are present.\n"
+            "If you pass an unknown kind, the error lists the kinds currently "
+            "registered.\n"
+            "\n"
+            "Three ways to call it:\n"
+            "• `target=\"<kind>:<handle>\"` (default `mode=\"block\"`) — hold "
+            "the turn, polling until that thing reaches a terminal state or "
+            "the timeout expires; returns the terminal outcome (or a still-"
+            "pending result on timeout).\n"
+            "• `target=\"<kind>:<handle>\", mode=\"signal\"` — register a watch "
+            "and return IMMEDIATELY; the wait reconciler wakes you with a "
+            "`wait.complete` cognition signal once it finishes. Use this for "
+            "long/unattended waits so you don't hold a turn.\n"
+            "• `duration_seconds=N` (no target) — a plain bounded pause, the "
+            "native alternative to shelling out to `sleep` between polls in an "
+            "autonomous loop."
         ),
         category=ToolCategory.UTILITY,
         command_prefix="!wait",

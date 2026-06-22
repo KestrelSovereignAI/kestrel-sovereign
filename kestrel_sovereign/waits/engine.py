@@ -6,16 +6,16 @@ public surfaces:
 ``run_wait_loop`` is the engine. Give it a :class:`Waitable` provider, a
 handle, and timing bounds; it polls until the provider reports a terminal
 :class:`Outcome` or the timeout expires, then returns a canonical
-:class:`ToolResult`. It holds no reference to the agent, so a feature's
-own ``wait_for_task`` / ``talon_wait`` tools call it directly with a
-provider they construct — which keeps them unit-testable without a live
-agent.
+:class:`ToolResult`. It holds no reference to the agent, so it is callable
+directly (and unit-testable) with a provider constructed in isolation; in
+production the :class:`WaitRegistry` calls it.
 
-``WaitRegistry`` is the per-agent dispatch table. Features register one
-provider per handle kind in ``post_all_features_loaded``; the generic
-``wait("talon:job_42")`` tool resolves the ``kind`` prefix here so it can
-reach a provider owned by a *different* feature. The Wave-2 reconciler
-cron will also enumerate the registry to drive the signal-resume path.
+``WaitRegistry`` is the per-agent dispatch table behind the SINGLE generic
+``wait`` tool. There are no per-feature wait tools — each feature registers
+one provider per handle kind in ``post_all_features_loaded``, and
+``wait("<kind>:<handle>")`` resolves the ``kind`` prefix here to reach the
+owning feature's provider. The reconciler cron also enumerates the registry
+to drive the signal-resume path.
 """
 
 from __future__ import annotations
