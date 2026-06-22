@@ -86,7 +86,7 @@ async def test_retry_succeeds_after_first_idle_timeout_under_cap():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
@@ -125,7 +125,7 @@ async def test_retry_waits_via_seam_before_second_attempt():
     try:
         call_count = {"n": 0}
 
-        async def fake_run_turn(*args):
+        async def fake_run_turn(*args, **kwargs):
             call_count["n"] += 1
             if call_count["n"] == 1:
                 raise _transport_error()
@@ -154,7 +154,7 @@ async def test_no_retry_when_events_already_yielded():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         yield {"text": "hello"}
         raise _transport_error()
@@ -180,7 +180,7 @@ async def test_no_retry_when_exceeds_cap():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         raise _transport_error(
             "codex turn idle for 300s with no completion — EXCEEDS cap",
@@ -207,7 +207,7 @@ async def test_no_retry_when_exceeds_cap_attribute_missing():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         # Construct directly without going through the hint rewrite,
         # so no exceeds_cap attribute is set.
@@ -234,7 +234,7 @@ async def test_no_retry_when_error_is_not_idle_timeout():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         # Has exceeds_cap=False but the message doesn't carry the
         # idle-timeout markers — different transport failure class.
@@ -260,7 +260,7 @@ async def test_no_retry_on_connection_closed():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         raise CodexAppServerConnectionClosed("codex app-server closed mid-turn")
         yield  # pragma: no cover
@@ -285,7 +285,7 @@ async def test_no_retry_when_tools_are_present():
     received_tools = []
     received_tool_executor = []
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
         call_count["n"] += 1
         received_tools.append(tools)
         received_tool_executor.append(tool_executor)
@@ -325,7 +325,7 @@ async def test_retry_invalidates_cached_thread_for_session():
     call_count = {"n": 0}
     cache_at_start_of_attempt: List[dict] = []
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
         call_count["n"] += 1
         # Snapshot the cache as seen at the start of each attempt — the
         # wrapper's invariant is "cache popped between attempts."
@@ -367,7 +367,8 @@ def test_run_turn_rechecks_session_cache_after_acquiring_thread_lock():
 
     src = inspect.getsource(m.CodexAdapter._run_turn)
     # The re-check must come after the initial lock acquire.
-    initial_acquire_idx = src.find("await lock.acquire()")
+    # With cancellation support, lock.acquire() is wrapped in await_or_cancelled.
+    initial_acquire_idx = src.find("lock.acquire()")
     assert initial_acquire_idx > 0
     # The re-check loop pattern.
     recheck_idx = src.find("self._session_threads.get(session_id)")
@@ -437,7 +438,7 @@ async def test_retry_fires_with_empty_tool_list():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(model, messages, tools, session_id, tool_executor):
+    async def fake_run_turn(model, messages, tools, session_id, tool_executor, cancel_token=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
@@ -531,7 +532,7 @@ async def test_retry_does_not_touch_cache_for_sessionless_calls():
 
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         if call_count["n"] == 1:
             raise _transport_error()
@@ -561,7 +562,7 @@ async def test_retry_exhaustion_preserves_transport_and_exceeds_cap():
     adapter = _stub_adapter()
     call_count = {"n": 0}
 
-    async def fake_run_turn(*args):
+    async def fake_run_turn(*args, **kwargs):
         call_count["n"] += 1
         raise _transport_error()
         yield  # pragma: no cover
