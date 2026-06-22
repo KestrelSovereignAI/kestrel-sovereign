@@ -837,3 +837,54 @@ async def test_dry_run_preview_matches_apply_plan_for_promoted_quarantine(tmp_pa
         with redirect_stdout(buf2):
             await backup_cleanup._main_async(args2)
     assert "legacy_private_candidate: 1 objects" not in buf2.getvalue()
+
+
+def test_gcs_snapshot_is_attributed_by_path_not_quarantined():
+    # GCS objects are path-attributed (EXPEDIENT tier), not manifest-attributed.
+    snap = _record(
+        "gs://bucket/kestrel/agent-a/snapshots/20260601_120000.db",
+        "agent-a",
+        200,
+        store="gcs",
+        name="20260601_120000.db",
+    )
+    cls = backup_cleanup.classify_inventory_record(snap)
+    assert cls.inventory_class == "attributed_snapshot"
+
+    # A GCS test-path object still classifies as test (test check has precedence).
+    test_obj = _record(
+        "gs://bucket/kestrel/did:test:agent/snapshots/20260601_120000.db",
+        "did:test:agent",
+        1,
+        store="gcs",
+        name="20260601_120000.db",
+    )
+    assert (
+        backup_cleanup.classify_inventory_record(test_obj).inventory_class
+        == "test_proven_orphan"
+    )
+
+
+def test_delete_plan_prunes_old_gcs_snapshot_but_protects_newest():
+    records = [
+        _record(
+            "gs://bucket/kestrel/agent-a/snapshots/new.db", "agent-a", 1, store="gcs",
+            name="new.db",
+        ),
+        _record(
+            "gs://bucket/kestrel/agent-a/snapshots/old.db", "agent-a", 900, store="gcs",
+            name="old.db",
+        ),
+    ]
+    plan = backup_cleanup.build_delete_plan(
+        records,
+        RetentionPolicy.from_config(
+            {"backup": {"retention": {"working_memory": {
+                "keep_all_days": 0, "weekly_forever": False, "monthly_forever": False}}}}
+        ),
+        quarantine_state={"objects": {}},
+        now=NOW,
+    )
+    deleted = _delete_keys(plan)
+    assert "gs://bucket/kestrel/agent-a/snapshots/old.db" in deleted
+    assert "gs://bucket/kestrel/agent-a/snapshots/new.db" not in deleted  # newest protected
