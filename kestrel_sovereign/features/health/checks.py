@@ -119,10 +119,18 @@ async def check_llm_service(agent) -> Dict[str, Any]:
                 else:
                     model_label = active_model
                 msg += f" (active: {model_label})"
+            reachability = getattr(llm_service, "reachability", None)
+            if not isinstance(reachability, list):
+                reachability = None
+            status = "pass"
+            if reachability:
+                if any(r.get("status") == "unreachable" for r in reachability):
+                    status = "warn"
             return {
                 "name": "llm_service",
-                "status": "pass",
+                "status": status,
                 "message": msg,
+                "details": {"reachability": reachability} if reachability else {},
                 "duration_ms": _elapsed(start),
             }
 

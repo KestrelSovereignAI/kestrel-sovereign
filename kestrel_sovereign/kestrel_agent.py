@@ -1485,8 +1485,10 @@ class KestrelAgent(
         # itself — PayerKind.NONE is a valid no-LLM configuration).
         from kestrel_sovereign.lifecycle_checks import (
             verify_llm_providers_initialized,
+            verify_llm_providers_reachable,
         )
         verify_llm_providers_initialized(self.llm_service)
+        await verify_llm_providers_reachable(self.llm_service)
 
         # All subsystems are now up (memory system, context manager, dispatcher,
         # LLM). Notify features that the agent is fully ready, so any that must

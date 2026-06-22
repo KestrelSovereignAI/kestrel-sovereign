@@ -549,6 +549,7 @@ See `.env.example` for a complete list. Key variables:
 - `OPENROUTER_API_KEY`: OpenRouter API key (recommended - access to multiple providers)
 - `OPENAI_API_KEY`: OpenAI API key for cloud models
 - `ANTHROPIC_API_KEY`: Anthropic API key for Claude models
+- `KESTREL_SKIP_REACHABILITY_PROBE=1`: Skip startup reachability probes for local LLM daemons in CI/test contexts
 
 **Storage:**
 - `KESTREL_DB_PATH`: Directory where the agent database is stored (default: `./agent_data`). This is a **directory** path -- the database file `kestrel_prime.db` is created inside it.

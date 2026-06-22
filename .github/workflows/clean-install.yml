@@ -61,6 +61,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.13"
   KESTREL_AUDIT_MODE: "skip"
+  KESTREL_SKIP_REACHABILITY_PROBE: "1"
   # Force the wizard's non-TTY branch so it never blocks on a prompt.
   # With this set, build_context() returns NonInteractivePrompter which
   # accepts defaults silently — exactly what --quickstart needs in CI.

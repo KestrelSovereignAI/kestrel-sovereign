@@ -264,6 +264,21 @@ class LLMAdapter(_SDKLLMAdapter):
     #: ``LLMResponse`` already carries it.
     supports_partial_usage_flush: bool = False
 
+    async def probe_reachable(
+        self,
+        client: Any,
+        *,
+        base_url: Optional[str] = None,
+        timeout: float = 1.5,
+    ) -> Optional[bool]:
+        """Return local-route reachability, or ``None`` when unsupported.
+
+        Startup lifecycle checks call this only for routes marked local.
+        Cloud routes deliberately skip reachability probing to avoid adding
+        startup latency and transient-network failure modes.
+        """
+        return None
+
     def create_messages(
         self,
         user_prompt: Optional[str] = None,

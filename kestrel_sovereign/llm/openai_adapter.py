@@ -13,6 +13,7 @@ import openai
 import logging
 from typing import Any, Dict, List, Optional, AsyncIterator, Type, Union
 
+import httpx
 from pydantic import BaseModel
 
 from kestrel_sdk.llm import ToolCallStarted
@@ -90,6 +91,29 @@ class OpenAIAdapter(LLMAdapter):
                 "Structured output uses response_format=json_schema for Pydantic models.",
             ),
         )
+
+    async def probe_reachable(
+        self,
+        client: Any,
+        *,
+        base_url: Optional[str] = None,
+        timeout: float = 1.5,
+    ) -> Optional[bool]:
+        """Probe an OpenAI-compatible local route's models endpoint."""
+        root = base_url
+        if not root:
+            root = str(getattr(client, "base_url", "") or "") or None
+        if not root:
+            return None
+
+        root = str(root).rstrip("/")
+        url = f"{root}/models" if root.endswith("/v1") else f"{root}/v1/models"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                response = await http.get(url)
+            return response.status_code < 500
+        except httpx.HTTPError:
+            return False
 
     async def aembed(
         self,

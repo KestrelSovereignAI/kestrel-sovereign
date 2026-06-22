@@ -33,11 +33,16 @@ class NoLLMProvidersError(RuntimeError):
     """Raised when the agent boots with zero LLM providers initialized (#377)."""
 
 
+class NoReachableProvidersError(RuntimeError):
+    """Raised when only local LLM routes are configured and none are reachable."""
+
+
 class IdentityIsolationError(RuntimeError):
     """Raised when the DB's agent DID does not match the operator-declared DID (#381)."""
 
 
 EXPECTED_DID_ENV_VAR = "KESTREL_EXPECTED_DID"
+SKIP_REACHABILITY_PROBE_ENV_VAR = "KESTREL_SKIP_REACHABILITY_PROBE"
 
 
 def verify_llm_providers_initialized(llm_service: Any) -> None:
@@ -80,6 +85,128 @@ def verify_llm_providers_initialized(llm_service: Any) -> None:
         "reachable. See LLM_SERVICE_ARCHITECTURE.md for the route-config "
         "shape. If this agent is intentionally LLM-disabled, configure "
         "PayerPolicy.llm.kind = NONE."
+    )
+
+
+def _env_truthy(value: Optional[str]) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+async def verify_llm_providers_reachable(
+    llm_service: Any,
+    *,
+    env: Optional[dict] = None,
+    timeout: float = 1.5,
+) -> None:
+    """Probe local LLM routes before declaring startup successful (#1265).
+
+    Cloud routes are intentionally skipped: credential failures are caught at
+    initialization and network probing cloud APIs at startup adds latency and
+    transient-failure risk. Local routes are different: constructing their SDK
+    clients does not prove the daemon is listening, so we perform a cheap
+    adapter-owned probe and store the per-route result on ``llm_service`` for
+    health endpoints.
+    """
+    if getattr(llm_service, "disabled", False):
+        return
+
+    env_map = env if env is not None else os.environ
+    if _env_truthy(env_map.get(SKIP_REACHABILITY_PROBE_ENV_VAR)):
+        providers = getattr(llm_service, "providers", None) or []
+        llm_service.reachability = [
+            {
+                "name": p.get("name", p.get("vendor", "?")),
+                "vendor": p.get("vendor"),
+                "route": p.get("route"),
+                "is_local": bool(p.get("is_local")),
+                "status": "skipped",
+                "message": f"{SKIP_REACHABILITY_PROBE_ENV_VAR}=1",
+            }
+            for p in providers
+        ]
+        return
+
+    providers = getattr(llm_service, "providers", None) or []
+    if not providers:
+        return
+
+    local_routes = [p for p in providers if p.get("is_local")]
+    has_cloud_route = any(p.get("is_cloud") for p in providers)
+    if not local_routes:
+        llm_service.reachability = [
+            {
+                "name": p.get("name", p.get("vendor", "?")),
+                "vendor": p.get("vendor"),
+                "route": p.get("route"),
+                "is_local": False,
+                "status": "skipped",
+                "message": "cloud route not probed at startup",
+            }
+            for p in providers
+        ]
+        return
+
+    results = []
+    reachable = []
+    for provider in providers:
+        name = provider.get("name", provider.get("vendor", "?"))
+        result = {
+            "name": name,
+            "vendor": provider.get("vendor"),
+            "route": provider.get("route"),
+            "is_local": bool(provider.get("is_local")),
+            "status": "skipped",
+            "message": "cloud route not probed at startup",
+        }
+        if not provider.get("is_local"):
+            results.append(result)
+            continue
+
+        adapter = provider.get("adapter")
+        probe = getattr(adapter, "probe_reachable", None)
+        if not callable(probe):
+            result["message"] = "adapter has no reachability probe"
+            results.append(result)
+            logger.warning("Local LLM route %s has no reachability probe", name)
+            continue
+
+        try:
+            ok = await probe(
+                provider.get("client"),
+                base_url=provider.get("base_url"),
+                timeout=timeout,
+            )
+        except Exception as exc:  # defensive: probes should not crash startup obscurely
+            ok = False
+            result["error"] = str(exc)
+
+        if ok is True:
+            result["status"] = "reachable"
+            result["message"] = "local route probe succeeded"
+            reachable.append(name)
+        elif ok is False:
+            result["status"] = "unreachable"
+            result["message"] = "local route probe failed"
+            logger.warning("Local LLM route %s is not reachable at startup", name)
+        else:
+            result["status"] = "skipped"
+            result["message"] = "adapter probe unavailable"
+            logger.warning("Local LLM route %s did not report reachability", name)
+        results.append(result)
+
+    llm_service.reachability = results
+    if reachable or has_cloud_route:
+        return
+
+    local_names = ", ".join(
+        p.get("name", p.get("vendor", "?")) for p in local_routes
+    )
+    raise NoReachableProvidersError(
+        "LLM providers initialized, but no configured local provider was "
+        f"reachable at startup ({local_names}). Start the local daemon "
+        "(for example `ollama serve`), configure a reachable llama.cpp/"
+        "OpenAI-compatible base_url, add a cloud route, or set "
+        f"{SKIP_REACHABILITY_PROBE_ENV_VAR}=1 in CI/test contexts."
     )
 
 
