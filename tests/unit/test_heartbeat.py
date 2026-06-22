@@ -159,13 +159,6 @@ def mock_agent(tmp_path):
 
     agent.dispatcher = Mock()
     agent.dispatcher.dispatch_signal = AsyncMock(side_effect=fake_dispatch)
-
-    # Bootstrap timeout check support (#378) — most tests don't care about
-    # bootstrap state, so set bootstrap_service=None to skip the check
-    agent.bootstrap_service = None
-    agent.storage = Mock()
-    agent.storage.get_node = AsyncMock(return_value=None)
-
     return agent
 
 

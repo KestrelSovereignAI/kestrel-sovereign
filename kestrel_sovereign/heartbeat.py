@@ -301,14 +301,6 @@ class HeartbeatRunner:
         start_time = time.monotonic()
         timestamp = datetime.now(tz=_UTC).isoformat()
 
-        stale_bootstrap = await self._check_stale_bootstrap(timestamp, start_time)
-        if stale_bootstrap is not None:
-            gap_seconds, missed_beats = self._consume_pending_gap()
-            stale_bootstrap.gap_seconds = gap_seconds
-            stale_bootstrap.missed_beats = missed_beats
-            self._record_result(stale_bootstrap)
-            return stale_bootstrap
-
         heartbeat_content = self._load_heartbeat_file() or ""
 
         signal = Signal(
@@ -343,36 +335,6 @@ class HeartbeatRunner:
 
         self._record_result(result)
         return result
-
-    async def _check_stale_bootstrap(
-        self,
-        timestamp: str,
-        start_time: float,
-    ) -> Optional[HeartbeatResult]:
-        """Escalate bootstrap PENDING timeout before the LLM heartbeat turn."""
-        from kestrel_sovereign.lifecycle_checks import warn_stale_bootstrap_pending
-
-        stale = await warn_stale_bootstrap_pending(
-            self.agent,
-            threshold_seconds=3600,
-            context="heartbeat",
-        )
-        if not stale:
-            return None
-
-        duration_ms = int((time.monotonic() - start_time) * 1000)
-        age_minutes = (stale.get("age_seconds") or 0) / 60.0
-        created_at = stale.get("created_at") or "unknown"
-        return HeartbeatResult(
-            status="alert",
-            message=(
-                "stale_bootstrap: bootstrap_state='pending' for "
-                f"{age_minutes:.1f} minutes; created_at={created_at}"
-            ),
-            timestamp=timestamp,
-            duration_ms=duration_ms,
-            reason="stale_bootstrap",
-        )
 
     def _translate_result(
         self, sig_result, timestamp: str, duration_ms: int
