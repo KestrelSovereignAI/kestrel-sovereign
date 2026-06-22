@@ -468,15 +468,24 @@ class LighthouseTarget(ManifestManagerMixin, SyncTarget):
         try:
             uploads: list[Dict[str, Any]] = []
             last_key = None
+            seen_cursors: set[str] = set()
             while True:
                 page = await client.get_uploads(last_key=last_key)
                 file_list = page.get("fileList", [])
-                if not isinstance(file_list, list):
+                if not isinstance(file_list, list) or not file_list:
                     break
                 uploads.extend(file_list)
-                last_key = page.get("lastKey") or page.get("nextLastKey")
-                if not last_key or len(file_list) == 0:
+                # files_uploaded has no nextLastKey/lastKey; the cursor is the
+                # last record's id (page size 1000, continue until empty).
+                last_item = file_list[-1]
+                last_key = (
+                    str(last_item.get("id"))
+                    if isinstance(last_item, dict) and last_item.get("id")
+                    else None
+                )
+                if not last_key or last_key in seen_cursors:
                     break
+                seen_cursors.add(last_key)
 
             items: list[RetentionItem] = []
             for upload in uploads:

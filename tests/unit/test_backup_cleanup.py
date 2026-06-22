@@ -215,29 +215,27 @@ class AsyncDeleteClient:
 
 @pytest.mark.asyncio
 async def test_lighthouse_pagination_consumes_empty_and_multi_page_responses(caplog):
+    # The real files_uploaded response has NO nextLastKey/lastKey; the cursor is
+    # the last item's id. Pages are keyed by the previous page's last id.
     class FakeClient:
         def __init__(self):
             self.calls = []
             self.pages = {
                 None: {
-                    "fileList": [{"cid": "cid-1", "fileName": "one.db"}],
-                    "nextLastKey": "cursor-1",
-                    "totalFiles": 3,
+                    "fileList": [
+                        {"cid": "cid-1", "id": "a", "fileName": "one.db"},
+                        {"cid": "cid-2", "id": "b", "fileName": "two.db"},
+                    ],
+                    "totalFiles": 4,
                 },
-                "cursor-1": {
-                    "fileList": [],
-                    "nextLastKey": "cursor-empty",
-                    "totalFiles": 3,
+                "b": {
+                    "fileList": [
+                        {"cid": "cid-3", "id": "c", "fileName": "three.db"},
+                        {"cid": "cid-4", "id": "d", "fileName": "four.db"},
+                    ],
+                    "totalFiles": 4,
                 },
-                "cursor-empty": {
-                    "fileList": [{"cid": "cid-2", "fileName": "two.db"}],
-                    "lastKey": "cursor-2",
-                    "totalFiles": 3,
-                },
-                "cursor-2": {
-                    "fileList": [{"cid": "cid-3", "fileName": "three.db"}],
-                    "totalFiles": 3,
-                },
+                "d": {"fileList": [], "totalFiles": 4},
             }
 
         async def get_uploads(self, last_key=None):
@@ -258,9 +256,10 @@ async def test_lighthouse_pagination_consumes_empty_and_multi_page_responses(cap
     with caplog.at_level("INFO"):
         uploads = await backup_cleanup._all_lighthouse_uploads(client)
 
-    assert client.calls == [None, "cursor-1", "cursor-empty", "cursor-2"]
-    assert [upload["cid"] for upload in uploads] == ["cid-1", "cid-2", "cid-3"]
-    assert "Lighthouse total files seen: 3" in caplog.text
+    # All pages consumed via the id cursor (not just page 1).
+    assert client.calls == [None, "b", "d"]
+    assert [u["cid"] for u in uploads] == ["cid-1", "cid-2", "cid-3", "cid-4"]
+    assert "Lighthouse total files seen: 4" in caplog.text
 
 
 @pytest.mark.asyncio
