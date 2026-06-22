@@ -69,6 +69,26 @@ class RestartDiscoveryResult:
         return self.message.lower()
 
 
+@dataclass(frozen=True)
+class BootstrapStaleness:
+    """Status for a bootstrap-pending timeout check."""
+
+    is_stale: bool
+    state: BootstrapState
+    age_seconds: Optional[float] = None
+    created_at: Optional[str] = None
+    status: str = "ok"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "is_stale": self.is_stale,
+            "state": self.state.value,
+            "age_seconds": self.age_seconds,
+            "created_at": self.created_at,
+            "status": self.status,
+        }
+
+
 class BootstrapService:
     """
     Manages agent wake-up and personality discovery.
@@ -85,8 +105,12 @@ class BootstrapService:
     BOOTSTRAP_STATE_KEY = "bootstrap_state"
     BOOTSTRAP_STARTED_KEY = "bootstrap_started_at"
     BOOTSTRAP_COMPLETED_KEY = "bootstrap_completed_at"
+    BOOTSTRAP_STATUS_KEY = "bootstrap_status"
+    BOOTSTRAP_STALE_AT_KEY = "bootstrap_stale_at"
     DISCOVERY_HISTORY_KEY = "bootstrap_discovery_history"
     USER_NAME_KEY = "bootstrap_user_name"
+    STALE_BOOTSTRAP_STATUS = "stale_bootstrap"
+    DEFAULT_PENDING_TIMEOUT_SECONDS = 3600
 
     def __init__(
         self,
@@ -216,6 +240,169 @@ class BootstrapService:
             # On DB error, assume complete to avoid hijacking existing agents
             return BootstrapState.COMPLETE
 
+    async def check_pending_timeout(
+        self,
+        *,
+        agent_node: Any = None,
+        storage: Any = None,
+        threshold_seconds: int = DEFAULT_PENDING_TIMEOUT_SECONDS,
+        now: Optional[datetime] = None,
+        mark_stale: bool = True,
+    ) -> BootstrapStaleness:
+        """Flag agents that remain in PENDING past the bootstrap timeout.
+
+        ``PENDING`` means the agent was created but never received its first
+        turn, so ``bootstrap_started_at`` is intentionally absent. Use the
+        graph agent node's ``created_at`` as the age anchor because inception
+        stores the original pending state there.
+        """
+        state = await self._get_bootstrap_state_from_metadata_or_node(agent_node)
+        if state != BootstrapState.PENDING:
+            return BootstrapStaleness(is_stale=False, state=state)
+
+        if await self._has_completion_evidence():
+            await self._ensure_complete("bootstrap completion evidence exists")
+            return BootstrapStaleness(is_stale=False, state=BootstrapState.COMPLETE)
+
+        created_at = self._get_agent_created_at(agent_node)
+        if not created_at:
+            return BootstrapStaleness(
+                is_stale=False,
+                state=state,
+                status="unknown_created_at",
+            )
+
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        age_seconds = (now - created_at).total_seconds()
+        created_at_str = created_at.isoformat()
+        if age_seconds <= threshold_seconds:
+            return BootstrapStaleness(
+                is_stale=False,
+                state=state,
+                age_seconds=age_seconds,
+                created_at=created_at_str,
+            )
+
+        stale = BootstrapStaleness(
+            is_stale=True,
+            state=state,
+            age_seconds=age_seconds,
+            created_at=created_at_str,
+            status=self.STALE_BOOTSTRAP_STATUS,
+        )
+        if mark_stale:
+            await self.mark_stale_bootstrap(stale, agent_node=agent_node, storage=storage)
+        return stale
+
+    async def mark_stale_bootstrap(
+        self,
+        stale: Optional[BootstrapStaleness] = None,
+        *,
+        agent_node: Any = None,
+        storage: Any = None,
+    ) -> None:
+        """Persist the stale-bootstrap escalation in metadata and graph state."""
+        now = datetime.now(timezone.utc)
+        stale_at = now.isoformat()
+        age_seconds = None if stale is None else stale.age_seconds
+        try:
+            await self.db.execute(
+                """
+                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (self.agent_id, self.BOOTSTRAP_STATUS_KEY, self.STALE_BOOTSTRAP_STATUS, now),
+            )
+            await self.db.execute(
+                """
+                INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (self.agent_id, self.BOOTSTRAP_STALE_AT_KEY, stale_at, now),
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist stale bootstrap metadata: %s", exc)
+
+        if agent_node is None and storage is not None:
+            try:
+                agent_node = await storage.get_node(self.agent_id)
+            except Exception as exc:
+                logger.debug("Failed to load agent node for stale bootstrap mark: %s", exc)
+                agent_node = None
+
+        if agent_node is None or storage is None:
+            return
+
+        try:
+            from copy import copy
+
+            updated_node = copy(agent_node)
+            updated_node.properties = dict(getattr(agent_node, "properties", {}) or {})
+            updated_node.properties["bootstrap_state"] = BootstrapState.PENDING.value
+            updated_node.properties["bootstrap_status"] = self.STALE_BOOTSTRAP_STATUS
+            updated_node.properties["bootstrap_stale_at"] = stale_at
+            if age_seconds is not None:
+                updated_node.properties["bootstrap_pending_age_seconds"] = int(age_seconds)
+            await storage.add_node(updated_node)
+        except Exception as exc:
+            logger.warning("Failed to persist stale bootstrap graph state: %s", exc)
+
+    async def _get_bootstrap_state_from_metadata_or_node(self, agent_node: Any) -> BootstrapState:
+        """Read metadata first, then legacy/inception graph-node state."""
+        try:
+            result = await self.db.fetchall(
+                """
+                SELECT value FROM agent_metadata
+                WHERE agent_id = ? AND key = ?
+                """,
+                (self.agent_id, self.BOOTSTRAP_STATE_KEY),
+            )
+            if result:
+                return BootstrapState(result[0][0])
+        except Exception as exc:
+            logger.debug("Bootstrap metadata state lookup failed: %s", exc)
+
+        properties = getattr(agent_node, "properties", {}) or {}
+        try:
+            return BootstrapState(properties.get("bootstrap_state", BootstrapState.PENDING.value))
+        except ValueError:
+            return BootstrapState.COMPLETE
+
+    @staticmethod
+    def _get_agent_created_at(agent_node: Any) -> Optional[datetime]:
+        properties = getattr(agent_node, "properties", {}) or {}
+        raw = properties.get("created_at")
+        if isinstance(raw, datetime):
+            created_at = raw
+        elif isinstance(raw, str) and raw.strip():
+            try:
+                created_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return created_at
+
+    async def _has_completion_evidence(self) -> bool:
+        """Return True when durable artifacts prove bootstrap already happened."""
+        if self.agent_data_path:
+            soul_path = Path(self.agent_data_path) / "SOUL.md"
+            if soul_path.exists() and soul_path.stat().st_size > 0:
+                return True
+
+        try:
+            history_count = await self.db.fetchall(
+                "SELECT COUNT(*) FROM conversations WHERE agent_id = ?",
+                (self.agent_id,),
+            )
+            return bool(history_count and history_count[0][0] > 0)
+        except Exception:
+            return False
+
     async def set_bootstrap_state(self, state: BootstrapState) -> None:
         """Update the bootstrap state in agent_metadata."""
         try:
@@ -245,6 +432,13 @@ class BootstrapService:
                     VALUES (?, ?, ?, ?)
                     """,
                     (self.agent_id, self.BOOTSTRAP_COMPLETED_KEY, now_str, now),
+                )
+                await self.db.execute(
+                    """
+                    INSERT OR REPLACE INTO agent_metadata (agent_id, key, value, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (self.agent_id, self.BOOTSTRAP_STATUS_KEY, "ok", now),
                 )
         except Exception as e:
             logger.error(f"Failed to set bootstrap state: {e}")

@@ -9,9 +9,35 @@ import json
 from pathlib import Path
 from typing import Dict, List
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from kestrel_sovereign.bootstrap.service import BootstrapService, BootstrapState
+
+
+@dataclass
+class _GraphNode:
+    node_id: str
+    node_type: str = "agent"
+    label: str = "Agent"
+    properties: dict = None
+
+    def __post_init__(self):
+        if self.properties is None:
+            self.properties = {}
+
+
+class _Storage:
+    def __init__(self, node):
+        self.node = node
+        self.saved = None
+
+    async def get_node(self, node_id):
+        return self.node if node_id == self.node.node_id else None
+
+    async def add_node(self, node):
+        self.saved = node
+        self.node = node
 
 
 class MockDB:
@@ -147,6 +173,104 @@ class TestBootstrapState:
         """Bootstrap should not be needed when state is COMPLETE."""
         await bootstrap_service.set_bootstrap_state(BootstrapState.COMPLETE)
         assert await bootstrap_service.is_bootstrap_needed() is False
+
+    @pytest.mark.asyncio
+    async def test_pending_timeout_not_stale_before_threshold(self, bootstrap_service):
+        """A recently-created pending agent should not be escalated."""
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc)
+        node = _GraphNode(
+            node_id=bootstrap_service.agent_id,
+            properties={
+                "bootstrap_state": "pending",
+                "created_at": (now - timedelta(minutes=30)).isoformat(),
+            },
+        )
+
+        stale = await bootstrap_service.check_pending_timeout(
+            agent_node=node,
+            now=now,
+            threshold_seconds=3600,
+        )
+
+        assert stale.is_stale is False
+        assert stale.status == "ok"
+        assert (bootstrap_service.agent_id, BootstrapService.BOOTSTRAP_STATUS_KEY) not in bootstrap_service.db.data
+
+    @pytest.mark.asyncio
+    async def test_pending_timeout_escalates_stale_bootstrap(self, bootstrap_service):
+        """A pending agent older than the threshold should be flagged."""
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc)
+        node = _GraphNode(
+            node_id=bootstrap_service.agent_id,
+            properties={
+                "bootstrap_state": "pending",
+                "created_at": (now - timedelta(hours=2)).isoformat(),
+            },
+        )
+        storage = _Storage(node)
+
+        stale = await bootstrap_service.check_pending_timeout(
+            agent_node=node,
+            storage=storage,
+            now=now,
+            threshold_seconds=3600,
+        )
+
+        assert stale.is_stale is True
+        assert stale.status == "stale_bootstrap"
+        assert bootstrap_service.db.data[
+            (bootstrap_service.agent_id, BootstrapService.BOOTSTRAP_STATUS_KEY)
+        ] == "stale_bootstrap"
+        assert storage.saved.properties["bootstrap_status"] == "stale_bootstrap"
+        assert storage.saved.properties["bootstrap_state"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_pending_timeout_uses_graph_state_when_metadata_missing(self, bootstrap_service):
+        """Inception wrote bootstrap_state on the graph node before metadata existed."""
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc)
+        node = _GraphNode(
+            node_id=bootstrap_service.agent_id,
+            properties={
+                "bootstrap_state": "complete",
+                "created_at": (now - timedelta(days=17)).isoformat(),
+            },
+        )
+
+        stale = await bootstrap_service.check_pending_timeout(
+            agent_node=node,
+            now=now,
+            threshold_seconds=3600,
+        )
+
+        assert stale.is_stale is False
+        assert stale.state == BootstrapState.COMPLETE
+
+    @pytest.mark.asyncio
+    async def test_pending_timeout_ignores_stale_graph_when_soul_exists(
+        self, bootstrap_service, temp_agent_dir
+    ):
+        """A stale graph property should not alert after bootstrap artifacts exist."""
+        (temp_agent_dir / "SOUL.md").write_text("# SOUL.md\n")
+        now = datetime(2026, 3, 11, 12, 0, tzinfo=timezone.utc)
+        node = _GraphNode(
+            node_id=bootstrap_service.agent_id,
+            properties={
+                "bootstrap_state": "pending",
+                "created_at": (now - timedelta(days=17)).isoformat(),
+            },
+        )
+
+        stale = await bootstrap_service.check_pending_timeout(
+            agent_node=node,
+            now=now,
+            threshold_seconds=3600,
+        )
+
+        assert stale.is_stale is False
+        assert stale.state == BootstrapState.COMPLETE
+        assert bootstrap_service.db.data[
+            (bootstrap_service.agent_id, BootstrapService.BOOTSTRAP_STATE_KEY)
+        ] == "complete"
 
 
 class TestWakeUpMessage:

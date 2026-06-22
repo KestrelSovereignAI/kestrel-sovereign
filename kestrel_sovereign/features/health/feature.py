@@ -42,6 +42,7 @@ from kestrel_sdk.tools.base import ToolCategory
 from kestrel_sdk.tools.result import ToolResult
 
 from .checks import (
+    check_bootstrap_state,
     check_context_budget,
     check_database,
     check_disk_space,
@@ -446,6 +447,7 @@ class HealthFeature(Feature):
         checks.append(await check_memory_system(self.agent))
         checks.append(await check_disk_space())
         checks.append(await check_context_budget(self.agent))
+        checks.append(await check_bootstrap_state(self.agent))
 
         overall_status = _derive_overall_status(checks)
         overall_healthy = overall_status == "healthy"
