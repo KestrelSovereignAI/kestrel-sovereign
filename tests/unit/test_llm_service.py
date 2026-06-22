@@ -1082,6 +1082,66 @@ class TestStreamingMandatePreference:
                (len(call_args.args) > 1 and call_args.args[1] == "claude-sonnet-4-5")
 
     @pytest.mark.asyncio
+    async def test_stream_with_messages_passes_cancel_token(self, llm_service, mock_adapter):
+        """Request cancellation token is forwarded to adapter streams."""
+        async def mock_streaming(*args, **kwargs):
+            yield "response"
+
+        mock_adapter.get_streaming_response = Mock(return_value=mock_streaming())
+        token = Mock(return_value=False)
+
+        chunks = []
+        async for chunk in llm_service.stream_with_messages(
+            messages=[{"role": "user", "content": "Test"}],
+            cancel_token=token,
+        ):
+            chunks.append(chunk)
+
+        assert chunks == ["response"]
+        assert mock_adapter.get_streaming_response.call_args.kwargs[
+            "cancel_token"
+        ] is token
+
+    @pytest.mark.asyncio
+    async def test_generate_with_messages_passes_cancel_token(self, llm_service, mock_adapter):
+        """Request cancellation token is forwarded to non-streaming calls."""
+        token = Mock(return_value=False)
+
+        await llm_service.generate_with_messages(
+            messages=[{"role": "user", "content": "Test"}],
+            cancel_token=token,
+        )
+
+        assert mock_adapter.get_response.await_args.kwargs["cancel_token"] is token
+
+    @pytest.mark.asyncio
+    async def test_stream_with_tool_detection_passes_cancel_token(self, llm_service, mock_adapter):
+        """Request cancellation token is forwarded to tool-aware streams."""
+        async def mock_streaming(*args, **kwargs):
+            yield LLMResponse(content="done", input_tokens=1, output_tokens=1)
+
+        mock_adapter.get_streaming_response_with_tools = Mock(
+            return_value=mock_streaming()
+        )
+        token = Mock(return_value=False)
+
+        items = []
+        async for item in llm_service.stream_with_tool_detection(
+            messages=[{"role": "user", "content": "Test"}],
+            tools=[{"type": "function", "function": {
+                "name": "noop",
+                "parameters": {"type": "object", "properties": {}},
+            }}],
+            cancel_token=token,
+        ):
+            items.append(item)
+
+        assert isinstance(items[-1], LLMResponse)
+        assert mock_adapter.get_streaming_response_with_tools.call_args.kwargs[
+            "cancel_token"
+        ] is token
+
+    @pytest.mark.asyncio
     async def test_streaming_without_mandate_uses_default(self, llm_service, mock_adapter):
         """Test that streaming without mandate uses provider default model."""
         # Ensure no mandate is set

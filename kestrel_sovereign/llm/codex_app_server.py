@@ -40,6 +40,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
+from .cancellation import CancelToken, raise_if_cancelled
+
 logger = logging.getLogger(__name__)
 
 # Hard floor — matches kestrel-claw ``MIN_CODEX_APP_SERVER_VERSION``. The
@@ -1184,6 +1186,7 @@ class CodexAppServerClient:
         *,
         idle_timeout: float = 300,
         thread_id: Optional[str] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> "asyncio.AsyncIterator[dict]":
         """Yield notifications until ``turn/completed`` / failure / close.
 
@@ -1221,7 +1224,24 @@ class CodexAppServerClient:
         """
         while True:
             try:
-                msg = await asyncio.wait_for(sink.get(), timeout=idle_timeout)
+                started = asyncio.get_running_loop().time()
+                while True:
+                    raise_if_cancelled(cancel_token)
+                    elapsed = asyncio.get_running_loop().time() - started
+                    remaining = idle_timeout - elapsed
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError
+                    try:
+                        msg = await asyncio.wait_for(
+                            sink.get(), timeout=min(remaining, 0.1)
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        if (
+                            asyncio.get_running_loop().time() - started
+                            >= idle_timeout
+                        ):
+                            raise
             except asyncio.TimeoutError as e:
                 # Not a stall if the app-server is blocked awaiting our
                 # reply to a server-request it sent (long tool callback,

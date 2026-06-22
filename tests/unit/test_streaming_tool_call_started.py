@@ -563,7 +563,7 @@ class TestCodexAdapterEmissionLogic:
             def close_turn_sink(self, key):
                 pass
 
-            async def iter_turn_events(self, sink, *, idle_timeout=120, thread_id=None):
+            async def iter_turn_events(self, sink, *, idle_timeout=120, thread_id=None, cancel_token=None):
                 for ev in [
                     {"method": "item/agentMessage/delta",
                      "params": {"delta": "calling"}},

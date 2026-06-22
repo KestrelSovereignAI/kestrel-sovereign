@@ -19,6 +19,12 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingContentSplitter, ThinkingDelta, ToolCall
+from .cancellation import (
+    CancelToken,
+    anext_or_cancelled,
+    await_or_cancelled,
+    raise_if_cancelled,
+)
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -752,7 +758,9 @@ class AnthropicAdapter(LLMAdapter):
         Returns:
             LLMResponse with content and/or tool calls
         """
+        cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
+            raise_if_cancelled(cancel_token)
             filtered_messages, combined_system = self._convert_messages_to_anthropic(
                 messages,
                 system_prompt,
@@ -808,7 +816,10 @@ class AnthropicAdapter(LLMAdapter):
             api_params = self._apply_oauth_request_shaping(api_params)
             await self._ensure_fresh_oauth_token(client)
 
-            response = await with_retry(client.messages.create, **api_params)
+            response = await await_or_cancelled(
+                with_retry(client.messages.create, **api_params),
+                cancel_token,
+            )
 
             # Parse response
             content = None
@@ -895,7 +906,9 @@ class AnthropicAdapter(LLMAdapter):
             Structured output with response_format is not well-supported in streaming mode
             for Anthropic. Use non-streaming get_response for structured output.
         """
+        cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
+            raise_if_cancelled(cancel_token)
             filtered_messages, combined_system = self._convert_messages_to_anthropic(
                 messages,
                 system_prompt,
@@ -929,7 +942,14 @@ class AnthropicAdapter(LLMAdapter):
             splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with client.messages.stream(**api_params) as stream:
-                async for event in stream:
+                stream_iter = stream.__aiter__()
+                while True:
+                    try:
+                        event = await anext_or_cancelled(
+                            stream_iter, cancel_token
+                        )
+                    except StopAsyncIteration:
+                        break
                     event_type = getattr(event, 'type', None)
                     if event_type != 'content_block_delta' or not hasattr(event, 'delta'):
                         logger.debug("Ignoring unsupported Anthropic stream event: %s", event_type)
@@ -999,7 +1019,9 @@ class AnthropicAdapter(LLMAdapter):
         # still flush partial usage (#1684). Popped before building api_params
         # so it is never forwarded to the Anthropic SDK.
         usage_sink = kwargs.pop("usage_sink", None)
+        cancel_token: Optional[CancelToken] = kwargs.pop("cancel_token", None)
         try:
+            raise_if_cancelled(cancel_token)
             filtered_messages, combined_system = self._convert_messages_to_anthropic(
                 messages,
                 system_prompt,
@@ -1056,7 +1078,14 @@ class AnthropicAdapter(LLMAdapter):
             splitter = ThinkingContentSplitter(provider="anthropic")
 
             async with client.messages.stream(**api_params) as stream:
-                async for event in stream:
+                stream_iter = stream.__aiter__()
+                while True:
+                    try:
+                        event = await anext_or_cancelled(
+                            stream_iter, cancel_token
+                        )
+                    except StopAsyncIteration:
+                        break
                     # Handle different event types
                     event_type = getattr(event, 'type', None)
 

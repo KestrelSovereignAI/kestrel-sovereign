@@ -315,7 +315,9 @@ class _FakeAppServer:
     def close_turn_sink(self, key):
         pass
 
-    async def iter_turn_events(self, sink, *, idle_timeout=120, thread_id=None):
+    async def iter_turn_events(
+        self, sink, *, idle_timeout=120, thread_id=None, cancel_token=None
+    ):
         for ev in self._events:
             yield ev
 
@@ -420,6 +422,46 @@ class TestAdapterTextPath:
                 messages=[{"role": "user", "content": "hi"}], session_id="s")
         ]
         assert "".join(c for c in out if isinstance(c, str)) == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_cancel_token_aborts_silent_turn_and_closes_sink(self):
+        import asyncio
+
+        a = _adapter_with([])
+        started = asyncio.Event()
+        cancelled = False
+        closed = []
+
+        async def silent_iter(
+            sink, *, idle_timeout=120, thread_id=None, cancel_token=None
+        ):
+            if False:
+                yield {}
+            assert cancel_token is not None
+            started.set()
+            while True:
+                if cancel_token():
+                    raise asyncio.CancelledError
+                await asyncio.sleep(0.01)
+
+        a._client.iter_turn_events = silent_iter
+        a._client.close_turn_sink = lambda key: closed.append(key)
+
+        task = asyncio.create_task(
+            a.get_response(
+                client="x",
+                model="auto",
+                messages=[{"role": "user", "content": "hi"}],
+                session_id="s",
+                cancel_token=lambda: cancelled,
+            )
+        )
+        await started.wait()
+        cancelled = True
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1)
+        assert closed == ["thr-1"]
 
 
 class TestThreadStartParams:
@@ -1131,11 +1173,14 @@ class TestToolExecutorBridge:
         release = asyncio.Event()
         original_iter = a._client.iter_turn_events
 
-        async def gated_iter(sink, *, idle_timeout=120, thread_id=None):
+        async def gated_iter(
+            sink, *, idle_timeout=120, thread_id=None, cancel_token=None
+        ):
             in_turn.set()
             await release.wait()
             async for ev in original_iter(
-                sink, idle_timeout=idle_timeout, thread_id=thread_id
+                sink, idle_timeout=idle_timeout, thread_id=thread_id,
+                cancel_token=cancel_token,
             ):
                 yield ev
 
@@ -1265,7 +1310,10 @@ class TestToolExecutorBridge:
             def close_turn_sink(self, key):
                 pass
 
-            async def iter_turn_events(self, sink, *, idle_timeout=120, thread_id=None):
+            async def iter_turn_events(
+                self, sink, *, idle_timeout=120, thread_id=None,
+                cancel_token=None,
+            ):
                 for ev in [
                     {"method": "item/completed",
                      "params": {"item": {
