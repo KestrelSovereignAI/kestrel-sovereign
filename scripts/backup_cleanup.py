@@ -1007,8 +1007,18 @@ def render_delete_preflight(
     return "\n".join(lines)
 
 
-def _deal_expiry_from_status(status: Mapping[str, Any] | None) -> Any:
+def _deal_expiry_from_status(status: Any) -> Any:
     if not status:
+        return None
+    # The Lighthouse deal_status endpoint returns a JSON list of deals; accept a
+    # list at any nesting level and return the first expiry found.
+    if isinstance(status, (list, tuple)):
+        for deal in status:
+            expiry = _deal_expiry_from_status(deal)
+            if expiry is not None:
+                return expiry
+        return None
+    if not isinstance(status, Mapping):
         return None
     for key in ("dealExpiry", "deal_expiry", "endEpoch", "expiration", "expiry"):
         if key in status:
@@ -1059,7 +1069,13 @@ def _append_audit(
         entry["filecoin_status"] = (
             "deleted_from_account_but_deal_may_persist_until_expiry"
         )
-        deal_expiry = _deal_expiry_from_status(deal_status)
+        # Never let an unexpected deal_status shape abort the delete batch —
+        # audit deal_expiry best-effort.
+        try:
+            deal_expiry = _deal_expiry_from_status(deal_status)
+        except Exception as exc:  # noqa: BLE001
+            deal_expiry = None
+            entry["deal_expiry_parse_error"] = str(exc)
         if deal_expiry is not None:
             entry["deal_expiry"] = deal_expiry
     with audit_log.open("a", encoding="utf-8") as fh:
