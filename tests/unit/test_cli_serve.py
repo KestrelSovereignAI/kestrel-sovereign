@@ -161,9 +161,36 @@ def test_running_model_clears_stale_pidfile(monkeypatch):
 
 
 def test_running_model_returns_live(monkeypatch):
-    cli_serve.write_state({"name": "x", "pid": 123, "port": 8001})
+    cli_serve.write_state({
+        "name": "x", "pid": 123, "port": 8001,
+        "cmd": ["/opt/homebrew/bin/llama-server", "--model", "/m/x.gguf"],
+    })
     monkeypatch.setattr(cli_serve, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli_serve, "_process_cmdline",
+                        lambda pid: "/opt/homebrew/bin/llama-server --model /m/x.gguf --port 8001")
     assert cli_serve.running_model()["name"] == "x"
+
+
+def test_running_model_rejects_reused_pid(monkeypatch):
+    # PID alive, but it's a DIFFERENT process (PID reuse) — must not be treated as ours.
+    cli_serve.write_state({
+        "name": "x", "pid": 123, "port": 8001,
+        "cmd": ["/opt/homebrew/bin/llama-server", "--model", "/m/x.gguf"],
+    })
+    monkeypatch.setattr(cli_serve, "pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli_serve, "_process_cmdline", lambda pid: "/usr/sbin/cupsd")
+    assert cli_serve.running_model() is None
+    assert cli_serve.read_state() is None  # stale state reaped
+
+
+def test_state_matches_process_requires_model_path(monkeypatch):
+    state = {"cmd": ["/x/llama-server", "--model", "/m/v4.gguf"]}
+    monkeypatch.setattr(cli_serve, "_process_cmdline",
+                        lambda pid: "/x/llama-server --model /m/OTHER.gguf")
+    assert cli_serve._state_matches_process(state, 1) is False
+    monkeypatch.setattr(cli_serve, "_process_cmdline",
+                        lambda pid: "/x/llama-server --model /m/v4.gguf --port 8001")
+    assert cli_serve._state_matches_process(state, 1) is True
 
 
 # --------------------------------------------------------------------------- #

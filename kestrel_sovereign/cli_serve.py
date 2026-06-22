@@ -170,13 +170,51 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def _process_cmdline(pid: int) -> str:
+    """Full argv of pid via ps (-ww = no width truncation). '' if unavailable."""
+    try:
+        out = subprocess.run(
+            ["ps", "-ww", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _state_matches_process(state: dict[str, Any], pid: int) -> bool:
+    """True only if pid's live argv matches the llama-server we recorded.
+
+    Guards against PID reuse: a stale state whose PID the OS later handed to an
+    unrelated process must NOT be treated as our managed model (else down/switch
+    would killpg() a stranger). We require both the llama-server binary and our
+    exact --model path to appear in the live process's command line.
+    """
+    cmdline = _process_cmdline(pid)
+    if "llama-server" not in cmdline:
+        return False
+    cmd = state.get("cmd", [])
+    if "--model" in cmd:
+        i = cmd.index("--model")
+        model = cmd[i + 1] if i + 1 < len(cmd) else ""
+        if model and model not in cmdline:
+            return False
+    return True
+
+
 def running_model() -> Optional[dict[str, Any]]:
-    """Return live state ({name,pid,port,...}) if a managed model is running, else None."""
+    """Return live state ({name,pid,port,...}) if OUR managed model is running.
+
+    Returns None (and reaps the pidfile) if the process is gone OR the PID was
+    reused by an unrelated process.
+    """
     st = read_state()
-    if st and pid_alive(int(st.get("pid", -1))):
+    if not st:
+        return None
+    pid = int(st.get("pid", -1))
+    if pid_alive(pid) and _state_matches_process(st, pid):
         return st
-    if st:  # stale pidfile — process is gone
-        clear_state()
+    clear_state()  # gone, or PID reused by a stranger
     return None
 
 
