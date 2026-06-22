@@ -19,6 +19,7 @@ from typing import Dict, Optional, List, Any, Union
 from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
+from .destructive_audit import DestructiveAuditLog, audit_db_path_for
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge
 from .async_rag_store import AsyncRAGStore
 from .db import DatabaseBackend, SQLiteBackend, create_backend
@@ -112,6 +113,7 @@ class AsyncStorage:
         self.db: Optional[AsyncDatabase] = None
         self.files: Optional[AsyncFileStore] = None
         self.conversation: Optional[AsyncConversationStore] = None
+        self.destructive_audit: Optional[DestructiveAuditLog] = None
         self.graph: Optional[AsyncGraphStore] = None
         self.rag: Optional[AsyncRAGStore] = None
         self._initialized = False
@@ -153,11 +155,15 @@ class AsyncStorage:
             self.db = AsyncDatabase(self._backend)
             await self.db._init_schema()
             self.db._initialized = True
+            if self.backend_type == "sqlite" and self.db_path and self.db_path != ":memory:":
+                self.destructive_audit = DestructiveAuditLog(audit_db_path_for(self.db_path))
+                await self.destructive_audit.initialize()
             self.files = AsyncFileStore(self.db)
             self.conversation = AsyncConversationStore(
                 self.db,
                 agent_id=self.agent_id,
                 llm_service=self.llm_service,
+                destructive_audit=self.destructive_audit,
             )
             self.graph = AsyncGraphStore(self.db)
             self.rag = AsyncRAGStore(self.db, llm_service=self.llm_service)

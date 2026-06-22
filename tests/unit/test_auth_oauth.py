@@ -101,10 +101,22 @@ class TestOAuthEndpoints:
 
     def test_login_redirects_to_google(self, client):
         """Test /auth/login redirects to Google OAuth."""
-        resp = client.get("/auth/login", follow_redirects=False)
-        assert resp.status_code in (302, 303)
-        location = resp.headers.get("location", "")
-        assert "accounts.google.com" in location
+        from fastapi.responses import RedirectResponse
+
+        # Mock the OAuth redirect to avoid real network calls
+        mock_redirect = RedirectResponse(
+            url="https://accounts.google.com/o/oauth2/auth?client_id=test&redirect_uri=http://testserver/auth/callback",
+            status_code=302
+        )
+
+        with patch("kestrel_sovereign.endpoints.auth_oauth.oauth") as mock_oauth:
+            mock_oauth._clients = {"google": MagicMock()}
+            mock_oauth.google.authorize_redirect = AsyncMock(return_value=mock_redirect)
+
+            resp = client.get("/auth/login", follow_redirects=False)
+            assert resp.status_code in (302, 303)
+            location = resp.headers.get("location", "")
+            assert "accounts.google.com" in location
 
     def test_logout_clears_session(self, client):
         """Test /auth/logout clears session and redirects."""

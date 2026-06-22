@@ -241,6 +241,39 @@ class TestAuditAnchorFeature:
         assert result.data["entries_count"] == 3
 
     @pytest.mark.asyncio
+    async def test_anchor_audit_includes_destructive_audit_log(self, tmp_path):
+        """Existing anchor flow also captures isolated destructive audit rows."""
+        from kestrel_sovereign.features.audit_anchor.feature import AuditAnchorFeature
+        from kestrel_sovereign.storage.destructive_audit import (
+            DestructiveAuditEvent,
+            DestructiveAuditLog,
+            hash_rows,
+        )
+
+        agent = await _make_mock_agent(tmp_path, audit_entries=[])
+        audit = DestructiveAuditLog(tmp_path / "kestrel_audit.db")
+        await audit.append(
+            DestructiveAuditEvent(
+                agent_id="did:test:audit",
+                operation_type="purge_all",
+                row_count=1,
+                pre_operation_hash=hash_rows([{"id": 1, "content": "gone"}]),
+                snapshot_reference="inline:sha256",
+                scope={"table": "conversation_history"},
+                reason="test",
+            )
+        )
+        agent.storage.destructive_audit = audit
+
+        feature = AuditAnchorFeature(agent)
+        await feature.initialize()
+
+        result = await feature.anchor_audit()
+
+        assert result.data["status"] == "anchored"
+        assert result.data["entries_count"] == 1
+
+    @pytest.mark.asyncio
     async def test_verify_audit_no_anchors(self, feature_no_entries):
         """Verify returns 'no_anchors' when none exist."""
         result = await feature_no_entries.verify_audit()

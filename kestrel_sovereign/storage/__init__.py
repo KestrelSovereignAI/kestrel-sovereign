@@ -30,6 +30,7 @@ from .async_storage import AsyncStorage
 from .async_database import AsyncDatabase
 from .async_file_store import AsyncFileStore
 from .async_conversation_store import AsyncConversationStore
+from .destructive_audit import DestructiveAuditLog, destructive_audit_caller
 from .async_graph_store import AsyncGraphStore, GraphNode, Edge
 from .async_rag_store import AsyncRAGStore
 from .bm25_index import BM25Index, AsyncBM25Index, BM25_AVAILABLE
@@ -83,6 +84,7 @@ __all__ = [
     "AsyncDatabase",
     "AsyncFileStore",
     "AsyncConversationStore",
+    "DestructiveAuditLog",
     "AsyncGraphStore",
     "AsyncRAGStore",
     # BM25 search
@@ -121,6 +123,7 @@ __all__ = [
     "DecryptionError",
     # Utilities
     "get_default_agent_data_dir",
+    "destructive_audit_caller",
     # Sovereignty
     "SovereignStorageAdapter",
     "RootManifest",

@@ -9,6 +9,7 @@ rather than continuous WAL polling.
 import asyncio
 import json
 import logging
+import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
@@ -352,7 +353,6 @@ class SyncService:
         "unchanged" for a real change (it may over-report changes after a
         touch, which only costs one redundant snapshot). Returns None on any
         stat error — callers then never skip."""
-        import os
         parts = []
         try:
             for suffix in ("", "-wal", "-shm"):
@@ -408,7 +408,8 @@ class SyncService:
             and results
             and all(r.success for r in results.values())
         ):
-            self._state.last_fingerprint = fingerprint
+            completed_fingerprint = self._compute_db_fingerprint() or fingerprint
+            self._state.last_fingerprint = completed_fingerprint
             self._state.last_snapshot_targets = sorted(
                 r.target_name for r in results.values() if r.success
             )
@@ -630,5 +631,7 @@ class SyncService:
             try:
                 with open(self.state_file, "w", encoding="utf-8") as f:
                     json.dump(self._state.to_dict(), f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
             except Exception as e:
                 logger.error(f"Failed to save sync state: {e}")
