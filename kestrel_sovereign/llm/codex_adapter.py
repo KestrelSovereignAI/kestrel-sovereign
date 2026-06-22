@@ -1549,9 +1549,10 @@ class CodexAdapter(LLMAdapter):
            could run any binary or write any path. Codex review #1575
            round 1 P1.
         2. **ApprovalQueue.** Keyed as ``feature_name="codex_native"``,
-           ``tool_name=kind``. Auto-mode covers it; operator DENY in
-           the permission store hard-stops it; every decision is
-           audited.
+           ``tool_name=kind``. The security feature registers these as
+           ``ALWAYS_ASK`` by default so global auto-mode does not silently
+           approve destructive native sandbox requests; operator DENY in
+           the permission store hard-stops it; every decision is audited.
 
         Reply shape mirrors codex's
         ``CommandExecutionApprovalDecision`` /

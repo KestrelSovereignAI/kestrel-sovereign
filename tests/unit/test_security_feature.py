@@ -164,6 +164,7 @@ class TestPermissionStore:
     async def test_global_auto_mode_overrides_non_denied_permissions(self, store):
         await store.register_tool("WalletAgent", "get_balance", PermissionLevel.ASK)
         await store.register_tool("WalletAgent", "delete_everything", PermissionLevel.DENY)
+        await store.register_tool("ShellFeature", "rm", PermissionLevel.ALWAYS_ASK)
         await store.register_tool("SearchFeature", "web_search", PermissionLevel.ALLOW)
 
         store.set_global_auto_mode(True)
@@ -172,6 +173,7 @@ class TestPermissionStore:
         assert await store.get_permission("SearchFeature", "web_search") == PermissionLevel.AUTO
         assert await store.get_permission("NewFeature", "new_tool") == PermissionLevel.AUTO
         assert await store.get_permission("WalletAgent", "delete_everything") == PermissionLevel.DENY
+        assert await store.get_permission("ShellFeature", "rm") == PermissionLevel.ALWAYS_ASK
 
     @pytest.mark.asyncio
     async def test_clear_session_overrides_disables_global_auto(self, store):
@@ -644,6 +646,39 @@ class TestSecurityHook:
         assert logs[0]["user_choice"] == "constitutional_honesty_unflagged"
 
     @pytest.mark.asyncio
+    async def test_always_ask_prompts_under_global_auto_mode(
+        self, hook, permission_store, approval_queue
+    ):
+        await permission_store.register_tool(
+            "ShellFeature", "rm", PermissionLevel.ALWAYS_ASK
+        )
+        permission_store.set_global_auto_mode(True)
+        request_was_pending = False
+
+        async def approve_later():
+            nonlocal request_was_pending
+            await asyncio.sleep(0.05)
+            pending = approval_queue.pending_requests
+            request_was_pending = bool(pending)
+            if pending:
+                await approval_queue.submit_decision(pending[0].id, True, "once")
+
+        asyncio.create_task(approve_later())
+        input = HookInput(
+            session_id="test",
+            hook_event_name="PreToolUse",
+            tool_name="rm",
+            feature_name="ShellFeature",
+            tool_input={"command": "rm /tmp/outside-workspace"},
+        )
+
+        output = await hook.execute(input)
+
+        assert output.continue_execution is True
+        assert output.permission_decision == PermissionDecision.ALLOW
+        assert request_was_pending is True
+
+    @pytest.mark.asyncio
     async def test_auto_deny(self, hook, permission_store):
         await permission_store.register_tool(
             "WalletAgent", "delete_everything", PermissionLevel.DENY
@@ -906,6 +941,45 @@ class TestApprovalQueueScopePersistence:
         assert logs[0]["decision"] == "auto_denied"
 
     @pytest.mark.asyncio
+    async def test_global_auto_mode_direct_request_approval_always_ask_prompts(
+        self, store
+    ):
+        request_added = False
+
+        async def on_request_added(_request):
+            nonlocal request_added
+            request_added = True
+
+        auto_policy = MagicMock()
+        auto_policy.evaluate = AsyncMock(
+            side_effect=AssertionError("ALWAYS_ASK must not reach auto-approve")
+        )
+        queue = ApprovalQueue(
+            on_request_added=on_request_added,
+            permission_store=store,
+            auto_approve_policy=auto_policy,
+        )
+        await store.register_tool(
+            "codex_native",
+            "commandExecution",
+            PermissionLevel.ALWAYS_ASK,
+        )
+        store.set_global_auto_mode(True)
+
+        approved, scope = await queue.request_approval(
+            feature_name="codex_native",
+            tool_name="commandExecution",
+            tool_args={"command": "rm /etc/passwd"},
+            timeout=0.01,
+        )
+
+        assert approved is False
+        assert scope == "timeout"
+        assert request_added is True
+        assert queue.pending_requests == []
+        auto_policy.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_session_scope_persists_via_direct_caller(self, queue_with_store, store):
         """A direct ``request_approval`` call (the path used by code_edit,
         compute, keys, reflection.*) with scope='session' must produce a
@@ -1091,6 +1165,25 @@ class TestApprovalQueueScopePersistence:
 
 class TestSecurityFeature:
     """Tests for SecurityFeature command contracts."""
+
+    @pytest.mark.asyncio
+    async def test_register_all_tools_seeds_codex_native_as_always_ask(self, tmp_path):
+        agent = MagicMock()
+        agent.features = {}
+        feature = SecurityFeature(agent)
+        feature.permission_store = PermissionStore(str(tmp_path / "security.db"))
+        await feature.permission_store.initialize()
+
+        await feature._register_all_tools()
+
+        assert (
+            await feature.permission_store.get_permission(
+                "codex_native", "commandExecution"
+            )
+        ) == PermissionLevel.ALWAYS_ASK
+        assert (
+            await feature.permission_store.get_permission("codex_native", "fileChange")
+        ) == PermissionLevel.ALWAYS_ASK
 
     @pytest.mark.asyncio
     async def test_pending_approvals_uses_wall_clock_age(self):

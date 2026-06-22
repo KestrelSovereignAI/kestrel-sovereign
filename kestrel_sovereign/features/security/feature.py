@@ -314,6 +314,13 @@ class SecurityFeature(Feature):
                         f"{feature_name}.{subagent_tool_name}: {exc}"
                     )
 
+        for tool_name in ("commandExecution", "fileChange"):
+            await self.permission_store.register_tool(
+                feature_name="codex_native",
+                tool_name=tool_name,
+                default_level=PermissionLevel.ALWAYS_ASK,
+            )
+
         if is_demo_server:
             logger.info(
                 "Registered all tools with ALLOW (KESTREL_DEMO_SERVER=1)"
@@ -411,6 +418,7 @@ class SecurityFeature(Feature):
             "allow_all": "☑",
             "auto_all": "◆",
             "deny_all": "☒",
+            "always_ask_all": "◇",
             "ask_all": "☐",
             "session_all": "◑",
             "mixed": "◐",
@@ -419,6 +427,7 @@ class SecurityFeature(Feature):
             "allow": "☑",
             "auto": "◆",
             "deny": "☒",
+            "always_ask": "◇",
             "ask": "☐",
             "session": "◑",
         }
@@ -445,7 +454,7 @@ class SecurityFeature(Feature):
             })
 
         lines.append(
-            "\nLegend: ☑=Allow ◆=Auto ☒=Deny ☐=Ask ◑=Session ◐=Mixed"
+            "\nLegend: ☑=Allow ◆=Auto ◇=Always Ask ☒=Deny ☐=Ask ◑=Session ◐=Mixed"
         )
         return ToolResult.ok(
             confirmation="\n".join(lines),
@@ -474,13 +483,13 @@ class SecurityFeature(Feature):
         Args:
             feature_name: Name of the feature (e.g., "WalletAgent")
             tool_name: Name of the tool (optional, sets all if omitted)
-            level: Permission level - "allow", "auto", "deny", "ask", or "session"
+            level: Permission level - "allow", "auto", "always_ask", "deny", "ask", or "session"
         """
         try:
             perm_level = PermissionLevel(level)
         except ValueError:
             return ToolResult.failed(
-                f"Invalid level '{level}'. Use: allow, auto, deny, ask, session"
+                f"Invalid level '{level}'. Use: allow, auto, always_ask, deny, ask, session"
             )
 
         try:

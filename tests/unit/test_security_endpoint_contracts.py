@@ -240,7 +240,7 @@ def test_security_global_auto_mode_endpoints_are_session_scoped():
         assert status_response.json()["enabled"] is False
         assert enable_response.status_code == 200
         assert enable_response.json()["enabled"] is True
-        assert "non-DENY tools" in enable_response.json()["warning"]
+        assert "not DENY or ALWAYS_ASK" in enable_response.json()["warning"]
         security_feature.permission_store.set_global_auto_mode.assert_called_once_with(True)
         security_feature.permission_store.log_decision.assert_awaited_once()
     finally:

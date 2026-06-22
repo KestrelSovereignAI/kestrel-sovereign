@@ -27,12 +27,14 @@ class PermissionLevel(Enum):
     - AUTO: Auto-approve after earlier constitutional/honesty/security hooks
       have not blocked the call
     - DENY: Always deny the tool execution
+    - ALWAYS_ASK: Ask every time, even when global Auto mode is enabled
     - ASK: Ask for user approval each time (default for new tools)
     - SESSION: Allow for the current session only (not persisted)
     """
     ALLOW = "allow"
     AUTO = "auto"
     DENY = "deny"
+    ALWAYS_ASK = "always_ask"
     ASK = "ask"
     SESSION = "session"
 
@@ -118,17 +120,24 @@ def _name_variants(name: str) -> set[str]:
 # DENY-wins ordering for casing-variant resolution. An explicit DENY anywhere
 # in the row set is treated as the operator's last word — a stale ALLOW under
 # a legacy casing must not silently re-enable a tool the operator has since
-# blocked under the canonical casing. ALLOW/AUTO outrank ASK/SESSION; SESSION
-# outranks ASK because SESSION is a deliberate per-session grant whereas ASK
-# is the "no row at all" default. See codex review #1427 P1 — without the
-# DENY priority, security regressions sneak in via the mixed-case DB state
-# this normalization layer was added to handle.
+# blocked under the canonical casing. ALWAYS_ASK similarly survives stale
+# grants because it is the "prompt before irreversible work" tier; ALLOW/AUTO
+# outrank ASK/SESSION; SESSION outranks ASK because SESSION is a deliberate
+# per-session grant whereas ASK is the "no row at all" default. See codex
+# review #1427 P1 — without the DENY priority, security regressions sneak in
+# via the mixed-case DB state this normalization layer was added to handle.
 _LEVEL_RANK = {
     PermissionLevel.DENY: 100,
+    PermissionLevel.ALWAYS_ASK: 90,
     PermissionLevel.ALLOW: 4,
     PermissionLevel.AUTO: 3,
     PermissionLevel.SESSION: 2,
     PermissionLevel.ASK: 1,
+}
+
+_AUTO_MODE_EXEMPT_LEVELS = {
+    PermissionLevel.DENY,
+    PermissionLevel.ALWAYS_ASK,
 }
 
 
@@ -405,11 +414,12 @@ class PermissionStore:
         """
         key = f"{feature_name}.{tool_name}"
 
-        # Session override takes priority. In global Auto mode, an explicit
-        # DENY remains a hard stop; everything else can flow through Auto.
+        # Session override takes priority. In global Auto mode, explicit
+        # DENY and ALWAYS_ASK remain hard policy rails; everything else can
+        # flow through Auto.
         if key in self._session_overrides:
             level = self._session_overrides[key]
-            if self._global_auto_mode and level != PermissionLevel.DENY:
+            if self._global_auto_mode and level not in _AUTO_MODE_EXEMPT_LEVELS:
                 return PermissionLevel.AUTO
             return level
 
@@ -432,7 +442,7 @@ class PermissionStore:
         rows = await self._lookup_rows(feature_name, tool_name)
         if rows:
             best = _most_permissive(rows)
-            if self._global_auto_mode and best != PermissionLevel.DENY:
+            if self._global_auto_mode and best not in _AUTO_MODE_EXEMPT_LEVELS:
                 return PermissionLevel.AUTO
             return best
 

@@ -204,6 +204,7 @@ class ApprovalQueue:
               (or a user-chosen approve scope returned with approved=False)
               as a user denial (#1542).
         """
+        always_ask = False
         if self._permission_store is not None:
             try:
                 from .permissions import PermissionLevel
@@ -212,6 +213,7 @@ class ApprovalQueue:
                     feature_name,
                     tool_name,
                 )
+                always_ask = level == PermissionLevel.ALWAYS_ASK
                 if level == PermissionLevel.DENY:
                     await self._permission_store.log_decision(
                         feature_name=feature_name,
@@ -245,6 +247,7 @@ class ApprovalQueue:
                     )
                     return (True, "auto")
             except Exception as e:  # noqa: BLE001
+                always_ask = False
                 logger.warning(
                     "ApprovalQueue: failed to evaluate pre-approval policy for "
                     f"{feature_name}.{tool_name}: {e}",
@@ -256,7 +259,7 @@ class ApprovalQueue:
         # human is queued. A match means the Sovereign pre-authorised this
         # exact pattern for this agent+repo; we write the full audit row
         # *before* returning so the invocation can never run silently.
-        if self._auto_approve_policy is not None:
+        if self._auto_approve_policy is not None and not always_ask:
             try:
                 from .permissions import PermissionLevel
 
