@@ -228,6 +228,36 @@ def test_run_missing_registry_returns_1(monkeypatch, tmp_path):
     assert rc == 1
 
 
+def test_run_status_works_without_registry(monkeypatch, tmp_path, capsys):
+    # Registry absent, but status must still work from the state file.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_serve, "memory_status", lambda: (512.0, 400.0, "GREEN"))
+    monkeypatch.setattr(cli_serve, "running_model", lambda: None)
+    rc = cli_serve.run(argparse.Namespace(serve_command="status"))
+    assert rc == 0
+    assert "Memory:" in capsys.readouterr().out
+
+
+def test_run_down_works_without_registry(monkeypatch, tmp_path):
+    # Registry absent; down must still be able to stop a managed model.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_serve, "running_model", lambda: None)
+    rc = cli_serve.run(argparse.Namespace(serve_command="down", timeout=1))
+    assert rc == 0  # nothing running, but did not error on missing registry
+
+
+def test_switch_validates_target_before_stopping_current(monkeypatch, tmp_path):
+    # Target binary is non-executable -> switch must refuse WITHOUT stopping current.
+    gguf = tmp_path / "m.gguf"; gguf.write_text("x")
+    bad_binary = tmp_path / "not-exec"; bad_binary.write_text("x")  # no +x
+    stop = MagicMock()
+    monkeypatch.setattr(cli_serve, "_stop", stop)
+    args = SimpleNamespace(name="m", port=None, timeout=1, no_wait=True, force=False)
+    rc = cli_serve.cmd_switch({"m": {"gguf": str(gguf), "binary": str(bad_binary)}}, args)
+    assert rc == 1
+    stop.assert_not_called()  # current model left running
+
+
 def test_run_list_dispatches(monkeypatch, tmp_path, capsys):
     p = _write_registry(tmp_path, 'default_port=8001\n[models."glm-5.2"]\ngguf="/x/g.gguf"\nest_ram_gb=300\n')
     monkeypatch.setenv("KESTREL_SERVE_REGISTRY", str(p))

@@ -255,7 +255,7 @@ def cmd_list(models: dict[str, dict[str, Any]]) -> int:
     return 0
 
 
-def cmd_status(models: dict[str, dict[str, Any]]) -> int:
+def cmd_status() -> int:
     total, avail, pressure = memory_status()
     print(f"Memory: {avail:.0f}GB available / {total:.0f}GB total"
           + (f"  pressure={pressure}" if pressure else ""))
@@ -369,10 +369,20 @@ def cmd_up(models: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
 
 def cmd_switch(models: dict[str, dict[str, Any]], args: argparse.Namespace) -> int:
     entry = _get_entry(models, args.name)
+    port = args.port or int(entry.get("port", DEFAULT_PORT))
+    # Validate the target is launchable (GGUF resolves, binary exists/executable)
+    # BEFORE stopping the current model — a registry-drift typo should not take a
+    # healthy server offline. The RAM gate stays in _start: stopping frees the RAM
+    # the target needs, so it can only be checked meaningfully post-stop.
+    try:
+        build_command(args.name, entry, port)
+    except (FileNotFoundError, ValueError, KeyError) as e:
+        print(f"REFUSING switch: target {args.name!r} is not launchable, leaving "
+              f"current model running: {e}", file=sys.stderr)
+        return 1
     rc = _stop(timeout=args.timeout)
     if rc != 0:
         return rc
-    port = args.port or int(entry.get("port", DEFAULT_PORT))
     return _start(args.name, entry, port, timeout=args.timeout,
                   wait=not args.no_wait, force=args.force)
 
@@ -409,10 +419,19 @@ def add_serve_subparser(subparsers: argparse._SubParsersAction) -> None:
 
 def run(args: argparse.Namespace) -> int:
     """Dispatch ``kestrel serve <subcommand>``."""
-    if not getattr(args, "serve_command", None):
+    cmd = getattr(args, "serve_command", None)
+    if not cmd:
         print("usage: kestrel serve {list,up,down,switch,status}", file=sys.stderr)
         return 1
 
+    # status/down operate purely from the state file — they must work even if the
+    # registry is missing/moved, so we can always stop a model we started.
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "down":
+        return _stop(timeout=args.timeout)
+
+    # list/up/switch need the registry.
     reg_path = resolve_registry_path()
     if reg_path is None:
         print("No registry found. Create serve_models.toml (see serve_models.example.toml) "
@@ -424,13 +443,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"Failed to load registry {reg_path}: {e}", file=sys.stderr)
         return 1
 
-    cmd = args.serve_command
     if cmd == "list":
         return cmd_list(models)
-    if cmd == "status":
-        return cmd_status(models)
-    if cmd == "down":
-        return _stop(timeout=args.timeout)
     if cmd == "up":
         return cmd_up(models, args)
     if cmd == "switch":
