@@ -16,8 +16,11 @@ from kestrel_sovereign.lifecycle_checks import (
     EXPECTED_DID_ENV_VAR,
     IdentityIsolationError,
     NoLLMProvidersError,
+    NoReachableProvidersError,
+    SKIP_REACHABILITY_PROBE_ENV_VAR,
     verify_identity_isolation,
     verify_llm_providers_initialized,
+    verify_llm_providers_reachable,
 )
 
 
@@ -29,6 +32,14 @@ from kestrel_sovereign.lifecycle_checks import (
 class _FakeLLMService:
     def __init__(self, providers):
         self.providers = providers
+
+
+class _ProbeAdapter:
+    def __init__(self, result):
+        self.result = result
+
+    async def probe_reachable(self, client, *, base_url=None, timeout=1.5):
+        return self.result
 
 
 def test_provider_check_passes_when_at_least_one_provider_initialized():
@@ -91,6 +102,123 @@ def test_provider_check_message_mentions_payer_policy_escape_hatch():
     # Operators reading the error should see the path to a deliberate-disable
     # configuration, not just "missing key" diagnostics.
     assert "PayerPolicy.llm.kind = NONE" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_reachability_check_raises_when_all_local_routes_unreachable():
+    svc = _FakeLLMService(
+        providers=[
+            {
+                "name": "ollama:local",
+                "vendor": "ollama",
+                "route": "local",
+                "is_local": True,
+                "is_cloud": False,
+                "adapter": _ProbeAdapter(False),
+                "client": object(),
+                "base_url": "http://127.0.0.1:11434",
+            }
+        ]
+    )
+
+    with pytest.raises(NoReachableProvidersError) as exc:
+        await verify_llm_providers_reachable(svc, env={})
+
+    assert "ollama:local" in str(exc.value)
+    assert SKIP_REACHABILITY_PROBE_ENV_VAR in str(exc.value)
+    assert svc.reachability[0]["status"] == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_reachability_check_warns_only_when_one_local_route_reachable(caplog):
+    svc = _FakeLLMService(
+        providers=[
+            {
+                "name": "ollama:local",
+                "vendor": "ollama",
+                "route": "local",
+                "is_local": True,
+                "is_cloud": False,
+                "adapter": _ProbeAdapter(False),
+                "client": object(),
+                "base_url": "http://127.0.0.1:11434",
+            },
+            {
+                "name": "llamacpp:local",
+                "vendor": "llamacpp",
+                "route": "local",
+                "is_local": True,
+                "is_cloud": False,
+                "adapter": _ProbeAdapter(True),
+                "client": object(),
+                "base_url": "http://127.0.0.1:8080/v1",
+            },
+        ]
+    )
+
+    await verify_llm_providers_reachable(svc, env={})
+
+    statuses = {r["name"]: r["status"] for r in svc.reachability}
+    assert statuses == {
+        "ollama:local": "unreachable",
+        "llamacpp:local": "reachable",
+    }
+    assert "ollama:local is not reachable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_reachability_check_skips_all_cloud_routes():
+    svc = _FakeLLMService(
+        providers=[
+            {
+                "name": "openai:api",
+                "vendor": "openai",
+                "route": "api",
+                "is_local": False,
+                "is_cloud": True,
+                "adapter": _ProbeAdapter(False),
+                "client": object(),
+            }
+        ]
+    )
+
+    await verify_llm_providers_reachable(svc, env={})
+
+    assert svc.reachability == [
+        {
+            "name": "openai:api",
+            "vendor": "openai",
+            "route": "api",
+            "is_local": False,
+            "status": "skipped",
+            "message": "cloud route not probed at startup",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reachability_check_respects_skip_env():
+    svc = _FakeLLMService(
+        providers=[
+            {
+                "name": "ollama:local",
+                "vendor": "ollama",
+                "route": "local",
+                "is_local": True,
+                "is_cloud": False,
+                "adapter": _ProbeAdapter(False),
+                "client": object(),
+            }
+        ]
+    )
+
+    await verify_llm_providers_reachable(
+        svc,
+        env={SKIP_REACHABILITY_PROBE_ENV_VAR: "1"},
+    )
+
+    assert svc.reachability[0]["status"] == "skipped"
+    assert SKIP_REACHABILITY_PROBE_ENV_VAR in svc.reachability[0]["message"]
 
 
 # ---------------------------------------------------------------------------

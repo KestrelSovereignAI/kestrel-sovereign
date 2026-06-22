@@ -216,6 +216,12 @@ class ProviderRegistry:
         model = route_cfg.get("model") or "auto"
         hints = list(route_cfg.get("selection_hints") or [])
         base_url = route_cfg.get("base_url")
+        if not base_url and adapter_cls is OllamaAdapter:
+            base_url = (
+                os.environ.get("OLLAMA_HOST")
+                or route_cfg.get("host")
+                or get_ollama_url()
+            )
 
         # Optional embedding sibling (#1494). When the active chat
         # provider can't embed (Anthropic has no embedding API), the

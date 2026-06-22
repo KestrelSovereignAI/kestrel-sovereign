@@ -12,6 +12,7 @@ import json
 import logging
 from typing import Any, Dict, List, Optional, Type, Union, TYPE_CHECKING, AsyncIterator
 
+import httpx
 from pydantic import BaseModel
 
 from .adapter import (
@@ -103,6 +104,29 @@ class OllamaAdapter(LLMAdapter):
                 "Structured output passes a JSON schema via Ollama's format option.",
             ),
         )
+
+    async def probe_reachable(
+        self,
+        client: Any,
+        *,
+        base_url: Optional[str] = None,
+        timeout: float = 1.5,
+    ) -> Optional[bool]:
+        """Probe Ollama's lightweight model-tags endpoint."""
+        host = base_url
+        if not host:
+            http_client = getattr(client, "_client", None)
+            host = str(getattr(http_client, "base_url", "") or "") or None
+        if not host:
+            return None
+
+        url = f"{str(host).rstrip('/')}/api/tags"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as http:
+                response = await http.get(url)
+            return response.status_code < 500
+        except httpx.HTTPError:
+            return False
 
     async def aembed(
         self,

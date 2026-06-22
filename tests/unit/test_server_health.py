@@ -77,3 +77,44 @@ def test_health_detailed_uses_health_feature_from_feature_dict():
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
     health_feature.get_latest.assert_awaited_once()
+
+
+def test_health_surfaces_llm_reachability():
+    """Basic /health should expose startup probe results for operators."""
+    from server import app
+
+    @asynccontextmanager
+    async def noop_lifespan(_app):
+        yield
+
+    original_lifespan = app.router.lifespan_context
+    original_agent = getattr(app.state, "agent", None)
+    original_manager = getattr(app.state, "agent_manager", None)
+    original_startup_error = getattr(app.state, "startup_error", None)
+
+    app.router.lifespan_context = noop_lifespan
+
+    agent = MagicMock()
+    agent.llm_service.reachability = [
+        {
+            "name": "ollama:local",
+            "status": "unreachable",
+            "is_local": True,
+        }
+    ]
+
+    app.state.agent = agent
+    app.state.agent_manager = None
+    app.state.startup_error = None
+
+    try:
+        with TestClient(app) as client:
+            response = client.get("/health")
+    finally:
+        app.router.lifespan_context = original_lifespan
+        app.state.agent = original_agent
+        app.state.agent_manager = original_manager
+        app.state.startup_error = original_startup_error
+
+    assert response.status_code == 200
+    assert response.json()["llm_reachability"][0]["name"] == "ollama:local"

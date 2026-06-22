@@ -934,7 +934,12 @@ def health_check(request: Request):
     startup_error = getattr(request.app.state, "startup_error", None)
     agent = getattr(request.state, 'agent', None) or getattr(request.app.state, 'agent', None)
     if agent:
-        return {"status": "ok", "agent_initialized": True}
+        payload = {"status": "ok", "agent_initialized": True}
+        llm_service = getattr(agent, "llm_service", None)
+        reachability = getattr(llm_service, "reachability", None)
+        if isinstance(reachability, list):
+            payload["llm_reachability"] = reachability
+        return payload
     # In multi-agent mode, check if any agents are loaded
     manager = getattr(request.app.state, 'agent_manager', None)
     if manager and manager.list_agents():
