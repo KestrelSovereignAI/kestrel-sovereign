@@ -1139,3 +1139,24 @@ def test_include_quarantined_bulk_deletes_legacy_but_protects_live():
     assert "cid-rawdb" in deleted
     assert "cid-bin" in deleted
     assert "cid-live" not in deleted  # live-manifest-referenced stays protected
+
+
+@pytest.mark.asyncio
+async def test_include_quarantined_actually_applies_deletes(tmp_path):
+    # Regression for the apply-gate: bulk_quarantined rows must pass _deletion_allowed.
+    records = [
+        _record("cid-rawdb", None, 900, store="lighthouse", name="kestrel_prime.db"),
+        _record("cid-bin", None, 900, store="lighthouse", name="x.bin"),
+    ]
+    for r in records:
+        r.metadata["id"] = f"file-{r.key}"
+    plan = backup_cleanup.build_delete_plan(
+        records, _expire_everything_policy(), quarantine_state={"objects": {}},
+        include_quarantined=True, now=NOW)
+    client = AsyncDeleteClient()
+    rc = await backup_cleanup.apply_plan(
+        plan, lighthouse_client=client,
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=tmp_path / "audit.jsonl")
+    assert rc == 0
+    assert set(client.deleted) == {"file-cid-rawdb", "file-cid-bin"}

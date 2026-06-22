@@ -1136,10 +1136,10 @@ def _deletion_allowed(row: PlannedRecord) -> bool:
     inventory_class = classify_inventory_record(row.record).inventory_class
     if inventory_class in {"attributed_snapshot", "test_proven_orphan"}:
         return True
-    return (
-        inventory_class in QUARANTINE_CLASSES
-        and row.reason == f"promoted_{inventory_class}"
-    )
+    return inventory_class in QUARANTINE_CLASSES and row.reason in {
+        f"promoted_{inventory_class}",  # per-object promotion
+        f"bulk_quarantined_{inventory_class}",  # --include-quarantined override
+    }
 
 
 async def apply_plan(
