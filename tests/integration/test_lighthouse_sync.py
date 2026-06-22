@@ -693,3 +693,41 @@ class TestHealthCheck:
             result = await target.health_check()
 
         assert result is False
+
+
+@pytest.mark.asyncio
+async def test_prune_paginates_with_id_cursor_across_pages():
+    """prune() must consume all pages via the last-item id cursor (the real API
+    returns no nextLastKey/lastKey), not stop after the first page."""
+    from unittest.mock import AsyncMock
+    from kestrel_sovereign.storage.sync.lighthouse_target import LighthouseTarget
+    from kestrel_sovereign.storage.sync.retention import RetentionPolicy
+
+    pages = {
+        None: {"fileList": [
+            {"cid": "QmA", "id": "a", "fileName": "kestrel_state__agent-1__20240101_000000.car",
+             "createdAt": "2024-01-01T00:00:00Z"},
+            {"cid": "QmB", "id": "b", "fileName": "kestrel_state__agent-1__20240108_000000.car",
+             "createdAt": "2024-01-08T00:00:00Z"}], "totalFiles": 3},
+        "b": {"fileList": [
+            {"cid": "QmC", "id": "c", "fileName": "kestrel_state__agent-1__20240115_000000.car",
+             "createdAt": "2024-01-15T00:00:00Z"}], "totalFiles": 3},
+        "c": {"fileList": [], "totalFiles": 3},
+    }
+    calls = []
+    client = AsyncMock()
+    async def _get_uploads(last_key=None):
+        calls.append(last_key); return pages[last_key]
+    client.get_uploads = _get_uploads
+    client.delete_file = AsyncMock(return_value={"deleted": True})
+    client.close = AsyncMock()
+
+    target = LighthouseTarget(api_key="k", agent_id="agent-1")
+    with patch(LIGHTHOUSE_REST_CLIENT, return_value=client):
+        result = await target.prune(RetentionPolicy.from_config(
+            {"backup": {"retention": {"working_memory": {
+                "keep_all_days": 0, "weekly_forever": False, "monthly_forever": False}}}}))
+
+    # All three pages consumed via id cursor; older snapshots pruned, newest kept.
+    assert calls == [None, "b", "c"]
+    assert result["scanned"] == 3

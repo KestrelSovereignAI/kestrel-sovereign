@@ -459,8 +459,16 @@ async def _all_lighthouse_uploads(client: LighthouseClient) -> list[Mapping[str,
         uploads.extend(item for item in file_list if isinstance(item, Mapping))
         if account_total is None and page.get("totalFiles") is not None:
             account_total = _size(page.get("totalFiles"))
-        next_key = page.get("nextLastKey") or page.get("lastKey")
-        next_key = str(next_key) if next_key else None
+        # The real files_uploaded response has no nextLastKey/lastKey; pagination
+        # is cursor-by-last-item — pass the last record's id as the next lastKey.
+        if not file_list:
+            break
+        last_item = file_list[-1]
+        next_key = (
+            str(last_item.get("id"))
+            if isinstance(last_item, Mapping) and last_item.get("id")
+            else None
+        )
         if not next_key:
             break
         if next_key in seen_cursors:
