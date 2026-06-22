@@ -1,11 +1,14 @@
 """Constitution verification and integrity checking for Kestrel Agent."""
 import logging
 import hashlib
+import json
 import os
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 from datetime import datetime, timezone
+
+from kestrel_sovereign.storage import GraphNode
 
 
 class ConstitutionMixin:
@@ -726,20 +729,155 @@ class ConstitutionMixin:
         logging.warning(f"EXITING SAFE MODE. Authorization: {authorization or 'none provided'}")
         return "Safe mode deactivated. Please verify system integrity."
 
-    async def reanchor_constitution(self, expected_hash: str = None, authorization: str = None) -> str:
+    def _trusted_sovereign_did_document(
+        self,
+        agent_node: Optional[GraphNode] = None,
+    ) -> Optional[dict]:
+        """Return the trusted Sovereign root DID document for amendments.
+
+        The amendment signer must be an authority outside the running agent's
+        own signing identity. Never fall back to ``self.identity``: the agent
+        holds that private key and accepting it would make reanchor
+        self-authorizing.
+        """
+        self_dids = self._agent_signing_dids()
+
+        for did_doc in self._configured_sovereign_root_did_documents(agent_node):
+            if self._is_external_sovereign_doc(did_doc, self_dids):
+                return dict(did_doc)
+
+        controller = self._controller_did()
+        if controller and controller not in self_dids:
+            resolver = getattr(self, "a2a_did_resolver", None)
+            if callable(resolver):
+                try:
+                    did_doc = resolver(controller)
+                except Exception:
+                    logging.exception(
+                        "Failed to resolve Sovereign controller DID %s", controller
+                    )
+                    did_doc = None
+                if self._is_external_sovereign_doc(did_doc, self_dids):
+                    return dict(did_doc)
+        return None
+
+    def _agent_signing_dids(self) -> set[str]:
+        dids: set[str] = set()
+        agent_id = getattr(self, "agent_id", None)
+        if isinstance(agent_id, str) and agent_id:
+            dids.add(agent_id)
+
+        identity = getattr(self, "identity", None)
+        if identity is None:
+            return dids
+        for attr in ("legacy_did", "new_did", "signing_did"):
+            value = getattr(identity, attr, None)
+            if isinstance(value, str) and value:
+                dids.add(value)
+        did_doc = getattr(identity, "legacy_did_document", None)
+        if isinstance(did_doc, Mapping):
+            doc_id = did_doc.get("id")
+            if isinstance(doc_id, str) and doc_id:
+                dids.add(doc_id)
+        return dids
+
+    def _configured_sovereign_root_did_documents(
+        self,
+        agent_node: Optional[GraphNode],
+    ) -> list[Mapping[str, Any]]:
+        candidates: list[Mapping[str, Any]] = []
+
+        for attr in (
+            "sovereign_root_did_document",
+            "trusted_sovereign_did_document",
+        ):
+            value = getattr(self, attr, None)
+            if isinstance(value, Mapping):
+                candidates.append(value)
+
+        props = getattr(agent_node, "properties", None)
+        if not isinstance(props, Mapping):
+            return candidates
+
+        for key in (
+            "sovereign_root_did_document",
+            "trusted_sovereign_did_document",
+        ):
+            value = props.get(key)
+            if isinstance(value, Mapping):
+                candidates.append(value)
+
+        root_did = props.get("sovereign_root_did")
+        public_key_hex = props.get("sovereign_root_public_key_hex")
+        if isinstance(root_did, str) and isinstance(public_key_hex, str):
+            candidates.append(
+                {
+                    "id": root_did,
+                    "publicKey": [
+                        {
+                            "id": f"{root_did}#keys-1",
+                            "type": "EcdsaSecp256k1VerificationKey2019",
+                            "controller": root_did,
+                            "publicKeyHex": public_key_hex,
+                        }
+                    ],
+                }
+            )
+        return candidates
+
+    def _controller_did(self) -> Optional[str]:
+        identity = getattr(self, "identity", None)
+        did_doc = getattr(identity, "legacy_did_document", None)
+        if not isinstance(did_doc, Mapping):
+            return None
+        controller = did_doc.get("controller")
+        if isinstance(controller, str) and controller:
+            return controller
+        return None
+
+    @staticmethod
+    def _is_external_sovereign_doc(
+        did_doc: Any,
+        self_dids: set[str],
+    ) -> bool:
+        if not isinstance(did_doc, Mapping):
+            return False
+        did = did_doc.get("id")
+        if not isinstance(did, str) or not did:
+            return False
+        if did in self_dids:
+            logging.critical(
+                "Refusing to trust agent-owned DID %s as Sovereign root", did
+            )
+            return False
+        return True
+
+    async def reanchor_constitution(
+        self,
+        expected_hash: str = None,
+        authorization: str = None,
+        amendment_artifact_path: str = None,
+    ) -> str:
         """Re-anchor the agent to the current constitution on disk.
 
         Use after a legitimate constitution update (e.g. amendment ratification).
-        Requires the caller to provide the expected hash prefix of the new
-        constitution, proving they know what they're blessing. Does NOT
-        auto-exit safe mode — use !safe-mode exit separately after verifying.
+        Requires a detached artifact signed by the Sovereign root key. The
+        expected hash prefix is retained only as an operator integrity hint; it
+        is not the trust boundary. Does NOT auto-exit safe mode — use
+        !safe-mode exit separately after verifying.
 
         Args:
-            expected_hash: Required hash prefix (min 8 chars) of the new constitution.
+            expected_hash: Optional hash prefix (min 8 chars) of the new constitution.
             authorization: Who authorized this re-anchor (logged in audit trail).
+            amendment_artifact_path: Path to a signed amendment/reanchor artifact.
         """
-        if not expected_hash or len(expected_hash) < 8:
-            return "Error: Expected hash required (min 8 characters). Run sha256sum on the constitution file first."
+        if not amendment_artifact_path:
+            return (
+                "Error: Signed amendment artifact required. "
+                "Usage: !reanchor-constitution <artifact.json> [expected_hash_prefix]"
+            )
+        if expected_hash and len(expected_hash) < 8:
+            return "Error: Expected hash prefix must be at least 8 characters."
 
         agent_node = await self.storage.get_node(self.agent_id)
         if not agent_node:
@@ -772,7 +910,7 @@ class ConstitutionMixin:
 
         new_hash = hashlib.sha256(constitution_content).hexdigest()
 
-        if not new_hash.startswith(expected_hash):
+        if expected_hash and not new_hash.startswith(expected_hash):
             logging.critical(
                 f"REANCHOR REJECTED: expected prefix {expected_hash} "
                 f"does not match file hash {new_hash}"
@@ -782,13 +920,65 @@ class ConstitutionMixin:
                 f"does not start with expected prefix '{expected_hash}'."
             )
 
+        artifact_path_used = str(amendment_artifact_path)
+        try:
+            with open(amendment_artifact_path, "rb") as f:
+                amendment_artifact_bytes = f.read()
+            amendment_artifact = json.loads(amendment_artifact_bytes.decode("utf-8"))
+        except FileNotFoundError:
+            return f"Error: Signed amendment artifact not found: {artifact_path_used}"
+        except Exception as e:
+            return f"Error: Failed to read signed amendment artifact: {e}"
+
+        trusted_did_document = self._trusted_sovereign_did_document(agent_node)
+        if not trusted_did_document:
+            return "Error: Trusted Sovereign root DID document not available."
+
+        from kestrel_sovereign.constitution.amendment_artifact import (
+            verify_reanchor_artifact,
+        )
+
+        verification = verify_reanchor_artifact(
+            amendment_artifact,
+            trusted_did_document=trusted_did_document,
+            expected_constitution_sha256=new_hash,
+        )
+        if not verification.ok:
+            logging.critical(
+                "REANCHOR REJECTED: signed amendment verification failed: %s",
+                verification.reason,
+            )
+            return f"Error: Signed amendment verification failed: {verification.reason}"
+
         if new_hash == old_hash:
             return f"Constitution already anchored to current version. Hash: {new_hash[:16]}..."
 
         try:
             stored_hash = await self.storage.store_file(constitution_content, "KESTREL_CONSTITUTION.md")
+            artifact_hash = await self.storage.store_file(
+                amendment_artifact_bytes,
+                "KESTREL_CONSTITUTION.reanchor.signed.json",
+            )
         except Exception as e:
             return f"Error: Failed to store constitution: {e}"
+
+        artifact_node = GraphNode(
+            node_id=artifact_hash,
+            node_type="constitution_amendment_artifact",
+            label="Signed Constitution Reanchor Artifact",
+            properties={
+                "hash": artifact_hash,
+                "type": "SignedConstitutionAmendment",
+                "artifact_type": amendment_artifact.get("artifact_type"),
+                "constitution_hash": stored_hash,
+                "signer": verification.signer,
+                "source_path": artifact_path_used,
+                "created_at": amendment_artifact.get("created_at"),
+                "anchored_at": self._get_timestamp(),
+                "verification": verification.reason,
+            },
+        )
+        await self.storage.add_node(artifact_node)
 
         agent_node.properties["constitution_hash"] = stored_hash
         agent_node.properties["constitution_reanchor"] = {
@@ -796,6 +986,10 @@ class ConstitutionMixin:
             "old_hash": old_hash,
             "new_hash": stored_hash,
             "path": constitution_path_used,
+            "signed_artifact_hash": artifact_hash,
+            "signed_artifact_path": artifact_path_used,
+            "signed_artifact_signer": verification.signer,
+            "signed_artifact_verification": verification.reason,
             "authorization": authorization or "unspecified",
             "expected_hash_prefix": expected_hash,
         }
@@ -814,6 +1008,8 @@ class ConstitutionMixin:
                 "event": "constitution_reanchor",
                 "old_hash": old_hash,
                 "new_hash": stored_hash,
+                "signed_artifact_hash": artifact_hash,
+                "signed_artifact_signer": verification.signer,
                 "authorization": authorization or "unspecified",
                 "timestamp": self._get_timestamp(),
             },
@@ -828,6 +1024,7 @@ class ConstitutionMixin:
             f"  Old hash: {old_hash[:16]}...\n"
             f"  New hash: {stored_hash[:16]}...\n"
             f"  Source:   {constitution_path_used}\n"
+            f"  Artifact: {artifact_hash[:16]}... signed by {verification.signer}\n"
             f"  Auth:     {authorization or 'unspecified'}"
             f"{safe_mode_note}"
         )
