@@ -40,6 +40,9 @@ AUDIT_LOG = "backup_cleanup_deletions.log"
 QUARANTINE_STATE = "backup_cleanup_quarantine.json"
 RETENTION_POLICY_VERSION = "backup-retention-v1"
 TOOL_VERSION = "backup-cleanup-mutation-v1"
+MANIFEST_READ_MAX_ATTEMPTS = 4
+MANIFEST_READ_INITIAL_BACKOFF_SECONDS = 0.25
+MANIFEST_READ_THROTTLE_SECONDS = 0.05
 DEAL_IMMUTABILITY_CAVEAT = (
     "Lighthouse/Filecoin deletion removes the object from the active backup "
     "namespace/quota and restore catalogs; immutable Filecoin deals may "
@@ -107,7 +110,7 @@ class ClassifiedRecord:
 class LighthouseClient(Protocol):
     async def get_uploads(self, last_key: str | None = None) -> Mapping[str, Any]: ...
     async def download(self, cid: str, timeout: float | None = None) -> bytes: ...
-    async def delete_file(self, cid: str) -> Mapping[str, Any]: ...
+    async def delete_file(self, file_id: str) -> Mapping[str, Any]: ...
     async def get_deal_status(self, cid: str) -> Mapping[str, Any]: ...
     async def close(self) -> None: ...
 
@@ -360,9 +363,42 @@ def _valid_manifest_agent(
     return agent_id
 
 
+def _http_status(exc: BaseException) -> int | None:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return int(status_code) if isinstance(status_code, int) else None
+
+
+async def _download_manifest_with_retries(
+    client: LighthouseClient,
+    cid: str,
+    *,
+    max_attempts: int = MANIFEST_READ_MAX_ATTEMPTS,
+    initial_backoff_seconds: float = MANIFEST_READ_INITIAL_BACKOFF_SECONDS,
+) -> bytes:
+    delay = initial_backoff_seconds
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await client.download(cid)
+        except Exception as exc:
+            if _http_status(exc) != 429 or attempt >= max_attempts:
+                raise
+            logger.warning(
+                "Lighthouse manifest %s read hit HTTP 429; retrying attempt %s/%s",
+                cid,
+                attempt + 1,
+                max_attempts,
+            )
+            await asyncio.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"unreachable Lighthouse manifest retry state for {cid}")
+
+
 async def build_manifest_index(
     uploads: Iterable[Mapping[str, Any]],
     client: LighthouseClient,
+    *,
+    manifest_read_throttle_seconds: float = MANIFEST_READ_THROTTLE_SECONDS,
 ) -> tuple[dict[str, ManifestAttribution], set[str], dict[str, str]]:
     cid_index: dict[str, ManifestAttribution] = {}
     manifest_cids: set[str] = set()
@@ -377,11 +413,14 @@ async def build_manifest_index(
             continue
         manifest_cids.add(cid)
         try:
-            body = await client.download(cid)
+            body = await _download_manifest_with_retries(client, cid)
             manifest = json.loads(body.decode("utf-8"))
         except Exception as exc:  # noqa: BLE001 - malformed manifests are skipped.
             logger.warning("Skipping unreadable Lighthouse manifest %s: %s", cid, exc)
             continue
+        finally:
+            if manifest_read_throttle_seconds > 0:
+                await asyncio.sleep(manifest_read_throttle_seconds)
         if not isinstance(manifest, Mapping):
             logger.warning("Skipping non-object Lighthouse manifest %s", cid)
             continue
@@ -1117,6 +1156,7 @@ async def apply_plan(
             manifest_index_hash=manifest_index_hash,
             policy_version=policy_version,
         )
+    lighthouse_failures = 0
     if lighthouse_rows:
         for row in lighthouse_rows:
             deal_status = None
@@ -1126,7 +1166,35 @@ async def apply_plan(
                     deal_status = await get_deal_status(row.record.key)
                 except Exception as exc:  # noqa: BLE001 - audit deletion still proceeds.
                     deal_status = {"error": str(exc)}
-            delete_result = await lighthouse_client.delete_file(row.record.key)
+            file_id = row.record.metadata.get("id")
+            if not file_id:
+                _append_audit(
+                    audit_log,
+                    row,
+                    "failed",
+                    delete_call_result={
+                        "error": "missing Lighthouse upload id; delete skipped"
+                    },
+                    manifest_index_hash=manifest_index_hash,
+                    policy_version=policy_version,
+                    deal_status=deal_status,
+                )
+                lighthouse_failures += 1
+                continue
+            try:
+                delete_result = await lighthouse_client.delete_file(str(file_id))
+            except Exception as exc:  # noqa: BLE001 - audit and continue batch.
+                _append_audit(
+                    audit_log,
+                    row,
+                    "failed",
+                    delete_call_result={"error": str(exc), "file_id": str(file_id)},
+                    manifest_index_hash=manifest_index_hash,
+                    policy_version=policy_version,
+                    deal_status=deal_status,
+                )
+                lighthouse_failures += 1
+                continue
             _append_audit(
                 audit_log,
                 row,
@@ -1136,6 +1204,15 @@ async def apply_plan(
                 policy_version=policy_version,
                 deal_status=deal_status,
             )
+    # Non-zero exit if any Lighthouse delete failed, so automation doesn't read
+    # a partial cleanup as success (all rows were still attempted + audited).
+    if lighthouse_failures:
+        logger.error(
+            "%s Lighthouse deletion(s) failed; see audit log %s",
+            lighthouse_failures,
+            audit_log,
+        )
+        return 1
     return 0
 
 

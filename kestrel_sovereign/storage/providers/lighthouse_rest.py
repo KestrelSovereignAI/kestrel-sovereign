@@ -183,7 +183,7 @@ class LighthouseRestClient:
                 return data["data"]
         return {"fileList": [], "totalFiles": 0}
 
-    async def delete_file(self, cid: str) -> Dict[str, Any]:
+    async def delete_file(self, file_id: str) -> Dict[str, Any]:
         """
         Delete an upload record from the Lighthouse account.
 
@@ -193,8 +193,8 @@ class LighthouseRestClient:
         client = await self._get_client()
         response = await client.delete(
             f"{self.API_URL}/api/user/delete_file",
-            headers=self._auth_headers,
-            params={"cid": cid},
+            headers={**self._auth_headers, "Content-Type": "application/json"},
+            params={"id": file_id},
         )
         response.raise_for_status()
         data = response.json()

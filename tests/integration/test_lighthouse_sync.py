@@ -586,18 +586,22 @@ class TestPrune:
             {
                 "fileName": "kestrel_state__agent-1__20260101_000000.car",
                 "cid": "QmOldSnapshot",
+                "id": "file-old-snapshot",
             },
             {
                 "fileName": "kestrel_state__agent-1__20260201_000000.car",
                 "cid": "QmNewSnapshot",
+                "id": "file-new-snapshot",
             },
             {
                 "fileName": "kestrel_manifest__agent-1__20260101_000000.json",
                 "cid": "QmOldManifest",
+                "id": "file-old-manifest",
             },
             {
                 "fileName": "kestrel_manifest__agent-1__20260201_000000.json",
                 "cid": "QmNewManifest",
+                "id": "file-new-manifest",
             },
             {
                 "fileName": "kestrel_prime.db-wal",
@@ -641,8 +645,8 @@ class TestPrune:
         # data-loss risk); another agent's structured upload is never touched.
         assert result["scanned"] == 4
         deleted = {call.args[0] for call in mock_client.delete_file.await_args_list}
-        assert "QmOldSnapshot" in deleted
-        assert "QmOldManifest" in deleted
+        assert "file-old-snapshot" in deleted
+        assert "file-old-manifest" in deleted
         assert "QmLegacyWal" not in deleted
         assert "QmOtherAgent" not in deleted
 

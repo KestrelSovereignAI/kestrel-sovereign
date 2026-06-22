@@ -111,6 +111,27 @@ class TestLighthouseRestClient:
         assert result["dealStatus"] == "active"
 
     @pytest.mark.asyncio
+    async def test_delete_file_uses_file_id_param(self, client, mock_response):
+        resp = mock_response(json_data={"data": {"deleted": True}})
+
+        with patch.object(client, "_get_client") as mock_get:
+            mock_http = AsyncMock()
+            mock_http.delete = AsyncMock(return_value=resp)
+            mock_get.return_value = mock_http
+
+            result = await client.delete_file("file-uuid-123")
+
+        assert result == {"deleted": True}
+        mock_http.delete.assert_awaited_once_with(
+            f"{client.API_URL}/api/user/delete_file",
+            headers={
+                "Authorization": "Bearer test-api-key",
+                "Content-Type": "application/json",
+            },
+            params={"id": "file-uuid-123"},
+        )
+
+    @pytest.mark.asyncio
     async def test_get_balance(self, client, mock_response):
         resp = mock_response(json_data={"data": {"dataUsed": "1000", "dataLimit": "5000000000"}})
 

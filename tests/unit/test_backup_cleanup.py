@@ -1,8 +1,9 @@
 import inspect
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from kestrel_sovereign.storage.sync.retention import DataClass, RetentionPolicy
@@ -22,6 +23,7 @@ def _record(
     data_class: DataClass = DataClass.WORKING_MEMORY,
     name: str | None = None,
     attributed: bool = True,
+    metadata: dict | None = None,
 ):
     name = name or key.rsplit("/", 1)[-1]
     return backup_cleanup.BackupRecord(
@@ -32,7 +34,7 @@ def _record(
         size=size,
         timestamp=NOW - timedelta(days=days_old),
         data_class=data_class,
-        metadata={},
+        metadata=metadata or {},
         attributed=attributed,
     )
 
@@ -134,9 +136,20 @@ async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp
             name="old.db",
         ),
     ]
-    for record in records:
-        record.metadata["manifest_cid"] = f"manifest-{record.agent_id}"
-        record.metadata["manifest_cid_kind"] = "snapshot"
+    records = [
+        backup_cleanup.BackupRecord(
+            **{
+                **record.__dict__,
+                "metadata": {
+                    **record.metadata,
+                    "manifest_cid": f"manifest-{record.agent_id}",
+                    "manifest_cid_kind": "snapshot",
+                    **({"id": f"file-{record.key}"} if record.store == "lighthouse" else {}),
+                },
+            }
+        )
+        for record in records
+    ]
     plan = backup_cleanup.build_delete_plan(
         records,
         RetentionPolicy.from_config(
@@ -171,7 +184,7 @@ async def test_apply_with_confirmation_deletes_and_audits_gcs_and_lighthouse(tmp
     assert rc == 0
     run.assert_called_once()
     assert run.call_args.args[0][-1] == "gs://bucket/kestrel/agent-a/snapshots/old.db"
-    assert lighthouse_client.deleted == ["cid-old"]
+    assert lighthouse_client.deleted == ["file-cid-old"]
     audit_entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
     assert {entry["key"] for entry in audit_entries} == {
         "gs://bucket/kestrel/agent-a/snapshots/old.db",
@@ -189,8 +202,8 @@ class AsyncDeleteClient:
     async def download(self, cid, timeout=None):
         return b"{}"
 
-    async def delete_file(self, cid):
-        self.deleted.append(cid)
+    async def delete_file(self, file_id):
+        self.deleted.append(file_id)
         return {"deleted": True}
 
     async def get_deal_status(self, cid):
@@ -387,6 +400,61 @@ async def test_manifest_index_attributes_export_car_and_rejects_malformed_manife
     assert "manifest_cid_kind" not in by_key["cid-bad-export"].metadata
 
 
+@pytest.mark.asyncio
+async def test_manifest_index_retries_429_and_preserves_attribution():
+    request = httpx.Request("GET", "https://gateway.lighthouse.storage/ipfs/cid-manifest")
+    response = httpx.Response(429, request=request)
+    rate_limited = httpx.HTTPStatusError(
+        "too many requests",
+        request=request,
+        response=response,
+    )
+
+    class FakeClient:
+        def __init__(self):
+            self.downloads = 0
+
+        async def get_uploads(self, last_key=None):
+            return {}
+
+        async def download(self, cid, timeout=None):
+            assert cid == "cid-manifest"
+            self.downloads += 1
+            if self.downloads == 1:
+                raise rate_limited
+            return json.dumps(
+                {"agent_id": "agent-a", "snapshot_cid": "cid-snapshot"}
+            ).encode()
+
+        async def delete_file(self, file_id):
+            raise AssertionError("delete_file should not be called")
+
+        async def close(self):
+            pass
+
+    client = FakeClient()
+
+    with patch("scripts.backup_cleanup.asyncio.sleep", new_callable=AsyncMock) as sleep:
+        index, manifest_cids, manifest_agents = await backup_cleanup.build_manifest_index(
+            [
+                {
+                    "cid": "cid-manifest",
+                    "fileName": "manifest_agent-a.json",
+                    "createdAt": "2026-06-20T12:00:00Z",
+                }
+            ],
+            client,
+            manifest_read_throttle_seconds=0,
+        )
+
+    assert client.downloads == 2
+    sleep.assert_awaited_once_with(backup_cleanup.MANIFEST_READ_INITIAL_BACKOFF_SECONDS)
+    assert manifest_cids == {"cid-manifest"}
+    assert manifest_agents == {"cid-manifest": "agent-a"}
+    assert index["cid-snapshot"].agent_id == "agent-a"
+    assert index["cid-snapshot"].manifest_cid == "cid-manifest"
+
+
 def test_inventory_classifier_assigns_expected_class_confidence_and_reason():
     records = [
         _record(
@@ -567,7 +635,14 @@ def test_manifest_cid_entries_parses_legacy_and_collection_fields():
 
 
 def _attributed_snapshot(key: str, agent_id: str, days_old: int):
-    record = _record(key, agent_id, days_old, store="lighthouse", name=f"{key}.car")
+    record = _record(
+        key,
+        agent_id,
+        days_old,
+        store="lighthouse",
+        name=f"{key}.car",
+        metadata={"id": f"file-{key}"},
+    )
     record.metadata["manifest_cid"] = f"manifest-{agent_id}"
     record.metadata["manifest_cid_kind"] = "snapshot"
     return record
@@ -736,7 +811,7 @@ async def test_lighthouse_delete_audit_records_filecoin_caveat_and_pending_expir
     )
 
     assert rc == 0
-    assert client.deleted == ["cid-old"]
+    assert client.deleted == ["file-cid-old"]
     entry = json.loads(audit_log.read_text().strip())
     assert entry["key"] == "cid-old"
     assert entry["delete_call_result"] == {"deleted": True}
@@ -747,6 +822,98 @@ async def test_lighthouse_delete_audit_records_filecoin_caveat_and_pending_expir
     assert entry["deal_expiry"] == "2030-01-01T00:00:00Z"
     assert entry["manifest_index_hash"] == "abc123"
     assert entry["policy_version"] == "policy-test"
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_delete_missing_file_id_is_audited_and_skipped(tmp_path):
+    old = _attributed_snapshot("cid-old", "agent-a", 900)
+    old = backup_cleanup.BackupRecord(
+        **{**old.__dict__, "metadata": {"manifest_cid_kind": "snapshot"}}
+    )
+    new = _attributed_snapshot("cid-new", "agent-a", 1)
+    plan = backup_cleanup.build_delete_plan(
+        [old, new],
+        _expire_everything_policy(),
+        quarantine_state={"objects": {}},
+        now=NOW,
+    )
+    client = AsyncDeleteClient()
+    audit_log = tmp_path / "audit.jsonl"
+
+    rc = await backup_cleanup.apply_plan(
+        plan,
+        lighthouse_client=client,
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=audit_log,
+    )
+
+    # A planned delete with no upload id is requested-but-undeleted -> non-zero.
+    assert rc == 1
+    assert client.deleted == []
+    entry = json.loads(audit_log.read_text().strip())
+    assert entry["key"] == "cid-old"
+    assert entry["result"] == "failed"
+    assert "missing Lighthouse upload id" in entry["delete_call_result"]["error"]
+
+
+@pytest.mark.asyncio
+async def test_lighthouse_delete_failure_is_audited_and_batch_continues(tmp_path):
+    rows = [
+        _attributed_snapshot("cid-fails", "agent-a", 900),
+        _attributed_snapshot("cid-deletes", "agent-a", 901),
+        _attributed_snapshot("cid-new", "agent-a", 1),
+    ]
+    plan = backup_cleanup.build_delete_plan(
+        rows,
+        _expire_everything_policy(),
+        quarantine_state={"objects": {}},
+        now=NOW,
+    )
+
+    class FailingClient(AsyncDeleteClient):
+        async def delete_file(self, file_id):
+            self.deleted.append(file_id)
+            if file_id == "file-cid-fails":
+                raise RuntimeError("lighthouse 400")
+            return {"deleted": True, "id": file_id}
+
+    client = FailingClient()
+    audit_log = tmp_path / "audit.jsonl"
+
+    rc = await backup_cleanup.apply_plan(
+        plan,
+        lighthouse_client=client,
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=audit_log,
+    )
+
+    # Batch continues through the failure (both attempted), but the run reports
+    # non-zero so automation doesn't treat a partial cleanup as success.
+    assert rc == 1
+    assert client.deleted == ["file-cid-deletes", "file-cid-fails"]
+    entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+    by_key = {entry["key"]: entry for entry in entries}
+    assert by_key["cid-fails"]["result"] == "failed"
+    assert by_key["cid-fails"]["delete_call_result"]["file_id"] == "file-cid-fails"
+    assert by_key["cid-deletes"]["result"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_apply_plan_returns_zero_when_all_lighthouse_deletes_succeed(tmp_path):
+    rows = [
+        _attributed_snapshot("cid-a", "agent-a", 900),
+        _attributed_snapshot("cid-new", "agent-a", 1),
+    ]
+    plan = backup_cleanup.build_delete_plan(
+        rows, _expire_everything_policy(), quarantine_state={"objects": {}}, now=NOW
+    )
+    rc = await backup_cleanup.apply_plan(
+        plan,
+        lighthouse_client=AsyncDeleteClient(),
+        confirmation=backup_cleanup.CONFIRMATION_PHRASE,
+        audit_log=tmp_path / "audit.jsonl",
+    )
+    assert rc == 0
 
 
 def test_delete_plan_preserves_newest_and_live_manifest_referenced_objects():
