@@ -41,6 +41,7 @@ class UvExecutor(BaseExecutor):
         self,
         uv_path: Optional[str] = None,
         max_output_bytes: int = 1024 * 1024,  # 1MB default
+        current_agent_data_path: Optional[str | Path] = None,
     ):
         """
         Initialize the UV executor.
@@ -52,7 +53,9 @@ class UvExecutor(BaseExecutor):
         self._uv_path = uv_path
         self._cached_uv_path: Optional[str] = None
         self._max_output_bytes = max_output_bytes
-        self._policy = DestructiveOperationPolicy()
+        self._policy = DestructiveOperationPolicy(
+            current_agent_data_path=current_agent_data_path
+        )
     
     @property
     def name(self) -> str:

@@ -12,8 +12,10 @@ Tests cover:
 """
 
 import asyncio
+import json
 import os
 import shutil
+import subprocess
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -45,6 +47,7 @@ from kestrel_sovereign.features.compute.script_analyzer import (
     WARNING_PATTERNS,
 )
 from kestrel_sovereign.features.compute.destructive_policy import (
+    AgentDataProtectionError,
     DestructiveOperationPolicy,
     rewrite_script_for_safety,
 )
@@ -561,6 +564,89 @@ class TestDestructivePolicy:
         
         # Should keep original rm for temp files
         assert result.startswith("rm")
+
+    def test_rewrite_rm_blocks_other_agent_data(self, temp_trash_dir, tmp_path):
+        """Test that shell rm cannot touch another agent's data directory."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_rm(f"rm -rf {other}")
+
+        audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
+        entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert entries[-1]["decision"] == "blocked"
+        assert entries[-1]["reason"] == "other_agent_data"
+
+    def test_rewrite_rm_allows_own_agent_data(self, temp_trash_dir, tmp_path):
+        """Test that an agent can choose to delete its own data directory."""
+        current = tmp_path / "agent_data" / "emma"
+        current.mkdir(parents=True)
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        result = policy.rewrite_rm(f"rm -rf {current}")
+
+        assert result.startswith("rm")
+        audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
+        entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert entries[-1]["decision"] == "allowed"
+        assert entries[-1]["reason"] == "own_agent_data"
+
+    def test_rewrite_bash_blocks_mv_of_other_agent_data(self, temp_trash_dir, tmp_path):
+        """Test shell mv cannot relocate another agent's data directory."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_bash_script(f"mv {other} /tmp/claw")
+
+    def test_rewrite_bash_blocks_redirect_to_other_agent_database(self, temp_trash_dir, tmp_path):
+        """Test shell redirection cannot truncate another agent's database."""
+        current = tmp_path / "agent_data" / "emma"
+        other_db = tmp_path / "agent_data" / "claw" / "kestrel_prime.db"
+        current.mkdir(parents=True)
+        other_db.parent.mkdir()
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_bash_script(f": > {other_db}")
+
+    def test_rewrite_bash_blocks_compound_mv_of_other_agent_data(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test compound shell lines cannot hide mv against another agent."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_bash_script(f"true; mv {other} /tmp/claw")
+
+        with pytest.raises(AgentDataProtectionError):
+            policy.rewrite_bash_script(f"echo hi && mv {other} /tmp/claw")
     
     def test_rewrite_bash_script(self, temp_trash_dir):
         """Test rewriting entire bash script."""
@@ -597,6 +683,172 @@ print("Done")
         assert "KESTREL_TRASH_DIR" in result
         # Original code should be at the end
         assert "Done" in result
+
+    def test_python_wrapper_blocks_other_agent_data_delete(self, temp_trash_dir, tmp_path):
+        """Test non-rm Python deletion is blocked for another agent's data."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        (other / "kestrel_prime.db").write_text("memory")
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import shutil\n"
+                f"shutil.rmtree({str(other)!r})\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert (other / "kestrel_prime.db").exists()
+        audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
+        entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert entries[-1]["decision"] == "blocked"
+
+    def test_python_wrapper_allows_own_agent_data_delete(self, temp_trash_dir, tmp_path):
+        """Test non-rm Python deletion is allowed for the agent's own data."""
+        current = tmp_path / "agent_data" / "emma"
+        current.mkdir(parents=True)
+        (current / "kestrel_prime.db").write_text("memory")
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import shutil\n"
+                f"shutil.rmtree({str(current)!r})\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 0
+        assert not current.exists()
+        audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
+        entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert entries[-1]["decision"] == "allowed"
+
+    def test_python_wrapper_blocks_open_truncate_other_agent_database(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test builtins.open truncation is blocked for another agent database."""
+        current = tmp_path / "agent_data" / "emma"
+        other_db = tmp_path / "agent_data" / "claw" / "kestrel_prime.db"
+        current.mkdir(parents=True)
+        other_db.parent.mkdir()
+        other_db.write_text("memory")
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                f"with open({str(other_db)!r}, 'w') as handle:\n"
+                "    handle.write('gone')\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert other_db.read_text() == "memory"
+        audit_log = temp_trash_dir / "agent_data_access_audit.jsonl"
+        entries = [json.loads(line) for line in audit_log.read_text().splitlines()]
+        assert entries[-1]["action"] == "open_truncate"
+        assert entries[-1]["decision"] == "blocked"
+
+    def test_python_wrapper_blocks_rename_other_agent_data(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test os.rename is blocked for another agent data directory."""
+        current = tmp_path / "agent_data" / "emma"
+        other = tmp_path / "agent_data" / "claw"
+        current.mkdir(parents=True)
+        other.mkdir()
+        (other / "kestrel_prime.db").write_text("memory")
+        destination = tmp_path / "claw-moved"
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import os\n"
+                f"os.rename({str(other)!r}, {str(destination)!r})\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert (other / "kestrel_prime.db").exists()
+        assert not destination.exists()
+
+    def test_python_wrapper_blocks_truncate_other_agent_database(
+        self, temp_trash_dir, tmp_path
+    ):
+        """Test os.truncate is blocked for another agent database."""
+        current = tmp_path / "agent_data" / "emma"
+        other_db = tmp_path / "agent_data" / "claw" / "kestrel_prime.db"
+        current.mkdir(parents=True)
+        other_db.parent.mkdir()
+        other_db.write_text("memory")
+
+        policy = DestructiveOperationPolicy(
+            trash_dir=temp_trash_dir,
+            current_agent_data_path=current,
+        )
+        script_path = tmp_path / "script.py"
+        script_path.write_text(
+            policy.rewrite_python_script(
+                "import os\n"
+                f"os.truncate({str(other_db)!r}, 0)\n"
+            )
+        )
+
+        result = subprocess.run(
+            ["python", str(script_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert other_db.read_text() == "memory"
 
 
 # =============================================================================
@@ -684,6 +936,22 @@ class TestTrashManager:
         assert deleted == 1
         assert not old_subdir.exists()
         assert new_subdir.exists()
+
+    def test_empty_refuses_agent_database_artifacts(self, temp_trash_dir):
+        """Test old trashed agent databases are not permanently purged."""
+        manager = TrashManager(temp_trash_dir)
+
+        old_timestamp = (datetime.now() - timedelta(days=40)).strftime("%Y%m%d_%H%M%S")
+        old_subdir = temp_trash_dir / old_timestamp
+        agent_dir = old_subdir / "claw"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "kestrel_prime.db").write_text("memory")
+
+        deleted = manager.empty(older_than_days=30)
+
+        assert deleted == 0
+        assert old_subdir.exists()
+        assert (agent_dir / "kestrel_prime.db").exists()
     
     def test_get_stats(self, temp_trash_dir):
         """Test getting trash statistics."""

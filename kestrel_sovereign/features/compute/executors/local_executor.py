@@ -52,6 +52,7 @@ class LocalExecutor(BaseExecutor):
         self,
         max_output_bytes: int = 1024 * 1024,
         require_env_flag: bool = True,
+        current_agent_data_path: Optional[str | Path] = None,
     ):
         """
         Initialize the local executor.
@@ -62,7 +63,9 @@ class LocalExecutor(BaseExecutor):
         """
         self._max_output_bytes = max_output_bytes
         self._require_env_flag = require_env_flag
-        self._policy = DestructiveOperationPolicy()
+        self._policy = DestructiveOperationPolicy(
+            current_agent_data_path=current_agent_data_path
+        )
     
     @property
     def name(self) -> str:
