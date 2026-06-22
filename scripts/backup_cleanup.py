@@ -778,6 +778,7 @@ def build_delete_plan(
     policy: RetentionPolicy,
     *,
     quarantine_state: Mapping[str, Any] | None = None,
+    include_quarantined: bool = False,
     now: datetime | None = None,
 ) -> CleanupPlan:
     record_list = list(records)
@@ -814,7 +815,14 @@ def build_delete_plan(
             )
             continue
         if inventory_class in QUARANTINE_CLASSES:
-            if object_id in promoted_ids:
+            if include_quarantined:
+                # Operator override (--include-quarantined): bulk-delete the
+                # whole legacy quarantine class without per-object promotion.
+                # newest-per-agent + live-manifest protections already ran above.
+                rows.append(
+                    PlannedRecord(record, False, f"bulk_quarantined_{inventory_class}")
+                )
+            elif object_id in promoted_ids:
                 rows.append(PlannedRecord(record, False, f"promoted_{inventory_class}"))
             else:
                 rows.append(
@@ -1293,6 +1301,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             records,
             policy,
             quarantine_state=quarantine_state,
+            include_quarantined=args.include_quarantined,
         )
         manifest_hash = _manifest_index_hash(records)
         print(
@@ -1323,6 +1332,7 @@ async def _main_async(args: argparse.Namespace) -> int:
         records,
         policy,
         quarantine_state=quarantine_state,
+        include_quarantined=args.include_quarantined,
     )
     manifest_hash = _manifest_index_hash(records)
     print(
@@ -1396,6 +1406,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Object id (store:key) or unique key/name to promote from quarantine",
     )
     parser.add_argument("--gcs-batch-size", type=int, default=100)
+    parser.add_argument(
+        "--include-quarantined",
+        action="store_true",
+        help=(
+            "Operator override: bulk-delete ALL quarantine-class objects "
+            "(legacy raw DB/WAL, .bin, unattributed) without per-object "
+            "promotion. newest-per-agent + live-manifest objects stay "
+            "protected. Requires the typed --confirm phrase."
+        ),
+    )
     return parser
 
 
