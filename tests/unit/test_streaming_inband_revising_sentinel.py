@@ -238,7 +238,9 @@ async def test_sentinel_not_appended_to_persisted_assistant_text():
     agent = _build_mock_agent()
     persisted = []
     agent.privacy_agent.add_conversation = AsyncMock(
-        side_effect=lambda role, content, **kw: persisted.append({"role": role, "content": content}),
+        side_effect=lambda role, content, **kw: persisted.append({
+            "role": role, "content": content, **kw,
+        }),
     )
 
     async def stream():
@@ -287,7 +289,9 @@ async def test_thinking_delta_yielded_as_ui_only_sentinel_and_not_persisted():
     agent = _build_mock_agent()
     persisted = []
     agent.privacy_agent.add_conversation = AsyncMock(
-        side_effect=lambda role, content, **kw: persisted.append({"role": role, "content": content}),
+        side_effect=lambda role, content, **kw: persisted.append({
+            "role": role, "content": content, **kw,
+        }),
     )
 
     async def stream():
@@ -319,7 +323,9 @@ async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
     agent = _build_mock_agent()
     persisted = []
     agent.privacy_agent.add_conversation = AsyncMock(
-        side_effect=lambda role, content, **kw: persisted.append({"role": role, "content": content}),
+        side_effect=lambda role, content, **kw: persisted.append({
+            "role": role, "content": content, **kw,
+        }),
     )
 
     async def stream():
@@ -352,11 +358,12 @@ async def test_post_tool_thinking_delta_is_ui_only_and_not_persisted():
 
     assistant_rows = [r for r in persisted if r["role"] == "assistant"]
     assert len(assistant_rows) == 1
-    # #1547: the pre-tool prose and post-tool synthesis must NOT glue into
-    # "Checking that now.Final post-tool answer." A ToolCallStarted marker
-    # fired here, so the persisted turn carries a paragraph break at the
-    # revise boundary — matching what the chat client weld renders.
-    assert assistant_rows[0]["content"] == "Checking that now.\n\nFinal post-tool answer."
+    assert assistant_rows[0]["content"] == "Final post-tool answer."
+    assert assistant_rows[0]["metadata"]["pre_tool_reasoning"] == {
+        "content": "Checking that now.",
+        "seam": "\n\n",
+        "context_replay": "Checking that now.\n\nFinal post-tool answer.",
+    }
     assert THINKING_SENTINEL_PREFIX not in assistant_rows[0]["content"]
     assert "Now synthesize" not in assistant_rows[0]["content"]
 

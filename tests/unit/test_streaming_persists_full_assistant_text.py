@@ -1,20 +1,17 @@
 """
-Regression: streaming agent must persist the FULL visible assistant text.
+Regression: streaming tool turns keep honest history and self-recall.
 
-When the LLM emits explanatory text BEFORE deciding to call tools, those
-chunks are streamed to the client (the user sees them) and accumulated
-into `full_response`. The synthesizing answer AFTER tool execution is
-accumulated separately in `tool_response_chunks`. The user sees both
-streams concatenated in the chat pane.
+When the LLM emits explanatory text BEFORE deciding to call tools, the
+streaming client briefly sees those chunks, then retracts them on the
+ToolCallStarted/revising marker. Persisting that pre-tool prose in the
+assistant ``content`` field makes the retracted text reappear after a
+conversation-history reload.
 
-The persisted assistant message used to be ONLY the post-tool half
-(tool_response_chunks). On the next user turn, the conversation-history
-loader showed the agent only the post-tool synthesis — the pre-tool
-reasoning the user had just seen was missing. Surfaced by Meridian's
-"I don't see my own quantum response" transcript.
-
-The fix: persist ``pre_tool_text + post_tool_text`` so the next turn's
-context contains exactly what the user saw.
+The contract is now split: ``content`` stores only the post-tool synthesis
+that remains user-visible, while ``metadata.pre_tool_reasoning`` keeps the
+retracted prose available to the next-turn LLM context. That preserves the
+#877 Meridian self-recall fix without leaking the retracted prose through
+history GET payloads.
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -32,9 +29,10 @@ async def _passthrough():
 
 
 @pytest.mark.asyncio
-async def test_streaming_persists_pre_tool_plus_post_tool_text():
-    """The assistant turn persisted to the DB must include BOTH the
-    pre-tool reasoning chunks and the post-tool synthesis chunks."""
+async def test_streaming_persists_post_tool_content_and_pre_tool_metadata():
+    """The assistant content is post-tool only; metadata preserves recall."""
+    from kestrel_sdk.llm import ToolCallStarted
+    from kestrel_sovereign.agent.context_builder import ContextBuilder
     from kestrel_sovereign.agent.streaming import StreamingMixin
     from kestrel_sovereign.llm.adapter import LLMResponse, ToolCall
 
@@ -59,6 +57,7 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     mock_agent.extension = None
     mock_agent._cached_features_prompt = ""
     mock_agent.is_request_cancelled = MagicMock(return_value=False)
+    mock_agent.emit_event = AsyncMock()
     mock_agent._maybe_audit = AsyncMock()
     mock_agent._get_privacy_transition_lock = MagicMock(return_value=_passthrough())
     mock_agent._turn_lifecycle = MagicMock(return_value=_passthrough())
@@ -91,6 +90,7 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     async def mock_stream_with_tool_detection(**kwargs):
         yield "I'll check the github epic. "
         yield "Pulling it now."
+        yield ToolCallStarted(index=0, id="tc1", name="github")
         yield LLMResponse(
             content="",
             tool_calls=[ToolCall(id="tc1", name="github", arguments={})],
@@ -115,6 +115,9 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     mock_agent._persist_assistant_turn_safely = (
         StreamingMixin._persist_assistant_turn_safely.__get__(mock_agent)
     )
+    mock_agent._emit_revising_event = (
+        StreamingMixin._emit_revising_event.__get__(mock_agent)
+    )
 
     # Drain the stream like an HTTP client would.
     yielded = []
@@ -123,10 +126,12 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     ):
         yielded.append(chunk)
 
-    # User-visible stream = pre-tool chunks + post-tool chunks concatenated.
-    visible_text = "".join(yielded)
-    assert "I'll check the github epic." in visible_text
-    assert "Wave 2 is in flight." in visible_text
+    # The live stream still contains the brief pre-tool text, then an
+    # in-band revise marker, then post-tool synthesis. The client uses the
+    # marker to clear the in-flight bubble before rendering the final answer.
+    assert yielded[0:2] == ["I'll check the github epic. ", "Pulling it now."]
+    assert any("\x1eKESTREL:REVISE:" in chunk for chunk in yielded)
+    assert "Wave 2 is in flight." in "".join(yielded)
 
     # Find the assistant-row insert (there's also a user-row insert).
     assistant_inserts = [c for c in add_convo_calls if c["role"] == "assistant"]
@@ -135,21 +140,39 @@ async def test_streaming_persists_pre_tool_plus_post_tool_text():
     )
 
     persisted = assistant_inserts[0]["content"]
+    metadata = assistant_inserts[0].get("metadata") or {}
 
-    # The bug: persisted used to equal ONLY the post-tool synthesizing
-    # chunks. The fix is to persist pre-tool + post-tool. Assert both.
-    assert "I'll check the github epic." in persisted, (
-        "pre-tool reasoning must be persisted — the user saw it and "
-        "the next turn's context loader needs it"
+    assert persisted == "Found the epic. Wave 2 is in flight."
+    assert "I'll check the github epic." not in persisted
+    assert "pre_tool_reasoning" in metadata
+    assert metadata["pre_tool_reasoning"]["content"] == (
+        "I'll check the github epic. Pulling it now."
     )
-    assert "Pulling it now." in persisted, "all pre-tool chunks, not just the first"
-    assert "Wave 2 is in flight." in persisted, "post-tool synthesis must remain persisted"
 
-    # Persisted text should match the user-visible stream byte-for-byte
-    # (post-response-hook is identity in this test).
-    assert persisted == visible_text, (
-        "persisted assistant turn must match exactly what was streamed to the user"
+    cb = ContextBuilder.__new__(ContextBuilder)
+    cb._llm_service = None
+    cb._model_fallback = "test-stub"
+
+    class _Counter:
+        def count(self, s):
+            return max(1, len(s) // 4)
+
+        def truncate_to_tokens(self, s, n):
+            return s[: n * 4]
+
+    cb._counter = _Counter()
+    cb._counter_model = "test-stub"
+    formatted = cb.format_conversation_history(
+        [{"role": "assistant", "content": persisted, "metadata": metadata}],
+        max_tokens=10_000,
     )
+    assert formatted == [{
+        "role": "assistant",
+        "content": (
+            "I'll check the github epic. Pulling it now.\n\n"
+            "Found the epic. Wave 2 is in flight."
+        ),
+    }]
 
 
 @pytest.mark.asyncio

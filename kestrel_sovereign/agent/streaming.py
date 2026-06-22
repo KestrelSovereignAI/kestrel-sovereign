@@ -909,15 +909,12 @@ class StreamingMixin:
                 # arrives between the inner check and the next yield.
                 if request_id and self.is_request_cancelled(request_id):
                     break
-            # Persist the FULL visible assistant text — pre-tool reasoning
-            # the LLM emitted before deciding to call tools (full_response,
-            # already yielded to the client at the first stream loop) plus
-            # the post-tool synthesizing answer (tool_response_chunks).
-            # The user saw both streams concatenated; persisting only the
-            # post-tool half meant the next turn's history loader was blind
-            # to any pre-tool explanation, and the agent couldn't see the
-            # reasoning it had just shown the user. Surfaced by Meridian's
-            # "I don't see my own quantum response" transcript.
+            # Persist only the post-tool synthesis in ``content``. Any
+            # pre-tool prose was already retracted from the SSE client by
+            # the ToolCallStarted/revising protocol, so storing it in
+            # content makes the lie reappear on history reload. Keep that
+            # prose in metadata instead; ContextBuilder replays it to the
+            # next-turn LLM context so #877 self-recall is preserved.
             # #1547/#1659: strip + weld in-band sentinels from BOTH halves
             # and recover each tool sentinel's clean-text position. The pre
             # half can carry codex inline tool sentinels (emitted on the LLM
@@ -945,7 +942,7 @@ class StreamingMixin:
                 seam = "\n\n"
             else:
                 seam = ""
-            tool_final_text = pre_tool_text + seam + post_tool_text
+            context_replay_text = pre_tool_text + seam + post_tool_text
             pending_visible_boundary = False
             # Position-stamp tool_events so the renderer can place each card
             # back between the right prose segments (live + on reload). Pre
@@ -978,7 +975,7 @@ class StreamingMixin:
                 for tc in tool_response.tool_calls
             ]
             tool_final_text = await self._fire_post_response_hook(
-                tool_final_text, session_id,
+                post_tool_text, session_id,
                 pre_tool_prose=pre_tool_for_audit,
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
@@ -993,8 +990,14 @@ class StreamingMixin:
             # here (every adapter that goes through the multi-iteration
             # tool loop). Close it in both branches uniformly.
             meta: Optional[Dict[str, Any]] = None
-            if tool_events or tool_results:
+            if tool_events or tool_results or pre_tool_text:
                 meta = {}
+                if pre_tool_text:
+                    meta['pre_tool_reasoning'] = {
+                        'content': pre_tool_text,
+                        'seam': seam,
+                        'context_replay': context_replay_text,
+                    }
                 if tool_events:
                     meta['tool_events'] = tool_events
                 if tool_results:
@@ -1092,7 +1095,7 @@ class StreamingMixin:
             # persisted text and recover their positions to stamp onto the
             # synthesized events (inline_executed order == start-sentinel
             # order on the wire).
-            final_text, inline_parts = _parse_stream_sentinels(
+            context_replay_text, inline_parts = _parse_stream_sentinels(
                 "".join(full_response)
             )
             _stamp_tool_event_positions(synth_tool_events, inline_parts)
@@ -1100,11 +1103,19 @@ class StreamingMixin:
                 {"id": e["id"], "name": e["name"], "arguments": e["arguments"]}
                 for e in inline_executed
             ]
+            pre_tool_text = _parse_stream_sentinels(
+                pre_tool_prose_snapshot or ""
+            )[0]
+            post_tool_text = context_replay_text
+            seam = ""
+            if pre_tool_text and context_replay_text.startswith(pre_tool_text):
+                post_tool_text = context_replay_text[len(pre_tool_text):]
+                if post_tool_text.startswith("\n\n"):
+                    seam = "\n\n"
+                    post_tool_text = post_tool_text[2:]
             final_text = await self._fire_post_response_hook(
-                final_text, session_id,
-                pre_tool_prose=_parse_stream_sentinels(
-                    pre_tool_prose_snapshot or ""
-                )[0],
+                post_tool_text, session_id,
+                pre_tool_prose=pre_tool_text,
                 tool_calls=tool_calls_payload,
                 tool_results=tool_results,
             )
@@ -1116,6 +1127,13 @@ class StreamingMixin:
             await self._persist_assistant_turn_safely(
                 final_text,
                 metadata={
+                    **({
+                        "pre_tool_reasoning": {
+                            "content": pre_tool_text,
+                            "seam": seam,
+                            "context_replay": context_replay_text,
+                        }
+                    } if pre_tool_text else {}),
                     "tool_events": synth_tool_events,
                     "tool_results": tool_results,
                 },

@@ -107,7 +107,7 @@ def _build_inline_agent(persisted):
     privacy_agent = MagicMock()
     privacy_agent.add_conversation = AsyncMock(
         side_effect=lambda role, content, **kw: persisted.append(
-            {"role": role, "content": content}
+            {"role": role, "content": content, **kw}
         )
     )
     privacy_agent.privacy_config.allows_cloud_llm.return_value = True
@@ -186,10 +186,12 @@ async def test_inline_execution_path_welds_pre_and_post_tool_prose():
 
     assistant_rows = [r for r in persisted if r["role"] == "assistant"]
     assert len(assistant_rows) == 1
-    # The two plain-text segments straddling the inline tool call must not
-    # glue into "Let me check that.The answer is 42." — the marker records
-    # a boundary in the accumulated text.
-    assert assistant_rows[0]["content"] == "Let me check that.\n\nThe answer is 42."
+    assert assistant_rows[0]["content"] == "The answer is 42."
+    assert assistant_rows[0]["metadata"]["pre_tool_reasoning"] == {
+        "content": "Let me check that.",
+        "seam": "\n\n",
+        "context_replay": "Let me check that.\n\nThe answer is 42.",
+    }
     assert "\x1e" not in assistant_rows[0]["content"]
 
 
