@@ -153,6 +153,9 @@ def _convert_tools_to_codex_dynamic_tools(tools):
     return out or None
 
 
+CodexTurnInput = Union[str, List[Dict[str, Any]]]
+
+
 def _msg_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -164,7 +167,84 @@ def _msg_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-def _build_turn_input(input_messages: List[Dict[str, Any]], *, fresh_thread: bool) -> str:
+def _content_has_image_parts(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(part, dict)
+        and part.get("type") in ("image_url", "input_image")
+        for part in content
+    )
+
+
+def _image_url_from_part(
+    part: Dict[str, Any],
+) -> Tuple[Optional[str], Optional[Any]]:
+    image_url = part.get("image_url")
+    detail = part.get("detail")
+    if isinstance(image_url, str):
+        return image_url, detail
+    if isinstance(image_url, dict):
+        return image_url.get("url"), image_url.get("detail", detail)
+    return None, detail
+
+
+def _content_to_codex_input_parts(content: Any) -> List[Dict[str, Any]]:
+    """Convert OpenAI chat content parts to Responses-API input parts.
+
+    Kestrel's upstream vision path carries images in Chat Completions shape
+    (``{"type": "image_url", "image_url": {"url": "data:..."}}``). Codex's
+    app-server forwards turn input to the Responses API, where the matching
+    part is ``{"type": "input_image", "image_url": "data:..."}``.
+    """
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}]
+    if not isinstance(content, list):
+        text = "" if content is None else str(content)
+        return [{"type": "input_text", "text": text}]
+
+    out: List[Dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            logger.warning(
+                "CodexAdapter: dropping unsupported non-dict content part "
+                "(#847): %r",
+                part,
+            )
+            continue
+        ptype = part.get("type")
+        if ptype in ("text", "input_text"):
+            text = part.get("text")
+            if text:
+                out.append({"type": "input_text", "text": str(text)})
+            continue
+        if ptype in ("image_url", "input_image"):
+            url, detail = _image_url_from_part(part)
+            if url:
+                item: Dict[str, Any] = {
+                    "type": "input_image",
+                    "image_url": url,
+                }
+                if detail:
+                    item["detail"] = detail
+                out.append(item)
+            else:
+                logger.warning(
+                    "CodexAdapter: dropping image content part without URL "
+                    "(#847): %r",
+                    part,
+                )
+            continue
+        logger.warning(
+            "CodexAdapter: dropping unsupported content part type %r (#847)",
+            ptype,
+        )
+    return out
+
+
+def _build_turn_input(
+    input_messages: List[Dict[str, Any]], *, fresh_thread: bool
+) -> CodexTurnInput:
     """Text to send for this turn.
 
     Existing thread: only the latest user message (server holds history).
@@ -177,11 +257,17 @@ def _build_turn_input(input_messages: List[Dict[str, Any]], *, fresh_thread: boo
             last_user_idx = i
             break
     latest = (
-        _msg_text(input_messages[last_user_idx]["content"])
+        input_messages[last_user_idx]["content"]
         if last_user_idx is not None else ""
     )
+    latest_text = _msg_text(latest)
+    latest_has_images = _content_has_image_parts(latest)
     if not fresh_thread or last_user_idx in (None, 0):
-        return latest
+        return (
+            _content_to_codex_input_parts(latest)
+            if latest_has_images
+            else latest_text
+        )
     lines = []
     for m in input_messages[:last_user_idx]:
         role = m.get("role", "user")
@@ -194,11 +280,38 @@ def _build_turn_input(input_messages: List[Dict[str, Any]], *, fresh_thread: boo
         if txt:
             lines.append(f"{role}: {txt}")
     if not lines:
-        return latest
-    return (
+        return (
+            _content_to_codex_input_parts(latest)
+            if latest_has_images
+            else latest_text
+        )
+    prefix = (
         "Conversation so far (for context):\n"
         + "\n".join(lines)
-        + f"\n\nCurrent message:\n{latest}"
+        + "\n\nCurrent message:\n"
+    )
+    if latest_has_images:
+        parts = _content_to_codex_input_parts(latest)
+        return [{"type": "input_text", "text": prefix}, *parts]
+    return prefix + latest_text
+
+
+def _turn_input_to_request_input(
+    turn_input: CodexTurnInput,
+) -> List[Dict[str, Any]]:
+    if isinstance(turn_input, list):
+        return turn_input
+    return [{"type": "text", "text": turn_input}]
+
+
+def _turn_input_text_for_estimate(turn_input: CodexTurnInput) -> str:
+    if isinstance(turn_input, str):
+        return turn_input
+    return "".join(
+        part.get("text", "")
+        for part in turn_input
+        if isinstance(part, dict)
+        and part.get("type") in ("text", "input_text")
     )
 
 
@@ -834,14 +947,14 @@ class CodexAdapter(LLMAdapter):
         return ProviderCapabilities(
             supports_tools=True,
             supports_streaming=True,
-            supports_vision=False,
+            supports_vision=True,
             supports_structured_output=False,
             structured_output_mode=StructuredOutputMode.NONE,
             tool_streaming_mode=ToolStreamingMode.INLINE_EXECUTOR,
-            vision_input_mode=VisionInputMode.NONE,
+            vision_input_mode=VisionInputMode.OPENAI_IMAGE_URL,
             notes=(
                 "Codex app-server tools are executed through dynamic tool events.",
-                "Generic response_format and image input are not part of this adapter contract.",
+                "OpenAI image_url parts are translated to Responses input_image parts.",
             ),
         )
 
@@ -2203,7 +2316,7 @@ class CodexAdapter(LLMAdapter):
             # with the workspace boundary the sandbox is enforcing.
             turn_params: Dict[str, Any] = {
                 "threadId": thread_id,
-                "input": [{"type": "text", "text": turn_input}],
+                "input": _turn_input_to_request_input(turn_input),
                 "cwd": self._resolve_thread_cwd(),
             }
             # Reuse _model_param's sentinel filter — "auto"/"default" are
@@ -2229,7 +2342,7 @@ class CodexAdapter(LLMAdapter):
             started_item_ids: set = set()
             completed_item_ids: set = set()
 
-            turn_input_len_chars = len(turn_input)
+            turn_input_len_chars = len(_turn_input_text_for_estimate(turn_input))
             instructions_len_chars = len(instructions or "")
             # Estimated payload-cap hint for the idle-timeout branch
             # below. We don't want to import the TokenCounter here
