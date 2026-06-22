@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Union
 from kestrel_sdk.llm import LLMResponse, ToolCall
 from kestrel_sdk.llm import LLMAdapter as _SDKLLMAdapter
 
+from .cancellation import CancelToken
 from .image_utils import process_images
 
 @dataclass(frozen=True)
@@ -157,6 +158,7 @@ class ThinkingContentSplitter:
 __all__ = [
     "LLMAdapter",
     "LLMResponse",
+    "CancelToken",
     "ThinkingDelta",
     "ThinkingContentSplitter",
     "ToolCall",

@@ -467,7 +467,7 @@ async def test_no_retry_when_exceeds_cap_unset_for_unknown_cap():
     adapter = _stub_adapter()
 
     class _FakeApp:
-        async def iter_turn_events(self, sink, *, thread_id=None):
+        async def iter_turn_events(self, sink, *, thread_id=None, cancel_token=None):
             if False:
                 yield  # pragma: no cover
             raise CodexAppServerTransportError(
@@ -669,7 +669,7 @@ async def test_overflow_hint_rewrite_sets_exceeds_cap_attribute():
         def __init__(self):
             self._raised = False
 
-        async def iter_turn_events(self, sink, *, thread_id=None):
+        async def iter_turn_events(self, sink, *, thread_id=None, cancel_token=None):
             if False:
                 yield  # pragma: no cover (make this a generator)
             raise CodexAppServerTransportError(

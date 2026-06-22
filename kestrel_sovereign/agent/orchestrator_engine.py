@@ -407,6 +407,7 @@ class OrchestratorEngineMixin:
         session_id: Optional[str],
         *,
         streaming: bool = False,
+        request_id: Optional[str] = None,
     ) -> Union[str, LLMResponse]:
         """Give the model one more step when it narrates continuing but emits no tool call."""
         content = response.content or ""
@@ -424,6 +425,10 @@ class OrchestratorEngineMixin:
             model_override=effective_model,
             session_id=session_id,
             tool_executor=self._make_inline_tool_executor(session_id),
+            cancel_token=(
+                (lambda: self.is_request_cancelled(request_id))
+                if request_id else None
+            ),
         )
 
     async def _execute_tool_with_hooks(
@@ -2111,6 +2116,7 @@ class OrchestratorEngineMixin:
                     effective_model=effective_model,
                     session_id=session_id,
                     streaming=True,
+                    request_id=request_id,
                 )
                 if isinstance(response, str):
                     yield response
@@ -2239,6 +2245,10 @@ class OrchestratorEngineMixin:
                         # genuine prompt turn (tool_result turns are skipped), so
                         # "what's in this image?" + a tool call still sees it.
                         images=images,
+                        cancel_token=(
+                            (lambda: self.is_request_cancelled(request_id))
+                            if request_id else None
+                        ),
                     ):
                         if _cancelled():
                             break
@@ -2332,6 +2342,7 @@ class OrchestratorEngineMixin:
                         effective_model=effective_model,
                         session_id=session_id,
                         streaming=True,
+                        request_id=request_id,
                     )
                     if isinstance(response, str):
                         yield response

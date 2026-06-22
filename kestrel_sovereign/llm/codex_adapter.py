@@ -49,6 +49,7 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMAdapter, LLMResponse, ThinkingDelta, ToolCall
+from .cancellation import CancelToken, await_or_cancelled, raise_if_cancelled
 from kestrel_sdk.llm import (
     ProviderCapabilities,
     StructuredOutputMode,
@@ -1967,6 +1968,7 @@ class CodexAdapter(LLMAdapter):
         sink: "asyncio.Queue[dict]",
         est_payload_tokens: int,
         thread_id: Optional[str] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> AsyncIterator[dict]:
         """Stream turn events; rewrite the idle-timeout error with a
         route-cap hint so the operator can act on it.
@@ -1982,7 +1984,9 @@ class CodexAdapter(LLMAdapter):
         knob so the operator can raise the cap or shorten the turn.
         """
         try:
-            async for ev in app.iter_turn_events(sink, thread_id=thread_id):
+            async for ev in app.iter_turn_events(
+                sink, thread_id=thread_id, cancel_token=cancel_token
+            ):
                 yield ev
         except CodexAppServerError as e:
             msg = str(e)
@@ -2061,6 +2065,7 @@ class CodexAdapter(LLMAdapter):
         self, model: str, messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]], session_id: Optional[str],
         tool_executor: Optional[ToolExecutor],
+        cancel_token: Optional[CancelToken] = None,
     ) -> AsyncIterator[dict]:
         """Drive one turn; yield normalized events:
 
@@ -2068,6 +2073,7 @@ class CodexAdapter(LLMAdapter):
         ``{"tool_call": ToolCall}`` | ``{"final": (text, [ToolCall], usage)}``
         """
         app = self._app_server()
+        raise_if_cancelled(cancel_token)
         await app.ensure_started()
         instructions, input_messages = _extract_instructions_and_input(messages)
         # Nothing in the LLM pipeline calls contribute_system_prompt for
@@ -2107,7 +2113,7 @@ class CodexAdapter(LLMAdapter):
         # (same session_id) must not race on the turn-sink / handler
         # registrations. ``setdefault`` keeps lock identity stable.
         lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-        await lock.acquire()
+        await await_or_cancelled(lock.acquire(), cancel_token)
 
         # Defense against concurrent same-session idle-timeout invalidation:
         # while we were queued on this thread lock, another same-session
@@ -2137,7 +2143,7 @@ class CodexAdapter(LLMAdapter):
             )
             turn_input = _build_turn_input(input_messages, fresh_thread=fresh)
             lock = self._thread_locks.setdefault(thread_id, asyncio.Lock())
-            await lock.acquire()
+            await await_or_cancelled(lock.acquire(), cancel_token)
 
         # Per-turn record of every inline-executed tool call. Surfaced
         # on the final LLMResponse so the orchestrator can render
@@ -2235,8 +2241,10 @@ class CodexAdapter(LLMAdapter):
             ) // 4
 
             async for ev in self._iter_with_overflow_hint(
-                app, sink, est_payload_tokens, thread_id=thread_id
+                app, sink, est_payload_tokens, thread_id=thread_id,
+                cancel_token=cancel_token,
             ):
+                raise_if_cancelled(cancel_token)
                 method = ev.get("method")
                 p = ev.get("params") or {}
                 # #1518: codex's per-session per-plan ceiling is reported on
@@ -2507,6 +2515,7 @@ class CodexAdapter(LLMAdapter):
         tools: Optional[List[Dict[str, Any]]],
         session_id: Optional[str],
         tool_executor: Optional[ToolExecutor],
+        cancel_token: Optional[CancelToken] = None,
     ) -> AsyncIterator[dict]:
         """One-shot retry around :meth:`_run_turn` for the narrow case
         of a transient codex/ChatGPT-Plus idle stall.
@@ -2556,6 +2565,7 @@ class CodexAdapter(LLMAdapter):
             # Codex review round 4 caught this.
             async for ev in self._run_turn(
                 model, messages, tools, session_id, tool_executor,
+                cancel_token=cancel_token,
             ):
                 yield ev
             return
@@ -2566,6 +2576,7 @@ class CodexAdapter(LLMAdapter):
             try:
                 async for ev in self._run_turn(
                     model, messages, None, session_id, None,
+                    cancel_token=cancel_token,
                 ):
                     events_yielded += 1
                     yield ev
@@ -2605,7 +2616,7 @@ class CodexAdapter(LLMAdapter):
                     "(session=%s, model=%s)",
                     wait_s, session_id, model,
                 )
-                await asyncio.sleep(wait_s)
+                await await_or_cancelled(asyncio.sleep(wait_s), cancel_token)
 
     @staticmethod
     def _annotate_retry_exhaustion(
@@ -2637,12 +2648,14 @@ class CodexAdapter(LLMAdapter):
     ) -> LLMResponse:
         session_id = kwargs.get("session_id")
         tool_executor = kwargs.get("tool_executor")
+        cancel_token = kwargs.get("cancel_token")
         content: Optional[str] = None
         tool_calls: Optional[List[ToolCall]] = None
         usage: Dict[str, Optional[int]] = {}
         executed: List[Dict[str, Any]] = []
         async for ev in self._run_turn_with_retry(
             model, messages, tools, session_id, tool_executor,
+            cancel_token=cancel_token,
         ):
             if "final" in ev:
                 content, tool_calls, usage = ev["final"]
@@ -2675,11 +2688,13 @@ class CodexAdapter(LLMAdapter):
         **kwargs,
     ) -> AsyncIterator[Union[str, ThinkingDelta]]:
         session_id = kwargs.get("session_id")
+        cancel_token = kwargs.get("cancel_token")
         # Tools intentionally not passed: text-only streaming surface.
         # Uses ``_run_turn_with_retry`` so a transient codex idle stall
         # gets one chance to recover before the error surfaces. See #1411.
         async for ev in self._run_turn_with_retry(
             model, messages, None, session_id, None,
+            cancel_token=cancel_token,
         ):
             if "text" in ev:
                 yield ev["text"]
@@ -2697,9 +2712,11 @@ class CodexAdapter(LLMAdapter):
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         session_id = kwargs.get("session_id")
         tool_executor = kwargs.get("tool_executor")
+        cancel_token = kwargs.get("cancel_token")
         idx = 0
         async for ev in self._run_turn(
-            model, messages, tools, session_id, tool_executor
+            model, messages, tools, session_id, tool_executor,
+            cancel_token=cancel_token,
         ):
             if "text" in ev:
                 yield ev["text"]

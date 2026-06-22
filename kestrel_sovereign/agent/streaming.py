@@ -738,6 +738,10 @@ class StreamingMixin:
         eager_images = (
             await self._resolve_eager_images(attachments) if attachments else None
         )
+        cancel_token = (
+            (lambda: self.is_request_cancelled(request_id))
+            if request_id else None
+        )
 
         async for item in self.llm_service.stream_with_tool_detection(
             messages=messages,
@@ -748,6 +752,7 @@ class StreamingMixin:
             session_id=session_id,
             tool_executor=self._make_inline_tool_executor(session_id),
             images=eager_images or None,
+            cancel_token=cancel_token,
         ):
             # #1256: Honor stop-button cancellation INSIDE the agent
             # loop, not just at the HTTP response layer. Before this

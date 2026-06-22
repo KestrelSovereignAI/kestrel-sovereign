@@ -33,6 +33,7 @@ from .provider_registry import (
     ProviderInitializationError,
     provider_cache_body,
 )
+from .cancellation import CancelToken
 from .error_handling import (
     handle_llm_errors,
     handle_observability_errors,
@@ -1687,6 +1688,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
         force_local_only: bool,
         start_time: float,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> Union[str, LLMResponse]:
         """Try to get a response from a single provider.
 
@@ -1720,6 +1722,7 @@ class LLMService(ModelDiscoveryMixin, ModelMandateMixin, UsageTrackingMixin, Str
             response_format=response_format,
             extra_body=provider_cache_body(provider),
             tool_executor=tool_executor,
+            cancel_token=cancel_token,
         )
 
         # Calculate duration and log to observability
@@ -1918,6 +1921,7 @@ No other text or formatting.
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> Union[str, LLMResponse]:
         """Get a response from providers in priority order.
 
@@ -1970,6 +1974,7 @@ No other text or formatting.
                         force_local_only=force_local_only,
                         start_time=start_time,
                         tool_executor=tool_executor,
+                        cancel_token=cancel_token,
                     )
                     if llm_span and isinstance(result, LLMResponse):
                         if result.input_tokens is not None:
@@ -2161,6 +2166,7 @@ No other text or formatting.
         tools: Optional[List[Dict[str, Any]]] = None,
         response_format: Optional[Type[BaseModel]] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> Union[str, LLMResponse]:
         """Generate text using the active backend with automatic fallback.
 
@@ -2207,6 +2213,7 @@ No other text or formatting.
                         messages=messages,
                         tools=tools,
                         response_format=response_format,
+                        cancel_token=cancel_token,
                     )
                     if llm_span:
                         llm_span.set_attribute("llm.provider", "remote_gpu")
@@ -2242,6 +2249,7 @@ No other text or formatting.
                 tools=tools,
                 response_format=response_format,
                 tool_executor=tool_executor,
+                cancel_token=cancel_token,
             )
 
     async def generate_with_messages(
@@ -2254,6 +2262,7 @@ No other text or formatting.
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> Union[str, LLMResponse]:
         """Generate using existing message list (for multi-turn tool calling).
 
@@ -2290,6 +2299,7 @@ No other text or formatting.
                     messages=messages,
                     tools=tools,
                     response_format=response_format,
+                    cancel_token=cancel_token,
                 )
                 await self._meter_message_response(
                     response, "remote_gpu", model,
@@ -2426,6 +2436,7 @@ No other text or formatting.
                     extra_body=provider_cache_body(provider),
                     session_id=session_id,
                     tool_executor=tool_executor,
+                    cancel_token=cancel_token,
                 )
                 await self._meter_message_response(
                     response, provider["name"], model,

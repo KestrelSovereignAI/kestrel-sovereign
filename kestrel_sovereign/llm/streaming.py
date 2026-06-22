@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from kestrel_sdk.llm import ToolCallStarted
 
 from .adapter import LLMResponse, ThinkingDelta, messages_for
+from .cancellation import CancelToken
 from .codex_app_server import CodexAppServerTransportError
 from .error_handling import LLMError
 from .provider_registry import provider_cache_body
@@ -233,7 +234,8 @@ class StreamingMixin:
         user_prompt: str,
         force_local_only: bool = False,
         model_override: str = None,
-        response_format: Optional[Type[BaseModel]] = None
+        response_format: Optional[Type[BaseModel]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ):
         """Get a streaming response from the LLM.
 
@@ -284,6 +286,7 @@ class StreamingMixin:
                                 messages=messages,
                                 response_format=response_format,
                                 extra_body=provider_cache_body(provider),
+                                cancel_token=cancel_token,
                             ):
                                 yield chunk
                             logger.info(f"Streaming completed from {provider_name}")
@@ -299,6 +302,7 @@ class StreamingMixin:
                     messages=messages,
                     response_format=response_format,
                     extra_body=provider_cache_body(provider),
+                    cancel_token=cancel_token,
                 )
                 # Yield content as string (LLMResponse.content) to match streaming behavior
                 yield response.content or ""
@@ -360,6 +364,7 @@ class StreamingMixin:
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         response_format: Optional[Type[BaseModel]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ):
         """Stream text using the active backend with automatic fallback.
 
@@ -394,6 +399,7 @@ class StreamingMixin:
                     model=model,
                     messages=messages,
                     response_format=response_format,
+                    cancel_token=cancel_token,
                 ):
                     yield chunk
                 return
@@ -409,6 +415,7 @@ class StreamingMixin:
             force_local_only=force_local_only,
             model_override=model_override,
             response_format=response_format,
+            cancel_token=cancel_token,
         ):
             yield chunk
 
@@ -419,6 +426,7 @@ class StreamingMixin:
         force_local_only: bool = False,
         model_override: Optional[str] = None,
         session_id: Optional[str] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> AsyncIterator[str]:
         """Stream response using a pre-built messages array.
 
@@ -453,6 +461,7 @@ class StreamingMixin:
                         client=self._remote_client,
                         model=model,
                         messages=messages,
+                        cancel_token=cancel_token,
                     ):
                         yield chunk
                     return
@@ -483,6 +492,7 @@ class StreamingMixin:
                         messages=messages,
                         extra_body=provider_cache_body(provider),
                         session_id=session_id,
+                        cancel_token=cancel_token,
                     ):
                         yield chunk
                     return
@@ -494,6 +504,7 @@ class StreamingMixin:
                         messages=messages,
                         extra_body=provider_cache_body(provider),
                         session_id=session_id,
+                        cancel_token=cancel_token,
                     )
                     yield response.content if hasattr(response, 'content') else str(response)
                     return
@@ -626,6 +637,7 @@ class StreamingMixin:
         session_id: Optional[str] = None,
         tool_executor: Optional[Callable[[str, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
         images: Optional[List[Union[str, bytes]]] = None,
+        cancel_token: Optional[CancelToken] = None,
     ) -> AsyncIterator[Union[str, ThinkingDelta, ToolCallStarted, LLMResponse]]:
         """
         Stream response with tool call detection.
@@ -715,6 +727,7 @@ class StreamingMixin:
                         model=model,
                         messages=messages,
                         tools=tools,
+                        cancel_token=cancel_token,
                     ):
                         yield item
                     return
@@ -764,6 +777,8 @@ class StreamingMixin:
                         kwargs["session_id"] = session_id
                     if tool_executor is not None:
                         kwargs["tool_executor"] = tool_executor
+                    if cancel_token is not None:
+                        kwargs["cancel_token"] = cancel_token
 
                     # Meter the streamed turn from its terminal LLMResponse.
                     # The `finally` records even if the consumer stops iterating
@@ -827,6 +842,7 @@ class StreamingMixin:
                             tools=tools,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
+                            cancel_token=cancel_token,
                         )
                         # adapter.get_response does not meter (only the service's
                         # non-streaming path does), so record it here too.
@@ -849,6 +865,7 @@ class StreamingMixin:
                             messages=adapter_messages,
                             extra_body=provider_cache_body(provider),
                             session_id=session_id,
+                            cancel_token=cancel_token,
                         ):
                             yield chunk
                         return
