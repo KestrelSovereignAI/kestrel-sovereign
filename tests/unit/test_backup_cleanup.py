@@ -1159,3 +1159,60 @@ async def test_include_quarantined_actually_applies_deletes(tmp_path):
         audit_log=tmp_path / "audit.jsonl")
     assert rc == 0
     assert set(client.deleted) == {"file-cid-rawdb", "file-cid-bin"}
+
+
+@pytest.mark.asyncio
+async def test_age_purge_deletes_old_keeps_recent_protected_and_undated(tmp_path):
+    now = NOW
+    def up(cid, fid, days_old=None, size=100):
+        u = {"cid": cid, "id": fid, "fileSizeInBytes": str(size), "fileName": f"{cid}.car"}
+        if days_old is not None:
+            u["createdAt"] = int((now - timedelta(days=days_old)).timestamp() * 1000)
+        return u
+    pages = {
+        None: {"fileList": [
+            up("cid-old1", "f1", 90),       # old -> delete
+            up("cid-old2", "f2", 30),       # old -> delete
+            up("cid-recent", "f3", 2),      # recent -> keep
+            up("cid-protected", "f4", 900), # old but in keep-set -> keep
+            up("cid-undated", "f5", None),  # no date -> keep (fail-safe)
+            {"cid": "cid-noid", "fileSizeInBytes": "100", "fileName": "x.car",
+             "createdAt": int((now - timedelta(days=900)).timestamp() * 1000)},  # no id -> keep
+        ], "totalFiles": 6},
+        "f4": {"fileList": [], "totalFiles": 6},
+    }
+    from unittest.mock import AsyncMock
+    client = AsyncMock()
+    async def _get(last_key=None): return pages[last_key]
+    client.get_uploads = _get
+    client.delete_file = AsyncMock(return_value={"deleted": True})
+    client.close = AsyncMock()
+
+    audit = tmp_path / "age.jsonl"
+    rc = await backup_cleanup.age_purge_lighthouse(
+        client, days=14, keep_cids={"cid-protected"},
+        audit_log=audit, confirmation=backup_cleanup.CONFIRMATION_PHRASE, now=now)
+
+    assert rc == 0
+    deleted = {c.args[0] for c in client.delete_file.await_args_list}
+    assert deleted == {"f1", "f2"}  # only old, id-bearing, non-protected
+    entries = [json.loads(l) for l in audit.read_text().splitlines()]
+    assert {e["cid"] for e in entries} == {"cid-old1", "cid-old2"}
+
+
+@pytest.mark.asyncio
+async def test_age_purge_refuses_without_confirmation(tmp_path):
+    from unittest.mock import AsyncMock
+    client = AsyncMock()
+    async def _get(last_key=None):
+        return {"fileList": [{"cid": "c", "id": "f", "fileSizeInBytes": "1",
+                "createdAt": int((NOW - timedelta(days=900)).timestamp()*1000)}] if last_key is None else [],
+                "totalFiles": 1}
+    client.get_uploads = _get
+    client.delete_file = AsyncMock()
+    with patch("scripts.backup_cleanup.input", side_effect=EOFError):
+        rc = await backup_cleanup.age_purge_lighthouse(
+            client, days=14, keep_cids=set(),
+            audit_log=tmp_path / "a.jsonl", confirmation=None, now=NOW)
+    assert rc == 2
+    client.delete_file.assert_not_called()
