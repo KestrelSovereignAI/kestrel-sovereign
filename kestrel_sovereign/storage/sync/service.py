@@ -630,5 +630,7 @@ class SyncService:
             try:
                 with open(self.state_file, "w", encoding="utf-8") as f:
                     json.dump(self._state.to_dict(), f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
             except Exception as e:
                 logger.error(f"Failed to save sync state: {e}")
