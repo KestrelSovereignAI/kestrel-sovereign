@@ -303,6 +303,8 @@ class TestNellieFailureModes:
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_AUTH_TOKEN"}
         # Also blank ANTHROPIC_API_KEY so the anthropic route can't fall back.
         env.pop("ANTHROPIC_API_KEY", None)
+        # Disable Claude Code credential store delegation
+        env["KESTREL_ANTHROPIC_OAUTH_DELEGATE"] = "0"
         with patch.dict("os.environ", env, clear=True):
             registry = ProviderRegistry(config)
             # ``ProviderInitializationError`` fires when EVERY route fails.
