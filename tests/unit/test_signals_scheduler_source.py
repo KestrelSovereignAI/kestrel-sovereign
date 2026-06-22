@@ -89,6 +89,7 @@ def test_all_cron_tasks_are_classified():
     names = [t[0] for t in CRON_TASKS]
     assert sorted(names) == sorted([
         "backup_snapshot",
+        "bootstrap_timeout_check",  # #378 — bootstrap watchdog
         "morning_signal",
         "signal_dispatch",
         "trash_retention",
@@ -111,6 +112,7 @@ def test_action_vs_artifact_split_matches_design():
         by_mode[mode].add(name)
     assert by_mode[SignalMode.ACTION] == {
         "backup_snapshot",
+        "bootstrap_timeout_check",  # #378 — bootstrap watchdog
         "signal_dispatch",
         "trash_retention",
         "training_cycle",
@@ -154,6 +156,7 @@ def test_state_mutating_tasks_declare_memory():
     assert ResourceLock.MEMORY in by_name["memory_consolidate"]
     assert ResourceLock.MEMORY in by_name["reflect"]
     assert ResourceLock.MEMORY in by_name["sleep"]  # #1674 P3
+    assert ResourceLock.MEMORY in by_name["bootstrap_timeout_check"]  # #378
 
 
 # ---------------------------------------------------------------------------
