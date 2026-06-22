@@ -8,10 +8,12 @@ janitor scheduling layer is unit-tested separately in
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 
 from kestrel_sovereign.storage import AsyncStorage
+from kestrel_sovereign.storage.destructive_audit import audit_db_path_for
 
 
 AGENT_ID = "did:test:retention"
@@ -49,6 +51,55 @@ async def test_purge_trash_older_than_destroys_aged_rows(tmp_path):
         assert purged == 1
         gone = await storage.conversation.get_full_history_with_ids(include_deleted=True)
         assert gone == []
+
+
+@pytest.mark.asyncio
+async def test_purge_all_audit_survives_conversation_history_wipe(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        await storage.conversation.add_conversation("user", "first")
+        await storage.conversation.add_conversation("assistant", "second")
+
+        purged = await storage.purge_all_conversations(reason="test-wipe")
+
+        assert purged == 2
+        assert await storage.conversation.get_full_history_with_ids(include_deleted=True) == []
+
+    audit_db = audit_db_path_for(db)
+    assert audit_db.exists()
+    with sqlite3.connect(audit_db) as conn:
+        row = conn.execute(
+            "SELECT agent_id, operation_type, row_count, pre_operation_hash, "
+            "snapshot_reference, reason FROM destructive_audit_log"
+        ).fetchone()
+        assert row[0] == AGENT_ID
+        assert row[1] == "purge_all"
+        assert row[2] == 2
+        assert row[3].startswith("sha256:")
+        assert row[4] == "inline:sha256"
+        assert row[5] == "test-wipe"
+
+
+@pytest.mark.asyncio
+async def test_destructive_audit_log_is_append_only(tmp_path):
+    db = tmp_path / "kestrel.db"
+    async with AsyncStorage(str(db), agent_id=AGENT_ID) as storage:
+        await storage.conversation.add_conversation("user", "erase me")
+        await storage.purge_all_conversations(reason="append-only-test")
+
+    audit_db = audit_db_path_for(db)
+    with sqlite3.connect(audit_db) as conn:
+        audit_id = conn.execute("SELECT id FROM destructive_audit_log").fetchone()[0]
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            conn.execute(
+                "UPDATE destructive_audit_log SET reason = ? WHERE id = ?",
+                ("tampered", audit_id),
+            )
+        with pytest.raises(sqlite3.DatabaseError, match="append-only"):
+            conn.execute(
+                "DELETE FROM destructive_audit_log WHERE id = ?",
+                (audit_id,),
+            )
 
 
 @pytest.mark.asyncio

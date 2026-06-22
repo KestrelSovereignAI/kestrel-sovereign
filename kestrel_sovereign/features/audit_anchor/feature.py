@@ -423,35 +423,38 @@ class AuditAnchorFeature(Feature):
         Returns:
             List of entry dicts.
         """
-        permission_store = self._get_permission_store()
-        if permission_store is None:
-            return []
+        entries = []
 
-        try:
+        permission_store = self._get_permission_store()
+        if permission_store is not None:
             import aiosqlite
-            async with aiosqlite.connect(permission_store.db_path) as db:
-                db.row_factory = aiosqlite.Row
-                if since:
-                    cursor = await db.execute(
-                        """SELECT id, feature_name, tool_name, action, decision,
-                                  user_choice, args_summary, created_at
-                           FROM security_audit_log
-                           WHERE created_at > ?
-                           ORDER BY created_at ASC""",
-                        (since,),
-                    )
-                else:
-                    cursor = await db.execute(
-                        """SELECT id, feature_name, tool_name, action, decision,
-                                  user_choice, args_summary, created_at
-                           FROM security_audit_log
-                           ORDER BY created_at ASC"""
-                    )
-                rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
-        except Exception as e:
-            logger.warning(f"Could not read audit log entries: {e}")
-            return []
+
+            try:
+                async with aiosqlite.connect(permission_store.db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    if since:
+                        cursor = await db.execute(
+                            """SELECT id, feature_name, tool_name, action, decision,
+                                      user_choice, args_summary, created_at
+                               FROM security_audit_log
+                               WHERE created_at > ?
+                               ORDER BY created_at ASC""",
+                            (since,),
+                        )
+                    else:
+                        cursor = await db.execute(
+                            """SELECT id, feature_name, tool_name, action, decision,
+                                      user_choice, args_summary, created_at
+                               FROM security_audit_log
+                               ORDER BY created_at ASC"""
+                        )
+                    rows = await cursor.fetchall()
+                    entries.extend(dict(row) for row in rows)
+            except Exception as e:
+                logger.warning(f"Could not read audit log entries: {e}")
+
+        entries.extend(await self._get_destructive_audit_entries_since(since))
+        return entries
 
     async def _get_audit_entries_range(
         self, first_at: Optional[str], last_at: Optional[str]
@@ -466,34 +469,133 @@ class AuditAnchorFeature(Feature):
         Returns:
             List of entry dicts.
         """
-        permission_store = self._get_permission_store()
-        if permission_store is None:
-            return []
+        entries = []
 
+        permission_store = self._get_permission_store()
+        if permission_store is not None:
+            import aiosqlite
+            try:
+                async with aiosqlite.connect(permission_store.db_path) as db:
+                    db.row_factory = aiosqlite.Row
+                    if first_at and last_at:
+                        cursor = await db.execute(
+                            """SELECT id, feature_name, tool_name, action, decision,
+                                      user_choice, args_summary, created_at
+                               FROM security_audit_log
+                               WHERE created_at >= ? AND created_at <= ?
+                               ORDER BY created_at ASC""",
+                            (first_at, last_at),
+                        )
+                    else:
+                        cursor = await db.execute(
+                            """SELECT id, feature_name, tool_name, action, decision,
+                                      user_choice, args_summary, created_at
+                               FROM security_audit_log
+                               ORDER BY created_at ASC"""
+                        )
+                    rows = await cursor.fetchall()
+                    entries.extend(dict(row) for row in rows)
+            except Exception as e:
+                logger.warning(f"Could not read audit log entries for range: {e}")
+
+        entries.extend(
+            await self._get_destructive_audit_entries_range(first_at, last_at)
+        )
+        return entries
+
+    def _get_destructive_audit_db_path(self) -> Optional[str]:
+        from pathlib import Path
+
+        audit = getattr(getattr(self.agent, "storage", None), "destructive_audit", None)
+        path = getattr(audit, "db_path", None)
+        if not isinstance(path, (str, Path)):
+            return None
+        return str(path) if path else None
+
+    async def _get_destructive_audit_entries_since(
+        self, since: Optional[str]
+    ) -> list:
+        path = self._get_destructive_audit_db_path()
+        if not path:
+            return []
         try:
             import aiosqlite
-            async with aiosqlite.connect(permission_store.db_path) as db:
+            async with aiosqlite.connect(path) as db:
+                db.row_factory = aiosqlite.Row
+                if since:
+                    cursor = await db.execute(
+                        """SELECT id, timestamp, agent_id, caller_identity,
+                                  operation_type, row_count, pre_operation_hash,
+                                  snapshot_reference, scope, reason, request_id,
+                                  session_id, approval_id, anchor_status
+                           FROM destructive_audit_log
+                           WHERE timestamp > ?
+                           ORDER BY timestamp ASC""",
+                        (since,),
+                    )
+                else:
+                    cursor = await db.execute(
+                        """SELECT id, timestamp, agent_id, caller_identity,
+                                  operation_type, row_count, pre_operation_hash,
+                                  snapshot_reference, scope, reason, request_id,
+                                  session_id, approval_id, anchor_status
+                           FROM destructive_audit_log
+                           ORDER BY timestamp ASC"""
+                    )
+                rows = await cursor.fetchall()
+                return [
+                    {
+                        "audit_source": "destructive_audit_log",
+                        "created_at": row["timestamp"],
+                        **dict(row),
+                    }
+                    for row in rows
+                ]
+        except Exception as e:
+            logger.warning(f"Could not read destructive audit entries: {e}")
+            return []
+
+    async def _get_destructive_audit_entries_range(
+        self, first_at: Optional[str], last_at: Optional[str]
+    ) -> list:
+        path = self._get_destructive_audit_db_path()
+        if not path:
+            return []
+        try:
+            import aiosqlite
+            async with aiosqlite.connect(path) as db:
                 db.row_factory = aiosqlite.Row
                 if first_at and last_at:
                     cursor = await db.execute(
-                        """SELECT id, feature_name, tool_name, action, decision,
-                                  user_choice, args_summary, created_at
-                           FROM security_audit_log
-                           WHERE created_at >= ? AND created_at <= ?
-                           ORDER BY created_at ASC""",
+                        """SELECT id, timestamp, agent_id, caller_identity,
+                                  operation_type, row_count, pre_operation_hash,
+                                  snapshot_reference, scope, reason, request_id,
+                                  session_id, approval_id, anchor_status
+                           FROM destructive_audit_log
+                           WHERE timestamp >= ? AND timestamp <= ?
+                           ORDER BY timestamp ASC""",
                         (first_at, last_at),
                     )
                 else:
                     cursor = await db.execute(
-                        """SELECT id, feature_name, tool_name, action, decision,
-                                  user_choice, args_summary, created_at
-                           FROM security_audit_log
-                           ORDER BY created_at ASC"""
+                        """SELECT id, timestamp, agent_id, caller_identity,
+                                  operation_type, row_count, pre_operation_hash,
+                                  snapshot_reference, scope, reason, request_id,
+                                  session_id, approval_id, anchor_status
+                           FROM destructive_audit_log
+                           ORDER BY timestamp ASC"""
                     )
                 rows = await cursor.fetchall()
-                return [dict(row) for row in rows]
+                return [
+                    {
+                        "audit_source": "destructive_audit_log",
+                        "created_at": row["timestamp"],
+                        **dict(row),
+                    }
+                    for row in rows
+                ]
         except Exception as e:
-            logger.warning(f"Could not read audit log entries for range: {e}")
+            logger.warning(f"Could not read destructive audit entries for range: {e}")
             return []
 
     async def _get_last_anchor_timestamp(self) -> Optional[str]:

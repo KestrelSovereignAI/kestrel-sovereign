@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .async_database import AsyncDatabase
 from .conversation_ids import coerce_persistent_message_id
+from .destructive_audit import DestructiveAuditEvent, DestructiveAuditLog, hash_rows
 from .sqla.embedding_profile import upsert_embedding_profile as _upsert_embedding_profile
 from .encryption import (
     get_fernet, get_agent_fernet, encrypt_string, decrypt_string, remove_enc_flag,
@@ -255,6 +256,7 @@ class AsyncConversationStore:
         db: AsyncDatabase,
         agent_id: str = "",
         llm_service: Optional[Any] = None,
+        destructive_audit: Optional[DestructiveAuditLog] = None,
     ):
         """Initialize the conversation store.
 
@@ -285,12 +287,67 @@ class AsyncConversationStore:
         self.db = db
         self.agent_id = agent_id
         self._llm_service = llm_service
+        self._destructive_audit = destructive_audit
         # Global key for backward compatibility
         self._global_fernet = get_fernet()
         # Per-agent key (recommended, used for new data)
         self._agent_fernet = get_agent_fernet(agent_id) if agent_id else None
         # Auto-migration on read (can be disabled via env var)
         self._migrate_on_read = os.environ.get("KESTREL_DISABLE_MIGRATION") != "true"
+
+    async def _audit_destructive_operation(
+        self,
+        *,
+        operation_type: str,
+        rows: list[dict[str, Any]],
+        scope: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Write the fail-closed pre-operation destructive audit row."""
+
+        if self._destructive_audit is None:
+            return
+
+        await self._destructive_audit.append(
+            DestructiveAuditEvent(
+                agent_id=self.agent_id,
+                operation_type=operation_type,
+                row_count=len(rows),
+                pre_operation_hash=hash_rows(rows),
+                snapshot_reference="inline:sha256",
+                scope=scope,
+                reason=reason,
+            )
+        )
+
+    async def _audit_conversation_rows(
+        self,
+        query: str,
+        params: tuple[Any, ...],
+        *,
+        operation_type: str,
+        scope: dict[str, Any],
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        rows = await self.db.fetchall(query, params)
+        snapshot = [
+            {
+                "id": row[0],
+                "role": row[1],
+                "content": row[2],
+                "metadata": row[3],
+                "created_at": row[4],
+                "deleted_at": row[5],
+            }
+            for row in rows
+        ]
+        await self._audit_destructive_operation(
+            operation_type=operation_type,
+            rows=snapshot,
+            scope=scope,
+            reason=reason,
+        )
+        return snapshot
 
     def _lazy_embedding_service(self) -> Optional[Any]:
         """Return the active chat provider's embedding service when available.
@@ -1735,6 +1792,14 @@ class AsyncConversationStore:
         Returns:
             True if a row was destroyed, False if not found.
         """
+        await self._audit_conversation_rows(
+            "SELECT id, role, content, metadata, created_at, deleted_at "
+            "FROM conversation_history WHERE id = ? AND agent_id = ?",
+            (message_id, self.agent_id),
+            operation_type="purge_message",
+            scope={"table": "conversation_history", "message_id": message_id},
+            reason=reason,
+        )
         affected = await self.db.execute_commit(
             "DELETE FROM conversation_history WHERE id = ? AND agent_id = ?",
             (message_id, self.agent_id),
@@ -1771,6 +1836,18 @@ class AsyncConversationStore:
 
         placeholders = ",".join("?" for _ in ids)
         params = [*ids, self.agent_id]
+        await self._audit_conversation_rows(
+            "SELECT id, role, content, metadata, created_at, deleted_at "
+            f"FROM conversation_history WHERE id IN ({placeholders}) AND agent_id = ?",
+            tuple(params),
+            operation_type="purge_conversation_session",
+            scope={
+                "table": "conversation_history",
+                "session_id": session_id,
+                "message_ids": ids,
+            },
+            reason=reason,
+        )
         affected = await self.db.execute_commit(
             f"DELETE FROM conversation_history "
             f"WHERE id IN ({placeholders}) AND agent_id = ?",
@@ -1796,6 +1873,14 @@ class AsyncConversationStore:
         wipes the entire history regardless of when rows were authored
         (#867).
         """
+        await self._audit_conversation_rows(
+            "SELECT id, role, content, metadata, created_at, deleted_at "
+            "FROM conversation_history WHERE agent_id = ? ORDER BY id ASC",
+            (self.agent_id,),
+            operation_type="purge_all",
+            scope={"table": "conversation_history"},
+            reason=reason,
+        )
         affected = await self.db.execute_commit(
             "DELETE FROM conversation_history WHERE agent_id = ?",
             (self.agent_id,),
@@ -1836,6 +1921,18 @@ class AsyncConversationStore:
                 self.agent_id, reason,
             )
             return 0
+        await self._audit_conversation_rows(
+            "SELECT id, role, content, metadata, created_at, deleted_at "
+            "FROM conversation_history WHERE agent_id = ? AND created_at >= ? "
+            "ORDER BY id ASC",
+            (self.agent_id, since_iso),
+            operation_type="purge_all_since",
+            scope={
+                "table": "conversation_history",
+                "since_iso": since_iso,
+            },
+            reason=reason,
+        )
         affected = await self.db.execute_commit(
             "DELETE FROM conversation_history "
             "WHERE agent_id = ? AND created_at >= ?",
@@ -1891,6 +1988,26 @@ class AsyncConversationStore:
         # SQLite doesn't support LIMIT directly inside DELETE on every
         # build path, and even when it does the syntax differs from
         # PostgreSQL. The IN (SELECT ... LIMIT ...) form is portable.
+        await self._audit_conversation_rows(
+            "SELECT id, role, content, metadata, created_at, deleted_at "
+            "FROM conversation_history "
+            "WHERE id IN ("
+            "  SELECT id FROM conversation_history "
+            "  WHERE agent_id = ? "
+            "    AND deleted_at IS NOT NULL "
+            "    AND deleted_at < ? "
+            "  ORDER BY deleted_at ASC "
+            "  LIMIT ?"
+            ") ORDER BY deleted_at ASC",
+            (self.agent_id, cutoff_iso, max_rows),
+            operation_type="purge_trash_older_than",
+            scope={
+                "table": "conversation_history",
+                "cutoff_iso": cutoff_iso,
+                "max_rows": max_rows,
+            },
+            reason=reason,
+        )
         affected = await self.db.execute_commit(
             "DELETE FROM conversation_history "
             "WHERE id IN ("
